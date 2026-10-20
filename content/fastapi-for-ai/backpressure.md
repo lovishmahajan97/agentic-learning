@@ -108,6 +108,24 @@ L_max = X × W_budget
 
 A well-built service uses all three.
 
+## Diagram
+Solid arrows are work flowing toward the slowest stage; dotted arrows are the backpressure signals
+flowing back, each ending in a deliberate wait, slowdown or refusal.
+
+```mermaid
+flowchart LR
+    C["Client"] -->|"POST /ingest"| E{"Admission check before body or model"}
+    E -->|"full"| R["503 or 429 with Retry-After"]
+    R -.->|"retry with backoff"| C
+    E -->|"room"| Q[("Bounded queue, L_max = X times W_budget")]
+    Q --> W["Fixed worker pool"]
+    W --> P["Model or provider, the bottleneck"]
+    P -.->|"429 or 503 with Retry-After"| W
+    W -.->|"back off, lower concurrency"| P
+    E -.->|"low priority sheds first"| S["Load shedding"]
+    E -->|"can wait"| J[("Durable job queue, return 202")]
+```
+
 ## Examples
 ### Bounded ingest queue with all-or-nothing admission
 An ingest endpoint feeding a bounded queue drained by a fixed pool of embedding workers. When the queue is
@@ -268,6 +286,44 @@ crossed client timeouts, so the service spent capacity on answers nobody receive
 load. The redesign bounds the wait (a short acquire timeout or an explicit queue cap), returns 503
 with `Retry-After` before doing expensive work, sheds lower-priority traffic first, alerts on queue
 depth, and raises real capacity if the overload is normal demand rather than a spike.
+
+## Interview questions
+### What is backpressure, and why is a bigger buffer not the answer to overload?
+- **Backpressure is a feedback signal** from a slow consumer to a fast producer, so the producer waits,
+  slows down or is told no instead of filling buffers.
+- **Queues do not add capacity.** At 8 requests per second of capacity and 12 arriving, the queue grows by
+  4 every second regardless of its size.
+- **A bigger buffer only delays collapse,** because a deeper queue means longer waits for everything in it,
+  until the tail misses client timeouts.
+
+### How would you size the bound on an in-process queue in front of an embedding stage?
+- **Start from the latency budget,** because the wait at the back of a queue of length *L* in front of a
+  stage with throughput *X* is about *L / X*.
+- **Invert it:** `L_max = X × W_budget`. At 16 chunks per second and a 15-second budget that is 240, and
+  the example uses 200 to leave margin for the embed call itself.
+- **Then watch** `qsize()` and p99 time in queue, which move before average latency does.
+
+### Users upload large documents and overload still hurts even though you return 503. What is wrong?
+- **The rejection happens too late.** FastAPI reads and parses a declared body parameter before the
+  endpoint or its dependencies run, so a capacity check inside the endpoint happens after the upload.
+- **Overload responses then cost as much as successes,** so shedding relieves nothing.
+- **Fix:** admit in middleware or take the raw `Request` and read the body only once admitted, rejecting
+  with 503 and `Retry-After` first.
+
+### Does a slow streaming client slow down the LLM provider?
+- **Partly, and only up to your code.** When the client reads slowly, socket and server buffers fill, the
+  awaited `send` stalls and the generator stops being iterated.
+- **The provider typically keeps decoding,** because generation on its side is decoupled from socket
+  writes, so tokens are buffered or billed regardless.
+- **So for an expensive upstream,** treat a stalled or vanished client as an explicit decision to cancel.
+
+### When would you shed load or use a durable queue instead of just applying backpressure?
+- **Shed when slowing is impossible:** drop the least valuable work first, such as free tier before paid or
+  background re-indexing before interactive chat.
+- **Use a durable job queue** for work that can wait, such as batch embedding: return 202, keep its own
+  depth limit, and survive restarts that would lose an in-process queue.
+- **The trade-off:** classification adds up-front cost and occasionally fails cheap work, but keeps the
+  protected class healthy under overload.
 
 ## Quiz
 ### Q: A stage handles 10 requests per second and 15 arrive per second. What does adding a larger unbounded buffer in front of it achieve?

@@ -5,7 +5,7 @@ name: Context managers / resource cleanup
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - python-for-ai/generators
   - python-for-ai/async-cancellation-and-exception-propagation
@@ -23,37 +23,41 @@ sources:
 
 ## TL;DR
 A context manager pairs setup with guaranteed teardown: `with` runs `__enter__`, your block, then
-`__exit__` whether the block returns, raises or is cancelled. It exists because the resources an AI
-service holds (HTTP connection pools, streams, DB sessions, locks, temp files, GPU memory modes) leak
-quietly when cleanup depends on every code path remembering it. `async with` and `contextlib` extend the
-pattern to async code, generators and dynamic sets of resources.
+`__exit__` whether the block returns, raises or is cancelled, so AI-service resources stop leaking on
+error paths. `async with` and `contextlib` extend it.
 
 ## Why it exists
-Resources are acquired on the happy path and leaked on the unhappy one. A streaming LLM call opens a
-connection; the client disconnects, a parser raises on malformed JSON, or a timeout cancels the task,
-and the line that closes the stream never runs. Each leak is small, but an AI backend does this
-thousands of times an hour: the connection pool fills, new requests wait for a free connection, and
-latency climbs until the service looks down. GPU code has the same shape: forget to restore a mode or
-release a buffer and memory creeps up.
-
-The naive fixes fall short. Calling `close()` at the end of the function misses every early return and
-exception. `try/finally` is correct, but it must be repeated at every call site, nested for each
-additional resource, and written correctly every time. Relying on `__del__` or garbage collection gives
-no timing guarantee (reference cycles delay it, other interpreters do not refcount, and async cleanup
-cannot run from a finaliser at all).
-
-PEP 343 packaged `try/finally` into the resource itself. The object that knows how to acquire also knows
-how to release, and the `with` statement guarantees the release runs. Callers write one line and cannot
-get the cleanup wrong.
+- **Resources leak on the unhappy path.** A streaming LLM call opens a connection; the client
+  disconnects, a parser raises on malformed JSON, or a timeout cancels the task, and the line that closes
+  the stream never runs.
+- **Small leaks compound.** An AI backend does this thousands of times an hour: the connection pool
+  fills, new requests wait for a free connection, and latency climbs until the service looks down. GPU
+  code has the same shape: forget to restore a mode or release a buffer and memory creeps up.
+- **The naive fixes fall short.**
+  - Calling `close()` at the end of the function misses every early return and exception.
+  - `try/finally` is correct, but must be repeated at every call site, nested for each additional
+    resource, and written correctly every time.
+  - Relying on `__del__` or garbage collection gives no timing guarantee: reference cycles delay it, other
+    interpreters do not refcount, and async cleanup cannot run from a finaliser at all.
+- **PEP 343 packaged `try/finally` into the resource itself.** The object that knows how to acquire also
+  knows how to release, and the `with` statement guarantees the release runs. Callers write one line and
+  cannot get the cleanup wrong.
+- **What it covers:** HTTP connection pools, streams, DB sessions, locks, temp files and GPU memory
+  modes, which all leak quietly when cleanup depends on every code path remembering it.
 
 ## How it works
 ### The protocol
-`with expr as x:` evaluates `expr` to a manager, calls `manager.__enter__()` and binds its return value to
-`x`, runs the block, then always calls `manager.__exit__(exc_type, exc, tb)`. On a normal exit all three
-are `None`. On an exception they describe it, and if `__exit__` returns a truthy value the exception is
-**suppressed**, *because* some managers (`contextlib.suppress`) exist precisely to do that; everyone else
-must return `None` or `False`. Multiple managers in one statement exit in reverse order of entry, so
-dependencies unwind correctly.
+`with expr as x:` runs these steps:
+1. **Evaluate** `expr` to a manager.
+2. **Enter:** call `manager.__enter__()` and bind its return value to `x`.
+3. **Run the block.**
+4. **Always exit:** call `manager.__exit__(exc_type, exc, tb)`. On a normal exit all three are `None`; on
+   an exception they describe it.
+
+- **Suppression.** If `__exit__` returns a truthy value the exception is **suppressed**, *because* some
+  managers (`contextlib.suppress`) exist precisely to do that; everyone else must return `None` or `False`.
+- **Reverse unwinding.** Multiple managers in one statement exit in reverse order of entry, so
+  dependencies unwind correctly.
 
 Written out, `with mgr as x: body` is approximately what PEP 343 specifies:
 
@@ -72,46 +76,75 @@ finally:
         exit(mgr, None, None, None)   # normal exit, including return/break
 ```
 
-Three consequences follow from that expansion. First, `__exit__` runs only if `__enter__` succeeded,
-*because* the protocol cannot know how far a failed setup got; a manager that acquires two things in
-`__enter__` must clean up the first itself if the second fails. Second, `except BaseException` means
-`KeyboardInterrupt` and `CancelledError` trigger cleanup too. Third, if `__exit__` itself raises, that
-new exception replaces the original (which survives only as `__context__` in the traceback), so a
-cleanup that can fail should log and swallow its own error rather than mask the real one.
+Three consequences follow from that expansion:
+| Consequence | Why | What to do |
+|---|---|---|
+| `__exit__` runs only if `__enter__` succeeded | The protocol cannot know how far a failed setup got | A manager that acquires two things in `__enter__` must clean up the first itself if the second fails |
+| Interrupts trigger cleanup too | `except BaseException` catches `KeyboardInterrupt` and `CancelledError` | Rely on `with` for cleanup in cancellable code |
+| A raising `__exit__` replaces the original error | The original survives only as `__context__` in the traceback | A cleanup that can fail should log and swallow its own error rather than mask the real one |
 
 ### async with
-`async with` calls `await __aenter__()` and `await __aexit__(...)`, *because* closing a network
-resource is itself I/O: flushing a stream, returning a connection, sending a close frame. `httpx.AsyncClient`,
-async DB sessions and `asyncio.Lock` are all async context managers. Cancellation arrives as
-`CancelledError` and passes through `__aexit__` like any exception, which is why `async with` is the
-reliable way to release resources in cancellable code. Keep exit code short and bounded, because it can
-itself be interrupted during shutdown.
+- **Awaited entry and exit.** `async with` calls `await __aenter__()` and `await __aexit__(...)`,
+  *because* closing a network resource is itself I/O: flushing a stream, returning a connection, sending a
+  close frame.
+- **Common examples:** `httpx.AsyncClient`, async DB sessions and `asyncio.Lock` are all async context
+  managers.
+- **Cancellation passes through.** It arrives as `CancelledError` and passes through `__aexit__` like any
+  exception, which is why `async with` is the reliable way to release resources in cancellable code.
+- **Keep exit code short and bounded**, because it can itself be interrupted during shutdown.
 
 ### contextlib: managers without classes
-`@contextmanager` turns a generator into a manager: code before `yield` is setup, the yielded value is
-bound by `as`, code after is teardown. The exception from the block is thrown in at the `yield`, so
-teardown must sit in `finally` or it is skipped on error. `@asynccontextmanager` is the async version, and
-it is what FastAPI's `lifespan` expects. `ExitStack`/`AsyncExitStack` manage a number of resources known
-only at runtime and unwind whatever was entered if a later setup step fails, which is exactly the
-partial-setup problem from the expansion above. Smaller helpers: `closing()` for objects with only
-`close()`, `suppress()`, `nullcontext()` for optional managers, and `aclosing()` for async generators.
-A `@contextmanager` object is single-use (it wraps one generator, so entering it twice raises), its
-generator must yield exactly once, and it doubles as a decorator: `@timed_span()` above a function
-wraps every call in the block.
+- **`@contextmanager` turns a generator into a manager.** Code before `yield` is setup, the yielded value
+  is bound by `as`, code after is teardown.
+- **Teardown belongs in `finally`.** The exception from the block is thrown in at the `yield`, so teardown
+  must sit in `finally` or it is skipped on error.
+- **`@asynccontextmanager`** is the async version, and it is what FastAPI's `lifespan` expects.
+- **`ExitStack` and `AsyncExitStack`** manage a number of resources known only at runtime and unwind
+  whatever was entered if a later setup step fails, which is exactly the partial-setup problem from the
+  expansion above.
+- **Smaller helpers:** `closing()` for objects with only `close()`, `suppress()`, `nullcontext()` for
+  optional managers, and `aclosing()` for async generators.
+- **Rules for generator managers.** A `@contextmanager` object is single-use (it wraps one generator, so
+  entering it twice raises), and its generator must yield exactly once.
+- **It doubles as a decorator:** `@timed_span()` above a function wraps every call in the block.
 
 ### When there is no block to hang it on
-Some lifetimes do not fit a lexical block: an object handed to a caller, a cache entry, a worker that
-lives until shutdown. Then the owner of that lifetime (the app's lifespan, the pool, the cache's
-eviction hook) must call close explicitly. `weakref.finalize(obj, cleanup)` is a better last-resort
-safety net than `__del__`, since it runs at most once and also at interpreter exit, but it still runs
-on garbage-collection timing, so treat it as leak insurance, not as the cleanup plan.
+- **Some lifetimes do not fit a lexical block:** an object handed to a caller, a cache entry, a worker
+  that lives until shutdown.
+- **Then the owner of that lifetime closes it explicitly:** the app's lifespan, the pool, or the cache's
+  eviction hook.
+- **`weakref.finalize(obj, cleanup)` is a better last resort than `__del__`**, since it runs at most once
+  and also at interpreter exit. It still runs on garbage-collection timing, so treat it as leak insurance,
+  not as the cleanup plan.
 
 ### Context managers that are not about I/O
-`torch.no_grad()` and `torch.inference_mode()` switch autograd off for a block and restore it after.
-`decimal.localcontext()` and temporary environment patches in tests follow the same pattern: change state,
-guarantee restoration. The principle generalises to anything with a "before" and a mandatory "after".
+- **Mode switches:** `torch.no_grad()` and `torch.inference_mode()` switch autograd off for a block and
+  restore it after.
+- **Temporary state:** `decimal.localcontext()` and temporary environment patches in tests follow the same
+  pattern: change state, guarantee restoration.
+- **The principle generalises** to anything with a "before" and a mandatory "after".
 
-## Example
+## Diagram
+The life of one `with` statement: `__exit__` runs on every path once `__enter__` has succeeded, and its
+return value decides whether an exception propagates.
+
+```mermaid
+flowchart TD
+    E["Evaluate expr to a manager"] --> EN["Call __enter__"]
+    EN -->|"raises"| P0["Error propagates, __exit__ never runs"]
+    EN -->|"returns value"| B["Bind to x, run the block"]
+    B -->|"normal end, return or break"| X1["__exit__(None, None, None)"]
+    B -->|"raises, incl. CancelledError"| X2["__exit__(type, exc, tb)"]
+    X2 --> Q{"Truthy return value?"}
+    Q -->|"yes"| S["Exception suppressed, continue after with"]
+    Q -->|"no"| P1["Original exception re-raised"]
+    X1 --> D["Continue after with"]
+```
+
+## Examples
+### App lifespan with AsyncExitStack
+Two process-scoped clients opened in a lifespan; a crash mid-request still closes both, in reverse order.
+
 ```python
 import asyncio
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -146,47 +179,146 @@ async def main() -> None:
 
 asyncio.run(main())
 ```
-Output: `llm-http: opened`, `vector-db: opened`, `serving with ['db', 'llm']`, then `vector-db: closed`
-and `llm-http: closed` in reverse order, then `propagated: crash mid-request`. The error is not
-suppressed, both clients are closed, and the dependency opened last is closed first. The clients are
-created once per process, not once per request, which is the point of putting them in a lifespan.
+
+**Output, in order:**
+1. `llm-http: opened`, `vector-db: opened`, `serving with ['db', 'llm']`.
+2. `vector-db: closed` then `llm-http: closed`, in reverse order.
+3. `propagated: crash mid-request`.
+
+- **The error is not suppressed**, both clients are closed, and the dependency opened last is closed first.
+- **The clients are created once per process**, not once per request, which is the point of putting them
+  in a lifespan.
+
+### Guarding partial setup, plus a timing span that is also a decorator
+A class that acquires two resources in `__enter__` uses an `ExitStack` so a failure on the second closes
+the first, then hands the stack over with `pop_all()`. Runs on Python 3.9+.
+
+```python
+import time
+from contextlib import ExitStack, contextmanager
+
+@contextmanager
+def resource(name: str, fail: bool = False):
+    if fail:
+        raise ConnectionError(f"{name}: connect failed")
+    print(f"{name}: opened")
+    try:
+        yield name
+    finally:
+        print(f"{name}: closed")              # runs on success and on error
+
+class Pipeline:                               # acquires two resources in __enter__
+    def __init__(self, fail_second: bool = False):
+        self.fail_second = fail_second
+
+    def __enter__(self):
+        with ExitStack() as stack:
+            self.llm = stack.enter_context(resource("llm"))
+            self.db = stack.enter_context(resource("db", fail=self.fail_second))
+            self._stack = stack.pop_all()     # success: keep both open past this block
+        return self                           # failure: the with above closes llm
+
+    def __exit__(self, *exc):
+        return self._stack.__exit__(*exc)     # unwind in reverse order
+
+@contextmanager
+def timed_span(name: str):
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        print(f"{name}: {(time.perf_counter() - start) * 1000:.0f} ms")
+
+@timed_span("embed")                          # also works as a decorator, fresh generator per call
+def embed(texts: list[str]) -> int:
+    time.sleep(0.05)
+    return len(texts)
+
+with Pipeline():
+    print(embed(["a", "b"]))
+try:
+    with Pipeline(fail_second=True):
+        pass
+except ConnectionError as exc:
+    print("setup failed:", exc)
+# llm: opened / db: opened / embed: 50 ms (about) / 2 / db: closed / llm: closed
+# llm: opened / llm: closed / setup failed: db: connect failed
+```
+
+Without the `ExitStack` in `__enter__`, the failing run would leak `llm`, because `__exit__` never runs
+when `__enter__` raises.
+
+### Worked incident: a stream leaked on the error path
+Illustrative numbers for one worker using a shared `httpx.AsyncClient` (100 connections by default).
+
+| Step | What happens |
+|---|---|
+| Code opens the provider stream, parses chunks, closes it at the end | Happy path releases the connection |
+| About 1% of responses contain malformed JSON and the parser raises | The close line is skipped, the connection stays checked out |
+| At 10,000 streams an hour, about 100 leak per hour | The pool's 100 connections are gone in roughly an hour |
+| New requests wait for a free connection, then hit pool timeouts | Latency climbs while CPU is idle; restarts "fix" it for an hour |
+| Fix: iterate inside `async with client.stream(...)` | The connection returns on success, parse error and cancellation |
+
+## Production patterns
+- **Process-scoped clients in a lifespan.** Open shared clients and pools in an `@asynccontextmanager`
+  passed to FastAPI as `lifespan=`, with an `AsyncExitStack` when there are several. Monitor open
+  connections and pool wait time per worker.
+- **Keep streams open exactly as long as they are consumed.** Put `async with client.stream(...)` inside
+  the async generator you hand to `StreamingResponse`, so the stream closes when iteration ends or the
+  client disconnects. Monitor open upstream connections after client disconnects.
+- **Make leaks loud in tests.** Run the suite with `python -W error::ResourceWarning` (or `-X dev`), since
+  `ResourceWarning` is ignored by default, and fail on "unclosed" warnings. Add error-injection tests that
+  assert the pool is idle afterwards.
+- **Bound cleanup that does I/O.** Wrap awaited cleanup in `__aexit__` or `finally` with
+  `asyncio.timeout(...)`, and log rather than raise if it fails, so a hung close neither stalls shutdown
+  nor masks the real error. Monitor shutdown duration.
+- **Transactions as managers.** Use the driver's transaction manager (for example
+  `with Session(engine) as session, session.begin():` in SQLAlchemy) so commit happens on success and
+  rollback on any exception. Monitor rollback rate and long-open transactions.
 
 ## Trade-offs
-- `with` guarantees cleanup at a lexically visible point, but ties resource lifetime to a block; when a
-  resource must outlive the function (a pool shared by all requests), move it to an app-level lifespan.
-- `@contextmanager` is far shorter than a class, but forgets cleanup on error if you omit `try/finally`;
-  a class with `__exit__` is clearer when the manager carries state or is reused often.
-- `ExitStack` handles dynamic resource sets, at the cost of less obvious control flow; for two or three
-  fixed resources a single multi-item `with` statement is easier to read.
-- Suppressing exceptions in `__exit__` can turn a crash into graceful degradation, but hides real bugs
-  unless the manager suppresses only specific, expected exception types.
+- **Visible cleanup point vs tied lifetime.** `with` guarantees cleanup at a lexically visible point, but
+  ties resource lifetime to a block. When a resource must outlive the function (a pool shared by all
+  requests), move it to an app-level lifespan.
+- **Short vs easy to get wrong.** `@contextmanager` is far shorter than a class, but forgets cleanup on
+  error if you omit `try/finally`. A class with `__exit__` is clearer when the manager carries state or is
+  reused often.
+- **Dynamic sets vs readable control flow.** `ExitStack` handles dynamic resource sets, at the cost of less
+  obvious control flow. For two or three fixed resources a single multi-item `with` statement is easier to
+  read.
+- **Graceful degradation vs hidden bugs.** Suppressing exceptions in `__exit__` can turn a crash into
+  graceful degradation, but hides real bugs unless the manager suppresses only specific, expected
+  exception types.
 
 ## Pitfalls
-- Creating an `httpx.AsyncClient` inside each request with `async with`; correct cleanup but no
-  connection reuse, which shows up as high latency from repeated TLS handshakes.
-- Returning a lazy stream or generator from inside a `with` block; the resource closes on return, and
-  the consumer later fails with "stream closed" or reads nothing.
-- Writing `@contextmanager` teardown after `yield` without `finally`; it runs in tests on the happy path
+- **Creating an `httpx.AsyncClient` inside each request with `async with`.** Cleanup is correct but there is
+  no connection reuse. Symptom: high latency from repeated TLS handshakes.
+- **Returning a lazy stream or generator from inside a `with` block.** The resource closes on return.
+  Symptom: the consumer later fails with "stream closed" or reads nothing.
+- **Writing `@contextmanager` teardown after `yield` without `finally`.** It runs in tests on the happy path
   and silently does not run when the block raises.
-- An `__exit__` that returns `True` by accident (e.g. returning the result of a cleanup call); exceptions
-  vanish and callers see `None` results with no traceback.
-- Relying on `__del__` to close connections; the symptom is "unclosed client session" warnings and
-  pool exhaustion that varies with garbage-collection timing.
-- Acquiring a second resource in `__enter__` after the first without guarding it; when the second
-  fails, `__exit__` never runs, and the first leaks only on that rare setup-failure path, which shows up
-  as slowly climbing open connections after upstream outages.
-- A cleanup step in `__exit__` or `finally` that can raise (closing an already-broken stream); the
-  traceback reports the cleanup error and the real cause is buried under "During handling of the above
+- **An `__exit__` that returns `True` by accident** (e.g. returning the result of a cleanup call).
+  Symptom: exceptions vanish and callers see `None` results with no traceback.
+- **Relying on `__del__` to close connections.** Symptom: "unclosed client session" warnings and pool
+  exhaustion that varies with garbage-collection timing.
+- **Acquiring a second resource in `__enter__` after the first without guarding it.** When the second
+  fails, `__exit__` never runs, and the first leaks only on that rare setup-failure path. Symptom: slowly
+  climbing open connections after upstream outages.
+- **A cleanup step in `__exit__` or `finally` that can raise** (closing an already-broken stream). Symptom:
+  the traceback reports the cleanup error and the real cause is buried under "During handling of the above
   exception".
 
 ## When to use
-Use a context manager for anything with an acquire-and-release pair: clients and connection pools, streams,
-DB sessions and transactions, locks and semaphores, temp files and directories, tracing spans, and
-temporary mode changes such as `torch.inference_mode()`. Prefer the library's own manager over manual
-`close()` calls. Give long-lived resources a lifespan-scoped manager and short-lived ones a block-scoped
-manager. Measure by watching open connections, pool wait time and file descriptors under load and after
-error injection; if they climb after errors, a path is skipping cleanup. In interviews, expect to explain
-`__exit__`'s arguments and return value and write a `@contextmanager` with a correct `finally`.
+- **Use for anything with an acquire-and-release pair:** clients and connection pools, streams, DB sessions
+  and transactions, locks and semaphores, temp files and directories, tracing spans, and temporary mode
+  changes such as `torch.inference_mode()`.
+- **Prefer the library's own manager** over manual `close()` calls.
+- **Match scope to lifetime:** give long-lived resources a lifespan-scoped manager and short-lived ones a
+  block-scoped manager.
+- **Measure:** watch open connections, pool wait time and file descriptors under load and after error
+  injection; if they climb after errors, a path is skipping cleanup.
+- **Interviews:** expect to explain `__exit__`'s arguments and return value and write a `@contextmanager`
+  with a correct `finally`.
 
 ## Role lens
 - **Engineer:** Wraps every client, stream, session and lock in `with`/`async with`, and writes
@@ -205,6 +337,42 @@ stay open for as long as the data is consumed. Either make the helper a generato
 inside the `with` block, so the stream closes when iteration ends, with consumers using `closing()` or
 `aclosing()` for early exit, or have the helper itself be a context manager that yields the response so
 the caller controls its lifetime with `with`.
+
+## Interview questions
+### What are the arguments and return value of __exit__, and why do they matter?
+- **Arguments:** `exc_type`, `exc` and `tb` describe the exception that left the block, or are all
+  `None` on a normal exit, so the manager can clean up differently (for example roll back instead of
+  commit).
+- **Return value:** truthy suppresses the exception, which is how `contextlib.suppress` works; anything
+  else must return `None` or `False`, or errors silently vanish.
+
+### Write a @contextmanager that always releases its resource. What is the common bug?
+- **Setup before `yield`, teardown in `finally`.** The block's exception is thrown in at the `yield`, so
+  teardown placed after it without `finally` is skipped on error.
+- **Yield exactly once**, and remember the object is single-use; for async resources use
+  `@asynccontextmanager` and await the close.
+- **Test the error path:** raise inside the block and assert the resource was released.
+
+### A service's open connections climb slowly after every upstream outage. How do you find the leak?
+- **Suspect a setup-failure or error path.** A second resource acquired in `__enter__` without a guard
+  leaks the first when it fails, because `__exit__` never runs.
+- **Reproduce with error injection** while watching open connections, pool wait time and file
+  descriptors; enable `ResourceWarning` to see "unclosed" objects.
+- **Fix with `ExitStack` in `__enter__`** or by moving each resource into its own `with`.
+
+### When should a resource not be scoped to a with block?
+- **When it must outlive the function**, such as an `httpx.AsyncClient` pool shared by all requests;
+  per-request `async with` gives correct cleanup but repeated TLS handshakes.
+- **Move it to the owner of its lifetime:** the app lifespan, the pool or the cache's eviction hook.
+- **Use `weakref.finalize(obj, cleanup)` only as leak insurance**, since it runs on garbage-collection
+  timing.
+
+### Why is async with the reliable way to release resources in cancellable asyncio code?
+- **Cancellation is an exception.** `CancelledError` passes through `await __aexit__(...)` like any other
+  error, so the close runs when a timeout or disconnect cancels the task.
+- **Closing is I/O**, such as returning a connection or sending a close frame, so it must be awaited
+  rather than run from a finaliser.
+- **Keep exit short and bounded**, because shutdown can interrupt it too.
 
 ## Quiz
 ### Q: What happens if an `__exit__` method returns `True` while the block raised an exception?

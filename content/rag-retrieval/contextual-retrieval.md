@@ -125,6 +125,24 @@ shape (each layer helps, and they stack), not the exact percentages.
 - **Small corpora:** the post's own advice applies below a certain size: if everything fits in the context
   window, put it in the prompt with caching and skip retrieval.
 
+## Diagram
+All the work is on the ingestion side: one cached LLM call per chunk writes a context that feeds both
+index legs, while the query path stays exactly as it was.
+
+```mermaid
+flowchart TD
+    D["Whole document"] -->|"cached prefix"| L["LLM: situate this chunk, 50 to 100 tokens"]
+    CH["Chunk i"] -->|"per-call suffix"| L
+    L --> CC["Context plus newline plus chunk"]
+    CC -->|"contextual embeddings"| DV[("Dense index")]
+    CC -->|"contextual BM25"| BM[("BM25 index")]
+    CH -->|"original text for citation"| ST[("Chunk store")]
+    Q["Query, unchanged serving path"] --> H["Hybrid search plus rank fusion"]
+    DV --> H
+    BM --> H
+    H --> RR["Reranker, top-n to generator"]
+```
+
 ## Examples
 ### A contextualisation step for both index legs
 `llm` accepts a cached prefix (the document) and a per-call suffix; `embed`, `dense.add` and `bm25.add`
@@ -263,6 +281,43 @@ order of magnitude cheaper).
 Costs: an LLM call per chunk at ingestion, document-level re-indexing on edits, and the risk of a wrong
 generated context, so validate on a golden set and try title-plus-heading prefixes first as the cheap
 baseline.
+
+## Interview questions
+### What is contextual retrieval, and how is it different from adding a title prefix?
+- **Definition:** at ingestion an LLM reads the whole document and writes a short, chunk-specific context,
+  which is prepended to the chunk before both embedding and BM25 indexing.
+- **Versus a title prefix:** a rule-based prefix is free and often enough, but cannot supply what the title
+  lacks, such as the quarter, the product variant or the entity three paragraphs up.
+- **Why it matters:** it fixes a recall failure caused by the indexing unit, with no added query latency.
+
+### Contextual embeddings shipped but exact-name queries still miss. What do you check?
+- **Both legs:** the contexts must be in the BM25 index too; the post reported around 35% failure reduction
+  for embeddings alone versus around 49% with contextual BM25.
+- **The concatenation:** embedding only the context or only the chunk gives no measurable gain.
+- **Context quality:** check that entities and dates in the generated context appear in the source, and
+  that long documents were not silently truncated before late chunks were contextualised.
+
+### When would you not use contextual retrieval?
+- **Small corpora** that fit in the context window: put them in the prompt with caching and skip retrieval.
+- **High-churn corpora:** each context depends on the whole document, so any edit can re-contextualise every
+  chunk, and the recurring ingestion cost can outweigh the gain.
+- **Short self-contained records** that never lost their subject, or corpora where structural prefixes
+  already close the gap on the golden set.
+
+### Estimate the ingestion cost for a 20,000-token document with 50 chunks, with and without caching.
+- **Uncached:** 50 × (20,000 + 500) ≈ 1,025,000 full-price input tokens.
+- **Cached, using the quoted ratios** (write about 1.25×, read about 0.1×): about 148,000 full-price
+  equivalents, roughly 7× less.
+- **Growth:** doubling the document and its chunks roughly quadruples cost (148,000 → 496,000), so split
+  long documents into sections and contextualise against the section.
+
+### Your ingestion bill came in close to the uncached estimate even with caching on. Why?
+- **The fan-out raced the cache write:** firing all chunk calls in parallel before the first call wrote
+  the cache makes each one pay write or miss charges.
+- **Fix:** send one chunk's call first, then fan out the rest within the cache lifetime, processing one
+  document's chunks back to back.
+- **Monitor** `cache_creation_input_tokens` and `cache_read_input_tokens`; reads should dominate after the
+  first call per document.
 
 ## Quiz
 ### Q: Why is the generated context prepended before BM25 indexing as well as before embedding?

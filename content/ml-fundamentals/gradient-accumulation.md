@@ -5,7 +5,7 @@ name: Gradient accumulation
 kind: practice
 difficulty: core
 est_minutes: 11
-status: reviewed
+status: crisp
 related:
   - ml-fundamentals/batch-size
   - ml-fundamentals/gradient-clipping
@@ -22,101 +22,112 @@ sources:
 ---
 
 ## TL;DR
-Gradient accumulation runs several small micro-batches and lets their gradients add up before one
-optimizer step. Because the gradient of a mean loss is linear in the examples, the sum equals the
-gradient of the larger batch, so the optimizer sees the batch the recipe asked for while GPU memory only
-ever holds one micro-batch of activations. It costs no memory and changes nothing in the optimization,
-but it buys no speed: every micro-batch still runs.
+Gradient accumulation sums gradients from several micro-batches before one optimizer step, giving the
+optimizer the recipe's batch while memory holds one micro-batch of activations. It costs no memory and
+changes no optimization, but buys no speed.
 
 ## Why it exists
-Memory on a training GPU splits into two very different parts. Model state (weights, gradients, optimizer
-moments) is fixed by the parameter count: with Adam in mixed precision it is about 16 bytes per parameter,
-so a 7B model needs roughly 112 GB before a single example is processed. Activations, the intermediate
-tensors kept for backward, scale with micro-batch × sequence length × hidden size × layers, and they are
-the only part that shrinks when you process fewer examples at once. On a given card the largest
-micro-batch that fits is therefore a hardware fact, illustratively 1–8 sequences for a multi-billion
-parameter model at a few thousand tokens of context.
-
-The training recipe does not care about that fact. It wants an effective batch chosen from the
-gradient-noise scale, and a learning rate tuned for that batch: hundreds of sequences for fine-tuning,
-millions of tokens for pre-training. Simply training at the micro-batch that fits is a different
-experiment: the gradient is noisier, the learning rate tuned for the large batch is now too high, the
-schedule gets many more steps than planned, and per-step overhead (optimizer update, communication,
-kernel launches) is paid every few examples instead of every few hundred.
-
-The naive alternatives are to buy memory (a bigger GPU, or more GPUs under data parallelism) or to shrink
-the model (frozen or quantized parameters). Both are legitimate; both cost money or capability.
-Accumulation is the free option. It exploits the fact that the gradient of a sum of per-example losses is
-the sum of per-example gradients, so the large-batch gradient can be assembled piece by piece without
-the large batch ever existing in memory.
+- **Memory has a fixed part.** Weights, gradients and optimizer moments are set by parameter count: with
+  Adam in mixed precision about 16 bytes per parameter, so a 7B model needs roughly 112 GB before a single
+  example is processed.
+- **Only activations shrink.** They scale with micro-batch × sequence length × hidden size × layers, so
+  the largest micro-batch that fits is a hardware fact, illustratively 1–8 sequences for a multi-billion
+  parameter model at a few thousand tokens of context.
+- **The recipe wants a bigger batch.** It picks the effective batch from the gradient-noise scale and
+  tunes the learning rate for it: hundreds of sequences for fine-tuning, millions of tokens for
+  pre-training.
+- **Training at the micro-batch is a different experiment.** The gradient is noisier, the tuned rate is
+  too high, the schedule gets many more steps than planned, and per-step overhead (optimizer update,
+  communication, kernel launches) is paid every few examples instead of every few hundred.
+- **The alternatives cost money or capability.** Buy memory (bigger or more GPUs) or shrink the model
+  (frozen or quantized parameters). Accumulation is free: the gradient of a sum of per-example losses is
+  the sum of per-example gradients, so the big-batch gradient is built piece by piece.
 
 ## How it works
 ### The arithmetic
-For a batch of `B` examples with mean loss `L = (1/B) Σ ℓ_i`, the gradient is `(1/B) Σ ∇ℓ_i`. Split the
-batch into `k` micro-batches of `b = B/k` examples. Micro-batch `j` has mean loss `L_j` and gradient
-`∇L_j`, and
+For a batch of `B` examples with mean loss `L = (1/B) Σ ℓ_i`, the gradient is `(1/B) Σ ∇ℓ_i`. Split it
+into `k` micro-batches of `b = B/k` examples; micro-batch `j` has mean loss `L_j` and gradient `∇L_j`:
 
 ```
 ∇L = (1/k) × Σ_j ∇L_j
 ```
 
-so dividing each micro-batch loss by `k` and summing the resulting gradients reproduces the big-batch
-gradient exactly, as long as the weights do not change in between, which is precisely the situation
-inside one optimizer step. PyTorch makes the summing free: `backward()` *adds* into `.grad` rather than
-overwriting it, which is the only reason `zero_grad()` exists. Accumulation is simply not calling
-`zero_grad()` until the window is complete.
+- **Exact while weights are frozen.** Dividing each micro-batch loss by `k` and summing gradients
+  reproduces the big-batch gradient exactly, as long as the weights do not change in between, which is
+  precisely the situation inside one optimizer step.
+- **PyTorch makes summing free.** `backward()` *adds* into `.grad` rather than overwriting it, which is
+  the only reason `zero_grad()` exists. Accumulation is simply not calling `zero_grad()` until the window
+  is complete.
 
 ### The step, in order
-1. `zero_grad()` once, at the start of the window.
-2. For each of the `k` micro-batches: forward, divide the loss by `k`, `backward()`. Gradients add up in
-   `.grad`; the activations of this micro-batch are freed as soon as its backward finishes, so peak
-   memory is that of one micro-batch.
-3. After the k-th backward: if using fp16 loss scaling, unscale; clip the global gradient norm once;
-   `optimizer.step()`; `scheduler.step()`.
+1. **Zero once:** `zero_grad()` at the start of the window.
+2. **Accumulate:** for each of the `k` micro-batches, forward, divide the loss by `k`, `backward()`.
+   Gradients add up in `.grad`; each micro-batch's activations are freed when its backward finishes, so
+   peak memory is that of one micro-batch.
+3. **Step once:** after the k-th backward, unscale if using fp16 loss scaling, clip the global gradient
+   norm once, then `optimizer.step()` and `scheduler.step()`.
 
-The optimizer, the scheduler, clipping and logging all operate on the window, because the window *is*
-the batch. Warmup steps, `num_training_steps` and the "step" in every log line therefore mean optimizer
-steps: a run with accumulation 8 that processes 80,000 micro-batches has taken 10,000 steps.
+- **The window *is* the batch.** Optimizer, scheduler, clipping and logging all operate on it.
+- **Every "step" means optimizer step:** warmup steps, `num_training_steps` and log lines. A run with
+  accumulation 8 that processes 80,000 micro-batches has taken 10,000 steps.
 
 ### Under data parallelism
-DistributedDataParallel all-reduces gradients across ranks inside `backward()`, bucket by bucket, as
-they become ready. With accumulation that would reduce `k` times per step, `k − 1` of them wasted,
-because only the sum matters. The `model.no_sync()` context manager disables the reduction for the first
-`k − 1` micro-batches so that one all-reduce carries the whole window; Accelerate's `accumulate()`
-wrapper does the same bookkeeping. Under sharded training (FSDP, ZeRO) each rank normally keeps only its
-shard of the gradient; postponing the reduce-scatter across the window means holding the full unsharded
-gradient on every rank until the step, which is a memory cost, so those frameworks expose it as an
-option and the trade is decided per job.
+- **DDP reduces inside `backward()`,** bucket by bucket. With accumulation that is `k` reductions per
+  step, `k − 1` of them wasted, because only the sum matters.
+- **`model.no_sync()`** disables the reduction for the first `k − 1` micro-batches, so one all-reduce
+  carries the whole window. Accelerate's `accumulate()` wrapper does the same bookkeeping.
+- **Sharded training (FSDP, ZeRO)** normally keeps only a gradient shard per rank. Postponing the
+  reduce-scatter across the window means holding the full unsharded gradient on every rank until the
+  step, a memory cost, so those frameworks expose it as an option decided per job.
 
 ### When the sum is not the big-batch gradient
-Two things break the identity. The first is any operation whose output depends on which examples share a
-batch: BatchNorm computes statistics per micro-batch, so `k` micro-batches of 4 do not behave like one
-batch of `4k`. Transformers use LayerNorm or RMSNorm, which are per-token, so this is a CNN concern.
-The second is loss normalization. For language models the loss is usually a mean over *tokens*, and
-micro-batches rarely contain the same number of non-padding tokens. `loss / k` with per-micro-batch means
-gives a micro-batch holding 50 real tokens the same weight as one holding 4,000, which is not the
-per-token mean of the window. The exact form is to sum token losses within each micro-batch and divide by
-the total token count across the window, computed once before the loop. This mismatch was found in
-widely used fine-tuning code in 2024 and showed up as a training loss that depended on the accumulation
-count. Data parallelism adds one more level: DDP *averages* gradients across ranks, so dividing by each
-rank's local token count yields a mean of per-rank means. The exact version all-reduces the window's token
-count once, divides each rank's summed loss by that global count, and multiplies by the world size to
-undo DDP's averaging.
+- **Batch-coupled layers.** BatchNorm computes statistics per micro-batch, so `k` micro-batches of 4 do
+  not behave like one batch of `4k`. Transformers use LayerNorm or RMSNorm, which are per-token, so this
+  is a CNN concern.
+- **Loss normalization.** LM loss is usually a mean over *tokens*, and micro-batches rarely hold the same
+  number of non-padding tokens. `loss / k` with per-micro-batch means gives a micro-batch with 50 real
+  tokens the same weight as one with 4,000, which is not the window's per-token mean.
+- **The exact form:** sum token losses within each micro-batch and divide by the total token count across
+  the window, computed once before the loop. This mismatch was found in widely used fine-tuning code in
+  2024 and showed up as a training loss that depended on the accumulation count.
+- **Under DDP:** gradients are *averaged* across ranks, so dividing by each rank's local token count gives
+  a mean of per-rank means. The exact version all-reduces the window's token count once, divides each
+  rank's summed loss by that global count, and multiplies by the world size to undo DDP's averaging.
 
 ### What it costs
-Nothing in memory beyond the `.grad` buffers, which exist anyway. In time, `k` forward/backward passes
-per step, exactly as many as a true batch of `kb` would need on an infinitely large GPU, minus the
-amortization of per-step overhead. What it does not do is make training faster: throughput per token is
-set by how busy the GPU is during each micro-batch, and accumulation does not touch that. Raising the
-micro-batch until memory is nearly full (or the step is compute-bound) is what raises throughput;
-accumulation then covers the remaining gap to the target effective batch. Gradient checkpointing is the
-other compute-for-memory trade, and it is complementary: it shrinks per-sequence activation memory at
-the price of recomputation, so it can make a long sequence fit at all, which accumulation cannot.
+| Resource | Cost |
+|---|---|
+| Memory | nothing beyond the `.grad` buffers, which exist anyway |
+| Compute per step | `k` forward/backward passes, as many as a true batch of `kb` on an infinitely large GPU, minus amortized per-step overhead |
+| Throughput | unchanged: set by how busy the GPU is during each micro-batch |
 
-## Example
-One optimizer step with token-weighted loss normalization, a single all-reduce per window under DDP, and
-clipping and the scheduler applied once to the summed gradient. The model is assumed to be a Hugging Face
-causal LM; the worked numbers underneath show the step accounting that schedulers must be given.
+- **To go faster,** raise the micro-batch until memory is nearly full (or the step is compute-bound);
+  accumulation then covers the remaining gap to the target effective batch.
+- **Gradient checkpointing is complementary.** It shrinks per-sequence activation memory at the price of
+  recomputation, so it can make a long sequence fit at all, which accumulation cannot.
+
+## Diagram
+One optimizer step spans `k` micro-batches; communication, clipping and the scheduler happen once, at the
+end of the window.
+
+```mermaid
+flowchart TD
+    A["zero_grad once per window"] --> B["Micro-batch j: forward"]
+    B --> C["Loss sum over window token count"]
+    C --> D{"Last micro-batch?"}
+    D -->|"no: inside no_sync"| E["backward adds into .grad"]
+    E --> B
+    D -->|"yes"| F["backward plus one all-reduce"]
+    F --> G["Unscale if fp16, clip once"]
+    G --> H["optimizer.step and scheduler.step"]
+    H -->|"next window"| A
+```
+
+## Examples
+### One optimizer step with token-weighted loss under DDP
+Token-weighted loss normalization, a single all-reduce per window under DDP, and clipping and the
+scheduler applied once to the summed gradient. The model is assumed to be a Hugging Face causal LM; the
+worked numbers show the step accounting schedulers must be given.
 
 ```python
 import torch
@@ -151,52 +162,111 @@ def train_step(model, opt, sched, micro_batches, max_norm=1.0):
 #   the same as one holding 8,000, so the gradient would differ from a true batch of 128.
 ```
 
+### Checking the identity, and the token-weighting bug, in pure Python
+No dependencies. Part 1 shows the accumulated gradient equals the big-batch gradient for a 1-D linear
+model; part 2 shows how a mean of per-micro-batch means over-weights a short micro-batch.
+
+```python
+import random
+random.seed(0)
+
+# 1) Linearity: accumulated gradient == big-batch gradient (1-D linear model, mean squared error)
+xs = [random.uniform(-1, 1) for _ in range(64)]
+ys = [3 * x + random.gauss(0, 0.1) for x in xs]
+w = 0.5
+
+def grad(batch):                          # d/dw of mean (w*x - y)^2 over the batch
+    return sum(2 * (w * x - y) * x for x, y in batch) / len(batch)
+
+data = list(zip(xs, ys))
+k = 8
+full = grad(data)
+accum = sum(grad(data[j * 8:(j + 1) * 8]) / k for j in range(k))   # loss / k, gradients add
+print(f"full {full:.6f}  accumulated {accum:.6f}")
+
+# 2) Token weighting: two micro-batches with very different real-token counts
+mbs = [dict(tokens=50, loss_sum=50 * 3.0), dict(tokens=4000, loss_sum=4000 * 2.0)]
+naive = sum(mb["loss_sum"] / mb["tokens"] for mb in mbs) / len(mbs)     # mean of means / k
+n_tokens = sum(mb["tokens"] for mb in mbs)                              # whole window
+exact = sum(mb["loss_sum"] for mb in mbs) / n_tokens                    # per-token mean
+print(f"naive {naive:.4f}  exact {exact:.4f}")
+for mb in mbs:
+    w_naive = 1 / (len(mbs) * mb["tokens"])
+    print(f"{mb['tokens']:5d} tokens: weight per token naive {w_naive:.2e}  exact {1 / n_tokens:.2e}")
+# full -1.549793  accumulated -1.549793
+# naive 2.5000  exact 2.0123
+#    50 tokens: weight per token naive 1.00e-02  exact 2.47e-04
+#  4000 tokens: weight per token naive 1.25e-04  exact 2.47e-04
+```
+
+| Normalization | Window loss | Weight of one token in the 50-token micro-batch |
+|---|---|---|
+| Mean of per-micro-batch means | 2.50 | 1.00e-2, 80× a token in the long one |
+| Sum over window ÷ window tokens | 2.01 | 2.47e-4, same as every other token |
+
+## Production patterns
+- **Let the trainer own the loop.** In Hugging Face `Trainer` set `gradient_accumulation_steps`; in
+  Accelerate pass `gradient_accumulation_steps` to `Accelerator` and wrap each micro-batch in
+  `accelerator.accumulate(model)`; in DeepSpeed set `gradient_accumulation_steps` in the config. Monitor
+  the logged step count: it should equal micro-batches ÷ `k`.
+- **Normalize by window tokens.** For variable-length LM data, compute the window's real-token count
+  before the loop and divide summed token losses by it (recent Trainer versions pass this count to the
+  loss as `num_items_in_batch`). Regression-test that the loss does not shift when `k` changes.
+- **Max the micro-batch, then accumulate.** Raise the micro-batch (with gradient checkpointing if needed)
+  until memory is nearly full, then set `k = target ÷ (micro-batch × world size)`. Monitor tokens per
+  second, step time and peak memory, and log the effective batch explicitly.
+- **One all-reduce per window.** Under DDP use `no_sync()` for the first `k − 1` micro-batches; under
+  FSDP or ZeRO decide per job whether to delay the reduce-scatter, weighing communication saved against
+  unsharded-gradient memory. Watch communication time per step.
+- **Golden test for the loop.** On a tiny fp32 model with dropout off and fixed data order, compare one
+  accumulated window with one large batch; gradients should agree to around 1e-6. Run it in CI whenever
+  the training loop changes.
+
 ## Trade-offs
-- Reaches any effective batch on fixed memory at zero memory cost, but delivers zero speed-up: the
-  forward/backward work runs serially, so time per optimizer step grows linearly with `k`.
-- Exact for per-token mean losses and per-token normalization layers, but inexact for BatchNorm-style
-  layers and for a naive `loss / k` under variable-length batches; the error grows with the spread in
-  tokens per micro-batch.
-- Skipping the all-reduce until the last micro-batch cuts DDP communication `k`-fold, but under FSDP or
-  ZeRO it means holding unsharded gradients for the whole window, which can cost the memory accumulation
-  was meant to save.
-- A large `k` preserves the recipe's effective batch, yet optimizer steps per hour fall with it; on a small
-  fine-tuning set, fewer and larger steps can be worse than more and smaller ones, which is a batch-size
-  question that accumulation cannot answer.
-- Compared with gradient checkpointing, accumulation costs no extra compute but cannot make a single long
-  sequence fit; checkpointing costs roughly one extra forward pass per layer but shrinks per-sequence
-  activation memory. Most memory-constrained runs end up using both.
+- **Any effective batch vs zero speed-up.** It reaches any effective batch on fixed memory at no memory
+  cost, but the forward/backward work runs serially, so time per optimizer step grows linearly with `k`.
+- **Exact vs inexact cases.** Exact for per-token mean losses and per-token normalization layers;
+  inexact for BatchNorm-style layers and a naive `loss / k` under variable-length batches, with error
+  growing with the spread in tokens per micro-batch.
+- **Fewer all-reduces vs sharded memory.** Skipping the all-reduce until the last micro-batch cuts DDP
+  communication `k`-fold, but under FSDP or ZeRO it means holding unsharded gradients for the whole window,
+  which can cost the memory accumulation was meant to save.
+- **Recipe fidelity vs steps per hour.** A large `k` preserves the effective batch, yet optimizer steps per
+  hour fall with it; on a small fine-tuning set, fewer and larger steps can be worse than more and smaller
+  ones, a batch-size question accumulation cannot answer.
+- **Accumulation vs gradient checkpointing.** Accumulation costs no extra compute but cannot make a single
+  long sequence fit; checkpointing costs roughly one extra forward pass per layer but shrinks per-sequence
+  activation memory. Most memory-constrained runs use both.
 
 ## Pitfalls
-- Forgetting to divide the loss by `k` (or by the window's token count): the summed gradient is `k`×
-  too large, which acts like a `k`× learning rate for SGD and distorts clipping thresholds and logged
-  gradient norms for Adam.
-- Stepping the scheduler, or counting warmup, per micro-batch; decay finishes `k`× early and the symptom
-  is a run that spends most of its length at the floor learning rate.
-- Clipping inside the micro-batch loop: each clip rescales a partial sum, so the final gradient's
-  direction and magnitude depend on `k`. Clip once after the last backward.
-- Calling `zero_grad()` at the top of every micro-batch, copied from a plain loop: only the last
-  micro-batch's gradient survives, so the model trains on a batch of `b` with a learning rate tuned for
-  `kb`, and the loss curve is far noisier than the config suggests.
-- Expecting faster training: tokens per second are unchanged or slightly lower, and the person who set
-  `gradient_accumulation_steps=16` "for speed" has made each optimizer step 16× slower.
-- Per-micro-batch loss means on variable-length data: the training loss shifts when `k` changes and short
-  sequences are over-weighted; fix by summing token losses and dividing by the window's token count (and
-  under DDP, by the global count across ranks if exactness matters).
-- Handling the last partial window of an epoch inconsistently: a step from 3 micro-batches divided by
-  `k = 8` is a 3/8-size step; either drop the remainder or normalize by the actual count.
+- **Not dividing the loss by `k`** (or by the window's token count). The summed gradient is `k`× too
+  large: a `k`× learning rate for SGD, and distorted clipping thresholds and logged norms for Adam.
+- **Stepping the scheduler or counting warmup per micro-batch.** Decay finishes `k`× early; the run spends
+  most of its length at the floor learning rate.
+- **Clipping inside the loop.** Each clip rescales a partial sum, so the final gradient's direction and
+  magnitude depend on `k`. Clip once after the last backward.
+- **`zero_grad()` at the top of every micro-batch,** copied from a plain loop. Only the last gradient
+  survives, so the model trains on a batch of `b` with a rate tuned for `kb`, and the loss curve is far
+  noisier than the config suggests.
+- **Expecting faster training.** Tokens per second are unchanged or slightly lower; setting
+  `gradient_accumulation_steps=16` "for speed" makes each optimizer step 16× slower.
+- **Per-micro-batch means on variable-length data.** The training loss shifts when `k` changes and short
+  sequences are over-weighted. Fix: sum token losses and divide by the window's token count (under DDP, by
+  the global count across ranks if exactness matters).
+- **Inconsistent last partial window.** A step from 3 micro-batches divided by `k = 8` is a 3/8-size step;
+  drop the remainder or normalize by the actual count.
 
 ## When to use
-Use it whenever the micro-batch that fits is smaller than the effective batch the recipe calls for, which
-describes most single-GPU and small-cluster fine-tuning. The order of operations: first raise the
-micro-batch until memory is nearly full or the GPU is compute-bound, because that is what raises
-throughput; then set accumulation to close the gap to the target effective batch; then size warmup and
-total steps in optimizer steps. Do not use it to push the effective batch past the gradient-noise scale:
-that costs data for no gain whether the batch comes from GPUs or from accumulation. Measure tokens per
-optimizer step, step time and peak memory, and log the effective batch explicitly. In interviews, the
-expected depth is the linearity argument for why the sum is the big-batch gradient, the ordering with
-clipping, loss scaling and the scheduler, the `no_sync` communication point, and the plain statement that
-it saves memory, not time.
+- **Use it** whenever the micro-batch that fits is smaller than the recipe's effective batch, which
+  describes most single-GPU and small-cluster fine-tuning.
+- **Order of operations:** raise the micro-batch until memory is nearly full or the GPU is compute-bound
+  (that is what raises throughput), set accumulation to close the gap, then size warmup and total steps in
+  optimizer steps.
+- **Avoid** pushing the effective batch past the gradient-noise scale: it costs data for no gain whether
+  the batch comes from GPUs or from accumulation.
+- **Measure:** tokens per optimizer step, step time and peak memory; log the effective batch explicitly.
+- **Interviews:** the linearity argument, the ordering with clipping, loss scaling and the scheduler, the
+  `no_sync` communication point, and the plain statement that it saves memory, not time.
 
 ## Role lens
 - **Engineer:** Writes the accumulation loop, or configures the trainer, with per-window loss
@@ -225,6 +295,37 @@ inside the loop, which discards seven of the eight gradients; or a BatchNorm lay
 test is a tiny model in fp32 with dropout off and the same data order: the gradients after one window
 and after one large batch should agree to around 1e-6, and whichever step of the loop breaks that
 agreement is the bug.
+
+## Interview questions
+### Why does gradient accumulation give the same gradient as a larger batch?
+- **Linearity:** the gradient of a mean loss is the mean of per-example gradients, so `k` micro-batch
+  gradients, each scaled by `1/k`, sum to the big-batch gradient.
+- **Weights are frozen inside the window,** so every micro-batch sees the same parameters.
+- **PyTorch adds into `.grad`,** so accumulation is just delaying `zero_grad()` and the optimizer step.
+
+### A team set gradient_accumulation_steps to 16 to speed training up. What happened?
+- **No speed-up:** the 16 forward/backward passes run one after another, so tokens per second are
+  unchanged or slightly lower and each optimizer step takes about 16× longer.
+- **Memory is flat:** only one micro-batch of activations is alive at a time.
+- **What actually helps:** a larger micro-batch until the GPU is compute-bound, or more GPUs.
+
+### Your training loss changes when you change the accumulation count. Where do you look?
+- **Loss normalization first:** per-micro-batch means divided by `k` over-weight short micro-batches on
+  variable-length data; sum token losses and divide by the window's token count.
+- **Then step accounting:** a scheduler stepping per micro-batch gives different rates at the same "step".
+- **Then the loop:** clipping or `zero_grad()` inside it, or a BatchNorm layer.
+
+### Under FSDP, should you delay gradient reduction until the end of the window?
+- **Benefit:** fewer reduce-scatters, so less communication per optimizer step.
+- **Cost:** every rank must hold the full unsharded gradient for the whole window, which can erase the
+  memory saving that motivated sharding and accumulation.
+- **Decide per job** from measured communication time against peak memory.
+
+### Plan a fine-tune on one 80 GB GPU: micro-batch 4 sequences fits, target is 128. What are the numbers?
+- **Accumulation:** `k = 128 / 4 = 32` micro-batches per optimizer step.
+- **Steps:** 100,000 micro-batches give 3,125 optimizer steps, so `num_training_steps=3125` and a warmup
+  of 100 steps (3.2%).
+- **Expectations:** peak memory as for `k = 1`; each step takes about 32× one micro-batch.
 
 ## Quiz
 ### Q: Why is each micro-batch loss divided by the accumulation count k before `backward()`?

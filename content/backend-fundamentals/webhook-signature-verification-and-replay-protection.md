@@ -5,7 +5,7 @@ name: Webhook signature verification & replay protection
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - backend-fundamentals/api-and-sdk-integration
   - backend-fundamentals/message-queues
@@ -23,99 +23,127 @@ sources:
 ---
 
 ## TL;DR
-A webhook endpoint is a public URL that anyone on the internet can POST to, so the payload proves
-nothing by itself. Providers therefore sign each delivery: an HMAC-SHA256 over a timestamp and the raw
-body using a secret only you and they hold, which you recompute and compare in constant time. A
-signature alone stays valid forever, so replay protection adds a timestamp window and deduplication by
-event id, and because providers retry on any failure, the handler has to be idempotent anyway.
+Anyone can POST to a webhook URL, so providers sign each delivery with an HMAC-SHA256 over a timestamp
+and the raw body. Verify in constant time, bound replays with a timestamp window and event-id dedupe,
+and keep the handler idempotent: providers retry.
 
 ## Why it exists
-`POST /webhooks/payments` is reachable from every machine on the internet. If the handler trusts the
-body, an attacker sends `{"type": "payment.succeeded", "customer": "them"}` and gets the product for
-free. An agent platform that receives Slack events will happily execute instructions from anyone who
-can craft a request, which is prompt injection with a delivery mechanism. A pipeline waiting for a
-provider's "batch job finished" event will ingest a forged result. The sender's identity has to come
-from somewhere, and nothing in plain HTTP provides it: TLS authenticates your server to the sender, not
-the sender to you.
-
-The naive defences each fail in a specific way. A secret URL is a bearer token that leaks through access
-logs, proxies, browser history and a screenshot in a support ticket, and rotating it means touching
-every integration. An IP allowlist breaks because providers send from large, changing cloud ranges and
-your own ingress may rewrite source addresses. A `"source": "billing"` field in the JSON is written by
-whoever sends the JSON. Mutual TLS would settle the question, but few SaaS providers offer it for
-webhooks. What
-remains is a shared secret used to compute a message authentication code over the exact bytes
-received: cheap, verifiable offline, and proof that whoever produced the message held the secret.
-
-Signing stops forgery but not replay. A captured legitimate delivery is still correctly signed next
-week, so "credit 100 units" can be resent until the attacker is satisfied. And the provider itself
-redelivers on any non-2xx response or timeout, so duplicates are normal operation, not an edge case.
-A timestamp inside the signed content bounds the window, an event id bounds duplicates inside it, and
-an idempotent handler makes whatever slips through harmless.
+- **The endpoint is public.** `POST /webhooks/payments` is reachable from every machine on the internet.
+  Trust the body and an attacker sends `{"type": "payment.succeeded", "customer": "them"}` and gets the
+  product for free.
+- **AI systems raise the stakes.** An agent platform receiving Slack events will execute instructions from
+  anyone who can craft a request: prompt injection with a delivery mechanism. A pipeline waiting for a
+  "batch job finished" event will ingest a forged result.
+- **Plain HTTP does not identify the sender.** TLS authenticates your server to the sender, not the
+  sender to you.
+- **The naive defences fail.** A secret URL is a bearer token that leaks through access logs, proxies,
+  browser history and support-ticket screenshots, and rotating it touches every integration. IP
+  allowlists break on large, changing cloud ranges and ingress that rewrites source addresses. A
+  `"source": "billing"` field is written by whoever sends the JSON.
+- **What remains is a MAC.** Mutual TLS would settle it, but few SaaS providers offer it for webhooks. A
+  shared secret used to compute a MAC over the exact bytes is cheap, verifiable offline, and proves the
+  producer held the secret.
+- **Signing stops forgery, not replay.** A captured delivery is still correctly signed next week, so
+  "credit 100 units" can be resent at will. Providers also redeliver on any non-2xx or timeout, so
+  duplicates are normal operation. A signed timestamp bounds the window, an event id bounds duplicates
+  inside it, and an idempotent handler makes the rest harmless.
 
 ## How it works
 ### What the provider signs
-Each endpoint gets its own secret: Stripe calls it a signing secret, GitHub a webhook secret you type
-into the settings page. On delivery the provider computes `HMAC-SHA256(secret, signed_content)` and
-sends the result in a header. Schemes differ in what `signed_content` is. Stripe signs
-`"{timestamp}.{raw_body}"` and sends `Stripe-Signature: t=<unix>,v1=<hex>`. The Standard Webhooks
-convention (used by Svix and adopted by several vendors) signs `"{msg_id}.{timestamp}.{raw_body}"` and
-sends `webhook-id`, `webhook-timestamp` and `webhook-signature` headers. GitHub signs the body alone in
-`X-Hub-Signature-256: sha256=<hex>` with a separate `X-GitHub-Delivery` id and no timestamp. Slack signs
-`"v0:{timestamp}:{raw_body}"` into `X-Slack-Signature`. The common core is an HMAC with a per-endpoint
-secret over raw bytes. It is an HMAC rather than a bare hash *because* a hash of public bytes can be
-computed by anyone; it is in a header rather than the body *because* the body is the thing being
-authenticated. A few providers use asymmetric signatures with a published public key instead, which lets
-many parties verify without any of them being able to forge.
+- **Each endpoint gets its own secret.** Stripe calls it a signing secret; GitHub a webhook secret you
+  type into the settings page.
+- **On delivery** the provider computes `HMAC-SHA256(secret, signed_content)` and sends the result in a
+  header. Schemes differ in what `signed_content` is:
+
+| Provider or scheme | Signed content | Headers |
+|---|---|---|
+| Stripe | `"{timestamp}.{raw_body}"` | `Stripe-Signature: t=<unix>,v1=<hex>` |
+| Standard Webhooks (Svix and several vendors) | `"{msg_id}.{timestamp}.{raw_body}"` | `webhook-id`, `webhook-timestamp`, `webhook-signature` |
+| GitHub | the body alone, no timestamp | `X-Hub-Signature-256: sha256=<hex>`, plus a separate `X-GitHub-Delivery` id |
+| Slack | `"v0:{timestamp}:{raw_body}"` | `X-Slack-Signature` |
+
+- **The common core:** an HMAC with a per-endpoint secret over raw bytes.
+- **An HMAC, not a bare hash**, *because* a hash of public bytes can be computed by anyone.
+- **In a header, not the body**, *because* the body is the thing being authenticated.
+- **Some providers sign asymmetrically** with a published public key, which lets many parties verify
+  without any of them being able to forge.
 
 ### Verifying, in order
-1. Read the raw bytes of the body before any framework parses it. Re-serialising parsed JSON changes
-   whitespace, key order, float formatting and unicode escaping, so the MAC will not match. Cap the
-   body size at the edge first, since an unauthenticated sender can otherwise make you buffer and
-   hash arbitrarily large payloads.
-2. Parse the header into a timestamp and one or more signatures; reject anything malformed.
-3. Check `|now − timestamp| ≤ tolerance`. The tolerance is a few minutes (Stripe's libraries default to
-   300 seconds), not zero, *because* clocks drift and deliveries queue.
-4. Recompute the MAC over the provider's exact signed content and compare with `hmac.compare_digest`,
-   never `==`. An ordinary comparison returns at the first differing byte, so response time leaks how
-   many leading bytes of a guess were right; a constant-time compare removes that side channel. Accept
-   the delivery if *any* supplied signature matches, because during secret rotation providers send one
+1. **Read the raw body bytes before any framework parses them.** Re-serialising parsed JSON changes
+   whitespace, key order, float formatting and unicode escaping, so the MAC will not match. Cap the body
+   size at the edge first, since an unauthenticated sender can otherwise make you buffer and hash
+   arbitrarily large payloads.
+2. **Parse the header** into a timestamp and one or more signatures; reject anything malformed.
+3. **Check `|now − timestamp| ≤ tolerance`.** A few minutes (Stripe's libraries default to 300 seconds),
+   not zero, *because* clocks drift and deliveries queue.
+4. **Recompute the MAC and compare with `hmac.compare_digest`, never `==`.** An ordinary comparison
+   returns at the first differing byte, so response time leaks how many leading bytes of a guess were
+   right; a constant-time compare removes that side channel.
+5. **Accept if *any* supplied signature matches**, because during secret rotation providers send one
    signature per active secret.
-5. Only now parse the JSON and dispatch on the event type.
+6. **Only now parse the JSON** and dispatch on the event type.
 
 ### Replay protection
-The timestamp only helps *because* it is inside the signed content: an attacker who edits it breaks
-the MAC. A timestamp sent in an unsigned header, or no timestamp at all (GitHub's scheme), gives no
-replay bound, so for those senders deduplication by delivery id is the only replay defence and its
-retention has to be long. Where the timestamp is signed, the window turns "valid forever" into
-"valid for five minutes", which is still plenty for a double credit. So deduplicate by event id:
-`SET webhook:seen:{id} 1 NX EX <ttl>` in Redis, or an insert into a
-`processed_events(event_id UNIQUE)` table. Retention must cover the provider's retry horizon (often days), not just the tolerance window, *because* legitimate retries arrive later with the same
-id. Check whether your provider re-signs retries with a fresh timestamp; if it does not, the tolerance
-has to cover its retry schedule as well. The robust version puts the uniqueness insert in the same
-database transaction as the side effect, so either both commit or neither, and a crash between "marked
-seen" and "credited" cannot lose an event. A Redis flag set before the work is cheaper but can mark an
-event seen that then fails; that is the exactly-once limitation, and the cure is an idempotent handler
-plus periodic reconciliation against the provider's API.
+- **The timestamp helps only because it is signed.** An attacker who edits it breaks the MAC.
+- **No signed timestamp, no replay bound.** An unsigned timestamp header, or none at all (GitHub's
+  scheme), means dedupe by delivery id is the only replay defence, and its retention must be long.
+- **A signed window is still enough for a double credit.** It turns "valid forever" into "valid for five
+  minutes", so also deduplicate by event id: `SET webhook:seen:{id} 1 NX EX <ttl>` in Redis, or an insert
+  into a `processed_events(event_id UNIQUE)` table.
+- **Retention covers the retry horizon (often days)**, not just the tolerance window, *because*
+  legitimate retries arrive later with the same id.
+- **Check whether retries are re-signed** with a fresh timestamp; if not, the tolerance must cover the
+  provider's retry schedule too.
+
+| Dedupe store | Guarantee | Failure mode |
+|---|---|---|
+| Uniqueness insert in the same DB transaction as the side effect | both commit or neither; a crash between "seen" and "credited" cannot lose an event | a write per event |
+| Redis flag set before the work | one cheap command | can mark an event seen that then fails: the exactly-once limitation |
+
+- **The cure for the remainder:** an idempotent handler plus periodic reconciliation against the
+  provider's API.
 
 ### Acknowledge fast, process later, trust the API over the payload
-Providers time out deliveries after seconds to tens of seconds, retry on any non-2xx with backoff over
-hours or days, and may disable an endpoint that keeps failing. So: verify, dedupe, enqueue the raw
-event, return 200, and let a worker do the real work. Deliveries are not ordered (a `completed` can
-arrive before `started`) and payload contents can be stale, so for anything that moves money or grants
-access, fetch the current object from the provider's authenticated API by id and act on that. "Thin"
-webhooks that carry only ids make this pattern the default.
+- **Providers are impatient.** They time out deliveries after seconds to tens of seconds, retry any
+  non-2xx with backoff over hours or days, and may disable an endpoint that keeps failing.
+- **So:** verify, dedupe, enqueue the raw event, return 200, and let a worker do the real work.
+- **Deliveries are unordered and payloads can be stale** (a `completed` can arrive before `started`).
+  For anything that moves money or grants access, fetch the current object from the provider's
+  authenticated API by id and act on that.
+- **"Thin" webhooks** that carry only ids make this pattern the default.
 
 ### Secrets
-The signing secret lives in your secret manager, per endpoint, never in code. It is symmetric: anyone
-holding it can forge deliveries, so do not share one secret across services or environments, and rotate
-with an overlap window during which both the old and the new secret are accepted.
+- **Store it in your secret manager, per endpoint, never in code.**
+- **It is symmetric:** anyone holding it can forge deliveries, so never share one secret across services
+  or environments.
+- **Rotate with an overlap window** during which both old and new secrets are accepted.
 
-## Example
-A FastAPI receiver for a Stripe-style scheme: raw-body HMAC, timestamp tolerance, multiple signatures
-for rotation, constant-time compare, Redis dedupe keyed by event id with retention longer than the
-tolerance, and a hand-off to a queue so the provider gets its 200 in milliseconds. Test it with three
-fixtures: a recorded good delivery, the same body with one byte changed, and the same delivery twice.
+## Diagram
+Verification and dedupe happen before any work, the provider gets its 200 at once, and the worker acts
+on the provider's current object rather than the payload.
+
+```mermaid
+sequenceDiagram
+    participant P as Provider
+    participant W as Webhook endpoint
+    participant R as Redis or DB
+    participant Q as Queue worker
+    P->>W: POST raw body plus signature header
+    Note over W: cap size, check timestamp, HMAC, constant-time compare
+    W->>R: SET seen id NX with TTL
+    R-->>W: new, or already seen
+    W->>Q: enqueue raw event
+    W-->>P: 200 within milliseconds
+    Q->>P: GET current object by id
+    Note over Q: idempotent side effect
+```
+
+## Examples
+### FastAPI receiver for a Stripe-style scheme
+Raw-body HMAC, timestamp tolerance, multiple signatures for rotation, constant-time compare, Redis
+dedupe keyed by event id with retention longer than the tolerance, and a queue hand-off so the provider
+gets its 200 in milliseconds. Test it with three fixtures: a recorded good delivery, the same body with
+one byte changed, and the same delivery twice.
 
 ```python
 import hashlib, hmac, json, os, time
@@ -160,48 +188,116 @@ async def receive(request: Request):
     return {"status": "queued"}
 ```
 
+### The fixtures, runnable with the standard library
+A self-contained version of the same checks, run against a good delivery, a tampered body, a retry, a
+replay a week later, and a delivery signed during secret rotation.
+
+```python
+import hashlib, hmac
+
+def sign(secret: bytes, ts: int, raw: bytes) -> str:
+    return hmac.new(secret, f"{ts}.".encode() + raw, hashlib.sha256).hexdigest()
+
+def check(secrets: list[bytes], raw: bytes, header: str, seen: set, now: float, tol: int = 300) -> str:
+    fields = [p.split("=", 1) for p in header.split(",") if "=" in p]
+    ts = next((v for k, v in fields if k == "t"), None)
+    sigs = [v for k, v in fields if k == "v1"]
+    if ts is None or not ts.isdigit() or not sigs:
+        return "400 malformed"
+    if abs(now - int(ts)) > tol:
+        return "400 stale"
+    ok = any(hmac.compare_digest(sign(s, int(ts), raw).encode(), sig.encode())
+             for s in secrets for sig in sigs)            # any active secret, any supplied signature
+    if not ok:
+        return "400 bad signature"
+    if raw in seen:                                       # stand-in for dedupe by event id
+        return "200 duplicate"
+    seen.add(raw)
+    return "200 queued"
+
+old, new = b"whsec_old", b"whsec_new"
+body, now, seen = b'{"id":"evt_1","type":"payment.succeeded"}', 1_760_000_000, set()
+good = f"t={now},v1={sign(old, now, body)}"
+print(check([old], body, good, seen, now))                         # 200 queued
+print(check([old], body.replace(b"1", b"2"), good, seen, now))     # 400 bad signature (one byte changed)
+print(check([old], body, good, seen, now + 60))                    # 200 duplicate (retry or replay)
+print(check([old], body, good, seen, now + 7 * 86400))             # 400 stale (replayed a week later)
+rot = f"t={now},v1={sign(old, now, body)},v1={sign(new, now, body)}"
+print(check([new], body, rot, set(), now))                         # 200 queued (rotation overlap)
+```
+
+### Worked scenario: which check stops which attack
+Tolerance 300 seconds, dedupe retention 3 days, provider retries for up to a few days.
+
+| Incoming request | Signature | Timestamp window | Event-id dedupe | Result |
+|---|---|---|---|---|
+| Forged body, no secret | fails | | | 400 |
+| Real delivery, one byte edited | fails | | | 400 |
+| Real delivery replayed after a week | valid | fails | | 400 |
+| Real delivery replayed after 2 minutes | valid | passes | seen | 2xx, no side effect |
+| Provider retry after a timeout | valid (re-signed) | passes | seen | 2xx, no side effect |
+| Retry after 4 days, beyond retention | valid | passes | expired | processed again: only an idempotent handler saves you |
+
+## Production patterns
+- **Verify in a dedicated dependency on raw bytes.** Read `await request.body()` before any JSON parsing,
+  cap the body size at the proxy, and use the provider's official verification helper when one exists.
+  Monitor the verification-failure rate per provider; anything above zero is an attack or a
+  misconfiguration.
+- **Transactional dedupe for money and access.** Insert into `processed_events(event_id UNIQUE)` with
+  `INSERT ... ON CONFLICT (event_id) DO NOTHING` inside the same transaction as the side effect, and skip
+  when no row was inserted. Monitor the duplicate rate; a spike usually means slow acks.
+- **Ack-then-queue with a dead-letter queue.** Return 200 after verify, dedupe and enqueue, and let workers
+  retry with a dead-letter queue for poison events. Monitor processing lag, DLQ depth and provider-side
+  delivery failures in the provider's dashboard.
+- **Overlapped secret rotation.** Keep a list of active secrets per endpoint in the secret manager, accept
+  a match from any of them, roll the provider to the new secret, then retire the old one after the overlap.
+  Watch for a burst of signature failures during the switch.
+- **Scheduled reconciliation.** Periodically list recent objects from the provider's API and compare with
+  what you processed, to catch dropped or expired-dedupe events. Track the count of discrepancies found
+  per run.
+
 ## Trade-offs
-- An HMAC with a shared secret is simple, fast and verifiable offline, but it is symmetric: every holder
-  can forge, so asymmetric signatures become the better choice when many parties must verify or the
-  verifier must never be able to sign.
-- A tight timestamp tolerance shrinks the replay window, but clock skew and queued deliveries then cause
-  false rejections and more retries; widen it when the provider does not re-sign retries and lean on id
-  deduplication instead.
-- Dedupe in Redis with a TTL is one cheap command, but it is not transactional with your side effect; a
-  unique constraint inside the same database transaction costs a write per event and buys a real
+- **Shared-secret HMAC vs asymmetric signatures.** HMAC is simple, fast and verifiable offline, but every
+  holder can forge; asymmetric signatures win when many parties must verify or the verifier must never be
+  able to sign.
+- **Tight vs wide tolerance.** A tight window shrinks replay exposure, but clock skew and queued
+  deliveries cause false rejections and more retries; widen it when the provider does not re-sign retries
+  and lean on id deduplication instead.
+- **Redis TTL vs a unique constraint.** Redis dedupe is one cheap command but not transactional with your
+  side effect; a unique constraint in the same transaction costs a write per event and buys a real
   effectively-once guarantee.
-- Acknowledging immediately and processing in a worker frees you from provider timeouts, but a 200 no
-  longer means "done", so monitoring, dead-lettering and reconciliation move to the queue.
-- Fetching the authoritative object from the provider on every event defeats stale and out-of-order
-  payloads, but it adds an API call per event and is subject to the provider's rate limits.
+- **Immediate ack vs visible completion.** Acknowledging immediately frees you from provider timeouts, but
+  a 200 no longer means "done", so monitoring, dead-lettering and reconciliation move to the queue.
+- **Fetching the object vs API cost.** Fetching the authoritative object on every event defeats stale and
+  out-of-order payloads, but adds an API call per event, subject to the provider's rate limits.
 
 ## Pitfalls
-- Verifying over parsed-then-re-serialised JSON; the symptom is signatures that fail only for some
-  payloads (non-ASCII text, floats, nested key order) while every local test passes.
-- Comparing signatures with `==`; there is no functional symptom, which is exactly the danger, and it
+- **Verifying over re-serialised JSON.** Symptom: signatures fail only for some payloads (non-ASCII text,
+  floats, nested key order) while every local test passes.
+- **Comparing signatures with `==`.** There is no functional symptom, which is exactly the danger; it
   surfaces only in a pentest or security review.
-- Checking the signature but neither the timestamp nor the event id; the symptom is double side effects
-  (two credits, two emails) whenever the provider retries, and silent replayability.
-- A gateway, body-parsing middleware or compression layer rewriting the body before your handler; the
-  symptom is every signature failing after a deployment that changed nothing in your code.
-- Doing the work inline and returning 200 only at the end; the symptom is provider-side timeouts,
-  escalating retries and duplicate processing under load, sometimes ending with the endpoint disabled.
-- Assuming ordered delivery; the symptom is a record stuck in `started` because a late `started` event
+- **Checking the signature but neither timestamp nor event id.** Symptom: double side effects (two credits,
+  two emails) whenever the provider retries, and silent replayability.
+- **A gateway, body-parsing middleware or compression layer rewriting the body.** Symptom: every signature
+  fails after a deployment that changed nothing in your code.
+- **Doing the work inline and returning 200 at the end.** Symptom: provider-side timeouts, escalating
+  retries and duplicate processing under load, sometimes ending with the endpoint disabled.
+- **Assuming ordered delivery.** Symptom: a record stuck in `started` because a late `started` event
   overwrote `completed`.
-- Rotating the secret without an overlap; the symptom is a burst of 400s and missed events during the
-  switch.
-- Logging full headers and bodies; the symptom is signatures, tokens and customer data sitting in the
-  log platform for anyone with search access.
+- **Rotating the secret without an overlap.** Symptom: a burst of 400s and missed events during the switch.
+- **Logging full headers and bodies.** Symptom: signatures, tokens and customer data sit in the log
+  platform for anyone with search access.
 
 ## When to use
-Every inbound webhook, without exception, including events from your own services whenever they cross
-a trust boundary; the cost is a few lines and the failure mode is an attacker driving your business
-logic. If a sender cannot sign, require at least a secret header and prefer polling the provider's API
-for state over trusting pushes. Measure the verification-failure rate (anything above zero is an attack
-or a misconfiguration), the duplicate rate, the distribution of timestamp age, and processing lag. In
-interviews, "how would you secure a webhook endpoint" is a standard question; a strong answer walks
-raw-body HMAC, constant-time compare, timestamp window, id dedupe, idempotent handler, ack-then-queue
-and fetching the authoritative object, and can say why each exists.
+- **Every inbound webhook, without exception**, including your own services' events whenever they cross a
+  trust boundary; the cost is a few lines, the failure mode is an attacker driving your business logic.
+- **If a sender cannot sign**, require at least a secret header, and prefer polling the provider's API for
+  state over trusting pushes.
+- **Measure** the verification-failure rate (anything above zero is an attack or a misconfiguration), the
+  duplicate rate, the distribution of timestamp age, and processing lag.
+- **Interviews:** "how would you secure a webhook endpoint" is standard; walk raw-body HMAC, constant-time
+  compare, timestamp window, id dedupe, idempotent handler, ack-then-queue and fetching the authoritative
+  object, and say why each exists.
 
 ## Role lens
 - **Engineer:** Writes the verification middleware on raw bytes, the dedupe and queue hand-off, and the
@@ -224,6 +320,46 @@ per-endpoint secret from the secret manager, compare in constant time, reject ti
 few minutes, deduplicate on event id with retention covering the provider's retry schedule, make the
 handler idempotent, return 200 quickly and process from a queue, and for anything that grants value,
 fetch the current object from the billing API by id before acting.
+
+## Interview questions
+### Why is the timestamp included inside the signed content rather than sent as its own header?
+- **Binding:** if the timestamp is part of the MAC input, an attacker who changes it to look fresh breaks
+  the signature.
+- **Unsigned is useless:** a separate, unsigned timestamp can be rewritten on a replayed request, so it
+  bounds nothing.
+- **Without one** (GitHub's scheme), deduplication by delivery id with long retention is the only replay
+  defence.
+
+### After a deploy, every webhook signature fails, but the secret did not change. How do you debug it?
+- **Suspect the bytes:** new body-parsing middleware, a gateway transformation or a compression layer is
+  changing the body before verification.
+- **Confirm:** log a hash and length of the raw body at the edge and in the handler for one delivery, and
+  compare with the provider's dashboard.
+- **Also check** that the header name and the secret's environment variable still match after the deploy,
+  and that the server clock has not drifted outside the tolerance.
+
+### Redis `SET NX` or a unique constraint in the database: which do you use for webhook dedupe?
+- **Redis** is one cheap command with a TTL, fine for low-stakes events, but it is not transactional with
+  the side effect and can mark an event seen that then fails.
+- **A unique insert in the same transaction** as the side effect costs a write per event and guarantees
+  both commit or neither.
+- **For money or access**, use the transaction, plus an idempotent handler and reconciliation for what
+  slips past retention.
+
+### How long should dedupe records live, and what happens if they expire too early?
+- **Retention covers the provider's retry horizon**, often days, not the few-minute tolerance window,
+  because legitimate retries carry the same id later.
+- **Too short:** a late retry is processed again, producing double side effects unless the handler is
+  idempotent.
+- **Size it** from the provider's documented retry schedule, and monitor the age of duplicates you see.
+
+### Why acknowledge immediately and process in a worker instead of doing the work in the handler?
+- **Provider timeouts:** deliveries time out after seconds to tens of seconds, and a slow handler causes
+  retries, duplicates and possibly a disabled endpoint.
+- **Ordering and freshness:** the worker can fetch the current object by id, which handles out-of-order
+  and stale payloads.
+- **Cost:** a 200 no longer means "done", so you need queue monitoring, a dead-letter queue and
+  reconciliation.
 
 ## Quiz
 ### Q: Why must the HMAC be computed over the raw request bytes rather than over the parsed JSON object?

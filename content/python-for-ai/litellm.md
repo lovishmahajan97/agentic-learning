@@ -108,6 +108,25 @@ example two Azure regions plus OpenAI direct).
 - **Licensing.** The core is open source, but some enterprise proxy features (for example SSO and certain
   audit and admin controls) need a commercial licence; check which you need before standardising.
 
+## Diagram
+A request for the logical name "chat": retries stay inside the group first, a failing deployment cools
+down, and only when the whole group fails does the call fall back to another provider's model.
+
+```mermaid
+flowchart TD
+    APP["App: OpenAI-format call, model chat"] --> R["Router or proxy: logical name to deployments"]
+    R -->|"routing_strategy, simple-shuffle default"| D1["openai/gpt-4o-mini"]
+    R --> D2["azure/my-gpt4o-mini-eu"]
+    D1 -->|"429 or 5xx"| RT{"num_retries left in group?"}
+    RT -->|"yes, pick a healthy deployment"| D2
+    D1 -.->|"over allowed_fails"| CD["Cooldown for cooldown_time seconds"]
+    RT -->|"no, whole group failed"| FB["fallbacks: chat-backup, anthropic model"]
+    D2 --> TX["Translate response to OpenAI shape"]
+    FB --> TX
+    TX --> COST["completion_cost and callbacks log spend with metadata"]
+    COST --> APP
+```
+
 ## Examples
 ### Router with two deployments, retries and a cross-provider fallback
 Model names are illustrative; take them from config.
@@ -267,6 +286,46 @@ output modes, need equivalents or graceful degradation. Rate limits and quotas o
 failover traffic. The routing layer itself must not become the new single point of failure, so the
 proxy runs with multiple replicas or the library is embedded. Finally, alert on fallback rate, so a
 silent permanent failover with worse quality is noticed.
+
+## Interview questions
+### What does LiteLLM translate, and where does translation lose fidelity?
+- **It maps requests and responses:** for `anthropic/...` the OpenAI `system` message becomes top-level
+  `system`, `tools[].function` becomes `input_schema` tools, and `role: "tool"` messages become
+  `tool_result` blocks inside a user message.
+- **On the way back** `stop_reason` maps to `finish_reason` and `input_tokens` to `prompt_tokens`, so
+  parsing and logging are written once.
+- **Lost or hidden:** features with no OpenAI equivalent, such as thinking blocks, cache breakpoints or
+  citations, which must ride in extra fields.
+
+### After a provider outage, support tickets spiked but logs showed no errors. What happened?
+- **Likely a silent fallback:** the router moved traffic to `chat-backup`, so requests succeeded on a
+  model with different style or accuracy on your prompts.
+- **Check `drop_params`:** if it is on globally, a stop sequence or response format may have been dropped
+  only for the fallback provider, changing output format.
+- **Fix:** run the eval suite on every fallback pair before enabling it and alert on fallback rate per route.
+
+### When would you not introduce LiteLLM?
+- **One strategic provider:** if you depend on its newest features, a native SDK exposes them first and
+  at full fidelity.
+- **Small call volume:** an extra abstraction on every LLM call, with its own correctness, latency and
+  update cadence, may not be worth owning.
+- **Library versus proxy:** choose the proxy only when many services and languages need shared keys,
+  budgets and spend logs, because it is an extra hop you must run highly available.
+
+### How many upstream calls can one user request make during a full outage?
+- **Stacked layers multiply:** 3 application attempts × 3 router attempts per group × 2 groups gives 18
+  upstream calls in the illustrative setup.
+- **With retries owned only by the router** the same request makes 3 × 2 = 6 calls.
+- **So set `max_retries=0`** on clients that call the proxy and monitor upstream calls per user request
+  during incidents.
+
+### Cost reports show zero spend for one Azure deployment. How do you fix attribution?
+- **Cause:** `completion_cost` looks up price by model name, and a custom name such as
+  `my-gpt4o-mini-eu` is not in the price map.
+- **Fix:** declare `base_model` in that deployment's `model_info` and pass `metadata` (feature, tenant)
+  on each call so callbacks can attribute spend.
+- **Then reconcile** computed spend against provider invoices before chargeback, because price maps can
+  lag price changes and negotiated rates.
 
 ## Quiz
 ### Q: What does LiteLLM's response translation give application code?

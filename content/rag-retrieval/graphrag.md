@@ -100,6 +100,25 @@ query time when they do not.
 - **Links back to source chunks** preserve grounding: a community report is a model-written paraphrase, so
   answers should still cite original text where possible.
 
+## Diagram
+The top row is the expensive index-time pipeline; the bottom shows how the two query modes reuse it,
+global search over community reports and local search through entities back to source chunks.
+
+```mermaid
+flowchart TD
+    D["Corpus"] --> C["Chunk"]
+    C --> X["LLM extraction per chunk plus gleaning"]
+    X --> MG["Merge entities, summarise descriptions"]
+    MG --> G[("Entity graph, edges weighted by count")]
+    G --> L["Leiden hierarchical communities"]
+    L --> R[("Community reports per level")]
+    Q["Query"] --> RT{"Route by question type"}
+    RT -->|"corpus-wide theme"| GS["Global: map over reports, reduce top partial answers"]
+    RT -->|"specific entities"| LS["Local: match entities, follow edges, pull source chunks"]
+    GS --> R
+    LS --> G
+```
+
 ## Examples
 ### Worked cost walkthrough: 2,000 incident reports
 Illustrative orders of magnitude, not benchmarks, for a corpus of 2,000 internal incident reports
@@ -243,6 +262,41 @@ extraction and community summaries would be stale or constantly rebuilt. GraphRA
 relational questions. If product managers also want "what are the top recurring problems this quarter", run
 a periodic GraphRAG or clustering job over a snapshot for that use, route those questions to it, and keep
 plain retrieval for lookups. Validate with an eval split by question type before committing spend.
+
+## Interview questions
+### What problem does GraphRAG solve that top-k vector retrieval cannot?
+- **Global questions:** "what are the recurring complaints across 5,000 tickets" has no similar chunk;
+  the answer is a property of the corpus, so top-k returns an arbitrary, unrepresentative handful.
+- **Connective questions:** facts joined by a shared entity across documents, not shared vocabulary.
+  GraphRAG pre-builds an entity graph and community summaries so both become answerable.
+
+### Walk me through the GraphRAG indexing pipeline and say why each step exists.
+- **Chunk and extract:** an LLM pulls entities and relationships per chunk, with optional gleaning passes
+  because single-pass extraction under-recalls on dense text.
+- **Merge and build the graph:** consolidate entity descriptions and weight edges by extraction count;
+  this is crude entity resolution, weak on aliases.
+- **Leiden communities and reports:** Leiden guarantees well-connected communities (Louvain does not), and
+  pre-written reports turn an O(corpus) read per query into an O(communities) read.
+
+### A team indexed their wiki with GraphRAG, and answers to lookup questions are no better than before. What happened, and what would you do?
+- **Wrong tool for the traffic.** Lookups answerable from one chunk are served as well by hybrid search
+  with reranking, so the indexing bill buys nothing there.
+- **Fix:** split the eval set by question type, route only thematic and relational questions to GraphRAG,
+  and keep plain retrieval for lookups; drop GraphRAG if global questions are rare.
+
+### How would you estimate whether GraphRAG pays off for a 4-million-token corpus?
+- **Index side:** about 3,300 chunks of 1,200 tokens, roughly 6,600 extraction calls with one gleaning
+  pass, on the order of 15 to 25 million LLM tokens before merging and reports (illustrative).
+- **Query side:** a global query is about 41 calls over 40 reports versus about 3,300 calls for naive
+  map-reduce per question.
+- **Decide** by how many global and relational queries per month repay the index bill, measured on a
+  1-5% pilot slice first.
+
+### When would you choose LazyGraphRAG or LightRAG over the reference GraphRAG?
+- **LazyGraphRAG** when the corpus changes often or is queried rarely: cheap noun-phrase co-occurrence
+  graphs at index time, with LLM summarisation deferred and paid per query.
+- **LightRAG-style** when you need incremental updates: keep LLM extraction, skip the community hierarchy,
+  and merge new documents without re-clustering.
 
 ## Quiz
 ### Q: What lets GraphRAG answer "what are the main themes in this corpus?" when vector RAG cannot?

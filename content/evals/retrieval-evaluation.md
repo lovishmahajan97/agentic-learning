@@ -5,7 +5,7 @@ name: Retrieval evaluation (recall@k, MRR, NDCG)
 kind: metric
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - rag-retrieval/recall-vs-precision-trade-off
   - rag-retrieval/reranking
@@ -21,57 +21,68 @@ sources:
 ---
 
 ## TL;DR
-A RAG answer can only be as good as the passages the retriever puts in front of the model, so the
-retriever is measured on its own against queries with known relevant documents. recall@k asks whether
-the relevant passages made it into the top k the generator will see; MRR asks how high the first
-relevant hit was; NDCG asks whether the ranking is right when relevance comes in grades. Choosing k to
-match the context budget and building honest relevance judgments matter more than the formulas.
+A RAG answer is only as good as its retrieved passages, so the retriever is scored alone against known
+relevant documents: recall@k (did evidence get in?), MRR (first hit how high?), NDCG (graded ranking
+right?). Choosing k and honest judgments matter most.
 
 ## Why it exists
-When a RAG system answers wrongly, there are two suspects: the retriever did not surface the evidence,
-or the generator mishandled evidence that was there. An end-to-end answer score cannot tell them apart,
-so it cannot tell you what to fix. Retrieval evaluation isolates the first suspect, and it does so
-cheaply: no LLM call is needed, so a change to chunking, embedding model, hybrid weights or filters can
-be scored on hundreds of queries in seconds and run on every commit.
-
-Three naive alternatives fail. Eyeballing results for a few queries does not scale and misses
-regressions. Reading the retriever's similarity scores as quality fails because similarity is not
-relevance and scores are not comparable across models or even across queries. Treating retrieval as
-classification and reporting precision and recall at a score threshold fails because the consumer of the
-results is a model that reads a *ranked* top-k list: a relevant chunk at rank 3 helps, the same chunk at
-rank 40 does not exist. The metrics therefore have to be rank-aware and cut off at the k that the
-generator actually receives.
-
-Three metrics exist because they answer three different questions. Did everything needed get in
-(recall@k)? How quickly does the list reach something useful (MRR)? Is the ordering right when some
-passages are more relevant than others (NDCG)? Which one is primary depends on what sits downstream.
+- **A wrong RAG answer has two suspects.** The retriever did not surface the evidence, or the generator
+  mishandled evidence that was there. An end-to-end answer score cannot tell them apart, so it cannot tell
+  you what to fix. Retrieval evaluation isolates the first suspect.
+- **It is cheap.** No LLM call is needed, so a change to chunking, embedding model, hybrid weights or
+  filters can be scored on hundreds of queries in seconds and run on every commit.
+- **The naive alternatives fail.** Eyeballing a few queries does not scale and misses regressions.
+  Similarity scores are not relevance and are not comparable across models or even across queries.
+- **Threshold precision and recall fail too,** because the consumer is a model reading a *ranked* top-k
+  list: a relevant chunk at rank 3 helps, the same chunk at rank 40 does not exist. Metrics must be
+  rank-aware and cut off at the k the generator actually receives.
+- **Three metrics, three questions.** Did everything needed get in (recall@k)? How quickly does the list
+  reach something useful (MRR)? Is the ordering right when some passages are more relevant (NDCG)? Which
+  is primary depends on what sits downstream.
 
 ## How it works
 ### Ingredients: queries and relevance judgments
-You need a query set that resembles production traffic, including the short, ambiguous and multi-part
-queries that real users send, and for each query a set of relevant chunks or documents, the **qrels**.
-Relevance can be binary or graded (0–3). Sources: golden question–answer pairs where the answer's source
-passage is known; SME labeling; LLM-assisted labeling with a human audit; and **pooling**, where the
-top results of several systems are merged and judged so no system is penalised for finding something the
-labelers never looked at. Judge at the granularity the retriever returns: document-level labels applied
-to chunk-level retrieval mark the wrong chunk of the right document as a hit.
+- **A query set that resembles production traffic,** including the short, ambiguous and multi-part
+  queries real users send.
+- **qrels:** for each query, the set of relevant chunks or documents. Relevance can be binary or graded
+  (0–3).
+- **Sources of qrels:**
+  1. golden question–answer pairs where the answer's source passage is known;
+  2. SME labeling;
+  3. LLM-assisted labeling with a human audit;
+  4. **pooling:** merge the top results of several systems and judge them, so no system is penalised for
+     finding something the labelers never looked at.
+- **Judge at the granularity the retriever returns,** because document-level labels applied to
+  chunk-level retrieval mark the wrong chunk of the right document as a hit.
+
+### The metrics at a glance
+| Metric | Formula | Answers | Use as |
+|---|---|---|---|
+| recall@k | relevant items in top k ÷ all relevant items | did the evidence get in? | primary for the first stage |
+| hit rate@k | 1 if any relevant item in top k | did *something* relevant get in? | equals recall@k with one relevant item |
+| precision@k | relevant items in top k ÷ k | how much of the context is noise? | cost and distractor check |
+| MRR | mean of 1 / rank of first relevant item | how high was the first hit? | single-citation or top-heavy generators |
+| NDCG@k | DCG@k / IDCG@k | is the graded ranking right? | rerankers, graded judgments |
 
 ### recall@k
-recall@k = |relevant ∩ top-k| / |relevant|, averaged over queries. It is the primary metric for the
-first retrieval stage because the generator can ignore an irrelevant passage but cannot recover a
-missing one. Two conventions to be explicit about: if a query has more relevant items than k, recall@k
-cannot reach 1, so either choose k above the typical number of relevant items or report R-precision; and
-when each query has exactly one relevant item, recall@k equals **hit rate@k** (was any relevant item in
-the top k), which is what many RAG dashboards actually compute under the name recall. **precision@k** =
-|relevant ∩ top-k| / k measures how much of the context window is noise, which matters for cost and for
-the generator's sensitivity to distractors.
+- **Formula:** recall@k = |relevant ∩ top-k| / |relevant|, and precision@k = |relevant ∩ top-k| / k.
+- **Averaged over queries.** It is the primary first-stage metric because the generator can ignore an
+  irrelevant passage but cannot recover a missing one.
+- **Convention 1:** if a query has more relevant items than k, recall@k cannot reach 1, so either choose
+  k above the typical number of relevant items or report R-precision.
+- **Convention 2:** when each query has exactly one relevant item, recall@k equals **hit rate@k**, which
+  is what many RAG dashboards actually compute under the name recall.
+- **precision@k** measures how much of the context window is noise, which matters for cost and for the
+  generator's sensitivity to distractors.
 
 ### MRR
-For each query, the reciprocal rank is 1 / (rank of the first relevant item), or 0 if none appears in
-the top k; MRR is the mean. The reward is steep: rank 1 scores 1, rank 2 scores 0.5, rank 3 scores
-0.33. Use it when a single good hit is enough and position matters, such as showing one citation or
-when the generator attends mostly to the first passages. It ignores everything after the first hit, so
-it says nothing about queries that need several passages.
+- **Per query:** reciprocal rank = 1 / (rank of the first relevant item), or 0 if none appears in the
+  top k. MRR is the mean.
+- **Steep reward:** rank 1 scores 1, rank 2 scores 0.5, rank 3 scores 0.33.
+- **Use it when one good hit is enough and position matters,** such as showing one citation or when the
+  generator attends mostly to the first passages.
+- **Blind spot:** it ignores everything after the first hit, so it says nothing about queries that need
+  several passages.
 
 ### NDCG@k
 Discounted cumulative gain sums the relevance of each result with a position discount:
@@ -81,27 +92,50 @@ DCG@k  = Σ_{i=1..k} gain(rel_i) / log2(i + 1)
 NDCG@k = DCG@k / IDCG@k        (IDCG = DCG of the ideal ordering of the same judgments)
 ```
 
-gain is either rel_i itself or 2^rel_i − 1, the latter emphasising highly relevant items. The log
-discount exists because position matters with diminishing weight, smoother than MRR's 1/rank cliff.
-The normalisation exists so that queries with many relevant items do not dominate the average and so
-every query scores in [0, 1]. NDCG is the standard for graded judgments and for comparing rankers; IR
-benchmarks such as BEIR report NDCG@10.
+- **gain** is either rel_i itself or 2^rel_i − 1; the latter emphasises highly relevant items.
+- **The log discount** exists because position matters with diminishing weight, smoother than MRR's
+  1/rank cliff.
+- **The normalisation** exists so queries with many relevant items do not dominate the average and every
+  query scores in [0, 1].
+- **The standard for graded judgments and for comparing rankers;** IR benchmarks such as BEIR report
+  NDCG@10.
 
 ### Picking k and splitting stages
-Set k to the number of passages the generator receives after any reranking, because that is where
-missing evidence becomes a wrong answer. A two-stage pipeline gets two evaluations: the first-stage
-retriever at a larger k (what the reranker has to work with) scored by recall, and the reranker at the
-final k scored by NDCG or MRR. Raising k raises recall but costs tokens and adds distractors, so measure
-answer quality against k to find the knee.
+1. **Set k to the number of passages the generator receives** after any reranking, because that is where
+   missing evidence becomes a wrong answer.
+2. **Evaluate a two-stage pipeline twice:** the first-stage retriever at a larger k (what the reranker has
+   to work with) scored by recall, and the reranker at the final k scored by NDCG or MRR.
+3. **Find the knee:** raising k raises recall but costs tokens and adds distractors, so measure answer
+   quality against k.
 
 ### Statistical hygiene
-Compare two systems on the same queries with a paired bootstrap over queries and report intervals;
-means on a few dozen queries move by several points on resampling. Segment by query type, because an
-average of 0.85 can hide a category at 0.3.
+- **Paired bootstrap over queries:** compare two systems on the same queries and report intervals, because
+  means on a few dozen queries move by several points on resampling.
+- **Segment by query type,** because an average of 0.85 can hide a category at 0.3.
 
-## Example
-All three metrics for one query, then the numbers worked by hand. Relevant chunks are c3 (grade 2, the
-policy clause that answers the question) and c7 (grade 1, a related FAQ entry).
+## Diagram
+A two-stage pipeline gets two evaluations against the same qrels: recall at the wide first-stage k, and
+ranking quality at the final k that reaches the generator.
+
+```mermaid
+flowchart TD
+    Q["Query from real traffic"] --> R1["First-stage retriever, wide k"]
+    R1 --> M1["recall@wide k"]
+    R1 --> RR["Reranker"]
+    RR --> TK["Final top-k into the prompt"]
+    TK --> M2["recall@k, NDCG@k, MRR"]
+    TK --> G["Generator answer"]
+    QR[("qrels: judged relevant chunks")] --> M1
+    QR --> M2
+    M2 --> B["Paired bootstrap per category"]
+    B -.->|"new system finds unjudged chunks"| P["Pool and re-judge"]
+    P --> QR
+```
+
+## Examples
+### All three metrics for one query, worked by hand
+Relevant chunks are c3 (grade 2, the policy clause that answers the question) and c7 (grade 1, a related
+FAQ entry).
 
 ```python
 import math
@@ -132,45 +166,102 @@ print("NDCG@5   = %.3f" % ndcg_at_k(ranked, grades, 5))       # 0.643
 # Average each metric over the query set; compare two systems with a paired bootstrap over queries.
 ```
 
-By hand: DCG@5 = 2 / log2(3) + 1 / log2(5) ≈ 1.262 + 0.431 = 1.693. The ideal order puts c3 first and
-c7 second: IDCG = 2 / log2(2) + 1 / log2(3) ≈ 2 + 0.631 = 2.631, so NDCG@5 ≈ 0.643. recall@5 is perfect
-and MRR is 0.5, yet NDCG shows the ranking is far from ideal: an irrelevant chunk occupies the top slot
-and the second relevant item is pushed to rank 4. If the generator receives three passages, recall@3 is
-the number that predicts the wrong answer.
+| Quantity | Calculation | Value |
+|---|---|---|
+| DCG@5 | 2 / log2(3) + 1 / log2(5) ≈ 1.262 + 0.431 | 1.693 |
+| IDCG@5 (c3 first, c7 second) | 2 / log2(2) + 1 / log2(3) ≈ 2 + 0.631 | 2.631 |
+| NDCG@5 | 1.693 / 2.631 | ≈ 0.643 |
+
+- **recall@5 is perfect and MRR is 0.5, yet NDCG shows the ranking is far from ideal:** an irrelevant
+  chunk occupies the top slot and the second relevant item is pushed to rank 4.
+- **If the generator receives three passages,** recall@3 is the number that predicts the wrong answer.
+
+### Is the new retriever actually better? Paired bootstrap (runnable)
+Pure Python. Per-query recall@5 for 40 queries under the baseline and a hybrid-search variant; resample
+the per-query *differences*, so query difficulty cancels out.
+
+```python
+import random
+
+def paired_bootstrap(a, b, n_boot=10000, seed=0):
+    """a, b: per-query scores for the same queries. Returns mean(b - a) and a 95% interval."""
+    rng, d = random.Random(seed), [y - x for x, y in zip(a, b)]
+    means = sorted(sum(rng.choices(d, k=len(d))) / len(d) for _ in range(n_boot))
+    return sum(d) / len(d), means[int(0.025 * n_boot)], means[int(0.975 * n_boot)]
+
+# recall@5 per query for 40 queries: baseline vs hybrid search
+base   = [1, 1, 0.5, 1, 0, 1, 1, 0.5, 1, 1] * 4
+hybrid = [1, 1, 1,   1, 0, 1, 1, 0.5, 1, 1] * 3 + [1, 1, 0.5, 1, 0, 1, 0.5, 0.5, 1, 1]
+print("baseline %.3f  hybrid %.3f" % (sum(base) / 40, sum(hybrid) / 40))
+print("diff %.3f, 95%% CI (%.3f, %.3f)" % paired_bootstrap(base, hybrid))
+# baseline 0.800  hybrid 0.825
+# diff 0.025, 95% CI (-0.025, 0.075)
+```
+
+| Reading | Conclusion |
+|---|---|
+| +2.5 points of recall@5 | looks like a win on a dashboard |
+| interval includes 0 | not distinguishable from no change on 40 queries |
+| next step | add queries (or check the category that improved) before switching |
+
+## Production patterns
+- **Retrieval eval as a CI gate.** Version the qrels file next to the index config, compute recall at the
+  first-stage k and NDCG at the final k on every change to embeddings, chunking, filters or hybrid
+  weights, and block the merge when the paired-bootstrap lower bound shows a drop. Monitor per-category
+  recall, not just the mean.
+- **Pool and re-judge on every retriever swap.** Merge the top results of old and new systems, send
+  unjudged items to SMEs or an LLM labeler with a human-audited slice, and add them to the qrels. Monitor
+  the share of top-k results that are unjudged; a high share means the numbers are unreliable.
+- **Span-based qrels that survive re-chunking.** Store relevance as document id plus character span, and
+  map spans onto chunks by overlap whenever chunking changes. Monitor the share of qrels that map to no
+  chunk after a re-index.
+- **Choose k from a sweep, not a guess.** Run answer-quality evals at several final k values and pick the
+  knee; record the chosen k in config with the eval that justified it. Monitor prompt tokens per request
+  and answer quality together.
+- **Deduplicate before the top-k cut.** Collapse near-duplicate chunks (same source, high overlap) so
+  copies do not crowd out distinct evidence. Monitor the count of distinct sources per top-k.
 
 ## Trade-offs
-- recall@k is the right target for a first-stage retriever but is blind to ordering and to noise; when
-  the generator is sensitive to position or distractors, add NDCG and precision@k.
-- MRR is easy to explain and rewards getting the top slot right, but it ignores everything after the
-  first hit; for multi-hop questions that need several passages, use recall@k or NDCG instead.
-- NDCG uses graded relevance, which is more informative but costlier to label and has lower annotator
-  agreement than binary labels; with a small labeling budget, binary judgments and recall are safer.
-- A larger k raises recall but adds tokens and distractors; once answer quality stops improving with k,
-  the extra recall is paying for nothing.
-- LLM-generated qrels scale far beyond SME labeling but can over-credit passages that merely repeat the
-  query's terms; when the retriever under test is lexical, audit a human-labeled slice before trusting them.
+- **Completeness vs ordering.** recall@k is the right target for a first-stage retriever but is blind to
+  ordering and to noise; when the generator is sensitive to position or distractors, add NDCG and
+  precision@k.
+- **Simplicity vs coverage.** MRR is easy to explain and rewards getting the top slot right, but it
+  ignores everything after the first hit; for multi-hop questions that need several passages, use
+  recall@k or NDCG instead.
+- **Information vs labeling cost.** NDCG uses graded relevance, which is more informative but costlier to
+  label and has lower annotator agreement than binary labels; with a small labeling budget, binary
+  judgments and recall are safer.
+- **Recall vs tokens.** A larger k raises recall but adds tokens and distractors; once answer quality
+  stops improving with k, the extra recall is paying for nothing.
+- **Scale vs bias.** LLM-generated qrels scale far beyond SME labeling but can over-credit passages that
+  merely repeat the query's terms; when the retriever under test is lexical, audit a human-labeled slice
+  before trusting them.
 
 ## Pitfalls
-- Incomplete qrels, with unjudged chunks counted as irrelevant; the symptom is a new retriever that finds
-  different but valid passages scoring *lower*, which pooling and re-judging its top results corrects.
-- Eval queries written by reading the chunks; the symptom is near-perfect offline recall and poor results
-  on real user phrasing.
-- Document-level labels with chunk-level retrieval; the symptom is "relevant document retrieved" while the
-  chunk that reached the generator lacks the answer.
-- Reporting only the mean; the symptom is average recall of 0.85 with short or ambiguous queries at 0.3.
-- Changing chunk size and comparing recall@k against the old qrels; the symptom is numbers that are not
-  comparable because the unit of relevance changed.
-- Near-duplicate chunks in the index; the symptom is a top-k full of copies, recall of distinct relevant
-  items stalling while precision looks fine.
+- **Incomplete qrels, with unjudged chunks counted as irrelevant.** Symptom: a new retriever that finds
+  different but valid passages scoring *lower*. Fix: pooling and re-judging its top results.
+- **Eval queries written by reading the chunks.** Symptom: near-perfect offline recall and poor results
+  on real user phrasing. Fix: queries from logs and tickets.
+- **Document-level labels with chunk-level retrieval.** Symptom: "relevant document retrieved" while the
+  chunk that reached the generator lacks the answer. Fix: judge chunks or spans.
+- **Reporting only the mean.** Symptom: average recall of 0.85 with short or ambiguous queries at 0.3.
+  Fix: segment by query type.
+- **Changing chunk size and comparing recall@k against the old qrels.** Symptom: numbers that are not
+  comparable because the unit of relevance changed. Fix: re-map or re-judge.
+- **Near-duplicate chunks in the index.** Symptom: a top-k full of copies, recall of distinct relevant
+  items stalling while precision looks fine. Fix: deduplicate.
 
 ## When to use
-Run retrieval evaluation on every change to the embedding model, chunking, index, hybrid weights,
-reranker or metadata filters, and reach for it first whenever answers are wrong, because "was the
-evidence present?" is the cheapest question to answer. Track recall at the first-stage k and NDCG or MRR
-at the final k, with paired intervals and a per-category breakdown. Build the query set from real
-traffic, on the order of a few hundred queries (illustrative), stratified by type. In interviews, define
-the three metrics, say which one you would make primary and why, and explain how you would construct
-the judgments.
+- **Run it on every change** to the embedding model, chunking, index, hybrid weights, reranker or
+  metadata filters.
+- **Reach for it first whenever answers are wrong,** because "was the evidence present?" is the cheapest
+  question to answer.
+- **Track** recall at the first-stage k and NDCG or MRR at the final k, with paired intervals and a
+  per-category breakdown.
+- **Build the query set from real traffic,** on the order of a few hundred queries (illustrative),
+  stratified by type.
+- **Interviews:** define the three metrics, say which one you would make primary and why, and explain how
+  you would construct the judgments.
 
 ## Role lens
 - **Engineer:** Keeps the qrels file and the metrics script in CI so an embedding-model swap that drops
@@ -191,6 +282,42 @@ ranked low (embedding, chunking, hybrid weighting), or it is filtered out (metad
 recall@k is high and answers are still wrong, the generator or faithfulness is the problem. MRR and NDCG
 then say whether a reranker is worth adding. Every comparison between pipeline variants runs on the same
 queries with a paired bootstrap.
+
+## Interview questions
+### Which retrieval metric would you make primary for a first-stage retriever, and why?
+- **recall@k at the k the reranker or generator receives,** because the generator can ignore a
+  distractor but cannot recover a passage that never arrived.
+- **Not MRR,** which stops at the first hit and says nothing about multi-passage questions.
+- **Add NDCG at the final k** once a reranker exists, since ordering then matters.
+
+### Offline recall@5 is 0.95, but users say answers lack the evidence they need. What do you check?
+- **The query set:** queries written by reading chunks inflate recall; rebuild from search logs and
+  tickets.
+- **Label granularity:** document-level labels can count the wrong chunk of the right document as a hit.
+- **Filters and permissions in production:** metadata or ACL filters active live but not offline remove
+  passages before the top-k cut.
+
+### How would you pick k for a RAG system?
+- **Start from the context budget:** k is the number of passages the generator actually receives after
+  reranking.
+- **Sweep it:** measure answer quality at several k; recall keeps rising but answer quality flattens or
+  drops as distractors and tokens grow.
+- **Pick the knee** and record the eval that justified it, so the choice is revisited when models change.
+
+### You have no labeled data for a new customer. How do you build qrels in a week?
+- **Take a few hundred real queries** from logs or tickets, stratified by type.
+- **Pool candidates** from two or three retrievers (lexical, dense, hybrid) and judge the union, so no
+  system is penalised for unjudged finds.
+- **Use an LLM labeler with an SME-audited slice** to scale, checking especially that it does not
+  over-credit passages that merely repeat query terms.
+
+### A hybrid-search change lifts mean recall@5 from 0.800 to 0.825 on 40 queries. Do you ship?
+- **Not on that evidence alone:** a paired bootstrap gives a 95% interval of roughly −0.025 to +0.075,
+  which includes no change.
+- **Look per category:** if the gain is concentrated where users struggle, it may still be worth a larger
+  test.
+- **Add queries** to narrow the interval, because means on a few dozen queries move by several points on
+  resampling.
 
 ## Quiz
 ### Q: Each query has one relevant chunk; the retriever ranks it first for half the queries and fourth for the rest, with k = 5. What are recall@5 and MRR?

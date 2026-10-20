@@ -5,7 +5,7 @@ name: mypy
 kind: tool
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - python-for-ai/type-hints
   - python-for-ai/protocols-generics-structural-typing
@@ -21,64 +21,76 @@ sources:
 ---
 
 ## TL;DR
-mypy is a static type checker: it reads your type hints, infers the rest, and reports code that would
-pass the wrong type, read a missing key or call a method on `None`, without running anything. Python
-ignores hints at runtime, so without a checker they are comments that drift. mypy is gradual: unannotated
-code is mostly unchecked, which lets large codebases adopt it module by module but also hides gaps.
+mypy is a static type checker: it reads your hints, infers the rest, and reports code that would pass the
+wrong type, read a missing key or call a method on `None`, without running anything. It is gradual, so
+unannotated code stays mostly unchecked.
 
 ## Why it exists
-Python's runtime does not enforce annotations. `def call_model(prompt: str) -> str` happily accepts a
-list and returns `None`; you find out when a downstream `.strip()` raises `AttributeError` in production,
-often on a rare path: the model returned no content, an env var was unset, a tool call had no arguments.
-AI code is especially exposed because so much of it passes loosely shaped data between layers: provider
-responses where `content` may be `None`, dicts of tool arguments, optional fields in config, results
-that are either a value or an error.
-
-Tests catch some of this, but only on the paths you test, and the `None` paths are exactly the ones
-people forget. Runtime validation with Pydantic catches it at boundaries, but not inside your own code
-between boundaries. The naive alternative, "we have annotations, that is enough", gives you
-documentation that silently becomes wrong after the third refactor, because nothing checks it.
-
-A static checker turns annotations into a cheap, whole-program test that runs in seconds and covers
-every path, including the ones no test exercises. It also makes refactoring safe: change a function's
-signature and the checker lists every caller you broke.
+- **Python ignores hints at runtime.** `def call_model(prompt: str) -> str` happily accepts a list and
+  returns `None`; you find out when a downstream `.strip()` raises `AttributeError` in production, often
+  on a rare path: the model returned no content, an env var was unset, a tool call had no arguments.
+- **AI code is especially exposed.** It passes loosely shaped data between layers: provider responses
+  where `content` may be `None`, dicts of tool arguments, optional fields in config, results that are
+  either a value or an error.
+- **Tests and Pydantic leave gaps.** Tests cover only the paths you test, and the `None` paths are the
+  ones people forget. Runtime validation catches bad data at boundaries, but not inside your own code
+  between boundaries.
+- **Unchecked annotations are comments that drift.** "We have annotations, that is enough" gives you
+  documentation that silently becomes wrong after the third refactor, because nothing checks it.
+- **A checker is a cheap whole-program test.** It runs in seconds, covers every path including those no
+  test exercises, and makes refactoring safe: change a signature and it lists every caller you broke.
 
 ## How it works
 ### Checking
-mypy parses each module, builds types for every definition from annotations and from inference
-(`x = []` followed by `x.append(1)` infers `list[int]`), and checks every expression against them.
-Errors carry a code in brackets (`[arg-type]`, `[union-attr]`, `[return-value]`), which you use for
-targeted ignores and configuration.
+1. **Parse** each module.
+2. **Build types** for every definition from annotations and from inference (`x = []` followed by
+   `x.append(1)` infers `list[int]`).
+3. **Check every expression** against them.
+4. **Report errors with a code** in brackets (`[arg-type]`, `[union-attr]`, `[return-value]`), which you
+   use for targeted ignores and configuration.
 
-**Narrowing** is what makes optional types usable: after `if content is None: return`, mypy knows
-`content` is `str`. The same works for `isinstance`, comparisons against `Literal` values, and
-`TypeGuard`/`TypeIs` functions. Calling `assert_never(x)` in the final branch makes mypy prove a
-chain of checks is exhaustive, so adding a new literal value breaks the build where it is not handled.
+### Narrowing
+- **Narrowing makes optional types usable:** after `if content is None: return`, mypy knows `content` is
+  `str`.
+- **Same mechanism** for `isinstance`, comparisons against `Literal` values, and `TypeGuard`/`TypeIs`
+  functions.
+- **Exhaustiveness:** calling `assert_never(x)` in the final branch makes mypy prove a chain of checks is
+  exhaustive, so adding a new literal value breaks the build where it is not handled.
 
 ### Subtyping: nominal, structural, and variance
-By default a value is compatible with a class if it is an instance of that class or a subclass
-(nominal typing). A `Protocol` switches to structural typing: any object with matching methods
-qualifies, without inheriting anything, which is how you type "anything with an async `complete`
-method" so a real client and a test fake both satisfy one interface. Generic containers carry a
-subtlety that surprises most people: `list[int]` is *not* a `list[float]`, even though `int` is
-accepted where `float` is expected. The reason is soundness: a function taking `list[float]` may
-append `0.5`, which would corrupt the caller's `list[int]`. Mutable containers are therefore
-invariant, while read-only ones such as `Sequence` and `Mapping` (values) are covariant, so the usual
-fix is to accept `Sequence[float]` when the function only reads. `reveal_type(expr)` prints what mypy
-inferred at that point, and is the first tool when a message seems wrong.
+- **Nominal by default:** a value is compatible with a class if it is an instance of that class or a
+  subclass.
+- **`Protocol` switches to structural typing:** any object with matching methods qualifies, without
+  inheriting anything. That is how you type "anything with an async `complete` method", so a real client
+  and a test fake both satisfy one interface.
+- **`list[int]` is *not* a `list[float]`**, even though `int` is accepted where `float` is expected. The
+  reason is soundness: a function taking `list[float]` may append `0.5`, which would corrupt the caller's
+  `list[int]`.
+
+| Container | Variance | Consequence |
+|---|---|---|
+| `list`, `dict` (mutable) | invariant | `list[int]` rejected where `list[float]` is expected |
+| `Sequence`, `Mapping` values (read-only) | covariant | `Sequence[float]` accepts a `list[int]` |
+
+- **The usual fix** is to accept `Sequence[float]` when the function only reads.
+- **`reveal_type(expr)`** prints what mypy inferred at that point, and is the first tool when a message
+  seems wrong.
 
 ### Gradual typing
-Anything typed `Any` is compatible with everything, in both directions, so errors stop propagating
-through it. By default mypy does not check the bodies of functions that have no annotations at all,
-because adopting a checker on an untyped codebase would otherwise produce thousands of errors. Both
-choices make adoption possible and both hide bugs, which is why `--strict` (and flags such as
-`disallow_untyped_defs`, `check_untyped_defs`, `warn_return_any`, `warn_unused_ignores`) exist.
+- **`Any` is compatible with everything, in both directions**, so errors stop propagating through it.
+- **Unannotated functions are skipped by default:** mypy does not check the bodies of functions with no
+  annotations at all, because adopting a checker on an untyped codebase would otherwise produce
+  thousands of errors.
+- **Both choices make adoption possible and both hide bugs**, which is why `--strict` exists, along with
+  flags such as `disallow_untyped_defs`, `check_untyped_defs`, `warn_return_any` and `warn_unused_ignores`.
 
 ### Third-party types
-For libraries, mypy uses inline hints if the package ships a `py.typed` marker (PEP 561), otherwise
-stub packages: the standard library's from typeshed (bundled), others from `types-*` packages. Untyped
-libraries produce "missing library stubs" errors, silenced per module with `ignore_missing_imports`.
-Some libraries need plugins to be understood, such as Pydantic's mypy plugin for model constructors.
+- **Inline hints** are used if the package ships a `py.typed` marker (PEP 561).
+- **Otherwise stub packages:** the standard library's from typeshed (bundled), others from `types-*`
+  packages.
+- **Untyped libraries** produce "missing library stubs" errors, silenced per module with
+  `ignore_missing_imports`.
+- **Plugins** teach mypy about some libraries, such as Pydantic's mypy plugin for model constructors.
 
 ### Configuration and speed
 Configure in `pyproject.toml`; per-module overrides let you be strict in new code and lenient in legacy:
@@ -97,18 +109,44 @@ module = ["some_untyped_sdk.*"]
 ignore_missing_imports = true
 ```
 
-mypy reads types from the packages installed in the environment it runs in, so it must run with the
-project's real dependencies installed and the same target Python version (`python_version`) as
-production; run it in a bare CI image and every third-party import becomes a missing-stubs error or
-silently `Any`. mypy caches results in `.mypy_cache` and rechecks only what changed; `dmypy` keeps a daemon running for
-faster editor-style feedback. The main alternative is pyright (the engine behind Pylance), which is
-faster and infers more aggressively, so the two disagree at the edges; newer Rust-based checkers such as
-Astral's ty and Meta's Pyrefly are much faster but younger, so check their current maturity and
-typing-spec conformance before making one a gate. Pick one checker as the CI gate.
+- **Run it in the real environment.** mypy reads types from the packages installed where it runs, so it
+  needs the project's real dependencies and the same target Python version (`python_version`) as
+  production. In a bare CI image every third-party import becomes a missing-stubs error or silently `Any`.
+- **Incremental:** results are cached in `.mypy_cache` and only what changed is rechecked; `dmypy` keeps a
+  daemon running for faster editor-style feedback.
 
-## Example
-Bugs a test suite can easily miss, each reported by mypy with its error code, plus one it misses. The comments show
-mypy's messages (paths and line numbers omitted).
+| Checker | Notes |
+|---|---|
+| mypy | long-standing reference, plugin system |
+| pyright (engine behind Pylance) | faster, infers more aggressively, so it disagrees with mypy at the edges |
+| Astral's ty, Meta's Pyrefly | Rust-based and much faster but younger; check current maturity and typing-spec conformance before making one a gate |
+
+- **Pick one checker as the CI gate.**
+
+## Diagram
+What mypy consumes and where checking silently stops: annotated code is checked end to end, while `Any`
+and unannotated bodies bypass the checks unless strict flags close them.
+
+```mermaid
+flowchart TD
+    SRC["Your modules and annotations"] --> P["Parse and build types"]
+    PKG[("Installed packages: py.typed hints, typeshed, types-* stubs")] --> P
+    CFG["pyproject.toml: strict, overrides, plugins"] --> P
+    P --> I["Infer unannotated locals, e.g. list of int"]
+    I --> Q{"Function annotated?"}
+    Q -->|"no, default"| SK["Body skipped"]
+    Q -->|"yes"| C["Check each expression, narrow on None, isinstance, Literal"]
+    C --> A{"Value typed Any?"}
+    A -->|"yes"| SL["Checks switched off downstream"]
+    A -->|"no"| E["Errors with codes: arg-type, union-attr, return-value"]
+    SK -.->|"check_untyped_defs or strict"| C
+    E --> CA[(".mypy_cache for incremental reruns")]
+```
+
+## Examples
+### Bugs a test suite misses, and one mypy misses
+Each reported by mypy with its error code. The comments show mypy's messages (paths and line numbers
+omitted).
 
 ```python
 import os
@@ -147,44 +185,120 @@ def helper(resp):                  # unannotated: mypy skips this body by defaul
     # resp.choises would pass even then: an unannotated parameter is Any until you annotate it
 ```
 
-The fixes are one line each (`os.environ["MODEL"]` or a default, an `is None` branch, the correct key),
-and the last function shows why `strict` matters: unannotated bodies are skipped by default, and even
-`check_untyped_defs` cannot see through parameters that are implicitly `Any`. Strict mode's
-`disallow_untyped_defs` forces the annotation that makes the checker useful there.
+- **The fixes are one line each:** `os.environ["MODEL"]` or a default, an `is None` branch, the correct
+  key. mypy 1.19 also adds a `Did you mean "arguments"?` note to the TypedDict error.
+- **Why `strict` matters:** unannotated bodies are skipped by default, and even `check_untyped_defs` cannot
+  see through parameters that are implicitly `Any`. Strict mode's `disallow_untyped_defs` forces the
+  annotation that makes the checker useful there.
+- **A side effect of the stub:** `def run(...) -> str: ...` in a regular module is itself reported as
+  `Missing return statement  [empty-body]`; real code has a body or lives in a `.pyi` stub.
+
+### Protocols and variance: a fake that type-checks, a fake that does not
+Check with `mypy --strict fakes.py`; the file is for the checker, not for running. Messages are from
+mypy 1.19, abridged.
+
+```python
+from typing import Protocol, Sequence
+
+class Completer(Protocol):
+    async def complete(self, prompt: str) -> str: ...
+
+class FakeLLM:                                  # no inheritance: matches structurally
+    async def complete(self, prompt: str) -> str:
+        return prompt.upper()
+
+class BadFake:
+    def complete(self, prompt: str) -> str:     # sync: does not match the protocol
+        return prompt
+
+async def summarize(llm: Completer, text: str) -> str:
+    return await llm.complete(f"Summarize: {text}")
+
+def mean(xs: list[float]) -> float:
+    return sum(xs) / len(xs)
+
+def mean_ro(xs: Sequence[float]) -> float:
+    return sum(xs) / len(xs)
+
+async def main() -> None:
+    await summarize(FakeLLM(), "doc")           # ok
+    await summarize(BadFake(), "doc")
+    # error: Argument 1 to "summarize" has incompatible type "BadFake"; expected "Completer"  [arg-type]
+    # note: Expected: def complete(self, prompt: str) -> Coroutine[Any, Any, str]
+    scores: list[int] = [3, 4, 5]
+    mean(scores)
+    # error: Argument 1 to "mean" has incompatible type "list[int]"; expected "list[float]"  [arg-type]
+    # note: "list" is invariant ... Consider using "Sequence" instead, which is covariant
+    mean_ro(scores)                             # ok: Sequence is covariant
+    reveal_type(scores)                         # note: Revealed type is "builtins.list[builtins.int]"
+```
+
+The sync fake would have failed at runtime with "object str can't be used in 'await' expression", but
+only on the path that awaits it; mypy reports it before any test runs.
+
+### Worked scenario: adopting mypy on a legacy service
+Illustrative counts for a 60-module service; the shape of the ratchet is what matters.
+
+| Step | Config change | Errors to fix | Result |
+|---|---|---|---|
+| 1 | default mode, `ignore_missing_imports` per untyped SDK | ~40, mostly `union-attr` and `arg-type` | real `None` bugs fixed; gate turned on in CI |
+| 2 | `strict = true`, all old modules in a `legacy.*`-style override | 0 new; new modules strict from day one | strict code grows with every PR |
+| 3 | move 5 modules per sprint out of the override | ~20 per module | override list shrinks; track it as a metric |
+| 4 | `warn_unused_ignores` on | stale ignores removed | suppressions stay honest |
+
+## Production patterns
+- **Gate CI in the project's environment.** Install the real dependencies (for example `uv run mypy src/`
+  or `pip install -e .` first) and set `python_version` to production's version. Cache `.mypy_cache`
+  between CI runs. Monitor error count on main, which must stay at zero.
+- **Strict for new code, ratchet the rest.** `strict = true` globally, with legacy packages listed in a
+  `[[tool.mypy.overrides]]` block that relaxes `disallow_untyped_defs`. Remove modules from the list as
+  they are typed, and track the list's length as the adoption metric.
+- **Honest suppressions.** Require error codes on every ignore (`# type: ignore[union-attr]`) by adding
+  `enable_error_code = ["ignore-without-code"]`, and set `warn_unused_ignores = true` so stale ones fail
+  the build. Review the ignore count in each release.
+- **Measure `Any` leakage.** Run `mypy --any-exprs-report <dir>` periodically; it writes a per-module
+  table of how many expressions are `Any` and why (unannotated, unimported, explicit). Model the worst
+  boundaries with `TypedDict` or Pydantic.
+- **pre-commit needs its dependencies.** The `mirrors-mypy` hook runs in its own isolated environment, so
+  list typed libraries and stub packages under `additional_dependencies`. Otherwise imports silently
+  become `Any` and pre-commit passes code that CI rejects.
 
 ## Trade-offs
-- Strict mode catches the most bugs, but costs annotation effort and fights dynamic code; it flips from
-  burden to bargain once a codebase is refactored often or shared by several teams.
-- Gradual typing lets you adopt mypy incrementally, but `Any` and unannotated functions leave holes that
-  look checked; track the untyped share and ratchet strictness module by module.
-- Static checks cover every path at near-zero runtime cost, but say nothing about data from outside the
-  process; model output and HTTP payloads still need runtime validation with Pydantic or similar.
-- pyright is faster and more aggressive at inference, while mypy is the long-standing reference with a
-  plugin system; mixing both as CI gates mostly produces arguments about edge cases.
+- **Strict mode: most bugs caught vs annotation effort.** It fights dynamic code, and flips from burden to
+  bargain once a codebase is refactored often or shared by several teams.
+- **Gradual typing: incremental adoption vs holes.** `Any` and unannotated functions leave holes that look
+  checked; track the untyped share and ratchet strictness module by module.
+- **Static checks: every path vs only your process.** They cover every path at near-zero runtime cost, but
+  say nothing about data from outside the process; model output and HTTP payloads still need runtime
+  validation with Pydantic or similar.
+- **pyright vs mypy.** pyright is faster and more aggressive at inference, while mypy is the long-standing
+  reference with a plugin system; mixing both as CI gates mostly produces arguments about edge cases.
 
 ## Pitfalls
-- Sprinkling bare `# type: ignore` comments; the symptom is suppressed real errors that outlive their
-  reason, which `warn_unused_ignores` and error-code-specific ignores make visible.
-- Typing provider responses or tool arguments as `dict[str, Any]`; the symptom is mypy passing code that
+- **Sprinkling bare `# type: ignore` comments.** Symptom: suppressed real errors that outlive their
+  reason. Fix: `warn_unused_ignores` and error-code-specific ignores make them visible.
+- **Typing provider responses or tool arguments as `dict[str, Any]`.** Symptom: mypy passes code that
   reads misspelled keys, because `Any` turns off every check downstream of it.
-- Leaving functions unannotated and assuming they are checked; the symptom is obvious misuse of typed
-  values in those bodies that mypy never reports until `check_untyped_defs` is on, and attribute typos
-  on their implicitly `Any` parameters that stay invisible until the parameters are annotated.
-- Running mypy only in editors, not in CI; the symptom is a main branch with hundreds of errors that
-  nobody can turn on as a gate without a week of cleanup.
-- Annotating a read-only parameter as `list[float]` or `dict[str, float]`; the symptom is
-  `[arg-type]` errors at callers passing `list[int]`, "fixed" with casts or ignores, when
-  `Sequence[float]` or `Mapping[str, float]` states the real requirement.
-- Ignoring missing stubs globally rather than per module; the symptom is a typo in an import or a
-  wrongly named function from a library that no longer produces any error.
+- **Leaving functions unannotated and assuming they are checked.** Symptom: obvious misuse of typed values
+  in those bodies that mypy never reports until `check_untyped_defs` is on, and attribute typos on their
+  implicitly `Any` parameters that stay invisible until the parameters are annotated.
+- **Running mypy only in editors, not in CI.** Symptom: a main branch with hundreds of errors that nobody
+  can turn on as a gate without a week of cleanup.
+- **Annotating a read-only parameter as `list[float]` or `dict[str, float]`.** Symptom: `[arg-type]`
+  errors at callers passing `list[int]`, "fixed" with casts or ignores, when `Sequence[float]` or
+  `Mapping[str, float]` states the real requirement.
+- **Ignoring missing stubs globally rather than per module.** Symptom: a typo in an import or a wrongly
+  named function from a library that no longer produces any error.
 
 ## When to use
-Run mypy (or one chosen alternative) on every service that will be maintained beyond a prototype, as a
-CI gate alongside ruff and pytest. New projects should start in strict mode; existing ones should start
-lenient, fix the error codes that find real bugs (`union-attr`, `arg-type`, `return-value`), and tighten
-per module. Pair it with `TypedDict`, `Literal` and Pydantic models at the points where untyped data
-enters, because types are only as good as the boundary that establishes them. In interviews, explain
-gradual typing and why `Any` is contagious, not just which flags you set.
+- **Use on every service that will be maintained beyond a prototype:** mypy (or one chosen alternative)
+  as a CI gate alongside ruff and pytest.
+- **New projects:** start in strict mode.
+- **Existing projects:** start lenient, fix the error codes that find real bugs (`union-attr`, `arg-type`,
+  `return-value`), and tighten per module.
+- **Pair with boundary types:** `TypedDict`, `Literal` and Pydantic models where untyped data enters,
+  because types are only as good as the boundary that establishes them.
+- **Interviews:** explain gradual typing and why `Any` is contagious, not just which flags you set.
 
 ## Role lens
 - **Engineer:** Annotates provider and tool boundaries precisely, narrows optional values explicitly,
@@ -204,6 +318,45 @@ Second, gradual-typing gaps: the failing code is in unannotated functions or und
 so its body is not checked; turn on `check_untyped_defs` or strict for that module and see what appears.
 A third possibility is that runtime data violates the declared types, such as a field the provider
 documents as present arriving as null, which only runtime validation catches.
+
+## Interview questions
+### What does "gradual typing" mean in mypy, and why is Any called contagious?
+- **Gradual:** unannotated functions are not checked by default and `Any` is compatible with everything in
+  both directions, so a large codebase can adopt mypy module by module.
+- **Contagious:** any value derived from an `Any` (an attribute, an index, a call result) is also `Any`, so
+  one `dict[str, Any]` response switches off checking for everything downstream.
+- **Close the gap** with `--strict`, boundary models (`TypedDict`, Pydantic) and `--any-exprs-report`.
+
+### Why is list[int] rejected where list[float] is expected, and how do you fix the signature?
+- **Mutable containers are invariant** for soundness: a function taking `list[float]` could append `0.5`
+  and corrupt the caller's `list[int]`.
+- **State the real requirement:** if the function only reads, accept `Sequence[float]` (or
+  `Mapping[str, float]`), which is covariant.
+- **Do not paper over it** with `cast` or `# type: ignore[arg-type]`; mypy's own note suggests `Sequence`.
+
+### mypy passes locally but CI reports dozens of missing-stubs errors. What happened?
+- **mypy reads types from the installed environment**, so a CI image without the project's dependencies
+  makes every third-party import a missing-stubs error, or silently `Any`.
+- **Fix the environment, not the config:** install real dependencies and `types-*` stubs before running,
+  and set `python_version` to production's.
+- **The reverse also happens** with pre-commit's isolated hook environment, unless typed libraries are
+  listed under `additional_dependencies`.
+
+### How would you introduce mypy to a 200-module untyped codebase without stopping feature work?
+- **Start lenient and gate CI immediately** on the codes that find real bugs (`union-attr`, `arg-type`,
+  `return-value`), with `ignore_missing_imports` per untyped SDK, never globally.
+- **Make new code strict** via `strict = true` plus an override listing legacy packages, so the strict share
+  grows with every pull request.
+- **Ratchet:** remove a few modules from the override each sprint, turn on `warn_unused_ignores`, and track
+  the override list and `Any` share as metrics.
+
+### Would you use mypy or pyright as the CI gate, and would you run both?
+- **Either works as a gate:** mypy is the long-standing reference with a plugin system (Pydantic's
+  plugin, for example); pyright is faster and infers more aggressively, which suits editor feedback.
+- **Run one as the gate**, because the two disagree at the edges and dual gates mostly produce arguments
+  about edge cases.
+- **Treat newer Rust-based checkers** (ty, Pyrefly) as candidates to evaluate on maturity and typing-spec
+  conformance before they gate anything.
 
 ## Quiz
 ### Q: By default, what does mypy do with the body of a function that has no annotations?

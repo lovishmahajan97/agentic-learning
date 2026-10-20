@@ -5,7 +5,7 @@ name: C4 diagrams
 kind: practice
 difficulty: intro
 est_minutes: 11
-status: reviewed
+status: crisp
 related:
   - system-design/ai-solution-architecture
   - system-design/reference-architectures
@@ -20,101 +20,115 @@ sources:
 ---
 
 ## TL;DR
-C4 is a small set of conventions for architecture diagrams at four nested zoom levels, System Context,
-Container, Component and Code, where every box states its name, type, technology and purpose and every
-arrow states its intent. It exists because ad-hoc boxes-and-arrows mix abstraction levels and leave
-readers guessing what a box is and which way data flows. For AI systems it is the quickest way to show
-where the model, the customer's data and the trust boundaries actually sit.
+C4 draws architecture at four nested zoom levels (System Context, Container, Component, Code), with every
+box labelled by name, type, technology and purpose and every arrow by intent. For AI systems it shows
+where the model, customer data and trust boundaries sit.
 
 ## Why it exists
-Most architecture diagrams fail at the same thing: nobody can tell what level they are looking at. One
-picture shows a Kubernetes cluster, a "Users" stick figure, a PostgreSQL cylinder, an `AuthService`
-class and a team name, connected by unlabelled lines that may mean "calls", "deploys to" or "is owned
-by". Every review then spends its first twenty minutes establishing what the boxes are. UML tried to fix
-this with a rigorous notation that almost nobody learned, so teams fell back to free-form whiteboards
-and the ambiguity returned.
-
-C4 borrows the idea of a map. A country map, a city map and a street map use different symbols and a
-different density of detail, and you know which one you are holding. C4 fixes four zoom levels and a
-tiny notation, so a reader knows that a box on a Container diagram is a deployable unit and a box on a
-Component diagram is a part of one. Everything else, tooling, layout, colours, is left free.
-
-AI systems raise the stakes. The first question from security, legal and the customer's architects is
-"where does our data go, and which parts talk to the model provider?" A diagram that cannot answer that
-in one glance costs you a review cycle. C4's insistence on labelling technology and the direction and
-meaning of each flow is exactly what that audience needs.
+- **Ad-hoc diagrams mix abstraction levels.** One picture shows a Kubernetes cluster, a "Users" stick
+  figure, a PostgreSQL cylinder, an `AuthService` class and a team name, joined by unlabelled lines that
+  may mean "calls", "deploys to" or "is owned by". Every review spends its first twenty minutes working
+  out what the boxes are.
+- **UML was too heavy.** Its rigorous notation was learned by almost nobody, so teams fell back to
+  free-form whiteboards and the ambiguity returned.
+- **C4 borrows the idea of a map.** Country, city and street maps use different symbols and detail, and
+  you know which one you hold. C4 fixes four zoom levels and a tiny notation, so a Container box is a
+  deployable unit and a Component box is part of one. Tooling, layout and colours stay free.
+- **AI systems raise the stakes.** Security, legal and customer architects first ask "where does our data
+  go, and which parts talk to the model provider?" A diagram that cannot answer at a glance costs a review
+  cycle; C4's labelled technology and flow direction answer it.
 
 ## How it works
 ### The four levels
-1. **System Context.** Your system is one box. A *software system* here is the thing one team builds
-   and owns; anything owned by someone else, including another team's platform, is drawn as external.
-   Around the box are the people who use it and the external systems it depends on: the identity provider, the CRM it reads tickets from, the hosted model
-   provider. No technology inside the box yet. This exists because the first thing any audience needs is
-   the system's place in the world, and it is the diagram you show executives and customers.
-2. **Container.** Zoom into the system box. A *container* here is a separately runnable or deployable
-   unit: the web app, the API, the ingestion worker, the database, the vector store, the queue, the model
-   server, the LLM gateway. The term predates Docker and is wider than it; a database is a container, a
-   Docker image is not necessarily one container. Each shows its technology ("FastAPI", "PostgreSQL +
-   pgvector", "vLLM"). This is the diagram engineers and operators live in.
-3. **Component.** Zoom into one container and show its major structural parts and responsibilities:
-   inside the API, an authentication middleware, a tenancy resolver, an orchestration component, a
-   retrieval client, a guardrail layer, a usage meter. Components map to modules or packages, not to
-   classes. Draw this only for containers whose internals matter to someone other than their authors.
-4. **Code.** Class or entity diagrams for one component. Generate them from the code if you need them
-   at all; hand-maintained code diagrams are the first to rot.
+| Level | What a box is | Audience | Why it exists |
+|---|---|---|---|
+| **1. System Context** | Your system as one box, plus the people who use it and the external systems it depends on (identity provider, the CRM it reads tickets from, the hosted model provider). No technology inside the box | Executives, customers | Every audience first needs the system's place in the world |
+| **2. Container** | A separately runnable or deployable unit: web app, API, ingestion worker, database, vector store, queue, model server, LLM gateway, each with its technology ("FastAPI", "PostgreSQL + pgvector", "vLLM") | Engineers, operators | Where day-to-day design and operations live |
+| **3. Component** | Major structural parts of one container, e.g. inside the API: authentication middleware, tenancy resolver, orchestration, retrieval client, guardrail layer, usage meter | Those who depend on that container's internals | Maps to modules or packages, not classes |
+| **4. Code** | Class or entity diagrams for one component | Rarely anyone | Generate from code if needed at all; hand-maintained code diagrams rot first |
 
-Three supplementary diagrams reuse the same elements: a **System Landscape** for several systems, a
-**Dynamic** diagram that numbers the arrows to tell the story of one use case (a RAG request: resolve
-tenant, embed query, search, assemble prompt, call gateway, stream, meter), and a **Deployment** diagram
-that places containers onto infrastructure (region, VPC, cluster, GPU node pool, the customer's network
-versus yours). The deployment view is the one forward-deployed engineers draw most, because it is where
-trust boundaries and data residency become visible.
+- **"Software system" means what one team builds and owns.** Anything owned by someone else, including
+  another team's platform, is drawn as external.
+- **"Container" predates Docker and is wider than it.** A database is a container; a Docker image is not
+  necessarily one container.
+- **Draw Component diagrams only** for containers whose internals matter to someone other than their
+  authors.
+
+### Supplementary diagrams
+These reuse the same elements:
+- **System Landscape:** several systems side by side.
+- **Dynamic:** numbered arrows telling the story of one use case. A RAG request: resolve tenant, embed
+  query, search, assemble prompt, call gateway, stream, meter.
+- **Deployment:** places containers onto infrastructure (region, VPC, cluster, GPU node pool, the
+  customer's network versus yours). Forward-deployed engineers draw it most, *because* it is where trust
+  boundaries and data residency become visible.
 
 ### The notation rules that do the work
-Each rule exists to remove one specific ambiguity:
-- Every element carries **name, type, technology and a one-line description**, so a reader never has to
-  guess whether "Gateway" is an API gateway, an LLM gateway or a network device.
-- Every relationship is a **single-direction arrow labelled with intent and, where useful, protocol**
+Each rule removes one specific ambiguity:
+- **Every element has name, type, technology and a one-line description**, so a reader never guesses
+  whether "Gateway" is an API gateway, an LLM gateway or a network device.
+- **Every relationship is a single-direction arrow labelled with intent** and, where useful, protocol
   ("sends completion requests to, HTTPS/JSON"), so data-flow direction is never inferred.
-- Every diagram has a **title stating its level and scope**, and a **legend** if colours or shapes carry
+- **Every diagram has a title stating level and scope**, and a **legend** if colours or shapes carry
   meaning.
-- Keep a diagram to roughly twenty elements. Past that, the right move is a new diagram one level down,
-  not a smaller font.
-- Colour and shape are consistent across diagrams: people, your containers, external systems and data
+- **Roughly twenty elements per diagram.** Past that, draw a new diagram one level down, not a smaller
+  font.
+- **Consistent colour and shape across diagrams:** people, your containers, external systems and data
   stores each look the same everywhere.
 
 ### Diagrams as code
-The C4 authors' tooling, Structurizr, separates the **model** (elements and relationships, defined once)
-from **views** (which subset to draw at which level). This exists because consistency is the hard part:
-when the model is one source of truth, renaming a container updates every diagram, and a relationship
-cannot appear on the Container view but be missing from the Context view. C4-PlantUML and Mermaid's C4
-syntax give the same notation in text form with less model discipline. Text diagrams live in the
-repository, change in pull requests next to the code they describe, and can be regenerated in CI, which
-is the practical answer to diagram rot.
+- **Structurizr separates model from views.** Elements and relationships are defined once; views choose
+  which subset to draw at which level.
+- **Why:** consistency is the hard part. With one source of truth, renaming a container updates every
+  diagram, and a relationship cannot appear on the Container view but be missing from the Context view.
+- **Lighter options:** C4-PlantUML and Mermaid's C4 syntax give the same notation in text, with less model
+  discipline.
+- **Text in the repository is the cure for diagram rot.** It changes in pull requests next to the code it
+  describes and can be regenerated in CI.
 
 ### What to make visible in an AI system
-Treat the model provider as an external system on the Context diagram, because that arrow is a data
-egress a reviewer must see. Show the gateway, the vector store and the evaluation pipeline as containers,
-because each is where a decision (routing, isolation, release gating) is enforced. On the Deployment
-view, draw the boundary between the customer's environment and yours and mark which flows carry
-customer documents or prompts. A Dynamic diagram of one request is usually worth more than a Component
-diagram of everything.
+- **Model provider as an external system on the Context diagram**, *because* that arrow is a data egress a
+  reviewer must see.
+- **Gateway, vector store and evaluation pipeline as containers**, *because* each enforces a decision:
+  routing, isolation, release gating.
+- **On the Deployment view**, draw the boundary between the customer's environment and yours and mark
+  which flows carry customer documents or prompts.
+- **Prefer a Dynamic diagram of one request** over a Component diagram of everything; it is usually worth
+  more.
 
-C4 has no first-class trust-boundary element, and it does not pretend to be a threat model. Draw
-boundaries with deployment nodes (the customer's VPC, your cloud account, the provider's region) or with
-named groups, and state in the legend what crossing one means. A security team running a STRIDE-style
-review will still want a data-flow diagram; a good Deployment view gives them most of it.
+### Trust boundaries and threat models
+- **C4 has no first-class trust-boundary element** and does not pretend to be a threat model.
+- **Draw boundaries with deployment nodes** (the customer's VPC, your cloud account, the provider's
+  region) or named groups, and state in the legend what crossing one means.
+- **A STRIDE-style review still wants a data-flow diagram**; a good Deployment view gives most of it.
 
-## Example
-A Structurizr DSL workspace for a support assistant. One model feeds three views, so the Context
-diagram for stakeholders, the Container diagram for engineers and the Dynamic view of one request cannot
-disagree. The model provider is external, the vector-capable database is tagged so it renders as a
-cylinder, and every relationship states intent and protocol. The dynamic view numbers the steps of one
-reply in order, and Structurizr checks each step against the relationships in the model, so if someone
-deletes the `api -> gateway` arrow the workspace fails to build instead of the request story silently
-going stale. Notice also
-what the Context view reveals once rendered: two arrows leave the system, to the CRM and to the model
-provider, and the second is the data egress a privacy review will ask about first.
+## Diagram
+Each level zooms into one box of the level above; the supplementary views reuse the same elements to
+answer behaviour and placement questions.
+
+```mermaid
+flowchart TD
+    M[("One model: elements and relationships")] --> L1["System Context: system as one box"]
+    L1 -->|"zoom into system"| L2["Container: deployables and tech"]
+    L2 -->|"zoom into one container"| L3["Component: modules inside it"]
+    L3 -->|"rarely, generated"| L4["Code: classes"]
+    M --> DY["Dynamic: numbered steps of one request"]
+    M --> DP["Deployment: containers on infrastructure"]
+    M --> LS["System Landscape: many systems"]
+    DP -.->|"shows"| TB["Trust boundaries and data egress"]
+```
+
+## Examples
+### Structurizr DSL: one model, three views
+- **Three views, one model:** the Context diagram for stakeholders, the Container diagram for engineers and
+  the Dynamic view of one request cannot disagree.
+- **Labelling:** the model provider is external, the vector-capable database is tagged to render as a
+  cylinder, and every relationship states intent and protocol.
+- **Self-checking story:** the dynamic view numbers the steps of one reply, and Structurizr checks each
+  step against the model's relationships. Delete the `api -> gateway` arrow and the workspace fails to
+  build, instead of the request story silently going stale.
+- **What the rendered Context view reveals:** two arrows leave the system, to the CRM and to the model
+  provider. The second is the data egress a privacy review asks about first.
 
 ```
 workspace "Support Copilot" "Drafts ticket replies grounded in the knowledge base" {
@@ -156,45 +170,103 @@ workspace "Support Copilot" "Drafts ticket replies grounded in the knowledge bas
 }
 ```
 
+### C4-PlantUML: a deployment view with the trust boundary drawn
+For a pilot in a customer's VPC, deployment nodes act as the trust boundary, and the one arrow that leaves
+the customer's environment is labelled with what it carries.
+
+```
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Deployment.puml
+title Deployment: Support Copilot pilot in customer VPC
+
+Deployment_Node(cust, "Customer VPC", "Customer cloud account") {
+    Deployment_Node(k8s, "Kubernetes cluster", "Customer-managed") {
+        Container(api, "API", "FastAPI", "Auth, tenancy, orchestration")
+        Container(worker, "Ingestion Worker", "Python", "Chunks and embeds articles")
+        ContainerDb(db, "Database", "PostgreSQL + pgvector", "Chunks, embeddings")
+    }
+}
+Deployment_Node(vendor, "Vendor cloud", "Vendor account") {
+    Container(gateway, "LLM Gateway", "Python", "Routing, quotas")
+}
+System_Ext(llm, "Model Provider", "Hosted LLM API")
+
+Rel(api, db, "Reads and writes", "SQL")
+Rel(worker, db, "Writes chunks and embeddings to", "SQL")
+Rel(api, gateway, "Sends prompts containing ticket text", "HTTPS")
+Rel(gateway, llm, "Forwards prompts", "HTTPS")
+SHOW_LEGEND()
+@enduml
+```
+
+### Worked scenario: which view answers which reviewer
+A customer's security review for that pilot, mapped to the view that answers each first question.
+
+| Reviewer | First question | View to send | Must make explicit |
+|---|---|---|---|
+| Privacy and legal | Which third parties touch our data? | System Context | Model provider and CRM as external systems |
+| Customer architects | What runs, on what technology? | Container | Every deployable with technology and labelled arrows |
+| Security | Where does data leave our VPC? | Deployment | Trust boundary and flows carrying prompts or documents |
+| New engineer | What happens on one request? | Dynamic | Numbered steps of a chat request and the ingestion flow |
+
+## Production patterns
+- **Diagrams as code, rendered in CI.** Use for every system more than one team touches. Keep the
+  Structurizr DSL or C4-PlantUML files next to the code, and have a CI job render them (for example with
+  the Structurizr CLI's export command or PlantUML) so a broken model fails the build. Monitor time since
+  each diagram file last changed relative to the services it describes.
+- **Same-PR diagram updates.** Use when adding or removing a queue, model server or external dependency.
+  Add a pull-request template checkbox and a code-owner rule on the architecture folder so the architect
+  reviews diagram changes. Monitor containers in the deployment manifests that are missing from the model.
+- **Per-customer deployment views.** Use for every forward-deployed or VPC install. Keep one deployment
+  environment per customer topology in the same workspace, reusing the shared model, so the Container
+  view stays common while placement differs. Monitor open review questions per customer.
+- **Tag flows that carry customer data.** Use when privacy reviews are routine. Tag relationships that
+  carry prompts or documents and give that tag a distinct style and a legend entry, so egress is visible
+  without reading every label. Monitor untagged arrows that cross a deployment boundary.
+- **Element budget per view.** Use in design reviews. Treat roughly twenty elements as the ceiling and
+  split into a level-down view or a Dynamic view instead. Monitor views that exceed the budget.
+
 ## Trade-offs
-- Fixed abstraction levels make diagrams instantly readable to anyone who knows C4, but they constrain
-  you when a system does not decompose neatly; the fix is usually a Dynamic or Deployment view, not a
-  bespoke notation.
-- Diagrams as code stay in sync with the repository and survive reviews, but auto-layout rarely looks as
-  good as a hand-arranged picture; hand layout wins only for a diagram that will be shown far more often
-  than it changes.
-- A single model with many views guarantees consistency, but it demands that someone own the model;
-  without that owner, C4-PlantUML files per diagram are easier to keep alive.
-- C4 is deliberately lighter than UML or ArchiMate, which makes it learnable in an afternoon, but it
-  says nothing about behaviour beyond numbered arrows or about formal semantics; for enterprise-wide
-  capability mapping or protocol-level design, those heavier notations (or sequence diagrams) earn their cost.
-- Component diagrams explain a container's internals, but they rot fastest and are read least; draw them
-  for the containers whose structure others depend on and skip the rest.
+- **Fixed levels: instant readability vs constraint.** Anyone who knows C4 reads the diagrams at once, but
+  a system that does not decompose neatly feels constrained. The fix is usually a Dynamic or Deployment
+  view, not a bespoke notation.
+- **Diagrams as code: in sync vs uglier layout.** They stay in sync with the repository and survive
+  reviews, but auto-layout rarely matches a hand-arranged picture. Hand layout wins only for a diagram
+  shown far more often than it changes.
+- **One model, many views: consistency vs an owner.** Consistency is guaranteed only if someone owns the
+  model; without that owner, C4-PlantUML files per diagram are easier to keep alive.
+- **Lighter than UML or ArchiMate: learnable vs limited.** C4 is learnable in an afternoon, but says
+  nothing about behaviour beyond numbered arrows or about formal semantics. For enterprise-wide capability
+  mapping or protocol-level design, heavier notations (or sequence diagrams) earn their cost.
+- **Component diagrams: explain internals vs rot.** They rot fastest and are read least; draw them for the
+  containers whose structure others depend on and skip the rest.
 
 ## Pitfalls
-- Mixing levels in one diagram; the symptom is a picture that shows "Kubernetes" and "the retry helper
-  class" at the same time, and a review that spends its time asking what the boxes are.
-- Unlabelled or double-headed arrows; the symptom is a security reviewer asking "which direction does
-  customer data flow here?" and nobody being sure.
-- Reading *container* as Docker container; the symptom is a diagram with a managed database and a hosted
-  model provider missing because "they are not containers".
-- Leaving the model provider off the Context diagram because it is "just an API"; the symptom is a
-  procurement or privacy review discovering the data egress late.
-- Diagrams in a slide deck disconnected from the code; the symptom is a Container view that still shows
-  a service deleted two quarters ago.
-- Drawing everything; the symptom is a forty-box Container diagram nobody can read, instead of a
-  Container view plus two Dynamic views of the requests that matter.
+- **Mixing levels in one diagram.** Symptom: a picture shows "Kubernetes" and "the retry helper class" at
+  once, and the review is spent asking what the boxes are.
+- **Unlabelled or double-headed arrows.** Symptom: a security reviewer asks "which direction does
+  customer data flow here?" and nobody is sure.
+- **Reading *container* as Docker container.** Symptom: a managed database and a hosted model provider
+  are missing because "they are not containers".
+- **Leaving the model provider off the Context diagram** because it is "just an API". Symptom: a
+  procurement or privacy review discovers the data egress late.
+- **Diagrams in a slide deck disconnected from the code.** Symptom: a Container view still shows a
+  service deleted two quarters ago.
+- **Drawing everything.** Symptom: a forty-box Container diagram nobody can read, instead of a Container
+  view plus two Dynamic views of the requests that matter.
 
 ## When to use
-Draw a Context and a Container diagram for every system that more than one team or one organisation
-needs to understand, and keep them in the repository as text. Add a Deployment view the moment the
-system crosses a trust boundary, which for an AI product is usually immediately (a hosted model provider,
-a customer VPC). Add Dynamic views for the two or three request paths that reviewers and new engineers
-ask about most, typically a chat request and the ingestion flow. Skip Component and Code diagrams unless
-a specific audience needs them. A useful test: can a new engineer, a security reviewer and a customer
-architect each find the diagram meant for them and answer their first question without you in the
-room? In interviews, sketching a Context then a Container diagram is a clean way to structure any
-system-design answer, and naming technologies and flow directions as you go signals the discipline.
+- **Always:** a Context and a Container diagram for every system that more than one team or organisation
+  needs to understand, kept in the repository as text.
+- **Add a Deployment view** the moment the system crosses a trust boundary, which for an AI product is
+  usually immediately (a hosted model provider, a customer VPC).
+- **Add Dynamic views** for the two or three request paths reviewers and new engineers ask about most,
+  typically a chat request and the ingestion flow.
+- **Skip Component and Code diagrams** unless a specific audience needs them.
+- **Test:** can a new engineer, a security reviewer and a customer architect each find the diagram meant
+  for them and answer their first question without you in the room?
+- **Interviews:** sketching a Context then a Container diagram structures any system-design answer;
+  naming technologies and flow directions as you go signals the discipline.
 
 ## Role lens
 - **Engineer:** Keeps the Container and Dynamic diagrams in the repo as code, updates them in the same
@@ -216,6 +288,41 @@ arrows labelled by intent and protocol, so they can see where prompts and docume
 processed. And a Deployment diagram placing those containers inside their VPC versus your environment,
 with the trust boundary drawn and the flows that cross it marked. One picture would have to mix the
 three levels, which is exactly what makes reviewers unsure what each box is and which way data flows.
+
+## Interview questions
+### What are the four C4 levels, and why separate them?
+- **Levels:** System Context (the system as one box among people and external systems), Container
+  (deployables with technology), Component (modules inside one container), Code (classes, usually
+  generated).
+- **Why:** each level has one audience and one density of detail, so a reader always knows what a box
+  means; mixing levels is what makes ad-hoc diagrams unreadable.
+
+### Sketch the architecture of a RAG assistant using C4. Where do you start?
+- **Start with Context:** users, the system as one box, the identity provider, the document source and
+  the hosted model provider as external systems.
+- **Then Container:** web app, API, ingestion worker, LLM gateway, database with a vector extension, each
+  with technology and labelled arrows.
+- **Then one Dynamic view** of a chat request: resolve tenant, embed, search, assemble prompt, call
+  gateway, stream, meter.
+
+### Your diagrams are always out of date. How do you fix that?
+- **Move them to text in the repository** (Structurizr DSL or C4-PlantUML) so they change in the same
+  pull requests as the code.
+- **Use one model with several views** so a rename or deletion propagates and inconsistent views fail to
+  build.
+- **Render in CI and require diagram updates** in PRs that add or remove containers.
+
+### When would C4 not be enough?
+- **Threat modelling:** C4 has no trust-boundary element; a STRIDE-style review still wants a data-flow
+  diagram, though a good Deployment view covers most of it.
+- **Behaviour and protocols:** beyond numbered arrows, use sequence diagrams.
+- **Enterprise capability mapping:** heavier notations such as ArchiMate earn their cost there.
+
+### A diagram has forty boxes. What do you do?
+- **Split it:** about twenty elements is the practical ceiling, so move detail one level down into a
+  Component view of the container that matters.
+- **Replace breadth with stories:** a Container view plus two Dynamic views of the important requests
+  usually answers more questions than one dense picture.
 
 ## Quiz
 ### Q: In the C4 model, what does "container" mean?

@@ -5,7 +5,7 @@ name: Node.js / TypeScript
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: reviewed
+status: crisp
 related:
   - node-ts-for-ai/event-loop-and-microtask-queue
   - node-ts-for-ai/runtime-schema-validation
@@ -22,79 +22,101 @@ sources:
 ---
 
 ## TL;DR
-This is an orientation lesson; the deep dive is the `node-ts-for-ai` module. Node.js with TypeScript
-is where the product edge of an AI system lives: the web app, streaming chat routes, the
-backend-for-frontend, serverless functions, MCP servers and agent glue. It shares the frontend's
-language and its event loop proxies many concurrent streams cheaply. It is a poor home for inference,
-evals and data work, so most stacks put TypeScript at the edge and Python at the core, joined by an
-HTTP contract.
+Node.js with TypeScript runs the product edge of an AI system: UI streaming routes, BFFs, serverless
+functions, MCP servers. It proxies many streams cheaply but is a poor home for inference and evals, so
+Python owns the core. (Deep dive: `node-ts-for-ai`.)
 
 ## Why it exists
-AI products are mostly chat and streaming interfaces, and the web is built in TypeScript: React,
-Next.js and the server-side rendering frameworks that render them, the serverless and edge platforms
-that host them, and the Vercel AI SDK that streams model output into components. A team shipping a
-product cannot avoid TypeScript, and putting the request path that talks to the model next to the UI
-in the same language removes a translation layer, a deployment and a second on-call rota.
-
-The naive "everything in Python" plan fails at the edge: the frontend team does not write Python,
-SSR frameworks are TypeScript, and edge runtimes are built around V8 and JavaScript (where Python is
-offered at all, it runs through WebAssembly with a restricted package set). The naive "everything in
-TypeScript" plan fails at the core: training, fine-tuning, evaluation harnesses, tokenizers, vector
-and data tooling are Python-first, and rewriting them is not a project any product team wants. The
-honest outcome is a two-language system, and the real engineering question becomes where the boundary
-sits and how its contract is kept honest.
-
-Node fits the edge role for a mechanical reason. Its single-threaded event loop with non-blocking I/O
-handles thousands of concurrent streaming connections cheaply, which is what a chat gateway does all
-day: open an upstream stream, relay chunks, apply backpressure, close. What it does badly is the same
-thing Python does badly, CPU-bound work on the main thread, and unlike Python it has no deep native ML
-ecosystem (NumPy, PyTorch) to hand that work to.
+- **The web is built in TypeScript.** React, Next.js and the SSR frameworks that render them, the
+  serverless and edge platforms that host them, and the Vercel AI SDK that streams model output into
+  components. AI products are mostly chat and streaming interfaces, so a product team cannot avoid it.
+- **Same language as the UI removes overhead.** Putting the model-facing request path next to the UI
+  removes a translation layer, a deployment and a second on-call rota.
+- **"Everything in Python" fails at the edge.** The frontend team does not write Python, SSR frameworks are
+  TypeScript, and edge runtimes are built around V8; where Python is offered, it runs through WebAssembly
+  with a restricted package set.
+- **"Everything in TypeScript" fails at the core.** Training, fine-tuning, eval harnesses, tokenizers,
+  vector and data tooling are Python-first. The honest outcome is two languages; the real question is
+  where the boundary sits and how its contract stays honest.
+- **Node fits the edge for a mechanical reason.** Its single-threaded, non-blocking event loop holds
+  thousands of concurrent streams cheaply: open upstream, relay chunks, apply backpressure, close. It is
+  bad at CPU-bound main-thread work, like Python, but has no NumPy or PyTorch to hand that work to.
 
 ## How it works
 ### The event loop
-JavaScript runs on one thread; libuv provides a thread pool for file, DNS and crypto work and a loop
-that dispatches completed I/O callbacks. A request handler that awaits a network call costs a promise,
-not a thread, so concurrency is cheap. The corollary is that any synchronous CPU work on the main
-thread (parsing a 50 MB JSON body, tokenizing a book in pure JavaScript) stops every other request.
-The escape hatches are `worker_threads` for CPU-bound tasks and keeping heavy compute in the Python
-core, *because* nothing on the main thread can preempt a running function.
+- **One JavaScript thread.** libuv provides a thread pool for file, DNS and crypto work and a loop that
+  dispatches completed I/O callbacks.
+- **Waiting is cheap.** A handler awaiting a network call costs a promise, not a thread.
+- **The corollary.** Synchronous CPU work on the main thread (parsing a 50 MB JSON body, tokenizing a book
+  in pure JavaScript) stops every other request.
+- **Escape hatches.** `worker_threads` for CPU-bound tasks, and heavy compute kept in the Python core,
+  *because* nothing on the main thread can preempt a running function.
 
 ### Streams and backpressure
-Node 18 and later ship `fetch` and the Web Streams API globally, so a handler can read an upstream
-model stream chunk by chunk and write it to the client as it arrives. On the Node side, `res.write()`
-returns `false` once the response's internal buffer passes its high-water mark, meaning the client is
-reading slower than you are writing; honouring that signal (stop pulling from upstream, wait for
-`drain`) is what keeps memory flat when a slow browser consumes a fast model, and ignoring it is the
-classic way a streaming proxy runs out of memory. Web Streams express the same idea through
-`desiredSize` and pull-based reads, and `pipeTo` handles it for you.
+1. **Read upstream incrementally.** Node 18 and later ship `fetch` and the Web Streams API globally, so a
+   handler reads a model stream chunk by chunk and writes it to the client as it arrives.
+2. **Watch the write signal.** `res.write()` returns `false` once the response's internal buffer passes
+   its high-water mark: the client is reading slower than you write.
+3. **Honour it.** Stop pulling from upstream and wait for `drain`. That keeps memory flat when a slow
+   browser consumes a fast model; ignoring it is the classic way a streaming proxy runs out of memory.
+
+- **Web Streams express the same idea** through `desiredSize` and pull-based reads, and `pipeTo` handles
+  it for you.
 
 ### Cancellation
-The other direction matters as much for AI traffic: when the user closes the tab, the upstream model
-is still generating tokens you are billed for. Node signals the hang-up as a `close` event on the
-response before it finished writing; wiring that to an `AbortController` whose `signal` was passed to
-`fetch` tears down the upstream connection. That saves money only if the upstream in turn stops
-generating when its client disconnects, so check that both hops propagate cancellation.
+- **The problem.** When the user closes the tab, the upstream model keeps generating tokens you are billed
+  for.
+- **The signal.** Node reports the hang-up as a `close` event on the response before it finished writing.
+- **The wiring.** Connect that to an `AbortController` whose `signal` was passed to `fetch`, which tears
+  down the upstream connection.
+- **The caveat.** It saves money only if the upstream in turn stops generating when its client
+  disconnects, so check that both hops propagate cancellation.
 
 ### TypeScript: static types, no runtime
-TypeScript's types are erased at compile time. Inside your code they catch mistakes; at the boundary
-they guarantee nothing, *because* the data arrives at runtime from a model, a webhook or an API that
-never saw your types. That is why TypeScript AI code pairs a runtime schema library (Zod and similar)
-with inferred static types: one schema validates the LLM's JSON, derives the TypeScript type, and can
-be converted to JSON Schema for the model's tool definition. `strict` mode and exhaustive switches on
-discriminated unions are the other half of the discipline.
+- **Types are erased at compile time.** Inside your code they catch mistakes; at the boundary they
+  guarantee nothing, *because* data arrives at runtime from a model, a webhook or an API that never saw
+  your types.
+- **Pair a runtime schema with inferred types.** One Zod (or similar) schema validates the LLM's JSON,
+  derives the TypeScript type, and converts to JSON Schema for the model's tool definition.
+- **The other half of the discipline:** `strict` mode and exhaustive switches on discriminated unions.
 
 ### Where it fits in an AI system
-Typical Node/TS responsibilities: the chat UI and its streaming route handlers, a backend-for-frontend
-that adds auth and rate limits in front of the Python service, serverless functions and edge
-middleware, MCP servers exposing product data as tools, and agent orchestration through the OpenAI,
-Anthropic and Vercel SDKs. Typical Python responsibilities: model serving, RAG pipelines, evals,
-fine-tuning, batch data jobs. The boundary is an HTTP (often SSE) contract; generating the TypeScript
-client from the Python service's OpenAPI schema is how the two sides stay in sync.
+| Node/TypeScript | Python |
+|---|---|
+| chat UI and its streaming route handlers | model serving |
+| backend-for-frontend adding auth and rate limits in front of the Python service | RAG pipelines |
+| serverless functions and edge middleware | evals |
+| MCP servers exposing product data as tools | fine-tuning |
+| agent orchestration through the OpenAI, Anthropic and Vercel SDKs | batch data jobs |
 
-## Example
-A minimal Node gateway that relays a streaming response from the Python core while honouring
-backpressure and cancelling the upstream call when the client disconnects, plus a Zod schema that validates a model-produced tool call at runtime and provides the
-static type for free.
+- **The boundary is an HTTP (often SSE) contract.** Generating the TypeScript client from the Python
+  service's OpenAPI schema is how the two sides stay in sync.
+
+## Diagram
+The gateway relays chunks, pauses when the browser falls behind, and aborts the upstream call when the
+browser leaves.
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant G as Node gateway
+    participant P as Python core
+    B->>G: POST /chat
+    G->>P: fetch with AbortController signal
+    P-->>G: stream chunk
+    G-->>B: res.write chunk
+    Note over G: write returns false, wait for drain
+    B-->>G: drain, client caught up
+    P-->>G: next chunk
+    B--xG: tab closed, close event
+    G--xP: ac.abort cancels upstream
+```
+
+## Examples
+### Streaming gateway with backpressure, cancellation and Zod
+A minimal Node gateway that relays a streaming response from the Python core, honours backpressure,
+cancels the upstream call when the client disconnects, and validates a model-produced tool call at
+runtime with a Zod schema that also provides the static type for free.
 
 ```ts
 import http from "node:http";
@@ -139,39 +161,101 @@ const parsed = ToolCall.safeParse(JSON.parse('{"name":"lookup_order","arguments"
 if (!parsed.success) console.error(parsed.error.issues);   // never trust model output structurally
 ```
 
+### Measuring a blocked event loop, and the worker fix
+Runnable with Node alone (`node lag.mjs`). `perf_hooks.monitorEventLoopDelay` records how late the
+loop's timer fires, in nanoseconds.
+
+```js
+import { monitorEventLoopDelay } from "node:perf_hooks";
+import { Worker } from "node:worker_threads";
+
+const h = monitorEventLoopDelay({ resolution: 10 });     // sample loop delay every 10 ms
+h.enable();
+
+const busy = (ms) => { const end = Date.now() + ms; while (Date.now() < end); }; // sync CPU work
+
+async function phase(name, work) {
+  h.reset();
+  await new Promise((r) => setTimeout(r, 50));             // first sample after reset is a baseline
+  await work();
+  await new Promise((r) => setTimeout(r, 200));            // let the histogram take samples
+  console.log(`${name}: max loop delay ${(h.max / 1e6).toFixed(0)} ms`); // histogram is in ns
+}
+
+await phase("idle", async () => {});
+await phase("500 ms of CPU on the main thread", async () => busy(500));
+await phase("same 500 ms in a worker thread", () => new Promise((resolve) => {
+  const src = `const end = Date.now() + 500; while (Date.now() < end);
+               require("node:worker_threads").parentPort.postMessage("done");`;
+  new Worker(src, { eval: true }).once("message", resolve); // main loop stays free meanwhile
+}));
+// idle: ~11 ms   main thread: ~507 ms   worker thread: ~11 ms
+```
+
+### Worked scenario: why the gateway's memory climbed
+A gateway relays 500 concurrent chats. The model emits ~50 tokens per second; a slow mobile client
+reads ~10. Figures are illustrative.
+
+| Design | Per slow stream after 60 s | 500 streams |
+|---|---|---|
+| Ignore `res.write()` returning `false` | ~2,400 unsent tokens buffered and growing | memory climbs until the process dies |
+| Wait for `drain` before pulling more | about one high-water mark of buffer | flat; the upstream TCP window throttles the model stream |
+| Plus abort on `close` | buffer freed when the tab closes | upstream connections track client connections |
+
+## Production patterns
+- **Alert on event-loop delay.** Export `monitorEventLoopDelay` percentiles (p99, max) as a metric every
+  few seconds and reset the histogram; alert when p99 climbs. Rising lag across all routes points to sync
+  CPU work on the main thread.
+- **Move CPU work to a worker pool.** Tokenizing, large JSON transforms or hashing go to
+  `worker_threads` (often through a pool library such as Piscina) or to the Python core. Monitor pool
+  queue length and task duration.
+- **Abort upstream on disconnect.** Pass an `AbortController` signal to every upstream `fetch` and abort
+  on the response `close` event before it finished. Monitor the ratio of upstream to client
+  connections, and token spend against tokens delivered.
+- **Validate every boundary with a schema.** Parse model output, webhooks and third-party responses with
+  Zod `safeParse` and log `error.issues` with the prompt version. Track validation-failure rate per model
+  and prompt.
+- **Generate the client from OpenAPI.** Run a generator (for example openapi-typescript) over the Python
+  service's schema in CI and fail the build on a diff. That turns a renamed field into a compile error
+  instead of a silent `undefined`.
+
 ## Trade-offs
-- One language from browser to gateway cuts translation and team overhead, but the model, eval and
-  data ecosystem stays in Python, so you pay for a cross-language contract instead.
-- The event loop makes streaming proxies cheap, but any CPU-bound step on the main thread blocks
-  everyone; the balance flips when per-request compute grows and you need worker threads or Python.
-- Static types give refactoring safety, but they vanish at runtime, so every external boundary needs
-  a schema library and the duplication that comes with it.
-- Serverless and edge deployment is frictionless for Node, but long-running agent loops and large
-  streaming responses hit platform timeouts and body-size limits that a long-lived server never sees.
+- **One language vs a split ecosystem.** One language from browser to gateway cuts translation and team
+  overhead, but the model, eval and data ecosystem stays in Python, so you pay for a cross-language
+  contract instead.
+- **Cheap streaming vs CPU fragility.** The event loop makes streaming proxies cheap, but any CPU-bound
+  step on the main thread blocks everyone; it flips when per-request compute grows and you need worker
+  threads or Python.
+- **Static safety vs runtime blindness.** Types give refactoring safety but vanish at runtime, so every
+  external boundary needs a schema library and the duplication that comes with it.
+- **Frictionless serverless vs platform limits.** Serverless and edge deployment is easy for Node, but
+  long-running agent loops and large streaming responses hit platform timeouts and body-size limits a
+  long-lived server never sees.
 
 ## Pitfalls
-- Parsing and validating model output with a TypeScript cast (`as ToolCall`); the symptom is a
-  runtime `undefined is not a function` far from the boundary that produced the bad data.
-- Buffering a whole model stream before writing it to the client; the symptom is time-to-first-token
-  equal to total generation time and memory spikes under concurrent chats.
-- Not propagating client disconnects upstream; the symptom is token spend that exceeds what users
-  received, and open upstream connections that outnumber open client connections.
-- Running tokenization or large JSON transforms synchronously in a route handler; the symptom is
-  every concurrent request's latency rising together, visible as event-loop lag.
-- Letting the Python service's API and the hand-written TypeScript client drift; the symptom is a
-  field rename on one side surfacing as silent `undefined` on the other.
+- **Validating model output with a cast (`as ToolCall`).** Symptom: a runtime
+  `undefined is not a function` far from the boundary that produced the bad data. Fix: `safeParse`.
+- **Buffering the whole model stream before writing.** Symptom: time-to-first-token equals total
+  generation time, and memory spikes under concurrent chats.
+- **Not propagating client disconnects upstream.** Symptom: token spend exceeds what users received, and
+  open upstream connections outnumber open client connections.
+- **Sync tokenization or large JSON transforms in a route handler.** Symptom: every concurrent request's
+  latency rises together, visible as event-loop lag.
+- **A hand-written TypeScript client drifting from the Python API.** Symptom: a field rename on one side
+  surfaces as silent `undefined` on the other. Fix: generate it from OpenAPI.
 
 ## When to use
-Use Node/TypeScript for the layer that faces the product: UI streaming routes, a backend-for-frontend,
-serverless glue, MCP servers for product data, and lightweight agent orchestration where the SDKs are
-excellent. Keep inference, evaluation, fine-tuning and data pipelines in Python. If a team is entirely
-TypeScript and the AI work is API calls to a provider, a TypeScript-only stack is reasonable until
-evals or custom models appear. Measure event-loop lag (`perf_hooks.monitorEventLoopDelay` gives a
-histogram), heap and RSS under many concurrent slow streams, and the ratio of upstream to client
-connections; generate the client from
-OpenAPI rather than typing it by hand. In interviews, expect to explain why types are erased, how
-backpressure works in a streaming proxy, and where the Python boundary belongs. The `node-ts-for-ai`
-module goes deep on each.
+- **Use Node/TypeScript** for the layer facing the product: UI streaming routes, a backend-for-frontend,
+  serverless glue, MCP servers for product data, and lightweight agent orchestration where the SDKs are
+  excellent.
+- **Keep in Python:** inference, evaluation, fine-tuning and data pipelines.
+- **TypeScript-only is reasonable** if the team is entirely TypeScript and the AI work is API calls to a
+  provider, until evals or custom models appear.
+- **Measure:** event-loop lag (`perf_hooks.monitorEventLoopDelay` gives a histogram), heap and RSS under
+  many concurrent slow streams, and the ratio of upstream to client connections; generate the client from
+  OpenAPI rather than typing it by hand.
+- **Interviews:** explain why types are erased, how backpressure works in a streaming proxy, and where the
+  Python boundary belongs. The `node-ts-for-ai` module goes deep on each.
 
 ## Role lens
 - **Engineer:** Writes streaming route handlers, validates model output with Zod, keeps CPU work off
@@ -192,6 +276,43 @@ workflow; rewriting them in Node means maintaining ports of tools that move mont
 "anything that touches model weights, tokenizers or evaluation datasets is Python; anything that
 touches the user is TypeScript", with an OpenAPI-generated client as the contract so the second
 language costs a build step rather than a translation team.
+
+## Interview questions
+### Why does a TypeScript service still need runtime validation?
+- **Types are erased at compile time:** the emitted JavaScript has no knowledge of `ToolCall`, so a cast
+  only silences the compiler.
+- **Boundary data never saw your types:** model output, webhooks and third-party APIs can send anything.
+- **The fix is one schema for both:** Zod validates at runtime, `z.infer` derives the static type, and the
+  same schema can become the model's tool JSON Schema.
+
+### A Node streaming gateway's memory grows steadily under load until it is OOM-killed. How do you debug it?
+- **Suspect ignored backpressure:** check whether the relay keeps writing after `res.write()` returns
+  `false` instead of waiting for `drain`.
+- **Suspect leaked upstreams:** compare upstream and client connection counts; more upstreams means
+  disconnects are not aborting `fetch`.
+- **Confirm with a heap snapshot** under a slow-client load test, then add the `drain` wait and the
+  `AbortController` wiring and re-run.
+
+### When would you not put an AI feature's backend in Node?
+- **When it touches weights, tokenizers or eval datasets:** that tooling is Python-first, and ports lag.
+- **When per-request CPU work is heavy:** the single JavaScript thread blocks everyone, and Node has no
+  NumPy-class native ecosystem to offload to.
+- **When serverless limits bite:** long agent loops or big streams hit platform timeouts and body-size
+  limits.
+
+### How would you keep a TypeScript frontend and a Python AI service in sync as both evolve?
+- **Single source of truth:** the Python service's Pydantic models generate its OpenAPI schema.
+- **Generated client:** CI generates TypeScript types from that schema and fails on an unreviewed diff,
+  so a rename breaks the build, not production.
+- **Compatibility rules:** additive changes only within a version, plus contract tests on the boundary.
+
+### A user closes the tab halfway through a long answer. What should happen, and how do you verify it?
+- **Gateway:** the response `close` event fires before the write finished; abort the `AbortController`
+  passed to `fetch`, which closes the upstream connection.
+- **Core:** the Python service must notice the disconnect and stop generation, or the abort saves
+  nothing; both hops must propagate cancellation.
+- **Verify:** load-test with clients that disconnect early and compare tokens generated against tokens
+  delivered.
 
 ## Quiz
 ### Q: Why must a TypeScript service validate an LLM's JSON output with a runtime schema even though the response type is declared?

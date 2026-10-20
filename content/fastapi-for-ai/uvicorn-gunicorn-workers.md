@@ -91,6 +91,26 @@ workers per GPU: usually 1, because each process would load its own copy of the 
 - **Multiple workers per pod** still make sense when pods are large and per-pod overhead (sidecars, memory
   reserved for the model) is significant.
 
+## Diagram
+The Gunicorn master serves nothing: it forks workers, watches their heartbeats and replaces them. Each
+worker is a full process with its own event loop, pools and model copy, which is why memory caps the count.
+
+```mermaid
+flowchart TD
+    K["Kernel: shared listening socket"] -->|"spreads connections"| W1
+    K -->|"spreads connections"| W2
+    M["Gunicorn master, serves no requests"] -->|"fork"| W1["Worker 1: event loop, pools, model copy"]
+    M -->|"fork"| W2["Worker 2: event loop, pools, model copy"]
+    W1 -.->|"heartbeat"| M
+    W2 -.->|"heartbeat"| M
+    M --> T{"Heartbeat missed for the timeout, 30 s default?"}
+    T -->|"yes, loop blocked"| X["Kill and replace worker"]
+    M --> R{"Served max requests plus jitter?"}
+    R -->|"yes"| G["Graceful recycle within the graceful timeout"]
+    W1 -->|"RSS adds up"| L["Pod memory limit"]
+    W2 -->|"RSS adds up"| L
+```
+
 ## Examples
 ### Worked sizing: API with a local CPU reranker
 A FastAPI retrieval service calls a hosted LLM over HTTP and runs a local cross-encoder reranker on CPU.
@@ -229,6 +249,45 @@ workers would help. But if the event loop is blocked by a synchronous call (a sy
 JSON over large payloads), more workers only spread the stall. I would check event-loop lag and per-core
 usage. If the loop is CPU-bound on legitimate work, adding workers (or replicas) is right, checking that
 memory and DB connection limits allow it. If something blocks, fix it with an async client or a thread pool.
+
+## Interview questions
+### What is the difference between Uvicorn and Gunicorn, and why would you run both?
+- **Uvicorn is the ASGI server:** it opens the socket, parses HTTP and runs the asyncio event loop that
+  calls your FastAPI app.
+- **Gunicorn is a pre-fork process manager:** its master forks workers, kills those that miss the
+  heartbeat for `--timeout`, recycles them after `--max-requests` and passes signals through.
+- **Together** (`-k uvicorn_worker.UvicornWorker`) you get async request handling plus in-host
+  supervision, useful on VMs and large pods.
+
+### How would you choose the worker count when each worker, model included, uses 3 GiB of RSS?
+- **Memory first:** workers ≤ (container memory − headroom) ÷ per-worker RSS, so on
+  an 8 GiB pod with 1.6 GiB headroom, 6.4 ÷ 3 rounds down to 2 workers.
+- **Then CPU:** async workers start near one per core, but memory is the binding limit here.
+- **Then concurrency:** Little's law (rate × latency) divided by workers must stay under each worker's
+  HTTP pool, or raise the pool or add replicas.
+- **If weights dominate RSS**, move the model to a separate model server instead.
+
+### Gunicorn logs WORKER TIMEOUT under load and in-flight requests fail. What is happening?
+- **The async worker's heartbeat runs on the event loop,** so a blocking call (synchronous inference,
+  a sync HTTP client) stops the heartbeat and the master kills the worker after `--timeout`, 30 s by
+  default.
+- **Raising `--timeout` is a workaround:** every other request on that worker still stalls while the loop
+  is blocked.
+- **The fix:** move the work off the loop, with `run_in_threadpool` for GIL-releasing libraries or a
+  process pool for pure Python, then lower the timeout again.
+
+### On Kubernetes, when would you not use Gunicorn at all?
+- **For an I/O-bound gateway, one Uvicorn process per pod is often simpler**, because the orchestrator
+  already restarts dead processes and scales replicas, and per-pod memory and metrics stay easy to read.
+- **Keep Gunicorn** when pods are large and per-pod overhead (sidecars, model memory) makes several
+  workers per pod cheaper, or when you need `--max-requests` recycling for a native leak.
+
+### Why is --preload risky for a GPU model service?
+- **`--preload` imports the app in the master before forking**, sharing read-only pages copy-on-write.
+- **CUDA must not be initialised before a fork,** so a model loaded on the GPU in the master breaks the
+  children; sockets, threads and some client pools created before fork also misbehave.
+- **So:** load GPU models and create pools per worker in lifespan, after the fork, and usually run one
+  worker per GPU.
 
 ## Quiz
 ### Q: Why does adding Uvicorn workers help a CPU-bound FastAPI service but barely help a slow I/O-bound one?

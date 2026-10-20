@@ -5,7 +5,7 @@ name: Positional encoding (RoPE)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - model-internals/self-attention
   - model-internals/context-window
@@ -22,101 +22,134 @@ sources:
 ---
 
 ## TL;DR
-Self-attention treats its input as a set, so a transformer needs an explicit signal for token order.
-Early models added a sinusoid or learned vector per absolute position to the embeddings. RoPE instead
-rotates each query and key by an angle proportional to its position, so their dot product depends only
-on their distance apart. That relative property, zero parameters and clean interaction with the KV cache
-made RoPE the default in open LLMs, and context extension is mostly about stretching those angles.
+Self-attention sees a set, so transformers need an order signal. RoPE rotates each query and key by an
+angle proportional to position, so their dot product depends only on distance. It is the open-LLM
+default; context extension means stretching those angles.
 
 ## Why it exists
-Without position information, self-attention gives identical per-token outputs for "dog bites man" and
-"man bites dog"; permuting the input permutes the output and nothing else. Order has to be injected, and
-a good scheme has to satisfy several demands at once: every position must be distinguishable; the model
-must be able to learn *relative* offsets, because most linguistic structure is local (adjective before
-noun, matching brackets, the previous token); it should degrade gracefully past the lengths seen in
-training; and it must be cheap and compatible with caching keys and values.
+- **Attention is order-blind.** Without position information, "dog bites man" and "man bites dog" give
+  identical per-token outputs; permuting the input permutes the output and nothing else.
+- **A good scheme must do four things at once:** make every position distinguishable; let the model learn
+  *relative* offsets, because most linguistic structure is local (adjective before noun, matching
+  brackets, the previous token); degrade gracefully past trained lengths; and be cheap and compatible
+  with caching keys and values.
+- **Earlier schemes each missed something** (table below): additive signals get mixed into content,
+  learned tables hard-cap context, relative biases complicate the kernel and still extrapolate poorly.
+- **RoPE encodes absolute position as a rotation** of queries and keys, so `qₘ·kₙ` depends only on
+  `n − m` and the contents. No parameters, only a cheap elementwise rotation, any attention kernel, and
+  cached keys stay valid as the sequence grows.
+- **ALiBi is the main alternative.** It adds a fixed distance penalty to the scores; it extrapolates
+  better out of the box but imposes a recency prior that can hurt long-range retrieval. The open-model
+  ecosystem converged on RoPE.
 
-The original transformer added fixed sinusoidal vectors to the embeddings, chosen because a shift by
-*k* positions is a linear function of the sinusoids, so relative offsets are in principle learnable.
-But the signal is added once at the input, gets mixed into values and content, and the model has to
-disentangle it. GPT-2 and BERT replaced sinusoids with a learned table, one vector per position, which
-is simple and strong at trained lengths but hard-caps the context at the table size and leaves rarely
-seen positions undertrained. Relative-position schemes (Shaw et al., the T5 bias) add a learned bias per
-offset directly to the attention scores, a better inductive bias, but they bucket offsets, add a term to
-the attention kernel and still extrapolate poorly.
-
-RoPE's move is to encode absolute position as a rotation of the query and key vectors, so that the score
-`qₘ·kₙ` depends only on `n − m` and the contents. It needs no parameters, adds nothing to the score
-computation beyond a cheap elementwise rotation, works with any attention kernel, and lets cached keys
-stay valid as the sequence grows. ALiBi, the main alternative, instead adds a fixed distance penalty to
-the scores; it extrapolates better out of the box but imposes a recency prior that can hurt long-range
-retrieval. The open-model ecosystem converged on RoPE.
+| Scheme | How | Strength | Weakness |
+|---|---|---|---|
+| Sinusoidal (original transformer) | fixed vectors added to embeddings | a shift by *k* positions is a linear function of the sinusoids, so offsets are learnable in principle | added once at the input, mixed into values and content; the model must disentangle it |
+| Learned table (GPT-2, BERT) | one vector per position | simple and strong at trained lengths | hard-caps context at the table size; rarely seen positions undertrained |
+| Relative bias (Shaw et al., T5) | learned bias per offset added to scores | better inductive bias | buckets offsets, adds a term to the kernel, still extrapolates poorly |
+| RoPE | rotate q and k by position | relative, parameter-free, cache-friendly | extrapolates poorly past trained length |
+| ALiBi | fixed distance penalty on scores | extrapolates out of the box | recency prior |
 
 ## How it works
 ### The rotation
-Split the head dimension *d* into d/2 pairs. Pair *i* is assigned a frequency `θ_i = base^(−2i/d)`, with
-base = 10,000 in the original paper and Llama 2 and 500,000 in Llama 3. A vector at position *m* has each
-pair rotated by the angle `m·θ_i`:
+1. Split the head dimension *d* into d/2 pairs.
+2. Give pair *i* a frequency `θ_i = base^(−2i/d)`, with base = 10,000 in the original paper and Llama 2,
+   and 500,000 in Llama 3.
+3. At position *m*, rotate each pair by the angle `m·θ_i`:
 
 ```
 [x, y] -> [x·cos(mθ_i) − y·sin(mθ_i),  x·sin(mθ_i) + y·cos(mθ_i)]
 ```
 
-This is applied to queries and keys, **not** to values. Why the dot product becomes relative: a 2-D
-rotation matrix satisfies `R_mᵀ·R_n = R_(n−m)`, so `(R_m q)·(R_n k) = q·R_(n−m) k`. The absolute positions
-cancel; only the offset and the contents remain. Values are left alone because they carry content that
-is summed into the output; rotating them would scramble what is retrieved by where it sits, whereas
-positions should only influence *who attends to whom*.
+4. Apply it to queries and keys, **not** to values.
+
+Why it works:
+- **The dot product becomes relative.** A 2-D rotation matrix satisfies `R_mᵀ·R_n = R_(n−m)`, so
+  `(R_m q)·(R_n k) = q·R_(n−m) k`. The absolute positions cancel; only the offset and the contents remain.
+- **Values are left alone** because they carry content summed into the output. Rotating them would
+  scramble what is retrieved by where it sits; positions should only influence *who attends to whom*.
 
 ### Frequencies and what they encode
-Pair 0 rotates one radian per token and wraps every ~6 tokens, so it resolves very local order. The
-slowest pair, with d = 128 and base 10,000, turns by about 27° across 4,096 tokens and completes a full
-rotation only every ~54,000 tokens, so within a typical context it barely moves and acts as a
-near-absolute, long-range channel. Raising the base to 500,000 leaves pair 0 at one radian per token and
-slows every other pair, increasingly so toward the slow end; the slowest pair then needs about 2.5
-million tokens for a full turn, so more pairs stay inside the arc they saw in training at long range. The spread of frequencies lets different dimensions
-specialize in different ranges, the same geometric schedule the sinusoidal encoding used additively.
-The RoPE paper also shows that the inner product between a fixed query and key decays with distance on
-average, a built-in mild preference for nearby tokens.
+| Pair | Behaviour (d = 128) | Role |
+|---|---|---|
+| Pair 0 | one radian per token, wraps every ~6 tokens | very local order |
+| Slowest pair, base 10,000 | about 27° across 4,096 tokens; full rotation every ~54,000 tokens | near-absolute, long-range channel |
+| Slowest pair, base 500,000 | full turn needs about 2.5 million tokens | more pairs stay inside the arc seen in training at long range |
+
+- **Raising the base** to 500,000 leaves pair 0 at one radian per token and slows every other pair,
+  increasingly so toward the slow end.
+- **The spread lets dimensions specialize** in different ranges, the same geometric schedule the
+  sinusoidal encoding used additively.
+- **A mild recency preference.** The RoPE paper shows the inner product between a fixed query and key
+  decays with distance on average.
 
 ### Implementation
-Two equivalent layouts exist: interleaved pairs `(2i, 2i+1)` as in the paper and in Meta's reference
-Llama code (which multiplies complex numbers), or "rotate-half", which pairs dimension *i* with
-*i + d/2* and computes `q·cos + rotate_half(q)·sin`, as in the Hugging Face Llama implementation. They
-differ by a permutation of dimensions, and the permutation is baked into trained `W_Q` and `W_K`, so
-converting checkpoints between layouts requires permuting those weights; the official conversion script
-does exactly that, and forgetting it is a classic porting bug. The cos/sin tables `[max_len, d/2]` are
-precomputed, usually in fp32, and applied after the Q/K projections and before the score matmul. The
-order matters: rotating the hidden state *before* `W_Q` and `W_K` would put the projection matrices
-between the two rotations and destroy the `R_mᵀ·R_n = R_(n−m)` cancellation. Some families rotate only a
-fraction of each head's dimensions (`partial_rotary_factor` or `rotary_pct` in configs) and leave the
-rest position-free, so check the config rather than assuming the whole head is rotated.
+Two equivalent layouts exist:
+
+| Layout | Pairs | Where |
+|---|---|---|
+| Interleaved | `(2i, 2i+1)` | the paper and Meta's reference Llama code (which multiplies complex numbers) |
+| Rotate-half | dimension *i* with *i + d/2*, computed as `q·cos + rotate_half(q)·sin` | the Hugging Face Llama implementation |
+
+- **They differ by a permutation baked into trained `W_Q` and `W_K`**, so converting checkpoints between
+  layouts requires permuting those weights. The official conversion script does exactly that; forgetting
+  it is a classic porting bug.
+- **Tables:** cos/sin `[max_len, d/2]` are precomputed, usually in fp32.
+- **Order:** apply after the Q/K projections and before the score matmul. Rotating the hidden state
+  *before* `W_Q` and `W_K` puts the projections between the two rotations and destroys the
+  `R_mᵀ·R_n = R_(n−m)` cancellation.
+- **Partial rotation.** Some families rotate only a fraction of each head's dimensions
+  (`partial_rotary_factor` or `rotary_pct` in configs) and leave the rest position-free, so check the
+  config rather than assuming the whole head is rotated.
 
 ### Interaction with the KV cache
-Each key is rotated by its own absolute position when it is inserted into the cache, and each query by
-its position at query time; the relative property emerges in the dot product, so nothing in the cache
-needs re-rotation as the sequence grows. The consequences follow: evicting tokens from the front of a
-sliding-window cache leaves the survivors at their original absolute angles (streaming schemes re-assign
-positions inside the cache for this reason), and editing anything before position *i* invalidates every
-cached key from *i* onward.
+- **Rotate once, at insertion.** Each key is rotated by its own absolute position when cached, and each
+  query by its position at query time. The relative property emerges in the dot product, so nothing in
+  the cache needs re-rotation as the sequence grows.
+- **Front eviction keeps old angles.** Evicting from the front of a sliding-window cache leaves the
+  survivors at their original absolute angles; streaming schemes re-assign positions inside the cache
+  for this reason.
+- **Edits invalidate.** Changing anything before position *i* invalidates every cached key from *i*
+  onward.
 
 ### Context extension
 Past the training length, the low-frequency pairs reach angles the model never saw, attention patterns
-break and perplexity rises sharply soon after the limit. Position interpolation
-(Chen et al.) rescales positions by `L_train / L_new` so all angles stay inside the trained range, then
-fine-tunes briefly; it works but squeezes the high-frequency pairs, costing resolution between adjacent
-tokens. NTK-aware scaling instead raises the base, which stretches low frequencies a lot and high ones
-little. YaRN combines per-frequency treatment, leaving high frequencies untouched and interpolating low
-ones, with a temperature on the logits, and needs fewer fine-tuning tokens. Llama 3.1's 128k context uses
-a frequency-dependent scaling of this family on top of an 8k-trained base. The common lesson is that
-"max context" is a property of the trained angles, not of a config field.
+break and perplexity rises sharply soon after the limit.
+
+| Method | What it does | Cost |
+|---|---|---|
+| Position interpolation (Chen et al.) | rescales positions by `L_train / L_new` so all angles stay in the trained range, then fine-tunes briefly | squeezes high-frequency pairs, costing resolution between adjacent tokens |
+| NTK-aware scaling | raises the base: stretches low frequencies a lot, high ones little | a heuristic; still benefits from tuning |
+| YaRN | per-frequency treatment (high frequencies untouched, low ones interpolated) plus a temperature on the logits | needs fewer fine-tuning tokens, more knobs |
+| Llama 3.1 | frequency-dependent scaling of this family on an 8k-trained base | reaches 128k context |
+
+The common lesson: "max context" is a property of the trained angles, not of a config field.
 
 ### ALiBi, briefly
-ALiBi adds `−slope_h·(i − j)` to the score of query *i* and key *j ≤ i*, with per-head slopes forming a
-geometric series. No parameters, decent extrapolation, used by BLOOM and MPT; its recency bias is the
-trade.
+- **Mechanism:** adds `−slope_h·(i − j)` to the score of query *i* and key *j ≤ i*, with per-head slopes
+  forming a geometric series.
+- **Profile:** no parameters, decent extrapolation, used by BLOOM and MPT; its recency bias is the trade.
 
-## Example
+## Diagram
+Where the rotation sits in one attention layer: after the projections, on queries and keys only, with
+keys cached already rotated by their own positions.
+
+```mermaid
+flowchart TD
+    H["Hidden state at position m"] --> PQ["Q projection"]
+    H --> PK["K projection"]
+    H --> PV["V projection"]
+    PQ -->|"rotate by m times theta"| RQ["Rotated query"]
+    PK -->|"rotate by m times theta"| RK["Rotated key"]
+    RK --> C[("KV cache: keys stored rotated")]
+    PV -->|"no rotation"| C
+    RQ --> S["Score depends on n minus m"]
+    C --> S
+    S --> A["Softmax and weighted sum of V"]
+```
+
+## Examples
+### RoPE in NumPy: the relative property and why extrapolation fails
 A minimal RoPE in NumPy that demonstrates the relative property numerically and shows why extension
 beyond the trained length needs care.
 
@@ -152,41 +185,92 @@ print(f"slowest pair: {np.degrees(4096 * theta_min):.1f} degrees over 4096 token
 # Position interpolation: rope(x, pos * L_train / L_new) keeps every pair inside its trained range.
 ```
 
+### Worked scenario: stretching a 4k model to 8k
+Angles for d = 128, base 10,000, trained at 4,096 tokens, served at 8,192 (computed with the formulas
+above):
+
+| Setting | Slowest pair at position 8,191 | Trained range | Adjacent-token step, fastest pair |
+|---|---|---|---|
+| No scaling | 54.2° | up to 27.1° | 1.00 rad |
+| Position interpolation (factor 2) | 27.1° | up to 27.1° | 0.50 rad |
+
+- **No scaling** pushes slow pairs to angles never seen in training, so attention breaks right after
+  4k.
+- **Interpolation** keeps every angle in range but halves local resolution, which the short fine-tune
+  recovers.
+
+### Correct position ids for a left-padded batch
+Positions must come from the attention mask, not from the padded index, or shorter prompts get shifted
+angles. This mirrors what Hugging Face generation does internally.
+
+```python
+import torch
+
+attention_mask = torch.tensor([[0, 0, 1, 1, 1],      # short prompt, left-padded
+                               [1, 1, 1, 1, 1]])     # longest prompt
+position_ids = attention_mask.long().cumsum(-1) - 1  # real tokens count from 0
+position_ids.masked_fill_(attention_mask == 0, 1)    # pad slots get a dummy id; they are masked anyway
+print(position_ids)
+# tensor([[1, 1, 0, 1, 2],
+#         [0, 1, 2, 3, 4]])
+# During decode, the next position is the cache length per sequence, not the step counter.
+```
+
+## Production patterns
+- **Read the angles before trusting max context.** Check `rope_theta`, `rope_scaling` and
+  `max_position_embeddings` in `config.json` and the model card's trained length. Treat any context above
+  the trained or officially extended length as unsupported until evaluated.
+- **Enable vendor-documented scaling only.** When a model family documents YaRN for longer inputs, add the
+  `rope_scaling` block it specifies (type, factor and original length) to the config or the engine's
+  override. Monitor short-context eval scores too, since static scaling can cost quality on short inputs.
+- **Evaluate extension at the target length.** Run needle-in-a-haystack and real long-document tasks at
+  the lengths you will serve, not just perplexity. Alert when production context-length p95 approaches the
+  evaluated limit.
+- **Test ported checkpoints for layout bugs.** After converting weights between interleaved and
+  rotate-half code, compare perplexity on known text with the source implementation; a value in the
+  hundreds means the Q/K permutation was skipped. Run it in CI for every conversion.
+- **Derive position ids from mask and cache length.** For left-padded batches use the cumulative-sum
+  pattern above, and keep cos/sin tables in fp32. Test that one prompt gives identical output alone and in
+  a batch.
+
 ## Trade-offs
-- RoPE gives relative attention with zero parameters and a cache that never needs re-rotation, but it
-  extrapolates poorly past the trained length; if you need length generalization with no fine-tuning,
-  ALiBi's fixed penalty behaves better out of the box.
-- Learned absolute tables are simple and strong at trained lengths, with a hard cap on context; they
-  remain reasonable for fixed-length encoders and wrong for anything that must grow.
-- A larger base (500,000 versus 10,000) improves long-context behaviour by slowing the middle and low
-  frequencies, at the cost of fewer pairs that distinguish offsets in the hundreds-to-thousands range;
-  whether that costs short-context quality depends on model and data, and vendors tune it empirically.
-- Position interpolation is simple and robust after a short fine-tune but blurs local resolution; YaRN
-  preserves high frequencies and needs fewer tokens but has more knobs to get wrong.
+- **RoPE vs ALiBi.** RoPE gives relative attention with zero parameters and a cache that never needs
+  re-rotation, but extrapolates poorly past the trained length. If you need length generalization with no
+  fine-tuning, ALiBi's fixed penalty behaves better out of the box.
+- **Learned absolute tables vs growth.** Simple and strong at trained lengths, with a hard cap on context.
+  Reasonable for fixed-length encoders; wrong for anything that must grow.
+- **Larger base vs mid-range resolution.** A larger base (500,000 versus 10,000) improves long-context
+  behaviour by slowing the middle and low frequencies, at the cost of fewer pairs that distinguish
+  offsets in the hundreds-to-thousands range. Whether that costs short-context quality depends on model
+  and data, and vendors tune it empirically.
+- **Interpolation vs YaRN.** Position interpolation is simple and robust after a short fine-tune but
+  blurs local resolution; YaRN preserves high frequencies and needs fewer tokens but has more knobs to get
+  wrong.
 
 ## Pitfalls
-- Mixing the interleaved and rotate-half layouts when loading ported weights; the symptom is a model with
-  correct shapes and no errors whose perplexity is in the hundreds.
-- Feeding wrong position ids: restarting at 0 on each decode step, or counting pad tokens in a
-  left-padded batch; the symptom is output that is fine for the longest prompt in a batch but degraded
-  for shorter ones, or quality that drops right after the first generated token. Positions must come
-  from the attention mask and the cache length.
-- Running past `max_position_embeddings` with no scaling; the symptom is output that degenerates into
+- **Mixing the interleaved and rotate-half layouts** when loading ported weights. Symptom: correct shapes,
+  no errors, perplexity in the hundreds.
+- **Feeding wrong position ids:** restarting at 0 on each decode step, or counting pad tokens in a
+  left-padded batch. Symptom: output fine for the longest prompt but degraded for shorter ones, or quality
+  that drops right after the first generated token. Positions must come from the attention mask and the
+  cache length.
+- **Running past `max_position_embeddings` with no scaling.** Symptom: output that degenerates into
   repetition or nonsense right after the trained length, with no exception raised.
-- Computing the cos/sin tables in bf16 or fp16 for large positions; the symptom is slowly degrading
-  quality at high positions caused by rounding of large angles. Keep the frequency computation in fp32.
-- Setting `rope_scaling` in a serving config without the fine-tuning the method assumes; the symptom is
+- **Computing the cos/sin tables in bf16 or fp16 for large positions.** Symptom: slowly degrading quality
+  at high positions caused by rounding of large angles. Keep the frequency computation in fp32.
+- **Setting `rope_scaling` in a serving config without the fine-tuning the method assumes.** Symptom:
   degraded short-context quality and only partial recovery at long context.
 
 ## When to use
 You choose a positional scheme indirectly by choosing a model, but you meet it directly in three places:
-reading `rope_theta` and `rope_scaling` in a config to know what context the model really supports,
-running a context-extension project (interpolation or YaRN plus a fine-tune, evaluated at the target
-length with needle-in-haystack and real tasks, not just perplexity), and debugging ported checkpoints
-or custom kernels where the rotation layout matters. Measure quality at the lengths you will actually
-serve, because the loss past the trained length is a cliff, not a slope. In interviews, be ready to
-derive the relative property from rotation composition, explain why only queries and keys are rotated,
-and describe why extrapolation fails and how interpolation fixes it.
+- **Reading a config:** `rope_theta` and `rope_scaling` tell you what context the model really supports.
+- **Context-extension projects:** interpolation or YaRN plus a fine-tune, evaluated at the target length
+  with needle-in-haystack and real tasks, not just perplexity.
+- **Debugging ported checkpoints or custom kernels**, where the rotation layout matters.
+- **Measure** quality at the lengths you will actually serve, because the loss past the trained length is
+  a cliff, not a slope.
+- **Interviews:** derive the relative property from rotation composition, explain why only queries and
+  keys are rotated, and describe why extrapolation fails and how interpolation fixes it.
 
 ## Role lens
 - **Engineer:** Sets `rope_scaling` correctly when serving extended context, verifies the rotation
@@ -208,6 +292,36 @@ arc, so the model's weights are tuned to scores produced within that arc. At pos
 enter angles never seen, the scores they contribute are effectively random, attention patterns break and
 perplexity climbs. Position interpolation rescales positions so 8k maps into
 the trained arc, then a short fine-tune restores quality.
+
+## Interview questions
+### Why does RoPE rotate queries and keys but not values?
+- **Position should decide who attends to whom**, which is the q·k score; rotating both makes that score
+  depend only on the offset n − m.
+- **Values carry content** that is summed into the output; rotating them would make the retrieved content
+  depend on where it sat, which is not what attention should return.
+
+### A ported Llama checkpoint loads cleanly but has perplexity in the hundreds. What do you suspect?
+- **A rotation-layout mismatch.** Interleaved and rotate-half layouts differ by a permutation baked into
+  `W_Q` and `W_K`; converting without permuting those weights breaks every score.
+- **Also check** `rope_theta`, partial rotary settings and whether RoPE is applied after the projections,
+  then compare perplexity with the source implementation on the same text.
+
+### A customer asks to raise max tokens from 8k to 64k by editing the config. What do you say?
+- **The trained angles bound reliable behaviour**, not the config field; past the trained length slow
+  pairs hit unseen angles and quality falls off a cliff.
+- **Options:** use a model trained or officially extended to that length, apply interpolation or YaRN with
+  the fine-tune it assumes and evaluate at 64k, or use retrieval to keep inputs short.
+
+### When would you prefer ALiBi over RoPE?
+- **When you need length extrapolation with no fine-tuning**, since ALiBi's fixed distance penalty
+  degrades more gracefully past the trained length.
+- **Not when long-range retrieval matters**, because its built-in recency bias can suppress attention to
+  distant but relevant tokens.
+
+### What does raising rope_theta from 10,000 to 500,000 change, in numbers?
+- **Pair 0 is unchanged** at one radian per token; every slower pair turns more slowly.
+- **The slowest pair (d = 128)** goes from a full turn every ~54,000 tokens to about 2.5 million, so more
+  pairs stay inside angles seen in training at long range, at some cost in mid-range offset resolution.
 
 ## Quiz
 ### Q: In RoPE, which tensors are rotated?

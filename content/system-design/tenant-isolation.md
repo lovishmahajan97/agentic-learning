@@ -5,7 +5,7 @@ name: Tenant isolation
 kind: pattern
 difficulty: advanced
 est_minutes: 18
-status: reviewed
+status: crisp
 related:
   - system-design/multi-tenancy
   - safety-security/cross-tenant-data-leakage
@@ -22,114 +22,138 @@ sources:
 ---
 
 ## TL;DR
-Tenant isolation is the set of controls that make the "each tenant is alone" promise of multi-tenancy
-true even when application code is wrong. It layers independent mechanisms, scoped credentials,
-database-enforced row policies, partitioned indexes and caches, per-tenant quotas and tenant-tagged
-telemetry, so that a single bug cannot leak data or performance across tenants. In AI systems the
-prompt is a new exfiltration path: anything retrieved, remembered or cached under the wrong tenant key
-is read out loud by the model.
+Tenant isolation layers independent controls (scoped credentials, database row policies, partitioned
+indexes and caches, quotas, tagged telemetry) so one bug cannot leak data or performance across tenants.
+In AI systems the prompt is a new exfiltration path.
 
 ## Why it exists
-Multi-tenancy establishes a tenant identity and tells every layer to respect it. Isolation is what you
-build because some layer, some day, will not. A developer adds an admin report that forgets the filter;
-an ORM relationship lazy-loads across the tenant column; a background job runs with no tenant in context
-and queries everything; a cache key omits the tenant; a retrieval call passes the filter as a soft
-re-ranking hint instead of a hard constraint. Each is an ordinary mistake, and in a classic SaaS it
-produces a wrong row on a screen. In an LLM product the wrong row becomes part of a prompt, and the model
-helpfully summarises another company's contract to the user.
-
-The naive answer, "we filter everything in the application layer and we have tests", fails because it
-has a single point of failure: the discipline of every engineer on every code path forever. Reviews
-catch most omissions; the leak comes from the one they miss, and it is discovered by a customer. The
-second naive answer, "give every tenant their own database", is isolation by cost: correct but
-unaffordable at scale, and it still leaves compute, caches, model servers, logs and agent credentials
-shared.
-
-Isolation therefore means **defence in depth**: at least two independent mechanisms between any tenant
-and any other tenant's data, performance and secrets, such that the application being wrong is not
-sufficient to cause a leak. It also means being able to *prove* that to a security reviewer, which is why
-the mechanisms must be enforceable and testable rather than conventions.
+- **Some layer, some day, will not respect the tenant.** Multi-tenancy tells every layer to; isolation is
+  what you build for when one does not. Typical misses: an admin report without the filter, an ORM
+  relationship lazy-loading across the tenant column, a background job with no tenant in context, a cache
+  key without the tenant, a retrieval filter passed as a soft re-ranking hint.
+- **In an LLM product a wrong row is read aloud.** In classic SaaS each mistake shows a wrong row on a
+  screen. Here the row becomes part of a prompt, and the model helpfully summarises another company's
+  contract to the user.
+- **"We filter in the app and have tests" is a single point of failure:** the discipline of every
+  engineer on every code path forever. Reviews catch most omissions; the leak comes from the one they
+  miss, and a customer discovers it.
+- **"A database per tenant" is isolation by cost.** Correct but unaffordable at scale, and compute,
+  caches, model servers, logs and agent credentials stay shared anyway.
+- **So: defence in depth you can prove.** At least two independent mechanisms between any tenant and any
+  other tenant's data, performance and secrets, so the app being wrong is not enough to leak. They must be
+  enforceable and testable, *because* you must show a security reviewer, not assert.
 
 ## How it works
 ### The dimensions you are isolating
-Isolation is not one property. A review should walk through each dimension and name the control:
+Isolation is not one property. A review walks each dimension and names its control:
 
-1. **Data at rest and in query.** Who can read which rows, documents, embeddings and files.
-2. **Performance.** One tenant's load must not become another's latency; noisy-neighbour control.
-3. **Secrets and credentials.** A tenant's connector tokens, API keys and encryption keys are usable only
-   in that tenant's work.
-4. **Execution.** Agent tool calls and generated code run in a sandbox scoped to the tenant.
-5. **Configuration and lifecycle.** Prompt versions, model choices and feature flags are per tenant, and
-   a tenant can be migrated, suspended or deleted on its own.
-6. **Telemetry.** Logs, traces and evaluation samples carry the tenant tag and are access-controlled by
-   it, because support staff reading traces is itself a cross-tenant read.
-7. **Residency.** Data and inference stay in the tenant's required region or environment.
+| # | Dimension | What must hold |
+|---|---|---|
+| 1 | **Data at rest and in query** | Who can read which rows, documents, embeddings and files |
+| 2 | **Performance** | One tenant's load must not become another's latency (noisy-neighbour control) |
+| 3 | **Secrets and credentials** | Connector tokens, API keys and encryption keys usable only in that tenant's work |
+| 4 | **Execution** | Agent tool calls and generated code run in a sandbox scoped to the tenant |
+| 5 | **Configuration and lifecycle** | Prompt versions, models and flags per tenant; a tenant can be migrated, suspended or deleted alone |
+| 6 | **Telemetry** | Logs, traces and eval samples carry the tenant tag and are access-controlled by it, because support staff reading traces is itself a cross-tenant read |
+| 7 | **Residency** | Data and inference stay in the tenant's required region or environment |
 
 ### Layer 1: the database enforces the filter
-With a pooled schema, the strongest cheap control is **row-level security**: the database attaches a
-predicate to every query on a table, and the predicate reads the tenant from a per-transaction setting
-that the application sets right after it verifies the caller. This exists *because* it moves the filter
-from "every query" to "one policy": a forgotten `WHERE` still returns only the current tenant's rows.
-Two details make or break it. The application role must not be a superuser or hold `BYPASSRLS`, and the
-policy must apply to the table owner (`FORCE ROW LEVEL SECURITY`), otherwise migrations and admin
-scripts silently bypass it. And the tenant setting must be transaction-local (`SET LOCAL`), because
-with transaction-mode connection pooling a session-level setting leaks to whichever request gets the
-connection next. Bridge and silo models get the same property structurally: a schema or database per
-tenant, with per-tenant database credentials so a connection can only ever reach one tenant.
+**Row-level security (RLS)** is the strongest cheap control for a pooled schema:
+1. The database attaches a predicate to every query on the table.
+2. The predicate reads the tenant from a per-transaction setting.
+3. The application sets it right after verifying the caller.
 
-Be precise about what RLS defends against. It catches the *forgotten* filter, because the tenant is set
-once, right after authentication, and every later query in the transaction inherits it. It does not stop
-a *compromised* application: SQL injection, or any code path that can issue `SET LOCAL`, can name another
-tenant, because the setting is just a string the database trusts. That threat is what per-tenant
-credentials (bridge or silo) address, and it is why RLS is one layer rather than the whole answer. Index
-for it as well: the policy adds `tenant_id = …` to every query, so composite indexes should lead with
-`tenant_id`, or large tables degrade into scans that the policy then filters.
+*Why:* the filter moves from "every query" to "one policy", so a forgotten `WHERE` still returns only the
+current tenant's rows.
+
+**Two details make or break it:**
+- **No bypass.** The application role must not be a superuser or hold `BYPASSRLS`, and the policy must
+  apply to the table owner (`FORCE ROW LEVEL SECURITY`); otherwise migrations and admin scripts silently
+  bypass it.
+- **Transaction-local setting.** Use `SET LOCAL`, *because* with transaction-mode connection pooling a
+  session-level setting leaks to whichever request gets the connection next.
+
+**Bridge and silo get the same property structurally:** a schema or database per tenant, with per-tenant
+database credentials so a connection can only ever reach one tenant.
+
+**What RLS does and does not defend against:**
+- **Catches the forgotten filter**, because the tenant is set once after authentication and every later
+  query in the transaction inherits it.
+- **Does not stop a compromised application.** SQL injection, or any path that can issue `SET LOCAL`, can
+  name another tenant, because the setting is just a string the database trusts. Per-tenant credentials
+  (bridge or silo) address that threat, which is why RLS is one layer, not the whole answer.
+- **Index for it.** The policy adds `tenant_id = …` to every query, so composite indexes should lead with
+  `tenant_id`, or large tables degrade into scans that the policy then filters.
 
 ### Layer 2: retrieval and caches are partitioned, not post-filtered
 Vector search is where AI products most often leak. The tenant key must be a **hard pre-filter** or a
-**separate namespace**, never a re-ranking step applied after top-k, because a post-filter on a
-cross-tenant top-k can return fewer results than requested, which tempts someone to widen the search,
-and because the unfiltered candidates have already crossed the boundary in memory and logs. With
-pgvector the row policy from Layer 1 runs inside the database, so no other tenant's row ever reaches the
-application; with an approximate index (HNSW, IVFFlat) the engine still filters the index's candidate
-list, so isolation holds but small tenants can get fewer than k rows. Iterative index scans (pgvector 0.8
-and later) mitigate that recall loss, and a partition or partial index per large tenant is the structural
-fix. With a dedicated vector database use a collection or namespace per tenant for larger tenants and mandatory metadata filtering for pooled ones,
-and make the filter non-optional in the retrieval client's signature. Semantic caches, prompt caches and
-agent memory stores must include the tenant in the key for the same reason: a cache hit is a read.
+**separate namespace**, never a re-ranking step after top-k, *because*:
+- a post-filter on a cross-tenant top-k can return fewer results than requested, tempting someone to widen
+  the search;
+- the unfiltered candidates have already crossed the boundary in memory and logs.
+
+| Store | How isolation holds | Caveat |
+|---|---|---|
+| **pgvector** | The Layer 1 row policy runs inside the database, so no other tenant's row reaches the app | With an approximate index (HNSW, IVFFlat) the engine filters the index's candidate list: isolation holds but small tenants can get fewer than k rows. Iterative index scans (pgvector 0.8 and later) mitigate the recall loss; a partition or partial index per large tenant is the structural fix |
+| **Dedicated vector database** | Collection or namespace per tenant for larger tenants; mandatory metadata filtering for pooled ones | Make the filter non-optional in the retrieval client's signature |
+| **Semantic caches, prompt caches, agent memory** | The tenant is part of every key | A cache hit is a read |
 
 ### Layer 3: credentials are scoped per tenant and per run
-Agent tools that reach into a customer's systems (CRM, ticketing, email) use that tenant's stored
-credentials, fetched from a secrets manager by tenant ID at run time, injected into the tool adapter for
-that run only, and never placed in the prompt. Per-tenant encryption keys for stored documents mean
-that even a storage-level leak yields ciphertext, and deleting a tenant becomes deleting a key.
-Model-provider keys can also be split per tenant or per tier so that a leaked key has a bounded blast
-radius and spend can be attributed.
+- **Connector credentials.** Agent tools reaching a customer's CRM, ticketing or email use that tenant's
+  credentials: fetched from a secrets manager by tenant ID at run time, injected into the tool adapter for
+  that run only, never placed in the prompt.
+- **Per-tenant encryption keys** for stored documents: a storage-level leak yields ciphertext, and
+  deleting a tenant becomes deleting a key.
+- **Model-provider keys split per tenant or tier**, so a leaked key has a bounded blast radius and spend
+  can be attributed.
 
 ### Layer 4: performance isolation
-Quotas and fair scheduling at the gateway and in the job system cap what one tenant can consume:
-requests per second, concurrent generations, tokens per period, ingestion jobs in flight. Dedicated
-worker pools or model-serving capacity for the top tier isolate the heaviest tenants physically. The
-indicator that this layer is missing is simple: a latency incident whose root cause is one tenant's
-traffic.
+- **Quotas and fair scheduling** at the gateway and in the job system cap requests per second, concurrent
+  generations, tokens per period and ingestion jobs in flight.
+- **Dedicated worker pools or model-serving capacity** for the top tier isolate the heaviest tenants
+  physically.
+- **The missing-layer indicator:** a latency incident whose root cause is one tenant's traffic.
 
 ### Layer 5: verification
-Isolation that is not tested decays. Two tests earn their keep. A **cross-tenant canary**: each tenant's
-corpus contains a unique marker document, and an automated probe runs representative questions as every
-other tenant and fails on any marker appearing in retrieved passages or generated answers. And
-**negative access tests** in CI: every data-access function is called with tenant A's context against
-tenant B's identifiers and must return nothing or raise. Combined with log review for queries executed
-without a tenant setting, this turns isolation into something you can show an auditor.
+Isolation that is not tested decays. Two tests earn their keep:
+1. **Cross-tenant canary.** Each tenant's corpus holds a unique marker document. An automated probe runs
+   representative questions as every other tenant and fails on any marker in retrieved passages or
+   generated answers.
+2. **Negative access tests in CI.** Every data-access function is called with tenant A's context against
+   tenant B's identifiers and must return nothing or raise.
 
-## Example
-PostgreSQL row-level security on a pooled `documents` table that also holds embeddings. The policy uses
-a transaction-local setting. If the application forgets to set it, `current_setting(..., true)` returns
-NULL on a fresh connection but an empty string on a connection that has used the setting before (the
-placeholder persists for the session), so the policy wraps it in `NULLIF`; either way the predicate is
-NULL and the query returns no rows. The failure mode is "empty", not "leak". The policy predicate is
-applied as a filter on the scan, so a forgotten filter in the vector query still cannot cross tenants;
-with an approximate index (HNSW, IVFFlat) the filter may leave fewer than k rows, which is a recall
-problem, not an isolation problem.
+Add log review for queries executed without a tenant setting, and isolation becomes something you can
+show an auditor.
+
+## Diagram
+A bug in application code still meets independent layers before any data crosses tenants; the canary and
+negative tests continuously check that those layers hold.
+
+```mermaid
+flowchart TD
+    A["Verified request for tenant A"] --> B["App code, filter may be missing"]
+    B --> C["Postgres RLS with SET LOCAL"]
+    B --> D["Retrieval client: mandatory tenant filter"]
+    B --> E["Cache and memory keys include tenant"]
+    B --> F["Secrets fetched by tenant for this run"]
+    C --> G[("Only tenant A rows")]
+    D --> G
+    E --> G
+    H["Canary probe and negative CI tests"] -.->|"verify"| C
+    H -.->|"verify"| D
+    H -.->|"verify"| E
+```
+
+## Examples
+### PostgreSQL row-level security on a pooled table with embeddings
+- **Transaction-local setting.** If the app forgets to set it, `current_setting(..., true)` returns NULL
+  on a fresh connection but an empty string on a connection that used the setting before (the
+  placeholder persists for the session). The policy wraps it in `NULLIF`, so either way the predicate is
+  NULL and the query returns no rows.
+- **Fails closed.** The failure mode is "empty", not "leak".
+- **Vector queries inherit it.** The policy predicate filters the scan, so a forgotten filter in the
+  vector query still cannot cross tenants. With HNSW or IVFFlat the filter may leave fewer than k rows:
+  a recall problem, not an isolation problem.
 
 ```sql
 CREATE TABLE documents (
@@ -162,49 +186,125 @@ COMMIT;
 -- INSERT naming another tenant_id: ERROR: new row violates row-level security policy for table "documents"
 ```
 
+### Runnable: a cross-tenant canary probe
+Plant one unique marker per tenant, ask as every other tenant, and fail on any marker that appears. The
+toy store shows the probe catching a search that drops the tenant pre-filter.
+
+```python
+import uuid
+
+class ToyStore:
+    def __init__(self):
+        self.rows = []                                   # (tenant_id, text)
+    def add(self, tenant_id, text):
+        self.rows.append((tenant_id, text))
+    def search(self, tenant_id, query, k=8, enforce=True):
+        words = query.lower().split()
+        return [text for tid, text in self.rows
+                if (not enforce or tid == tenant_id)     # the hard pre-filter
+                and any(w in text.lower() for w in words)][:k]
+
+def plant_canaries(store, tenants):
+    markers = {t: f"CANARY-{uuid.uuid4().hex[:12]}" for t in tenants}
+    for t, m in markers.items():
+        store.add(t, f"internal codename is {m}")
+    return markers
+
+def find_leaks(search, tenants, markers, questions):
+    leaks = []
+    for asker in tenants:
+        for q in questions:
+            seen = " ".join(search(asker, q))            # in production, also scan the answer
+            leaks += [(asker, owner) for owner, m in markers.items()
+                      if owner != asker and m in seen]
+    return leaks
+
+tenants = ["acme", "globex", "initech"]
+store = ToyStore()
+markers = plant_canaries(store, tenants)
+qs = ["what is our internal codename"]
+print("enforced:", find_leaks(store.search, tenants, markers, qs))
+unfiltered = lambda t, q: store.search(t, q, enforce=False)
+print("unfiltered:", len(find_leaks(unfiltered, tenants, markers, qs)), "leaks")
+# enforced: []
+# unfiltered: 6 leaks   (3 askers x 2 other tenants)
+```
+
+### Worked incident: session-level SET behind a transaction pooler
+| Step | What happened |
+|---|---|
+| Change | A helper switched from `SET LOCAL` to a session-level `SET` "to save a round trip" |
+| Pooling | The pooler runs in transaction mode, so request 2 got request 1's connection |
+| Symptom | Intermittent, unreproducible reports of a user seeing another tenant's document titles |
+| Why tests missed it | Tests used one connection per test, so the setting never outlived a request |
+| Fix | Back to `SET LOCAL` inside the request transaction, plus a check that fails a query run with no tenant setting |
+
+## Production patterns
+- **Mandatory tenant argument in the retrieval client.** Use for every vector store. Make the tenant a
+  required keyword-only parameter of `search()` and have the client add the filter or pick the namespace
+  itself, so no call site can omit it. Monitor the number of code paths that call the store's SDK
+  directly instead of the client.
+- **Fail-closed connection checkout.** Use with RLS and a transaction pooler. Wrap transaction start so
+  it always issues `SET LOCAL app.tenant_id` from the request context and raises if the context has no
+  tenant. Monitor counts of raised "no tenant" errors per job type; they find background jobs that lost
+  context.
+- **Continuous cross-tenant canary.** Use for every pooled corpus. Plant a marker document per tenant (or
+  per tier for the long tail), run the probe on a schedule and after every retrieval or prompt change,
+  and page on any hit. Monitor probe coverage and time since last successful run.
+- **Separate path for cross-tenant analytics.** Use when reporting needs all tenants. Give analytics a
+  read replica and a dedicated role, and create reporting views with `security_invoker` (PostgreSQL 15+)
+  so they check the caller's policies. Monitor which roles hold `BYPASSRLS`; the list should be tiny.
+- **Per-tenant secret paths.** Use for agent connectors. Store each tenant's tokens under a path keyed by
+  tenant ID in the secrets manager, grant the runtime read access per run, and redact tokens from traces.
+  Monitor secret reads whose tenant differs from the run's tenant.
+
 ## Trade-offs
-- Database-enforced policies catch application mistakes, but they add a per-query predicate and make
-  "run this query across all tenants" an explicit privileged path; that is a feature until an analytics
-  team needs cross-tenant reporting, which should then go through a separate replica and role.
-- Namespaces or collections per tenant give clean separation and per-tenant re-indexing, but many small
-  collections waste memory and connections; pooled indexes with mandatory filters win for the long tail.
-- Per-tenant encryption keys make deletion and breach containment simple, but key management becomes
-  part of every read path; the cost is justified when contracts require crypto-shredding or residency.
-- Dedicated capacity for a tenant removes noisy-neighbour risk, but it reintroduces idle cost; it is
-  worth it only when a tenant's load is both heavy and latency-sensitive, or when they pay for it.
-- Canary and negative tests slow the suite slightly and need per-tenant fixtures, but they are the only
-  evidence of isolation that survives a refactor.
+- **Database-enforced policies: catch app mistakes vs explicit privileged paths.** They add a per-query
+  predicate and make "run this across all tenants" a privileged path. That is a feature until analytics
+  needs cross-tenant reporting, which should then use a separate replica and role.
+- **Namespaces per tenant: clean separation vs overhead.** Per-tenant collections allow per-tenant
+  re-indexing, but many small collections waste memory and connections; pooled indexes with mandatory
+  filters win for the long tail.
+- **Per-tenant encryption keys: simple deletion vs key management on every read.** Deletion and breach
+  containment become simple, but key management joins every read path. Justified when contracts require
+  crypto-shredding or residency.
+- **Dedicated capacity: no noisy neighbour vs idle cost.** Worth it only when a tenant's load is both
+  heavy and latency-sensitive, or when they pay for it.
+- **Canary and negative tests: a slower suite vs durable evidence.** They need per-tenant fixtures, but
+  they are the only evidence of isolation that survives a refactor.
 
 ## Pitfalls
-- Enabling RLS but connecting as the table owner or a superuser; the symptom is that tests pass, and a
-  manual check with the production role shows every tenant's rows.
-- Using session-level `SET` behind a transaction-pooling proxy; the symptom is intermittent, unreproducible
+- **Enabling RLS but connecting as the table owner or a superuser.** Symptom: tests pass, and a manual
+  check with the production role shows every tenant's rows.
+- **Using session-level `SET` behind a transaction-pooling proxy.** Symptom: intermittent, unreproducible
   cases where a request sees a previous request's tenant.
-- Applying the tenant filter after top-k in vector search; the symptom is queries returning fewer than
-  k results for small tenants, followed by someone raising k to compensate.
-- Putting customer connector tokens into the system prompt so the agent can "use them"; the symptom is a
-  token appearing in a trace, an eval sample or a model response.
-- Trusting the vector database's metadata filter without making it mandatory in the client; the symptom
-  is one new call site that omits the filter and passes review because the code "looks like the others".
-- Reading through views or `SECURITY DEFINER` functions owned by a superuser or a `BYPASSRLS` role; the
-  symptom is a reporting view that returns every tenant's rows although the base table has a policy,
-  because a view checks policies as its owner unless it is created with `security_invoker` (PostgreSQL 15+).
-- Assuming RLS hides everything; unique and foreign-key checks bypass row security, so "this email is
-  already registered" on a globally unique column tells tenant A that a value exists in tenant B. The
-  symptom is an enumeration finding in a pen test; scope unique constraints to `(tenant_id, …)`.
-- Logging full prompts to a shared log store without tenant tags and access control; the symptom is
-  support engineers reading tenant data they are not cleared for, which is itself a reportable breach.
+- **Applying the tenant filter after top-k in vector search.** Symptom: queries return fewer than k
+  results for small tenants, followed by someone raising k to compensate.
+- **Putting customer connector tokens into the system prompt** so the agent can "use them". Symptom: a
+  token appears in a trace, an eval sample or a model response.
+- **Trusting the vector database's metadata filter without making it mandatory in the client.** Symptom:
+  one new call site omits the filter and passes review because the code "looks like the others".
+- **Reading through views or `SECURITY DEFINER` functions owned by a superuser or a `BYPASSRLS` role.**
+  Symptom: a reporting view returns every tenant's rows although the base table has a policy, because a
+  view checks policies as its owner unless created with `security_invoker` (PostgreSQL 15+).
+- **Assuming RLS hides everything.** Unique and foreign-key checks bypass row security, so "this email is
+  already registered" on a globally unique column tells tenant A a value exists in tenant B. Symptom: an
+  enumeration finding in a pen test. Fix: scope unique constraints to `(tenant_id, …)`.
+- **Logging full prompts to a shared log store without tenant tags and access control.** Symptom: support
+  engineers read tenant data they are not cleared for, which is itself a reportable breach.
 
 ## When to use
-Every multi-tenant AI system needs at least two independent isolation layers for data and one for
-performance from the first production tenant; the question is how far up the ladder each tier goes.
-Pooled tenants: RLS or equivalent plus mandatory retrieval filters plus quotas. Mid tier: add per-tenant
-namespaces and encryption keys. Enterprise or regulated: bridge or silo data, dedicated capacity, and
-per-tenant credentials end to end. Measure it: count queries executed without a tenant setting (should be
-zero), run the cross-tenant canary continuously, and track per-tenant latency so noisy neighbours are
-seen as a graph rather than a ticket. In security reviews and interviews, the expected depth is naming
-each layer, explaining what failure it catches that the layer above misses, and showing the test that
-proves it.
+- **Baseline:** every multi-tenant AI system needs at least two independent isolation layers for data and
+  one for performance from the first production tenant; the question is how far up the ladder each tier
+  goes.
+- **Pooled tenants:** RLS or equivalent, plus mandatory retrieval filters, plus quotas.
+- **Mid tier:** add per-tenant namespaces and encryption keys.
+- **Enterprise or regulated:** bridge or silo data, dedicated capacity, and per-tenant credentials end to
+  end.
+- **Measure:** queries executed without a tenant setting (should be zero), the cross-tenant canary running
+  continuously, and per-tenant latency so noisy neighbours show up as a graph rather than a ticket.
+- **Interviews and security reviews:** name each layer, explain what failure it catches that the layer
+  above misses, and show the test that proves it.
 
 ## Role lens
 - **Engineer:** Sets the tenant in the transaction, makes the retrieval client refuse calls without a
@@ -227,6 +327,42 @@ or a namespace per tenant, and every cache key includes the tenant. For evidence
 policy definitions and role grants, a CI suite that calls every data function as tenant A against
 tenant B's IDs, and a continuously running cross-tenant canary that plants marker documents and alerts
 if any marker is ever retrieved or generated for another tenant.
+
+## Interview questions
+### What does row-level security protect against, and what does it not?
+- **Protects:** the forgotten filter. The tenant is set once per transaction after authentication, so any
+  query that omits `WHERE tenant_id = …` still sees only that tenant's rows.
+- **Does not protect:** a compromised application. SQL injection or any code that can run `SET LOCAL` can
+  name another tenant; per-tenant credentials in a bridge or silo model address that.
+- **Also bypassed by:** superusers, `BYPASSRLS` roles, unforced table owners, and unique or foreign-key
+  checks.
+
+### Small tenants say search returns only two or three results. What is going on?
+- **Likely cause:** the tenant filter is applied to a shared approximate index (HNSW or IVFFlat), which
+  returns a candidate list that the filter then thins.
+- **Isolation is fine; recall is not.** Do not raise k across tenants as a workaround.
+- **Fixes:** iterative index scans in pgvector 0.8 and later, a partition or partial index per large
+  tenant, or a namespace per tenant in a dedicated vector database.
+
+### When is a database per tenant worth it over RLS on a pooled schema?
+- **Worth it** when contracts or regulators require physical separation, when a compromised app must not
+  reach other tenants, or when a tenant needs its own backup and migration timing.
+- **Not worth it** for the long tail: migrations run per tenant and connections and catalogs multiply,
+  while RLS plus mandatory filters and canaries covers the forgotten-filter risk cheaply.
+
+### How do you keep an agent's connector tokens from leaking across tenants?
+- **Fetch per run:** read the tenant's token from a secrets manager by tenant ID when the run starts.
+- **Inject into the adapter only:** the tool adapter holds it; the prompt, traces and eval samples never
+  do.
+- **Bound the blast radius:** scope tokens to one tenant, and split model-provider keys per tenant or tier
+  so a leak is contained and spend is attributable.
+
+### How would you prove isolation to an auditor?
+- **Show the controls:** policy definitions, role grants with no `BYPASSRLS` on the app role, and the
+  retrieval client signature that requires a tenant.
+- **Show the tests:** CI negative tests calling every data function as tenant A with tenant B's IDs.
+- **Show live evidence:** canary probe results over time and a zero count of queries run without a tenant
+  setting.
 
 ## Quiz
 ### Q: Why is `SET LOCAL app.tenant_id` preferred over a session-level `SET` when using row-level security?

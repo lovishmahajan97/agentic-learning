@@ -5,7 +5,7 @@ name: Promises & async error propagation
 kind: concept
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - node-ts-for-ai/event-loop-and-microtask-queue
   - node-ts-for-ai/abortcontroller-and-cancellation
@@ -19,68 +19,68 @@ sources:
 ---
 
 ## TL;DR
-A promise is a one-shot result that is either fulfilled or rejected, and `await` turns a rejection back
-into a thrown exception at the awaiting site, so errors travel up the async call chain just like
-synchronous ones. The failure modes are promises nobody awaits (rejections vanish or crash the process),
-combinators that hide which call failed, and error objects that lose their cause. Getting this right is
-what makes a multi-provider LLM call fail loudly, precisely and recoverably.
+A promise settles once, and `await` re-throws a rejection at the awaiting site, so async errors travel up
+like sync ones. Unawaited promises, combinators that hide failures and lost causes are what make
+multi-provider LLM calls fail silently instead of loudly and recoverably.
 
 ## Why it exists
-Callback-style Node passed errors as the first argument of every callback, and the result was error
-handling that was easy to forget and impossible to compose: a forgotten `if (err)` meant silent
-corruption, and sequencing five dependent I/O calls meant five levels of nesting with five separate
-error paths. Promises fixed the composition problem by making the result a value: a chain of `.then`
-calls has one `.catch` at the end, and a rejection anywhere skips straight to it. `async`/`await`
-then made the control flow readable again, with `try`/`catch` working across awaits.
-
-What promises did not fix, and what still bites AI code specifically, is the *ownership* of a failure.
-An agent loop makes dozens of concurrent calls: the model, three tool executions, an embedding lookup,
-a logging sink. Each returns a promise. If one is started and never awaited, its rejection has no
-handler; modern Node treats that as fatal and exits the process, taking every other in-flight request
-with it. If several are awaited through `Promise.all`, the first rejection wins and the others keep
-running unobserved. If a low-level `fetch` error is caught and rethrown as `new Error("model call
-failed")`, the status code and the provider's error body are gone by the time it reaches a log. The
-discipline in this lesson exists because, in a system whose failures are dominated by upstream
-timeouts, rate limits and malformed outputs, the difference between a retryable 429 and a permanent
-400 must survive the trip up the call stack.
+- **Callbacks made errors easy to forget.** Callback-style Node passed errors as the first argument, so a
+  forgotten `if (err)` meant silent corruption, and five dependent I/O calls meant five levels of nesting
+  with five separate error paths.
+- **Promises made the result a value.** A chain of `.then` calls has one `.catch` at the end, and a
+  rejection anywhere skips straight to it. `async`/`await` made control flow readable again, with
+  `try`/`catch` working across awaits.
+- **What promises did not fix: ownership of a failure.** An agent loop makes dozens of concurrent calls (the
+  model, three tool executions, an embedding lookup, a logging sink). A started-but-never-awaited one has no
+  handler; modern Node treats that as fatal and exits, taking every other in-flight request with it.
+- **Combinators and wrappers hide detail.** With `Promise.all` the first rejection wins and the others keep
+  running unobserved. Rethrowing a `fetch` error as `new Error("model call failed")` loses the status code
+  and the provider's error body before it reaches a log.
+- **AI failures demand precision.** Failures are dominated by upstream timeouts, rate limits and malformed
+  outputs, so the difference between a retryable 429 and a permanent 400 must survive the trip up the stack.
 
 ## How it works
 ### States and chaining
-A promise is pending, then settles exactly once as fulfilled (with a value) or rejected (with a reason,
-conventionally an `Error`). `.then(onFulfilled, onRejected)` returns a *new* promise whose outcome is
-whatever the handler returns or throws; a returned promise is adopted (flattened). This is why a chain
-propagates: a throw in any step rejects the step's promise, every following `.then` without a rejection
-handler passes the rejection through unchanged, and the first `.catch` receives it. Handlers always run
-as microtasks, never synchronously, even when the promise is already settled, which keeps ordering
-consistent (see the event-loop lesson).
+- **Settles exactly once.** A promise is pending, then fulfilled (with a value) or rejected (with a reason,
+  conventionally an `Error`).
+- **`.then(onFulfilled, onRejected)` returns a *new* promise** whose outcome is whatever the handler returns
+  or throws; a returned promise is adopted (flattened).
+- **That is why chains propagate.** A throw in any step rejects that step's promise, every following
+  `.then` without a rejection handler passes it through unchanged, and the first `.catch` receives it.
+- **Handlers always run as microtasks,** never synchronously, even when the promise is already settled,
+  which keeps ordering consistent (see the event-loop lesson).
 
 ### What `async`/`await` desugars to
-An `async` function always returns a promise. `return x` fulfils it; a thrown exception, including one
-thrown synchronously before the first `await`, rejects it rather than escaping to the caller. `await p`
-suspends the function, and when `p` rejects, the rejection is re-thrown at the `await` expression, so
-an enclosing `try`/`catch` catches it. This is the single rule that makes propagation work: errors cross
-`await` boundaries as exceptions, so a stack of async functions behaves like a stack of sync ones.
+1. **An `async` function always returns a promise.** `return x` fulfils it.
+2. **A thrown exception rejects it,** including one thrown synchronously before the first `await`; it does
+   not escape to the caller.
+3. **`await p` suspends the function;** when `p` rejects, the rejection is re-thrown at the `await`
+   expression, so an enclosing `try`/`catch` catches it.
+4. **The single rule:** errors cross `await` boundaries as exceptions, so a stack of async functions behaves
+   like a stack of sync ones.
 
-One subtlety: `return fetchModel()` inside a `try` block does **not** catch a rejection of `fetchModel()`
-because the promise is returned before it settles; `return await fetchModel()` does. Outside a `try`,
-the two are equivalent apart from a stack frame.
+- **The `return await` subtlety.** `return fetchModel()` inside a `try` block does **not** catch a rejection
+  of `fetchModel()`, because the promise is returned before it settles; `return await fetchModel()` does.
+  Outside a `try`, the two are equivalent apart from a stack frame.
 
 ### Unhandled rejections
-A rejected promise with no handler attached by the end of the current microtask drain triggers
-`'unhandledRejection'`. Since Node 15 the default mode is `throw`: the rejection is raised as an uncaught
-exception and the process exits (unless an `'unhandledRejection'` listener is installed, which
-suppresses the throw). The crash output is the original error and its stack when the reason is an
-`Error`; only a non-Error reason (a thrown string, say) is wrapped in an error with code
-`ERR_UNHANDLED_REJECTION`, which then carries no useful stack. The usual cause is a *floating promise*: `logToSink(event)` called
-without `await` or `.catch`, or a `.then` with no rejection branch. Fix the cause, not the symptom:
-every promise must be awaited, returned, passed to a combinator, or given an explicit `.catch` that
-decides what to do. Lint for it (`@typescript-eslint/no-floating-promises`). Installing a global
-`process.on('unhandledRejection')` handler that only logs turns a crash into silent data loss; it is
-acceptable as a last-resort reporter, not as a strategy.
+- **The trigger.** A rejected promise with no handler attached by the end of the current microtask drain
+  fires `'unhandledRejection'`.
+- **Default since Node 15: `throw`.** The rejection is raised as an uncaught exception and the process exits,
+  unless an `'unhandledRejection'` listener is installed, which suppresses the throw.
+- **What the crash shows.** The original error and stack when the reason is an `Error`; only a non-Error
+  reason (a thrown string, say) is wrapped in an error with code `ERR_UNHANDLED_REJECTION`, which carries no
+  useful stack.
+- **The usual cause: a *floating promise*.** `logToSink(event)` called without `await` or `.catch`, or a
+  `.then` with no rejection branch.
+- **Fix the cause, not the symptom.** Every promise must be awaited, returned, passed to a combinator, or
+  given an explicit `.catch` that decides what to do. Lint for it (`@typescript-eslint/no-floating-promises`).
+- **A log-only global handler is not a strategy.** A `process.on('unhandledRejection')` handler that only logs
+  turns a crash into silent data loss; it is acceptable as a last-resort reporter only.
 
 ### The handler-attachment window
-"Unhandled" is judged per promise at the moment it rejects, not at the end of the function. That
-makes a tempting concurrency pattern dangerous:
+"Unhandled" is judged per promise at the moment it rejects, not at the end of the function. That makes a
+tempting concurrency pattern dangerous:
 
 ```
 const a = callModel(p1);   // both start now: good
@@ -89,53 +89,68 @@ const x = await a;         // while suspended here, b rejects -> nobody is liste
 const y = await b;         // too late: the process may already have crashed
 ```
 
-If `b` rejects while the function is still suspended on `a`, `b` has no handler, the
-`'unhandledRejection'` check fires, and in the default mode the process exits; attaching a handler
-later only triggers the `'rejectionHandled'` event. `await Promise.all([a, b])` (or `allSettled`)
-attaches handlers to both immediately, which is the reason to use a combinator for concurrent work
-rather than staggered awaits.
+- **What goes wrong.** If `b` rejects while the function is still suspended on `a`, `b` has no handler, the
+  `'unhandledRejection'` check fires, and in the default mode the process exits. Attaching a handler later
+  only triggers the `'rejectionHandled'` event.
+- **The fix.** `await Promise.all([a, b])` (or `allSettled`) attaches handlers to both immediately, which is
+  the reason to use a combinator for concurrent work rather than staggered awaits.
 
 ### Where propagation stops
 `await` carries errors only along promise edges. Four places break the chain:
 
 - **Callbacks scheduled from async code.** A `throw` inside `setTimeout(() => ...)`, an event-emitter
-  listener or a stream `'data'` handler is not inside your `try`; the enclosing async function has
-  already moved on. It becomes an uncaught exception. Wrap the callback-based API in a promise (or use
-  `events.once`, `timers/promises`, `stream/promises`) so the error re-enters the chain.
-- **Emitter `'error'` events.** An `EventEmitter` that emits `'error'` with no listener throws. Streams
-  and SDK clients that expose events need a listener, or use a promise-returning wrapper.
-- **Non-async functions that return promises.** `function call() { validate(x); return fetch(...) }`
-  throws *synchronously* if `validate` fails, so `call().catch(...)` never sees it. Marking the
-  function `async` converts that throw into a rejection, making error handling uniform.
-- **Floating promises**, covered above: no edge means no propagation.
+  listener or a stream `'data'` handler is not inside your `try`; the async function has already moved on, so
+  it becomes an uncaught exception. Wrap the callback API in a promise (or use `events.once`,
+  `timers/promises`, `stream/promises`) so the error re-enters the chain.
+- **Emitter `'error'` events.** An `EventEmitter` that emits `'error'` with no listener throws. Streams and
+  SDK clients that expose events need a listener, or a promise-returning wrapper.
+- **Non-async functions that return promises.** `function call() { validate(x); return fetch(...) }` throws
+  *synchronously* if `validate` fails, so `call().catch(...)` never sees it. Marking it `async` converts the
+  throw into a rejection, making error handling uniform.
+- **Floating promises,** covered above: no edge means no propagation.
 
 ### Combinators and their error semantics
-- `Promise.all(ps)` — fulfils with an array when all fulfil; rejects with the **first** rejection. The
-  remaining promises are not cancelled; they run to completion unobserved. Use it when any failure makes
-  the whole result useless.
-- `Promise.allSettled(ps)` — never rejects; yields `{status, value|reason}` per input. Use it when
-  partial results are useful, e.g. fan-out to several providers or tools where you want every outcome.
-- `Promise.any(ps)` — fulfils with the first fulfilment; rejects only when all reject, with an
-  `AggregateError` whose `.errors` holds each reason. Use it for racing equivalent providers.
-- `Promise.race(ps)` — settles with whichever settles first, success or failure; mostly used to impose a
-  timeout, which `AbortSignal.timeout` does more cleanly because it also stops the work.
+| Combinator | Fulfils | Rejects | Use when |
+|---|---|---|---|
+| `Promise.all(ps)` | With an array when all fulfil | With the **first** rejection; the rest run to completion unobserved, not cancelled | Any failure makes the whole result useless |
+| `Promise.allSettled(ps)` | Always, with one status object per input (below) | Never | Partial results are useful: fan-out to providers or tools where you want every outcome |
+| `Promise.any(ps)` | With the first fulfilment | Only when all reject, with an `AggregateError` whose `.errors` holds each reason | Racing equivalent providers |
+| `Promise.race(ps)` | Whichever settles first | Whichever settles first | Mostly timeouts, which `AbortSignal.timeout` does more cleanly because it also stops the work |
 
-Because combinators do not cancel losers, pair them with an `AbortController` when the losing calls are
-expensive (every model call is).
+- **`allSettled` result shape:** one `{status, value|reason}` object per input, in input order.
+- **Combinators do not cancel losers,** so pair them with an `AbortController` when the losing calls are
+  expensive (every model call is).
 
 ### Keeping the cause
-Wrapping an error adds context but must not destroy the original. `new Error("tool failed", { cause:
-err })` (ES2022) keeps the chain; a custom `class ProviderError extends Error` can carry `status`,
-`retryable` and the provider's error body. `catch (e: unknown)` forces narrowing with `instanceof`
-before reading fields. Node links async stack frames across `await` (async stack traces), but only when
-the promise is awaited directly; a `.then` chain hides the originating frame, which is one more reason
-to prefer `await`.
+- **Wrap, do not replace.** `new Error("tool failed", { cause: err })` adds context; the `cause` option
+  (ES2022) keeps the chain; a custom error class keeps classification too.
+- **Carry classification.** A custom `class ProviderError extends Error` can carry `status`, `retryable` and
+  the provider's error body.
+- **Narrow before reading.** `catch (e: unknown)` forces narrowing with `instanceof` before reading fields.
+- **Prefer `await` for stack traces.** Node links async stack frames across `await`, but only when the
+  promise is awaited directly; a `.then` chain hides the originating frame.
 
-## Example
-Fan-out to three providers with `allSettled` so every outcome is known, classify each failure with a
-status and a retryable flag, preserve the original cause when wrapping, abort the losers once a winner
-arrives, and give the fire-and-forget audit call an explicit `.catch` so it can never become an
-unhandled rejection.
+## Diagram
+How a rejection travels: through every `await`, until a `catch` handles it, or out to the process-level
+check that crashes Node when nothing is listening.
+
+```mermaid
+flowchart TD
+    F["fetch rejects: 429"] --> W["Wrap: ProviderError with cause"]
+    W --> A1["await in callProvider rethrows"]
+    A1 --> A2["await in agent step rethrows"]
+    A2 --> Q{"try/catch on the path?"}
+    Q -->|"yes"| H["Handle: retry if retryable"]
+    Q -->|"no, promise floating"| U["unhandledRejection check"]
+    U -->|"default mode throw"| X["Process exits"]
+    U -.->|"listener installed"| L["Logged only, work lost"]
+```
+
+## Examples
+### Provider fan-out with classified errors
+Fan-out to three providers with `allSettled` so every outcome is known, classify each failure with a status
+and a retryable flag, preserve the original cause when wrapping, abort the losers once a winner arrives,
+and give the fire-and-forget audit call an explicit `.catch` so it can never become an unhandled rejection.
 
 ```ts
 class ProviderError extends Error {
@@ -179,47 +194,101 @@ async function bestEffort(prompt: string) {
 void (async () => { /* audit sink */ })().catch((e) => console.error("audit sink failed", e));
 ```
 
+### Watching the attachment window crash a process
+Save as `window.mjs`. `node window.mjs` prints the caught error; `node window.mjs staggered` crashes,
+because the fast tool rejects at 50 ms while the function is still suspended on the 200 ms model call.
+
+```js
+const delay = (ms, fail) => new Promise((resolve, reject) =>
+  setTimeout(() => (fail ? reject(new Error(`tool failed at ${ms} ms`)) : resolve(ms)), ms));
+
+async function staggered() {
+  const a = delay(200);          // slow model call
+  const b = delay(50, true);     // fast tool call that fails
+  try {
+    await a;                     // b rejects while we wait here: no handler yet
+    await b;
+  } catch (e) { console.log("caught", e.message); }   // never reached
+}
+
+async function combined() {
+  try { await Promise.all([delay(200), delay(50, true)]); }
+  catch (e) { console.log("caught", e.message); }     // caught tool failed at 50 ms
+}
+
+await (process.argv[2] === "staggered" ? staggered() : combined());
+```
+
+### Worked scenario: sequential vs concurrent latency
+An agent step needs a model call, a tool call and an embedding lookup that do not depend on each other
+(illustrative timings).
+
+| Pattern | Latency | Failure behaviour |
+|---|---|---|
+| `await` each in turn (1.2 s + 0.8 s + 0.3 s) | 2.3 s, the sum | Safe, but slow |
+| Start all, await one by one | 1.2 s, the max | Crashes if the 0.3 s call rejects during the 1.2 s wait |
+| Start all, `await Promise.allSettled([...])` | 1.2 s, the max | Every outcome known; retry only what failed |
+
+## Production patterns
+- **Lint floating promises in CI.** Enable `@typescript-eslint/no-floating-promises` (it needs type
+  information) as an error, and require an explicit `void` plus `.catch` for intentional fire-and-forget.
+  Track disables per file in review.
+- **Crash loudly, report first.** Keep Node's default `--unhandled-rejections=throw` (or use `strict`), and
+  if you add a `process.on('unhandledRejection')` listener, make it log with the request context and then
+  exit so the orchestrator restarts the process. Alert on restart count and on any such log line.
+- **One error class per boundary.** Provider, tool and validation errors each carry `status`, `retryable`
+  and `cause`; retry logic reads `retryable` instead of parsing messages. Monitor the share of logged errors
+  that lack a cause chain.
+- **Serialize the cause chain in logs.** Have the logger walk `err.cause` recursively and redact provider
+  bodies at that boundary, rather than dropping the cause. Monitor log size per error event.
+- **Fan-out with `allSettled` plus abort.** Use `Promise.allSettled` with one `AbortController` per batch, and
+  give side-effecting tools idempotency keys so a retry of one failed call cannot duplicate an email or
+  charge. Monitor duplicate-side-effect reports and per-provider failure rates.
+
 ## Trade-offs
-- `Promise.all` is simplest and fastest to fail, but it discards the other outcomes and leaves them
-  running; it is the right choice only when a single failure invalidates the whole batch.
-- `allSettled` gives complete information at the cost of handling every outcome yourself, which is more
-  code but is what you want for provider fan-out, tool batches and anything partially useful.
-- Wrapping errors with `cause` keeps diagnostics but makes error objects larger and may carry sensitive
-  provider bodies into logs; redact at the logging boundary rather than by dropping the cause.
-- Crashing on unhandled rejections loses in-flight requests but surfaces bugs immediately; swallowing
-  them keeps the process up while silently losing work, which is worse in anything that bills tokens.
-- Prefer `await` over `.then` chains for readable stack traces, accepting that sequential awaits can
-  serialize work you meant to run concurrently; for concurrency, start the promises and await them
-  through one combinator, not one by one, so every rejection has a handler from the start.
+- **`Promise.all`: simple vs lossy.** Fastest to fail, but discards the other outcomes and leaves them
+  running; right only when a single failure invalidates the whole batch.
+- **`allSettled`: complete vs more code.** Full information at the cost of handling every outcome yourself,
+  which is what you want for provider fan-out, tool batches and anything partially useful.
+- **`cause` chains: diagnostics vs exposure.** Wrapping keeps diagnostics but makes error objects larger and
+  may carry sensitive provider bodies into logs; redact at the logging boundary rather than dropping the
+  cause.
+- **Crash vs swallow.** Crashing on unhandled rejections loses in-flight requests but surfaces bugs
+  immediately; swallowing keeps the process up while silently losing work, worse in anything that bills
+  tokens.
+- **`await` vs `.then`.** Prefer `await` for readable stack traces, accepting that sequential awaits can
+  serialize concurrent work. For concurrency, start the promises and await them through one combinator, not
+  one by one, so every rejection has a handler from the start.
 
 ## Pitfalls
-- Forgetting `await` on a call whose result you do not use (logging, metrics, cache writes); the symptom
-  is a process crash whose stack points into a logging or cache helper rather than the request that
-  started it (or `ERR_UNHANDLED_REJECTION` with no stack when a non-Error was thrown), or data that
-  never arrives.
-- `return promise` inside `try` instead of `return await promise`; the symptom is a `catch` block that
-  "never runs" while the error surfaces in the caller.
-- Awaiting sequentially what could run concurrently (`const a = await x(); const b = await y();`); the
-  symptom is latency equal to the sum of calls instead of the max.
-- "Fixing" that by starting both and awaiting them one after another; the symptom is an intermittent
-  crash on unhandled rejection that only happens when the second call fails while the first is slow.
-- Throwing inside a `setTimeout` or event-listener callback and expecting the surrounding `try` to
-  catch it; the symptom is an `uncaughtException` crash whose stack has no request-handler frames.
-- Rethrowing as a fresh `new Error(msg)` without `cause`; the symptom is logs saying "model call failed"
-  with no status code, no request id and no stack from the real failure.
-- Treating `Promise.all` rejection as "the batch failed" and retrying everything; the symptom is
-  duplicated tool side effects because the calls that had succeeded are run again.
+- **Forgetting `await` on a call whose result you ignore** (logging, metrics, cache writes). Symptom: a crash
+  whose stack points into a logging or cache helper rather than the request that started it (or
+  `ERR_UNHANDLED_REJECTION` with no stack when a non-Error was thrown), or data that never arrives.
+- **`return promise` inside `try` instead of `return await promise`.** Symptom: a `catch` block that "never
+  runs" while the error surfaces in the caller.
+- **Awaiting sequentially what could run concurrently** (`const a = await x(); const b = await y();`).
+  Symptom: latency equal to the sum of calls instead of the max.
+- **"Fixing" that with staggered awaits.** Symptom: an intermittent unhandled-rejection crash that only
+  happens when the second call fails while the first is slow.
+- **Throwing inside a `setTimeout` or event-listener callback** and expecting the surrounding `try` to catch
+  it. Symptom: an `uncaughtException` crash whose stack has no request-handler frames.
+- **Rethrowing as a fresh `new Error(msg)` without `cause`.** Symptom: logs saying "model call failed" with
+  no status code, no request id and no stack from the real failure.
+- **Retrying the whole batch on `Promise.all` rejection.** Symptom: duplicated tool side effects, because
+  the calls that had succeeded are run again.
 
 ## When to use
-Use `async`/`await` with `try`/`catch` as the default for all I/O, and reach for combinators only at
-explicit fan-out points: `all` for all-or-nothing, `allSettled` for partial results, `any` for racing
-equivalent providers, always paired with an `AbortController` so losers stop consuming resources
-(whether a provider stops generating, and billing, when the client disconnects is vendor-dependent). Define
-one error class per boundary (provider, tool, validation) carrying status and retryability, and wrap
-with `cause`. Enforce `no-floating-promises` in lint and keep the default crash-on-unhandled-rejection
-behaviour so bugs surface in staging. Measure the rate of unhandled rejections and of errors without a
-cause chain in logs. In interviews, explaining why `return await` differs inside `try`, what `all`
-does with the losers, and how an unhandled rejection becomes a crash shows the expected depth.
+- **Default:** `async`/`await` with `try`/`catch` for all I/O.
+- **At explicit fan-out points:** `all` for all-or-nothing, `allSettled` for partial results, `any` for
+  racing equivalent providers, always paired with an `AbortController` so losers stop consuming resources
+  (whether a provider stops generating, and billing, when the client disconnects is vendor-dependent).
+- **Errors:** one error class per boundary (provider, tool, validation) carrying status and retryability,
+  wrapped with `cause`.
+- **Guardrails:** enforce `no-floating-promises` in lint and keep the default crash-on-unhandled-rejection
+  behaviour so bugs surface in staging.
+- **Measure:** the rate of unhandled rejections and of errors without a cause chain in logs.
+- **Interviews:** explain why `return await` differs inside `try`, what `all` does with the losers, and how
+  an unhandled rejection becomes a crash.
 
 ## Role lens
 - **Engineer:** Writes provider and tool clients that classify errors, preserve causes, and never leave a
@@ -239,6 +308,38 @@ retried; give side-effecting tools an idempotency key so a retry cannot duplicat
 `AbortSignal` so that when the batch is genuinely abandoned, still-running tools are cancelled instead of
 completing unobserved. The error should also carry the original cause and a retryable flag so the loop
 can decide whether a retry is even appropriate.
+
+## Interview questions
+### What happens, step by step, when an awaited promise rejects inside a nested async call?
+- **At the innermost `await`:** the rejection is re-thrown as an exception at that expression.
+- **Up the stack:** each `async` function without a matching `catch` rejects its own returned promise, and
+  the next caller's `await` re-throws it, so it propagates like a synchronous exception.
+- **At the top:** if nothing catches it and the outermost promise has no handler, `'unhandledRejection'`
+  fires and, by default, the process exits.
+
+### A service crashes every few hours with an unhandled rejection pointing at a metrics helper. How do you debug it?
+- **Find the floating call:** search for the helper's call sites without `await`, `.catch` or a combinator;
+  turn on `no-floating-promises` to list them all.
+- **Fix the edge:** await it, or make fire-and-forget explicit with `.catch` that logs and drops.
+- **Check the timing:** the crash appears only when the metrics backend fails, which explains the
+  every-few-hours pattern.
+
+### When would you use `Promise.any` instead of `allSettled` for a multi-provider call?
+- **`any` when providers are equivalent** and you only need the first success; it rejects with an
+  `AggregateError` only if all fail.
+- **`allSettled` when every outcome matters,** for example to compare answers or to log every failure.
+- **Either way, abort the losers,** because neither combinator cancels them and each still costs tokens.
+
+### How do you decide whether a provider error should be retried, and keep that decision intact through the stack?
+- **Classify at the boundary:** 429 and 5xx are retryable, other 4xx (such as 400) are permanent, and
+  transport failures are usually retryable; record it on a `ProviderError` with `status` and `retryable`.
+- **Wrap with `cause`** at each higher layer instead of creating a fresh error, so the retry loop and the
+  logs still see the original status and body.
+
+### Your fan-out of five tool calls takes as long as their sum. What changed, and how do you fix it safely?
+- **Likely cause:** someone wrote sequential `await`s, so latency is the sum rather than the max.
+- **Safe fix:** start all five, then `await Promise.allSettled(...)` so every rejection has a handler from the
+  start; staggered awaits would reintroduce the crash window.
 
 ## Quiz
 ### Q: Why does `return fetchModel()` inside a `try` block fail to catch a rejection from `fetchModel()`, while `return await fetchModel()` catches it?

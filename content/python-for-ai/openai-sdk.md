@@ -116,6 +116,27 @@ Server-side state (`previous_response_id`, or a conversation object):
 - **Throttle before the 429.** Reading remaining-token headers lets a batch worker slow down before it hits
   429s instead of after.
 
+## Diagram
+One call through the SDK: watch where retries happen (inside the client), where the tool loop happens
+(in your code), and where the request ID and usage come back for logging.
+
+```mermaid
+sequenceDiagram
+    participant A as Your code
+    participant C as OpenAI client
+    participant S as API or compatible server
+    A->>C: create with model, messages, tools, timeout
+    C->>S: POST over pooled httpx connection
+    S-->>C: 429 or 5xx with retry-after
+    Note over C: backoff with jitter, up to max_retries
+    C->>S: retry same request
+    S-->>C: 200 with tool_calls, usage, request id
+    C-->>A: typed response object
+    Note over A: parse arguments, validate, run tool
+    A->>C: create again with tool result and tool_call_id
+    C-->>A: final message, log request id and usage
+```
+
 ## Examples
 ### Support classifier with structured output and explicit errors
 Model names change; read them from configuration.
@@ -276,6 +297,42 @@ interactive paths (keeping more retries for background jobs), use the async clie
 block workers, and add a circuit breaker or fallback model so that after repeated failures requests fail
 fast or route elsewhere. I would also alert on `APITimeoutError` and `RateLimitError` rates separately,
 because they need different fixes.
+
+## Interview questions
+### Why use the official SDK instead of calling the HTTP API with `requests`?
+- **It encodes the contract once:** generated from the OpenAPI specification, it gives typed parameters
+  and responses, so schema changes surface as type errors instead of `KeyError`s in production.
+- **It ships the hard parts:** connection pooling, retries with exponential backoff and jitter that honour
+  `retry-after`, timeouts, server-sent-event parsing and a precise exception hierarchy.
+- **Hand-rolled clients** tend to retry 400s or non-idempotent work, or forget timeouts entirely.
+
+### Token spend on long generations rose after you lowered the client timeout. Why?
+- **Generation is not idempotent:** if the timeout fires after the server started work, the SDK's retry
+  starts a second, separately billed generation.
+- **So short timeouts on long outputs raise cost as well as latency**, and the first attempt still bills.
+- **Fix:** size timeouts to the output length per path, stream long responses so progress is visible, and
+  for queued jobs set `max_retries=0` so the queue owns backoff.
+
+### When would you choose Chat Completions over the Responses API?
+- **Portability:** Chat Completions is the shape vLLM, Ollama and gateways copied, so the same client
+  reaches them via `base_url`.
+- **Data control:** Responses can keep server-side conversation state, which moves transcripts into
+  provider storage; `store=False` opts out at the cost of managing history yourself.
+- **Choose Responses** when you need new OpenAI-specific features or built-in tools, which tend to arrive
+  there first.
+
+### What is the worst-case time one request can hold a worker with default settings?
+- **Formula:** roughly `timeout × (max_retries + 1)` plus backoff.
+- **Defaults:** 600 seconds and `max_retries=2` give 1,800 seconds, 30 minutes, before backoff.
+- **Interactive fix:** 10 seconds with `max_retries=1` caps it at 20 seconds; derive that variant with
+  `client.with_options` from one shared client.
+
+### How do you get token usage when streaming?
+- **Chat Completions:** usage appears in a final chunk only when you pass
+  `stream_options={"include_usage": True}`.
+- **Responses:** usage is carried on the closing `response.completed` event.
+- **In both cases** log usage from the final event, and monitor time to first token separately from total
+  latency, because streaming changes what users perceive.
 
 ## Quiz
 ### Q: Why does the SDK retry 429 and 5xx responses by default but not 400?

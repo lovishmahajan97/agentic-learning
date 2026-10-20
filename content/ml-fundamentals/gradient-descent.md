@@ -5,7 +5,7 @@ name: Gradient descent
 kind: concept
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - ml-fundamentals/loss-functions
   - ml-fundamentals/backpropagation
@@ -23,81 +23,107 @@ sources:
 ---
 
 ## TL;DR
-Gradient descent minimises a loss by repeatedly moving the parameters a small step against the
-gradient: θ ← θ − η∇L(θ). It is the only practical way to fit models with millions to billions of
-parameters, because the gradient costs a small constant multiple of a forward pass regardless of
-parameter count.
-Stochastic (mini-batch) gradient descent uses a noisy estimate from a few examples, trading precision per
-step for many more steps per second, and that noise turns out to help rather than hurt.
+Gradient descent minimises a loss by stepping against the gradient, θ ← θ − η∇L(θ). It scales to
+billions of parameters because a gradient costs a constant multiple of a forward pass. Mini-batch
+noise trades precision per step for many more steps, and helps.
 
 ## Why it exists
-Training means finding θ that minimises L(θ), the average loss over the data. Closed-form solutions
-exist only for a few special cases such as linear least squares. Grid or random search over parameters
-is exponential in their number: even ten candidate values per parameter is 10^P combinations, absurd
-when P is a billion. Derivative-free methods such as evolution strategies need on the order of P loss
-evaluations to learn as much as one gradient tells you.
-
-The gradient is the escape. A first-order Taylor expansion says L(θ + δ) ≈ L(θ) + ∇L(θ)ᵀδ, and among all
-steps δ of a fixed small length, the one that decreases L the most points exactly along −∇L. Backpropagation
-delivers all P components of that direction in one backward pass costing roughly twice a forward pass. So
-each iteration buys a P-dimensional improvement direction for a constant factor over evaluating the loss
-once. Nothing else offers that ratio. Second-order methods look better on paper: Newton's step
-δ = −H⁻¹∇L rescales every curvature direction at once and removes the conditioning problem below. But
-the Hessian H has P² entries, 10¹⁸ for a billion parameters, and inverting it costs O(P³), so at scale
-second-order information is only ever approximated cheaply, which is what adaptive optimizers do with a
-per-parameter diagonal.
-
-Two problems remain. The approximation is local, so the step must be small enough for it to hold; that
-is the learning rate, and getting it wrong is the most common training failure. And computing the exact
-gradient over billions of examples per step is itself too expensive. Robbins and Monro showed in 1951
-that noisy, unbiased gradient estimates suffice if the steps are chosen sensibly, which licenses
-mini-batches and turns gradient descent into stochastic gradient descent, the algorithm underneath every
-modern optimizer.
+- **Training is minimising L(θ),** the average loss over the data. Closed-form solutions exist only for a
+  few special cases such as linear least squares.
+- **Search does not scale.** Grid or random search is exponential in the number of parameters: ten
+  candidate values per parameter is 10^P combinations, absurd when P is a billion. Derivative-free methods
+  such as evolution strategies need on the order of P loss evaluations to learn as much as one gradient.
+- **The gradient is the steepest direction, and cheap.** A first-order Taylor expansion says
+  L(θ + δ) ≈ L(θ) + ∇L(θ)ᵀδ; among all small steps of fixed length, −∇L decreases L the most.
+  Backpropagation delivers all P components in one backward pass costing roughly twice a forward pass.
+  Nothing else offers that ratio.
+- **Second-order methods do not fit in memory.** Newton's step δ = −H⁻¹∇L rescales every curvature
+  direction and removes the conditioning problem, but the Hessian H has P² entries, 10¹⁸ for a billion
+  parameters, and inverting it costs O(P³). At scale it is only approximated cheaply, which is what
+  adaptive optimizers do with a per-parameter diagonal.
+- **Two problems remain.** The approximation is local, so the step must be small enough (the learning
+  rate, the most common training failure). And exact gradients over billions of examples are too
+  expensive; Robbins and Monro showed in 1951 that noisy, unbiased estimates suffice if steps are chosen
+  sensibly, which licenses mini-batches: stochastic gradient descent, underneath every modern optimizer.
 
 ## How it works
 ### The update and why the learning rate has a ceiling
-θ_{t+1} = θ_t − η g_t, with g_t the gradient. Take a one-dimensional quadratic bowl L = ½λθ², so
-g = λθ and θ_{t+1} = (1 − ηλ)θ_t. The iteration converges only if |1 − ηλ| < 1, that is η < 2/λ, and
-converges in one step at η = 1/λ. In many dimensions every eigen-direction of the Hessian has its own
-curvature λ_i, and the same η applies to all of them: it must satisfy η < 2/λ_max or the steepest
-direction diverges, while progress along the flattest direction shrinks by only (1 − ηλ_min) per step.
-With η near 1/λ_max that factor is about 1 − λ_min/λ_max, so the number of iterations scales with the
-condition number κ = λ_max/λ_min. This one ratio explains why unscaled features train slowly, why
-normalisation layers help, and why momentum and adaptive optimizers exist: they all attack κ.
+The update is θ_{t+1} = θ_t − η g_t, with g_t the gradient. Work it on a one-dimensional quadratic bowl:
+
+```
+L = ½λθ²   ->   g = λθ   ->   θ_{t+1} = (1 − ηλ)θ_t
+converges only if |1 − ηλ| < 1, i.e. η < 2/λ;   one step at η = 1/λ
+```
+
+- **Many dimensions, one η.** Every eigen-direction of the Hessian has its own curvature λ_i, and the same
+  η applies to all. It must satisfy η < 2/λ_max or the steepest direction diverges.
+- **The flattest direction crawls.** Progress there shrinks by only (1 − ηλ_min) per step. With η near
+  1/λ_max that factor is about 1 − λ_min/λ_max.
+- **So iterations scale with the condition number** κ = λ_max/λ_min. This one ratio explains why
+  unscaled features train slowly, why normalisation layers help, and why momentum and adaptive optimizers
+  exist: they all attack κ.
 
 ### Mini-batches: stochastic gradient descent
-The full gradient is an average over N examples. A mini-batch of B examples gives an unbiased estimate
-whose variance scales as 1/B, at a cost proportional to B. For a fixed compute budget, smaller batches
-mean more updates; beyond a problem-dependent critical batch size, adding examples to a batch reduces
-noise that was no longer limiting and the extra compute is wasted. Shuffle each epoch so consecutive
-batches are not correlated. When you raise the batch size, the learning rate usually needs to rise with
-it to keep progress per epoch, a heuristic that holds up to a point and then breaks. The widely held,
-still-debated view is that the noise is not merely tolerated but useful: it helps escape saddle points
-and biases training toward flatter minima that generalise better. The batch-size lesson goes deeper.
+- **Unbiased, noisy estimate.** The full gradient is an average over N examples. A mini-batch of B
+  examples gives an unbiased estimate whose variance scales as 1/B, at a cost proportional to B.
+- **Critical batch size.** For a fixed compute budget, smaller batches mean more updates. Beyond a
+  problem-dependent critical batch size, extra examples reduce noise that was no longer limiting, and the
+  compute is wasted.
+- **Shuffle each epoch** so consecutive batches are not correlated.
+- **Scale η with B, up to a point.** When you raise the batch size the learning rate usually needs to rise
+  with it to keep progress per epoch; the heuristic holds up to a point and then breaks.
+- **Noise may help.** The widely held, still-debated view: noise helps escape saddle points and biases
+  training toward flatter minima that generalise better. The batch-size lesson goes deeper.
 
 ### Momentum
-Heavy-ball momentum keeps a running velocity: v ← μv + g, θ ← θ − ηv. The velocity is an exponential
-moving average of gradients. In a steep direction where the gradient flips sign every step (zig-zagging
-across a valley), successive terms cancel and the effective step shrinks; in a consistent direction they
-accumulate, up to a factor of 1/(1 − μ), ten times with μ = 0.9. The net effect is a smaller effective
-κ: on a quadratic, with η and μ tuned to the curvature range, the iterations needed scale with √κ instead
-of κ, so at κ = 10,000 the steps needed for a fixed reduction in error drop from order 10,000 to order 100. Nesterov momentum evaluates the gradient at the look-ahead point θ − ημv; the practical difference is
-usually small.
+- **Heavy-ball update:** v ← μv + g, θ ← θ − ηv. The velocity is an exponential moving average of
+  gradients.
+- **Zig-zags cancel, steady pulls accumulate.** In a steep direction where the gradient flips sign every
+  step (across a valley), successive terms cancel and the effective step shrinks. In a consistent
+  direction they accumulate, up to 1/(1 − μ), ten times with μ = 0.9.
+- **Net effect: a smaller effective κ.** On a quadratic, with η and μ tuned to the curvature range, the
+  iterations needed scale with √κ instead of κ: at κ = 10,000, from order 10,000 to order 100 steps for a
+  fixed error reduction.
+- **Nesterov momentum** evaluates the gradient at the look-ahead point θ − ημv; the practical difference
+  is usually small.
 
 ### Non-convexity
-Deep-network losses are non-convex, so the guarantee is only convergence to a stationary point. In
-practice, in high dimensions most stationary points are saddles rather than bad local minima, noise and
-momentum carry the iterate past them, and many different minima turn out to be equally good. What
-decides outcomes is not the fear of local minima but the learning-rate schedule, warmup, batch size and
-initialisation.
+- **Only a stationary point is guaranteed,** because deep-network losses are non-convex.
+- **In high dimensions most stationary points are saddles,** not bad local minima; noise and momentum carry
+  the iterate past them, and many different minima turn out equally good.
+- **What decides outcomes** is the learning-rate schedule, warmup, batch size and initialisation, not
+  fear of local minima.
 
 ### Reading the loss curve
-Loss shooting up or becoming NaN: η above the stability limit, or no gradient clipping. Loss flat from
-the start: η far too small, dead units, or a bug stopping gradient flow. Loss oscillating with period
-two: η near 2/λ_max in some direction. Long plateau then a sudden drop: a saddle. Watching the gradient
-norm alongside the loss separates these cases quickly.
+| Symptom | Likely cause |
+|---|---|
+| Loss shoots up or becomes NaN | η above the stability limit, or no gradient clipping |
+| Loss flat from the start | η far too small, dead units, or a bug stopping gradient flow |
+| Loss oscillating with period two | η near 2/λ_max in some direction |
+| Long plateau, then a sudden drop | a saddle |
 
-## Example
+Watching the gradient norm alongside the loss separates these cases quickly.
+
+## Diagram
+One training step, and the checks that decide whether the learning rate is right.
+
+```mermaid
+flowchart TD
+    B["Sample a shuffled mini-batch"] --> F["Forward pass: loss"]
+    F --> BW["Backward pass: gradient"]
+    BW --> GN["Log gradient norm, clip"]
+    GN --> M["Momentum: v = mu v + g"]
+    M --> U["Update: theta minus eta v"]
+    U --> C{"Loss curve?"}
+    C -->|"NaN or rising"| LO["Lower eta, warmup, clipping"]
+    C -->|"flat, near linear"| HI["Raise eta, check scaling"]
+    C -->|"falling"| B
+    LO --> B
+    HI --> B
+```
+
+## Examples
+### Ill-conditioned bowl: plain GD vs momentum
 A two-dimensional quadratic whose curvature is 50× larger along w2 than along w1 (condition number 50).
 The stability limit is 2/50 = 0.04. Plain gradient descent must crawl along w1 to stay stable along w2;
 momentum fixes it.
@@ -126,39 +152,97 @@ print(f"eta=0.03 + momentum 0.9: w={descend(0.03, mu=0.9)}")
 # momentum : both coordinates ~2e-5. The average cancels the w2 zig-zag and compounds the steady w1 pull.
 ```
 
+### Worked numbers: the per-step multiplier
+The error along each axis is multiplied by (1 − ηλ) every step. Same bowl, λ = 1 and λ = 50.
+
+| η | Multiplier on w1 (λ = 1) | Multiplier on w2 (λ = 50) | Outcome |
+|---|---|---|---|
+| 0.01 | 0.99 | 0.5 | stable; w1 crawls |
+| 0.02 = 1/λ_max | 0.98 | 0 | w2 solved in one step; w1 still crawls |
+| 0.03 | 0.97 | −0.5 | stable, w2 oscillates |
+| 0.041 | 0.959 | −1.05 | diverges along w2 |
+
+No single η is fast on both axes, which is the condition-number problem in four rows.
+
+### A production training step with the safety rails
+The loop most fine-tunes run: zero gradients, backward, clip and log the norm, step, schedule.
+
+```python
+import torch
+
+def train_epoch(model, loader, optimizer, scheduler, max_norm=1.0, log=print):
+    model.train()
+    for step, (x, y) in enumerate(loader):            # loader built with shuffle=True
+        optimizer.zero_grad(set_to_none=True)          # otherwise gradients accumulate across steps
+        loss = torch.nn.functional.cross_entropy(model(x), y)
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"non-finite loss at step {step}")   # stop, inspect the batch
+        loss.backward()
+        gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)  # returns pre-clip norm
+        optimizer.step()
+        scheduler.step()                               # warmup then decay
+        if step % 50 == 0:
+            log(f"step={step} loss={loss.item():.4f} grad_norm={gnorm.item():.2f} "
+                f"lr={scheduler.get_last_lr()[0]:.2e}")
+```
+
+## Production patterns
+- **Short learning-rate sweep before every new fine-tune.** Run a few hundred steps at several peak
+  learning rates spaced by factors of about 3, keep the largest that does not spike. Monitor loss and
+  gradient norm per run side by side.
+- **Gradient-norm clipping as a default.** Call `torch.nn.utils.clip_grad_norm_` (max norm around 1.0 is
+  a common starting value) before `optimizer.step()`. Monitor the returned pre-clip norm; frequent
+  clipping means the learning rate is too high.
+- **Warmup plus decay.** Wrap the optimizer in a scheduler that ramps η up over the first steps and decays
+  it afterwards, because the landscape sharpens as training proceeds. Monitor the logged learning rate
+  next to the loss.
+- **Fail fast on non-finite loss.** Check `torch.isfinite(loss)` each step, stop and dump the batch ids,
+  then resume from the last good checkpoint with a lower η. Monitor NaN events per run.
+- **Retune η when the batch size changes.** When moving to more GPUs or gradient accumulation, re-sweep
+  the learning rate instead of reusing the old one. Monitor progress per token or per example, not per
+  step, when comparing runs.
+- **Standardise inputs and targets.** For classical models fit a scaler on the training split only (for
+  example scikit-learn `StandardScaler`) before gradient-based training. Monitor the number of steps to a
+  target loss.
+
 ## Trade-offs
-- A large learning rate makes fast progress and crosses flat regions, but diverges once it exceeds
+- **Large η: fast progress vs divergence.** It crosses flat regions quickly but diverges once it exceeds
   2/λ_max in any direction; since the landscape sharpens as training proceeds, schedules decay η over time.
-- Small batches give more updates per epoch and helpful noise, but poor GPU utilisation and noisy
-  estimates; past the critical batch size, larger batches stop reducing the steps needed and only add cost.
-- Momentum accelerates in consistent directions and damps oscillation, but overshoots when μ and η are
-  both large and costs one extra copy of the parameters for the velocity.
-- Full-batch gradient descent is exact and deterministic, which is pleasant for small convex problems,
-  but delivers one update per pass over the data, hopeless at dataset scale.
+- **Small batches: more updates vs utilisation.** More updates per epoch and helpful noise, but poor GPU
+  utilisation and noisy estimates. Past the critical batch size, larger batches stop reducing the steps
+  needed and only add cost.
+- **Momentum: acceleration vs overshoot and memory.** It accelerates in consistent directions and damps
+  oscillation, but overshoots when μ and η are both large and costs one extra copy of the parameters for
+  the velocity.
+- **Full-batch: exact vs one update per pass.** Exact and deterministic, pleasant for small convex
+  problems, but one update per pass over the data is hopeless at dataset scale.
 
 ## Pitfalls
-- Unscaled inputs or targets inflate the condition number; the symptom is a loss that plateaus unless
-  the learning rate is tiny, fixed by standardising features or adding normalisation layers.
-- Learning rate too high; the symptom is loss rising after a few steps or NaN. Learning rate too low;
-  the symptom is loss decreasing slowly and almost linearly for the whole run.
-- Not shuffling between epochs; the symptom is a loss curve with a periodic pattern once per epoch and
-  a model biased by data order.
-- Forgetting to zero gradients between steps in PyTorch, so they accumulate; the symptom is an
-  effective learning rate that grows every step and a run that diverges for no visible reason.
-- Comparing runs with different batch sizes at the same learning rate; the symptom is the larger-batch
-  run "learning slower", which is fewer updates per epoch, not a worse optimizer.
-- Judging convergence from the training loss alone; the symptom is training loss still falling while
-  validation loss rises, which is overfitting, not an optimisation problem.
+- **Unscaled inputs or targets.** They inflate the condition number; the loss plateaus unless the learning
+  rate is tiny. Fix by standardising features or adding normalisation layers.
+- **Learning rate too high or too low.** Too high: loss rising after a few steps or NaN. Too low: loss
+  decreasing slowly and almost linearly for the whole run.
+- **Not shuffling between epochs.** Symptom: a loss curve with a periodic pattern once per epoch and a
+  model biased by data order.
+- **Forgetting to zero gradients between steps in PyTorch.** They accumulate, giving an effective learning
+  rate that grows every step and a run that diverges for no visible reason.
+- **Comparing batch sizes at the same learning rate.** The larger-batch run "learns slower" because it
+  makes fewer updates per epoch, not because the optimizer is worse.
+- **Judging convergence from training loss alone.** Training loss still falling while validation loss
+  rises is overfitting, not an optimisation problem.
 
 ## When to use
 Gradient descent is the default for every differentiable model; the decisions are about its variant and
-its hyperparameters. Plain SGD with momentum remains competitive for convolutional networks; AdamW is the
-default for transformers (see the optimizers lesson). Choose the learning rate with a short sweep, pair
-it with warmup and a decay schedule, and pick the batch size from hardware and the critical-batch-size
-curve. It is the wrong tool for tiny convex problems with closed forms, and it cannot be applied directly
-to non-differentiable objectives such as "did the agent complete the task", which is why reinforcement
-learning and surrogate losses exist. Measure loss and gradient norm over steps. Interviewers ask why not a
-closed form, why the learning rate has an upper bound, why mini-batches, and what momentum does.
+its hyperparameters.
+- **Variant:** plain SGD with momentum remains competitive for convolutional networks; AdamW is the
+  default for transformers (see the optimizers lesson).
+- **Settings:** choose the learning rate with a short sweep, pair it with warmup and a decay schedule, and
+  pick the batch size from hardware and the critical-batch-size curve.
+- **Avoid when** a tiny convex problem has a closed form, or the objective is non-differentiable, such as
+  "did the agent complete the task", which is why reinforcement learning and surrogate losses exist.
+- **Measure** loss and gradient norm over steps.
+- **Interviews:** why not a closed form, why the learning rate has an upper bound, why mini-batches, and
+  what momentum does.
 
 ## Role lens
 - **Engineer:** Runs the learning-rate sweep, reads loss and gradient-norm curves to tell divergence from
@@ -179,6 +263,39 @@ and check for mixed-precision overflow and for a batch containing extreme values
 the peak learning rate or lengthen warmup, enable gradient-norm clipping, verify loss scaling for fp16,
 inspect the offending batch, and resume from the last good checkpoint. More data changes nothing about
 the per-step dynamics that caused the blow-up.
+
+## Interview questions
+### Why do we train neural networks with gradient descent instead of a closed form or Newton's method?
+- **No closed form** exists for non-linear models; only special cases such as linear least squares have one.
+- **Newton needs the Hessian:** P² entries and O(P³) inversion, impossible at a billion parameters.
+- **The gradient is cheap:** backpropagation gives all P components for about twice a forward pass, so
+  first-order steps win on cost per unit of progress.
+
+### Why is there an upper bound on the learning rate?
+- **Quadratic analysis:** along curvature λ the error is multiplied by (1 − ηλ) each step, which shrinks
+  only when η < 2/λ.
+- **The steepest direction sets the limit:** η < 2/λ_max, while the flattest direction then crawls, so
+  iterations scale with κ.
+- **In practice** the landscape sharpens during training, which is why warmup, decay and clipping are
+  used.
+
+### Loss is flat for the first 1,000 steps of a fine-tune. How do you debug it?
+- **Check gradient flow:** log the gradient norm; zero or tiny means frozen parameters, dead units, or a
+  detached graph.
+- **Check the learning rate:** the scheduler may still be in warmup or η may be far too small.
+- **Check data and scaling:** unscaled inputs or a loss mask that excludes everything also give flat loss.
+
+### You move from 8 to 64 GPUs and keep the same per-GPU batch. What changes, and what do you retune?
+- **Global batch rises 8×,** so there are 8× fewer updates per epoch with lower-variance gradients.
+- **Raise the learning rate** (often with longer warmup) to keep progress per epoch, up to the point where
+  the heuristic breaks.
+- **Past the critical batch size,** extra GPUs stop shortening the run; measure progress per example.
+
+### What does momentum actually buy you, in numbers?
+- **Accumulation:** steady gradients sum to up to 1/(1 − μ), 10× at μ = 0.9, while zig-zags cancel.
+- **Conditioning:** tuned on a quadratic, iterations scale with √κ rather than κ, so κ = 10,000 goes from
+  order 10,000 to order 100 steps.
+- **Cost:** one extra parameter-sized buffer and a risk of overshoot when μ and η are both large.
 
 ## Quiz
 ### Q: For a quadratic loss with curvature λ, plain gradient descent converges only when the learning rate satisfies which condition?

@@ -110,6 +110,25 @@ For each level write down what the user sees, what it costs, and who gets it.
 - Time to recover to full.
 - **A good SLO:** "Percentage of sessions served at Level 0".
 
+## Diagram
+The ladder as states: each trigger steps down at once, a failure inside a level moves the request one level
+down, and the only way back up to Full is sustained health for the dwell time.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Full
+    Full --> Reduced: p95 over 4 s, budget at 80 percent, queue over 200
+    Reduced --> Full: p95 under 2.5 s for ten minutes
+    Full --> Cached: breaker open or budget spent
+    Reduced --> Cached: model timeout or error on this request
+    Cached --> Reduced: breaker closed and budget recovered
+    Cached --> NonAI: no tenant-scoped cache hit
+    Full --> NonAI: kill switch flipped
+    NonAI --> Unavailable: search itself is down
+    Unavailable --> NonAI: search recovers
+    NonAI --> Full: kill switch cleared and health sustained
+```
+
 ## Examples
 ### Support-answer endpoint with a degradation ladder
 A background task refreshes `h`, a health snapshot, every few seconds; the handler picks a level, enforces a
@@ -284,6 +303,41 @@ must show a clear message and a path to a human, because an unlabelled, unground
 an honest unavailability and the customer will own the consequences of it. Replace the absolute with an
 SLO, for example the share of sessions served at full quality, and agree the drill that proves each level
 works.
+
+## Interview questions
+### Why is a model fallback not enough on its own to keep an AI feature available?
+- **A fallback changes the provider, not the function:** it handles a provider outage, but not overload,
+  budget exhaustion or a latency SLO the fallback also misses.
+- **Degradation changes the function** to something cheaper and simpler (smaller model, cache, non-AI path,
+  honest message), so an incident lowers spend instead of raising it.
+- **AI adds a trust failure** too: a produced answer that failed its grounding check should be demoted to
+  sources-only, not shown.
+
+### Users report answers flipping between fast and slow, short and full, within one session. What is wrong?
+- **No hysteresis:** a single threshold near the signal's typical value toggles the level on every sample,
+  which users read as randomness.
+- **Fix:** separate enter and exit thresholds plus a dwell time, for example enter Reduced above a p95 of
+  4 s and leave only after ten minutes under 2.5 s.
+- **Compute the level in one background task** so every request in a window sees the same level.
+
+### Why trigger on projected budget burn rather than spend so far?
+- **Spend so far fires too late:** on a heavy day at $40 per hour from $150 at 10:00, a $500 cap is hit around
+  18:45 and everyone drops straight to Cached.
+- **Projected burn fires at 10:00:** 150 + 40 × 14 = $710 exceeds the cap, so stepping to Reduced early (halving
+  the rate gives $430) keeps the cap without a cliff.
+
+### When would you not build a full degradation ladder?
+- **Offline batch work** usually needs only retry-later, since no user is waiting.
+- **When the AI feature is the product,** no non-AI path exists, so degrade within AI levels and then be
+  honest.
+- **In medical, legal or financial contexts,** skip partial synthesis as a level and return sources only,
+  because a half answer can mislead.
+
+### How do you prove each degraded level actually works before an incident?
+- **Exercise it routinely:** send a small share of traffic through each level and run synthetic checks that
+  fail on a stale non-AI index or an expired credential.
+- **Make every level a runtime flag** named in the runbook, so mitigation is a flag flip, not a deploy.
+- **Hold game days** and track time per level, outcomes per level and time to recover to full.
 
 ## Quiz
 ### Q: What is the difference between a fallback and graceful degradation?

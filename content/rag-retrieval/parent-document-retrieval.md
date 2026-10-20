@@ -99,6 +99,24 @@ Pick by question type, and measure: the rules rank parents differently on the sa
 - **Stronger remedy:** contextual retrieval, which writes a chunk-specific context with an LLM.
 - **They compose:** contextualised children for matching, parents for answering.
 
+## Diagram
+Two stores, one join: children are searched, parents are fetched by id, and citations point back at the
+matched child spans.
+
+```mermaid
+flowchart LR
+    D["Document"] -->|"split at headings, size cap"| P["Parent sections"]
+    P -->|"split into small chunks"| C["Children with heading path"]
+    C -->|"embed children only"| V[("Vector index of children")]
+    P -->|"store by parent_id, not embedded"| KV[("Parent store")]
+    Q["Query"] -->|"over-fetch, k about 20"| V
+    V --> G["Group hits by parent_id, score by max, count or fraction"]
+    G --> B["Dedupe and fill token budget, top-n parents"]
+    B -->|"look up parent_id"| KV
+    KV --> GEN["Generator gets parent text"]
+    G -.->|"matched child spans"| CIT["Citations and highlights"]
+```
+
 ## Examples
 ### Two stores and the query-side join
 Heading paths are prepended to children for matching. `embed`, `index.add`, `index.search` and `split` are
@@ -249,6 +267,45 @@ the matched child spans for citations. New costs: each hit consumes a section's 
 sources fit, the index holds many more vectors, and the parent store must stay in sync with the index on
 every re-index or deletion. Validate with child recall@k and answer faithfulness against the old
 single-size baseline.
+
+## Interview questions
+### What is parent-document retrieval and what problem does it solve?
+- **Definition:** index small child chunks linked by `parent_id` to larger parents, search the children,
+  and give the generator the parents.
+- **Why:** one chunk size is wrong both ways; a short sentence is a sharp key but a useless answer, and a
+  whole section answers well but its embedding blurs several topics.
+- **It decouples the units:** the retrieval unit is chosen for matching and the generation unit for
+  answering, like a lookup on small keys joined to large values.
+
+### Users say the bot cites a whole section they cannot check, and some answers come back with empty context. How do you debug?
+- **Citation granularity:** return the matched child spans with offsets and highlight them inside the
+  parent instead of citing the 2k-token section.
+- **Empty contexts:** check for `parent_id` lookups that miss, the sign that the parent store and child
+  index drifted apart after a re-index or deletion.
+- **Fix the sync:** re-index per document (delete all children for the `doc_id`, replace its parents in one
+  job) and alert on lookup misses.
+
+### Max-child, count or fraction: how do you choose the parent scoring rule?
+- **Max child** suits pinpoint questions, because the parent with the single best passage wins.
+- **Count of hits** favours broad overview sections but has a size bias: a 30-child parent has more chances
+  to land hits than a 4-child one.
+- **Fraction** removes the size bias but over-rewards a tiny parent with one lucky hit; pick by question
+  type and measure on the golden set.
+
+### When would you not use parent-document retrieval?
+- **Short self-contained records** such as tickets, FAQ entries and product listings, where the record is
+  already the right unit.
+- **Breadth questions** that need evidence from many documents, because each hit costs parent-sized
+  context and fewer distinct sources fit.
+- **When matching, not context, is the failure:** parents do not help a child that lacks its subject;
+  prepend heading paths or use contextual retrieval instead.
+
+### Size it: a 6,000-token evidence budget with ~1,200-token parents. How many sources fit, and what does the index cost?
+- **About 5 parents fit** after deduplication, versus about 30 bare ~200-token children.
+- **The index grows:** a ~25k-token manual becomes about 125 child vectors instead of 20 section vectors,
+  raising storage and ANN cost.
+- **Over-fetch accordingly:** roughly 4–5 children per parent you return (20 for 4), then fill the token
+  budget rather than a fixed n.
 
 ## Quiz
 ### Q: Why are parents stored outside the vector index rather than embedded alongside the children?

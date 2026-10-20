@@ -132,6 +132,23 @@ Because the module already has a facade, owned data and events, extraction follo
 
 Contract tests written against the facade keep passing throughout.
 
+## Diagram
+The decision path for one boundary: stay a module by default, become a separate deployable from the same
+artifact for isolation, and become a service only for a named independence the monolith cannot give.
+
+```mermaid
+flowchart TD
+    M["Module with facade and owned data"] --> Q1{"Different hardware or failure domain?"}
+    Q1 -->|"no"| Q2{"Different team, runtime or compliance?"}
+    Q1 -->|"yes"| D["Separate deployable, same artifact"]
+    Q2 -->|"no"| K["Keep as module, CI-enforced"]
+    Q2 -->|"yes"| S["Extract to service"]
+    D -->|"still not enough"| S
+    S --> E1["Remote client behind same interface"]
+    E1 --> E2["Strangler: route a rising percentage"]
+    E2 --> E3["Move tables, delete in-process code"]
+```
+
 ## Examples
 ### Enforced module boundary in Python
 `chat` depends only on retrieval's public contract, side effects go through an in-process event bus, and
@@ -293,6 +310,40 @@ GPU and scales on throughput, not request concurrency. The hosted LLM is already
 HTTP boundary. That is three runtime units, not seven, with one build and one set of contracts. I would
 write down the triggers for further splits, for example a second team taking ownership of ingestion or
 retrieval needing a different data store, and keep module facades so extraction is an adapter swap.
+
+## Interview questions
+### What is a modular monolith, and why is it not just "a monolith with folders"?
+- **Definition:** one deployable whose modules expose narrow public APIs, own their tables and talk via
+  events for side effects, with the boundaries enforced by CI tooling such as `import-linter`.
+- **Why it matters:** folders without enforcement erode into a big ball of mud; enforced facades and owned
+  data make a later extraction a transport change rather than a rewrite.
+
+### Your services always ship together and one schema change broke two teams. What do you do?
+- **Diagnose:** this is a distributed monolith. Count coordinated deploys and repositories touched per
+  feature, and look for tables read by more than one service.
+- **Fix ownership first:** give each table one owner and route other access through its API or events.
+- **Then fix boundaries:** merge services that never change independently back into modules of one
+  deployable; keep only the splits whose independence you exercise.
+
+### When would you not split a module into a service even if it is CPU-heavy?
+- **When a separate deployable is enough.** Run the same artifact with a `worker` entrypoint and its own
+  replica count; you get isolation and independent scaling without a versioned network contract.
+- **When the team is one team.** Without a different release cadence there is no ownership reason, and you
+  would pay idempotency, timeouts and contract versioning for nothing.
+
+### A request path calls five services synchronously at 99.9% each. What availability should you expect?
+- **Roughly 0.999⁵ ≈ 99.5%**, so ~43 minutes of allowed monthly downtime per service becomes ~3.6 hours
+  for the path, assuming independent failures (real ones are correlated).
+- **Mitigate** by cutting synchronous links: async messaging, caches, fallbacks, and timeouts with partial
+  results for fan-out.
+
+### How would you extract the retrieval module into its own service safely?
+- **Same interface, new transport:** write an HTTP client implementing the existing `Retriever` contract,
+  so `ChatService` does not change.
+- **Strangler routing:** send a small, rising percentage of calls to the new service behind a flag and
+  compare error rate and p99 with the in-process path.
+- **Then move data:** migrate the tables, delete the in-process implementation, and keep the contract tests
+  green throughout.
 
 ## Quiz
 ### Q: What most distinguishes a modular monolith from an ordinary monolith?

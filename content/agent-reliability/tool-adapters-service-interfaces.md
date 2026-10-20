@@ -5,7 +5,7 @@ name: Tool adapters / service interfaces
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: reviewed
+status: crisp
 related:
   - agent-reliability/tool-permissions-and-least-privilege
   - agent-reliability/idempotent-tool-execution
@@ -21,104 +21,126 @@ sources:
 ---
 
 ## TL;DR
-The model speaks in small typed tool calls; real services speak HTTP with auth, pagination, rate limits
-and 40-field responses. A tool adapter is the layer that owns that translation: it validates arguments,
-enforces policy, injects credentials, applies timeouts, retries and idempotency, and turns every outcome,
-including failure, into a compact structured result the model can reason about. Keeping that layer
-explicit is what makes tools testable, swappable and safe.
+A tool adapter translates between small typed model calls and real services with auth, pagination, rate
+limits and 40-field responses. It validates, enforces policy, injects credentials, bounds retries and
+returns every outcome as a compact structured result, making tools testable, swappable and safe.
 
 ## Why it exists
-Hand a model the raw OpenAPI spec of a ticketing system and three things go wrong at once. The schema is
-enormous, so it eats context and degrades tool selection; the responses are enormous, so each result eats
-more context and buries the two fields that matter; and the failure modes are the vendor's, not yours: a
-429 with a Retry-After header, a 502 HTML page, a timeout with no body. The model will either hallucinate
-a fix for an error it cannot parse or loop on the same call. Meanwhile the API key has to live somewhere,
-and "in the prompt" is the one place it must not be.
-
-The naive alternative in the other direction is to write each tool as a quick function that calls the SDK
-directly. That works for a demo and fails the first time you need to swap the vendor, run the agent in an
-eval harness without hitting production, apply a permission check, or figure out why 8% of calls fail. The
-logic is scattered across twenty functions, each with its own idea of what an error looks like.
-
-The adapter pattern is older than agents. Hexagonal architecture calls the consumer-facing contract a
-*port* and the vendor-specific implementation an *adapter*; the application depends only on ports. What is
-new is that the consumer of the port is a language model, which changes what a good contract looks like:
-fewer arguments, enums over opaque IDs, outcomes that are explicit rather than implied by status codes,
-and absolutely no secrets on the model side of the boundary.
+- **Raw vendor APIs break three ways at once.** Hand a model the OpenAPI spec of a ticketing system and the
+  schema is enormous (eats context, degrades tool selection), the responses are enormous (bury the two
+  fields that matter), and the failure modes are the vendor's: a 429 with a Retry-After header, a 502 HTML
+  page, a timeout with no body.
+- **The model cannot parse vendor failures.** It either hallucinates a fix for an error it cannot read or
+  loops on the same call. And the API key has to live somewhere; "in the prompt" is the one place it must
+  not be.
+- **Quick SDK functions do not scale either.** They work for a demo and fail the first time you need to
+  swap the vendor, run the agent in an eval harness without hitting production, apply a permission check,
+  or figure out why 8% of calls fail, because the logic is scattered across twenty functions, each with
+  its own idea of an error.
+- **The pattern is older than agents.** Hexagonal architecture calls the consumer-facing contract a *port*
+  and the vendor-specific implementation an *adapter*; the application depends only on ports.
+- **What is new is the consumer.** A language model changes what a good contract looks like: fewer
+  arguments, enums over opaque IDs, explicit outcomes rather than ones implied by status codes, and
+  absolutely no secrets on the model side of the boundary.
 
 ## How it works
 ### Two interfaces, one component
-An adapter has an inner and an outer face.
+| Face | What it is | Designed for | Changes when |
+|---|---|---|---|
+| **Model-facing contract** | Tool definition: name, one-paragraph description, JSON schema for arguments, implied result shape | A reader that pattern-matches on descriptions and cannot look anything up | Rarely; it must stay stable across backend changes |
+| **Service interface** | Client for the real system: SDK or HTTP, auth, base URLs, pagination cursors, vendor error codes | The vendor | Whenever the vendor changes; the model never notices |
 
-- The **model-facing contract** is the tool definition the model sees: name, one-paragraph description, a
-  JSON schema for arguments, and an implied result shape. It is designed for a reader that
-  pattern-matches on descriptions and cannot look anything up: three to six arguments, enums where the
-  backend wants IDs (`project: "billing"` rather than `project_id: 10432`), sensible defaults, and a
-  stable shape across backend changes.
-- The **service interface** is the client that talks to the real system: SDK or HTTP, auth, base URLs,
-  pagination cursors, vendor error codes. It changes when the vendor changes and the model never notices.
+- **Good contract shape:** three to six arguments, enums where the backend wants IDs (`project: "billing"`
+  rather than `project_id: 10432`), sensible defaults, and a stable shape.
 
 ### What the adapter does on every call
-1. **Validate** the arguments against the schema before any side effect, *because* the model emits text
-   and a missing field is cheaper to reject now than to discover as a 400 after half the work is done.
-   Validation failures return a structured error that names the field, so the model can correct it.
+1. **Validate** arguments against the schema before any side effect, *because* the model emits text and a
+   missing field is cheaper to reject now than to discover as a 400 after half the work. Failures return
+   a structured error naming the field, so the model can correct it.
 2. **Authorize** against the run's permission policy. The adapter is the natural enforcement point because
    it is the last code that sees the parsed arguments before they become effects.
-3. **Translate** intent into service calls. One model-facing call may be several service calls: resolve
-   the project name to an ID, create the ticket, fetch its URL. Hiding that sequence is the point; the
-   model should not plan around the vendor's data model.
+3. **Translate** intent into service calls. One model-facing call may be several: resolve the project name
+   to an ID, create the ticket, fetch its URL. Hiding that sequence is the point; the model should not plan
+   around the vendor's data model.
 4. **Inject credentials** from a vault, scoped to the user and tool, at call time. The token exists only
    inside the adapter's stack frame.
-5. **Bound the call**: a timeout, a retry policy for retryable classes only, and an idempotency key derived
-   from the run and step so that a retry after a lost response cannot create a second ticket. If the
-   vendor does not honour an idempotency header, the adapter deduplicates locally by that key. Transient
-   failures are retried *inside* the adapter, a small bounded number of times with jittered backoff,
-   *because* a retry the model has to decide on costs a full model turn of latency and tokens; only when
-   that budget is spent does the failure reach the model, as a result it can plan around.
-6. **Normalize the outcome** into one shape: `{"ok": true, ...}` or `{"ok": false, "error": <code>,
-   "retryable": <bool>, ...}`. The error code comes from a small taxonomy you own (`invalid_arguments`,
-   `not_found`, `denied`, `rate_limited`, `upstream_timeout`, `upstream_error`), *because* the model should
-   learn one vocabulary of failure across all tools, and because your success-rate metrics need the same
-   classes.
+5. **Bound the call** with a timeout, a retry policy for retryable classes only, and an idempotency key
+   derived from the run and step, so a retry after a lost response cannot create a second ticket.
+   - If the vendor does not honour an idempotency header, the adapter deduplicates locally by that key.
+   - Transient failures are retried *inside* the adapter, a small bounded number of times with jittered
+     backoff, *because* a retry the model decides on costs a full model turn of latency and tokens.
+   - Only when that budget is spent does the failure reach the model, as a result it can plan around.
+6. **Normalize the outcome** into one shape: `{"ok": true, ...}` or `{"ok": false, "error": <code>, "retryable": <bool>, ...}`.
+   The error code comes from a small taxonomy you own (`invalid_arguments`, `not_found`, `denied`,
+   `rate_limited`, `upstream_timeout`, `upstream_error`), *because* the model should learn one vocabulary
+   of failure across all tools, and your success-rate metrics need the same classes.
 7. **Project the response** down to what the next step needs, with stable identifiers the model can refer
-   back to, and a cursor if the full result is paged. Large payloads go to a blob store and the model gets
-   a reference plus a summary.
-8. **Emit telemetry**: a span with latency and error class, and an event on the run's stream.
+   back to and a cursor if the result is paged. Large payloads go to a blob store; the model gets a
+   reference plus a summary.
+8. **Emit telemetry:** a span with latency and error class, and an event on the run's stream.
 
 ### Composite calls and partial failure
-Hiding a three-call sequence behind one tool creates a new failure mode: call two succeeds and call
-three fails. The adapter must not report a plain failure, *because* the model will try again and create
-a second ticket. It either compensates (undo the earlier calls, if they can be undone) or reports the
-partial state explicitly: `{"ok": false, "error": "partial", "created": {"ticket_id": "T-88"},
-"failed_step": "attach_file"}`. The rule of thumb is that one model-facing tool should map to at most one
-non-idempotent service write; when a workflow needs several, either make it a durable sub-workflow with
-its own checkpoints or expose the writes as separate tools.
+- **New failure mode:** hiding a three-call sequence behind one tool means call two can succeed and call
+  three fail.
+- **Never report a plain failure,** *because* the model will try again and create a second ticket.
+- **Either compensate** (undo the earlier calls, if they can be undone) **or report the partial state:**
+  `{"ok": false, "error": "partial", "created": {"ticket_id": "T-88"}, "failed_step": "attach_file"}`.
+- **Rule of thumb:** one model-facing tool maps to at most one non-idempotent service write. When a
+  workflow needs several, make it a durable sub-workflow with its own checkpoints, or expose the writes as
+  separate tools.
 
 ### Evolving the contract
-The model-facing contract is an API with a fussy client. Additive changes (a new optional argument with
-a default, a new result field) are safe. Renaming an argument, narrowing an enum or changing what a field
-means is a breaking change, *because* prompts, few-shot examples and recorded eval trajectories all
-encode the old shape, and the model will keep producing it. Version breaking changes as a new tool name
-(`create_ticket_v2`), run the trajectory suite against both, and retire the old one when its call volume
-reaches zero. The service interface behind it can change freely as long as the contract tests, which run
-the adapter against recorded vendor responses, keep passing.
+The model-facing contract is an API with a fussy client.
+
+| Change | Safe? | Why |
+|---|---|---|
+| New optional argument with a default | Yes | Old calls still validate |
+| New result field | Yes | Nothing depends on its absence |
+| Rename an argument, narrow an enum, change a field's meaning | No, breaking | Prompts, few-shot examples and recorded eval trajectories encode the old shape, and the model keeps producing it |
+
+- **Version breaking changes as a new tool name** (`create_ticket_v2`), run the trajectory suite against
+  both, and retire the old one when its call volume reaches zero.
+- **The service interface can change freely** as long as the contract tests, which run the adapter
+  against recorded vendor responses, keep passing.
 
 ### Where the boundary lives
-In-process adapters are plain classes, fastest and simplest. MCP standardizes the boundary as a protocol:
-the server exposes tool contracts, the host's client calls them, and the eight responsibilities above move
-into the server. That buys reuse across agents and languages at the cost of a network hop and a
-deployment. Either way, the adapter is also the seam for evaluation: swap the service interface for a
-recorded or fake one and the agent runs deterministically against the same contract.
+- **In-process adapters** are plain classes: fastest and simplest.
+- **MCP** standardizes the boundary as a protocol: the server exposes tool contracts, the host's client
+  calls them, and the eight responsibilities above move into the server. That buys reuse across agents and
+  languages at the cost of a network hop and a deployment.
+- **Either way the adapter is the evaluation seam:** swap the service interface for a recorded or fake one
+  and the agent runs deterministically against the same contract.
 
 ### Why not just let the model emit HTTP
-A generic `http_request` tool is the zero-adapter design. It maximizes flexibility and minimizes
-everything else: no argument validation, no permission check on semantics, vendor errors passed straight
-through, and credentials that have to be reachable by the model to be usable. It is the right tool for a
-sandboxed research agent and the wrong one for anything with side effects.
+- **A generic `http_request` tool is the zero-adapter design.** It maximizes flexibility and minimizes
+  everything else: no argument validation, no permission check on semantics, vendor errors passed straight
+  through, and credentials that must be reachable by the model to be usable.
+- **Right for** a sandboxed research agent; **wrong for** anything with side effects.
 
-## Example
-A `create_ticket` adapter: typed arguments on the outside, a vendor HTTP API on the inside, one error
-vocabulary, and a projected result. Nothing vendor-specific leaks to the model.
+## Diagram
+One model-facing call fans out inside the adapter; the model only ever sees the projected, normalized
+result, never the token or the raw vendor body.
+
+```mermaid
+sequenceDiagram
+    participant M as Model
+    participant A as Adapter
+    participant V as Vault
+    participant S as Vendor API
+    M->>A: create_ticket title, project billing
+    Note over A: validate, authorize, map billing to 10432
+    A->>V: token for user and tool, ttl 300 s
+    V-->>A: short-lived token
+    A->>S: POST /v2/tickets with Idempotency-Key
+    S-->>A: 201 large vendor JSON, or 429 or 5xx
+    Note over A: map to ok or error class, project fields
+    A-->>M: ok true, ticket_id, status, url
+```
+
+## Examples
+### A `create_ticket` adapter
+Typed arguments on the outside, a vendor HTTP API on the inside, one error vocabulary, and a projected
+result. Nothing vendor-specific leaks to the model.
 
 ```python
 from typing import Literal
@@ -166,46 +188,106 @@ class TicketAdapter:
                 "url": f"{self.web_base}/tickets/{d['id']}"}
 ```
 
+### Contract test against a fake vendor
+`httpx.MockTransport` replaces the network, so the adapter runs in CI and in eval harnesses without
+touching production. The handler plays back a big vendor response and a rate limit.
+
+```python
+import httpx
+
+class FakeVault:
+    def token_for(self, user, tool, ttl_s):
+        return "test-token"
+
+def vendor(request: httpx.Request) -> httpx.Response:
+    if request.headers["Idempotency-Key"] == "run-1:step-3":
+        return httpx.Response(201, json={"id": 88, "status": "open", "custom_fields": ["..."] * 40})
+    return httpx.Response(429, headers={"Retry-After": "7"})
+
+client = httpx.Client(transport=httpx.MockTransport(vendor), base_url="https://api.vendor.example")
+ad = TicketAdapter(client, {"billing": 10432, "platform": 1, "support": 2}, FakeVault(),
+                   web_base="https://tickets.example/")
+args = {"title": "Refund stuck", "body": "Order o-1", "project": "billing"}
+
+assert ad.create_ticket(args, user="u1", idempotency_key="run-1:step-3") == {
+    "ok": True, "ticket_id": 88, "status": "open", "url": "https://tickets.example/tickets/88"}
+assert ad.create_ticket(args, user="u1", idempotency_key="other")["retry_after_s"] == 7
+assert ad.create_ticket({"title": "x", "body": "y", "project": "sales"},
+                        user="u1", idempotency_key="k")["error"] == "invalid_arguments"
+```
+
+### Worked mapping: what the model sees for each vendor outcome
+| Vendor outcome | Adapter result | What the runtime or model does next |
+|---|---|---|
+| 201 with a 40-field body | `ok: true` with 4 fields | Uses `ticket_id` in the next step |
+| Missing `project` in arguments | `invalid_arguments`, `retryable: false`, field named | Model fixes the argument, no network call made |
+| 429, `Retry-After: 7` | `rate_limited`, `retry_after_s: 7` | Runtime waits, model does not burn a turn |
+| 403 | `denied`, `retryable: false` | Model re-plans or asks the user |
+| 502 HTML page | `upstream_error`, `retryable: true`, `http_status: 502` | Bounded retry; raw page goes to the trace only |
+| Timeout after 10 s | `upstream_timeout`, `retryable: true` | Retry with the same idempotency key, so no duplicate |
+
+## Production patterns
+- **One adapter base class.** When: from the second tool onward. How: a base that does schema validation,
+  a default timeout, the error taxonomy and the result envelope, so each tool implements only `translate`
+  and `project`. Monitor: success rate per tool broken down by error class.
+- **Recorded contract tests.** When: every adapter that talks to a vendor. How: replay recorded vendor
+  responses through a fake transport (`httpx.MockTransport`, or cassette libraries such as vcrpy) and
+  assert on the normalized result. Monitor: tests failing after a vendor API change, before users notice.
+- **Retries inside the adapter, keyed for idempotency.** When: timeouts, 429s and 5xx on calls that are
+  safe to repeat. How: a small attempt cap with jittered exponential backoff (for example tenacity's
+  `stop_after_attempt` and `wait_random_exponential`), reusing the run-and-step idempotency key. Monitor:
+  retries per call and duplicate writes.
+- **Shared rate limiter.** When: many concurrent runs hit one vendor limit. How: a token bucket in Redis or
+  a process-wide limiter set slightly under the vendor limit, shared by all runs. Monitor: 429 rate from
+  the vendor, which should stay near zero.
+- **Versioned tool names on breaking changes.** When: renaming arguments or narrowing enums. How: ship
+  `create_ticket_v2` beside the old tool, run the trajectory suite on both, retire at zero call volume.
+  Monitor: `invalid_arguments` rate per tool right after each deploy.
+- **Blob offload for big results.** When: a response would exceed a few thousand tokens. How: write the
+  full payload to object storage, return a reference, a summary and a cursor. Monitor: fraction of
+  responses truncated or offloaded per tool.
+
 ## Trade-offs
-- An adapter per tool is code to write and maintain, but it is the only place where validation, policy,
-  retries and error normalization can live once rather than being re-implemented per call site; the cost
-  flips in favour of a generic HTTP tool only for sandboxed, read-only exploration.
-- A narrow contract improves selection accuracy and safety yet cannot express the request you did not
-  anticipate; when tasks are open-ended, offer a few composable primitives rather than one tool per
-  workflow.
-- Projecting responses saves context tokens and keeps the model focused, but every dropped field is a
-  field the model cannot use; add a `fields` argument or a follow-up `get` tool rather than widening the
-  default.
-- MCP-style out-of-process adapters give reuse across agents and languages at the price of a network hop, a
-  deployment and a second place where auth must be configured; in-process adapters win for a
-  single-service agent.
+- **Adapter per tool vs generic HTTP tool.** An adapter is code to write and maintain, but it is the only
+  place validation, policy, retries and error normalization live once rather than per call site; the cost
+  flips toward a generic HTTP tool only for sandboxed, read-only exploration.
+- **Narrow contract vs expressiveness.** A narrow contract improves selection accuracy and safety yet cannot
+  express the request you did not anticipate; for open-ended tasks, offer a few composable primitives
+  rather than one tool per workflow.
+- **Projection vs completeness.** Projecting responses saves context tokens and keeps the model focused,
+  but every dropped field is one the model cannot use; add a `fields` argument or a follow-up `get` tool
+  rather than widening the default.
+- **Out-of-process vs in-process.** MCP-style adapters give reuse across agents and languages at the price
+  of a network hop, a deployment and a second place where auth must be configured; in-process adapters win
+  for a single-service agent.
 
 ## Pitfalls
-- Exposing a whole OpenAPI spec as tools; the symptom is a tool list of 80 entries, high token overhead
-  per turn and the model picking near-miss tools.
-- Letting the adapter raise; the symptom is agent loops that crash on a vendor 502 instead of telling the
+- **Exposing a whole OpenAPI spec as tools.** Symptom: a tool list of 80 entries, high token overhead per
+  turn and the model picking near-miss tools.
+- **Letting the adapter raise.** Symptom: agent loops that crash on a vendor 502 instead of telling the
   model the call failed and is retryable.
-- Passing vendor error bodies straight through; the symptom is the model "fixing" an HTML error page by
+- **Passing vendor error bodies straight through.** Symptom: the model "fixing" an HTML error page by
   inventing a different argument, repeatedly.
-- No timeout on the service call; the symptom is runs that hang for minutes on one tool while the step
+- **No timeout on the service call.** Symptom: runs that hang for minutes on one tool while the step
   budget and the user's patience expire.
-- Returning results without stable identifiers; the symptom is a follow-up call that refers to "the second
-  ticket" and the adapter cannot resolve it.
-- Hiding non-idempotent writes behind automatic retries; the symptom is duplicate tickets, emails or
-  refunds after a transient timeout.
-- Reporting a composite call's partial failure as a plain failure; the symptom is orphaned or duplicated
+- **Results without stable identifiers.** Symptom: a follow-up call refers to "the second ticket" and the
+  adapter cannot resolve it.
+- **Hiding non-idempotent writes behind automatic retries.** Symptom: duplicate tickets, emails or refunds
+  after a transient timeout.
+- **Reporting a composite call's partial failure as a plain failure.** Symptom: orphaned or duplicated
   records created by the model's well-meaning second attempt.
-- Renaming an argument in place; the symptom is a jump in `invalid_arguments` for that tool right after
+- **Renaming an argument in place.** Symptom: a jump in `invalid_arguments` for that tool right after
   deploy, because the model still emits the old name it learned from examples.
 
 ## When to use
-Introduce an adapter the moment a tool does anything beyond a pure in-memory computation: any network
-call, any credential, any side effect. For a prototype, a single adapter base class with validation,
-timeout and error normalization is enough; for production, add idempotency keys, policy checks and
-telemetry. Measure per-tool success rate by error class, p95 latency, and the fraction of responses
-truncated, because those three numbers tell you whether the contract or the service is the problem. In
-interviews, "how do you design a tool for an agent" should produce the two-face answer: a contract shaped
-for a model and a client shaped for the vendor, with the adapter owning everything between.
+- **Use when** a tool does anything beyond a pure in-memory computation: any network call, any credential,
+  any side effect.
+- **Prototype:** a single adapter base class with validation, timeout and error normalization is enough.
+- **Production:** add idempotency keys, policy checks and telemetry.
+- **Measure** per-tool success rate by error class, p95 latency, and the fraction of responses truncated,
+  because those three numbers tell you whether the contract or the service is the problem.
+- **Interviews:** "how do you design a tool for an agent" should produce the two-face answer: a contract
+  shaped for a model and a client shaped for the vendor, with the adapter owning everything between.
 
 ## Role lens
 - **Engineer:** Writes adapters with typed arguments, a shared error taxonomy and tests that run the agent
@@ -229,6 +311,41 @@ model, handles backoff. A client-side token bucket at slightly under 10 requests
 shared limit across concurrent runs, but only if it is shared by all of them (process-wide, or backed by
 Redis when runs span workers); a bucket per run lets ten concurrent runs send ten times the limit. Every outcome returns in the same `ok/error/retryable` envelope and is recorded
 with its error class so success rate per tool is visible from day one.
+
+## Interview questions
+### What is a tool adapter, and why not let tools call the vendor SDK directly?
+- **Definition:** the component between the model-facing contract and the real service that validates,
+  authorizes, translates, injects credentials, bounds the call, normalizes outcomes and projects results.
+- **Why not direct SDK calls:** that logic ends up scattered across every tool with a different idea of an
+  error, so you cannot swap vendors, run evals offline or explain why 8% of calls fail.
+- **Lineage:** it is the ports-and-adapters pattern, with a language model as the consumer of the port.
+
+### A create-then-attach tool fails on the attach step. What should the adapter return, and why?
+- **Not a plain failure,** because the model will retry and create a second ticket.
+- **Either compensate** by deleting the created ticket, **or report partial state** with the created id
+  and the failed step, so the model retries only the attach.
+- **Design fix:** keep at most one non-idempotent write per tool, or make the sequence a durable
+  sub-workflow with checkpoints.
+
+### When would you choose MCP servers over in-process adapters?
+- **Choose MCP** when several agents, teams or languages need the same tools: one server, one contract,
+  reused everywhere.
+- **Pay for it** with a network hop, a deployment and a second place where auth must be configured.
+- **Stay in-process** for a single-service agent where latency and simplicity matter more than reuse.
+
+### After a deploy, one tool's success rate dropped from 97% to 85%. How do you debug it?
+- **Split failures by error class first:** a jump in `invalid_arguments` points at a contract change the
+  model has not caught up with; `upstream_error` or `upstream_timeout` points at the service.
+- **Check the diff for renamed arguments or narrowed enums,** because recorded examples and prompts still
+  encode the old shape; the fix is a versioned tool name, not a prompt patch.
+- **Replay recorded vendor responses** through the contract tests to tell adapter bugs from vendor changes.
+
+### How do you keep a tool's response from flooding the context window?
+- **Project to what the next step needs:** a few fields plus stable identifiers the model can refer back to.
+- **Page and offload:** return a cursor for long lists, and put large payloads in a blob store with a
+  reference and a summary.
+- **Allow opt-in detail** through a `fields` argument or a follow-up `get` tool instead of widening the
+  default.
 
 ## Quiz
 ### Q: Why should a tool adapter return a structured error object instead of raising an exception when the upstream service times out?

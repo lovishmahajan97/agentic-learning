@@ -5,7 +5,7 @@ name: REST / GraphQL API design
 kind: decision
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - backend-fundamentals/api-versioning-and-backward-compatibility
   - backend-fundamentals/pagination-rate-limits-api-quotas
@@ -23,99 +23,134 @@ sources:
 ---
 
 ## TL;DR
-An API is a contract that outlives the code behind it. REST models a system as resources addressed by
-URLs and manipulated with HTTP methods whose semantics (safe, idempotent, cacheable) every proxy,
-cache and SDK already understands. GraphQL models it as a typed graph that clients query through one
-endpoint for exactly the shape they need. Choose REST for service-to-service and model-facing
-endpoints (simple, cacheable, streamable, tool-callable); choose GraphQL when many client shapes read
-one rich domain and over- and under-fetching is the real pain.
+An API is a contract that outlives its code. REST uses resources and HTTP semantics every proxy
+understands; GraphQL lets clients query one typed graph for exact shapes. Use REST for services, models
+and tools; GraphQL when many client shapes read one rich domain.
 
 ## Why it exists
-The moment a client ships against your interface, that interface is frozen. Design decisions made
-casually on day one, an action-style endpoint named `/getUserOrders2`, an error returned as 200 with
-`{"ok": false}`, a delete that is not safe to retry, cost forever. API styles exist to make those
-decisions by convention instead of by accident.
-
-REST's insight is to lean on HTTP rather than tunnel through it. If `GET` is safe and idempotent,
-caches can store it and clients can retry it blind. If `PUT` and `DELETE` are idempotent, a timeout
-can be retried without creating duplicates. If status codes carry meaning, load balancers can count
-5xx responses and retry policies can act on 429 and 503 without reading bodies. The naive alternative,
-one `POST /api` endpoint with an `action` field in the body, throws all of that away: nothing can be
-cached, nothing is retry-safe by inspection, and every request looks identical to observability.
-
-GraphQL arose at Facebook (open-sourced in 2015) from a different pain: mobile clients needed many
-different shapes of the same data, and REST either over-fetched (one fat resource) or under-fetched
-(three round trips to assemble a screen), with endpoints multiplying per screen. A typed schema plus
-client-authored queries fixes that by moving shape selection to the client. The cost is giving up
-HTTP's per-resource semantics, which is why neither style dominates.
-
-For AI services the question is sharper: model calls are big `POST` bodies with streaming responses,
-and tools exposed to an agent are easiest to describe as REST operations with an OpenAPI schema.
+- **A shipped interface is frozen.** Casual day-one choices cost forever: an action-style endpoint named
+  `/getUserOrders2`, an error returned as 200 with `{"ok": false}`, a delete that is not safe to retry.
+  API styles make those decisions by convention instead of by accident.
+- **REST leans on HTTP instead of tunnelling through it.** Safe, idempotent `GET` can be cached and
+  retried blind; idempotent `PUT` and `DELETE` survive a timeout retry without duplicates; meaningful
+  status codes let load balancers count 5xx and retry policies act on 429 and 503 without reading bodies.
+- **The naive alternative throws that away.** One `POST /api` endpoint with an `action` field: nothing
+  cacheable, nothing retry-safe by inspection, every request identical to observability.
+- **GraphQL solved a different pain.** It arose at Facebook (open-sourced in 2015): mobile clients needed
+  many shapes of the same data, and REST either over-fetched (one fat resource) or under-fetched (three
+  round trips per screen), with endpoints multiplying per screen. Client-authored queries over a typed
+  schema fix that, at the cost of HTTP's per-resource semantics, so neither style dominates.
+- **AI services sharpen the question.** Model calls are big `POST` bodies with streaming responses, and
+  tools exposed to an agent are easiest to describe as REST operations with an OpenAPI schema.
 
 ## How it works
-### REST: resources, methods, status codes
-Model nouns, not verbs: `/conversations/{id}/messages`, not `/sendMessage`. Collections and items
-nest at most a level or two. Methods carry semantics defined by HTTP: `GET` is safe and idempotent and
-may be cached; `PUT` replaces a resource and is idempotent; `DELETE` is idempotent; `PATCH` applies a
-partial change; `POST` creates or triggers and is *not* idempotent, which is why non-trivial APIs
-accept an `Idempotency-Key` header on it. Status codes are the first thing a client branches on:
-`200` and `201 Created`, `202 Accepted` for work that continues after the response, `204` for empty
-success, `400`/`422` for invalid input, `401`/`403` for identity and permission, `404`, `409` for state
-conflicts, `429` for rate limits, `5xx` for your faults. Use one error envelope everywhere; Problem
-Details (RFC 9457) gives a standard JSON shape with `type`, `title`, `status` and `detail`.
+### REST: resources and methods
+- **Model nouns, not verbs:** `/conversations/{id}/messages`, not `/sendMessage`. Nest collections and
+  items at most a level or two.
 
-Idempotency is about server state, not identical responses: a second `DELETE` of the same job may
-return `204` or `404` and both are idempotent, because the resource ends up gone either way. Pick one
-and document it, since clients write retry logic against it.
+| Method | Semantics (defined by HTTP) |
+|---|---|
+| `GET` | safe and idempotent; may be cached |
+| `PUT` | replaces a resource; idempotent |
+| `DELETE` | idempotent |
+| `PATCH` | applies a partial change |
+| `POST` | creates or triggers; *not* idempotent, which is why non-trivial APIs accept an `Idempotency-Key` header on it |
 
-Concurrent writers are HTTP's other built-in mechanism. A `GET` returns an `ETag` (a version tag for
-the representation); a client that wants to update sends `If-Match: <etag>` with its `PUT` or `PATCH`,
-and the server answers `412 Precondition Failed` if someone else changed the resource in between.
-That is optimistic concurrency without a custom `version` field, and it is what stops two editors (or
-two agents) from silently overwriting each other's changes to the same prompt template or config.
-The same tag sent as `If-None-Match` on a `GET` lets the server answer `304 Not Modified` with no
-body, which is how polling stays cheap.
+- **Idempotency is about server state, not identical responses.** A second `DELETE` of the same job may
+  return `204` or `404`; both are idempotent, because the resource ends up gone either way. Pick one and
+  document it, since clients write retry logic against it.
 
-Fielding's original definition also requires hypermedia (responses carrying links that tell the
-client what it can do next, often called HATEOAS). Most production "REST" APIs skip it; the useful
-remnants are the `Location` header, `next` links in paginated responses and job resources that link
-to their result.
+### REST: status codes and errors
+Status codes are the first thing a client branches on.
 
-Long-running AI work maps cleanly: `POST /summaries` returns `202` with a `Location` to a job resource
-that clients `GET` until it is `succeeded`, or the response itself streams as `text/event-stream`.
-Both keep proxies and timeouts happy *because* no single request has to live as long as the job.
+| Code | Meaning |
+|---|---|
+| `200`, `201 Created` | success; created |
+| `202 Accepted` | work continues after the response |
+| `204` | empty success |
+| `400` / `422` | invalid input |
+| `401` / `403` | identity / permission |
+| `404` | not found |
+| `409` | state conflict |
+| `429` | rate limited |
+| `5xx` | your fault |
+
+- **One error envelope everywhere.** Problem Details (RFC 9457) gives a standard JSON shape with `type`,
+  `title`, `status` and `detail`.
+
+### REST: concurrency and conditional requests
+1. **A `GET` returns an `ETag`**, a version tag for the representation.
+2. **The updater sends `If-Match: <etag>`** with its `PUT` or `PATCH`.
+3. **The server answers `412 Precondition Failed`** if someone changed the resource in between.
+
+- **Optimistic concurrency without a custom `version` field.** It stops two editors (or two agents) from
+  silently overwriting each other's changes to the same prompt template or config.
+- **Cheap polling.** The same tag sent as `If-None-Match` on a `GET` lets the server answer
+  `304 Not Modified` with no body.
+
+### REST: hypermedia and long-running work
+- **Fielding's definition also requires hypermedia** (responses carrying links to what the client can do
+  next, often called HATEOAS). Most production "REST" APIs skip it; the useful remnants are the `Location`
+  header, `next` links in paginated responses, and job resources that link to their result.
+- **Long-running AI work maps cleanly.** `POST /summaries` returns `202` with a `Location` to a job
+  resource that clients `GET` until it is `succeeded`, or the response streams as `text/event-stream`.
+- **Both keep proxies and timeouts happy**, *because* no single request has to live as long as the job.
 
 ### GraphQL: schema, resolvers, one endpoint
-A schema in SDL declares types and fields and three roots: `Query`, `Mutation`, `Subscription`. A
-client sends a query naming exactly the fields it wants; the server executes it by calling a resolver
-per field, walking the tree. Because resolvers run per field and per parent object, a list of 100
-conversations each resolving `lastMessage` naively issues 101 database queries; the standard fix is a
-per-request DataLoader that batches and caches lookups. In practice almost everything travels as
-`POST` to one endpoint, so HTTP caching does not apply unless you send queries (typically persisted
-ones) over `GET`. Field errors are returned alongside partial data in an `errors` array, conventionally
-with a 200 status, so clients must inspect the body; the GraphQL-over-HTTP spec lets servers using the
-`application/graphql-response+json` media type answer 4xx when a request fails before execution. Because
-clients author queries, the server must enforce depth and cost limits, *because* an unbounded nested
-query is a denial-of-service vector. The spec does not fix a transport for subscriptions; most
-servers use WebSockets (the `graphql-ws` protocol), and SSE is a common alternative.
+1. **A schema in SDL** declares types and fields and three roots: `Query`, `Mutation`, `Subscription`.
+2. **A client sends a query** naming exactly the fields it wants.
+3. **The server executes it** by calling a resolver per field, walking the tree.
 
-GraphQL also changes how the contract evolves. There are no URL versions: you add fields freely
-(clients only receive what they ask for, so additions never break anyone), mark old fields
-`@deprecated(reason: ...)`, and remove them once field-level usage telemetry shows zero queries
-selecting them. That telemetry is something REST cannot give you per field without extra work, and it
-is one of GraphQL's quieter advantages for a fast-moving product schema.
+- **N+1 by default.** Resolvers run per field and per parent object, so 100 conversations each resolving
+  `lastMessage` naively issue 101 database queries. The standard fix is a per-request DataLoader that
+  batches and caches lookups.
+- **No HTTP caching by default.** Almost everything travels as `POST` to one endpoint, unless you send
+  queries (typically persisted ones) over `GET`.
+- **Errors ride with data.** Field errors return alongside partial data in an `errors` array,
+  conventionally with a 200, so clients must inspect the body. The GraphQL-over-HTTP spec lets servers
+  using `application/graphql-response+json` answer 4xx when a request fails before execution.
+- **Cost limits are mandatory**, *because* clients author queries and an unbounded nested query is a
+  denial-of-service vector. Enforce depth and cost limits.
+- **Subscriptions have no fixed transport.** Most servers use WebSockets (the `graphql-ws` protocol); SSE
+  is a common alternative.
+
+### GraphQL: evolving the contract
+- **No URL versions.** Add fields freely: clients receive only what they ask for, so additions break no one.
+- **Deprecate, then remove.** Mark old fields `@deprecated(reason: ...)` and remove them once field-level
+  usage telemetry shows zero queries selecting them.
+- **That telemetry is a quiet advantage.** REST cannot give it per field without extra work, which matters
+  for a fast-moving product schema.
 
 ### The decision
-Ask who the clients are and how many shapes they need. One product UI with screens assembled from a
-rich domain, owned by a team that iterates weekly: GraphQL pays off. Service-to-service calls, public
-APIs for integrators, anything cached by CDNs, anything exposed to an LLM as a tool: REST with an
-OpenAPI schema, because the schema generates clients and tool definitions directly. Many teams run
-both: GraphQL in the product's BFF, REST underneath and outward.
+| Situation | Choose | Because |
+|---|---|---|
+| One product UI assembling screens from a rich domain, team iterates weekly | GraphQL | shape selection moves to the client |
+| Service-to-service calls | REST + OpenAPI | simple, cacheable, retry-safe |
+| Public APIs for integrators | REST + OpenAPI | the schema generates clients |
+| Anything cached by CDNs | REST | HTTP caches key on method and URL |
+| Anything exposed to an LLM as a tool | REST + OpenAPI | the schema generates tool definitions directly |
 
-## Example
-A REST design for a long-running summarisation job in FastAPI: `POST` returns `202` with a `Location`,
-`GET` is safe to poll, `DELETE` is idempotent. The GraphQL SDL after it expresses the same domain for a
-client that wants to pick fields and subscribe to updates.
+- **Many teams run both:** GraphQL in the product's BFF, REST underneath and outward.
+
+## Diagram
+Start from the client and the boundary, not from taste: most AI-service boundaries land on REST.
+
+```mermaid
+flowchart TD
+    S["New API boundary"] --> Q1{"Called by an agent, partner or CDN?"}
+    Q1 -->|"yes"| R["REST plus OpenAPI"]
+    Q1 -->|"no"| Q2{"Many client shapes over one domain?"}
+    Q2 -->|"no"| R
+    Q2 -->|"yes"| G["GraphQL in the BFF"]
+    G --> G1["DataLoader, depth and cost limits"]
+    R --> Q3{"Job longer than a few seconds?"}
+    Q3 -->|"yes"| J["202 plus job resource, or SSE"]
+    Q3 -->|"no"| D["Plain request and response"]
+```
+
+## Examples
+### REST: a long-running summarisation job in FastAPI
+`POST` returns `202` with a `Location`, `GET` is safe to poll, `DELETE` is idempotent.
 
 ```python
 from uuid import uuid4
@@ -151,6 +186,9 @@ async def cancel_summary(job_id: str):
     return Response(status_code=204)
 ```
 
+### GraphQL: the same domain
+For a client that wants to pick fields and subscribe to updates.
+
 ```graphql
 enum JobStatus { QUEUED RUNNING SUCCEEDED FAILED }
 type Summary { id: ID!  status: JobStatus!  result: String }
@@ -159,40 +197,70 @@ type Mutation { createSummary(documentId: ID!, maxWords: Int = 200): Summary! }
 type Subscription { summaryUpdated(id: ID!): Summary! }
 ```
 
+### Worked scenario: two agents edit one prompt template
+Agent A and agent B both improve the same template within seconds.
+
+| Step | Without `If-Match` | With `ETag` / `If-Match` |
+|---|---|---|
+| A and B `GET` the template | both read version `"v7"` | both receive `ETag: "v7"` |
+| A sends `PUT` | saved as v8 | `If-Match: "v7"` matches, saved, new tag `"v8"` |
+| B sends `PUT` | silently overwrites A's change | `If-Match: "v7"` fails: `412 Precondition Failed` |
+| B recovers | nothing to recover; "my change disappeared" | re-`GET` v8, merge, retry with `If-Match: "v8"` |
+
+## Production patterns
+- **One Problem Details envelope.** Register exception handlers that map every error to RFC 9457 JSON
+  with the `application/problem+json` media type and a stable `type` URI per error kind. Monitor error
+  counts by `type` and status, which turns dashboards into a list of named failure modes.
+- **Idempotency keys on `POST`.** Require an `Idempotency-Key` on creates and job submissions, store key
+  plus request hash plus response for a fixed window (for example 24 hours), and replay the stored
+  response on a repeat. Monitor replay hits and key reuse with a different body (return `409` or `422`).
+- **Job resources with polling hints.** For model work over a few seconds, return `202` plus `Location`,
+  and add a `Retry-After` hint so clients poll at a sane interval. Monitor job age by status and the
+  share of jobs stuck in `queued`.
+- **GraphQL guardrails.** Use persisted (allow-listed) queries for first-party clients, a per-request
+  DataLoader for every list relation, and depth or complexity limits in the server. Monitor database
+  queries per operation and rejected-query counts.
+- **Breaking-change gate in CI.** Generate the OpenAPI document on every build and diff it against the
+  released one with a tool such as oasdiff; fail on removed fields or tightened types. Track the count
+  of deliberate breaking changes per release.
+
 ## Trade-offs
-- REST gets HTTP caching, retry-safety by method and tooling for free, but a screen needing five
-  resources costs five round trips; this flips to GraphQL when client-side shape variety dominates.
-- GraphQL gives clients exact shapes and one evolving schema, but you give up HTTP caching, must
-  defend against expensive queries and must batch resolvers; it usually flips back to REST for public
-  APIs, where caching and per-endpoint limits matter (GitHub and Shopify are notable GraphQL exceptions).
-- Returning `202` and a job resource keeps requests short and proxy-friendly, but clients must poll
-  or subscribe, which costs more code than one long request when jobs are reliably under a few seconds.
-- A single error envelope and strict status codes make clients simple, but they force you to decide
-  the code for every failure up front rather than leaking exceptions as 500s.
+- **REST caching vs round trips.** REST gets HTTP caching, retry-safety by method and tooling for free,
+  but a screen needing five resources costs five round trips; it flips to GraphQL when client-side shape
+  variety dominates.
+- **GraphQL exact shapes vs operational load.** Clients get exact shapes and one evolving schema, but you
+  give up HTTP caching, must defend against expensive queries and must batch resolvers. It usually flips
+  back to REST for public APIs, where caching and per-endpoint limits matter (GitHub and Shopify are
+  notable GraphQL exceptions).
+- **`202` jobs vs simplicity.** A job resource keeps requests short and proxy-friendly, but clients must
+  poll or subscribe, which costs more code than one long request when jobs are reliably under a few seconds.
+- **Strict status codes vs up-front work.** A single error envelope and strict codes make clients simple,
+  but force you to decide the code for every failure up front rather than leaking exceptions as 500s.
 
 ## Pitfalls
-- Verbs in URLs and everything as `POST`; the symptom is that nothing can be cached or safely retried
-  and observability shows one undifferentiated endpoint.
-- Returning errors with status 200 and a flag in the body; the symptom is retry and alerting
-  policies that never fire and SDKs that treat failures as success.
-- GraphQL resolvers without DataLoader; the symptom is query count scaling with list length in the
-  database logs (the N+1 pattern).
-- Holding a request open for a multi-minute AI job; the symptom is intermittent 504s from a proxy
-  whose idle timeout you never configured, and clients retrying work that already ran.
-- Read-modify-write updates without `ETag`/`If-Match` or a version field; the symptom is "my change
-  disappeared" reports when two users or two agents edit the same resource within seconds.
-- Leaving GraphQL query depth and cost unlimited; the symptom is one client's nested query pinning
-  the database while everything else times out.
+- **Verbs in URLs and everything as `POST`.** Symptom: nothing can be cached or safely retried, and
+  observability shows one undifferentiated endpoint.
+- **Errors with status 200 and a flag in the body.** Symptom: retry and alerting policies never fire, and
+  SDKs treat failures as success.
+- **GraphQL resolvers without DataLoader.** Symptom: query count scales with list length in the database
+  logs (the N+1 pattern).
+- **Holding a request open for a multi-minute AI job.** Symptom: intermittent 504s from a proxy whose idle
+  timeout you never configured, and clients retrying work that already ran.
+- **Read-modify-write without `ETag`/`If-Match` or a version field.** Symptom: "my change disappeared"
+  reports when two users or two agents edit the same resource within seconds.
+- **Unlimited GraphQL query depth and cost.** Symptom: one client's nested query pins the database while
+  everything else times out.
 
 ## When to use
-Default to REST with an OpenAPI schema for AI service endpoints, internal service-to-service calls
-and anything an agent will call as a tool; the schema becomes the client, the docs and the tool
-definition. Reach for GraphQL when a product team owns a UI that assembles many shapes from a shared
-domain and is paying for it in round trips and endpoint sprawl. Measure round trips per screen,
-cache hit rate and p99 latency before switching either way. Day to day, the work is naming resources,
-choosing status codes deliberately and designing the long-running-job pattern. In interviews, expect
-"design the API for X" questions that test whether you reach for idempotency, `202` plus polling or
-streaming, and a consistent error shape without being prompted.
+- **Default to REST with an OpenAPI schema** for AI service endpoints, internal service-to-service calls
+  and anything an agent calls as a tool; the schema becomes the client, the docs and the tool definition.
+- **Reach for GraphQL** when a product team owns a UI that assembles many shapes from a shared domain and
+  is paying for it in round trips and endpoint sprawl.
+- **Measure** round trips per screen, cache hit rate and p99 latency before switching either way.
+- **Day to day:** name resources, choose status codes deliberately, and design the long-running-job
+  pattern.
+- **Interviews:** expect "design the API for X" questions testing whether you reach for idempotency,
+  `202` plus polling or streaming, and a consistent error shape without being prompted.
 
 ## Role lens
 - **Engineer:** Designs resource paths and status codes, implements `202` plus polling or SSE for
@@ -213,6 +281,43 @@ subscribe to an SSE stream of progress events for the UI. The `POST` accepts an 
 partner's retry after a timeout does not run the job twice. Results live at `/analyses/{id}/result`
 and are cacheable once terminal. I would not pick GraphQL here: the shapes are few, the clients are
 mostly machines, and long-running work plus caching favour HTTP semantics.
+
+## Interview questions
+### What does "idempotent" mean for an HTTP method, and why does it matter for retries?
+- **Definition:** repeating the request leaves the server in the same state as sending it once; the
+  responses may differ (a second `DELETE` may return `404`).
+- **Why it matters:** a client or proxy can retry an idempotent request after a timeout without creating
+  duplicates; `GET`, `PUT` and `DELETE` are idempotent, `POST` is not.
+- **Making `POST` safe:** accept an `Idempotency-Key` and replay the stored result for repeats.
+
+### Two users report that their edits to a shared config keep disappearing. How do you diagnose and fix it?
+- **Diagnosis:** a read-modify-write race; logs show two `PUT`s within seconds from different users, the
+  later one built on a stale read.
+- **Fix:** return an `ETag` on `GET` and require `If-Match` on `PUT`/`PATCH`; the losing writer gets `412`
+  and must re-read and merge.
+- **UX:** surface the conflict to the user instead of silently retrying with the newer version.
+
+### When would you not use GraphQL?
+- **Public or partner APIs:** integrators expect REST, CDN caching and per-endpoint rate limits, all
+  awkward when everything is `POST /graphql`.
+- **Agent tools and service-to-service calls:** OpenAPI operations map directly onto tool definitions and
+  generated clients.
+- **Few client shapes:** the resolver, DataLoader and cost-limit machinery only pays off when many
+  clients need different shapes.
+
+### A GraphQL endpoint's p99 jumped after a new screen shipped. What do you look at?
+- **Resolver fan-out:** database queries per operation; a new list field without DataLoader shows as
+  N+1 (100 items, 101 queries).
+- **Query cost:** depth and estimated complexity of the new query, and whether a cost limit should reject
+  or paginate it.
+- **Fix and guard:** batch with DataLoader, persist the query, and alert on queries-per-operation.
+
+### How would you design an endpoint for a model call that takes 30 seconds to 5 minutes?
+- **Submit:** `POST` with an `Idempotency-Key` returns `202 Accepted`, a `Location` to the job, and
+  optionally a `Retry-After` polling hint.
+- **Observe:** clients `GET` the job until a terminal `status`, or subscribe to SSE progress events.
+- **Finish:** the result lives at its own URL and is cacheable once terminal; `DELETE` cancels and is
+  idempotent.
 
 ## Quiz
 ### Q: Why return `202 Accepted` with a `Location` header for a five-minute AI job instead of holding the request open until it finishes?

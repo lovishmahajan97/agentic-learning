@@ -5,7 +5,7 @@ name: Quality–latency–cost optimization
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - system-design/model-routing-cascading
   - system-design/model-selection
@@ -19,47 +19,45 @@ sources:
 ---
 
 ## TL;DR
-Every LLM feature lives in a three-dimensional space: how good the answers are, how long the user waits,
-and what each request costs. The levers that improve one axis almost always degrade another, so you cannot
-maximize all three. The practice is to measure all three per task, throw away every configuration that is
-worse on every axis, and choose from the remaining Pareto frontier under the product's hard constraints.
-This is what separates features that scale from features that get switched off when the invoice arrives.
+Every LLM feature trades answer quality, user wait and per-request cost, and levers that improve one axis
+usually degrade another. Measure all three per task, discard dominated configurations, and choose from the
+Pareto frontier under the product's hard constraints.
 
 ## Why it exists
-The usual history: a prototype is built on the largest model with a long, example-stuffed prompt. It works,
-it ships, and then three things happen at once. The bill grows linearly with traffic; p95 latency of several
-seconds makes the interface feel broken; and when someone finally runs an eval, the "best" model turns out
-to be no better on this task than one an order of magnitude cheaper, because the task saturates.
-
-The naive strategies each fail on one axis. "Use the best model for everything" ignores that quality is
-task-relative and plateaus, while cost and latency are paid on every single request. "Use the cheapest
-model" ignores that a wrong answer has a cost too: a retry, a human escalation, a lost customer. The right
-denominator is cost per *successful* task, and on that measure the cheap model can be the expensive one.
-"Tune one axis at a time" is the most common failure: a team trims the prompt to cut cost, quality quietly
-drops, and nobody notices until a customer does, because quality was never a number on a dashboard.
-
-The axes are coupled by mechanism, not by accident. More reasoning tokens means better answers on hard
-problems and more decode time and spend. More retrieved context means more grounding and more prefill. A
-bigger model means more capability and more memory bandwidth per token. You therefore need a method that
-holds all three in view, makes the exchange rate between them explicit, and is re-run whenever a model,
-price or prompt changes.
+- **The usual history.** A prototype ships on the largest model with a long, example-stuffed prompt. Then
+  three things happen at once: the bill grows linearly with traffic, a p95 of several seconds makes the
+  interface feel broken, and the first eval shows the "best" model is no better on this task than one an
+  order of magnitude cheaper, because the task saturates.
+- **"Use the best model for everything" fails on cost and latency.** Quality is task-relative and
+  plateaus, while cost and latency are paid on every single request.
+- **"Use the cheapest model" fails on quality.** A wrong answer has a cost too: a retry, a human
+  escalation, a lost customer. The right denominator is cost per *successful* task, and on that measure the
+  cheap model can be the expensive one.
+- **"Tune one axis at a time" is the most common failure.** A team trims the prompt to cut cost, quality
+  quietly drops, and nobody notices until a customer does, because quality was never a number on a
+  dashboard.
+- **The axes are coupled by mechanism, not by accident.** More reasoning tokens buy better answers on hard
+  problems and more decode time and spend; more retrieved context buys grounding and more prefill; a bigger
+  model buys capability and more memory bandwidth per token.
+- **So you need a method, not a hunch.** It holds all three in view, makes the exchange rate explicit, and
+  is re-run whenever a model, price or prompt changes. That is what separates features that scale from
+  features that get switched off when the invoice arrives.
 
 ## How it works
 ### Make all three measurable
 Nothing below works without numbers for each axis on the *same* set of requests.
-
-- **Quality** is a task-specific eval: a golden set with a pass criterion (exact match for classification,
-  a rubric or LLM judge for open text, human grading for the ambiguous slice). It is defined first
-  *because* every cost or latency cut is a bet that quality survives, and bets need a scoreboard.
-- **Latency** must be the latency the user feels: time-to-first-token for streamed chat, end-to-end time
-  for a classifier or a tool call, and always a percentile (p95 or p99), not a mean. Means hide the tail,
-  and the tail is what users remember.
-- **Cost** is cost per successful task, including retries, fallbacks, judge or verifier calls, cache
-  misses and the downstream cost of failures. Per-request cost is what the provider bills; per-successful
-  task is what the business pays.
+- **Quality is a task-specific eval.** A golden set with a pass criterion: exact match for
+  classification, a rubric or LLM judge for open text, human grading for the ambiguous slice. Define it
+  first, *because* every cost or latency cut is a bet that quality survives, and bets need a scoreboard.
+- **Latency is what the user feels.** Time-to-first-token for streamed chat, end-to-end time for a
+  classifier or a tool call, and always a percentile (p95 or p99), not a mean. Means hide the tail, and the
+  tail is what users remember.
+- **Cost is cost per successful task.** Include retries, fallbacks, judge or verifier calls, cache misses
+  and the downstream cost of failures. Per-request cost is what the provider bills; per successful task is
+  what the business pays.
 
 ### Where latency and cost actually come from
-Before pulling levers, decompose each axis, *because* the decomposition tells you which lever can move it:
+Decompose each axis before pulling levers, *because* the decomposition tells you which lever can move it:
 
 ```
 cost_per_call ≈ n_in_uncached·p_in + n_in_cached·p_cached + n_out·p_out
@@ -67,22 +65,32 @@ TTFT          ≈ network + queueing + prefill(n_in)
 end_to_end    ≈ TTFT + n_out · TPOT          (TPOT = time per output token)
 ```
 
-Prefill processes the whole prompt in parallel, so input tokens are cheap in time; decode emits output
-tokens one at a time, so `n_out · TPOT` usually dominates end-to-end latency. Output tokens are also
-typically priced several times higher than input tokens. With an illustrative TPOT of 20 ms, a
-300-token answer spends about 6 s in decode alone, whatever the prompt length; cutting the answer to
-100 tokens saves about 4 s, while halving a 2,000-token prompt saves a fraction of a second of prefill.
-This is why output caps and terse formats are often the strongest latency lever, and why prompt trimming
-mainly buys cost and TTFT. Agents and chains multiply all of it by the number of sequential calls.
+- **Input tokens are cheap in time.** Prefill processes the whole prompt in parallel.
+- **Output tokens are expensive in time and money.** Decode emits them one at a time, so `n_out · TPOT`
+  usually dominates end-to-end latency, and output tokens are typically priced several times higher than
+  input tokens.
+- **Illustrative numbers.** With a TPOT of 20 ms, a 300-token answer spends about 6 s in decode alone,
+  whatever the prompt length. Cutting the answer to 100 tokens saves about 4 s; halving a 2,000-token prompt
+  saves only a fraction of a second of prefill.
+- **So output caps and terse formats are often the strongest latency lever**, and prompt trimming mainly
+  buys cost and TTFT.
+- **Agents and chains multiply all of it** by the number of sequential calls.
 
 ### Cost per success, and when quality *is* cost
-If each attempt succeeds with probability *q* and a verifier lets you retry until success, expected
-attempts are `1/q`, so `cost_per_success = (c_call + c_verify) / q`. That assumes independent attempts; in practice the
-same hard input tends to fail again, so retries recover less than `1/q` predicts. If failures instead go to a human,
-`cost_per_task = c_call + (1 − q) · c_human`. Illustratively, a $0.001 model at 86% with a $2 human
-escalation costs 0.001 + 0.14 × 2 ≈ $0.28 per task; a $0.018 model at 94% costs 0.018 + 0.06 × 2 ≈ $0.14.
-When failure is expensive, the quality axis collapses into the cost axis and the "expensive" model is the
-cheap one. When failure is cheap (a user rephrases), the axes stay separate and the frontier below matters.
+- **With a verifier and retries:** if each attempt succeeds with probability *q*, expected attempts are
+  `1/q`, so `cost_per_success = (c_call + c_verify) / q`.
+- **Caveat:** that assumes independent attempts. In practice the same hard input tends to fail again, so
+  retries recover less than `1/q` predicts.
+- **With human escalation:** `cost_per_task = c_call + (1 − q) · c_human`.
+
+| Model (illustrative) | Call cost | Pass rate | Escalation at $2 | Cost per task |
+|---|---|---|---|---|
+| Small | $0.001 | 86% | 0.14 × 2 | 0.001 + 0.14 × 2 ≈ $0.28 |
+| Large | $0.018 | 94% | 0.06 × 2 | 0.018 + 0.06 × 2 ≈ $0.14 |
+
+- **When failure is expensive,** the quality axis collapses into the cost axis and the "expensive" model
+  is the cheap one.
+- **When failure is cheap** (a user rephrases), the axes stay separate and the frontier below matters.
 
 ### Know which axis each lever moves
 | Lever | Quality | Latency | Cost | Note |
@@ -99,45 +107,66 @@ cheap one. When failure is cheap (a user rephrases), the axes stay separate and 
 | Quantization, speculative decoding | small risk | down | down | serving-side; measure per model |
 | Streaming | none | perceived down | none | changes perception, not the number |
 
-Two groups matter. Most levers move you *along* the frontier: you give up some of one axis for another.
-A few, caching, distillation, fine-tuning and task redesign, *shift* the frontier, because they remove work
-or make a cheaper model genuinely better at this task. When no point on the current frontier satisfies the
-constraints, only the second group can help; more tuning of the first group cannot.
+- **Most levers move you *along* the frontier:** you give up some of one axis for another.
+- **A few *shift* the frontier:** caching, distillation, fine-tuning and task redesign, because they
+  remove work or make a cheaper model genuinely better at this task.
+- **When no frontier point satisfies the constraints,** only the second group can help; more tuning of
+  the first group cannot.
 
 ### Build the frontier
-Run every candidate configuration against the same eval set and a replay of real traffic, and record the
-triple (quality, p95 latency, cost per successful task). Configuration A is *dominated* if some B is at
-least as good on all three and strictly better on one; discard the dominated ones. What remains is the
-Pareto frontier.
+1. **Run every candidate configuration** against the same eval set and a replay of real traffic.
+2. **Record the triple** (quality, p95 latency, cost per successful task) for each.
+3. **Discard dominated configurations.** A is *dominated* if some B is at least as good on all three and
+   strictly better on one. What remains is the Pareto frontier.
+4. **Respect measurement noise.** A pass rate on *n* items has a standard error of about `√(q(1−q)/n)`; at
+   q = 0.92 and n = 200 that is roughly 2 points, so 0.92 and 0.93 are a statistical tie.
+5. **Treat configurations inside the noise band as equal on quality.** Compare them on the same items with
+   a paired test, or grow the eval, and let latency and cost decide. A p95 from a few hundred requests is
+   itself noisy.
 
-Respect measurement noise when declaring dominance. A pass rate on *n* items has a standard error of about
-`√(q(1−q)/n)`; at q = 0.92 and n = 200 that is roughly 2 points, so 0.92 and 0.93 are a statistical tie.
-Treat configurations within the noise band as equal on quality (compare them on the same items with a
-paired test, or grow the eval) and let latency and cost decide. Latency percentiles need the same care:
-a p95 from a few hundred requests is itself noisy.
-
-The point of the exercise is that it turns a three-way argument into a short list and makes
-the exchange rate visible: "moving from B to C buys two points of quality for $0.003 per task and 450 ms
-of p95". People can argue about whether that trade is worth it; they can no longer argue about facts.
+The output turns a three-way argument into a short list with a visible exchange rate: "moving from B to C
+buys two points of quality for $0.003 per task and 450 ms of p95". People can argue about whether that
+trade is worth it; they can no longer argue about facts.
 
 ### Choose under constraints
-In practice two axes are constraints and one is the objective. Either *maximize quality subject to
-p95 ≤ L and cost ≤ C*, or *minimize cost subject to quality ≥ Q and p95 ≤ L*. The quality floor is nearly
-always a product requirement rather than a tunable, so the second form is the common one. Pick the
-feasible frontier point with the best objective. If the feasible set is empty, stop tuning and reach for a
-frontier-shifting lever.
+- **Two axes are constraints, one is the objective.** Either *maximize quality subject to p95 ≤ L and
+  cost ≤ C*, or *minimize cost subject to quality ≥ Q and p95 ≤ L*.
+- **The second form is the common one,** because the quality floor is nearly always a product requirement
+  rather than a tunable.
+- **Pick the feasible frontier point with the best objective.** If the feasible set is empty, stop tuning
+  and reach for a frontier-shifting lever.
 
 ### Do it per task, not per application
-A single application contains features with different frontiers. Intent classification saturates on a
-small model; multi-document synthesis does not. Splitting traffic by task and optimizing each separately is
-usually the single largest win, which is why routing comes before most other work.
+- **One application holds many frontiers.** Intent classification saturates on a small model;
+  multi-document synthesis does not.
+- **Split traffic by task and optimize each separately.** It is usually the single largest win, which is
+  why routing comes before most other work.
 
 ### Keep measuring
-Quality drifts when the provider updates a model or the input mix changes; prices fall; traffic mix
-shifts; a prompt edit makes the model chattier. Re-run the frontier on a cadence and on every change to
-prompt, model or retrieval, and alert on cost per task and p95 in production, not just on total spend.
+- **Everything drifts.** Quality drifts when the provider updates a model or the input mix changes; prices
+  fall; traffic mix shifts; a prompt edit makes the model chattier.
+- **Re-run the frontier** on a cadence and on every change to prompt, model or retrieval.
+- **Alert on cost per task and p95 in production,** not just on total spend.
 
-## Example
+## Diagram
+Read it as a loop: measure the triple, prune to the frontier, filter by constraints, and either ship a
+point or reach for a lever that shifts the frontier.
+
+```mermaid
+flowchart TD
+    E["Define eval and quality floor"] --> M["Measure quality, p95, cost per success"]
+    M --> D["Discard dominated configs"]
+    D --> F["Pareto frontier"]
+    F --> C{"Any point meets constraints?"}
+    C -->|"yes"| P["Pick best objective"]
+    C -->|"no"| S["Shift frontier: cache, distill, redesign"]
+    S --> M
+    P --> R["Monitor in production"]
+    R -->|"model, price or prompt change"| M
+```
+
+## Examples
+### Frontier step for a triage task
 A small, runnable version of the frontier step. The measurements are illustrative numbers for a
 support-ticket triage task, not benchmarks; the structure is what matters.
 
@@ -179,56 +208,111 @@ print("choose:", best.name)
 # choose: small, fine-tuned
 ```
 
-Two configurations vanish immediately: the trimmed large model is dominated by the cascade (same quality,
-faster, cheaper), and the medium model is dominated by the fine-tuned small one. Under the constraints
-(quality ≥ 0.90, p95 ≤ 2 s) only the fine-tuned small model and the cascade survive, and the fine-tuned
-model wins on cost. Note what the table does not show: the one-off cost of producing the fine-tuned model,
-which must be amortized over expected volume before the choice is final, and the fact that the cascade's
-p95 is driven by the escalated minority, so its p50 is close to the small model's. And the quality gap
-between the fine-tuned model (0.92) and the cascade (0.93) is inside the noise of a few-hundred-item eval,
-which is exactly why cost, not quality, should break the tie here.
+- **Two configurations vanish immediately.** The trimmed large model is dominated by the cascade (same
+  quality, faster, cheaper); the medium model is dominated by the fine-tuned small one.
+- **Constraints decide the rest.** Under quality ≥ 0.90 and p95 ≤ 2 s only the fine-tuned small model and
+  the cascade survive, and the fine-tuned model wins on cost.
+- **What the table hides (1): the one-off fine-tuning cost.** It must be amortized over expected volume
+  before the choice is final.
+- **What the table hides (2): the cascade's tail.** Its p95 is driven by the escalated minority, so its
+  p50 is close to the small model's.
+- **The quality gap is noise.** 0.92 vs 0.93 is inside the noise of a few-hundred-item eval, which is
+  exactly why cost, not quality, should break the tie here.
+
+### Worked scenario: does the cascade pay?
+Cascade cost per task is `s + e·l` (small cost *s*, large cost *l*, escalation rate *e*), so it beats the
+large model alone only while `e < 1 − s/l`. Illustrative prices:
+
+```python
+def cascade_cost(s, l, e):
+    return s + e * l                 # every request pays s; escalated ones also pay l
+
+def break_even_escalation(s, l):
+    return 1 - s / l                 # cascade wins while e is below this
+
+for s, l in [(0.001, 0.010), (0.005, 0.010)]:   # 10x and 2x price gaps
+    print(f"gap {l/s:.0f}x  break-even e < {break_even_escalation(s, l):.0%}")
+    for e in (0.1, 0.3, 0.6):
+        c = cascade_cost(s, l, e)
+        print(f"   e={e:.0%}  cascade ${c:.4f}  vs large ${l:.4f}  -> {'cascade' if c < l else 'large'}")
+# gap 10x  break-even e < 90%   (e=10%: $0.0020, e=30%: $0.0040, e=60%: $0.0070 -> cascade)
+# gap 2x   break-even e < 50%   (e=10%: $0.0060, e=30%: $0.0080 -> cascade; e=60%: $0.0110 -> large)
+```
+
+| Price gap | Break-even escalation | At 30% escalation | At 60% escalation |
+|---|---|---|---|
+| 10× | 90% | cascade, $0.0040 vs $0.0100 | cascade, $0.0070 vs $0.0100 |
+| 2× | 50% | cascade, $0.0080 vs $0.0100 | large wins, $0.0110 vs $0.0100 |
+
+The narrower the price gap, the less escalation the gate can afford, and every escalated request also
+pays both models' latency.
+
+## Production patterns
+- **Cap output per route.** When: any interactive route, because decode time is `n_out · TPOT`. How: set
+  the API's maximum output tokens (`max_tokens` on Anthropic's Messages API) per route and instruct a
+  terse format. Monitor output-token p95 and the share of responses stopped for length.
+- **Stable prefix plus prompt caching.** When: many calls share a long system prompt or tool list. How: put
+  stable content first and variable content last; on Anthropic mark the prefix with `cache_control`, while
+  OpenAI caches long shared prefixes automatically. Monitor cached input tokens per call and TTFT.
+- **Small-first cascade with a gate.** When: traffic mixes easy and hard inputs. How: answer with the small
+  model, escalate on a verifier failure or low confidence. Monitor escalation rate against `1 − s/l` and
+  the p95 of escalated requests separately.
+- **Batch path for offline work.** When: nobody waits on the result (backfills, nightly enrichment). How:
+  send it through the provider's batch endpoint, which trades a completion window of hours for a lower
+  price. Monitor batch completion time against the downstream deadline.
+- **Three lines per feature.** When: always, once a feature has real traffic. How: tag every call with a
+  feature id and plot quality on a sampled eval, p95, and cost per successful task. Alert on bands, not on
+  the monthly total.
+- **Eval gate on every change.** When: any prompt, model or retrieval change. How: re-run the golden set in
+  CI with a paired comparison on the same items, and block the merge if quality falls under the floor or
+  p95 and cost per task leave their band.
 
 ## Trade-offs
-- A cascade cuts average cost but raises tail latency and adds a confidence gate to maintain; with
+- **Cascade: lower average cost vs higher tail latency.** It also adds a confidence gate to maintain. With
   small-model cost *s*, large-model cost *l* and escalation rate *e*, it beats the large model alone only
   while `s + e·l < l`, i.e. while `e < 1 − s/l`. At a 10× price gap that is 90%; at 2× it is only 50%.
-- Trimming context and few-shot examples lowers cost and TTFT on every call, but each removed token is a
-  bet that it was not needed; the trade flips the moment the eval shows quality under the floor.
-- Thinking or reasoning budgets buy real quality on hard inputs and pure waste on easy ones; the trade is
-  favourable only when gated by task difficulty rather than applied uniformly.
-- Fine-tuning or distilling a small model shifts the whole frontier but front-loads engineering and must
-  be repeated when the task or base model changes; it pays only when monthly savings exceed the amortized
+- **Trimmed context: cheaper and faster TTFT vs quality risk.** Removing context and few-shot examples
+  lowers cost and TTFT on every call, but each removed token is a bet it was not needed. The trade flips
+  the moment the eval shows quality under the floor.
+- **Reasoning budget: quality on hard inputs vs waste on easy ones.** It is favourable only when gated by
+  task difficulty rather than applied uniformly.
+- **Fine-tuning or distillation: a shifted frontier vs front-loaded effort.** The engineering must be
+  repeated when the task or base model changes. It pays only when monthly savings exceed the amortized
   effort, which is a volume threshold.
-- Response caching gives near-zero cost and latency on hits, but is worthless on long-tail inputs and
-  harmful when answers must reflect fresh data; the trade flips with hit rate and staleness tolerance.
-- Batch endpoints can cut cost substantially for offline work at the price of minutes-to-hours latency;
-  the trade flips the instant a user is waiting on the result.
+- **Response caching: near-zero cost and latency on hits vs staleness.** It is worthless on long-tail
+  inputs and harmful when answers must reflect fresh data; the trade flips with hit rate and staleness
+  tolerance.
+- **Batch endpoints: much lower cost vs minutes-to-hours latency.** Good for offline work; the trade flips
+  the instant a user is waiting on the result.
 
 ## Pitfalls
-- Optimizing cost with no quality metric in place; the symptom is a falling bill followed weeks later by
-  rising escalation and complaint rates that nobody connects to the change.
-- Reporting mean latency; the symptom is a green dashboard while users report hangs, because the p95
-  nobody plotted is three times the mean.
-- Comparing cost per request instead of per successful task; the symptom is a "cheaper" model whose
-  retries, judge calls and human review make the total higher.
-- Evaluating on a handful of hand-picked prompts; the symptom is a configuration that shines in the demo
-  and degrades on the real traffic distribution.
-- Reading a one- or two-point eval difference as a real win; the symptom is the "winning" configuration
-  swapping places with the runner-up every time the eval is re-run or re-sampled.
-- Leaving output length unconstrained; the symptom is cost and decode latency creeping up after a prompt
-  or model change made the model chattier.
-- Treating the frontier as static; the symptom is a once-optimal setup that became dominated after a
-  provider price cut or model update that nobody re-tested.
+- **Optimizing cost with no quality metric in place.** Symptom: a falling bill followed weeks later by
+  rising escalation and complaint rates that nobody connects to the change. Fix: define the eval and floor
+  first.
+- **Reporting mean latency.** Symptom: a green dashboard while users report hangs, because the p95 nobody
+  plotted is three times the mean. Fix: plot p95 and p99.
+- **Comparing cost per request instead of per successful task.** Symptom: a "cheaper" model whose retries,
+  judge calls and human review make the total higher.
+- **Evaluating on a handful of hand-picked prompts.** Symptom: a configuration that shines in the demo and
+  degrades on the real traffic distribution. Fix: add a traffic replay.
+- **Reading a one- or two-point eval difference as a real win.** Symptom: the "winning" configuration swaps
+  places with the runner-up every time the eval is re-run or re-sampled. Fix: paired test or a bigger eval.
+- **Leaving output length unconstrained.** Symptom: cost and decode latency creep up after a prompt or
+  model change made the model chattier.
+- **Treating the frontier as static.** Symptom: a once-optimal setup became dominated after a provider
+  price cut or model update that nobody re-tested.
 
 ## When to use
-Run the full frontier exercise when a feature first approaches production scale, whenever a new model or
-price list appears, and whenever quality, p95 or cost per task moves outside its band in monitoring. Skip
-it for throwaway prototypes and low-volume internal tools, where the cost of measuring exceeds the cost of
-being wrong, but still write down the quality floor so the floor exists when volume arrives. The day-to-day
-form is a dashboard with three lines per feature (quality on a sampled eval, p95, cost per successful task)
-and a habit of re-running the eval on every prompt, model or retrieval change. In interviews, the expected
-depth is to name all three axes unprompted, insist on cost per successful task, separate frontier-moving
-levers from frontier-shifting ones, and derive the cascade break-even condition from the escalation rate.
+- **Use when** a feature first approaches production scale, whenever a new model or price list appears,
+  and whenever quality, p95 or cost per task moves outside its band in monitoring.
+- **Skip the full exercise** for throwaway prototypes and low-volume internal tools, where the cost of
+  measuring exceeds the cost of being wrong. Still write down the quality floor so it exists when volume
+  arrives.
+- **Day to day:** a dashboard with three lines per feature (quality on a sampled eval, p95, cost per
+  successful task) and a habit of re-running the eval on every prompt, model or retrieval change.
+- **Interviews:** name all three axes unprompted, insist on cost per successful task, separate
+  frontier-moving levers from frontier-shifting ones, and derive the cascade break-even condition from the
+  escalation rate.
 
 ## Role lens
 - **Engineer:** Owns the eval harness, the traffic replay and the per-config measurement; implements
@@ -251,6 +335,43 @@ frontier itself must move: distill the large model's outputs into a fine-tuned s
 that effort against monthly savings at the expected volume. Done means a configuration on the frontier
 satisfies all three constraints on the eval and the replay, with production monitoring of p95 and cost per
 successful task so a regression is caught in days rather than at the next invoice.
+
+## Interview questions
+### What is the Pareto frontier in quality, latency and cost, and why not just pick the best model?
+- **Definition:** the set of configurations that no other configuration beats on all three axes at once;
+  everything else is dominated and can be discarded without argument.
+- **Why not the best model:** quality is task-relative and saturates, while cost and latency are paid on
+  every request. The best-scoring model is often tied, within eval noise, with one far cheaper and faster.
+
+### A chat feature has a 6 s p95. How do you find which lever to pull?
+- **Decompose first:** end-to-end is TTFT plus `n_out · TPOT`, and TTFT is network, queueing and prefill.
+  Log TTFT, output tokens and TPOT per request.
+- **If decode dominates** (for example 300 output tokens at 20 ms each is about 6 s), cap output and ask
+  for a terser format; trimming the prompt would barely help.
+- **If TTFT dominates,** look at queueing and prompt length, and add prompt caching for the shared prefix.
+
+### When would a small-first cascade be a bad idea?
+- **When escalation is high:** it wins on cost only while `e < 1 − s/l`; at a 2× price gap that is just
+  50%, and above it every escalated request pays for both models.
+- **When the tail matters:** escalated requests pay both latencies, so p95 rises even when average cost
+  falls.
+- **When the gate is unreliable:** a confidence signal that misses wrong answers silently lowers quality,
+  so the gate needs its own eval.
+
+### Two configurations score 0.92 and 0.93 on a 200-item eval. The 0.93 one costs three times more. Which do you ship?
+- **They are tied on quality:** the standard error is about `√(q(1−q)/n)`, roughly 2 points at q = 0.92 and
+  n = 200.
+- **So cost and latency decide,** and the cheaper one ships unless a paired test on the same items, or a
+  larger eval, shows a real gap.
+- **State the exchange rate** to the product owner, so the decision is about whether a possible point is
+  worth 3× the spend.
+
+### How do you account for a fine-tuned small model whose per-task cost looks tiny?
+- **Add the one-off cost:** data preparation, training runs, evals and the engineering time, amortized over
+  expected volume in the payback period.
+- **Add the recurring cost:** it must be redone when the task or base model changes, so plan for repeats.
+- **Then compare cost per successful task,** including any human escalation, against the current point on
+  the frontier at realistic monthly volume.
 
 ## Quiz
 ### Q: Which lever shifts the quality–latency–cost frontier rather than moving along it?

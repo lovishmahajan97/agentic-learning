@@ -20,9 +20,9 @@ sources:
 ---
 
 ## TL;DR
-`UploadFile` is FastAPI's type for `multipart/form-data` files (PDFs, images, audio). It wraps a spooled
-temporary file, in memory while small and on disk when large, with filename, content type and async
-read/seek. Prefer it to `bytes = File()`; it does no size or safety checks.
+`UploadFile` is FastAPI's type for `multipart/form-data` files (PDFs, images, audio): a spooled temp
+file, in memory while small and on disk when large, with filename, content type and async read/seek.
+Prefer it to `bytes = File()`; it does no safety checks.
 
 ## Why it exists
 - **Files arrive as multipart.** Browsers and HTTP clients send a body split into parts by a boundary
@@ -101,6 +101,27 @@ The whole multipart body is parsed **before** your handler runs. By the time you
 | `bytes = File()` | small, bounded files |
 | raw body via `request.stream()` | single-file `application/octet-stream` uploads; avoids multipart and temp files and pipes bytes straight to object storage |
 | presigned direct-to-storage uploads | large files; takes them off your API altogether |
+
+## Diagram
+The key timing point: Starlette receives and spools the entire multipart body before your handler
+runs, and the temp file dies with the request, so only a storage key may travel onward.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant P as Starlette multipart parser
+    participant T as SpooledTemporaryFile
+    participant H as Your handler
+    participant S as Object storage and job queue
+    C->>P: POST multipart/form-data, file part plus Form fields
+    P->>T: write part bytes, in memory up to about 1 MiB
+    Note over T: rolls over to the temp directory when larger
+    P->>H: call handler only after the whole body is parsed
+    H->>T: await read(CHUNK) in a loop, check size and type
+    H->>S: copy chunks, enqueue job with the storage key
+    H-->>C: 202 with job ID
+    Note over T: closed and deleted when the request lifecycle ends
+```
 
 ## Examples
 ### Audio upload plus metadata, copied in chunks, handed to a job
@@ -260,6 +281,41 @@ parsing: `client_max_body_size` or the gateway limit at the edge, plus ASGI midd
 `Content-Length` and counts streamed bytes to stop chunked uploads. For genuinely large media, use
 presigned uploads straight to object storage, so the API only receives a key. Make sure temp space is
 on a properly sized volume.
+
+## Interview questions
+### What is `UploadFile`, and why prefer it over `bytes = File()` for documents and audio?
+- **It wraps a `SpooledTemporaryFile`** filled by Starlette's multipart parser: in memory below a
+  threshold (1 MiB in current Starlette), on disk above it, with `filename`, `content_type` and async
+  `read`/`seek`.
+- **`bytes = File()` holds the whole part in RAM** until the handler ends, so ten concurrent 300 MB uploads
+  can OOM-kill a pod.
+- **Neither one validates** size, type or filename; that is your job.
+
+### A background job that processes uploads fails with "I/O operation on closed file". What happened and how do you fix it?
+- **The `UploadFile` was passed to the job.** It is request-scoped, and some FastAPI versions close it
+  when the endpoint returns, before `BackgroundTasks` run.
+- **Fix:** inside the handler, copy the bytes to durable storage (or read them), then pass a path or
+  object key to the job.
+- **That also makes it queue-safe**, since an object in one process can never reach a worker in another.
+
+### Should an upload handler be `async def` or plain `def`?
+- **`async def`** with awaited `read`/`seek`, which run disk operations in a thread pool so the event loop
+  never blocks; never touch `file.file` directly there.
+- **Plain `def`** when everything else is blocking anyway (hashing, a sync storage SDK):
+  `shutil.copyfileobj(upload.file, dest)` is fine because FastAPI runs the handler in a thread pool.
+- **The cost of `def`** is one thread-pool slot per in-flight upload, and that pool is small by default.
+
+### Pods are evicted during upload peaks even though memory looks fine. What do you check?
+- **Temp disk.** Spooled files above the threshold land in the container's temp directory, which may be
+  small or memory-backed, and a large file is written twice (temp plus destination).
+- **Fix:** point `TMPDIR` at a sized volume, cap upload size before parsing, and move large media to
+  presigned or raw-stream uploads that skip the temp file.
+
+### How do you send a file and structured options in one request?
+- **Multipart only**, because a request body has one encoding: the file as `UploadFile`, options as
+  `Form()` fields.
+- **For nested options**, send one form field holding a JSON string and validate it with
+  `model_validate_json`; since FastAPI 0.113 flat options can bind to a Pydantic model with `Form()`.
 
 ## Quiz
 ### Q: What does `UploadFile` do with a large file part that `bytes = File()` does not?

@@ -106,6 +106,23 @@ Two documented sharp edges:
 | Plain SQLAlchemy 2.0 | storage and API shapes differ (denormalised read models, columns the client must never see); advanced mapping (hybrid properties, polymorphism, composite types); the team already knows it |
 | Core `insert()` or driver bulk copy | hot paths such as bulk-inserting a million chunks, a list of dicts inside the same engine |
 
+## Diagram
+One write through the Create/table/Read split: validation happens on the non-table schema, the unit of
+work emits SQL at flush, and the Read schema decides what leaves the API.
+
+```mermaid
+flowchart LR
+    B["JSON request body"] --> C["MessageCreate (validates)"]
+    C -->|"Message.model_validate(payload, update)"| T["Message table model"]
+    T -->|"session.add"| P["Pending in session"]
+    P -->|"flush: INSERT in FK order"| DB[("Postgres")]
+    P -->|"commit"| E{"expire_on_commit?"}
+    E -->|"True (default)"| X["Attributes expired, reload on access, MissingGreenlet in async"]
+    E -->|"False"| K["Loaded values kept"]
+    K --> R["MessageRead via response_model"]
+    R --> O["JSON response, hidden columns omitted"]
+```
+
 ## Examples
 ### SQLModel conversations and messages with the table/schema split
 Two sync endpoints. Sync endpoints run on the thread pool, which is fine for CRUD; the async session is
@@ -292,6 +309,40 @@ messages in one extra `IN` query, or `joinedload` if the result set is small. In
 loading is also effectively required, because the implicit lazy load raises `MissingGreenlet` (the
 explicit `await conv.awaitable_attrs.messages` from `AsyncAttrs` avoids the error but is still one
 query per conversation). Add `raiseload` in tests so the regression cannot return.
+
+## Interview questions
+### What are the identity map and unit of work in a SQLAlchemy Session, and why do they matter?
+- **Identity map:** one Python object per primary key per session, so `session.get()` for a loaded row
+  skips the database and two lookups return the same object.
+- **Unit of work:** changes are collected and flushed in foreign-key dependency order, so you never
+  hand-order INSERTs and UPDATEs.
+- **Why it matters:** a long-lived session can serve stale objects and autoflush can surface an
+  `IntegrityError` on a later `select()`, so keep sessions per request.
+
+### When would you choose plain SQLAlchemy 2.0 over SQLModel?
+- **When storage and API shapes diverge:** denormalised read models or columns the client must never see
+  remove SQLModel's one-class benefit.
+- **When mapping gets advanced:** hybrid properties, polymorphism or composite types, since SQLModel
+  tracks SQLAlchemy with some lag and you end up in `sa_column` and `sa_relationship` anyway.
+
+### A commit after msg.tool_calls["x"] = 1 writes nothing. Why, and how do you fix it?
+- **In-place JSON mutation is not detected;** SQLAlchemy only tracks reassignment of the attribute.
+- **Fix:** reassign the whole value, or declare the column with `MutableDict.as_mutable(JSON)` from
+  `sqlalchemy.ext.mutable`, and add a test that mutates, commits and re-reads.
+
+### How would you ingest a million embedding chunks efficiently?
+- **Skip per-object adds.** Use `session.execute(insert(Chunk), rows)` with a list of dicts in batches,
+  or the driver's `COPY`, which are typically several times faster; measure on your own data.
+- **Keep it in the same engine and transaction discipline,** and watch rows per second and transaction
+  duration per batch.
+- **Index foreign keys yourself,** because Postgres does not, or every per-document chunk lookup becomes
+  a sequential scan.
+
+### Why do clients sometimes manage to set id or created_at on a SQLModel service?
+- **The table model is used as the request body.** Table models also skip Pydantic validation when
+  instantiated.
+- **Fix:** accept a non-table `XCreate` schema, convert with `model_validate(..., update={...})` for
+  server-owned fields, and return `XRead` via `response_model`.
 
 ## Quiz
 ### Q: What is the one thing SQLModel adds on top of SQLAlchemy?

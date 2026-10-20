@@ -5,7 +5,7 @@ name: Tool schemas & argument validation
 kind: practice
 difficulty: core
 est_minutes: 13
-status: reviewed
+status: crisp
 related:
   - agents/tool-calling
   - agents/typed-tool-contracts
@@ -21,82 +21,107 @@ sources:
 ---
 
 ## TL;DR
-The input schema is the model's entire specification of a tool's arguments, and validation at the
-harness boundary is where the model's mistakes are caught before they become side effects. Design
-schemas small, flat and explicit (types, enums, required fields, descriptions that state units and
-formats); validate in layers, shape, then meaning, then permission; and send failures back as error
-results the model can act on, because a model that sees "amount must be in cents" fixes itself, while
-a 500 from your handler ends the run.
+The input schema is the model's whole specification of a tool's arguments; harness validation catches
+its mistakes before they become side effects. Keep schemas small and explicit, validate shape, meaning,
+then permission, and return fixable error results.
 
 ## Why it exists
-Model-generated arguments are plausible, not correct. They fail in three distinct ways. Shape errors:
-a string where an integer was expected, a missing required field, an invented field. Semantic errors:
-a date in the past for a future booking, an order id that does not exist, a quantity of 1000 where 10
-was meant. Authorization errors: a perfectly well-formed request for a record the current user may not
-see. Constrained decoding ("strict" schema mode) eliminates the first class on providers that offer it,
-and does nothing for the other two.
-
-The naive approach, pass `input` straight to the downstream API, produces a 400 at best and a wrong
-write at worst, and either way the exception kills the loop before the model gets a chance to correct
-itself. The second naive approach, validate and crash on failure, is only slightly better. What the
-model needs is the same thing a junior engineer needs from a code review: a specific message about what
-was wrong and what would be right.
-
-The schema is also documentation the model reads. A parameter named `date` typed as a bare string
-invites "next Friday"; the same parameter described as "ISO 8601 date, e.g. 2026-11-03" gets the right
-value from the same model. Many "the model passes bad arguments" complaints are schema bugs.
+- **Model-generated arguments are plausible, not correct.** They fail in three distinct ways:
+  - **Shape errors:** a string where an integer was expected, a missing required field, an invented field.
+  - **Semantic errors:** a past date for a future booking, an order id that does not exist, a quantity of
+    1000 where 10 was meant.
+  - **Authorization errors:** a well-formed request for a record the current user may not see.
+- **Strict mode fixes only the first class.** Constrained decoding ("strict" schema mode) eliminates shape
+  errors on providers that offer it and does nothing for the other two.
+- **Passing `input` straight downstream fails badly.** It yields a 400 at best and a wrong write at worst,
+  and either way the exception kills the loop before the model can correct itself. Validating and
+  crashing is only slightly better.
+- **The model needs what a junior engineer needs from code review:** a specific message saying what was
+  wrong and what would be right. A model that sees "amount must be in cents" fixes itself; a 500 from your
+  handler ends the run.
+- **The schema is documentation the model reads.** A `date` parameter typed as a bare string invites "next
+  Friday"; described as "ISO 8601 date, e.g. 2026-11-03" it gets the right value from the same model. Many
+  "bad arguments" complaints are schema bugs.
 
 ## How it works
 ### What the model sees
-The declared `input_schema` is a JSON Schema object: `type`, `properties`, `required`, `enum`,
-`description` per property, `default`, `items` for arrays, nested objects, and `additionalProperties`.
-The model reads every description. Put units, formats and examples there: "amount in minor currency
-units (cents)", "ISO 4217 code", "max 50 results". `additionalProperties: false` tells the model not to
-invent fields and is required by strict mode on the major providers (OpenAI's strict mode additionally
-requires every property to be listed in `required`, with optional fields expressed as nullable).
+- **The declared `input_schema` is a JSON Schema object:** `type`, `properties`, `required`, `enum`,
+  `description` per property, `default`, `items` for arrays, nested objects, and `additionalProperties`.
+- **The model reads every description,** so put units, formats and examples there: "amount in minor
+  currency units (cents)", "ISO 4217 code", "max 50 results".
+- **`additionalProperties: false`** tells the model not to invent fields and is required by strict mode on
+  the major providers.
+- **OpenAI's strict mode also requires** every property to be listed in `required`, with optional fields
+  expressed as nullable.
 
 ### Design rules, and the reason for each
-- **Flat over nested**, because every level of nesting is another place to misplace a key.
-- **Enums over free strings** for anything with a fixed set of values, because they turn a
-  classification into a choice the API can enforce.
-- **Few parameters with sensible defaults**, because every optional parameter is a decision the model
-  can get wrong; expose only what the task needs, not the downstream API's whole surface.
-- **Units and formats in names and descriptions** (`total_cents`, `starts_at_utc`), because "amount"
-  can mean cents or dollars and the model will pick one.
-- **Avoid unions, recursion and deep polymorphism**, because models fill them poorly and strict-mode
-  support for them differs by provider: at the time of writing OpenAI's strict mode accepts recursive
-  schemas and some numeric and pattern keywords, while Anthropic's rejects recursive schemas and numeric
-  or length bounds. Check the provider's supported subset rather than assuming either.
+- **Flat over nested,** because every level of nesting is another place to misplace a key.
+- **Enums over free strings** for anything with a fixed set of values, because they turn a classification
+  into a choice the API can enforce.
+- **Few parameters with sensible defaults,** because every optional parameter is a decision the model can
+  get wrong; expose only what the task needs, not the downstream API's whole surface.
+- **Units and formats in names and descriptions** (`total_cents`, `starts_at_utc`), because "amount" can
+  mean cents or dollars and the model will pick one.
+- **Avoid unions, recursion and deep polymorphism,** because models fill them poorly and strict-mode
+  support differs by provider.
+  - At the time of writing OpenAI's strict mode accepts recursive schemas and some numeric and pattern
+    keywords; Anthropic's rejects recursive schemas and numeric or length bounds.
+  - Check the provider's supported subset rather than assuming either.
 
 ### Where the shape guarantee comes from
-Without strict mode the model generates JSON as text and the API parses it; wrong types and missing
-fields are possible. With strict mode the provider compiles the schema into a grammar and masks tokens
-during decoding so the output must conform (constrained generation; open-weight servers do the same with
-libraries like Outlines). You pay with a restricted schema vocabulary and a one-time compilation cost
-for new schemas. Strict is worth it for write tools; it is unnecessary for a single free-text query
-parameter. Treat availability and the exact supported subset as vendor-dependent.
+| | Without strict mode | With strict mode |
+|---|---|---|
+| How JSON is produced | Generated as text, parsed by the API | Schema compiled to a grammar; tokens masked during decoding (constrained generation) |
+| Wrong types, missing fields | Possible | Impossible by construction |
+| Cost | None | Restricted schema vocabulary; one-time compilation cost for new schemas |
+| Worth it for | A single free-text query parameter | Write tools |
+
+- **Open-weight servers do the same** with libraries like Outlines.
+- **Treat availability and the exact supported subset as vendor-dependent.**
 
 ### Validation layers in the harness
-1. **Shape**: parse `input` into a typed model (Pydantic, Zod). Do this even with strict mode, because
-   constraints outside the provider's strict subset (often numeric bounds, sometimes patterns) are
-   stripped from the schema you send and are enforced only here, because a response truncated at
-   `max_tokens` is not a complete call, and because the next model or provider may not offer strict mode.
-2. **Meaning**: ranges, cross-field rules, existence checks against your data ("order not found").
-3. **Permission**: tenant and user scoping come from the authenticated session in the harness, never
-   from an argument the model supplied, because the model will cheerfully pass whatever id appears in
-   the conversation.
-4. **Consequence**: destructive or expensive calls get an approval gate regardless of validation.
+1. **Shape:** parse `input` into a typed model (Pydantic, Zod). Do this even with strict mode, because:
+   - constraints outside the provider's strict subset (often numeric bounds, sometimes patterns) are
+     stripped from the sent schema and enforced only here;
+   - a response truncated at `max_tokens` is not a complete call;
+   - the next model or provider may not offer strict mode.
+2. **Meaning:** ranges, cross-field rules, existence checks against your data ("order not found").
+3. **Permission:** tenant and user scoping come from the authenticated session in the harness, never from a
+   model-supplied argument, because the model will cheerfully pass whatever id appears in the conversation.
+4. **Consequence:** destructive or expensive calls get an approval gate regardless of validation.
 
-A failure at any layer returns `is_error: true` with a message naming the field, the problem and the
-fix, and nothing else (no stack traces, no table names). One exception to "be specific": make "does not
-exist" and "exists but belongs to someone else" return the same message, otherwise the error channel
-tells a caller which other tenants' ids are real. Cap validation retries per call, two or three
-is typical, so a model that cannot satisfy the schema does not loop forever.
+### What a failure returns
+- **`is_error: true` with a message naming the field, the problem and the fix,** and nothing else: no
+  stack traces, no table names.
+- **One exception to "be specific":** "does not exist" and "exists but belongs to someone else" return the
+  same message, otherwise the error channel tells a caller which other tenants' ids are real.
+- **Cap validation retries per call,** two or three is typical, so a model that cannot satisfy the schema
+  does not loop forever.
 
-## Example
-A Pydantic model is the single source for the schema the model sees and the validator the handler runs.
-The regex and bounds are shape rules; the existence check is a semantic rule; the tenant check is an
-authorization rule that uses the session, not the model's argument. Errors are turned into results.
+## Diagram
+Each call passes four gates in order; any failure becomes an `is_error` result the model can fix, and
+only a fully valid call reaches the side effect.
+
+```mermaid
+flowchart TD
+    C["Model tool_use input"] --> S{"Shape valid?"}
+    S -->|"no"| E["is_error: field, problem, fix"]
+    S -->|"yes"| M{"Meaning valid?"}
+    M -->|"no"| E
+    M -->|"yes"| P{"Session permits?"}
+    P -->|"no, same as not found"| E
+    P -->|"yes"| G{"Destructive or costly?"}
+    G -->|"yes"| A["Human approval"]
+    G -->|"no"| X["Execute"]
+    A --> X
+    E -->|"retry, capped at 2 or 3"| C
+```
+
+## Examples
+### One Pydantic model for schema and validator
+The Pydantic model is the single source for the schema the model sees and the validator the handler runs.
+The regex and bounds are shape rules; the existence check is semantic; the tenant check is authorization
+using the session, not the model's argument. Errors are turned into results.
 
 ```python
 from typing import Literal
@@ -145,49 +170,99 @@ def handle_refund(block, session_tenant: str) -> dict:
             "content": f'{{"status": "refunded", "amount_cents": {args.amount_cents}}}'}
 ```
 
-Trace one bad call through it. The user says "refund $12.90 on order 104233, it arrived broken" and the
-model sends `{"order_id": "104233", "amount_cents": 12.9, "reason": "broken"}`. All three fields fail the
-shape layer at once, and Pydantic reports all three in one pass, so the model receives a single result
-naming each: the pattern `^ORD-\d{6}$` the id must match, that `amount_cents` must be an integer with no
-fractional part, and the four allowed `reason` values. One round trip later it sends
-`{"order_id": "ORD-104233", "amount_cents": 1290, "reason": "damaged"}`, which passes. Reporting every
-error together matters *because* fixing them one per round trip would have cost three model calls instead
-of one. Had it sent `amount_cents: 129000`, shape would pass and the cross-field rule would reject it with
-the paid amount in the message, which is exactly the information needed to correct it.
+### Worked trace: one bad call, one round trip
+The user says "refund $12.90 on order 104233, it arrived broken". The model sends
+`{"order_id": "104233", "amount_cents": 12.9, "reason": "broken"}`.
+
+| Field | Sent | Layer that rejects | Message tells the model |
+|---|---|---|---|
+| `order_id` | `"104233"` | Shape | It must match the pattern `^ORD-\d{6}$` |
+| `amount_cents` | `12.9` | Shape | It must be an integer with no fractional part |
+| `reason` | `"broken"` | Shape | The four allowed `reason` values |
+
+- **Pydantic reports all three in one pass,** so the model gets a single result naming each.
+- **One round trip later** it sends `{"order_id": "ORD-104233", "amount_cents": 1290, "reason": "damaged"}`,
+  which passes.
+- **Reporting every error together matters** *because* fixing them one per round trip would cost three
+  model calls instead of one.
+- **Had it sent `amount_cents: 129000`,** shape would pass and the cross-field rule would reject it with the
+  paid amount in the message, exactly the information needed to correct it.
+
+### Capping validation retries
+A runnable sketch of the retry cap: after the third rejection of the same tool in a run, the result tells
+the model to stop and ask the user instead of trying again.
+
+```python
+from collections import Counter
+
+MAX_REJECTIONS = 3
+rejections: Counter[str] = Counter()          # per run, keyed by tool name
+
+def reject(tool: str, tool_use_id: str, msg: str) -> dict:
+    rejections[tool] += 1
+    if rejections[tool] >= MAX_REJECTIONS:
+        msg += f" (rejected {rejections[tool]} times; stop retrying and ask the user for the values)"
+    return {"type": "tool_result", "tool_use_id": tool_use_id, "is_error": True,
+            "content": f"invalid arguments: {msg}"}
+
+for i in range(3):
+    print(reject("issue_refund", f"toolu_{i}", "amount_cents: must be an integer")["content"])
+```
+
+## Production patterns
+- **Schema snapshot tests.** Whenever the schema is generated from code; commit the output of
+  `model_json_schema()` and fail CI when it changes unreviewed, because a renamed field silently changes what
+  the model sees. Monitor argument validity rate after each deploy.
+- **Replay real arguments as fixtures.** Once traces exist; export actual `input` objects (good and
+  rejected) from traces and run the validator over them in CI, instead of hand-written fixtures. Monitor the
+  semantic rejection rate per field.
+- **Per-provider schema rendering.** When one tool serves several vendors; keep one canonical Pydantic
+  model, render a provider-specific schema that drops unsupported keywords, and keep enforcing them in the
+  validator. Monitor 400s mentioning unsupported keywords.
+- **Coerce low-stakes, reject high-stakes.** For cosmetic issues; trim whitespace or upper-case a currency
+  code before validation, but reject ambiguous money, dates and ids. Monitor how often coercion fires.
+- **Retry cap plus escalation.** In every harness; cap rejections at two or three per call and then tell the
+  model to ask the user, as above. Monitor retries per rejected call; a rise after a prompt change usually
+  means a description became ambiguous.
 
 ## Trade-offs
-- Strict mode gives a hard shape guarantee but limits the schema vocabulary and adds first-call
-  compilation latency; it pays for itself on write tools and is overkill for a one-string search tool.
-- Tight validation catches more errors, but each rejection costs a model round trip; for low-stakes
-  arguments it is cheaper to coerce (trim whitespace, upper-case a currency code) than to reject.
-- Fewer, flatter parameters make calls reliable but push complexity into more tools or into the
-  handler; the balance flips when the domain genuinely needs a structured payload such as an address.
-- Detailed error messages help the model self-correct but can leak internals; return what the model
-  needs to fix the call, not what a developer needs to debug the service.
+- **Hard shape guarantee vs vocabulary and latency.** Strict mode limits the schema vocabulary and adds
+  first-call compilation latency; it pays for itself on write tools and is overkill for a one-string
+  search tool.
+- **Tight validation vs round trips.** It catches more errors, but each rejection costs a model round trip.
+  For low-stakes arguments it is cheaper to coerce (trim whitespace, upper-case a currency code) than to
+  reject.
+- **Flat parameters vs pushed complexity.** Fewer, flatter parameters make calls reliable but push
+  complexity into more tools or the handler; the balance flips when the domain genuinely needs a structured
+  payload such as an address.
+- **Detailed errors vs leakage.** Detail helps the model self-correct but can leak internals; return what
+  the model needs to fix the call, not what a developer needs to debug the service.
 
 ## Pitfalls
-- Generating the schema from an internal database model with thirty fields; the symptom is the model
-  filling optional fields with invented values or omitting the ones that matter.
-- A bare `{"type": "string"}` for dates, money or ids with no format in the description; the symptom
-  is "next Friday", "$12.90" and ids with the wrong prefix arriving in the handler.
-- Taking `tenant_id` or `user_id` from the model's arguments; the symptom is cross-tenant data access
-  that only shows up in a security review or an incident.
-- Validating shape only; the symptom is downstream 400s and refunds that are off by a factor of 100
-  because cents and dollars were confused.
-- Unbounded retry on validation failure; the symptom is the same call rejected twenty times with the
-  same message until the step budget trips.
-- Reusing one schema across providers with different strict-mode subsets; the symptom is a 400 from one
-  vendor about an unsupported keyword such as `pattern` or `minimum`.
+- **Generating the schema from an internal database model with thirty fields.** Symptom: the model fills
+  optional fields with invented values or omits the ones that matter. Fix: a purpose-built input model.
+- **A bare `{"type": "string"}` for dates, money or ids with no format in the description.** Symptom: "next
+  Friday", "$12.90" and ids with the wrong prefix arrive in the handler. Fix: formats, patterns, examples.
+- **Taking `tenant_id` or `user_id` from the model's arguments.** Symptom: cross-tenant data access that
+  only shows up in a security review or an incident. Fix: derive scope from the session.
+- **Validating shape only.** Symptom: downstream 400s and refunds off by a factor of 100 because cents and
+  dollars were confused. Fix: semantic and cross-field rules.
+- **Unbounded retry on validation failure.** Symptom: the same call rejected twenty times with the same
+  message until the step budget trips. Fix: a retry cap.
+- **Reusing one schema across providers with different strict-mode subsets.** Symptom: a 400 from one
+  vendor about an unsupported keyword such as `pattern` or `minimum`. Fix: per-provider rendering.
 
 ## When to use
-Always validate; what varies is how deep. A read-only search tool needs shape validation and little
-else. A tool that moves money, deletes data or sends messages needs all four layers plus an approval
-gate. Measure the argument validity rate (calls that pass shape validation), the semantic rejection
-rate, and how many retries a rejected call needs; a rising rejection rate after a prompt or model change
-usually means a description became ambiguous. In day-to-day work this is where most tool bugs live, so
-keep the schema and the validator in one place and test them with the model's actual outputs from
-traces, not hand-written fixtures. In interviews, be ready to explain exactly what strict mode does and
-does not guarantee, and why authorization can never come from a model argument.
+- **Always validate;** what varies is how deep.
+- **Read-only search tool:** shape validation and little else.
+- **Tools that move money, delete data or send messages:** all four layers plus an approval gate.
+- **Measure** argument validity rate (calls passing shape), semantic rejection rate, and retries per
+  rejected call. A rising rejection rate after a prompt or model change usually means a description became
+  ambiguous.
+- **Day to day** this is where most tool bugs live, so keep schema and validator in one place and test with
+  the model's actual outputs from traces, not hand-written fixtures.
+- **Interviews:** explain exactly what strict mode does and does not guarantee, and why authorization can
+  never come from a model argument.
 
 ## Role lens
 - **Engineer:** Defines each tool's input as a typed model, derives the JSON Schema from it, validates
@@ -207,6 +282,38 @@ contract and the handler, not the decoder: rename the field to `amount_cents` an
 its description; add a semantic check that the amount does not exceed what the order paid; gate refunds
 above a threshold behind human approval; and return a specific error when the check fails so the model
 corrects itself. Then watch the distribution of amounts in traces to confirm the fix.
+
+## Interview questions
+### What are the three ways model-generated arguments fail?
+- **Shape:** wrong types, missing or invented fields; strict mode or a typed parser catches these.
+- **Semantics:** values that parse but are wrong, such as a past date for a booking or a nonexistent id;
+  only checks against your data catch these.
+- **Authorization:** a well-formed request for a record the caller may not see; only the session in the
+  harness can decide that.
+
+### A model keeps sending dates like "next Friday". How do you fix it?
+- **Treat it as a schema bug first:** a bare string invites free text.
+- **Describe the format** ("ISO 8601 date, e.g. 2026-11-03"), add a pattern, and name the field with its
+  unit or zone (`starts_at_utc`).
+- **Validate and return a specific error** naming the expected format, so the next call self-corrects in
+  one round trip.
+
+### Why should tenant scope never be a tool argument?
+- **The model passes whatever id appears in its context,** including one injected by a document or a user.
+- **So scope comes from the authenticated session** and is applied regardless of arguments.
+- **Also make "not found" and "not yours" identical,** otherwise the error channel reveals which other
+  tenants' ids are real.
+
+### When would you coerce instead of rejecting an argument?
+- **Coerce cosmetic, unambiguous issues** such as whitespace or currency-code case, because each rejection
+  costs a full model round trip.
+- **Reject anything where a guess could be wrong:** money units, dates, ids, destructive flags.
+- **Log coercions** so you can see when a description needs fixing.
+
+### How do you keep validation retries from burning the step budget?
+- **Report every error in one result,** as Pydantic does, so three bad fields cost one retry, not three.
+- **Cap retries at two or three per call,** then tell the model to ask the user.
+- **Watch retries per rejected call;** a rise after a change points to an ambiguous description.
 
 ## Quiz
 ### Q: What does strict or constrained schema mode guarantee about a tool call's arguments?

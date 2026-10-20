@@ -103,6 +103,23 @@ fixed tenant.
 - **Request-scoped objects** (a session, a per-tenant configuration, a trace span) are created inside the
   dependency and torn down after `yield`.
 
+## Diagram
+The dependency tree for the `/chat` example below, resolved leaves first: `get_tenant` is shared by two
+dependents but runs once, the client comes from lifespan state, and the yield dependency's teardown
+runs after the handler, even when it raises.
+
+```mermaid
+flowchart TD
+    H["x-api-key header"] --> T["get_tenant (runs once, cached)"]
+    T -->|"cached value"| B["budget: setup up to yield"]
+    T -->|"cached value"| E["chat endpoint"]
+    S[("app.state.llm, built in lifespan")] --> L["get_llm: fetch, not build"]
+    L --> E
+    B -->|"yields Budget"| E
+    E -->|"returns or raises 429"| FIN["budget teardown: finally records spend"]
+    O["dependency_overrides in tests"] -.->|"replaces get_llm with FakeLLM"| L
+```
+
 ## Examples
 ### Auth, shared client, request-scoped budget and a test override
 - **Auth:** an API-key dependency.
@@ -277,6 +294,46 @@ should go to a durable queue. Tests hitting the provider means `get_llm` is not 
 `app.dependency_overrides[get_llm]` with a fake in a fixture and clear it on teardown. Note that
 `get_db` is resolved once per request thanks to caching, so `get_user` and the handler share one
 session and one transaction, which is the intended scope.
+
+## Interview questions
+### What problem does `Depends` solve that module-level globals do not?
+- **Testability:** dependencies are typed callables keyed in `app.dependency_overrides`, so a test swaps
+  the LLM client for a fake without monkeypatching the module.
+- **Consistency:** auth, tenant and quota checks are declared once, or attached to a whole router with
+  `dependencies=[...]`, instead of being copied into each handler where one route forgets them.
+- **Lifecycle:** `yield` dependencies give every session or transaction the same teardown, even when the
+  handler raises, because the exception is re-raised at the `yield` point.
+
+### A protected endpoint has 400 ms of latency before the handler body even starts. How do you find and fix it?
+- **Trace the dependency tree.** Open a span or timer inside each slow dependency and compare total
+  request time with handler time.
+- **Look for sibling lookups.** Sibling dependencies run one after another, so two independent 200 ms
+  lookups add 400 ms.
+- **Fix:** merge them into one dependency that runs both in a task group (about 200 ms), and check that
+  no `async def` dependency does blocking work such as a sync JWKS fetch.
+
+### Why is a `yield` dependency the wrong place to hold a resource a background task needs?
+- **Its lifetime ends with the request.** Teardown runs after `yield`, and when it runs relative to the
+  response bytes has changed between FastAPI versions.
+- **So the background task may get a closed session**, producing intermittent "session is closed" errors
+  that depend on timing and version.
+- **Instead:** let the task open its own session, do the write in the handler before returning, or move
+  the work to a durable queue.
+
+### How do you apply different rate limits to different routes with one dependency class?
+- **Use instances with `__call__`:** `Depends(RateLimit(per_minute=60))` on the chat route and
+  `Depends(RateLimit(5))` on an expensive batch route.
+- **Each instance is a distinct dependency** for caching and overrides, because the key is the object
+  itself.
+- **In tests, keep a reference** to the instance you registered, since overriding a new `RateLimit(...)`
+  object matches nothing.
+
+### Your test suite passes locally but fails in CI when files run in a different order. What is your first suspect?
+- **A leaked override.** `app.dependency_overrides` is global on the app object, so a test that sets a
+  fake model and never clears it changes later tests.
+- **Fix:** set overrides in a pytest fixture that yields the `TestClient` and calls
+  `app.dependency_overrides.clear()` afterwards.
+- **Prevent it** by making that fixture the only place overrides are set.
 
 ## Quiz
 ### Q: `get_settings` is a dependency of both `get_llm` and `get_retriever`, and an endpoint depends on both. How many times does `get_settings` run per request by default?

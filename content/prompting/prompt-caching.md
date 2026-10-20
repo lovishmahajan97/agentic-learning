@@ -5,7 +5,7 @@ name: Prompt caching
 kind: concept
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - prompting/system-prompt
   - prompting/prompt-templates
@@ -22,107 +22,133 @@ sources:
 ---
 
 ## TL;DR
-Every request re-runs prefill over the whole prompt, yet in most applications most of the prompt
-(system instructions, tool definitions, few-shot examples, a long reference document) is identical from
-one request to the next. Prompt caching stores the model's internal state for a prefix and reuses it
-when a later request starts with the same bytes, cutting input cost and time-to-first-token. It only
-works on exact prefixes, so the layout of your prompt decides whether you get the discount.
+Prompt caching reuses the model's stored state for a repeated prompt prefix when a later request starts
+with the same bytes, cutting input cost and time-to-first-token. Only exact prefixes match, so prompt
+layout decides the discount.
 
 ## Why it exists
-Prefill is compute-bound and grows at least linearly with prompt length (the attention part
-quadratically). Take a support assistant with a 20,000-token
-system prompt (policies, tone rules, worked examples) plus 2,000 tokens that vary per request. At 1,000
-requests an hour, that is 20 million tokens an hour of prefill whose result is identical every time:
-the same tokens, through the same weights, produce the same keys and values in every layer. You pay for
-the computation, and the user waits for it before the first output token appears.
-
-The naive fixes all cost something you want to keep. Shortening the prompt throws away instructions
-that earned their place. Fine-tuning the instructions into the weights makes iteration slow and expensive
-and still leaves the reference document to be re-sent. Running your own server with prefix caching is
-only an option if you self-host.
-
-The observation that makes caching possible is the same one behind the KV cache inside a single request:
-in a causal transformer, the key and value vectors at position *i* depend only on tokens 0..*i*. Two
-requests that share their first *n* tokens have identical K and V for those *n* positions in every layer,
-so the second request can start from the stored state instead of recomputing it. Prompt caching is the
-KV cache applied across requests rather than across decode steps.
+- **Most of every prompt repeats.** System instructions, tool definitions, few-shot examples and long
+  reference documents are identical from one request to the next, yet every request re-runs prefill over
+  the whole prompt.
+- **Prefill is expensive.** It is compute-bound and grows at least linearly with prompt length (the
+  attention part quadratically). A support assistant with a 20,000-token system prompt plus 2,000
+  varying tokens, at 1,000 requests an hour, prefills 20 million identical tokens an hour. You pay for
+  it, and the user waits for it before the first output token.
+- **The naive fixes cost something you want to keep.** Shortening the prompt throws away instructions
+  that earned their place. Fine-tuning instructions into the weights makes iteration slow and expensive
+  and still re-sends the reference document. Your own server with prefix caching needs self-hosting.
+- **The enabling fact.** In a causal transformer, K and V at position *i* depend only on tokens 0..*i*.
+  Two requests sharing their first *n* tokens have identical K and V for those *n* positions in every
+  layer. Prompt caching is the KV cache applied across requests rather than across decode steps.
 
 ## How it works
 ### What is stored and why the match must be exact
-The cache holds the per-layer K and V tensors for a prefix, keyed by a hash of the exact token sequence
-up to a breakpoint. Because position *i*'s state depends on every earlier token, a single different
-token at position *n* makes everything from *n* onward different; the cache can serve positions before
-*n* and must recompute the rest. Lookup is therefore "longest matching prefix", which is why the hosted
-APIs describe caching as a prefix match and why one stray timestamp at the top of the system prompt
-defeats it entirely.
+- **Stored:** per-layer K and V tensors for a prefix, keyed by a hash of the exact token sequence up to a
+  breakpoint.
+- **Exact match:** position *i*'s state depends on every earlier token, so one different token at
+  position *n* changes everything from *n* onward. The cache serves positions before *n*; the rest is
+  recomputed.
+- **Lookup is longest matching prefix.** That is why hosted APIs describe caching as a prefix match, and
+  why one stray timestamp at the top of the system prompt defeats it entirely.
 
-### Render order and breakpoints
-On Anthropic's API a request is rendered in a fixed order: tool definitions, then the system prompt,
-then the messages (other providers have their own fixed order). There you mark where a cacheable
-prefix ends with `cache_control: {"type": "ephemeral"}` on a content block (up to four breakpoints per request); a breakpoint caches everything from the start
-of the request up to and including that block. A top-level `cache_control` on the request instead places
-the breakpoint automatically on the last cacheable block, which suits growing conversations. Each
-breakpoint looks back a bounded number of blocks for an earlier entry to extend, so very long turns can
-benefit from an intermediate breakpoint. Some other providers cache automatically on any repeated prefix
-without markers; the prefix rule is the same, only the control differs.
+### Render order and breakpoints (Anthropic's API)
+1. **Fixed render order:** tool definitions, then the system prompt, then the messages. Other providers
+   have their own fixed order.
+2. **Explicit breakpoints:** `cache_control: {"type": "ephemeral"}` on a content block marks where a
+   cacheable prefix ends (up to four breakpoints per request). It caches everything from the start of the
+   request up to and including that block.
+3. **Automatic breakpoint:** a top-level `cache_control` on the request places the breakpoint on the last
+   cacheable block, which suits growing conversations.
+4. **Bounded lookback:** each breakpoint looks back a bounded number of blocks for an earlier entry to
+   extend, so very long turns benefit from an intermediate breakpoint.
+5. **Other providers** cache automatically on any repeated prefix without markers; the prefix rule is the
+   same, only the control differs.
 
 ### Lifetime
-Entries expire after a short time-to-live (five minutes by default on Anthropic's API, with a one-hour
-option at a higher write price) and a read refreshes the timer, so requests that share a prefix and
-arrive more often than the TTL keep the entry warm indefinitely. Entries are scoped to the model and
-are not shared between customers (organization-scoped on hosted APIs; check your provider's exact
-isolation rule before relying on it for tenant separation). Eviction is best-effort: a correctly laid-out
-prefix can still miss occasionally, so cost models should use the measured hit ratio, not an assumed 100%.
-The lifetime is measured from the start of the request that writes or reads the entry, so a long
-generation eats into the window: what matters is the start-to-start gap between requests.
+- **TTL:** five minutes by default on Anthropic's API, with a one-hour option at a higher write price. A
+  read refreshes the timer, so a prefix reused more often than the TTL stays warm indefinitely.
+- **Measured start to start.** The lifetime runs from the start of the request that writes or reads the
+  entry, so a long generation eats into the window.
+- **Scope:** entries are scoped to the model and not shared between customers (organization-scoped on
+  hosted APIs). Check your provider's exact isolation rule before relying on it for tenant separation.
+- **Eviction is best-effort.** A correctly laid-out prefix can still miss, so cost models use the
+  measured hit ratio, not an assumed 100%.
 
 ### Economics
-A cache write costs more than ordinary input (about 1.25× for the five-minute TTL and 2× for the
-one-hour TTL on Anthropic's API) and a cache read costs a fraction of ordinary input (about 0.1×, lower
-on some newer models). With the five-minute TTL two requests already break even (1.25 + 0.1 = 1.35
-versus 2.0 uncached); with the one-hour TTL you need three. There is also a minimum cacheable prefix,
-which varies by model from a few hundred to a few thousand tokens; shorter prefixes are silently not
-cached, with no error.
+| Item (Anthropic's API) | Price vs ordinary input |
+|---|---|
+| Cache write, five-minute TTL | about 1.25× |
+| Cache write, one-hour TTL | about 2× |
+| Cache read | about 0.1× (lower on some newer models) |
+| Break-even, five-minute TTL | two requests: 1.25 + 0.1 = 1.35 versus 2.0 uncached |
+| Break-even, one-hour TTL | three requests |
+
+- **Minimum cacheable prefix:** varies by model from a few hundred to a few thousand tokens. Shorter
+  prefixes are silently not cached, with no error.
 
 ### The invalidation hierarchy
-Because of render order, a change invalidates its own tier and everything after it. Changing tool
-definitions (adding, removing, reordering) invalidates tools, system and messages. Changing the system
-prompt keeps the tools entry but invalidates system and messages. Changing a message invalidates from
-that message onward. Changing the model is a full miss, since caches are model-scoped. Changing
-generation configuration that is rendered into the prompt, such as thinking or effort settings, also
-invalidates the messages tier (and on some models the earlier tiers too), so pin those per route rather
-than varying them per request.
+A change invalidates its own tier and everything after it, because of render order.
+
+| Change | Invalidates |
+|---|---|
+| Tool definitions (add, remove, reorder) | tools, system and messages |
+| System prompt | system and messages (tools entry kept) |
+| A message | from that message onward |
+| Model | everything: caches are model-scoped |
+| Generation config rendered into the prompt (thinking, effort) | messages tier, and on some models earlier tiers too |
+
+Pin thinking and effort settings per route rather than varying them per request.
 
 ### Observing it
-The response `usage` block reports three input counts: `input_tokens` (uncached remainder),
-`cache_creation_input_tokens` (written this request, at the write premium) and
-`cache_read_input_tokens` (served from cache). The prompt size is their sum. A healthy multi-turn loop
-shows reads growing turn over turn and small writes; reads stuck at zero mean something volatile sits
-before the breakpoint.
+The response `usage` block reports three input counts; the prompt size is their sum:
+- `input_tokens`: the uncached remainder;
+- `cache_creation_input_tokens`: written this request, at the write premium;
+- `cache_read_input_tokens`: served from cache.
+
+A healthy multi-turn loop shows reads growing turn over turn and small writes. Reads stuck at zero mean
+something volatile sits before the breakpoint.
 
 ### Concurrency
-An entry becomes readable only once the first response has started. N identical requests fired in
-parallel all miss and all pay the write premium. For fan-out, send one request, wait for its first token,
-then send the rest.
+- **An entry is readable only once the first response has started.**
+- **So N identical parallel requests all miss** and all pay the write premium.
+- **For fan-out:** send one request, wait for its first token, then send the rest.
 
 ### What it does not change
-Prompt caching is semantically transparent: the reused K and V are the ones the model would have
-computed anyway, so the output distribution is the same as an uncached call. That is the difference
-from *response* caching (or a "semantic cache"), which returns a stored answer for a similar question
-and can be wrong when the question differs in a detail. It also only touches prefill. Output tokens
-are billed and decoded exactly as before, so an output-heavy workload (short prompt, long answer)
-saves little, and time-to-first-token improves while time per output token does not.
+- **Semantically transparent.** The reused K and V are the ones the model would compute anyway, so the
+  output distribution matches an uncached call.
+- **Not response caching.** A "semantic cache" returns a stored answer for a similar question and can be
+  wrong when the question differs in a detail.
+- **Prefill only.** Output tokens are billed and decoded as before, so output-heavy workloads (short
+  prompt, long answer) save little; time-to-first-token improves, time per output token does not.
 
 ### Self-hosted equivalents
-vLLM's automatic prefix caching and SGLang's RadixAttention do the same thing inside the serving engine,
-with no markers: any common token prefix is reused. vLLM hashes each fixed-size KV block together with
-everything before it and shares blocks whose hashes match (so reuse is at block granularity); SGLang
-keeps the cached prefixes in a radix tree and matches the longest one. The serving module covers the memory side.
+- **vLLM automatic prefix caching:** hashes each fixed-size KV block together with everything before it
+  and shares blocks whose hashes match, so reuse is at block granularity. No markers.
+- **SGLang RadixAttention:** keeps cached prefixes in a radix tree and matches the longest one.
+- The serving module covers the memory side.
 
-## Example
-Two calls with the same 20k-token policy document and tool list, different questions. Stable content is
-rendered first with one breakpoint at the end of the system block; the only volatile part is the user
-turn, which comes after it. The `usage` fields show the write on the first call and the read on the second.
+## Diagram
+The prefix up to the breakpoint is hashed and looked up; a hit skips its prefill and bills it at the read
+rate, a miss prefills everything and writes the entry.
+
+```mermaid
+flowchart TD
+    R["Request: tools, system, messages"] --> H["Hash prefix up to breakpoint"]
+    H --> L{"Longest prefix in cache?"}
+    L -->|"hit"| RD["Reuse K, V at about 0.1x"]
+    L -->|"miss"| W["Prefill prefix, write at 1.25x"]
+    RD --> T["Prefill only the volatile tail"]
+    W --> C[("Prefix cache, TTL 5 min")]
+    W --> T
+    RD -.->|"read refreshes TTL"| C
+    T --> O["Decode output as usual"]
+```
+
+## Examples
+### Two calls sharing a 20k-token prefix
+The same 20k-token policy document and tool list, different questions. Stable content is rendered first
+with one breakpoint at the end of the system block; the only volatile part is the user turn after it. The
+`usage` fields show the write on the first call and the read on the second.
 
 ```python
 import anthropic, json
@@ -151,51 +177,103 @@ ask("Does the 14-day trial convert to a paid plan automatically?")
 # illustrative: uncached=~20  written=0       read=~20000   -> prefix at the read rate (0.1x on most models)
 ```
 
-Arithmetic for 1,000 requests an hour with a 20k stable prefix and 2k variable tail, at an illustrative
-$3 per million input tokens and the common 0.1× read rate: uncached, each request bills 22k tokens, about $0.066, so $66 an hour.
-Cached, each request bills 2k at full price plus 20k at 0.1×, equivalent to 4k tokens, about $0.012, so
-$12 an hour, with the occasional write after an idle gap adding a few cents. Roughly an 80% cut in input
-cost, and time-to-first-token drops because 20k tokens of prefill are skipped.
+### Worked cost: 1,000 requests an hour
+20k stable prefix, 2k variable tail, an illustrative $3 per million input tokens and the common 0.1× read
+rate.
+
+| | Billed tokens per request | Cost per request | Cost per hour |
+|---|---|---|---|
+| Uncached | 22k | about $0.066 | $66 |
+| Cached | 2k full + 20k at 0.1× = 4k equivalent | about $0.012 | $12 |
+
+- **Roughly an 80% cut in input cost**, with the occasional write after an idle gap adding a few cents.
+- **Time-to-first-token drops** because 20k tokens of prefill are skipped.
+
+The same arithmetic as a runnable calculator, plus a helper that finds the byte where two rendered
+prompts diverge (the usual way to locate a cache-breaking timestamp):
+
+```python
+import os
+
+def hourly_cost(req_per_hour, prefix, tail, price_per_m=3.0, read=0.1, write=1.25, writes_per_hour=0):
+    uncached = req_per_hour * (prefix + tail)
+    cached = (req_per_hour * (tail + prefix * read)        # every request reads the prefix
+              + writes_per_hour * prefix * (write - read))  # a miss pays the write instead of the read
+    return uncached * price_per_m / 1e6, cached * price_per_m / 1e6
+
+u, c = hourly_cost(1000, 20_000, 2_000)
+print(f"uncached ${u:.2f}/h, cached ${c:.2f}/h, saving {1 - c / u:.0%}")   # $66.00, $12.00, 82%
+print(f"${hourly_cost(1000, 20_000, 2_000, writes_per_hour=2)[1]:.2f}/h")  # $12.14 with 2 idle-gap writes
+
+def first_divergence(a: str, b: str) -> int:
+    return len(os.path.commonprefix([a, b]))
+
+a = "You are a support agent. Today is 2026-10-20T09:14:03Z.\nPolicies..."
+b = "You are a support agent. Today is 2026-10-20T09:14:07Z.\nPolicies..."
+i = first_divergence(a, b)
+print(i, repr(a[max(0, i - 20):i + 10]))   # the timestamp: everything after it is a cache miss
+```
+
+## Production patterns
+- **Layered request builder.** Build every request as stable (tools, policies), session and turn layers,
+  serialized deterministically (`json.dumps(..., sort_keys=True)`, tools sorted by name), with breakpoints
+  at the layer boundaries. Monitor hit ratio per route.
+- **Cache regression test in CI.** Send the same request twice against a test key and assert the second
+  reports `cache_read_input_tokens` greater than zero, because the common failure is a later change that
+  silently breaks caching for months.
+- **Hit-ratio dashboard from usage fields.** Log the three usage counts per call and chart reads over
+  total prompt tokens; alert when it drops after a deploy. A spike in `cache_creation_input_tokens` with
+  flat traffic points to a volatile byte in the prefix.
+- **Warm before fan-out.** For N parallel calls on one prefix, stream the first request, wait for its
+  first token, then release the other N - 1. Monitor writes per batch; it should be one.
+- **Volatile data after the breakpoint.** Put current date, user name, plan and retrieved snippets in the
+  user turn or after the shared breakpoint, never at the top of the system prompt. Diff two rendered
+  prompts (as above) whenever reads stay at zero.
+- **Prefix caching when self-hosting.** Keep automatic prefix caching enabled in vLLM or SGLang and route
+  requests sharing a system prompt to the same replica, so the shared blocks stay resident. Monitor the
+  engine's prefix-cache hit rate and time to first token.
 
 ## Trade-offs
-- You trade a constraint on prompt layout (stable content first, volatile last) for the discount; it
-  flips to a surcharge when the prompt is mostly unique per request, because the write premium is paid
-  and never read back.
-- The write premium means a prefix used once within the TTL costs more than not caching at all; the
-  break-even is two uses, so cache the parts you know repeat and leave one-off documents uncached.
-- The one-hour TTL doubles the write price to survive idle gaps; it pays only when requests sharing a
-  prefix arrive 5 to 60 minutes apart, and buys nothing under continuous traffic.
-- Putting per-user content (name, plan, profile) in the system prompt personalises the model but creates
-  one prefix per user; moving it after the shared breakpoint keeps cross-user sharing, and a second
-  per-user breakpoint is worth adding only when that user makes many requests within the TTL.
-- A prompt release invalidates every cached prefix at once, so a deploy costs a cost and latency blip; a
-  gradual alias move spreads the writes, at the price of running two prompt versions for a while.
+- **Layout constraint vs discount.** You accept stable content first, volatile last. It flips to a
+  surcharge when the prompt is mostly unique per request, because the write premium is paid and never
+  read back.
+- **Write premium vs one-off use.** A prefix used once within the TTL costs more than not caching. The
+  break-even is two uses, so cache parts you know repeat and leave one-off documents uncached.
+- **One-hour TTL vs price.** It doubles the write price to survive idle gaps; it pays only when requests
+  sharing a prefix arrive 5 to 60 minutes apart, and buys nothing under continuous traffic.
+- **Personalisation vs sharing.** Per-user content (name, plan, profile) in the system prompt creates one
+  prefix per user. Moving it after the shared breakpoint keeps cross-user sharing; a second per-user
+  breakpoint pays only when that user makes many requests within the TTL.
+- **Releases vs warm caches.** A prompt release invalidates every cached prefix at once, so a deploy
+  costs a cost and latency blip. A gradual alias move spreads the writes, at the price of running two
+  prompt versions for a while.
 
 ## Pitfalls
-- A timestamp, request id or UUID interpolated into the system prompt; the symptom is
-  `cache_creation_input_tokens` near the full prompt on every request and reads stuck at zero.
-- Non-deterministic serialization: `json.dumps` without `sort_keys`, iterating a set, or a tool list
-  built per user; the symptom is an intermittent hit rate that nobody can explain from the prompt text.
-- Letting the automatic breakpoint land after a unique per-request tail; the symptom is a write on
-  every request while reads never cover the full shared prefix.
-- A prefix below the model's minimum cacheable size; the symptom is zero writes and zero reads with no
-  error, usually on a short prompt that someone assumed was cached.
-- Rewriting earlier history (injecting then deleting a reminder, truncating the middle of a conversation);
-  the symptom is a write the size of the whole conversation on every turn of an agent loop.
-- Fan-out of N identical requests at once; the symptom is N writes and no reads at the start of each batch.
-- Switching models or toggling thinking and effort per request; the symptom is full misses on
+- **A timestamp, request id or UUID in the system prompt.** Symptom: `cache_creation_input_tokens` near
+  the full prompt on every request and reads stuck at zero.
+- **Non-deterministic serialization.** `json.dumps` without `sort_keys`, iterating a set, or a tool list
+  built per user. Symptom: an intermittent hit rate nobody can explain from the prompt text.
+- **Automatic breakpoint after a unique per-request tail.** Symptom: a write on every request while reads
+  never cover the full shared prefix.
+- **A prefix below the model's minimum cacheable size.** Symptom: zero writes and zero reads with no
+  error, usually on a short prompt someone assumed was cached.
+- **Rewriting earlier history** (injecting then deleting a reminder, truncating the middle of a
+  conversation). Symptom: a write the size of the whole conversation on every turn of an agent loop.
+- **Fan-out of N identical requests at once.** Symptom: N writes and no reads at the start of each batch.
+- **Switching models or toggling thinking and effort per request.** Symptom: full misses on
   byte-identical text, which looks impossible until you remember caches are model- and config-scoped.
 
 ## When to use
-Reach for caching whenever a prefix larger than the model's minimum repeats within the TTL: shared system
-prompts and tool sets, few-shot examples, a long document interrogated with many questions, and above all
-agent loops, where every turn re-sends the growing history. Skip it for one-off requests with unique
-content and for batch jobs where only a few hundred tokens of instructions are shared. Measure three
-things: hit ratio (reads over total prompt tokens), time-to-first-token before and after, and cost per
-request from the usage fields. Add an integration test that asserts a second identical request shows
-reads, because the common failure is a later change that silently breaks caching for months. In
-interviews, the expected depth is: prefix match, render order, the write-versus-read economics, and where
-to put the breakpoint.
+- **Use when** a prefix larger than the model's minimum repeats within the TTL: shared system prompts and
+  tool sets, few-shot examples, a long document interrogated with many questions, and above all agent
+  loops, where every turn re-sends the growing history.
+- **Skip** one-off requests with unique content and batch jobs where only a few hundred tokens of
+  instructions are shared.
+- **Measure:** hit ratio (reads over total prompt tokens), time-to-first-token before and after, and cost
+  per request from the usage fields. Add an integration test asserting a second identical request shows
+  reads.
+- **Interviews:** prefix match, render order, write-versus-read economics, and where to put the
+  breakpoint.
 
 ## Role lens
 - **Engineer:** Structures the request builder as stable, session and turn layers, places breakpoints at
@@ -216,6 +294,45 @@ Reads total roughly 2.5M tokens, equivalent to about 250k at full price, plus ab
 writes, so around 410k-equivalent versus 2.6M: an 80-85% reduction, with time-to-first-token falling on
 every turn. The conditions: turns start less than the TTL apart, history is append-only, the tool list is
 deterministic, and the model and thinking settings do not change mid-task.
+
+## Interview questions
+### What is prompt caching, and how is it different from a semantic cache?
+- **Definition:** reuse of the per-layer K and V state for an exact token prefix across requests, so
+  prefill over that prefix is skipped and billed at a read rate.
+- **Why it is safe:** the reused state is exactly what the model would recompute, so outputs have the
+  same distribution as an uncached call.
+- **A semantic cache** returns a stored answer for a similar question, which can be wrong when the new
+  question differs in a detail.
+
+### Your hit ratio dropped to zero after a deploy. How do you debug it?
+- **Read the usage fields.** Writes near the full prompt on every request with zero reads means the
+  prefix is never seen twice.
+- **Diff two rendered requests** and find the first differing byte: usually a timestamp, request id,
+  per-user field or unsorted JSON before the breakpoint.
+- **Check tier changes.** A reordered tool list or a per-request thinking toggle invalidates everything
+  after it; also confirm the prefix still exceeds the model's minimum.
+
+### When would caching make a workload more expensive?
+- **When prefixes rarely repeat within the TTL.** Every request pays about 1.25× to write an entry that
+  is never read.
+- **When the one-hour TTL is used under continuous traffic.** The 2× write buys nothing, because reads
+  already refresh the five-minute entry.
+- **Output-heavy workloads** gain little either way, since output tokens are unaffected.
+
+### You fan out 50 parallel calls over the same 30k-token document. What happens and what do you change?
+- **All 50 miss.** An entry is readable only once the first response has started, so each call pays the
+  write premium.
+- **Fix:** send one request, wait for its first streamed token, then release the other 49; they read the
+  prefix at about 0.1×.
+- **Monitor** writes per batch, which should fall from 50 to one.
+
+### Where do you place breakpoints in a long-running agent loop?
+- **One explicit breakpoint at the end of the system block**, so the expensive shared tools and
+  instructions always have a read point.
+- **Automatic caching on the conversation tail**, so each turn reads the history and writes only the new
+  turn, with an intermediate breakpoint if a single turn is very long.
+- **Keep history append-only** and pin model and thinking settings, or each turn rewrites the whole
+  conversation.
 
 ## Quiz
 ### Q: Why must a cached prefix match the new request byte for byte?

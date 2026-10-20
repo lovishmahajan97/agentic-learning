@@ -5,7 +5,7 @@ name: Batch size
 kind: concept
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - ml-fundamentals/gradient-descent
   - ml-fundamentals/gradient-accumulation
@@ -23,64 +23,56 @@ sources:
 ---
 
 ## TL;DR
-Batch size is how many examples (for LLMs, how many tokens) contribute to one gradient estimate. A
-larger batch gives a less noisy gradient and better hardware utilization, so each step is worth more and
-costs less per example, but only up to a point: past the *critical batch size* set by gradient noise,
-extra examples per step stop reducing the number of steps needed and simply burn data. Batch size,
-learning rate and step count are therefore one coupled decision, not three.
+Batch size is how many examples (for LLMs, tokens) feed one gradient estimate. Bigger batches give cleaner
+gradients and busier GPUs, until the *critical batch size* where extra examples just burn data, so batch,
+learning rate and steps are one decision.
 
 ## Why it exists
-Full-batch gradient descent computes the exact gradient over the whole dataset once per step. For a
-dataset of billions of tokens that is absurd: one step would take hours and the model would learn nothing
-until it finished. Stochastic gradient descent instead estimates the gradient from a sample, and the
-batch size is the sample size. That makes it a statistics question. The mini-batch gradient is an
-unbiased estimate of the full gradient with variance proportional to `1/B`. Small `B` gives cheap,
-noisy steps; large `B` gives expensive, accurate ones.
-
-Hardware pushes in one direction. A GPU multiplies matrices efficiently only when they are large, and
-the number of tokens flowing through each layer (batch × sequence length) is what makes the activations
-large. A batch of only a few hundred tokens leaves most of the chip idle and makes the step
-memory-bandwidth bound (weights are read once per step regardless of batch, so more tokens per step
-amortize that read). Doubling the batch until the GPU is compute-bound is close to
-free in wall-clock per example. Data parallelism pushes the same way: each additional GPU usually adds
-its share of examples to the batch rather than splitting a fixed batch finer.
-
-Optimization pushes back. Once the gradient estimate is already accurate, more samples do not change the
-direction of the step, so a batch twice as large produces essentially the same update and the model
-learns the same amount per step from twice the data. The run needs the same number of steps but consumes
-twice the tokens: wasted compute, and for a fixed dataset, fewer epochs' worth of unique signal. The naive
-policy "use the biggest batch that fits" is therefore wrong in both directions: too small wastes hardware,
-too large wastes data. The useful question is where the crossover is, and the answer depends on the
-noise in the gradient, which changes over training.
+- **Full-batch descent is absurd at scale.** One exact step over billions of tokens would take hours, and
+  the model would learn nothing until it finished. SGD estimates the gradient from a sample; the batch
+  size is the sample size.
+- **It is a statistics question.** The mini-batch gradient is an unbiased estimate with variance
+  proportional to `1/B`: small `B` gives cheap, noisy steps, large `B` expensive, accurate ones.
+- **Hardware pushes bigger.** GPUs are efficient only on large matrices, and batch × sequence length is
+  what makes activations large. A few hundred tokens leave most of the chip idle and make the step
+  memory-bandwidth bound, because weights are read once per step regardless of batch. Doubling until
+  compute-bound is close to free per example; data parallelism adds each GPU's examples to the batch.
+- **Optimization pushes back.** Once the gradient is accurate, a batch twice as large gives essentially
+  the same update: same steps, twice the tokens. That is wasted compute, and for a fixed dataset fewer
+  epochs' worth of unique signal.
+- **So "biggest batch that fits" is wrong both ways.** Too small wastes hardware; too large wastes data.
+  The crossover depends on gradient noise, which changes over training.
 
 ## How it works
 ### Gradient noise and the critical batch size
 Write the per-example gradient as the true gradient `G` plus noise with covariance `Σ`. The *gradient
-noise scale* is roughly `B_noise = tr(Σ) / |G|²`: the batch size at which the noise in the estimate is
-comparable to the signal. The empirical model of large-batch training gives a clean relation between the
-steps `S` and examples `E` a run needs at batch `B`, relative to the minimums `S_min` (infinite batch) and
-`E_min` (infinitesimal batch):
+noise scale* is roughly `B_noise = tr(Σ) / |G|²`: the batch at which noise is comparable to signal.
+
+The empirical model of large-batch training relates steps `S` and examples `E` at batch `B` to the minimums
+`S_min` (infinite batch) and `E_min` (infinitesimal batch):
 
 ```
 S = S_min × (1 + B_noise / B)        steps
 E = E_min × (1 + B / B_noise)        examples processed  (E = S × B)
 ```
 
-With `B ≪ B_noise`, doubling `B` roughly halves `S` for the same `E`: perfect scaling, free speed-up from
-more hardware. With `B ≫ B_noise`, doubling `B` leaves `S` unchanged and doubles `E`: pure waste. At
-`B = B_noise` both are 2× their minimum, which is why the noise scale is a sensible "critical" batch size.
-Two consequences follow. The noise scale *grows* during training, because `|G|` shrinks as the loss falls
-while the per-example noise does not, so the useful batch size is larger late in training than early;
-this is why some pre-training recipes ramp the batch size up over the first part of the run. And the
-noise scale tracks how low a loss the run reaches and how hard the task is: the scaling-law work of
-Kaplan et al. found the critical batch to depend mainly on the loss rather than directly on parameter
-count (later studies dispute the details), which is why LLM pre-training, reaching low losses on a hard
-task, uses batches of millions of tokens while a small classifier saturates at a few hundred examples.
+| Regime | Doubling `B` does | Verdict |
+|---|---|---|
+| `B ≪ B_noise` | roughly halves `S` for the same `E` | perfect scaling: free speed-up from more hardware |
+| `B = B_noise` | `S` and `E` are both 2× their minimum | the sensible "critical" batch |
+| `B ≫ B_noise` | leaves `S` unchanged, doubles `E` | pure waste |
+
+- **The noise scale grows during training,** because `|G|` shrinks as the loss falls while per-example
+  noise does not. The useful batch is larger late in training, which is why some pre-training recipes ramp
+  the batch up over the first part of the run.
+- **It tracks how low a loss the run reaches and how hard the task is.** Kaplan et al.'s scaling-law work
+  found the critical batch depends mainly on the loss rather than directly on parameter count (later
+  studies dispute the details). Hence LLM pre-training uses batches of millions of tokens while a small
+  classifier saturates at a few hundred examples.
 
 ### Measuring the noise scale
-You do not have to guess it. Because the squared norm of a mini-batch gradient is biased upward by the
-noise, `E|G_B|² = |G|² + tr(Σ)/B`, measuring the gradient norm at two batch sizes gives two equations in
-the two unknowns:
+You do not have to guess it. The squared norm of a mini-batch gradient is biased upward by the noise,
+`E|G_B|² = |G|² + tr(Σ)/B`, so the gradient norm at two batch sizes gives two equations in two unknowns:
 
 ```
 |G|²   ≈ (B_big · |G_big|² − B_small · |G_small|²) / (B_big − B_small)
@@ -88,52 +80,79 @@ tr(Σ)  ≈ (|G_small|² − |G_big|²) / (1/B_small − 1/B_big)
 B_simple = tr(Σ) / |G|²
 ```
 
-Under data parallelism both are free: each rank's local gradient before the all-reduce is the small
-batch, and the reduced gradient is the big one. The individual estimates are noisy, so average the
-numerator and denominator separately over many steps (an exponential moving average) before dividing.
-`B_simple` assumes a well-conditioned loss surface, so treat it as an order-of-magnitude guide to where
-the critical batch is and how it moves during training, not a value to set to the nearest token.
+- **Free under data parallelism:** each rank's local gradient before the all-reduce is the small batch;
+  the reduced gradient is the big one.
+- **Smooth before dividing:** single estimates are noisy, so average numerator and denominator separately
+  over many steps (an exponential moving average).
+- **Treat it as a guide:** `B_simple` assumes a well-conditioned loss surface, so use it as an
+  order-of-magnitude view of where the critical batch is and how it moves, not a value to set to the
+  nearest token.
 
 ### Learning rate must move with batch size
-A bigger batch justifies a bigger step, because the step is computed from a more trustworthy gradient.
-For SGD the *linear scaling rule* (multiply the learning rate by `k` when multiplying the batch by `k`)
-works well in the perfect-scaling regime, provided the run has warmup; this is the recipe that trained
-ImageNet in an hour at a batch of 8,192. For Adam-family optimizers the picture is less clean: square-root
-scaling is a common starting point with some theoretical support, but in practice the peak learning rate
-is re-tuned when the batch changes by more than a small factor. Either way, changing the batch without
-touching the learning rate compares two different optimizers, not two batch sizes.
+A bigger batch justifies a bigger step, because the step comes from a more trustworthy gradient.
+- **SGD: linear scaling rule.** Multiply the learning rate by `k` when multiplying the batch by `k`. It
+  works in the perfect-scaling regime with warmup; this recipe trained ImageNet in an hour at a batch of
+  8,192.
+- **Adam-family: less clean.** Square-root scaling is a common start with some theoretical support, but
+  the peak rate is re-tuned when the batch changes by more than a small factor.
+- **Either way,** changing the batch without touching the learning rate compares two different
+  optimizers, not two batch sizes.
 
 ### Generalization
-Early work observed that very large batches reached sharper minima and generalized worse. Later, larger
-studies showed most of that gap closes when the learning rate, warmup and number of steps are re-tuned
-for the larger batch; what remains is the hard ceiling from the noise scale, not a mysterious property of
-big batches. The practical reading: a large batch is not harmful by itself, but copying a small-batch
-recipe to a large batch is.
+- **Early finding:** very large batches reached sharper minima and generalized worse.
+- **Later, larger studies:** most of that gap closes when learning rate, warmup and step count are
+  re-tuned for the larger batch. What remains is the noise-scale ceiling, not a mysterious property of big
+  batches.
+- **Practical reading:** a large batch is not harmful by itself; copying a small-batch recipe to a large
+  batch is.
 
 ### Memory and the effective batch
 Activation memory scales linearly with the batch (and roughly linearly with sequence length under fused
-attention kernels, quadratically without them), while weight, gradient and optimizer memory do not. On a given GPU the largest *micro-batch* that fits is a hardware fact; the
-*effective batch* that the optimizer sees is
+attention kernels, quadratically without them); weight, gradient and optimizer memory do not. The largest
+*micro-batch* that fits is a hardware fact. The *effective batch* the optimizer sees is
 
 ```
 effective_batch = micro_batch × gradient_accumulation_steps × data_parallel_world_size
 ```
 
-and for LLMs it is usually quoted in tokens: `effective_batch × sequence_length`. Gradient accumulation
-and more GPUs change the effective batch without changing per-GPU memory; gradient checkpointing and
-mixed precision change how large the micro-batch can be. These are different knobs for different
-constraints, and conflating them ("I added GPUs so I can raise the learning rate" is right; "I added
-accumulation so training is faster" is wrong) is a common source of confusion.
+and for LLMs it is usually quoted in tokens: `effective_batch × sequence_length`.
+
+| Knob | Changes | Does not change |
+|---|---|---|
+| Gradient accumulation | effective batch | per-GPU memory, wall-clock per token |
+| More data-parallel GPUs | effective batch, throughput | per-GPU memory |
+| Gradient checkpointing, mixed precision | how large the micro-batch can be | the effective batch by itself |
+
+Conflating them is a common confusion: "I added GPUs so I can raise the learning rate" is right; "I added
+accumulation so training is faster" is wrong.
 
 ### Inference is a different problem
-Batching requests at serving time shares the name but not the trade-off: it is about amortizing weight
-reads across concurrent users, with latency rather than gradient noise as the cost. That lives in the
-serving module under continuous batching.
+Serving-time batching shares the name, not the trade-off: it amortizes weight reads across concurrent
+users, with latency rather than gradient noise as the cost. That lives in the serving module under
+continuous batching.
 
-## Example
-A planning function that turns a hardware constraint and a token budget into the three numbers that
-actually get written into a config, with the learning-rate adjustment made explicit. The numbers are
-illustrative; the structure is what matters.
+## Diagram
+Planning goes top-down: the target batch comes from the noise scale, memory fixes the micro-batch,
+accumulation and GPUs fill the gap, and the learning rate follows the effective batch.
+
+```mermaid
+flowchart TD
+    A["Estimate noise scale: prior runs or two-batch"] --> B["Target effective batch in tokens"]
+    M["GPU memory"] --> C["Largest micro-batch that fits"]
+    B --> D["accum = target over micro times GPUs"]
+    C --> D
+    D --> E["Effective batch the optimizer sees"]
+    E --> F["Scale LR: linear for SGD, sqrt for Adam"]
+    F --> G["Steps = token budget over batch"]
+    G --> H["Compare runs on loss vs tokens"]
+    H -.->|"noise scale grows"| B
+```
+
+## Examples
+### Turning a hardware constraint into config numbers
+A planning function that turns a hardware constraint and a token budget into the three numbers written
+into a config, with the learning-rate adjustment explicit. The numbers are illustrative; the structure is
+what matters.
 
 ```python
 def plan(tokens_budget, seq_len, target_batch_tokens,
@@ -155,47 +174,103 @@ print(plan(tokens_budget=10_000_000_000, seq_len=4096, target_batch_tokens=1_000
 #   gives ~4.0e-4 (linear scaling would give 5.25e-4; either is a starting point to re-tune).
 ```
 
-The same function with `n_gpus=64` returns `accum=1` and `eff_tokens=1,048,576`: the target batch is now
-reached without accumulation, the step count drops to ~9.5k, and the learning rate moves only slightly
-(to ~4.2e-4) because the effective batch moved only slightly. That is the point: adding GPUs changed
-throughput, not the optimization problem, because the plan held the effective batch roughly fixed.
+- **Same function with `n_gpus=64`:** returns `accum=1` and `eff_tokens=1,048,576`. The target is reached
+  without accumulation, steps drop to ~9.5k, and the learning rate moves only slightly (to ~4.2e-4)
+  because the effective batch moved only slightly.
+- **The point:** adding GPUs changed throughput, not the optimization problem, because the plan held the
+  effective batch roughly fixed.
+
+### Measuring the noise scale and reading the cost curve
+Pure Python. The first part applies the two-batch estimator to illustrative squared norms from 8 ranks ×
+32 sequences; the second evaluates the `S` and `E` formulas around that noise scale.
+
+```python
+def noise_scale(g2_small, g2_big, b_small, b_big):
+    """Two-batch estimator: squared grad norms measured at two batch sizes."""
+    g2 = (b_big * g2_big - b_small * g2_small) / (b_big - b_small)    # |G|^2
+    tr_sigma = (g2_small - g2_big) / (1 / b_small - 1 / b_big)         # tr(Sigma)
+    return tr_sigma / g2                                                # B_simple
+
+# Data parallel: 8 ranks x 32 sequences. Local grad = small batch, all-reduced grad = big batch.
+# Illustrative measured values (averaged over many steps, as the text says):
+print(round(noise_scale(g2_small=32.25, g2_big=4.90625, b_small=32, b_big=256)))   # -> 1000
+
+def cost(B, B_noise, S_min=1.0, E_min=1.0):
+    return S_min * (1 + B_noise / B), E_min * (1 + B / B_noise)
+
+for B in (250, 500, 1000, 2000, 4000):
+    s, e = cost(B, B_noise=1000)
+    print(f"B={B:5d}  steps x{s:.2f}  examples x{e:.2f}")
+```
+
+| Batch (noise scale 1,000) | Steps vs minimum | Examples vs minimum |
+|---|---|---|
+| 250 | 5.00× | 1.25× |
+| 500 | 3.00× | 1.50× |
+| 1,000 | 2.00× | 2.00× |
+| 2,000 | 1.50× | 3.00× |
+| 4,000 | 1.25× | 5.00× |
+
+Going from 1,000 to 4,000 cuts steps only from 2× to 1.25× the minimum while examples rise from 2× to 5×:
+past the noise scale, hardware buys little time and costs a lot of data.
+
+## Production patterns
+- **Plot every run against tokens.** Log tokens per optimizer step (`effective_batch × sequence_length`)
+  and use tokens as the x-axis for loss curves, so runs with different batches are comparable. Flattening
+  loss-per-token after a batch increase is the sign you passed the noise scale.
+- **Measure the noise scale on the live run.** Under data parallelism, log each rank's local gradient norm
+  and the all-reduced norm, keep EMAs of the two estimator terms, and track `B_simple` over training. Use
+  it to decide whether a larger batch or more GPUs would actually shorten the run.
+- **Scale GPUs at fixed effective batch.** When adding data-parallel ranks, divide accumulation by the
+  same factor so the effective batch, learning rate and schedule stay put. Verify that loss-vs-tokens
+  curves overlay the old run.
+- **Re-tune the learning rate on every batch change.** Start from linear scaling for SGD or square-root
+  for Adam, lengthen warmup, then sweep the peak briefly. Monitor early grad-norm spikes and loss per
+  token against the reference run.
+- **Ramp the batch in long pre-training.** Because the noise scale grows as loss falls, start smaller and
+  ramp the batch up over the early part of the run (GPT-3 did this), with the schedule defined in tokens
+  rather than steps.
+- **Guarantee enough steps when fine-tuning.** Choose the effective batch so the run has at least a few
+  hundred optimizer steps; check `num_examples × epochs ÷ effective_batch` before launch.
 
 ## Trade-offs
-- Larger batches raise GPU utilization and cut wall-clock per token, but past the noise scale they stop
-  reducing the step count, so each extra example is paid for in data and compute without a loss benefit.
-- Small batches give more optimizer steps per token and a regularizing noise, which helps on small
-  datasets, but they under-use accelerators and make the step bandwidth-bound rather than compute-bound.
-- Scaling the learning rate with the batch keeps the optimizer comparable across hardware sizes, yet the
-  exact rule (linear, square-root, re-tune) depends on the optimizer and breaks down near the noise scale.
-- A batch-size ramp matches the growing noise scale during training and saves data early, at the cost of
-  a schedule whose step count and learning rate must be tied to tokens rather than steps.
-- Reaching a large effective batch through accumulation costs nothing in memory but delivers no speed-up;
-  reaching it through more GPUs costs hardware but actually shortens the run.
+- **Utilization vs data efficiency.** Larger batches raise GPU utilization and cut wall-clock per token,
+  but past the noise scale they stop reducing step count, so each extra example costs data and compute
+  with no loss benefit.
+- **Small batches: steps and regularizing noise vs idle hardware.** More optimizer steps per token help on
+  small datasets, but small batches under-use accelerators and make the step bandwidth-bound rather than
+  compute-bound.
+- **LR scaling vs exactness.** Scaling the learning rate with batch keeps the optimizer comparable across
+  hardware sizes, but the exact rule (linear, square-root, re-tune) depends on the optimizer and breaks
+  down near the noise scale.
+- **Batch ramp vs schedule complexity.** A ramp matches the growing noise scale and saves data early, at
+  the cost of a schedule whose step count and learning rate must be tied to tokens rather than steps.
+- **Accumulation vs more GPUs.** A large effective batch through accumulation costs nothing in memory but
+  delivers no speed-up; through more GPUs it costs hardware but actually shortens the run.
 
 ## Pitfalls
-- Doubling the batch (or the GPU count) and leaving the learning rate alone; the run trains noticeably
-  slower per token and the team blames the larger batch rather than the untouched learning rate.
-- Quoting batch size in sequences when sequence length varies between experiments; two runs with "batch
-  64" at 2k and 8k context see 4× different numbers of tokens per gradient.
-- Sizing a schedule in steps, then changing the batch, so warmup and decay now cover a different fraction
-  of the data than intended.
-- Raising the batch to push GPU utilization and watching loss-per-token flatten; the symptom of exceeding
-  the noise scale is more tokens for the same loss, visible when runs are plotted against tokens rather
-  than steps.
-- Assuming batch size does not matter for fine-tuning because the dataset is small; with a few thousand
-  examples, a batch of 128 may give only a few dozen optimizer steps per epoch, too few for the optimizer
-  to do anything.
+- **Doubling batch or GPUs, not the learning rate.** The run trains noticeably slower per token and the
+  team blames the larger batch instead of the untouched learning rate.
+- **Quoting batch in sequences across context lengths.** Two runs with "batch 64" at 2k and 8k context see
+  4× different numbers of tokens per gradient.
+- **Sizing the schedule in steps, then changing the batch.** Warmup and decay now cover a different
+  fraction of the data than intended.
+- **Pushing utilization past the noise scale.** Loss-per-token flattens: more tokens for the same loss,
+  visible only when runs are plotted against tokens rather than steps.
+- **Assuming batch is irrelevant for small fine-tunes.** With a few thousand examples, a batch of 128 may
+  give only a few dozen optimizer steps per epoch, too few for the optimizer to do anything.
 
 ## When to use
-Treat batch size as the first number fixed in a training plan, because the learning rate, warmup and step
-count all follow from it. For fine-tuning, start small enough to get at least a few hundred optimizer
-steps over the run, then raise the micro-batch until the GPU is busy and use accumulation only to reach a
-target effective batch. For pre-training or large-scale continued training, pick the effective batch from
-the model's expected noise scale (prior runs of similar size are the best guide, and the two-batch
-estimator measures it on the live run), consider ramping it,
-and scale the learning rate when the batch changes. Always compare runs on loss versus tokens, not loss
-versus steps. In interviews, the depth expected is the noise-scale argument, the coupling with learning
-rate, and the distinction between micro-batch, effective batch and tokens per step.
+- **Fix batch size first** in a training plan, because learning rate, warmup and step count all follow
+  from it.
+- **Fine-tuning:** start small enough for at least a few hundred optimizer steps, raise the micro-batch
+  until the GPU is busy, and use accumulation only to reach a target effective batch.
+- **Pre-training or large-scale continued training:** pick the effective batch from the expected noise
+  scale (prior runs of similar size are the best guide, and the two-batch estimator measures it on the
+  live run), consider ramping it, and scale the learning rate when the batch changes.
+- **Measure:** always compare runs on loss versus tokens, not loss versus steps.
+- **Interviews:** expect the noise-scale argument, the coupling with learning rate, and the distinction
+  between micro-batch, effective batch and tokens per step.
 
 ## Role lens
 - **Engineer:** Writes the micro-batch, accumulation and world-size arithmetic into the config, logs tokens
@@ -220,6 +295,42 @@ take it from prior runs of this model size, scale the learning rate (square-root
 starting point, then re-tune), lengthen warmup, and compare both configurations on loss versus tokens.
 If the data budget is fixed, exceeding the noise scale also means fewer effective passes over unique
 data, which is a quality cost, not just a compute one.
+
+## Interview questions
+### What is the critical batch size, and why does it exist?
+- **Definition:** roughly the gradient noise scale `tr(Σ) / |G|²`, the batch at which the mini-batch
+  gradient's noise is comparable to its signal.
+- **Why it caps scaling:** below it, doubling the batch nearly halves the steps; above it, steps barely
+  fall and tokens consumed double.
+- **It moves:** it grows as loss falls, so the useful batch is larger late in training.
+
+### Your team doubled the GPUs and the batch, and loss per token got worse. Debug it.
+- **First suspect the learning rate:** a larger batch with an unchanged rate takes equally cautious but
+  half as many steps, so progress per token slows.
+- **Second, the noise scale:** if the old batch was already near it, the bigger batch mostly burns data.
+- **Check the schedule:** if warmup and decay were sized in steps, they now cover different fractions of
+  the data. Re-tune and compare on loss versus tokens.
+
+### When would you choose a small batch even though the GPU could fit more?
+- **Small fine-tuning datasets:** a few thousand examples at batch 128 give only a few dozen steps per
+  epoch; a smaller batch gives the optimizer enough steps and some regularizing noise.
+- **Early in pre-training:** the noise scale is small, which is why some recipes ramp the batch up.
+- **Cost:** under-used accelerators, so raise the micro-batch for utilization only up to the target.
+
+### How would you measure the noise scale on a running data-parallel job?
+- **Two batch sizes for free:** each rank's local gradient is the small batch, the all-reduced gradient
+  the big one.
+- **Solve two equations:** `E|G_B|² = |G|² + tr(Σ)/B` at both sizes gives `|G|²` and `tr(Σ)`, hence
+  `B_simple`.
+- **Smooth it:** EMA the numerator and denominator separately over many steps, and treat the result as an
+  order-of-magnitude guide.
+
+### Does a large batch hurt generalization?
+- **Early work said yes:** large batches reached sharper minima and generalized worse.
+- **Later, larger studies:** most of the gap closes once learning rate, warmup and step count are re-tuned
+  for the larger batch.
+- **What remains** is the noise-scale ceiling on useful batch size, so the risk is copying a small-batch
+  recipe, not the large batch itself.
 
 ## Quiz
 ### Q: What determines the point beyond which increasing batch size stops reducing the number of training steps needed?

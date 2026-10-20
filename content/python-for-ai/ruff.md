@@ -5,7 +5,7 @@ name: ruff
 kind: tool
 difficulty: intro
 est_minutes: 12
-status: reviewed
+status: crisp
 related:
   - python-for-ai/mypy
   - python-for-ai/pytest
@@ -19,76 +19,116 @@ sources:
 ---
 
 ## TL;DR
-Ruff is a Python linter and formatter written in Rust that replaces a stack of separate tools (flake8 and
-its plugins, isort, pyupgrade, most of bandit's checks and a subset of pylint's, and Black for formatting) with one
-fast binary and one config section. It exists because a slow, fragmented lint toolchain gets skipped;
-fast enough to run on every save makes it a habit. It checks style and likely bugs, not types.
+Ruff is a Rust-written Python linter and formatter that replaces flake8 and its plugins, isort,
+pyupgrade, most of bandit, part of pylint, and Black with one fast binary and one config. It checks style
+and likely bugs, not types.
 
 ## Why it exists
-A typical Python project used to run five or six tools on every commit: flake8 for errors and style,
-several flake8 plugins (bugbear for likely bugs, comprehensions, simplify), isort for import order,
-pyupgrade for modern syntax, Black for formatting, sometimes pylint and bandit. Each had its own config
-file or section, its own version pins, its own ideas about line length, and its own parse of every file.
-On a large repository the combination took long enough that people disabled the pre-commit hook and let
-CI find problems, which means finding them minutes later instead of while the code is still on screen.
-
-This matters more than it sounds in AI code, because some lint rules catch real defects, not style.
-A blocking `time.sleep` or `requests.get` inside an `async def` stalls every concurrent request in the
-server. An `asyncio.create_task` whose result is not stored can be garbage-collected mid-flight. A mutable
-default argument shares state across calls. SQL built with f-strings is an injection risk when a tenant
-ID comes from a request. A blind `except Exception` swallows unexpected errors and hides
-failures. All of these are cheap to detect statically and expensive to debug in production.
-
-The naive alternative, "code review will catch it", does not scale: reviewers miss mechanical issues,
-and review time spent on import order is time not spent on design.
+- **The old toolchain was five or six tools.** flake8 for errors and style, several flake8 plugins
+  (bugbear for likely bugs, comprehensions, simplify), isort for import order, pyupgrade for modern
+  syntax, Black for formatting, sometimes pylint and bandit.
+- **Each had its own config, pins and parse.** Each had its own config file or section, its own version
+  pins, its own ideas about line length, and its own parse of every file.
+- **Slow, fragmented linting gets skipped.** On a large repository people disabled the pre-commit hook and
+  let CI find problems, minutes later instead of while the code is still on screen. Fast enough to run on
+  every save makes it a habit.
+- **In AI code some lint rules catch real defects, not style:**
+  - a blocking `time.sleep` or `requests.get` inside an `async def` stalls every concurrent request;
+  - an `asyncio.create_task` whose result is not stored can be garbage-collected mid-flight;
+  - a mutable default argument shares state across calls;
+  - SQL built with f-strings is an injection risk when a tenant ID comes from a request;
+  - a blind `except Exception` swallows unexpected errors and hides failures.
+  All are cheap to detect statically and expensive to debug in production.
+- **"Code review will catch it" does not scale:** reviewers miss mechanical issues, and review time spent
+  on import order is time not spent on design.
 
 ## How it works
 ### One parse, many rules
-Ruff parses each file once into an AST and token stream and runs every enabled rule over that single
-representation, in parallel across files, with a per-file cache so files unchanged since the last run
-(under the same settings) are skipped. Native Rust code and that architecture together explain the
-speed: the old toolchain ran each Python tool as its own process and re-parsed each file once per tool. The maintainers publish benchmarks showing large speedups
-over flake8; treat any specific multiple as illustrative and measure on your own repository.
+1. **Parse once:** each file becomes an AST and token stream.
+2. **Run every enabled rule** over that single representation.
+3. **In parallel across files.**
+4. **With a per-file cache**, so files unchanged since the last run (under the same settings) are skipped.
 
-The same design sets the limit of what it can see. Rules work on one file at a time, with a semantic
-model of that file's scopes, bindings and imports (enough to know that `requests.get` refers to the
-`requests` package, or that a name is unused), but with no cross-module type inference. That is why
-Ruff recognises a blocking call by its qualified name and cannot follow it through your own wrapper
-function in another module, and why the pylint checks that depend on whole-program inference are not
-among the ones it re-implements.
+- **Why it is fast:** native Rust code plus that architecture; the old toolchain ran each Python tool as
+  its own process and re-parsed each file once per tool.
+- **Benchmarks:** the maintainers publish benchmarks showing large speedups over flake8; treat any
+  specific multiple as illustrative and measure on your own repository.
+
+### What it can and cannot see
+- **One file at a time, with a semantic model** of that file's scopes, bindings and imports: enough to
+  know that `requests.get` refers to the `requests` package, or that a name is unused.
+- **No cross-module type inference.** That is why Ruff recognises a blocking call by its qualified name
+  but cannot follow it through your own wrapper function in another module.
+- **Hence no whole-program pylint checks:** those that depend on whole-program inference are not among
+  the ones it re-implements.
 
 ### Rules are namespaced by origin
-Each rule has a code whose prefix names the tool it re-implements: `F` (pyflakes: unused imports,
-undefined names), `E`/`W` (pycodestyle), `I` (isort), `B` (bugbear), `UP` (pyupgrade), `S` (bandit
-security checks), `ASYNC` (flake8-async), `PT` (pytest style), `SIM`, `C4`, plus `RUF` for Ruff's own
-rules. You enable by prefix (`select = ["B"]`) or single code; `extend-select` adds to the inherited
-selection instead of replacing it. Newly added rules start in **preview** and run only with
-`preview = true`, so upgrading Ruff does not silently add findings to your CI; rules graduate to
-stable in later releases. The default set is deliberately small,
-covering pyflakes and a subset of pycodestyle errors, because a linter that floods a new project with
-warnings gets switched off. `ruff rule B006` prints the rationale for any rule.
+Each rule code's prefix names the tool it re-implements.
+
+| Prefix | Origin | Catches |
+|---|---|---|
+| `F` | pyflakes | unused imports, undefined names |
+| `E`/`W` | pycodestyle | style errors and warnings |
+| `I` | isort | import order |
+| `B` | bugbear | likely bugs |
+| `UP` | pyupgrade | outdated syntax |
+| `S` | bandit | security checks |
+| `ASYNC` | flake8-async | blocking calls in coroutines |
+| `PT` | pytest style | test conventions |
+| `SIM`, `C4` | simplify, comprehensions | simpler equivalent code |
+| `RUF` | Ruff's own rules | e.g. dangling tasks, stale `noqa` |
+
+- **Enable by prefix** (`select = ["B"]`) or single code; `extend-select` adds to the inherited selection
+  instead of replacing it.
+- **Preview gate.** Newly added rules start in **preview** and run only with `preview = true`, so
+  upgrading Ruff does not silently add findings to your CI; rules graduate to stable in later releases.
+- **Small default set**, covering pyflakes and a subset of pycodestyle errors, because a linter that
+  floods a new project with warnings gets switched off.
+- **`ruff rule B006`** prints the rationale for any rule.
 
 ### Fixes
-Many rules have autofixes, split into **safe** fixes (behaviour-preserving, applied by `ruff check
---fix`) and **unsafe** ones (may change behaviour, such as removing an import with side effects),
-applied only with `--unsafe-fixes`. The split exists because a tool that silently changes semantics
-cannot be trusted in a pre-commit hook.
+- **Safe fixes** are behaviour-preserving and applied by `ruff check --fix`.
+- **Unsafe fixes** may change behaviour (such as removing an import with side effects) and are applied
+  only with `--unsafe-fixes`.
+- **Why the split:** a tool that silently changes semantics cannot be trusted in a pre-commit hook.
 
 ### Formatter
-`ruff format` is designed as a near drop-in replacement for Black's style, so teams can switch without
-reformatting debates. Linting and formatting are separate commands; when the formatter owns layout,
-disable lint rules that fight it (line length is the usual one).
+- **`ruff format`** is designed as a near drop-in replacement for Black's style, so teams can switch
+  without reformatting debates.
+- **Separate commands:** linting and formatting are run separately; when the formatter owns layout,
+  disable lint rules that fight it (line length is the usual one).
 
 ### Configuration
-Everything lives in `pyproject.toml` (or `ruff.toml`): `[tool.ruff]` for shared settings such as
-`target-version` and `line-length`, `[tool.ruff.lint]` for `select`, `ignore` and `per-file-ignores`.
-Inline `# noqa: B006` suppresses one rule on one line, and `RUF100` flags `noqa` comments that no
-longer suppress anything, so suppressions do not outlive the code they excused. What Ruff does not do is type checking: it does not know that a value may be
-`None`, which is mypy's or pyright's job, so the two run side by side.
+- **One place:** `pyproject.toml` (or `ruff.toml`). `[tool.ruff]` holds shared settings such as
+  `target-version` and `line-length`; `[tool.ruff.lint]` holds `select`, `ignore` and `per-file-ignores`.
+- **Suppressions:** inline `# noqa: B006` suppresses one rule on one line, and `RUF100` flags `noqa`
+  comments that no longer suppress anything, so suppressions do not outlive the code they excused.
+- **Not a type checker:** Ruff does not know that a value may be `None`, which is mypy's or pyright's job,
+  so the two run side by side.
 
-## Example
-A configuration for an async AI service, then a snippet with the findings Ruff reports under it. The
-comments name the rule codes; each is a real defect class, not cosmetics.
+## Diagram
+Follow one `ruff check` run: a single parse per file feeds every enabled rule, and each finding ends in a
+safe fix, an opt-in unsafe fix, or a human decision.
+
+```mermaid
+flowchart TD
+    F["Python file"] --> CH{"Unchanged since last run, same settings?"}
+    CH -->|"yes"| SKIP["Skip, reuse cached result"]
+    CH -->|"no"| P["One parse: AST plus tokens"]
+    P --> SM["Per-file semantic model: scopes, bindings, imports"]
+    CFG["pyproject.toml: select, extend-select, ignore, preview"] --> R
+    SM --> R["Run every enabled rule, files in parallel"]
+    R --> FD["Findings with codes, e.g. B006, ASYNC251, S608"]
+    FD -->|"safe fix"| FX["Applied by ruff check --fix"]
+    FD -->|"unsafe fix"| UF["Only with --unsafe-fixes, reviewed"]
+    FD -->|"design change needed"| H["Human: async client, parameterised query, None default"]
+    FX --> FMT["ruff format lays out the result"]
+```
+
+## Examples
+### Config and snippet for an async AI service
+A configuration, then a snippet with the findings Ruff reports under it. The comments name the rule
+codes; each is a real defect class, not cosmetics.
 
 ```toml
 [tool.ruff]
@@ -128,44 +168,95 @@ def docs_for(cur, tenant: str):
         raise RuntimeError("query failed")   # B904 re-raise without `from e`
 ```
 
-`ruff check --fix` resolves the import, `List` and some other findings safely; the async, SQL and
-default-argument findings need a human, because the fix is a design change (an async client, a
-parameterised query, a `None` default).
+- **What `--fix` handles:** `ruff check --fix` resolves the import, `List` and some other findings safely.
+- **What needs a human:** the async, SQL and default-argument findings, because the fix is a design
+  change (an async client, a parameterised query, a `None` default).
 
+### Worked run: what Ruff actually reported
+Running `ruff check svc.py` with the config above (Ruff 0.17.1) gives 12 findings. `ruff check --fix`
+then fixes 6 and leaves 6, and reports 1 more fix available only with `--unsafe-fixes`:
+
+| Group | Codes | Who fixes it |
+|---|---|---|
+| Imports and syntax | `E401`, `I001`, `F401`, `UP006` | `--fix`, safely |
+| Unused binding | `F841` | `--fix` drops `as e` |
+| Deprecated import | `UP035` | gone after `--fix`, because the now-unused `List` import is removed |
+| Mutable default | `B006` | unsafe fix offered (a `None` default plus `if seen is None`); review it |
+| Likely bugs | `B904`, `RUF006` | human: `raise ... from e`, keep a task reference |
+| Event-loop blockers | `ASYNC251`, `ASYNC210` | human: `await asyncio.sleep`, an async HTTP client |
+| Security | `S608` | human: parameterised query |
+
+Half of the findings are design decisions, which is why lint findings belong in review, not in a silent
+autofix job.
+
+### Hook and CI order
 In a pre-commit hook, run `ruff check --fix` before `ruff format`, because a lint fix (removing an
 import, rewriting a comprehension) can leave code the formatter would lay out differently. In CI, run
-`ruff check` and `ruff format --check`; neither writes files, so CI fails on findings instead of
-quietly fixing them in a throwaway checkout.
+`ruff check` and `ruff format --check`; neither writes files, so CI fails on findings instead of quietly
+fixing them in a throwaway checkout.
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.1               # same version as CI and the editor
+    hooks:
+      - id: ruff-check
+        args: [--fix]          # lint fixes first
+      - id: ruff-format        # then layout
+```
+
+## Production patterns
+- **One pinned version everywhere.** Pin Ruff in the dev dependencies, use the same `rev` in the
+  pre-commit hook, and run that version in CI, so findings and fixes do not flip between machines.
+  Monitor CI-only findings, which signal version drift.
+- **Shared baseline rule selection.** Keep one `[tool.ruff.lint]` block (for example `E`, `F`, `I`, `B`,
+  `UP`, `ASYNC`, `S`, `RUF`) across services, and use `extend-select` for per-repo additions so the
+  baseline is not silently replaced. Review it when Ruff graduates preview rules to stable.
+- **Baseline a legacy repo, then burn it down.** Enable the families you want, run
+  `ruff check --add-noqa` once to suppress existing findings with per-code comments, and keep `RUF100` on
+  so comments are removed as code is fixed. Track the count of `noqa` comments over time.
+- **CI annotations, no writes.** Run `ruff check --output-format github` and `ruff format --check` in the
+  pipeline, so findings appear inline on the pull request and nothing is fixed in a throwaway checkout.
+- **Triage with statistics.** Before enabling a new family, run `ruff check --select ASYNC --statistics`
+  to see counts per rule, fix the defect classes first (`ASYNC`, `B006`, `RUF006`, `S608`), then enable
+  the family as an error.
 
 ## Trade-offs
-- One fast tool replaces a fragmented chain and runs on every save, but you depend on Ruff's
-  re-implementations; a niche flake8 plugin or pylint check it lacks still needs the original tool.
-- Selecting broad rule families catches more real bugs, but floods legacy code with findings; start
-  with `F`, `B`, `ASYNC`, `S` and grow the selection once the backlog is cleared.
-- Autofix in pre-commit removes mechanical review churn, but unsafe fixes can change behaviour; keep
-  unsafe fixes manual and reviewed, which flips only for rules you have audited.
-- Ruff's formatter matches Black closely enough to switch in place, but small output differences mean
-  one large reformatting commit; do it once, then add that commit to the blame-ignore list.
+- **One fast tool vs re-implementations.** It replaces a fragmented chain and runs on every save, but you
+  depend on Ruff's re-implementations; a niche flake8 plugin or pylint check it lacks still needs the
+  original tool.
+- **Broad rule families vs legacy noise.** Selecting broad families catches more real bugs, but floods
+  legacy code with findings; start with `F`, `B`, `ASYNC`, `S` and grow the selection once the backlog is
+  cleared.
+- **Autofix in pre-commit vs behaviour changes.** Autofix removes mechanical review churn, but unsafe
+  fixes can change behaviour; keep unsafe fixes manual and reviewed, which flips only for rules you have
+  audited.
+- **Formatter switch vs one big diff.** Ruff's formatter matches Black closely enough to switch in place,
+  but small output differences mean one large reformatting commit; do it once, then add that commit to
+  the blame-ignore list.
 
 ## Pitfalls
-- Running only the default rules and assuming the code is checked; the symptom is blocking calls in
-  async handlers and mutable defaults shipping, because `ASYNC` and `B` were never enabled.
-- Blanket `# noqa` without a code; the symptom is a line that silently suppresses every future
-  finding, including the real bug someone adds to it later.
-- Different Ruff versions locally, in pre-commit and in CI; the symptom is findings that appear only in
-  CI or fixes that flip back and forth between machines, so pin one version everywhere.
-- Treating a clean Ruff run as type safety; the symptom is `None` attribute errors in production in code
+- **Running only the default rules and assuming the code is checked.** Symptom: blocking calls in async
+  handlers and mutable defaults shipping, because `ASYNC` and `B` were never enabled.
+- **Blanket `# noqa` without a code.** Symptom: a line that silently suppresses every future finding,
+  including the real bug someone adds to it later.
+- **Different Ruff versions locally, in pre-commit and in CI.** Symptom: findings that appear only in CI or
+  fixes that flip back and forth between machines. Fix: pin one version everywhere.
+- **Treating a clean Ruff run as type safety.** Symptom: `None` attribute errors in production in code
   Ruff passed, because Ruff does not reason about types.
-- Enabling both a line-length lint rule and the formatter with different limits; the symptom is
-  findings the formatter can never fix, and contributors adding `noqa` comments to get past them.
+- **A line-length lint rule and the formatter with different limits.** Symptom: findings the formatter can
+  never fix, and contributors adding `noqa` comments to get past them.
 
 ## When to use
-Use Ruff in every Python project, from the first commit: it is cheap enough to run in the editor, in a
-pre-commit hook and in CI with the same pinned version. Choose rule families deliberately: `F` and `E`
-for correctness, `B` and `RUF` for likely bugs, `ASYNC` for any service built on asyncio, `S` for code
-that touches SQL, subprocesses or secrets, `UP` to keep syntax current with your minimum Python. Run it
-next to mypy, not instead of it, and next to dependency auditing, which it does not do. In interviews, a
-good answer explains which rules catch production defects in async AI services, not just that Ruff is fast.
+- **Use in every Python project, from the first commit:** it is cheap enough to run in the editor, in a
+  pre-commit hook and in CI with the same pinned version.
+- **Choose rule families deliberately:** `F` and `E` for correctness, `B` and `RUF` for likely bugs,
+  `ASYNC` for any service built on asyncio, `S` for code that touches SQL, subprocesses or secrets, `UP`
+  to keep syntax current with your minimum Python.
+- **Run it next to mypy, not instead of it**, and next to dependency auditing, which it does not do.
+- **Interviews:** a good answer explains which rules catch production defects in async AI services, not
+  just that Ruff is fast.
 
 ## Role lens
 - **Engineer:** Fixes findings as they appear in the editor and knows why `ASYNC`, `B006` and `RUF006`
@@ -184,6 +275,45 @@ include the flake8-async family, so enabling `ASYNC` would flag blocking sleeps 
 coroutines, and `RUF006` would flag fire-and-forget tasks. The limits: Ruff only recognises known
 blocking calls by name; a sync call hidden behind your own helper, or a CPU-heavy function such as
 tokenising a huge document, is invisible to it. You confirm with asyncio debug mode or profiling.
+
+## Interview questions
+### Why is Ruff so much faster than the flake8-based toolchain it replaces?
+- **One parse per file:** every enabled rule runs over a single AST and token stream, where the old chain
+  ran each Python tool as its own process and re-parsed every file once per tool.
+- **Parallel and cached:** files are linted in parallel, and unchanged files under the same settings are
+  skipped.
+- **Native Rust code** adds the rest; quote your own repository's measurement, not a published multiple.
+
+### Which Ruff rules would you enable for an async LLM service, and why those?
+- **`ASYNC`:** flags blocking sleeps and HTTP calls inside `async def`, which stall every concurrent
+  request; the default set does not include it.
+- **`B` and `RUF`:** mutable defaults (`B006`), lost exception context (`B904`) and fire-and-forget tasks
+  that can be garbage-collected (`RUF006`).
+- **`S`:** SQL built from strings (`S608`) and other bandit checks, plus the defaults `E` and `F`, `I` for
+  imports and `UP` for current syntax.
+
+### You turn on ASYNC and B in a legacy repo and get 900 findings. How do you roll it out?
+- **Triage first** with `ruff check --statistics`, and fix the defect classes that matter in production
+  (blocking calls, dangling tasks, SQL injection) before cosmetic ones.
+- **Baseline the rest** with `ruff check --add-noqa`, which writes per-code `noqa` comments, so CI can
+  gate new code immediately.
+- **Burn down** with `RUF100` enabled, so each suppression disappears once its line is fixed, and track the
+  `noqa` count.
+
+### What can Ruff not catch, and what do you pair it with?
+- **Types:** it does not know a value may be `None`, so `.strip()` on `str | None` needs mypy or pyright.
+- **Cross-module behaviour:** a blocking call hidden behind your own helper in another module, or a
+  CPU-heavy function in a coroutine, is invisible because rules see one file at a time.
+- **Dependencies:** vulnerable packages need a dependency auditor; runtime blocking is confirmed with asyncio
+  debug mode or profiling.
+
+### When would you not apply Ruff's fixes automatically?
+- **Unsafe fixes:** they may change behaviour, such as removing an import with side effects, so they stay
+  behind `--unsafe-fixes` and get reviewed.
+- **In CI:** run `ruff check` and `ruff format --check`, which never write files, so findings fail the build
+  instead of being fixed in a throwaway checkout.
+- **Design findings:** async, SQL and default-argument findings have no autofix because the fix is a design
+  change.
 
 ## Quiz
 ### Q: What mainly explains Ruff's speed advantage over the older multi-tool lint chain?

@@ -124,6 +124,24 @@ per topic, not by discovery in an incident.
 - **CQRS** separates the write model from read models built from events.
 - Both are separate commitments with their own costs; "event-driven" does not require either.
 
+## Diagram
+The producer's only dependency is the outbox and the broker; each consumer group reads the same
+partitioned log at its own offset, and failures divert to a dead-letter topic instead of blocking it.
+
+```mermaid
+flowchart TD
+    U["Upload request"] --> P["Upload service"]
+    P -->|"one DB transaction"| DB[("Document row + outbox row")]
+    DB --> R["Outbox relay"]
+    R -->|"key = document id"| T[("documents topic, partitioned")]
+    T --> E["Embedder group"]
+    T --> B["Billing meter group"]
+    T --> A["Audit log group"]
+    E -->|"DocumentIndexed"| T
+    E -.->|"after N failures"| DLQ[("Dead-letter topic")]
+    E --> V[("Vector store, deterministic ids")]
+```
+
 ## Examples
 ### Document ingestion as events
 `publish` and `consume` stand in for any broker client; what matters is the envelope, the partition key
@@ -297,6 +315,47 @@ notification consumer in particular must be idempotent, or every restart re-ping
 a dead-letter topic with alerts; lag per consumer group is the health metric. If the customer also needs
 "ask questions immediately after upload", the UI waits for `DocumentIndexed` via a push channel rather
 than making indexing synchronous.
+
+## Interview questions
+### What is the difference between an event and a command, and why does it matter for coupling?
+- **An event is a past-tense fact with no addressee.** `DocumentUploaded` is owned by the producer, and
+  any number of consumers may react or ignore it, so the producer never changes when a consumer is added.
+- **A command is an instruction to one handler.** `ChargeCard` expects an outcome and may be refused, so
+  the sender depends on that handler existing and behaving.
+- **Why it matters:** publishing a command dressed as an event keeps all the coupling of a remote call and
+  adds broker latency and at-least-once duplicates on top.
+
+### Users report that deleted documents reappear in search results. The pipeline is event-driven. How do you debug it?
+- **Suspect ordering first.** Ordering holds only within a partition; if `DocumentDeleted` and
+  `DocumentUploaded` were keyed differently, the indexer can apply the delete before the upload.
+- **Check the keys and offsets.** Confirm both event types use the document id as the partition key, and
+  look for redeliveries of an old upload after the delete (a rebalance or a retry topic can replay it).
+- **Fix:** key every event by aggregate id, and make the indexer reject events older than the version it
+  already holds, so a late upload cannot resurrect a deleted document.
+
+### When would you not use an event-driven design?
+- **When the caller needs the result now.** If the user must see the answer in the same interaction, a
+  synchronous call (or a stream) is simpler than waiting on a downstream completion event.
+- **When there is one consumer and a short workflow.** A broker adds schemas, lag, idempotency and DLQs
+  for no decoupling benefit.
+- **When you cannot trace across services yet.** Without propagated trace ids, an emergent multi-hop flow
+  becomes undebuggable; build tracing first or keep the flow orchestrated.
+
+### A topic has 12 partitions and one consumer group is falling behind. You add 20 more consumers. What happens?
+- **At most 12 consumers in the group do work.** Each partition is read by at most one consumer of a group
+  at a time, so the other 20 sit idle.
+- **Real levers:** speed up per-event processing, batch work inside the consumer, or plan a larger
+  partition count, accepting that adding partitions remaps keys and breaks per-key order across the change.
+- **Check for a poison message too.** One partition lagging while the rest are at zero means a retry loop,
+  not a capacity problem.
+
+### How do you get an event published reliably when the service also writes to its database?
+- **Name the dual-write problem.** Writing the row and publishing separately can lose the event or publish
+  one for a rolled-back transaction if the process crashes between them.
+- **Use a transactional outbox.** Insert the event into an outbox table in the same transaction as the
+  row, then relay it with a poller or change-data capture.
+- **Expect duplicates downstream.** The relay can publish twice after a crash, so consumers still
+  deduplicate on `event_id`; monitor the age of the oldest unpublished outbox row.
 
 ## Quiz
 ### Q: What most clearly distinguishes an event from a command in a message-driven system?

@@ -5,7 +5,7 @@ name: Mixture of experts (MoE)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - model-internals/transformer
   - model-internals/llm-architecture
@@ -22,114 +22,141 @@ sources:
 ---
 
 ## TL;DR
-A mixture-of-experts transformer replaces each layer's dense feed-forward block with several parallel
-"expert" FFNs and a small router that sends each token to one or two of them. Compute per token tracks the
-active parameters, while quality lands well above a dense model of that active size, though usually below
-a dense model of the full size. The price: every expert must sit in memory, routing must be kept balanced,
-and serving economics shift with batch size.
+An MoE transformer swaps each dense FFN for many expert FFNs plus a router that picks one or two per
+token. Compute tracks active parameters and quality beats a dense model of that size, but every expert
+must sit in memory.
 
 ## Why it exists
-Scaling laws say loss keeps falling as parameters grow, but in a dense transformer every parameter is
-touched by every token, so FLOPs per token grow in lockstep with parameter count. Doubling the model
-doubles training compute per token and doubles the weight bytes read on every decode step. The
-feed-forward block is the obvious place to attack: with the usual 4× expansion it holds roughly two thirds
-of the per-layer non-embedding parameters (8d² for the FFN versus 4d² for the Q, K, V and O projections),
-yet for any single token most of that capacity is irrelevant. The circuits that handle Python indentation
-are not needed while the model is writing French prose.
-
-The naive alternative, "make the dense FFN bigger and pay for it", fails on the inference side as much as
-the training side. Decode is memory-bandwidth bound (see the KV cache lesson), so a model that reads twice
-the weights per token runs about twice as slowly at small batch no matter how good the kernels are. A
-second naive option, training separate specialist models and choosing one per request, fails because the
-useful choice is per token and per layer rather than per request, and because separate models cannot share
-the attention layers and embeddings that carry most of the general language ability.
-
-Conditional computation resolves the tension: keep a large pool of parameters but let a learned router
-activate a small subset for each token. Shazeer et al. made this trainable at scale in 2017, Switch
-Transformer simplified routing to a single expert per token and showed better loss per training FLOP than
-dense models, and open models such as Mixtral and DeepSeek-V3 made it the default architecture for the
-largest open-weight systems.
+- **Dense models pay for every parameter on every token.** Scaling laws say loss keeps falling as
+  parameters grow, but FLOPs per token grow in lockstep. Doubling the model doubles training compute per
+  token and doubles the weight bytes read on every decode step.
+- **The FFN is the obvious target.** With the usual 4× expansion it holds roughly two thirds of the
+  per-layer non-embedding parameters (8d² for the FFN versus 4d² for the Q, K, V and O projections), yet
+  for any single token most of that capacity is irrelevant. The circuits for Python indentation are not
+  needed while the model writes French prose.
+- **"Make the dense FFN bigger" fails at inference too.** Decode is memory-bandwidth bound (see the KV
+  cache lesson), so a model that reads twice the weights per token runs about twice as slowly at small
+  batch, no matter how good the kernels are.
+- **"Separate specialist models, one per request" fails too.** The useful choice is per token and per
+  layer, not per request, and separate models cannot share the attention layers and embeddings that carry
+  most of the general language ability.
+- **Conditional computation resolves it.** Keep a large pool of parameters and let a learned router
+  activate a small subset per token. Shazeer et al. made this trainable at scale in 2017; Switch Transformer
+  routed to a single expert and showed better loss per training FLOP than dense models; Mixtral and
+  DeepSeek-V3 made it the default for the largest open-weight systems.
 
 ## How it works
 ### The layer
-Attention is unchanged and shared by all tokens. The FFN in a layer is replaced by N expert FFNs
-E₁ … E_N, each shaped like an ordinary FFN (or narrower), plus a router: one linear map W_r from the hidden
-state **x** to N logits. The router scores become a distribution `p = softmax(x·W_r)`, the top-k experts
-are selected, and the layer output is a weighted sum of their outputs:
+1. **Attention is unchanged** and shared by all tokens.
+2. **The FFN becomes N experts** E₁ … E_N, each shaped like an ordinary FFN (or narrower).
+3. **A router** is one linear map W_r from the hidden state **x** to N logits, turned into a distribution
+   `p = softmax(x·W_r)`.
+4. **The top-k experts are selected** and the output is a weighted sum of their outputs:
 
 ```
 y = Σ_{i ∈ topk(p)}  p_i · E_i(x)        (the k weights usually renormalised to sum to 1)
 ```
 
-k is 1 in Switch Transformer and 2 in Mixtral. DeepSeek-V3 routes each token to 8 of 256 small routed
-experts plus one always-on shared expert, which gives fine-grained specialisation while keeping a common
-pathway every token passes through.
+| Model | Routing |
+|---|---|
+| Switch Transformer | k is 1 |
+| Mixtral | k is 2, of 8 experts |
+| DeepSeek-V3 | 8 of 256 small routed experts plus one always-on shared expert: fine-grained specialisation with a common pathway every token passes through |
 
-Routing is per token and per layer: the same token can go to expert 3 in layer 10 and expert 7 in layer
-11, and adjacent tokens in a sentence usually take different paths. The router is trained end to end with
-the rest of the network. Because top-k selection is not differentiable, gradient reaches the router only
-through the p_i weights that multiply the chosen experts' outputs. That is why the output is scaled by p_i
-rather than simply summed: without the multiplication the router would receive no learning signal.
+### How routing behaves and learns
+- **Per token and per layer.** The same token can go to expert 3 in layer 10 and expert 7 in layer 11,
+  and adjacent tokens in a sentence usually take different paths.
+- **Trained end to end** with the rest of the network.
+- **Why outputs are scaled by p_i.** Top-k selection is not differentiable, so gradient reaches the router
+  only through the p_i weights that multiply the chosen experts' outputs. Simply summing the outputs would
+  give the router no learning signal.
 
 ### Active versus total parameters
-Count Mixtral 8x7B: 8 experts per layer, top-2 routing. The total is about 47B parameters, not 8 × 7 =
-56B, because attention, embeddings and norms are shared across experts. Per token only 2 of the 8 FFNs run,
-so roughly 13B parameters are active. Training FLOPs per token and the weight bytes read per decode step at
-batch 1 both track the 13B figure, while quality is far better than a dense 13B model's. It is not free
-capacity, though: at equal total parameters a dense model is generally stronger, because every one of its
-parameters sees every token. An MoE sits between its active and total sizes, and buying that position at
-active-size compute is the whole point of the architecture.
+Count Mixtral 8x7B: 8 experts per layer, top-2 routing.
+
+| Quantity | Value | Why |
+|---|---|---|
+| Total parameters | about 47B, not 8 × 7 = 56B | attention, embeddings and norms are shared across experts |
+| Active per token | roughly 13B | only 2 of the 8 FFNs run |
+| Tracks the active figure | training FLOPs per token, weight bytes read per decode step at batch 1 | only active experts are computed and read |
+| Quality | far better than a dense 13B | more capacity overall |
+
+- **It is not free capacity.** At equal total parameters a dense model is generally stronger, because
+  every one of its parameters sees every token.
+- **An MoE sits between its active and total sizes.** Buying that position at active-size compute is the
+  whole point of the architecture.
 
 ### Load balancing
-Left alone, routers collapse. A few experts that happen to be slightly better early in training receive
-more tokens, learn faster, and attract still more tokens, until most experts are dead weight. Two
-mechanisms counter this:
-
-- **An auxiliary load-balancing loss** (Switch style). For each expert, multiply the fraction of tokens
-  routed to it, f_i, by the mean router probability it received, P_i; sum over experts and scale by N. The
-  sum is minimised when both are uniform, and because P_i is differentiable it pushes the router toward
-  spreading tokens. DeepSeek-V3 instead adds a per-expert bias to the scores used for
-  top-k selection (not to the gating weights) and nudges it after each step, raising it for underloaded
-  experts and lowering it for overloaded ones; that avoids most of the quality penalty a strong auxiliary
-  loss costs, and only a very small sequence-level balance loss remains.
-- **Router stability.** Router logits can grow until the softmax saturates and training diverges; ST-MoE
-  (Zoph et al., 2022) added a small "router z-loss" that penalises large logits, and routers are commonly
-  computed in fp32 even when the rest of the model runs in bf16, because tiny rounding differences flip
-  top-k choices.
+Left alone, routers collapse: experts that are slightly better early receive more tokens, learn faster and
+attract still more, until most experts are dead weight. Three mechanisms counter this:
+- **Auxiliary load-balancing loss (Switch style).** For each expert multiply the fraction of tokens routed
+  to it, f_i, by the mean router probability it received, P_i; sum over experts and scale by N. The sum is
+  minimised when both are uniform, and because P_i is differentiable it pushes the router toward
+  spreading tokens.
+- **Bias-based balancing (DeepSeek-V3).** Add a per-expert bias to the scores used for top-k selection
+  (not to the gating weights) and nudge it after each step: up for underloaded experts, down for
+  overloaded ones. That avoids most of the quality penalty a strong auxiliary loss costs; only a very small
+  sequence-level balance loss remains.
+- **Router stability.** Router logits can grow until the softmax saturates and training diverges. ST-MoE
+  (Zoph et al., 2022) added a small "router z-loss" that penalises large logits. Routers are commonly
+  computed in fp32 even when the model runs in bf16, because tiny rounding differences flip top-k choices.
 - **Expert capacity.** Each expert accepts at most `capacity_factor × tokens / N` tokens per batch.
   Overflow tokens are dropped from that expert (they pass through the residual connection only) or sent to
-  their next choice. This exists because experts run as fixed-size batched matrix multiplications, often
-  on different devices, and one overloaded expert would stall all the others.
+  their next choice. This exists because experts run as fixed-size batched matrix multiplications, often on
+  different devices, and one overloaded expert would stall all the others.
 
 ### Routing variants
-The scheme above is *token choice*: each token picks its top-k experts, so balance must be encouraged.
-Shazeer et al.'s original gate added tunable noise to the router logits before top-k, so that experts
-which were rarely chosen still got sampled and could learn. *Expert choice* inverts the selection: each
-expert takes its top-scoring tokens from the batch up to a fixed capacity, which balances load by
-construction but lets a token receive zero or many experts, and makes a token's routing depend on the other
-tokens in the batch. That dependence is awkward for autoregressive decoding, where the batch is a handful of
-unrelated requests, which is one reason open decoder LLMs use token choice.
+| Variant | How | Consequence |
+|---|---|---|
+| Token choice | each token picks its top-k experts | balance must be encouraged; used by open decoder LLMs |
+| Noisy top-k (Shazeer et al.) | tunable noise added to router logits before top-k | rarely chosen experts still get sampled and can learn |
+| Expert choice | each expert takes its top-scoring tokens from the batch up to a fixed capacity | balanced by construction, but a token can get zero or many experts, and its routing depends on other tokens in the batch |
+
+- **Why decoders use token choice.** Batch dependence is awkward for autoregressive decoding, where the
+  batch is a handful of unrelated requests.
 
 ### Why memory and parallelism change
-Every expert's weights must be resident, because the next token might be routed anywhere. Mixtral 8x7B
-therefore needs about 47B × 2 bytes ≈ 94 GB in fp16 for weights alone, more than one 80 GB card, even though
-it computes like a 13B model. At larger scale the experts of each layer are spread across devices (expert
-parallelism), and an all-to-all exchange moves each token's hidden state to the devices hosting its chosen
-experts and back again. That communication, twice per MoE layer, is the dominant engineering cost of
-training and serving MoE models.
+- **Every expert must be resident,** because the next token might be routed anywhere. Mixtral 8x7B needs
+  about 47B × 2 bytes ≈ 94 GB in fp16 for weights alone, more than one 80 GB card, even though it
+  computes like a 13B model.
+- **Expert parallelism.** At larger scale each layer's experts are spread across devices, and an
+  all-to-all exchange moves each token's hidden state to the devices hosting its chosen experts and back.
+- **That communication, twice per MoE layer,** is the dominant engineering cost of training and serving
+  MoE models.
 
 ### The batch-size effect at inference
-At batch 1 a decode step reads only the k active experts per layer, so an MoE is far faster than a dense
-model of equal total size. As the batch grows, different tokens pick different experts until every expert
-is touched on every step; weight traffic then approaches that of the dense total and the advantage shifts
-from bandwidth to FLOPs. Capacity planning for an MoE must be done at the concurrency you will actually run.
+1. **At batch 1** a decode step reads only the k active experts per layer, so an MoE is far faster than a
+   dense model of equal total size.
+2. **As the batch grows,** different tokens pick different experts until every expert is touched on every
+   step.
+3. **Weight traffic then approaches the dense total,** and the advantage shifts from bandwidth to FLOPs.
+4. **So capacity planning** for an MoE must be done at the concurrency you will actually run.
 
-## Example
-A minimal top-k MoE layer with a Switch-style balancing loss. With `d_model=512, d_ff=2048` one FFN has
-2 × 512 × 2048 ≈ 2.1M parameters; eight experts hold ≈ 16.8M in total, but each token runs through two,
-so ≈ 4.2M are active per token. With f_i normalised to sum to 1, `aux` is about 1.0 when tokens and
-probability are spread evenly and rises toward N as routing concentrates on one expert, so printing it on
-random inputs (an untrained router is close to uniform) should give a value near 1.
+## Diagram
+Follow one token through an MoE layer: shared attention, then the router picks top-k experts whose
+outputs are mixed by their router probabilities.
+
+```mermaid
+flowchart TD
+    X["Token hidden state x"] --> AT["Shared attention"]
+    AT --> R["Router: softmax of x times W_r"]
+    R -->|"top-k, k = 1 or 2"| S["Selected experts"]
+    S --> E1["Expert i"]
+    S --> E2["Expert j"]
+    R -.->|"weights p_i, p_j"| M["Weighted sum"]
+    E1 --> M
+    E2 --> M
+    M --> Y["Residual add, next layer"]
+    R -.->|"balance loss or bias"| B["Even expert load"]
+```
+
+## Examples
+### A minimal top-k MoE layer with a Switch-style balancing loss
+- **Sizes.** With `d_model=512, d_ff=2048` one FFN has 2 × 512 × 2048 ≈ 2.1M parameters; eight experts
+  hold ≈ 16.8M in total, but each token runs through two, so ≈ 4.2M are active per token.
+- **Expected output.** With f_i normalised to sum to 1, `aux` is about 1.0 when tokens and probability
+  are spread evenly and rises toward N as routing concentrates on one expert. An untrained router is close
+  to uniform, so printing it on random inputs should give a value near 1.
 
 ```python
 import torch, torch.nn as nn, torch.nn.functional as F
@@ -166,49 +193,100 @@ print(y.shape, round(aux.item(), 3))
 print(sum(p.numel() for p in layer.experts.parameters()) / 1e6, "M expert params total")
 ```
 
-Production kernels do not loop over experts in Python; they sort tokens by expert and run grouped matrix
-multiplications, which is why engines such as vLLM and SGLang ship fused MoE kernels.
+- **Not production code.** Production kernels do not loop over experts in Python; they sort tokens by
+  expert and run grouped matrix multiplications, which is why engines such as vLLM and SGLang ship fused
+  MoE kernels.
+
+### Worked scenario: how the batch erodes the MoE bandwidth advantage
+How many of Mixtral's 8 experts per layer does one decode step touch? Assume each token picks 2 of 8
+uniformly and independently. Real routing is skewed and correlated, so treat this as an illustrative upper
+bound on spread, not a benchmark.
+
+```python
+from math import comb
+
+def experts_touched(batch, n=8, k=2):
+    p_miss = comb(n - 1, k) / comb(n, k)        # chance one token skips a given expert: 0.75
+    return n * (1 - p_miss ** batch)
+
+# Back out per-expert size from 47B total and 13B active: 6 experts' worth = 34B
+expert_b, shared_b = (47 - 13) / 6, 13 - 2 * (47 - 13) / 6   # ~5.7B per expert, ~1.7B shared
+for b in (1, 4, 8, 16):
+    t = experts_touched(b)
+    gb = (shared_b + t * expert_b) * 2           # fp16 weight bytes read per step
+    print(f"batch {b:>2}: {t:.1f} experts/layer, ~{gb:.0f} GB weights read")
+```
+
+| Concurrent sequences | Experts touched per layer | fp16 weights read per step |
+|---|---|---|
+| 1 | 2.0 | ~26 GB (the 13B active figure) |
+| 4 | 5.5 | ~65 GB |
+| 8 | 7.2 | ~85 GB |
+| 16 | 7.9 | ~93 GB (nearly the 94 GB dense total) |
+
+- **Reading.** By a batch of about 8 the step reads most of the model, so the comparison with a dense
+  model shifts from bandwidth to FLOPs, where the MoE still does only active-size arithmetic per token.
+
+## Production patterns
+- **Size memory from total parameters.** Before promising hardware, compute weights as total parameters ×
+  bytes per weight, add the KV cache at target concurrency, and keep headroom. For Mixtral in fp16 that
+  means two 80 GB GPUs, for example `--tensor-parallel-size 2` in vLLM. Monitor peak GPU memory and
+  preemptions under load.
+- **Use an engine with fused MoE kernels and expert parallelism.** Serve with vLLM or SGLang rather than a
+  plain PyTorch loop; on multi-GPU nodes try expert parallelism (vLLM has an `--enable-expert-parallel`
+  option) and compare it with tensor parallelism. Monitor tokens per second and interconnect utilisation.
+- **Benchmark at production concurrency.** Load-test at the batch sizes you will really run, not batch 1,
+  because weight traffic per step rises until all experts are read. Track time per output token and
+  throughput as concurrency rises.
+- **Quantise weights to fit fewer cards.** 8-bit roughly halves the 94 GB fp16 footprint and 4-bit
+  roughly quarters it. Accept only after running your own eval set, and keep room for the KV cache.
+- **Watch the router when fine-tuning.** Log expert-utilisation histograms per layer, keep the balancing
+  loss on (Hugging Face Mixtral exposes `output_router_logits` and `router_aux_loss_coef`), or freeze the
+  router weights on small datasets. Alert on a few hot experts and many near zero.
 
 ## Trade-offs
-- Quality per training FLOP improves because capacity grows without proportional compute, but weight
-  memory grows with total parameters; when a single GPU's VRAM is the binding constraint, a dense model with
-  the same memory footprint can be the better choice.
-- Decode at small batch is faster than a dense model of equal total size because only k experts are read
-  per layer, but the gain shrinks as concurrency rises and every expert is touched on every step.
-- Expert parallelism lets total parameters exceed any one device, at the cost of an all-to-all exchange in
-  every MoE layer; on slow interconnects that communication can cancel the compute savings.
-- Fine-tuning an MoE on a small dataset is reported to be less stable than fine-tuning a dense model,
-  because the router can drift and overfit; freezing the router or using more data helps, but a workflow
-  built around frequent per-customer fine-tunes is simpler with dense models.
-- Many narrow experts plus a shared expert (the DeepSeek design) specialise more finely than a few wide
-  ones, but produce more small matrix multiplications and more routing overhead, which GPUs handle
-  efficiently only with fused kernels.
+- **Quality per training FLOP vs weight memory.** Capacity grows without proportional compute, but memory
+  grows with total parameters. When a single GPU's VRAM is the binding constraint, a dense model with the
+  same memory footprint can be the better choice.
+- **Fast small-batch decode vs concurrency.** Decode at small batch beats a dense model of equal total size
+  because only k experts are read per layer, but the gain shrinks as concurrency rises and every expert is
+  touched on every step.
+- **Expert parallelism vs communication.** Total parameters can exceed any one device, at the cost of an
+  all-to-all exchange in every MoE layer; on slow interconnects that communication can cancel the compute
+  savings.
+- **Capacity vs fine-tuning stability.** Fine-tuning an MoE on a small dataset is reported to be less
+  stable than a dense model, because the router can drift and overfit. Freezing the router or using more
+  data helps, but frequent per-customer fine-tunes are simpler with dense models.
+- **Fine-grained experts vs kernel overhead.** Many narrow experts plus a shared expert (the DeepSeek
+  design) specialise more finely than a few wide ones, but produce more small matrix multiplications and
+  more routing overhead, which GPUs handle efficiently only with fused kernels.
 
 ## Pitfalls
-- Sizing serving hardware from active parameters; the symptom is an out-of-memory error at model load,
-  because all experts must be resident regardless of how few run per token.
-- Reading "8x7B" as a 56B model, or benchmarking it against dense 56B models; shared attention makes it
-  about 47B total and 13B active, and the two numbers answer different questions.
-- Expecting experts to be human-interpretable specialists ("the code expert", "the legal expert"); the
+- **Sizing serving hardware from active parameters.** Symptom: an out-of-memory error at model load,
+  because all experts must be resident regardless of how few run per token. Fix: size from total.
+- **Reading "8x7B" as a 56B model.** Benchmarking it against dense 56B models is wrong too: shared attention
+  makes it about 47B total and 13B active, and the two numbers answer different questions.
+- **Expecting human-interpretable specialists.** "The code expert" and "the legal expert" do not exist: the
   Mixtral authors found routing correlates with token type and syntax far more than with topic, so you
   cannot prune "the experts you don't need" by domain.
-- Setting the capacity factor too low to save memory; the symptom is quality that degrades on inputs with
-  an unusual token mix (code in a chat model, a rare language) because overflow tokens are silently dropped.
-- Router collapse during training or continued pre-training; the symptom is an expert-utilisation histogram
-  with a few hot experts and many near zero, plus a loss plateau that the parameter count does not explain.
-- Benchmarking throughput at batch 1 and extrapolating to production concurrency; weight traffic per step
-  rises with batch until all experts are read, so the dense-versus-MoE comparison can invert.
+- **Setting the capacity factor too low to save memory.** Symptom: quality degrades on inputs with an
+  unusual token mix (code in a chat model, a rare language), because overflow tokens are silently dropped.
+- **Router collapse during training or continued pre-training.** Symptom: an expert-utilisation histogram
+  with a few hot experts and many near zero, plus a loss plateau the parameter count does not explain.
+- **Extrapolating batch-1 throughput to production.** Weight traffic per step rises with batch until all
+  experts are read, so the dense-versus-MoE comparison can invert.
 
 ## When to use
-You rarely decide to train an MoE; you decide whether to deploy one. Reach for an MoE when you need
-top-tier quality from open weights, you have a multi-GPU node or enough host memory, and your traffic
-pattern leaves a bandwidth advantage at the batch sizes you run. Prefer a dense model when you are on a
-single card, when you fine-tune often on small data, or when your serving stack lacks fused MoE kernels and
-expert-parallel support (a homegrown PyTorch loop will be slow). Measure tokens per second at your real
-concurrency, peak memory including the KV cache, and quality on your own eval set rather than the model
-card. In interviews expect "why is Mixtral 47B and not 56B", "what do active versus total parameters
-govern", "why is load balancing needed and how does it work", and "when can an MoE be slower than a dense
-model".
+You rarely decide to train an MoE; you decide whether to deploy one.
+- **Use when:** you need top-tier quality from open weights, you have a multi-GPU node or enough host
+  memory, and your traffic leaves a bandwidth advantage at the batch sizes you run.
+- **Prefer dense when:** you are on a single card, you fine-tune often on small data, or your serving stack
+  lacks fused MoE kernels and expert-parallel support (a homegrown PyTorch loop will be slow).
+- **Measure:** tokens per second at your real concurrency, peak memory including the KV cache, and quality
+  on your own eval set rather than the model card.
+- **Interviews:** expect "why is Mixtral 47B and not 56B", "what do active versus total parameters
+  govern", "why is load balancing needed and how does it work", and "when can an MoE be slower than a dense
+  model".
 
 ## Role lens
 - **Engineer:** Reads the model card for total and active parameters, picks an engine with fused MoE
@@ -230,6 +308,44 @@ CPU memory with a large latency penalty, or a dense model in the 13–30B range 
 claim also holds only at low concurrency; as batch grows, every expert is read each step. I would change the
 recommendation if they have a multi-GPU box with fast interconnect, or if their concurrency is near one and
 they accept quantised weights.
+
+## Interview questions
+### Why is Mixtral 8x7B about 47B parameters rather than 56B, and what do the active and total counts each govern?
+- **Shared parts are counted once.** Only the FFNs are replicated into 8 experts; attention, embeddings
+  and norms are shared, so the total is about 47B, not 8 × 7.
+- **Total governs memory.** Every expert must be resident because any token may route anywhere, so fp16
+  weights are about 94 GB.
+- **Active governs compute.** With top-2 routing roughly 13B parameters run per token, which sets training
+  FLOPs per token and weight bytes read per decode step at batch 1.
+
+### Your continued pre-training run on an MoE plateaus early. How do you check for router collapse, and how do you fix it?
+- **Look at routing, not just loss.** Plot per-layer expert-utilisation histograms; a few hot experts and
+  many near zero means early winners attracted most tokens and the rest stopped learning.
+- **Fix the balance.** Restore or raise the auxiliary load-balancing loss, or use DeepSeek-style
+  per-expert selection biases that are nudged toward uniform load.
+- **Check stability too.** Add a router z-loss against saturating logits and compute the router in fp32,
+  because rounding in bf16 flips top-k choices.
+
+### When can an MoE be slower or more expensive to serve than a dense model?
+- **At high concurrency.** Once the batch touches every expert, each step reads close to the full weight
+  set, so the bandwidth advantage over a dense model of equal total size disappears.
+- **On weak interconnects.** Expert parallelism adds an all-to-all exchange twice per MoE layer, which can
+  cancel the compute savings.
+- **Without fused kernels or on one card.** A Python loop over experts is slow, and a dense model that fits
+  the same VRAM may beat an MoE squeezed in by heavy quantisation.
+
+### Why do open decoder LLMs use token-choice routing rather than expert choice?
+- **Expert choice balances by construction** because each expert takes its top-scoring tokens up to a
+  fixed capacity.
+- **But routing then depends on the batch.** A token may get zero or many experts depending on unrelated
+  requests sharing the batch, which is awkward for autoregressive decoding with a handful of sequences.
+- **Token choice keeps each token's path its own,** at the price of needing a balancing loss or bias.
+
+### What does the capacity factor control, and what happens if you set it too low?
+- **It caps tokens per expert** at `capacity_factor × tokens / N` per batch, because experts run as
+  fixed-size batched matrix multiplications and one overloaded expert would stall the rest.
+- **Too low drops tokens.** Overflow tokens skip that expert and pass through the residual connection only,
+  so quality quietly degrades on unusual token mixes such as code in a chat model or a rare language.
 
 ## Quiz
 ### Q: Why does an MoE layer multiply each chosen expert's output by its router probability instead of simply summing the chosen outputs?

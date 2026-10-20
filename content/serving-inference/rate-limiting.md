@@ -5,7 +5,7 @@ name: Rate limiting
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - serving-inference/backpressure
   - serving-inference/retry-strategies
@@ -22,97 +22,127 @@ sources:
 ---
 
 ## TL;DR
-Rate limiting bounds how much work a caller may submit per unit of time. In LLM systems it points two
-ways: inbound, so one tenant or one runaway loop cannot consume the GPU or the provider quota everyone
-shares; outbound, so your fleet stays under provider limits that are counted in requests *and* tokens per
-minute. The LLM twist is that a request's cost is unknown until it finishes, so limiters reserve on an
-estimate and settle on the actual.
+Rate limiting bounds a caller's work per unit of time: inbound to protect shared GPUs and quota, outbound
+to stay under provider request and token limits. Cost is unknown until a request
+finishes, so limiters reserve an estimate and settle on the actual.
 
 ## Why it exists
-The resource behind an LLM call is shared, finite and expensive. A hosted provider gives your organisation
-a quota, typically requests per minute and tokens per minute per model, and when it is exceeded the 429s
-hit every caller in the organisation, not just the one that caused it. A self-hosted GPU has a fixed token
-budget per second. Without an inbound limiter, one customer's retry loop or one agent stuck in a tool
-cycle exhausts the shared allowance, every other customer sees errors, and the bill arrives anyway.
-
-"Let the provider's 429 be our rate limiter" is the naive design and it fails on four counts. The blast
-radius is the whole organisation. It is reactive: by the time the 429 arrives, the requests are already
-queued and the latency already spent. It removes your ability to prioritise, because the provider does
-not know which of your tenants matter. And it interacts badly with retries, since every rejected request
-comes back as another.
-
-"Limit requests per minute like any web API" is the second naive design. One request can carry 200
-tokens or 200,000; a request limit is both gamed (pack more work per call) and useless for protecting the
-resource that actually runs out, which is tokens. Rate limiting for LLMs therefore has to be cost-aware,
-has to estimate costs before they are known, and has to run in two directions at once.
+- **The resource is shared, finite and expensive.** A provider gives your organisation a quota, typically
+  requests and tokens per minute per model, and when it is exceeded the 429s hit every caller in the
+  organisation. A self-hosted GPU has a fixed token budget per second.
+- **One bad caller hurts everyone.** Without an inbound limiter, one customer's retry loop or one agent
+  stuck in a tool cycle exhausts the shared allowance, every other customer sees errors, and the bill
+  arrives anyway.
+- **"Let the provider's 429 be our limiter" fails four ways.** The blast radius is the whole organisation;
+  it is reactive (requests already queued, latency already spent); you cannot prioritise, because the
+  provider does not know which tenants matter; and every rejected request comes back as a retry.
+- **"Limit requests per minute like any web API" fails too.** One request can carry 200 tokens or 200,000,
+  so a request limit is gamed (pack more work per call) and does not protect the resource that runs out:
+  tokens.
+- **So LLM rate limiting must** be cost-aware, estimate costs before they are known, and run in two
+  directions at once.
 
 ## How it works
 ### Units
-Providers limit requests per minute, tokens per minute (sometimes input and output tokens separately,
-sometimes per day as well) and occasionally concurrency; the exact names and tiers vary by vendor and are
-published in their docs. Your inbound limiter should mirror this: per-tenant requests, per-tenant tokens
-and, for agents, steps or dollars per task.
+| Who | Units limited |
+|---|---|
+| Providers | requests per minute, tokens per minute (sometimes input and output separately, sometimes per day too), occasionally concurrency |
+| Your inbound limiter | per-tenant requests, per-tenant tokens and, for agents, steps or dollars per task |
+
+The exact names and tiers vary by vendor and are published in their docs; mirror them inbound.
 
 ### Algorithms, and why the token bucket wins here
-- **Token bucket.** A bucket of capacity *B* refills at *r* units per second; a request costing *c* is
-  admitted if the bucket holds at least *c*, which it then removes. It permits bursts up to *B* while
-  enforcing a long-run average of *r*, and its state is two numbers (level, last refill time). LLM
-  traffic is bursty and cost-weighted, which is exactly what this models; the "tokens" in the name map
-  directly onto LLM tokens if you set the units that way.
-- **Leaky bucket.** Requests drain at a fixed rate, smoothing output; equivalent in enforcement terms
-  (the GCRA formulation) but it reshapes bursts into delay rather than admitting them.
-- **Fixed window.** A counter per minute. Simple, but it allows 2× the limit across a window boundary,
-  since a caller can spend the full allowance at 0:59 and again at 1:00.
-- **Sliding window log.** Store every request's timestamp; exact, but memory grows with traffic.
-- **Sliding window counter.** Weight the previous window's count by its overlap with the current one;
-  constant memory, approximate, good enough for most inbound limits.
+| Algorithm | How it works | Weakness |
+|---|---|---|
+| **Token bucket** | capacity *B*, refills at *r* units per second; admit a request costing *c* if the bucket holds at least *c*, then remove it | bursts up to *B* may exceed an upstream's own windowing |
+| **Leaky bucket** | requests drain at a fixed rate, smoothing output; equivalent in enforcement (the GCRA formulation) | reshapes bursts into delay rather than admitting them |
+| **Fixed window** | a counter per minute | allows 2× the limit across a boundary: full allowance at 0:59 and again at 1:00 |
+| **Sliding window log** | store every request's timestamp; exact | memory grows with traffic |
+| **Sliding window counter** | weight the previous window's count by its overlap with the current one | approximate, but constant memory; good enough for most inbound limits |
+
+- **Why token bucket:** it permits bursts up to *B* while enforcing a long-run average of *r*, and its
+  state is two numbers (level, last refill time).
+- **It fits LLM traffic,** which is bursty and cost-weighted; the "tokens" in the name map directly onto
+  LLM tokens if you set the units that way.
 
 ### Reserve, then settle
-A request's cost is input tokens, which you can count or estimate before sending, plus output tokens,
-which you only learn when generation ends but which are bounded by `max_tokens`. The limiter therefore
-*reserves* input plus an output estimate at admission and *settles* when the response arrives, refunding
-the difference. Reserving the full `max_tokens` never overshoots but under-uses quota when clients set
-generous limits; reserving an expected output length uses quota well but occasionally overshoots and
-takes a provider 429. Which is right depends on how expensive an overshoot is for you. If you reserve an
-estimate, settlement must also *debit* when the actual exceeds it, letting the bucket go into debt that
-later refill pays off; refunding only in one direction turns every underestimate into silent overspend.
-Either way, clients who set `max_tokens` far above their needs shrink everyone's headroom. Check how your
-provider counts before sizing reservations: some count cached prompt tokens differently toward their
-input-token limits, and the exact accounting is vendor-specific.
+Cost = input tokens (countable before sending) + output tokens (known only at the end, but bounded by
+`max_tokens`).
 
-The numbers interact. In a bucket with 80,000 tokens of capacity, a request reserving a 20,000-token prompt plus
-`max_tokens` 4,000 takes 30% of the burst at once; if it actually generates 600 tokens, settlement
-returns 3,400. Three such requests arriving together hold 72,000 of the 80,000 and the fourth waits for
-refill (or for the first three to settle and refund), which is the limiter doing its job. A single 100,000-token request, by contrast, can never fit; the
-limiter must reject it with a non-retryable error or the bucket must be sized above the largest request
-you intend to accept.
+1. **Reserve** input plus an output estimate at admission.
+2. **Settle** when the response arrives: refund the difference, or *debit* when the actual exceeds the
+   estimate, letting the bucket go into debt that later refill pays off. Refunding in only one direction
+   turns every underestimate into silent overspend.
+
+| Reservation | Gain | Cost |
+|---|---|---|
+| Full `max_tokens` | never overshoots | under-uses quota when clients set generous limits |
+| Expected output length | uses quota well | occasionally overshoots and takes a provider 429 |
+
+- **Pick by how expensive an overshoot is for you.**
+- **Generous `max_tokens` hurts everyone:** clients who set it far above their needs shrink everyone's
+  headroom.
+- **Check your provider's accounting** before sizing reservations: some count cached prompt tokens
+  differently toward input-token limits, and the exact accounting is vendor-specific.
+
+Worked numbers in a bucket with 80,000 tokens of capacity:
+
+| Event | Bucket effect |
+|---|---|
+| Request reserves a 20,000-token prompt plus `max_tokens` 4,000 | takes 30% of the burst at once |
+| It actually generates 600 tokens | settlement returns 3,400 |
+| Three such requests arrive together | they hold 72,000 of the 80,000; the fourth waits for refill (or for the first three to settle and refund): the limiter doing its job |
+| A single 100,000-token request | can never fit: reject with a non-retryable error, or size the bucket above the largest request you intend to accept |
 
 ### Distributed enforcement
-Several application replicas share one provider quota, so the limiter's state must be shared, or the
-quota statically partitioned. Shared state lives in Redis with the check-and-decrement done atomically
-in a Lua script, because two replicas that read, decide and then write will both admit the last unit.
-Static partitioning (each of three replicas gets a third) needs no coordination but wastes headroom
-whenever load is uneven. A central gateway process is the third option and the usual home for
-per-tenant policy.
+Several replicas share one provider quota, so state must be shared or the quota partitioned:
+
+| Option | How | Cost |
+|---|---|---|
+| Shared state | Redis, with check-and-decrement done atomically in a Lua script | a round trip and a dependency |
+| Static partitioning | each of three replicas gets a third | wastes headroom whenever load is uneven |
+| Central gateway | one process enforces policy | the usual home for per-tenant policy |
+
+- **Atomicity matters** because two replicas that read, decide and then write will both admit the last
+  unit.
 
 ### The response contract and the feedback loop
-Inbound rejections return 429 with `Retry-After` and remaining-limit headers (a standard set of header
-names is being defined by the IETF; providers currently use their own). Outbound, read the provider's
-remaining-quota and reset headers and slow down before the first 429, decreasing the local rate when
-headroom is thin. Keep 429 for "you exceeded your allowance" and 503 for "we are out of capacity";
-clients fix them differently.
+- **Inbound rejections return 429 with `Retry-After`** and remaining-limit headers. A standard set of
+  header names is being defined by the IETF; providers currently use their own.
+- **Outbound, read the provider's remaining-quota and reset headers** and slow down before the first 429,
+  decreasing the local rate when headroom is thin.
+- **Keep 429 for "you exceeded your allowance" and 503 for "we are out of capacity";** clients fix them
+  differently.
 
 ### Fairness and layering
-Size per-tenant buckets from the plan, a global bucket from the provider quota minus a safety margin
-(running at around 80% leaves room for retries and bursts), and let high-priority traffic borrow from
-the global bucket before low-priority traffic does. Multiple keys, workspaces or regions multiply quota
-when a single bucket is not enough.
+- **Per-tenant buckets** sized from the plan.
+- **A global bucket** from the provider quota minus a safety margin: running at around 80% leaves room
+  for retries and bursts.
+- **Priority borrowing:** high-priority traffic borrows from the global bucket before low-priority does.
+- **More quota:** multiple keys, workspaces or regions multiply quota when a single bucket is not enough.
 
-## Example
-A cost-aware token bucket with a reservation step. Capacity is ten seconds of refill so short bursts are
-absorbed, the refill rate is 80% of an illustrative provider limit, and unused reservations are refunded
-once the real output length is known. In production the bucket lives in Redis with `try_reserve` as an
-atomic script.
+## Diagram
+Each request passes the tenant bucket, then the shared global bucket, before any provider call; the
+settle step afterwards corrects the reservation using the real output length.
+
+```mermaid
+flowchart TD
+    R["Request: prompt + max_tokens"] --> T{"Tenant bucket has room?"}
+    T -->|"no"| X["429 + Retry-After"]
+    T -->|"yes"| G{"Global bucket has room?"}
+    G -->|"no, global shortfall"| Y["503 + Retry-After"]
+    G -->|"yes"| P["Call provider"]
+    P --> S["Settle: refund or debit actual tokens"]
+    S --> B[("Shared bucket state in Redis")]
+    G -.->|"atomic reserve"| B
+    P -.->|"remaining-quota headers"| G
+```
+
+## Examples
+### Cost-aware token bucket with reserve and settle
+Capacity is ten seconds of refill so short bursts are absorbed, the refill rate is 80% of an
+illustrative provider limit, and unused reservations are refunded once the real output length is known.
+In production the bucket lives in Redis with `try_reserve` as an atomic script.
 
 ```python
 import time, threading
@@ -155,44 +185,98 @@ def call_llm(prompt_tokens: int, max_tokens: int):
     return resp
 ```
 
+### The same bucket shared across replicas in Redis
+A production shape: the refill-and-reserve runs as one Lua script, so two replicas can never both admit
+the last unit. Uses redis-py's `register_script`; calling `TIME` inside a script that then writes needs
+Redis 5 or later.
+
+```python
+import redis
+
+RESERVE = """
+local cap, rate, cost = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local s = redis.call('HMGET', KEYS[1], 'level', 'updated')
+local level = math.min(cap, (tonumber(s[1]) or cap) + (now - (tonumber(s[2]) or now)) * rate)
+local wait = 0
+if level >= cost then level = level - cost else wait = (cost - level) / rate end
+redis.call('HSET', KEYS[1], 'level', level, 'updated', now)
+redis.call('EXPIRE', KEYS[1], 3600)
+return tostring(wait)
+"""
+
+r = redis.Redis()
+reserve = r.register_script(RESERVE)
+
+def try_reserve(key, capacity, rate, cost):
+    return float(reserve(keys=[key], args=[capacity, rate, cost]))   # 0.0 means admitted
+
+def settle(key, reserved, actual):
+    # Refund or debit; the next reserve clamps the level back to capacity.
+    r.hincrbyfloat(key, "level", reserved - actual)
+
+wait = try_reserve("rl:model:tpm", 53_333, 5_333, 24_000)
+```
+
+## Production patterns
+- **Two-layer limiter at the gateway.** Per-tenant request and token buckets inbound, one global token
+  bucket per provider model outbound, both checked before retrieval or prompt assembly. Monitor
+  rejection rate per tenant and upstream 429 rate, which should be near zero.
+- **Atomic Redis bucket shared by replicas.** Run reserve as a Lua script (as above) keyed per tenant and
+  per model, with a TTL so idle keys expire. Monitor Redis latency on the limiter path, because it now
+  sits on every request.
+- **Header-driven outbound pacing.** Parse the provider's remaining-requests, remaining-tokens and reset
+  headers after each call and lower the local refill rate when headroom is thin. Monitor quota
+  utilisation against the provider's limit.
+- **Reservation accuracy tracking.** Log reserved versus actual tokens per route; if the ratio drifts far
+  from 1, tighten `max_tokens` defaults or switch to expected-output reservations. Monitor the
+  reservation-to-actual ratio.
+- **Separate keys for heavy workloads.** Give a nightly batch job or a dominant tenant its own provider key
+  or workspace, so it cannot starve interactive traffic. Monitor per-key utilisation.
+
 ## Trade-offs
-- Token buckets admit bursts, which users like, but a burst that fits your bucket may still exceed the
-  provider's own windowing; keep burst capacity below what the upstream tolerates.
-- Reserving `max_tokens` never overshoots but strands quota when clients over-specify; reserving an
-  expected output uses quota fully but accepts occasional provider 429s, so pick by how costly an
-  upstream rejection is.
-- A shared Redis limiter is exact across replicas at the price of a round trip and a dependency; static
-  partitioning is free and sufficient when replicas are few and load is even.
-- Strict per-tenant limits guarantee fairness but block legitimate spikes; letting tenants borrow unused
-  global headroom improves utilisation at the cost of weaker isolation.
+- **Bursts vs upstream windowing.** Token buckets admit bursts, which users like, but a burst that fits
+  your bucket may still exceed the provider's own windowing; keep burst capacity below what the upstream
+  tolerates.
+- **Safe vs full reservations.** Reserving `max_tokens` never overshoots but strands quota when clients
+  over-specify; reserving an expected output uses quota fully but accepts occasional provider 429s. Pick
+  by how costly an upstream rejection is.
+- **Shared vs partitioned state.** A shared Redis limiter is exact across replicas at the price of a round
+  trip and a dependency; static partitioning is free and sufficient when replicas are few and load is
+  even.
+- **Isolation vs utilisation.** Strict per-tenant limits guarantee fairness but block legitimate spikes;
+  borrowing unused global headroom improves utilisation at the cost of weaker isolation.
 
 ## Pitfalls
-- Limiting requests only; the symptom is provider 429s while your requests-per-minute dashboard is green,
+- **Limiting requests only.** Symptom: provider 429s while your requests-per-minute dashboard is green,
   because long prompts exhausted the token limit.
-- Fixed windows; the symptom is bursts of upstream 429s at minute boundaries as callers double-spend
-  across the edge.
-- Non-atomic check-then-decrement across replicas; the symptom is overshoot that scales with replica count
+- **Fixed windows.** Symptom: bursts of upstream 429s at minute boundaries as callers double-spend across
+  the edge.
+- **Non-atomic check-then-decrement across replicas.** Symptom: overshoot that scales with replica count
   and vanishes in single-instance tests.
-- Never refunding reservations; the symptom is sustained throughput far below quota while the limiter
+- **Never refunding reservations.** Symptom: sustained throughput far below quota while the limiter
   reports itself full.
-- Bucket capacity smaller than the largest legitimate request; the symptom is a few long-document
-  requests receiving `Retry-After` indefinitely while everything else flows, because they can never fit.
-- Limiting after expensive work (retrieval, prompt assembly); the symptom is CPU and vector-store load
-  that does not fall when requests are rejected.
-- Counting tokens with the wrong tokenizer; the symptom is systematic under- or over-reservation that
+- **Bucket capacity below the largest legitimate request.** Symptom: a few long-document requests get
+  `Retry-After` indefinitely while everything else flows, because they can never fit.
+- **Limiting after expensive work** (retrieval, prompt assembly). Symptom: CPU and vector-store load that
+  does not fall when requests are rejected.
+- **Counting tokens with the wrong tokenizer.** Symptom: systematic under- or over-reservation that
   appears the day a new model is added.
-- Treating 429 and 503 as interchangeable; the symptom is clients that back off per-caller when the problem
-  is global, or that hammer a saturated server believing they are under quota.
+- **Treating 429 and 503 as interchangeable.** Symptom: clients back off per-caller when the problem is
+  global, or hammer a saturated server believing they are under quota.
 
 ## When to use
-Put an inbound limiter in front of every LLM endpoint that serves more than one tenant or more than one
-application, and an outbound limiter in front of every provider key that more than one process uses.
-Start with per-tenant request and token buckets plus one global token bucket per provider model; add
-priority borrowing and per-agent step budgets when agents appear. Measure rejection rate per tenant,
-quota utilisation against the provider's limit, reservation-to-actual ratio and upstream 429 rate; the
-last should be near zero if the outbound limiter works. In interviews, expect to be asked why requests
-per minute is insufficient, how to limit when cost is unknown up front, and how to make a limiter correct
-across replicas.
+- **Inbound:** in front of every LLM endpoint that serves more than one tenant or more than one
+  application.
+- **Outbound:** in front of every provider key that more than one process uses.
+- **Start with** per-tenant request and token buckets plus one global token bucket per provider model;
+  add priority borrowing and per-agent step budgets when agents appear.
+- **Measure** rejection rate per tenant, quota utilisation against the provider's limit,
+  reservation-to-actual ratio and upstream 429 rate; the last should be near zero if the outbound
+  limiter works.
+- **Interviews:** expect why requests per minute is insufficient, how to limit when cost is unknown up
+  front, and how to make a limiter correct across replicas.
 
 ## Role lens
 - **Engineer:** Implements the bucket in Redis with an atomic script, wires reserve and settle around
@@ -217,6 +301,37 @@ clients back off correctly. I would read the provider's remaining-quota headers 
 first upstream 429, and monitor upstream 429 rate, per-tenant rejection rate and reservation accuracy. If
 one tenant genuinely needs most of the quota, I would give them a separate key rather than let them
 dominate the shared bucket.
+
+## Interview questions
+### What is a token bucket, and why does it suit LLM traffic better than a fixed window?
+- **Definition:** a bucket of capacity *B* refilling at *r* units per second; a request costing *c* is
+  admitted if *c* units are available. It allows bursts up to *B* with a long-run average of *r*.
+- **Why it fits:** costs can be weighted in LLM tokens, and it has no window boundary, so a caller cannot
+  spend twice the limit across 0:59 and 1:00.
+
+### Your request dashboard is green but the provider keeps returning 429s. What is happening?
+- **You are limiting requests, not tokens.** A few long prompts exhaust tokens per minute while the
+  request count looks healthy.
+- **Or replicas are racing:** a non-atomic check-then-decrement lets each replica admit the last unit, so
+  overshoot grows with replica count.
+- **Fix** with a token-weighted bucket shared atomically in Redis, at about 80% of the provider limit.
+
+### Would you reserve the full `max_tokens` or an expected output length?
+- **Full `max_tokens`** never overshoots, but strands quota when clients set generous limits.
+- **Expected output** uses quota fully but occasionally overshoots into a provider 429, so settlement must
+  debit as well as refund.
+- **Choose by the cost of an upstream rejection:** for user-facing chat, overshoot hurts more than
+  stranded quota.
+
+### A bucket holds 80,000 tokens. A request reserves a 20,000-token prompt plus 4,000 `max_tokens` and generates 600. Walk through it.
+- **Admission takes 24,000,** 30% of the burst; three such requests hold 72,000 and the fourth waits.
+- **Settlement refunds 3,400** once the 600-token output is known.
+- **A 100,000-token request never fits,** so it must get a non-retryable error rather than `Retry-After`.
+
+### Why return 503 rather than 429 when the global bucket is empty?
+- **429 blames the caller,** who would wrongly reduce their own rate while the real problem is global.
+- **503 says the server is out of capacity,** so clients back off appropriately and engineers look at
+  global quota rather than the tenant's plan.
 
 ## Quiz
 ### Q: Why is a requests-per-minute limit insufficient for LLM traffic?

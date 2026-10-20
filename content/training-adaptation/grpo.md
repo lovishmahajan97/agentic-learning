@@ -120,6 +120,26 @@ L_clip  = mean over tokens of  min( ratio_t · Â_i ,  clip(ratio_t, 1−ε, 1+�
 Which normalisation and clipping you use is a real design choice, not a detail: comparing GRPO runs that
 differ in it is comparing different algorithms.
 
+## Diagram
+One GRPO iteration: the group of samples replaces the critic, and the verifier's rewards are
+standardised within the group before the clipped update.
+
+```mermaid
+flowchart TD
+    Q["Prompt q"] --> OLD["Old policy samples G responses, often 8 to 16"]
+    OLD --> VR["Verifier or reward model scores each response"]
+    VR --> Z{"All rewards equal?"}
+    Z -->|"yes: zero advantage"| DROP["Filter group, no gradient"]
+    Z -->|"no"| ADV["Advantage: reward minus group mean, divided by group std"]
+    ADV -->|"same advantage on every token"| CL["Clipped surrogate on token ratios, new over old"]
+    REF["Frozen reference"] -->|"per-token KL in the loss"| CL
+    CL --> UP["1 to 4 gradient steps on the batch"]
+    UP --> NEW["Updated policy"]
+    NEW -->|"becomes old policy"| OLD
+    NEW -.->|"every few dozen steps"| HO{"Held-out verifier accuracy rising with reward?"}
+    HO -.->|"no: reward hacking"| RW["Fix reward, roll back"]
+```
+
 ## Examples
 ### Group advantages and the GRPO loss
 One prompt, eight sampled responses, verifier rewards with three of eight correct. Token log-probs are
@@ -263,6 +283,43 @@ code referencing literal test inputs; evaluate on a held-out verifier every few 
 it diverges from training reward; and keep a KL term and general coding benchmarks in the loop so the
 policy cannot drift into a degenerate style. The algorithm did its job; the reward defined the wrong
 task.
+
+## Interview questions
+### What problem does GRPO solve relative to PPO, and how?
+- **PPO needs a value model**, usually another policy-sized network trained alongside, whose estimates
+  are poor because the reward only arrives at the end of a long response.
+- **GRPO uses the group as the baseline:** sample G responses per prompt and standardise each reward by
+  the group mean and std.
+- **The result:** about half the trainable memory, no critic instability, and a signal that concentrates
+  on prompts the model sometimes but not always solves.
+
+### Half your batches have zero advantage. What is going on and what do you do?
+- **Those groups are all-correct or all-wrong**, so every reward equals the group mean.
+- **Curate by pass rate:** drop prompts solved 0/G or G/G at the start, and re-curate as the policy
+  improves and solved prompts accumulate.
+- **Or use dynamic sampling** as DAPO does: drop such groups and refill the batch, so GPU time is not
+  burned on samples with no gradient.
+
+### Should you divide the advantage by the group std?
+- **With it (original GRPO)** extreme groups are up-weighted: at G = 8, a lone success at 1/8 gets +2.47
+  versus +0.94 at 4/8.
+- **Without it (Dr. GRPO)** half-solved prompts carry relatively more of the gradient.
+- **It is debated, not a detail:** runs that differ in normalisation are different algorithms, so ablate
+  on your task rather than assume.
+
+### When would you not use GRPO?
+- **When you have no reward you trust:** with a learned reward model GRPO overoptimises just as PPO does.
+- **When a few thousand demonstrations or preference pairs already solve it**, because the sampling loop
+  is the most expensive post-training stage after pre-training.
+- **When the task has no checker**, since verifiable rewards exist only for tasks you can test.
+
+### Training reward climbs and mean response length doubles, but held-out accuracy is flat. Diagnose.
+- **Paying for length with nothing to show:** outcome rewards select for long reasoning only when it
+  buys accuracy.
+- **Check normalisation:** per-response length averaging penalises wrong long responses less per token,
+  biasing toward verbosity on failures.
+- **Check the reward for hacks** such as format terms or a lax checker, then set a maximum completion
+  length or an overlong penalty and watch truncation rate.
 
 ## Quiz
 ### Q: What does GRPO use instead of PPO's value model to compute advantages?

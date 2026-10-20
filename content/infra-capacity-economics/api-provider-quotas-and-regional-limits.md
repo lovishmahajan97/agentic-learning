@@ -5,7 +5,7 @@ name: API provider quotas & regional limits
 kind: concept
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - infra-capacity-economics/cloud-ai-architecture
   - infra-capacity-economics/capacity-planning
@@ -23,63 +23,65 @@ sources:
 ---
 
 ## TL;DR
-Hosted model APIs are shared pools, so every provider caps what one account may take: requests and
-tokens per minute (often input and output separately), per model, per region, per account, rising
-with spend tier. Exceed them and you get 429s; when the pool itself is full you get overload errors
-regardless of quota. Capacity planning on an API is therefore quota planning: measure demand in the
-provider's units, keep headroom, spread across regions where residency allows, and reserve capacity
-for the base load.
+Hosted model APIs cap each account's requests and tokens per minute, per model, per region, by spend
+tier. Exceed them and you get 429s; a full pool fails regardless. So API capacity planning is quota
+planning: measure, keep headroom, spread regions, reserve the base.
 
 ## Why it exists
-A provider's GPU fleet is finite and shared by everyone. Without limits, one customer's traffic
-spike would degrade every other customer, and the provider could not size its fleet. Rate limits
-are the provider's admission control; quotas are the allocation of that control per customer. They
-are set per model because models have different cost and capacity, per region because the fleet is
-regional, and per account or subscription because that is the billing and abuse boundary. Tiers
-that rise with spend exist because payment history is the provider's best signal that a customer is
-real and predictable.
-
-From the application side, the naive model is "the API is infinite, just call it; retry on error".
-It fails in three ways. First, a 429 under sustained demand is not transient: retries add load to a
-limiter that is already rejecting you, so the retry storm raises latency for every request without
-increasing throughput. Second, the limit is measured in tokens, not requests, and several major
-providers (OpenAI, Azure OpenAI and Bedrock among them) document that they count `max_tokens`
-against the token budget at admission, so a request with `max_tokens=4096` that produces 50 tokens
-still holds 4,096 tokens of budget when it is admitted (some providers credit the unused part back
-when the response completes, others do not); a team that never set `max_tokens` deliberately can
-find its effective capacity is a fraction of what the quota implies. The exact rule differs per
-provider and has changed over time, so read the current docs for the one you use.
-Third, quotas are regional, and the model the product depends on may not be available, or may have
-a lower quota, in the only region the data-residency rule allows. A launch has been delayed by a
-quota ticket more often than by a model's quality. Treating quota as a planned resource like GPU
-memory, with measurement, headroom and a growth process, is what this topic is about.
+- **The provider's fleet is finite and shared.** Without limits one customer's spike would degrade every
+  other customer, and the provider could not size its fleet. Rate limits are the provider's admission
+  control; quotas are the allocation of that control per customer.
+- **Each boundary has a reason.** Per model because models have different cost and capacity, per region
+  because the fleet is regional, per account or subscription because that is the billing and abuse
+  boundary. Tiers rise with spend because payment history is the provider's best signal that a customer
+  is real and predictable.
+- **"The API is infinite, just retry" fails, first, on retries.** A 429 under sustained demand is not
+  transient: retries add load to a limiter already rejecting you, raising latency for every request
+  without increasing throughput.
+- **Second, the limit is in tokens, including ones never generated.** Several major providers count
+  `max_tokens` against the budget at admission, so a team that never set it deliberately can find its
+  effective capacity is a fraction of what the quota implies.
+- **Third, quotas are regional.** The model may be missing, or have a lower quota, in the only region
+  the residency rule allows. A launch has been delayed by a quota ticket more often than by a model's
+  quality, so treat quota as a planned resource like GPU memory: measurement, headroom, a growth process.
 
 ## How it works
 ### The units
-- **RPM** (requests per minute): the simplest cap, binding for workloads with many small requests.
-- **TPM** (tokens per minute): the cap that usually binds for LLM traffic. Some providers count
-  input and output together; others keep separate input-TPM and output-TPM budgets, which matters
-  because long-prompt RAG traffic and long-output generation traffic exhaust different budgets.
-- **TPD / RPD** (per day): present at lower tiers on some providers, a budget rather than a rate.
-- **Concurrency**: some platforms cap simultaneous in-flight requests rather than, or in addition
-  to, rates.
-- **Per-model, per-region, per-account.** Azure OpenAI allocates TPM per model per region per
-  subscription and you split it across deployments; Bedrock's on-demand quotas are per model per
-  region per account and are raised through the service-quotas process; vendor APIs set limits per
-  organisation per model by usage tier; Vertex has moved toward dynamically shared quota for some
-  models, where the fixed per-project cap gives way to a pool shared across customers.
+| Unit | What it caps | When it binds |
+|---|---|---|
+| **RPM** (requests per minute) | The simplest cap | Workloads with many small requests |
+| **TPM** (tokens per minute) | Tokens; some providers count input and output together, others keep separate input-TPM and output-TPM | Usually, for LLM traffic. Long-prompt RAG and long-output generation exhaust different budgets |
+| **TPD / RPD** (per day) | A budget rather than a rate | Lower tiers on some providers |
+| **Concurrency** | Simultaneous in-flight requests, instead of or in addition to rates | Long generations |
+
+- **Azure OpenAI** allocates TPM per model per region per subscription and you split it across deployments.
+- **Bedrock** on-demand quotas are per model per region per account, raised through the service-quotas
+  process.
+- **Vendor APIs** set limits per organisation per model by usage tier.
+- **Vertex** has moved toward dynamically shared quota for some models, where the fixed per-project cap
+  gives way to a pool shared across customers.
 
 ### How counting works
-Providers implement limits as token buckets or sliding windows: the budget refills continuously, a
-request is admitted if the bucket holds enough, otherwise it is rejected with 429 and usually a
-`Retry-After` (or `retry-after-ms`) header saying when to try again. On providers that reserve output,
-the token cost is estimated at admission from the prompt length plus `max_tokens` (or a default
-when absent), *because* the provider must reserve capacity before it knows the real output length;
-some then adjust the accounting when the response completes, and others count only actual output
-against an output-token limit. Response headers report the remaining budget,
-for example OpenAI's `x-ratelimit-remaining-tokens` family and Anthropic's
-`anthropic-ratelimit-tokens-remaining` family, which a gateway can read to slow down before the
-first 429 rather than after it.
+1. **Token bucket or sliding window.** The budget refills continuously; a request is admitted if the
+   bucket holds enough.
+2. **Otherwise 429,** usually with a `Retry-After` (or `retry-after-ms`) header saying when to try again.
+3. **Output is reserved at admission** on providers that do so: the cost is estimated from prompt length
+   plus `max_tokens` (or a default when absent), *because* the provider must reserve capacity before it
+   knows the real output length.
+4. **Accounting afterwards differs.** Some adjust when the response completes; others count only actual
+   output against an output-token limit.
+5. **Response headers report the remaining budget,** for example OpenAI's `x-ratelimit-remaining-tokens`
+   family and Anthropic's `anthropic-ratelimit-tokens-remaining` family. A gateway can read them to slow
+   down before the first 429 rather than after it.
+
+### The max_tokens trap
+- **Who documents it:** OpenAI, Azure OpenAI and Bedrock among others document that they count
+  `max_tokens` against the token budget at admission.
+- **The effect:** a request with `max_tokens=4096` that produces 50 tokens still holds 4,096 tokens of
+  budget when admitted. Some providers credit the unused part back when the response completes, others
+  do not.
+- **Caveat:** the exact rule differs per provider and has changed over time, so read the current docs for
+  the one you use.
 
 ### The ceiling a quota actually gives you
 Every limit converts into a request ceiling, and the lowest one binds:
@@ -90,54 +92,79 @@ tokens charged    = prompt tokens + max_tokens     (on providers that reserve ou
 binding ceiling   = min(RPM quota, max RPM from TPM, concurrency cap ÷ mean seconds per request × 60)
 ```
 
-With a 400k TPM quota and 1,000-token prompts, `max_tokens=4000` charges 5,000 tokens a request,
-so the ceiling is 80 requests per minute even if answers average 300 tokens. Setting
-`max_tokens=800` charges 1,800 and lifts the ceiling to about 220 per minute, with no change to the
-quota or the bill. The concurrency term is Little's Law: at a cap of 50 in-flight requests and 15
-seconds per long generation, you cannot exceed 200 requests per minute whatever the token quota
-says. Running this calculation per model per region is the core of quota planning.
+| Setting (400k TPM, 1,000-token prompts) | Tokens charged | Ceiling |
+|---|---|---|
+| `max_tokens=4000` | 5,000 | 80 requests per minute, even if answers average 300 tokens |
+| `max_tokens=800` | 1,800 | about 220 per minute, no change to quota or bill |
+| Concurrency cap of 50 in flight, 15 seconds per long generation | n/a | at most 200 per minute whatever the token quota says (Little's Law) |
+
+Running this calculation per model per region is the core of quota planning.
 
 ### Quota versus capacity
-A quota is a promise about *your* admission, not about the pool's availability. When the regional
-pool is saturated, requests fail with overload or capacity errors (Anthropic's 529, Bedrock's
-throttling exceptions, Azure 429s on a deployment that is under its TPM) even though you are
-under quota. Provisioned or reserved capacity exists for this gap: it buys dedicated throughput that
-does not compete with the pool, which is why it is priced by the hour rather than by the token.
+- **A quota is a promise about *your* admission,** not about the pool's availability.
+- **A saturated regional pool fails you under quota:** overload or capacity errors (Anthropic's 529,
+  Bedrock's throttling exceptions, Azure 429s on a deployment that is under its TPM).
+- **Provisioned or reserved capacity fills this gap.** It buys dedicated throughput that does not compete
+  with the pool, which is why it is priced by the hour rather than by the token.
 
 ### Regional limits
-Quotas are per region, which cuts both ways. If residency rules allow, a workload can spread across
-several regions or several Azure deployments and multiply its effective quota. If residency names
-one region, the quota in that region is the ceiling and the plan must be built around it, including
-lead time for increase requests. Model availability is also regional: the newest model may reach
-some regions months after others. Cross-region inference profiles, global and data-zone deployment
-types and global endpoints are the providers' tools for borrowing capacity from elsewhere; using
-them is a residency decision as much as a capacity one.
+- **Quotas are per region, which cuts both ways.** If residency allows, spread across several regions or
+  Azure deployments and multiply effective quota. If residency names one region, that region's quota is
+  the ceiling, and the plan must include lead time for increase requests.
+- **Model availability is regional too:** the newest model may reach some regions months after others.
+- **Borrowing capacity is a residency decision.** Cross-region inference profiles, global and data-zone
+  deployment types and global endpoints borrow capacity from elsewhere; using them is a residency
+  decision as much as a capacity one.
 
 ### The client-side design
-1. **Measure demand in the provider's units.** Peak tokens per minute in and out, peak requests
-   per minute, per model, per region, from your own telemetry, with `max_tokens` included in the
-   input-side estimate when the provider reserves it.
-2. **Limit yourself below the quota.** A gateway-level token bucket at roughly 80–90% of each
-   quota smooths bursts, so the provider never sees a storm and the first rejection happens in your
-   queue, where you control priority.
-3. **Queue with priority and bound the wait.** Interactive traffic ahead of batch; shed or defer
-   when the queue exceeds the latency budget rather than letting everything time out.
-4. **Retry correctly.** Honour `Retry-After`, add jitter, cap attempts, and open a circuit breaker
-   when the failure rate shows the pool is overloaded, since retries cannot create capacity.
-5. **Spread and fall back.** Weighted routing across regions, deployments, accounts or providers
-   where allowed, with the fallback order chosen by residency and quality constraints. Spreading
-   across accounts is legitimate when they map to real organisational boundaries; creating accounts
-   purely to multiply a limit can breach a provider's terms, so check them and prefer a quota
-   increase or reserved capacity.
-6. **Buy reserved capacity for the base load** and use pay-as-you-go for burst, with batch APIs for
+1. **Measure demand in the provider's units.** Peak tokens per minute in and out, peak requests per minute,
+   per model, per region, from your own telemetry, with `max_tokens` included in the input-side estimate
+   when the provider reserves it.
+2. **Limit yourself below the quota.** A gateway-level token bucket at roughly 80–90% of each quota smooths
+   bursts, so the provider never sees a storm and the first rejection happens in your queue, where you
+   control priority.
+3. **Queue with priority and bound the wait.** Interactive traffic ahead of batch; shed or defer when the
+   queue exceeds the latency budget rather than letting everything time out.
+4. **Retry correctly.** Honour `Retry-After`, add jitter, cap attempts, and open a circuit breaker when the
+   failure rate shows the pool is overloaded, since retries cannot create capacity.
+5. **Spread and fall back.** Weighted routing across regions, deployments, accounts or providers where
+   allowed, with the fallback order chosen by residency and quality constraints.
+6. **Mind the terms when spreading across accounts.** It is legitimate when accounts map to real
+   organisational boundaries; creating accounts purely to multiply a limit can breach a provider's terms,
+   so check them and prefer a quota increase or reserved capacity.
+7. **Buy reserved capacity for the base load** and use pay-as-you-go for burst, with batch APIs for
    offline work because they have separate limits and typically a lower price.
-7. **Operate the quota.** Alert on remaining-budget headers and 429 rates; file increases before
-   growth, not during the incident; keep a table of quota per model per region in the runbook.
+8. **Operate the quota.** Alert on remaining-budget headers and 429 rates; file increases before growth,
+   not during the incident; keep a table of quota per model per region in the runbook.
 
-## Example
-A gateway-side limiter that budgets tokens the way the provider does (reserving `max_tokens`),
-routes across a pool of deployments, honours `Retry-After`, and refuses to retry into an overloaded
-pool. Deployment names and quotas are placeholders.
+## Diagram
+One request through a gateway that limits itself below quota: a 429 means wait as told, an overload
+error means stop sending to that deployment for a while and try another.
+
+```mermaid
+sequenceDiagram
+    participant A as App
+    participant G as Gateway limiter
+    participant D1 as Deployment A
+    participant D2 as Deployment B
+    A->>G: request, prompt plus max_tokens
+    Note over G: debit token and request buckets at 85% of quota
+    G->>D1: send
+    D1-->>G: 429 with Retry-After
+    Note over G: wait Retry-After plus jitter, cap attempts
+    G->>D1: retry
+    D1-->>G: 529 overloaded
+    Note over G: open circuit on A for 30 s
+    G->>D2: send to next deployment
+    D2-->>G: 200 plus remaining-budget headers
+    G-->>A: response
+```
+
+## Examples
+### Gateway limiter that budgets like the provider
+Budgets tokens the way the provider does (reserving `max_tokens`), routes across a pool of deployments,
+honours `Retry-After`, and refuses to retry into an overloaded pool. Deployment names and quotas are
+placeholders.
 
 ```python
 import time, random, threading
@@ -183,48 +210,96 @@ def call(send, prompt_tokens, max_tokens, attempts=4):
     raise RuntimeError("quota exhausted: shed or defer this request")
 ```
 
-The limiter admits only when both the request budget and the token budget of the chosen deployment
-have room, which is the condition the provider will check, and it debits only the deployment the
-request is actually sent to (debiting every candidate would silently burn the others' budgets).
-Running it at 85% of quota keeps a margin for estimation drift. A production version would also
-refund the unused part of `max_tokens` when the response reports its real usage, if the provider
-does the same.
+- **Admission matches the provider's check:** it admits only when both the request budget and the token
+  budget of the chosen deployment have room.
+- **It debits only the deployment actually used;** debiting every candidate would silently burn the
+  others' budgets.
+- **85% of quota** keeps a margin for estimation drift.
+- **A production version would also refund** the unused part of `max_tokens` when the response reports
+  its real usage, if the provider does the same.
+
+### Which limit binds? A ceiling calculator
+Plug in your quotas to see the request ceiling, and notice that fixing one limit exposes the next.
+
+```python
+def binding_rpm(tpm, rpm, prompt_tokens, max_tokens, concurrency=None, secs_per_request=None):
+    """Requests per minute you can actually get: the lowest of the limits binds."""
+    limits = {
+        "RPM quota": rpm,
+        "TPM quota / tokens charged": tpm / (prompt_tokens + max_tokens),  # providers that reserve output
+    }
+    if concurrency:
+        limits["concurrency cap (Little's Law)"] = concurrency / secs_per_request * 60
+    name = min(limits, key=limits.get)
+    return name, int(limits[name])
+
+# 400k TPM and 1,000-token prompts; the RPM quota of 10,000 is a placeholder.
+print(binding_rpm(400_000, 10_000, 1_000, 4_000))   # ('TPM quota / tokens charged', 80)
+print(binding_rpm(400_000, 10_000, 1_000, 800))     # ('TPM quota / tokens charged', 222)
+print(binding_rpm(400_000, 10_000, 1_000, 800, concurrency=50, secs_per_request=15))
+# ("concurrency cap (Little's Law)", 200): fix max_tokens and the next limit binds
+```
+
+## Production patterns
+- **Self-limit below quota.** For every deployment, run a gateway token bucket at 80–90% of TPM and RPM
+  (as in the limiter above), so rejections happen in your priority queue. Monitor local queue wait and
+  provider 429s, which should stay near zero.
+- **Throttle on remaining-budget headers.** Export `x-ratelimit-remaining-tokens` (OpenAI) or
+  `anthropic-ratelimit-tokens-remaining` (Anthropic) as a gauge and slow admission as it nears zero.
+  Monitor the gauge's minimum per minute alongside 429 counts.
+- **Right-size `max_tokens` per endpoint.** Set it from observed output-length percentiles plus a margin,
+  not a large default. Monitor the truncation rate: responses ending because they hit the limit
+  (`finish_reason` of `length` on OpenAI, `stop_reason` of `max_tokens` on Anthropic).
+- **Circuit-break overloaded deployments.** On 503 or 529, stop sending to that deployment for a cooldown
+  and fail over within the residency rules. Monitor open circuits per deployment and overload rate while
+  under quota.
+- **Batch APIs for offline work.** Send evaluations, backfills and nightly jobs to the provider's batch API,
+  which has separate limits and typically a lower price. Monitor batch turnaround against the job's
+  deadline.
+- **Quota register in the runbook.** One table of quota, current peak and increase lead time per model per
+  region, reviewed before each launch. Monitor peak demand as a share of quota and file increases well
+  before it nears the self-limit.
 
 ## Trade-offs
-- Self-limiting below quota prevents 429 storms and lets you prioritise, but it leaves a slice of
-  paid-for quota unused; the margin should shrink as your token estimates get better.
-- Spreading across regions or deployments multiplies quota and availability, but it weakens the
-  residency guarantee and splits prefix-cache and provisioned-capacity benefits across endpoints.
-- Reserved capacity removes 429 and overload risk for the base load, but it is billed by the hour
-  whether used or not; it pays when steady load fills most of it or an SLO forbids shed traffic.
-- Setting `max_tokens` tightly frees quota and lowers reservation waste, but a value below what
-  real answers need truncates output; tune it per endpoint from observed output-length percentiles.
-- Batch APIs give separate limits and a lower price, but hours of turnaround; they flip from useful
-  to useless when a workload is interactive or has a deadline inside the batch window.
+- **Self-limiting vs unused quota.** Limiting below quota prevents 429 storms and lets you prioritise, but
+  leaves a slice of paid-for quota unused; the margin should shrink as your token estimates get better.
+- **Spreading vs residency and cache benefits.** Spreading across regions or deployments multiplies quota
+  and availability, but weakens the residency guarantee and splits prefix-cache and provisioned-capacity
+  benefits across endpoints.
+- **Reserved capacity vs hourly billing.** It removes 429 and overload risk for the base load, but is billed
+  by the hour whether used or not; it pays when steady load fills most of it or an SLO forbids shed traffic.
+- **Tight `max_tokens` vs truncation.** A tight value frees quota and lowers reservation waste, but a value
+  below what real answers need truncates output; tune it per endpoint from observed output-length
+  percentiles.
+- **Batch APIs vs turnaround.** They give separate limits and a lower price, but hours of turnaround; they
+  flip from useful to useless when a workload is interactive or has a deadline inside the batch window.
 
 ## Pitfalls
-- Retrying 429s immediately and without a cap; the symptom is latency rising across every endpoint
-  while throughput stays flat, because retries are consuming the budget that fresh requests need.
-- Leaving `max_tokens` at a large default; the symptom is hitting TPM at a fraction of the token
-  volume the quota suggests, visible as 429s with low measured output tokens.
-- Planning capacity in one region without checking model availability and quota there; the
-  symptom is a launch waiting on a quota-increase ticket.
-- Treating a quota as a capacity guarantee; the symptom is overload errors during a provider-wide
-  peak while your dashboards show you well under quota.
-- Ignoring remaining-budget headers; the symptom is learning about exhaustion from the first 429
-  instead of throttling smoothly before it.
-- Enabling cross-region or global routing to fix a quota problem on a residency-bound workload; the
-  symptom is an audit finding rather than a runtime error.
+- **Retrying 429s immediately and without a cap.** Symptom: latency rising across every endpoint while
+  throughput stays flat, because retries consume the budget that fresh requests need.
+- **Leaving `max_tokens` at a large default.** Symptom: hitting TPM at a fraction of the token volume the
+  quota suggests, visible as 429s with low measured output tokens.
+- **Planning capacity in one region without checking model availability and quota there.** Symptom: a
+  launch waiting on a quota-increase ticket.
+- **Treating a quota as a capacity guarantee.** Symptom: overload errors during a provider-wide peak while
+  your dashboards show you well under quota.
+- **Ignoring remaining-budget headers.** Symptom: learning about exhaustion from the first 429 instead of
+  throttling smoothly before it.
+- **Enabling cross-region or global routing to fix a quota problem on a residency-bound workload.**
+  Symptom: an audit finding rather than a runtime error.
 
 ## When to use
-This is relevant to every workload on a hosted model API. Plan quotas when you choose the model and
-region, not at launch: convert peak demand into the provider's units, compare with the current
-allocation per model per region, and file increases with weeks of lead time. Put a self-limiter,
-priority queue and correct retry logic in the gateway from day one; add spreading across regions or
-deployments when residency allows and demand exceeds one region's quota; buy reserved capacity when
-there is a steady base load or an SLO at peak. Measure 429 and overload rates, remaining budget,
-queue wait time, and actual versus reserved output tokens. In interviews, expect questions on why
-retries do not fix sustained 429s and why `max_tokens` affects throughput before it affects cost.
+- **Applies to** every workload on a hosted model API.
+- **Plan quotas when you choose the model and region,** not at launch: convert peak demand into the
+  provider's units, compare with the current allocation per model per region, and file increases with
+  weeks of lead time.
+- **Day one in the gateway:** a self-limiter, priority queue and correct retry logic.
+- **Add later:** spreading across regions or deployments when residency allows and demand exceeds one
+  region's quota; reserved capacity when there is a steady base load or an SLO at peak.
+- **Measure** 429 and overload rates, remaining budget, queue wait time, and actual versus reserved output
+  tokens.
+- **Interviews:** expect questions on why retries do not fix sustained 429s and why `max_tokens` affects
+  throughput before it affects cost.
 
 ## Role lens
 - **Engineer:** Implements token-aware limiting, priority queueing and `Retry-After` handling in the
@@ -251,6 +326,42 @@ to the batch API, which has separate limits. Fourth, file a quota increase with 
 and if a peak SLO exists, buy provisioned capacity in the same region for the base load. Spreading
 to other regions is off the table because of residency, so the plan is efficiency, prioritisation
 and reserved capacity in-region.
+
+## Interview questions
+### Why do providers set limits per model, per region and per account, and what does that mean for your plan?
+- **Per model** because models differ in cost and capacity, **per region** because the GPU fleet is
+  regional, **per account** because that is the billing and abuse boundary.
+- **For your plan:** demand must be converted into each provider's units for each model-region pair, and
+  the lowest limit in the region you are allowed to use is your real ceiling.
+- **Tiers rise with spend,** so a new account may need a growth path before launch, not just a ticket.
+
+### You are under quota but still getting errors at peak. What is going on?
+- **Quota is not capacity:** it governs your admission, not whether the shared regional pool has room.
+- **Signs:** overload or capacity errors (Anthropic's 529, Bedrock throttling exceptions, Azure 429s on a
+  deployment under its TPM) during provider-wide peaks.
+- **Response:** circuit-break and fail over where residency allows, and buy reserved capacity for the base
+  load if you have a peak SLO.
+
+### How is retry logic for an LLM gateway different from retrying an ordinary HTTP call?
+- **A sustained 429 is not transient,** so blind retries become a retry storm that consumes the budget
+  fresh requests need.
+- **Do instead:** honour `Retry-After`, add jitter, cap attempts, queue by priority, and shed or defer when
+  the wait exceeds the latency budget.
+- **Treat overload separately:** open a circuit on a deployment returning 503 or 529, because retries
+  cannot create capacity.
+
+### Your provider caps you at 50 concurrent requests and long generations take 15 seconds. What is your ceiling, and what moves it?
+- **Little's Law:** 50 ÷ 15 s × 60 = 200 requests per minute, whatever the token quota says.
+- **Shorter requests raise it:** a tighter `max_tokens` or smaller outputs cut seconds per request.
+- **Otherwise:** a higher concurrency cap, reserved capacity, or spreading across deployments where
+  residency allows.
+
+### When would you not spread traffic across regions or accounts to get more quota?
+- **When residency names a region:** cross-region and global routing violate it silently and surface as
+  an audit finding.
+- **When accounts would exist only to multiply a limit:** that can breach the provider's terms; prefer an
+  increase or reserved capacity.
+- **When prefix caching or a reservation matters:** spreading splits those benefits across endpoints.
 
 ## Quiz
 ### Q: Why does retrying immediately after a 429 fail to improve throughput under sustained demand?

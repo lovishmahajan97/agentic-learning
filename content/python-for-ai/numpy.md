@@ -114,6 +114,24 @@ Indexing is arithmetic on strides, so many operations return a *view* sharing th
 - **Use `rng = np.random.default_rng(seed)` and pass `rng` around** rather than seeding global state,
   because explicit generators make experiments reproducible and do not interfere across libraries.
 
+## Diagram
+One buffer, many behaviours: the operation you choose decides whether you get a free view, a gathered
+copy or a compiled loop, and the C-extension boundary is where a copy is correct.
+
+```mermaid
+flowchart TD
+    B[("Raw buffer, one dtype")] --> M["Metadata: dtype, shape, strides"]
+    M --> O{"Which operation?"}
+    O -->|"basic slice, transpose, reshape when strides allow"| V["View: new strides, same buffer"]
+    O -->|"fancy index or boolean mask"| C["Copy: gather into new memory"]
+    O -->|"ufunc, reduction, matmul"| K["Compiled loop or BLAS over the buffer"]
+    V -.->|"writes go through to"| B
+    K --> R["Result array, a full temporary"]
+    V --> X{"Passing to a C extension?"}
+    X -->|"not C-contiguous or wrong dtype"| A["np.ascontiguousarray once at the boundary"]
+    X -->|"already contiguous float32"| P["Pass the pointer as is"]
+```
+
 ## Examples
 ### Exact top-k cosine search
 Exact top-k cosine search over 100,000 embeddings, the core of every retrieval prototype.
@@ -248,6 +266,44 @@ top of 3 GB for D and about 154 MB for Q. Normalize both once, then process quer
 row and keep only those indices and scores, discarding the full block. If this runs regularly, an
 approximate nearest-neighbour index is the right tool, with the exact batched computation kept as the
 recall baseline.
+
+## Interview questions
+### Why is a NumPy dot product so much faster than the same loop over Python lists?
+- **Lists hold pointers to boxed objects:** each element costs pointer chases, type checks, a result
+  allocation and an interpreter dispatch.
+- **An ndarray is one unboxed, typed buffer:** the loop runs in C, or in BLAS for `@`, over contiguous
+  memory with SIMD and often several cores.
+- **Memory follows:** values take exactly `n × d × itemsize` bytes and stay cache-friendly instead of
+  being scattered across the heap.
+
+### A recall metric looks plausible but is wrong after a refactor. How could broadcasting cause that?
+- **The classic bug:** `(N,) - (N, 1)` broadcasts to an `(N, N)` matrix with no error, so a mean is
+  silently taken over N² pairs.
+- **How to find it:** print or assert `shape` at each step; an unexpected 2-D intermediate, or a sudden
+  `MemoryError` at large N, gives it away.
+- **Fix:** keep reduced axes with `keepdims=True`, or reshape explicitly so both operands have the shape
+  you wrote down.
+
+### Memory doubled after a pipeline change. What do you check?
+- **Dtype promotion:** one float64 operand, such as a weights vector built with `np.array([...])`, turns
+  a float32 pipeline into float64. Under NumPy 2 a NumPy `float64` scalar also upcasts.
+- **The numbers:** 1,000,000 768-d embeddings take 3.1 GB in float32 but 6.1 GB in float64.
+- **Prevent it:** assert `x.dtype == np.float32` at stage boundaries and log `x.nbytes`, so the doubling
+  shows up in logs before it shows up as an OOM.
+
+### When is a view dangerous, and when should you copy deliberately?
+- **Aliasing:** basic slices share the buffer, so `head = docs[:10]` followed by `head[:] = 0` zeroes rows
+  of `docs`; call `.copy()` before mutating shared data.
+- **C-extension boundaries:** transposed or strided views are not C-contiguous, and code that takes a
+  raw pointer expects that layout. Convert once with `np.ascontiguousarray(a, dtype=np.float32)`.
+- **Otherwise prefer views:** slicing a 307 MB array costs nothing.
+
+### Why use `argpartition` rather than `argsort` for top-k retrieval?
+- **Less work:** `argpartition` selects the k best in O(N) without ordering them, while a full sort of
+  100,000 scores is O(N log N) to find 5.
+- **Then sort only k:** index the k scores and `argsort` just those.
+- **Batched form:** with `axis=1` and `np.take_along_axis`, the same trick keeps only k results per query
+  row, which bounds memory in batched search.
 
 ## Quiz
 ### Q: Which operation returns a view sharing memory with the original array `a` of shape (1000, 64)?

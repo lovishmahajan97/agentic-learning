@@ -5,7 +5,7 @@ name: Streams & backpressure
 kind: concept
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - node-ts-for-ai/abortcontroller-and-cancellation
   - node-ts-for-ai/event-loop-and-microtask-queue
@@ -20,106 +20,122 @@ sources:
 ---
 
 ## TL;DR
-A stream processes data in chunks as it arrives instead of buffering everything, which is how a
-token-by-token model response reaches a browser with sub-second first-token latency. Backpressure is
-the flow-control rule that makes this safe: when the consumer is slower than the producer, the
-producer is told to pause, so memory stays bounded. Node has two stream APIs (classic `node:stream`
-and WHATWG Web Streams, used by `fetch`), and `pipeline`/`pipeTo` are what wire them together with
-error propagation and backpressure intact.
+Streams process data in chunks as it arrives, so model tokens reach a browser with sub-second first-token
+latency. Backpressure pauses a fast producer when the consumer lags, keeping memory bounded; `pipeline` and
+`pipeTo` wire Node and Web streams with errors and backpressure intact.
 
 ## Why it exists
-An LLM answer of 800 tokens takes on the order of ten seconds to generate at typical decode rates of
-tens of tokens per second. Waiting for the whole thing and then
-sending it makes the user stare at a blank screen for the full duration; streaming each token as it is
-produced turns the same latency into a visibly "typing" response with time-to-first-token measured in
-hundreds of milliseconds. The same shape appears everywhere in AI systems: a 300 MB PDF corpus to chunk
-and embed, a JSONL export of a million rows to score, audio frames to transcribe. Loading any of these
-into memory first means memory proportional to input size, and a single large input takes the process
-down.
-
-Streaming alone is not enough, though, because the two ends rarely run at the same speed. A model API
-pushes tokens faster than a phone on a poor connection can acknowledge them; a file reader can produce
-64 KiB chunks far faster than an embedding call can consume them. Without a rule for the mismatch, the
-fast side's output piles up in buffers in your process. Size it honestly: a chat answer is small (800
-tokens is a few KB of text, perhaps tens of KB once each token is wrapped in an SSE JSON event), so
-for text chat the unbounded buffer is a latent bug more than an outage. Bulk payloads are different.
-Raw 24 kHz 16-bit mono speech is 48,000 bytes per second; a 60-second synthesized answer is about
-2.9 MB, and a thousand stalled mobile clients is about 2.9 GB of heap, and the process dies of memory
-pressure while every request looks healthy. The same arithmetic applies to file downloads, exports and
-proxied uploads. The naive fix, "make the consumer faster", does not exist
-for a network you do not control. Backpressure is the actual fix: the consumer's capacity propagates
-backwards to the producer, which stops reading from its own source until there is room. Node's stream
-abstractions exist to make that propagation automatic, and to make errors and early termination
-propagate along the same path.
+- **Users should not wait for the whole answer.** An 800-token answer takes on the order of ten seconds at
+  typical decode rates of tens of tokens per second. Streaming turns that into a visibly "typing" response
+  with time-to-first-token in hundreds of milliseconds.
+- **Inputs are often unbounded.** A 300 MB PDF corpus to chunk and embed, a JSONL export of a million rows to
+  score, audio frames to transcribe. Loading them first means memory proportional to input size, and one
+  large input takes the process down.
+- **The two ends rarely match speed.** A model API pushes tokens faster than a phone on a poor connection can
+  acknowledge them; a file reader produces 64 KiB chunks far faster than an embedding call consumes them.
+  Without a rule, the fast side's output piles up in your process.
+- **Size it honestly.** Text chat is small (800 tokens is a few KB, perhaps tens of KB as SSE JSON events), so
+  an unbounded buffer is a latent bug. Raw 24 kHz 16-bit mono speech is 48,000 bytes per second: a 60-second
+  answer is about 2.9 MB, and a thousand stalled mobile clients is about 2.9 GB of heap. The same arithmetic
+  applies to file downloads, exports and proxied uploads.
+- **Backpressure is the actual fix.** "Make the consumer faster" does not exist for a network you do not
+  control. The consumer's capacity propagates backwards so the producer stops reading its source until there
+  is room; Node's stream abstractions make that, plus error and early-termination propagation, automatic.
 
 ## How it works
 ### The classic `node:stream` types
-- **Readable** — a source you pull from (`fs.createReadStream`, an HTTP request body, a socket).
-- **Writable** — a sink you push into (an HTTP response, a file, a socket).
-- **Duplex** — both, independently (a TCP socket).
-- **Transform** — a Duplex where output is computed from input (gzip, a line splitter, an SSE parser).
+| Type | Role | Examples |
+|---|---|---|
+| **Readable** | A source you pull from | `fs.createReadStream`, an HTTP request body, a socket |
+| **Writable** | A sink you push into | An HTTP response, a file, a socket |
+| **Duplex** | Both, independently | A TCP socket |
+| **Transform** | A Duplex whose output is computed from input | gzip, a line splitter, an SSE parser |
 
-Each has an internal buffer bounded by `highWaterMark` (bytes for byte streams, item count in
-`objectMode`, where the default is 16 objects; the byte default is tens of KiB and was raised in recent
-Node versions, so set it explicitly when it matters). It is a *threshold*, not a hard cap: the stream
-will accept a write beyond it, but reports that it would rather you stopped. Worst-case memory per
-stream is therefore roughly the sum of the `highWaterMark`s along the chain plus one chunk per stage,
-which is what makes per-process memory budgetable: that figure times maximum concurrency.
+- **Each has a buffer bounded by `highWaterMark`:** bytes for byte streams, item count in `objectMode` (where
+  the default is 16 objects). The byte default is tens of KiB and was raised in recent Node versions, so set
+  it explicitly when it matters.
+- **It is a *threshold*, not a hard cap.** The stream accepts a write beyond it but reports that it would
+  rather you stopped.
+- **Memory becomes budgetable.** Worst case per stream is roughly the sum of the `highWaterMark`s along the
+  chain plus one chunk per stage; per process, that figure times maximum concurrency.
 
 ### The backpressure protocol
-`writable.write(chunk)` returns `false` when the internal buffer has reached `highWaterMark`. The
-contract is that the producer stops writing and waits for the `'drain'` event, then resumes. On the
-readable side, when nobody is consuming (the destination said stop), the readable stops calling its
-underlying `_read`, so the OS socket buffer fills, and TCP's own flow control eventually tells the
-remote server to slow down. That chain, from a slow browser through your process back to the model
-provider's socket, is backpressure end to end. It only works if every link honours the signal, which is
-why hand-written `on('data', chunk => res.write(chunk))` loops are the classic bug: they ignore the
-`false` return and buffer without bound.
+1. **`writable.write(chunk)` returns `false`** when the internal buffer has reached `highWaterMark`.
+2. **The producer stops writing** and waits for the `'drain'` event, then resumes.
+3. **The readable stops calling `_read`** when nobody consumes it (the destination said stop), so the OS
+   socket buffer fills.
+4. **TCP flow control** then tells the remote server to slow down.
+
+- **End to end:** from a slow browser, through your process, back to the model provider's socket.
+- **Every link must honour the signal.** Hand-written `on('data', chunk => res.write(chunk))` loops are the
+  classic bug: they ignore the `false` return and buffer without bound.
 
 ### `pipe` versus `pipeline`
-`readable.pipe(writable)` implements the pause/drain dance for you, but it does not forward errors or
-clean up: if the destination errors or closes, the source is merely unpiped and left paused, never
-destroyed, so its file descriptor or upstream HTTP connection stays open; if the source errors, the
-destination is not closed. Both leak. `stream.pipeline(src, ...transforms, dest, cb)` (or its promise form in `node:stream/promises`)
-wires backpressure *and* error propagation *and* cleanup: an error or early close anywhere destroys
-every stream in the chain and the callback receives the error. There is almost no reason to use `pipe`
-in a server.
+| | `readable.pipe(writable)` | `stream.pipeline(src, ...transforms, dest, cb)` |
+|---|---|---|
+| Pause/drain | Yes | Yes |
+| Destination errors or closes | Source merely unpiped and left paused, never destroyed: its file descriptor or upstream HTTP connection stays open | Every stream in the chain destroyed |
+| Source errors | Destination not closed | Callback receives the error |
+| Verdict | Both directions leak | Backpressure *and* error propagation *and* cleanup |
+
+- **Promise form** lives in `node:stream/promises`. There is almost no reason to use `pipe` in a server.
 
 ### Async iteration
-Readables are async iterables: `for await (const chunk of readable)` pulls one chunk at a time and
-naturally applies backpressure because the loop body must finish before the next chunk is requested.
-`Readable.from(asyncGenerator)` goes the other way. For token streams this is often the clearest code:
-an async generator that yields parsed events, consumed by a loop that writes to the response and
-awaits `drain` when needed.
+- **Readables are async iterables.** `for await (const chunk of readable)` pulls one chunk at a time and
+  applies backpressure naturally, because the loop body must finish before the next chunk is requested.
+- **The other direction:** `Readable.from(asyncGenerator)`.
+- **Often clearest for tokens:** an async generator yielding parsed events, consumed by a loop that writes to
+  the response and awaits `drain` when needed.
 
 ### Web Streams
-`fetch` in Node returns `response.body` as a WHATWG `ReadableStream`, the same API as browsers and the
-one many AI SDKs expose. It has the same ideas with different names: a queuing strategy with a
-`highWaterMark`, `pipeThrough(transformStream)`, `pipeTo(writable)` with error and abort propagation,
-and `reader.read()` for manual pulling. Backpressure is pull-based: a `ReadableStream`'s source
-`pull()` is called only while the queue's `desiredSize` (high-water mark minus queued size) is
-positive, and a writer exposes `writer.ready`, a promise that resolves when there is room, as the
-equivalent of waiting for `'drain'`. `Readable.fromWeb()` and `Readable.toWeb()` convert between the
-two worlds, which you need when a provider SDK hands you a Web stream and your HTTP framework wants a
-Node stream (or the reverse). Both kinds are async-iterable, so `for await` works on either.
+- **What `fetch` returns.** In Node, `response.body` is a WHATWG `ReadableStream`, the same API as browsers and
+  the one many AI SDKs expose.
+- **Same ideas, different names:** a queuing strategy with a `highWaterMark`, `pipeThrough(transformStream)`,
+  `pipeTo(writable)` with error and abort propagation, and `reader.read()` for manual pulling.
+- **Pull-based backpressure.** A `ReadableStream`'s source `pull()` is called only while the queue's
+  `desiredSize` (high-water mark minus queued size) is positive.
+- **The `'drain'` equivalent:** `writer.ready`, a promise that resolves when there is room.
+- **Bridging.** `Readable.fromWeb()` and `Readable.toWeb()` convert between the two worlds, needed when a
+  provider SDK hands you a Web stream and your framework wants a Node stream (or the reverse). Both kinds are
+  async-iterable, so `for await` works on either.
 
 ### Framing on the wire: SSE and chunked bodies
-A token stream has no natural chunk boundaries at the TCP level; a chunk may contain half a JSON
-event. Providers therefore frame events with Server-Sent Events (`data: {...}\n\n`), and a Transform
-on your side must buffer partial lines until a blank line arrives, and must decode bytes with a
-`StringDecoder` (or `TextDecoderStream`) because a chunk boundary can fall inside a multi-byte UTF-8
-character. A `Transform` enforces backpressure at chunk granularity for you: it does not call
-`_transform` with the next chunk until its readable side has been drained below `highWaterMark`. One
-chunk that expands into fifty events overshoots the threshold by that one chunk's output, which is
-bounded. Backpressure truly breaks in a hand-written `Readable` or event-driven producer that keeps
-calling `push()` after it has returned `false`; that buffer has no bound.
+- **TCP has no event boundaries;** a chunk may contain half a JSON event.
+- **Providers frame events with Server-Sent Events** (`data: {...}\n\n`), so your Transform must buffer partial
+  lines until a blank line arrives.
+- **Decode with a `StringDecoder`** (or `TextDecoderStream`), because a chunk boundary can fall inside a
+  multi-byte UTF-8 character.
+- **A `Transform` enforces backpressure per chunk.** It does not call `_transform` with the next chunk until
+  its readable side drains below `highWaterMark`. One chunk that expands into fifty events overshoots by that
+  one chunk's output, which is bounded.
+- **Where backpressure truly breaks:** a hand-written `Readable` or event-driven producer that keeps calling
+  `push()` after it has returned `false`; that buffer has no bound.
 
-## Example
-A Transform that reframes a provider's SSE stream into newline-delimited JSON for the browser, wired
-with `pipeline` so a client disconnect or upstream error tears down the whole chain. On client
-disconnect the `AbortSignal` cancels the upstream `fetch` and closes that connection; most providers
-stop generating when the connection drops, but whether partial output is still billed is
-vendor-specific.
+## Diagram
+The happy path flows right; the backpressure signal flows back from the slow client to the provider's
+socket. `pipeline` carries errors and aborts along the same chain.
+
+```mermaid
+flowchart TD
+    M["Model provider"] -->|"SSE bytes"| R["Readable.fromWeb(fetch body)"]
+    R --> T["Transform: SSE to NDJSON"]
+    T --> W["ServerResponse"]
+    W --> C["Slow mobile client"]
+    C -.->|"buffer over highWaterMark"| W
+    W -.->|"write returns false"| T
+    T -.->|"stop pulling"| R
+    R -.->|"TCP window fills"| M
+    C -->|"close"| A["AbortController aborts fetch"]
+```
+
+## Examples
+### SSE-to-NDJSON proxy with `pipeline`
+A Transform that reframes a provider's SSE stream into newline-delimited JSON for the browser, wired with
+`pipeline` so a client disconnect or upstream error tears down the whole chain.
+
+On client disconnect the
+`AbortSignal` cancels the upstream `fetch` and closes that connection; most providers stop generating when
+the connection drops, but whether partial output is still billed is vendor-specific.
 
 ```ts
 import { Transform, Readable, type TransformCallback } from "node:stream";
@@ -170,49 +186,98 @@ export async function proxy(req: IncomingMessage, res: ServerResponse) {
 }
 ```
 
+### Seeing `write()` return `false`
+Save as `bp.mjs` and run `node bp.mjs`. A slow sink takes 5 ms per 4 KiB frame. Honouring `'drain'` keeps the
+buffer at the 16 KiB threshold; delete the `await` line and the same loop buffers all 200 frames.
+
+```js
+import { Writable } from "node:stream";
+import { once } from "node:events";
+
+const slow = new Writable({
+  highWaterMark: 16 * 1024,                         // 16 KiB threshold
+  write(_chunk, _enc, cb) { setTimeout(cb, 5); },   // a slow client: 5 ms per chunk
+});
+
+let peak = 0;
+for (let i = 0; i < 200; i++) {
+  const ok = slow.write(Buffer.alloc(4096));        // one 4 KiB audio frame
+  peak = Math.max(peak, slow.writableLength);
+  if (!ok) await once(slow, "drain");               // honour backpressure
+}
+slow.end();
+console.log(`peak buffered: ${peak} bytes`);         // 16384 with the await, 819200 without
+```
+
+### Worked scenario: memory budget for a TTS gateway
+Raw 24 kHz 16-bit mono PCM is 48,000 bytes per second, streamed to mobile clients.
+
+| Design | Per stalled client | 1,000 stalled clients |
+|---|---|---|
+| Manual `'data'` → `res.write`, 60-second answer | ~2.9 MB (whole answer buffered) | ~2.9 GB heap: process killed |
+| `pipeline` with an explicit 64 KiB `highWaterMark` at each of 3 stages | ~192 KiB plus one chunk per stage | ~190 MiB, budgetable |
+| Same, plus abort upstream on client `'close'` | Freed when the client leaves | Abandoned streams stop costing memory and tokens |
+
+## Production patterns
+- **`pipeline` everywhere, with the request's signal.** Use `pipeline(src, ...transforms, res, { signal })`
+  from `node:stream/promises` for every proxied stream, and treat errors after an abort as normal. Monitor
+  open file descriptors and upstream sockets after client disconnects.
+- **Abort upstream on client close.** Register `res.on("close", () => ac.abort())` and pass `ac.signal` to the
+  provider `fetch` or SDK call. Monitor upstream streams still open after disconnect and tokens billed for
+  aborted requests.
+- **Turn off buffering in the path.** Send `X-Accel-Buffering: no` (or set `proxy_buffering off` in nginx, or
+  the equivalent in your load balancer) and exclude streamed routes from compression middleware. Monitor
+  time-to-first-token as measured at the client, not the server.
+- **Per-stream buffered-bytes metric and slow-client policy.** Sample `res.writableLength` across open
+  responses; for small text answers, drain upstream into a bounded buffer and disconnect clients that stay
+  over a cap. Alert on the p99 of buffered bytes per stream.
+- **Explicit `highWaterMark` for bulk data.** Set it per stage for audio, file and export streams, then
+  compute worst-case memory as stages × threshold × max concurrency and size the container from that.
+
 ## Trade-offs
-- Streaming gives low time-to-first-token and bounded memory, but you lose the ability to validate or
-  moderate the complete output before the user sees it; add a trailing check or stream through a
-  guard stage when the use case demands it.
-- Backpressure protects memory, but it also means a slow client slows the upstream read, holding a
-  provider connection open longer; when the whole response is small (a text chat answer of tens of KB),
-  draining upstream promptly into a bounded per-stream buffer and disconnecting clients that exceed it
-  is often better than perfect flow control. For audio and files, strict backpressure wins.
-- `objectMode` streams of parsed events are convenient and let the `highWaterMark` count events, but
-  each object is a heap allocation; for bulk byte processing stay in `Buffer` mode.
-- Web Streams are portable across runtimes (Node, browsers, edge) and match the AI SDK surfaces, while
-  Node streams have richer tooling and wider framework support; converting between them is cheap but
-  easy to get wrong around error propagation.
-- A larger `highWaterMark` smooths bursty producers and reduces pause/resume churn, at the cost of more
-  memory per stream, which multiplies by concurrency.
+- **Low latency vs whole-output checks.** Streaming gives low time-to-first-token and bounded memory, but you
+  cannot validate or moderate the complete output before the user sees it; add a trailing check or stream
+  through a guard stage when the use case demands it.
+- **Strict backpressure vs upstream hold time.** A slow client slows the upstream read and holds a provider
+  connection open longer. When the response is small (a text chat answer of tens of KB), draining upstream
+  promptly into a bounded per-stream buffer and disconnecting clients that exceed it is often better. For
+  audio and files, strict backpressure wins.
+- **`objectMode` convenience vs allocation.** Parsed-event streams let `highWaterMark` count events, but each
+  object is a heap allocation; for bulk byte processing stay in `Buffer` mode.
+- **Web Streams portability vs Node tooling.** Web Streams are portable across runtimes (Node, browsers, edge)
+  and match AI SDK surfaces; Node streams have richer tooling and wider framework support. Converting is cheap
+  but easy to get wrong around error propagation.
+- **Bigger `highWaterMark` vs memory.** It smooths bursty producers and reduces pause/resume churn, at the cost
+  of more memory per stream, which multiplies by concurrency.
 
 ## Pitfalls
-- Ignoring the `false` return of `write()` in a manual `'data'` handler; the symptom is heap growth
-  proportional to the number of slow clients and eventual out-of-memory under load.
-- Using `pipe` instead of `pipeline`, so an error on the response does not destroy the upstream body;
-  the symptom is leaked file descriptors and upstream connections held open after users disconnect.
-- Writing a custom `Readable` (for example, one fed by an SDK's event callbacks) that keeps calling
-  `push()` after it returns `false`; the symptom is backpressure that "works in tests" but buffers
-  unboundedly when real clients are slow.
-- Decoding each chunk with `chunk.toString()` in a streaming parser; the symptom is occasional `\uFFFD`
+- **Ignoring the `false` return of `write()`** in a manual `'data'` handler. Symptom: heap growth proportional
+  to the number of slow clients and eventual out-of-memory under load.
+- **Using `pipe` instead of `pipeline`,** so an error on the response does not destroy the upstream body.
+  Symptom: leaked file descriptors and upstream connections held open after users disconnect.
+- **A custom `Readable` that keeps calling `push()` after it returns `false`** (for example, one fed by an SDK's
+  event callbacks). Symptom: backpressure that "works in tests" but buffers unboundedly with real slow
+  clients.
+- **Decoding each chunk with `chunk.toString()`** in a streaming parser. Symptom: occasional `\uFFFD`
   replacement characters in non-English or emoji output where a character straddled two chunks.
-- Buffering a whole stream (`await res.text()`) to parse it, then streaming it to the client; the
-  symptom is time-to-first-token equal to total generation time.
-- Reverse proxies or compression middleware buffering the response; the symptom is tokens arriving in
-  one burst at the end even though the server wrote them incrementally (hence nginx's `X-Accel-Buffering: no`
-  header, or the equivalent setting in your proxy, and disabling compression for streamed routes).
-- Not listening for client disconnect and aborting upstream; the symptom is token spend on responses
-  nobody receives.
+- **Buffering the whole stream (`await res.text()`) before streaming it on.** Symptom: time-to-first-token
+  equal to total generation time.
+- **Proxies or compression middleware buffering the response.** Symptom: tokens arrive in one burst at the end
+  although the server wrote them incrementally. Fix: nginx's `X-Accel-Buffering: no` header or the equivalent
+  proxy setting, and no compression on streamed routes.
+- **Not aborting upstream on client disconnect.** Symptom: token spend on responses nobody receives.
 
 ## When to use
-Stream whenever the output is produced incrementally and a human is waiting (chat completions, voice,
-progress of long agent runs), and whenever input size is unbounded (files, exports, logs). Use
-`pipeline` or `pipeTo` rather than manual event wiring, keep one `AbortController` per request tied
-to client disconnect, and build Transforms that respect chunk boundaries. Do not stream when the
-consumer needs the complete result to act (a JSON tool call must be parsed whole) or when the
-response is small and fast. Measure time-to-first-token, per-stream heap, and the count of upstream
-streams still open after client disconnect. In interviews, explain what `write()` returning `false`
-means, why `pipeline` beats `pipe`, and how a slow browser ends up throttling a model provider.
+- **Stream when output is incremental and a human is waiting** (chat completions, voice, progress of long agent
+  runs), and whenever input size is unbounded (files, exports, logs).
+- **Wire with `pipeline` or `pipeTo`,** not manual events; keep one `AbortController` per request tied to
+  client disconnect; build Transforms that respect chunk boundaries.
+- **Do not stream** when the consumer needs the complete result to act (a JSON tool call must be parsed whole)
+  or when the response is small and fast.
+- **Measure:** time-to-first-token, per-stream heap, and the count of upstream streams still open after client
+  disconnect.
+- **Interviews:** explain what `write()` returning `false` means, why `pipeline` beats `pipe`, and how a slow
+  browser ends up throttling a model provider.
 
 ## Role lens
 - **Engineer:** Builds the SSE-to-client proxy with `pipeline`, respects `drain`, converts between Web
@@ -239,6 +304,36 @@ responses. Fix by replacing manual wiring with `pipeline` (or `pipeTo`), which p
 when the response buffer is full, and by aborting the upstream request on client `'close'` so abandoned
 streams stop consuming memory and tokens. Add a per-stream buffered-bytes metric (`res.writableLength`
 sampled across open responses) so a regression is visible.
+
+## Interview questions
+### What is backpressure, and why does streaming need it?
+- **Definition:** the consumer's capacity propagating back to the producer, so the producer pauses instead of
+  piling output into buffers.
+- **Why:** producers (model APIs, file readers) are usually faster than consumers (slow networks, embedding
+  calls), and without the signal memory grows with the number of slow consumers.
+
+### Users say answers appear all at once although the server streams tokens. How do you debug it?
+- **Check the path, not the code:** a reverse proxy, load balancer or compression middleware is buffering the
+  response; compare timing with `curl -N` direct to the service and through the proxy.
+- **Fix:** send `X-Accel-Buffering: no` or disable proxy buffering for the route, and exclude streamed routes
+  from compression.
+
+### When would you not apply strict end-to-end backpressure?
+- **Small text answers:** holding a provider connection open for a slow phone costs more than buffering tens of
+  KB, so drain upstream into a bounded buffer and disconnect clients that exceed it.
+- **Keep it strict for audio, files and exports,** where per-client buffers reach megabytes.
+
+### How do you estimate worst-case stream memory for a service?
+- **Per stream:** the sum of `highWaterMark`s along the chain plus one chunk per stage.
+- **Per process:** that figure times maximum concurrent streams; for example 3 stages × 64 KiB × 1,000 streams
+  is about 190 MiB before chunk overshoot.
+- **Verify:** sample `res.writableLength` in production and compare with the budget.
+
+### Why can `chunk.toString()` corrupt streamed text, and what is the fix?
+- **Cause:** a chunk boundary can split a multi-byte UTF-8 character, so each half decodes to a replacement
+  character.
+- **Fix:** keep a `StringDecoder` (or `TextDecoderStream`) per stream, which holds incomplete bytes until the
+  next chunk arrives.
 
 ## Quiz
 ### Q: What does `writable.write(chunk)` returning `false` mean?

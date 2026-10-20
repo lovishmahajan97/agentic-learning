@@ -5,7 +5,7 @@ name: PostgreSQL transactions & isolation levels
 kind: concept
 difficulty: core
 est_minutes: 18
-status: reviewed
+status: crisp
 related:
   - backend-fundamentals/database-design
   - backend-fundamentals/sql
@@ -22,120 +22,150 @@ sources:
 ---
 
 ## TL;DR
-A transaction makes a group of statements atomic and durable; the isolation level decides what each
-transaction may see of the others while they run. PostgreSQL implements isolation with multi-version
-concurrency control, so readers never block writers, and the default READ COMMITTED level is fast but
-permits lost updates and write skew in read-modify-write code. You fix those with explicit row locks,
-atomic updates, or SERIALIZABLE plus a retry loop.
+A transaction makes statements atomic and durable; the isolation level decides what concurrent
+transactions see. PostgreSQL's MVCC never blocks readers, but default READ COMMITTED permits lost updates
+and write skew; fix them with atomic updates, row locks, or SERIALIZABLE plus retries.
 
 ## Why it exists
-Backends run many requests at once against the same rows. Without transactions, a crash between "insert
-the message" and "increment the tenant's token counter" leaves the two permanently inconsistent, and
-without isolation, two requests that both read a balance, compute a new one and write it back will
-overwrite each other and lose one of the updates. These are not rare races: a budget check before an
-LLM call, a counter of concurrent runs, "create the conversation if it does not exist", and "claim the
-next job" are all read-then-write sequences that run concurrently in any real service.
-
-The naive defence, a global lock in the application, serializes everything and does not survive a second
-server. The classic database answer, two-phase locking, makes readers and writers block each other, so a
-long report query stalls every insert. PostgreSQL instead keeps multiple versions of each row and gives
-each transaction a consistent snapshot, which lets readers and writers proceed concurrently. The
-remaining question, which anomalies a snapshot still permits, is what isolation levels answer, and it is
-where most production data-corruption bugs in otherwise careful code come from. Understanding the
-levels is cheaper than debugging a tenant whose token usage no longer adds up.
+- **Crashes split related writes.** Without transactions, a crash between "insert the message" and
+  "increment the tenant's token counter" leaves the two permanently inconsistent.
+- **Concurrent read-modify-writes lose updates.** Two requests that both read a balance, compute a new one
+  and write it back overwrite each other. Budget checks before an LLM call, a counter of concurrent runs,
+  "create the conversation if it does not exist" and "claim the next job" all run concurrently in any real service.
+- **The naive fixes fail.** A global application lock serializes everything and does not survive a second
+  server. Classic two-phase locking makes readers and writers block each other, so a long report query
+  stalls every insert.
+- **MVCC lets both proceed.** PostgreSQL keeps multiple versions of each row and gives each transaction a
+  consistent snapshot, so readers and writers run concurrently.
+- **Isolation levels say which anomalies remain.** That question is where most production data-corruption
+  bugs in otherwise careful code come from; understanding the levels is cheaper than debugging a tenant
+  whose token usage no longer adds up.
 
 ## How it works
-### ACID in one paragraph
-A transaction (`BEGIN` ... `COMMIT`) is **atomic**: all of its writes become visible together or none do,
-via rollback. **Consistency** means constraints hold at commit. **Isolation** is the subject of this
-lesson. **Durability** means a committed transaction survives a crash, which PostgreSQL achieves by
-writing to the write-ahead log and fsyncing it before acknowledging the commit. That fsync is the floor
-on commit latency, which is why batching many small writes into one transaction is faster than committing
-each, and why `synchronous_commit = off` (per transaction if you like) exists: it acknowledges before the
-flush, risking the loss of the last few commits on a crash, but never corruption.
+### ACID in brief
+| Property | Meaning in PostgreSQL |
+|---|---|
+| **Atomic** | a transaction (`BEGIN` ... `COMMIT`) makes all its writes visible together, or none via rollback |
+| **Consistency** | constraints hold at commit |
+| **Isolation** | the subject of this lesson |
+| **Durability** | a committed transaction survives a crash, because the write-ahead log is fsynced before the commit is acknowledged |
+
+- **That fsync is the floor on commit latency,** which is why batching many small writes into one
+  transaction is faster than committing each.
+- **`synchronous_commit = off`** (per transaction if you like) acknowledges before the flush, risking the
+  last few commits on a crash, but never corruption.
 
 ### MVCC: versions instead of locks
-Every row version carries the id of the transaction that created it (`xmin`) and, once updated or
-deleted, the one that ended it (`xmax`). An `UPDATE` does not overwrite; it writes a new version and
-marks the old one as ended. A transaction takes a **snapshot** (the set of transaction ids that were
-committed when it started looking) and sees exactly the versions that were committed in that snapshot.
-This is why a long `SELECT` never blocks an `UPDATE` and vice versa. Old versions become dead once no
-snapshot can see them, and `VACUUM` reclaims them, which is why long-running or idle-in-transaction
-sessions cause table bloat: they pin old snapshots and prevent cleanup.
+1. **Versions carry ids.** Every row version records the transaction that created it (`xmin`) and, once
+   updated or deleted, the one that ended it (`xmax`).
+2. **Updates append.** An `UPDATE` writes a new version and marks the old one as ended.
+3. **Snapshots decide visibility.** A transaction's **snapshot** is the set of transaction ids committed
+   when it started looking; it sees exactly the versions committed in that snapshot. So a long `SELECT`
+   never blocks an `UPDATE` and vice versa.
+4. **`VACUUM` reclaims dead versions** once no snapshot can see them. Long-running or idle-in-transaction
+   sessions pin old snapshots and prevent cleanup, which causes table bloat.
 
 ### The isolation levels in PostgreSQL
-PostgreSQL offers three distinct behaviours (READ UNCOMMITTED is accepted but behaves as READ COMMITTED,
-because MVCC never exposes uncommitted data):
+PostgreSQL offers three distinct behaviours. READ UNCOMMITTED is accepted but behaves as READ COMMITTED,
+because MVCC never exposes uncommitted data.
 
-1. **READ COMMITTED (default).** Each *statement* takes a fresh snapshot, so a transaction can see
-   different data in two consecutive selects if another transaction committed in between
-   (non-repeatable read). An `UPDATE` that finds its target row changed by a concurrent committed
-   transaction waits, then re-evaluates its `WHERE` on the new version and proceeds. This is fast and
-   rarely aborts, but a read-modify-write in application code is not protected at all.
-2. **REPEATABLE READ.** The snapshot is taken at the first statement and held for the whole transaction,
-   so repeated reads agree and, in PostgreSQL, phantoms do not appear either. If the transaction tries to
-   update a row that another transaction modified and committed since the snapshot, it fails with
-   serialization error `40001` and must be retried. It still permits **write skew**: two transactions
-   each read a condition, both see it true, each writes a *different* row, and the combined result
-   violates the condition.
-3. **SERIALIZABLE.** Serializable snapshot isolation (SSI) tracks read/write dependencies between
-   concurrent transactions and aborts one when it sees the "dangerous structure" (two consecutive
-   read-write dependencies) that any non-serializable cycle must contain. The check is conservative, so it
-   sometimes aborts transactions that would have been fine. The result is as if transactions ran one at
-   a time, with no explicit locking, at the cost of extra bookkeeping and more `40001` aborts under
-   contention. Any code using it must retry.
+1. **READ COMMITTED (default).**
+   - Each *statement* takes a fresh snapshot, so two consecutive selects can differ if another
+     transaction committed in between (non-repeatable read).
+   - An `UPDATE` whose target row was changed by a concurrent committed transaction waits, then
+     re-evaluates its `WHERE` on the new version and proceeds.
+   - Fast and rarely aborts, but a read-modify-write in application code is not protected at all.
+2. **REPEATABLE READ.**
+   - The snapshot is taken at the first statement and held for the whole transaction, so repeated reads
+     agree and, in PostgreSQL, phantoms do not appear either.
+   - Updating a row another transaction modified and committed since the snapshot fails with serialization
+     error `40001`, and must be retried.
+   - Still permits **write skew**: two transactions each read a condition, both see it true, each writes a
+     *different* row, and the combined result violates the condition.
+3. **SERIALIZABLE.**
+   - Serializable snapshot isolation (SSI) tracks read/write dependencies between concurrent transactions
+     and aborts one on the "dangerous structure" (two consecutive read-write dependencies) that any
+     non-serializable cycle must contain.
+   - The check is conservative, so it sometimes aborts transactions that would have been fine.
+   - Result: as if transactions ran one at a time, with no explicit locking, at the cost of extra
+     bookkeeping and more `40001` aborts under contention. Any code using it must retry.
 
 ### The anomalies, side by side
-Naming the anomalies makes the levels easy to compare (PostgreSQL behaviour, which is stricter than the
-SQL standard's minimums):
-- **Dirty read** (seeing another transaction's uncommitted write): impossible at every level.
-- **Non-repeatable read and phantom** (a re-read returns changed values or new rows): possible at READ
-  COMMITTED; prevented at REPEATABLE READ and SERIALIZABLE.
-- **Lost update** (two read-modify-writes, one overwrites the other): possible at READ COMMITTED; at
-  REPEATABLE READ the second writer gets `40001` instead.
-- **Write skew** (two transactions read an overlapping condition and write *different* rows): possible
-  at READ COMMITTED and REPEATABLE READ; prevented only at SERIALIZABLE.
+PostgreSQL behaviour, which is stricter than the SQL standard's minimums:
+
+| Anomaly | What it is | READ COMMITTED | REPEATABLE READ | SERIALIZABLE |
+|---|---|---|---|---|
+| **Dirty read** | seeing another transaction's uncommitted write | impossible | impossible | impossible |
+| **Non-repeatable read, phantom** | a re-read returns changed values or new rows | possible | prevented | prevented |
+| **Lost update** | two read-modify-writes, one overwrites the other | possible | second writer gets `40001` | second writer gets `40001` |
+| **Write skew** | two transactions read an overlapping condition and write *different* rows | possible | possible | prevented |
 
 ### The lost update, concretely
-Tenant budget 1,000,000 tokens, 999,000 used. Two requests costing 800 each run `SELECT tokens_used`,
-both read 999,000, both compute 999,800 ≤ 1,000,000, both `UPDATE tokens_used = 999800`. Final value:
-999,800, real usage 1,000,600, and the budget was exceeded without any error. Under READ COMMITTED this is
-fully allowed: the second `UPDATE` does wait for the first's row lock and re-checks its `WHERE` on the
-new version, but its `SET` assigns the constant 999,800 that the application computed from a stale read,
-so re-evaluation changes nothing. The fixes below work by moving the read inside the protected step. Three fixes, each with a different cost:
+Tenant budget 1,000,000 tokens, 999,000 used, two requests costing 800 each:
+
+1. Both run `SELECT tokens_used` and read 999,000.
+2. Both compute 999,800 ≤ 1,000,000.
+3. Both run `UPDATE tokens_used = 999800`.
+4. Final value 999,800; real usage 1,000,600. The budget was exceeded without any error.
+
+Under READ COMMITTED this is fully allowed. The second `UPDATE` does wait for the first's row lock and
+re-checks its `WHERE` on the new version, but its `SET` assigns the constant 999,800 computed from a stale
+read, so re-evaluation changes nothing. The fixes move the read inside the protected step:
+
 - **Atomic update:** `UPDATE tenants SET tokens_used = tokens_used + 800 WHERE id = $1 AND
-  tokens_used + 800 <= budget RETURNING tokens_used`. The check and the write are one statement that
-  waits for the row lock, re-evaluates, and returns zero rows if the budget is now blown. Cheapest, and
-  needs no retry at READ COMMITTED; at REPEATABLE READ or SERIALIZABLE the second statement gets `40001`
-  instead of re-evaluating, so it is still safe but must be retried.
+  tokens_used + 800 <= budget RETURNING tokens_used`. Check and write are one statement that waits for the
+  row lock, re-evaluates, and returns zero rows if the budget is now blown.
+- **Atomic update, cost by level:** cheapest, and needs no retry at READ COMMITTED; at REPEATABLE READ or
+  SERIALIZABLE the second statement gets `40001` instead of re-evaluating, so it is still safe but must be retried.
 - **Pessimistic lock:** `SELECT ... FOR UPDATE` locks the row for the transaction, so the second request
-  waits until the first commits, then reads the new value. Simple, but the lock is held for the whole
-  transaction, so never hold it across a network call.
+  waits until the first commits, then reads the new value. The lock lasts the whole transaction, so never
+  hold it across a network call.
 - **Optimistic:** read a `version` column, write with `WHERE version = $old`, and retry when zero rows
-  are affected; or run the transaction at SERIALIZABLE and retry on `40001`.
+  are affected; or run at SERIALIZABLE and retry on `40001`.
 
 ### Row locks, SKIP LOCKED and deadlocks
-`FOR UPDATE` and the weaker `FOR NO KEY UPDATE` / `FOR SHARE` lock individual rows. `FOR UPDATE SKIP
-LOCKED` returns only rows nobody else holds, which is the primitive behind database-backed job queues:
-many workers each claim a different row with one statement. `NOWAIT` errors instead of waiting. When two
-transactions each hold a lock the other wants, PostgreSQL detects the cycle after `deadlock_timeout`
-(one second by default) and aborts one of them with `40P01`; the usual cause is acquiring locks in
-different orders, and the usual fix is a consistent ordering (sort ids before locking).
+- **Row lock strengths:** `FOR UPDATE` and the weaker `FOR NO KEY UPDATE` / `FOR SHARE` lock individual rows.
+- **`FOR UPDATE SKIP LOCKED`** returns only rows nobody else holds: the primitive behind database-backed job
+  queues, where many workers each claim a different row with one statement.
+- **`NOWAIT`** errors instead of waiting.
+- **Deadlocks:** when two transactions each hold a lock the other wants, PostgreSQL detects the cycle after
+  `deadlock_timeout` (one second by default) and aborts one with `40P01`. The usual cause is locking in
+  different orders; the fix is a consistent ordering (sort ids before locking).
 
 ### Things that surprise people
-- After any error inside a transaction, PostgreSQL rejects every further statement until `ROLLBACK`
-  (or rollback to a `SAVEPOINT`). Catching the exception in code and continuing does not help.
-- Transaction-level connection poolers (PgBouncer in transaction mode) reuse server connections between
-  transactions, so session state such as `SET` and session-level advisory locks leaks or vanishes.
-  Prepared statements were in the same list until PgBouncer 1.21 added protocol-level support
-  (`max_prepared_statements`); check your pooler version and setting.
-- Isolation level is per transaction: `BEGIN ISOLATION LEVEL SERIALIZABLE` or `SET TRANSACTION` as the
-  first statement; a `SET default_transaction_isolation` changes the session default.
+- **An error poisons the transaction.** PostgreSQL rejects every further statement until `ROLLBACK` (or
+  rollback to a `SAVEPOINT`). Catching the exception in code and continuing does not help.
+- **Transaction-mode poolers drop session state.** PgBouncer in transaction mode reuses server connections
+  between transactions, so session state such as `SET` and session-level advisory locks leaks or vanishes.
+- **Prepared statements and PgBouncer.** These were in the same list until PgBouncer 1.21 added
+  protocol-level support (`max_prepared_statements`); check your pooler version and setting.
+- **Isolation is per transaction:** `BEGIN ISOLATION LEVEL SERIALIZABLE`, or `SET TRANSACTION` as the
+  first statement; `SET default_transaction_isolation` changes the session default.
 
-## Example
-The budget race above, written with psycopg (3.x). `reserve_atomic` is the single-statement fix.
-`reserve_serializable` shows the SERIALIZABLE-plus-retry pattern for logic that genuinely needs several
-statements, such as checking a budget and then inserting the run that consumes it.
+## Diagram
+A decision path for a concurrent write: pick the cheapest mechanism that moves the read inside the
+protected step, and keep every transaction short.
+
+```mermaid
+flowchart TD
+    W["Concurrent read-modify-write"] --> S{"Fits one statement?"}
+    S -->|"yes"| A["Atomic conditional UPDATE"]
+    S -->|"no"| J{"Claiming queued work?"}
+    J -->|"yes"| K["FOR UPDATE SKIP LOCKED"]
+    J -->|"no"| R{"One row, short transaction?"}
+    R -->|"yes"| F["SELECT FOR UPDATE, then write"]
+    R -->|"no, multi-row invariant"| Z["SERIALIZABLE plus retry on 40001"]
+    A --> C["COMMIT before any LLM call"]
+    K --> C
+    F --> C
+    Z --> C
+```
+
+## Examples
+### The budget race in psycopg (3.x)
+- **`reserve_atomic`** is the single-statement fix.
+- **`reserve_serializable`** shows SERIALIZABLE plus retry for logic that genuinely needs several
+  statements, such as checking a budget and then inserting the run that consumes it.
 
 ```python
 import time, psycopg
@@ -176,50 +206,110 @@ with psycopg.connect(DSN) as conn:
 ```
 
 Run two copies of either function concurrently against a tenant at 999,000 of 1,000,000 with a cost of
-800: each lets exactly one through (the atomic version by re-evaluating its `WHERE`, the serializable one
-by aborting and retrying the loser, which then sees the budget is exhausted). The naive select-then-update
-at READ COMMITTED, the same body as `reserve_serializable` without the isolation level, lets both through.
+800: each lets exactly one through.
+- **Atomic version:** the loser's `WHERE` is re-evaluated on the new row and fails.
+- **Serializable version:** the loser aborts, retries, and then sees the budget is exhausted.
+- **Naive select-then-update at READ COMMITTED** (the same body as `reserve_serializable` without the
+  isolation level) lets both through.
+
+### Production SQL: claiming jobs and finding stuck transactions
+A job claim with `SKIP LOCKED` (each worker gets a different row in one statement), and the query to find
+sessions that hold snapshots open.
+
+```sql
+-- Claim one due job; concurrent workers skip rows another worker has locked.
+WITH next AS (
+  SELECT id FROM jobs
+  WHERE  status = 'queued' AND run_at <= now()
+  ORDER  BY run_at
+  LIMIT  1
+  FOR UPDATE SKIP LOCKED
+)
+UPDATE jobs SET status = 'running', locked_at = now(), attempts = attempts + 1
+FROM   next
+WHERE  jobs.id = next.id
+RETURNING jobs.id, jobs.payload;
+
+-- Sessions idle inside a transaction: they pin old row versions and block VACUUM cleanup.
+SELECT pid, usename, now() - xact_start AS open_for, left(query, 60) AS last_query
+FROM   pg_stat_activity
+WHERE  state = 'idle in transaction'
+ORDER  BY xact_start;
+```
+
+### Worked scenario: write skew on "at most one active run"
+Rule: a tenant may have at most one active run. Both transactions run at REPEATABLE READ.
+
+| Time | Transaction A | Transaction B |
+|---|---|---|
+| t1 | `SELECT count(*)` of active runs: 0 | |
+| t2 | | `SELECT count(*)` of active runs: 0 |
+| t3 | `INSERT` run a1 | |
+| t4 | | `INSERT` run b1 |
+| t5 | `COMMIT` succeeds | `COMMIT` succeeds: 2 active runs |
+
+Neither updated a row the other touched, so REPEATABLE READ sees no conflict. At SERIALIZABLE, SSI sees
+the read-write dependencies and aborts one with `40001`.
+
+## Production patterns
+- **Timeouts as guard rails.** Set `idle_in_transaction_session_timeout` (for example a minute) so a leaked
+  transaction is killed instead of pinning snapshots, `lock_timeout` for migrations and request paths, and
+  `statement_timeout` per role. Monitor `pg_stat_activity` for `idle in transaction` and lock waits.
+- **Reserve, commit, call, settle.** Never wrap an LLM call in a transaction: reserve budget with an atomic
+  `UPDATE` and commit, call the provider, then record actual usage in a second short transaction. Monitor
+  transaction duration p99, which should not track provider latency.
+- **A shared retry wrapper.** One helper retries on `40001` and `40P01` with exponential backoff and jitter
+  and a small attempt cap, and requires idempotent bodies (unique ids). Monitor retries per second and
+  `deadlocks` in `pg_stat_database`.
+- **Consistent lock order.** Lock multiple rows with `SELECT ... WHERE id = ANY($1) ORDER BY id FOR
+  UPDATE`, and turn on `log_lock_waits` so waits longer than `deadlock_timeout` are logged. Monitor the log
+  for recurring lock-wait statements.
+- **Transaction-scoped advisory locks behind a pooler.** Under PgBouncer transaction mode, use
+  `pg_advisory_xact_lock` (released at commit), never session-level advisory locks. Monitor lock wait time.
 
 ## Trade-offs
-- READ COMMITTED gives high throughput and almost no aborts, but every read-modify-write in application
-  code is a race; it flips to a stricter level or explicit locks as soon as money or quotas are involved.
-- SERIALIZABLE guarantees correctness without reasoning about every race, but aborts rise with
-  contention and every caller must implement retries; on a hot counter row it can thrash.
-- `FOR UPDATE` is simple and never aborts, but it blocks other writers for the length of the transaction,
-  so a transaction that also calls an LLM holds the row for seconds.
-- Optimistic version columns avoid locks and work through a pooler, but under heavy contention most
-  attempts fail and the retry loop becomes the bottleneck.
-- Long transactions give a consistent view for reports, but they pin old row versions, block `VACUUM`
-  and cause bloat; the trade flips toward a replica or a snapshot export for long analytics.
-- Transaction-mode pooling multiplies the clients one database can serve, but costs session features
-  such as advisory locks and `SET`, which must be moved into the transaction.
+- **READ COMMITTED throughput vs races.** High throughput and almost no aborts, but every read-modify-write
+  in code is a race; flip to a stricter level or explicit locks once money or quotas are involved.
+- **SERIALIZABLE safety vs aborts.** Correctness without reasoning about every race, but aborts rise with
+  contention and every caller must retry; on a hot counter row it can thrash.
+- **`FOR UPDATE` simplicity vs blocking.** Never aborts, but blocks other writers for the length of the
+  transaction, so a transaction that also calls an LLM holds the row for seconds.
+- **Optimistic versions vs contention.** Version columns avoid locks and work through a pooler, but under
+  heavy contention most attempts fail and the retry loop becomes the bottleneck.
+- **Long consistent reads vs bloat.** Long transactions give reports a consistent view but pin old row
+  versions, block `VACUUM` and cause bloat; flip to a replica or a snapshot export for long analytics.
+- **Transaction pooling vs session features.** It multiplies the clients one database can serve, but costs
+  session features such as advisory locks and `SET`, which must move into the transaction.
 
 ## Pitfalls
-- Select, compute, update in application code under the default level; the symptom is counters and
-  balances that drift from the sum of their events, with no errors in the logs.
-- Holding a transaction (and its row locks) across an LLM or HTTP call; the symptom is lock waits and
-  idle-in-transaction sessions that scale with provider latency, then pool exhaustion.
-- Not retrying on `40001` at REPEATABLE READ or SERIALIZABLE; the symptom is sporadic 500s under load
-  that disappear when you retry by hand.
-- Assuming REPEATABLE READ prevents write skew; the symptom is an invariant spanning two rows
-  (for example "at most one active run per tenant") violated by concurrent transactions that each saw it
-  satisfied.
-- Catching an exception mid-transaction and continuing; the symptom is `current transaction is aborted,
+- **Select, compute, update in code under the default level.** Symptom: counters and balances drift from
+  the sum of their events, with no errors in the logs.
+- **Holding a transaction across an LLM or HTTP call.** Symptom: lock waits and idle-in-transaction
+  sessions that scale with provider latency, then pool exhaustion.
+- **Not retrying on `40001` at REPEATABLE READ or SERIALIZABLE.** Symptom: sporadic 500s under load that
+  disappear when you retry by hand.
+- **Assuming REPEATABLE READ prevents write skew.** Symptom: a two-row invariant (for example "at most one
+  active run per tenant") violated by concurrent transactions that each saw it satisfied.
+- **Catching an exception mid-transaction and continuing.** Symptom: `current transaction is aborted,
   commands ignored until end of transaction block` on the next statement.
-- Deadlocks from locking rows in different orders in two code paths; the symptom is intermittent `40P01`
-  errors roughly one second after the conflicting requests start.
-- Expecting READ UNCOMMITTED to behave as in other databases; in PostgreSQL it is READ COMMITTED.
-- Forgetting that a pooler in transaction mode breaks `SET` and advisory locks across statements; the
-  symptom is settings that seem to apply randomly to other requests.
+- **Locking rows in different orders in two code paths.** Symptom: intermittent `40P01` deadlocks roughly
+  one second after the conflicting requests start.
+- **Expecting READ UNCOMMITTED to behave as in other databases.** In PostgreSQL it is READ COMMITTED, so
+  code relying on dirty reads silently gets committed data only.
+- **Forgetting a transaction-mode pooler breaks `SET` and advisory locks across statements.** Symptom:
+  settings that seem to apply randomly to other requests.
 
 ## When to use
-Start from the default level and make every write path safe by construction: atomic single-statement
-updates for counters and quotas, `FOR UPDATE` when a multi-statement decision must be exclusive and the
-transaction stays short, `SKIP LOCKED` for job claiming, and SERIALIZABLE with retries for genuinely
-multi-row invariants that are hard to lock explicitly. Keep transactions short and never span a network
-call. Watch `pg_stat_activity` for idle-in-transaction sessions, lock waits, and serialization failures
-per second. In interviews, expect to be given a read-modify-write and asked which level or lock fixes it,
-to explain write skew, and to say why a long transaction slows down a table it never wrote to.
+- **Default:** start at READ COMMITTED and make every write path safe by construction.
+- **Counters and quotas:** atomic single-statement updates.
+- **Exclusive multi-statement decisions:** `FOR UPDATE`, when the transaction stays short.
+- **Job claiming:** `SKIP LOCKED`.
+- **Multi-row invariants hard to lock explicitly:** SERIALIZABLE with retries.
+- **Always:** keep transactions short and never span a network call.
+- **Measure:** `pg_stat_activity` for idle-in-transaction sessions and lock waits, and serialization
+  failures per second.
+- **Interviews:** expect a read-modify-write and a question on which level or lock fixes it, an
+  explanation of write skew, and why a long transaction slows a table it never wrote to.
 
 ## Role lens
 - **Engineer:** Writes the atomic update or the `FOR UPDATE` block, adds the `40001` retry loop, and keeps
@@ -244,6 +334,39 @@ REPEATABLE READ the lock alone is not enough: the snapshot was taken by the lock
 waited, so the recount still cannot see the other transaction's insert. A third option is to keep an `active_runs` counter on the tenant row and use a
 single conditional `UPDATE ... WHERE active_runs < 3`, which turns the invariant into one atomic
 statement and avoids retries entirely.
+
+## Interview questions
+### How does MVCC let readers and writers avoid blocking each other in PostgreSQL?
+- **Updates create new versions** stamped with `xmin`/`xmax` instead of overwriting, so the old version
+  stays readable.
+- **Each transaction reads from a snapshot** of committed transaction ids, so a long `SELECT` sees a
+  stable view while `UPDATE`s proceed.
+- **The cost is cleanup:** `VACUUM` must reclaim dead versions, and old open snapshots prevent it.
+
+### Two concurrent requests both pass a budget check and overspend. Walk through your fix.
+- **Diagnose:** it is a lost update; both read the same committed value at READ COMMITTED and wrote a
+  constant computed from a stale read.
+- **Fix:** one conditional `UPDATE ... SET used = used + cost WHERE used + cost <= budget RETURNING`, which
+  waits for the row lock and re-evaluates, so exactly one succeeds without retries.
+- **If several statements are needed,** use `FOR UPDATE` in a short transaction or SERIALIZABLE with a retry loop.
+
+### When would you not use SERIALIZABLE everywhere?
+- **On hot rows,** because aborts rise with contention and a busy counter can thrash in retries.
+- **When callers cannot retry safely,** for example non-idempotent side effects inside the transaction.
+- **Prefer** atomic statements and explicit locks for known hot paths, and reserve SERIALIZABLE for
+  multi-row invariants that are hard to lock.
+
+### Tables are bloating and queries slowing, but write volume is unchanged. What do you look for?
+- **Old open snapshots:** query `pg_stat_activity` for `idle in transaction` sessions and long
+  `xact_start` ages; they hold back the cleanup horizon for the whole database.
+- **Fix the source** (a transaction wrapped around an HTTP or LLM call, a forgotten commit) and set
+  `idle_in_transaction_session_timeout` as a backstop.
+
+### What breaks when you put PgBouncer in transaction mode in front of an app?
+- **Session state:** `SET`, session-level advisory locks and anything assumed to persist between
+  transactions, because each transaction may get a different server connection.
+- **Prepared statements** worked only from PgBouncer 1.21 with `max_prepared_statements` set.
+- **Fix:** move settings into each transaction (`SET LOCAL`) and use `pg_advisory_xact_lock`.
 
 ## Quiz
 ### Q: Under PostgreSQL's default READ COMMITTED level, why can two transactions both pass a "balance is sufficient" check and overspend?

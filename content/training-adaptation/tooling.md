@@ -5,7 +5,7 @@ name: Tooling (Unsloth, Axolotl, TRL)
 kind: tool
 difficulty: core
 est_minutes: 13
-status: reviewed
+status: crisp
 related:
   - training-adaptation/peft
   - training-adaptation/supervised-fine-tuning
@@ -23,58 +23,64 @@ sources:
 ---
 
 ## TL;DR
-Fine-tuning an LLM is the same loop almost every time: load the model, maybe quantise it, attach LoRA,
-format chat data, train with a known loss, save the adapter. TRL (Hugging Face) provides those loops as
-trainers (SFT, DPO, GRPO, PPO, reward). Axolotl wraps them in a YAML file so a run is reproducible and
-multi-GPU is a config flag. Unsloth rewrites the kernels so the same LoRA/QLoRA run is faster and lighter
-on one GPU. Pick by how much control, reproducibility or raw speed you need.
+Fine-tuning is the same loop every time: load, maybe quantise, attach LoRA, format chat data, train,
+save the adapter. TRL provides the trainers, Axolotl makes runs reproducible YAML, Unsloth makes
+single-GPU LoRA faster. Pick by control, reproducibility or speed.
 
 ## Why it exists
-Before these tools every fine-tune was a bespoke script, and the hard part was never the training loop;
-it was the dozen details around it. Chat data has to be rendered through the exact template the model
-expects. The loss has to be masked so the model learns the assistant turns, not the user's questions.
-Sequences have to be packed without letting examples attend to each other. LoRA has to be injected into
-the right projection matrices. Mixed precision, gradient checkpointing, a 4-bit base with paged
-optimizers, checkpoint and resume, logging: each is a few lines, and each is easy to get subtly wrong.
-Preference training adds a second layer, because DPO needs log-probabilities from a reference model on
-exactly the right tokens, and GRPO needs a generation loop, reward functions and group-relative
-advantages.
-
-The damaging property of these mistakes is that they do not crash. Loss on the prompt tokens gives a
-model that parrots questions. A template mismatch between training and serving gives a model that
-looked fine in the notebook and misbehaves in vLLM. A padded-token bug in DPO gives a model that is
-slightly worse for reasons nobody can diagnose. Teams that write the loop from scratch reproduce these
-bugs one at a time, over weeks.
-
-The tools encode the known-good recipe so the only variables left are the ones that should vary: data,
-hyperparameters and evaluation. A hand-written loop is still the right way to *learn* what happens, and
-the right escape hatch for a genuinely new loss, but not the way to ship a fine-tune.
+- **The hard part was never the loop.** Before these tools every fine-tune was a bespoke script, and the
+  work was the dozen details around it:
+  - render chat data through the exact template the model expects;
+  - mask the loss so the model learns assistant turns, not the user's questions;
+  - pack sequences without letting examples attend to each other;
+  - inject LoRA into the right projection matrices;
+  - mixed precision, gradient checkpointing, a 4-bit base with paged optimizers, checkpoint and resume,
+    logging. Each is a few lines and easy to get subtly wrong.
+- **Preference training adds a second layer.** DPO needs log-probabilities from a reference model on
+  exactly the right tokens; GRPO needs a generation loop, reward functions and group-relative advantages.
+- **The mistakes do not crash.** Loss on prompt tokens gives a model that parrots questions. A template
+  mismatch between training and serving gives a model that looked fine in the notebook and misbehaves in
+  vLLM. A padded-token bug in DPO gives a model slightly worse for reasons nobody can diagnose. Teams that
+  write the loop from scratch reproduce these bugs one at a time, over weeks.
+- **What the tools buy.** They encode the known-good recipe, so the only variables left are the ones that
+  should vary: data, hyperparameters and evaluation.
+- **Where a hand-written loop still fits.** It is the right way to *learn* what happens, and the escape
+  hatch for a genuinely new loss, but not the way to ship a fine-tune.
 
 ## How it works
+### At a glance
+| Tool | Layer | You write | Best for |
+|---|---|---|---|
+| TRL | Trainers on top of `transformers` and PEFT | Python | Control, custom losses, newest methods |
+| Axolotl | Config over Transformers/TRL/PEFT/`accelerate` | YAML | Reproducible runs, dataset formats, multi-GPU |
+| Unsloth | Kernels under a TRL trainer | Two wrapper calls, then TRL | Fast, light LoRA/QLoRA on one GPU |
+
 ### TRL: trainers as the primitive
-TRL sits on top of `transformers` and PEFT. Unsloth hands its patched model to TRL trainers, and Axolotl
-uses TRL for its preference and RL trainers (its SFT path subclasses the Transformers `Trainer` directly,
-with its own packing and loss masking). `SFTTrainer` with
-`SFTConfig` accepts a dataset of `messages` (conversational) or plain `text`, renders it with the
-tokenizer's chat template, optionally packs sequences, applies LoRA through a `peft_config`, and runs
-the standard `Trainer` loop. `DPOTrainer` takes `prompt`/`chosen`/`rejected` rows, computes the
-log-probability ratio of each answer against a reference model, and minimises
-`−log σ(β · (Δ_chosen − Δ_rejected))`; with a LoRA policy the reference is the base model with the
-adapter disabled, so no second copy is held in memory. `GRPOTrainer` samples several completions per
-prompt (optionally through vLLM), scores them with plain Python reward functions, and normalises
-rewards within each group to form advantages. `RewardTrainer` and `PPOTrainer` cover the classic RLHF
-path. You write Python, every piece is overridable, and that is the point: TRL is the layer for people
-who need control or a custom loss.
+- **Where it sits.** TRL sits on top of `transformers` and PEFT. Unsloth hands its patched model to TRL
+  trainers. Axolotl uses TRL for its preference and RL trainers; its SFT path subclasses the Transformers
+  `Trainer` directly, with its own packing and loss masking.
+- **`SFTTrainer` with `SFTConfig`.** Accepts a dataset of `messages` (conversational) or plain `text`,
+  renders it with the tokenizer's chat template, optionally packs sequences, applies LoRA through a
+  `peft_config`, and runs the standard `Trainer` loop.
+- **`DPOTrainer`.** Takes `prompt`/`chosen`/`rejected` rows, computes the log-probability ratio of each
+  answer against a reference model, and minimises `−log σ(β · (Δ_chosen − Δ_rejected))`. With a LoRA
+  policy the reference is the base model with the adapter disabled, so no second copy is held in memory.
+- **`GRPOTrainer`.** Samples several completions per prompt (optionally through vLLM), scores them with
+  plain Python reward functions, and normalises rewards within each group to form advantages.
+- **`RewardTrainer` and `PPOTrainer`.** Cover the classic RLHF path.
+- **Why choose it.** You write Python and every piece is overridable; that is the point. TRL is the layer
+  for people who need control or a custom loss.
 
 ### Axolotl: the run as a config file
-Axolotl turns a run into a YAML document: base model, adapter type (full, LoRA, QLoRA), LoRA rank and
-targets, datasets with their format type (`alpaca`, `sharegpt`, `chat_template`, and others), sequence
-length, sample packing, micro-batch and accumulation, learning rate and scheduler, precision,
-FlashAttention, gradient checkpointing, DeepSpeed or FSDP settings, and experiment tracking. It
-tokenises and packs the data once and caches it, launches through `accelerate` so a one-GPU test and an
-eight-GPU run use the same file, and can merge the adapter afterwards. It exists because the dataset
-format matrix is a genuine pain and because a config file in git is a reproducible experiment; a Python
-script with twenty keyword arguments is not.
+- **One YAML document describes the run:** base model, adapter type (full, LoRA, QLoRA), LoRA rank and
+  targets, datasets with their format type (`alpaca`, `sharegpt`, `chat_template`, and others), sequence
+  length, sample packing, micro-batch and accumulation, learning rate and scheduler, precision,
+  FlashAttention, gradient checkpointing, DeepSpeed or FSDP settings, and experiment tracking.
+- **What it does with it:** tokenises and packs the data once and caches it, launches through
+  `accelerate` so a one-GPU test and an eight-GPU run use the same file, and can merge the adapter
+  afterwards.
+- **Why it exists:** the dataset format matrix is a genuine pain, and a config file in git is a
+  reproducible experiment; a Python script with twenty keyword arguments is not.
 
 ```yaml
 base_model: Qwen/Qwen2.5-7B-Instruct
@@ -103,29 +109,51 @@ Run it with the Axolotl CLI (`axolotl train config.yml`; older releases use
 `accelerate launch -m axolotl.cli.train config.yml`).
 
 ### Unsloth: the kernels
-Unsloth replaces the attention, MLP and LoRA forward and backward passes of supported model families
-with hand-written Triton kernels and manual autograd. Fewer intermediate tensors are materialised, more
-operations are fused, and the cross-entropy over the vocabulary is computed in chunks instead of as one
-huge logits tensor; it also ships its own gradient-checkpointing variant that offloads block inputs to
-CPU asynchronously (`use_gradient_checkpointing="unsloth"`). The API is a two-call wrapper:
-`FastLanguageModel.from_pretrained(name, max_seq_length=..., load_in_4bit=True)` then
-`FastLanguageModel.get_peft_model(model, r=16, target_modules=[...], lora_alpha=16, ...)`, after which
-you hand the model to a TRL trainer as usual. The project's own figures are roughly 2× faster training
-and substantially lower VRAM than stock Transformers plus PEFT on the same GPU; treat those as vendor
-claims and benchmark on your model. The sharp edges: only patched architectures are accelerated, and the
-open-source release has historically been single-GPU focused, so check the current docs before planning
-a multi-GPU run around it. It exports merged 16-bit weights, bare adapters, or GGUF for llama.cpp.
+- **What it replaces.** The attention, MLP and LoRA forward and backward passes of supported model
+  families, with hand-written Triton kernels and manual autograd.
+- **Why that is faster.** Fewer intermediate tensors are materialised, more operations are fused, and the
+  cross-entropy over the vocabulary is computed in chunks instead of as one huge logits tensor.
+- **Its own checkpointing variant.** It offloads block inputs to CPU asynchronously
+  (`use_gradient_checkpointing="unsloth"`).
+- **A two-call API.** `FastLanguageModel.from_pretrained(name, max_seq_length=..., load_in_4bit=True)` then
+  `FastLanguageModel.get_peft_model(model, r=16, target_modules=[...], lora_alpha=16, ...)`; then hand the
+  model to a TRL trainer as usual.
+- **The claimed gain.** The project's own figures are roughly 2× faster training and substantially lower
+  VRAM than stock Transformers plus PEFT on the same GPU. Treat those as vendor claims and benchmark on
+  your model.
+- **Sharp edges.** Only patched architectures are accelerated, and the open-source release has
+  historically been single-GPU focused, so check the current docs before planning a multi-GPU run around
+  it.
+- **Exports.** Merged 16-bit weights, bare adapters, or GGUF for llama.cpp.
 
 ### How they compose
-TRL is the base; Axolotl configures Transformers/TRL/PEFT/`accelerate` from YAML; Unsloth swaps in faster
-kernels underneath a TRL trainer. Similar config-driven frameworks exist (LLaMA-Factory, torchtune) and the
-same mental model applies.
+- **TRL is the base.**
+- **Axolotl configures** Transformers/TRL/PEFT/`accelerate` from YAML.
+- **Unsloth swaps in faster kernels** underneath a TRL trainer.
+- **Same mental model elsewhere.** Similar config-driven frameworks exist (LLaMA-Factory, torchtune).
 
-## Example
-A LoRA SFT on reviewed support conversations with TRL. The dataset rows carry a `messages` list, so the
-trainer renders them with the model's chat template; the adapter is saved on its own and merged into the
-bf16 base later only if the serving stack needs a single checkpoint. The commented lines show the
-Unsloth swap-in.
+## Diagram
+One conversation row flows through the same steps whichever tool drives it; Axolotl configures the
+trainer, Unsloth patches the model underneath it.
+
+```mermaid
+flowchart TD
+    D["messages rows in JSONL"] --> T["Render with chat template"]
+    T --> M["Label non-assistant tokens -100"]
+    M --> P["Pack into 2,048-token rows"]
+    A["Axolotl YAML config"] -->|"configures"| TR["TRL trainer: SFT, DPO, GRPO"]
+    U["Unsloth patched model"] -->|"hands model to"| TR
+    P --> TR
+    TR --> AD[("LoRA adapter")]
+    AD --> MG["Merge into bf16 base or GGUF"]
+    MG --> S["Serving stack, same template"]
+```
+
+## Examples
+### LoRA SFT with TRL
+A LoRA SFT on reviewed support conversations. The rows carry a `messages` list, so the trainer renders
+them with the model's chat template. The adapter is saved on its own and merged into the bf16 base later
+only if the serving stack needs a single checkpoint. The commented lines show the Unsloth swap-in.
 
 ```python
 from datasets import load_dataset
@@ -165,51 +193,104 @@ trainer.save_model()                     # writes the adapter only
 # then build SFTTrainer(model=model, ...) with peft_config=None.
 ```
 
-What the trainer does with one row is the part worth verifying by hand. The `messages` list is rendered by
-Qwen's ChatML template, in which each turn becomes `<|im_start|>{role}\n{content}<|im_end|>`, then
-tokenised. With `assistant_only_loss`, every system and user
-token gets label −100, so only the assistant span contributes to the loss. Packing concatenates rendered
-rows into 2,048-token sequences, and with a padding-free / position-id-aware attention path each row
-restarts its positions so it cannot attend to its neighbour. Then count steps (illustrative): 3,000 chats
-averaging 500 tokens are 1.5M tokens; an optimizer step consumes 16 × 2,048 ≈ 32.8k tokens, so one epoch
-is ~46 steps and two epochs ~92, which makes `warmup_ratio=0.03` about three steps and `save_strategy="epoch"`
-two checkpoints. Decode one packed batch and print its labels before the first real run: it takes a
-minute and catches template and masking bugs that the loss curve never shows.
+What the trainer does with one row is the part worth verifying by hand:
+1. **Render.** The `messages` list goes through Qwen's ChatML template, in which each turn becomes
+   `<|im_start|>{role}\n{content}<|im_end|>`, then is tokenised.
+2. **Mask.** With `assistant_only_loss`, every system and user token gets label −100, so only the
+   assistant span contributes to the loss.
+3. **Pack.** Rendered rows are concatenated into 2,048-token sequences. With a padding-free /
+   position-id-aware attention path each row restarts its positions, so it cannot attend to its neighbour.
+
+### Counting steps before you launch
+Illustrative numbers for the run above:
+
+| Quantity | Value |
+|---|---|
+| Data | 3,000 chats averaging 500 tokens = 1.5M tokens |
+| Tokens per optimizer step | 16 × 2,048 ≈ 32.8k |
+| Steps per epoch | ~46 |
+| Steps for two epochs | ~92 |
+| `warmup_ratio=0.03` | about three steps |
+| `save_strategy="epoch"` | two checkpoints |
+
+### Pre-flight: print what the loss actually sees
+Decode one packed batch and print its labels before the first real run. It takes a minute and catches
+template and masking bugs that the loss curve never shows. Run it on the `trainer` built above, before
+`trainer.train()`.
+
+```python
+batch = next(iter(trainer.get_train_dataloader()))
+ids, labels = batch["input_ids"][0], batch["labels"][0]
+trained = labels != -100
+
+print(f"{trained.float().mean():.0%} of tokens carry loss")   # far below 100% for chat data
+print("TRAINED ON:\n", tok.decode(ids[trained])[:600])        # should read as assistant answers only
+print("IGNORED:\n", tok.decode(ids[~trained])[:600])          # system and user turns, template tokens
+# If TRAINED ON contains user questions, masking is off: check the chat template or use
+# prompt/completion rows. If it contains two unrelated chats glued together, check packing.
+```
+
+## Production patterns
+- **Pin the training stack per run.** TRL and Transformers rename arguments across releases, so lock exact
+  versions of `trl`, `transformers`, `peft` and `accelerate` in a lockfile or container image tagged with
+  the run. Monitor deprecation warnings in the training log as an early signal before upgrading.
+- **One committed config per experiment.** Keep the Axolotl YAML in git next to a hash of the dataset
+  file, and run `axolotl preprocess config.yml` once so tokenisation and packing are cached and
+  inspectable. Track run name, commit and data hash in the experiment tracker.
+- **Template parity test in CI.** Render the same conversation with `tok.apply_chat_template(...)` in
+  the training image and the serving image and assert identical token ids. Monitor production outputs for
+  stray special tokens such as a literal `<|im_end|>`.
+- **Pre-flight label check on every new dataset.** Run the batch-decoding snippet above and record the
+  share of tokens carrying loss. A sudden jump toward 100% means masking broke.
+- **Benchmark before standardising on Unsloth.** Run about 50 steps of the same config with stock PEFT
+  and with Unsloth, and compare tokens per second and `torch.cuda.max_memory_allocated()`. Adopt it only
+  for architectures where the gain shows up.
+- **Evaluate the artifact you ship.** If serving needs one checkpoint, merge into the bf16 base (PEFT's
+  `merge_and_unload()`), then re-run the held-out eval on the merged model, not just the adapter.
 
 ## Trade-offs
-- TRL gives full control and the newest algorithms first, but you own the plumbing around the trainer
-  (data formatting, launch, multi-GPU config); it flips toward Axolotl once a team runs many similar jobs.
-- Axolotl gives reproducible configs and painless multi-GPU, but a custom loss or unusual data flow means
-  reading its source; it flips back to raw TRL when the experiment is not one of its supported shapes.
-- Unsloth gives real speed and memory savings on one GPU, but only for patched architectures and with
-  single-GPU focus historically; it flips to Axolotl or plain FSDP when the job needs several GPUs.
-- Every layer of convenience hides a decision; the lower you go, the more you must verify yourself, and
-  the higher you go, the more you must trust defaults you did not read.
+- **TRL: control vs plumbing.** Full control and the newest algorithms first, but you own the plumbing
+  around the trainer (data formatting, launch, multi-GPU config). It flips toward Axolotl once a team runs
+  many similar jobs.
+- **Axolotl: reproducibility vs flexibility.** Reproducible configs and painless multi-GPU, but a custom
+  loss or unusual data flow means reading its source. It flips back to raw TRL when the experiment is not
+  one of its supported shapes.
+- **Unsloth: speed vs coverage.** Real speed and memory savings on one GPU, but only for patched
+  architectures and with single-GPU focus historically. It flips to Axolotl or plain FSDP when the job
+  needs several GPUs.
+- **Convenience vs verification.** Every layer of convenience hides a decision: the lower you go, the more
+  you must verify yourself; the higher you go, the more you must trust defaults you did not read.
 
 ## Pitfalls
-- Chat-template mismatch between training and serving; the symptom is a model that behaves in the training
-  notebook but misbehaves or emits stray special tokens once deployed in vLLM or Ollama.
-- Computing the loss over prompt tokens; the symptom is suspiciously low training loss alongside a model
-  that generates user-style questions or echoes instructions.
-- Packing sequences without per-example attention masking; the symptom is answers that drift into the
-  topic of a neighbouring training example, which is context bleed across the pack.
-- Pinning nothing: TRL and Transformers rename arguments across releases (`tokenizer` → `processing_class`,
-  `max_seq_length` → `max_length`); the symptom is a job that ran last month failing on an unknown keyword.
-- Merging a QLoRA adapter into the 4-bit base instead of the bf16 base; the symptom is a merged model
-  that scores worse than the adapter-plus-base it came from. Even a bf16 merge is slightly off, because
-  the adapter was trained against dequantised 4-bit weights, so re-run the eval on the merged artifact.
-- Trusting Unsloth's speedup without checking the architecture list; the symptom is an error at load or a
-  run that is no faster than stock Transformers.
+- **Chat-template mismatch between training and serving.** Symptom: a model that behaves in the training
+  notebook but misbehaves or emits stray special tokens once deployed in vLLM or Ollama. Fix: one template
+  source and a parity test.
+- **Computing the loss over prompt tokens.** Symptom: suspiciously low training loss alongside a model
+  that generates user-style questions or echoes instructions. Fix: assistant-only or completion-only loss,
+  verified by decoding labels.
+- **Packing without per-example attention masking.** Symptom: answers that drift into the topic of a
+  neighbouring training example, which is context bleed across the pack. Fix: a padding-free,
+  position-id-aware attention path.
+- **Pinning nothing.** TRL and Transformers rename arguments across releases (`tokenizer` →
+  `processing_class`, `max_seq_length` → `max_length`). Symptom: a job that ran last month fails on an
+  unknown keyword. Fix: pin versions.
+- **Merging a QLoRA adapter into the 4-bit base instead of the bf16 base.** Symptom: a merged model that
+  scores worse than the adapter-plus-base it came from. Even a bf16 merge is slightly off, because the
+  adapter was trained against dequantised 4-bit weights, so re-run the eval on the merged artifact.
+- **Trusting Unsloth's speedup without checking the architecture list.** Symptom: an error at load or a
+  run that is no faster than stock Transformers. Fix: check the supported list and benchmark.
 
 ## When to use
-Reach for TRL when you need a trainer class in your own Python, a custom reward or loss, or the newest
-method the day it lands. Reach for Axolotl when runs must be reproducible across people and machines,
-when you juggle several dataset formats, or when the job spans several GPUs. Reach for Unsloth when the
-job is a LoRA or QLoRA on one GPU and the model family is supported, because the saving in time and
-VRAM is large enough to change what fits. Whatever you pick, measure the same things: tokens per second,
-peak memory, eval score on a held-out set, and an end-to-end check through the serving stack's chat
-template. In interviews, be ready to place the three on a control-versus-convenience axis and to name
-the failure modes the tools exist to prevent.
+- **Reach for TRL when:** you need a trainer class in your own Python, a custom reward or loss, or the
+  newest method the day it lands.
+- **Reach for Axolotl when:** runs must be reproducible across people and machines, you juggle several
+  dataset formats, or the job spans several GPUs.
+- **Reach for Unsloth when:** the job is a LoRA or QLoRA on one GPU and the model family is supported,
+  because the saving in time and VRAM is large enough to change what fits.
+- **Measure, whatever you pick:** tokens per second, peak memory, eval score on a held-out set, and an
+  end-to-end check through the serving stack's chat template.
+- **Interviews:** place the three on a control-versus-convenience axis and name the failure modes the
+  tools exist to prevent.
 
 ## Role lens
 - **Engineer:** Writes the TRL or Axolotl config, verifies loss masking and the chat template on one
@@ -229,6 +310,41 @@ pick if the run must be reproducible for others or move to several GPUs later. W
 quality and de-duplication, the chat template matching the serving stack, confirming the loss covers only
 assistant turns, LoRA rank, learning rate and epochs, a held-out eval set, and whether to serve the
 adapter or merge it into the bf16 base.
+
+## Interview questions
+### What do TRL, Axolotl and Unsloth actually save you compared with a hand-written loop?
+- **Not the loop itself,** which is short. They save the details around it: chat-template rendering, loss
+  masking, packing, LoRA injection, precision, checkpointing and resume.
+- **Why that matters:** those bugs do not crash. They produce a model that parrots questions or misbehaves
+  only after deployment, and a team finds them one at a time over weeks.
+- **What stays yours:** data quality, hyperparameters and evaluation.
+
+### A fine-tuned model is fine in the notebook but emits stray end tokens in vLLM. How do you debug it?
+- **Suspect a template mismatch first.** Render one conversation with the training tokenizer's chat
+  template and with the serving stack's, and diff the token ids.
+- **Check the stop tokens:** the serving config must treat the template's end-of-turn token (for ChatML,
+  `<|im_end|>`) as a stop sequence.
+- **Fix at the source:** ship the tokenizer and template with the adapter, and add a parity test so it
+  cannot drift again.
+
+### When would you not use Unsloth or Axolotl?
+- **Not Unsloth** when the model architecture is not patched, or the job needs several GPUs, because the
+  speedup disappears and the open-source release has historically been single-GPU focused.
+- **Not Axolotl** when the experiment needs a custom loss or unusual data flow, because you end up reading
+  and patching its source; drop to TRL and write Python.
+- **Not either** when the goal is learning the mechanics; write the loop once by hand.
+
+### 10,000 chats averaging 800 tokens, 4,096-token packing, effective batch 16. How many steps per epoch?
+- **Tokens:** 10,000 × 800 = 8M tokens.
+- **Per optimizer step:** 16 × 4,096 = 65,536 tokens, so about 122 steps per epoch.
+- **Why compute it:** it sets warmup (a ratio of 0.03 of a one-epoch run is about four steps), how many checkpoints a
+  per-epoch save writes, and whether logging every 10 steps gives a readable loss curve.
+
+### How does DPO with a LoRA policy avoid holding two copies of the model?
+- **DPO needs a reference model** to compute each answer's log-probability ratio.
+- **With LoRA, the reference is the base with the adapter disabled,** so TRL computes reference
+  log-probabilities from the same weights, and no second copy is held in memory.
+- **The trade-off:** extra forward passes per batch instead of extra memory.
 
 ## Quiz
 ### Q: How do TRL, Axolotl and Unsloth relate to each other?

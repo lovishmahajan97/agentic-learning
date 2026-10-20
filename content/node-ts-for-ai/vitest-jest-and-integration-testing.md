@@ -5,7 +5,7 @@ name: Vitest / Jest & integration testing
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - node-ts-for-ai/dependency-injection
   - node-ts-for-ai/openai-anthropic-node-sdks
@@ -23,128 +23,139 @@ sources:
 ---
 
 ## TL;DR
-A model call is slow, billed and non-deterministic, so it cannot sit inside a test that must pass on
-every commit. The working split is three layers: unit tests with an injected fake model, integration
-tests that run the real SDK, database and queue against intercepted or containerised dependencies, and
-evals that call the real model and are *scored*, not asserted. Vitest and Jest are the runners that
-make the first two layers fast; the design that makes them possible is injecting the model client.
+Model calls are slow, billed and non-deterministic, so split tests into three layers: unit tests with an
+injected fake, integration tests with the real SDK over intercepted HTTP plus real databases, and scored
+evals against the real model.
 
 ## Why it exists
-An AI service is ordinary backend code wrapped around a call that behaves unlike anything else in the
-process. The call takes seconds, costs money per token, needs a secret, and returns different text for
-the same input. Every property breaks a conventional test suite: a suite that hits the real model is
-too slow to run on every push, too expensive to run in parallel, leaks a production key into CI logs,
-and fails randomly whenever the provider is degraded or the model phrases an answer differently. Teams
-that start this way end up with `it.skip` all over the repo and no safety net at all.
-
-The opposite naive answer, "mock everything", fails more quietly. A `vi.mock("@anthropic-ai/sdk")`
-that returns a canned object tests only your own branches; it says nothing about whether the request
-you build is one the API accepts. The bug class that actually bites, a renamed field, a tool schema the
-provider rejects, a stream event type you forgot to handle, lives in the serialization and parsing
-layer that a module mock skips entirely. The same is true for the database: an in-memory stand-in does
-not enforce unique constraints, JSON column semantics or transaction isolation, so the test passes and
-production throws.
-
-The practice therefore has to separate *what you can assert* from *what you can only measure*. Logic
-around the model (prompt assembly, retries, parsing, tool dispatch, persistence) is deterministic once
-the model is faked, so assert it. The model's output quality is statistical, so measure it in an eval
-with a threshold and run it on a schedule, not as a merge gate. Getting that boundary right is the
-whole skill; the runner is secondary.
+- **The model call breaks every test assumption.** It takes seconds, costs money per token, needs a
+  secret, and returns different text for the same input. A suite that hits it is too slow for every push,
+  too expensive to parallelise, leaks a production key into CI logs, and fails whenever the provider is
+  degraded or rephrases. Teams that start this way end up with `it.skip` everywhere and no safety net.
+- **"Mock everything" fails more quietly.** A `vi.mock("@anthropic-ai/sdk")` returning a canned object
+  tests only your own branches. The bugs that bite (a renamed field, a tool schema the provider rejects, a
+  stream event type you forgot) live in the serialization and parsing layer that a module mock skips.
+- **In-memory databases lie the same way.** They do not enforce unique constraints, JSON column semantics
+  or transaction isolation, so the test passes and production throws.
+- **The skill is separating assert from measure.** Logic around the model (prompt assembly, retries,
+  parsing, tool dispatch, persistence) is deterministic once the model is faked, so assert it. Output
+  quality is statistical, so measure it in a scheduled eval with a threshold, not a merge gate. The runner
+  is secondary.
 
 ## How it works
 ### The runners
-Vitest and Jest share the `describe` / `it` / `expect` vocabulary, the `beforeAll` / `afterEach` hooks,
-module mocking, fake timers, snapshots and coverage, which is deliberate: Vitest was built to be
-largely Jest-compatible. They differ in how code reaches the test. Jest predates native ES modules and
-TypeScript in Node; it runs each file through a transform you configure (`ts-jest`, `babel-jest` or an
-swc plugin) and its ESM support has long sat behind an experimental flag, which is why Jest projects
-accumulate `moduleNameMapper` and `transformIgnorePatterns` entries. Vitest reuses the Vite pipeline:
-Vite's transformer (esbuild, or Oxc in recent Vite releases) strips types without type-checking, so
-run `tsc --noEmit` separately; ESM is the default, `vite.config.ts` aliases apply to tests too,
-and watch mode re-runs only the files whose import graph changed. For a TypeScript-first AI service
-started today, Vitest is the default; Jest remains the right answer when the repo already runs on it,
-because migrating a large suite buys little.
+Vitest and Jest share `describe` / `it` / `expect`, the `beforeAll` / `afterEach` hooks, module mocking,
+fake timers, snapshots and coverage, deliberately: Vitest was built to be largely Jest-compatible. They
+differ in how code reaches the test.
 
-Both run test files in parallel workers with an isolated module registry per file (Vitest's default
-`isolate: true`), *because* module state (a cached client, a memoised config) would otherwise leak
-between files. Jest's workers are child processes; Vitest lets you choose `pool: "forks"` (child
-processes, its default since v2) or `"threads"` (worker threads, lighter but unable to use
-`process.chdir` and fragile with some native addons). Parallelism is per file, not per test: tests
-inside one file run sequentially unless marked concurrent, and `fileParallelism: false` (Vitest) or
-`--runInBand` (Jest) serialises files when a shared resource forces it. Separately, `vi.mock` / `jest.mock` calls are hoisted above imports by the transform:
-ESM imports resolve before any statement runs, so a mock registered in normal source order would
-arrive too late. (Jest's hoisting is a Babel/ts-jest transform for CommonJS output; under native ESM
-Jest you need `jest.unstable_mockModule` plus a dynamic `import()` instead.)
+| | Jest | Vitest |
+|---|---|---|
+| TypeScript | Transform you configure: `ts-jest`, `babel-jest` or an swc plugin | Vite's transformer (esbuild, or Oxc in recent Vite) strips types without type-checking, so run `tsc --noEmit` separately |
+| ESM | Long behind an experimental flag, so projects accumulate `moduleNameMapper` and `transformIgnorePatterns` | Default; `vite.config.ts` aliases apply to tests too |
+| Workers | Child processes | `pool: "forks"` (child processes, default since v2) or `"threads"` (lighter, cannot use `process.chdir`, fragile with some native addons) |
+| Serialise files | `--runInBand` | `fileParallelism: false` |
+| Watch | Re-runs related tests | Re-runs only files whose import graph changed |
+
+- **Default choice.** For a TypeScript-first AI service started today, Vitest. Jest stays right when the
+  repo already runs on it, because migrating a large suite buys little.
+- **Isolated module registry per file** (Vitest's default `isolate: true`), *because* module state (a
+  cached client, a memoised config) would otherwise leak between files.
+- **Parallelism is per file, not per test.** Tests inside one file run sequentially unless marked
+  concurrent.
+- **Mocks are hoisted.** `vi.mock` / `jest.mock` calls are moved above imports by the transform, because
+  ESM imports resolve before any statement runs, so a mock in normal source order would arrive too late.
+- **Native ESM Jest is different.** Jest's hoisting is a Babel/ts-jest transform for CommonJS output;
+  under native ESM you need `jest.unstable_mockModule` plus a dynamic `import()` instead.
 
 ### Three kinds of double for the model
 1. **An injected fake.** Define the narrowest interface your code needs (`complete(prompt): Promise<string>`,
-   or a stream of events) and pass an implementation in, rather than importing the SDK at module scope.
-   Tests then hand in a function that returns scripted answers, including malformed ones, in a known
-   order. This tests your parsing, repair loops, budgets and persistence, and it runs in microseconds.
+   or a stream of events) and pass an implementation in rather than importing the SDK at module scope.
+   Tests hand in a function returning scripted answers, including malformed ones, in a known order. It
+   tests parsing, repair loops, budgets and persistence, in microseconds.
 2. **HTTP interception.** Construct the real SDK and intercept at the network layer with `msw`
-   (`setupServer` from `msw/node`), `nock`, or undici's `MockAgent`. Now the request body you assert on
-   is the exact JSON the provider would receive, and the response you return is parsed by the real SDK
-   code. This is the layer that catches a wrong field name or a stream-event handler that never fires.
-   Set `maxRetries: 0` on the client so a deliberate 500 does not trigger the SDK's default two
-   retries (three attempts) with backoff. Streams are intercepted the same way: the handler returns
-   `new HttpResponse(body, { headers: { "content-type": "text/event-stream" } })` where `body` is a
-   `ReadableStream` emitting recorded `event: …\ndata: {…}\n\n` frames, so the SDK's real SSE
-   parser runs. Splitting a frame across two chunks, or ending the stream before `message_stop`, is
-   how you test the reassembly and early-termination paths that hand-written fakes never exercise.
-3. **Recorded fixtures.** Capture a handful of real responses once (including tool-call turns and a
-   full stream transcript), store them as JSON, and replay them through the interceptor. They are the
-   only cheap way to test against the real response shape of a provider, and the only way to notice
-   that an SDK upgrade changed a type. Refresh them deliberately, not on every run.
+   (`setupServer` from `msw/node`), `nock`, or undici's `MockAgent`.
+   - The request body you assert on is the exact JSON the provider would receive, and the response is
+     parsed by real SDK code. This catches a wrong field name or a stream handler that never fires.
+   - Set `maxRetries: 0` on the client, so a deliberate 500 does not trigger the SDK's default two retries
+     (three attempts) with backoff.
+   - Streams: the handler returns `new HttpResponse(body, { headers: { "content-type": "text/event-stream" } })`,
+     where `body` is a `ReadableStream` emitting recorded `event: …\ndata: {…}\n\n` frames, so the SDK's
+     real SSE parser runs.
+   - Splitting a frame across two chunks, or ending before `message_stop`, tests the reassembly and
+     early-termination paths that hand-written fakes never exercise.
+3. **Recorded fixtures.** Capture a handful of real responses once (including tool-call turns and a full
+   stream transcript), store them as JSON, and replay them through the interceptor. They are the only
+   cheap way to test the provider's real response shape, and to notice that an SDK upgrade changed a type.
+   Refresh them deliberately, not on every run.
 
-Each layer exists because the one below it cannot see the failure it catches. The fake cannot see
-serialization bugs; the interceptor cannot see output-quality drift; evals cannot see a bug in your
-retry logic because they are too noisy to attribute a failure to it.
+**Each layer catches what the one below cannot see.** The fake cannot see serialization bugs; the
+interceptor cannot see output-quality drift; evals cannot see a bug in your retry logic because they are
+too noisy to attribute a failure to it.
 
 ### Integration tests with real dependencies
-Postgres, Redis and a queue should be real in integration tests, *because* the behaviours you depend
-on (constraint violations, `SELECT … FOR UPDATE`, JSONB queries, Redis expiry, BullMQ retries) are the
-things fakes get wrong. Two patterns work: a `globalSetup` that starts containers with Testcontainers
-and exports connection strings, or a service started by CI (a GitHub Actions `services:` block, a
-compose file locally). Isolation then has to be designed, since the runner is parallel: give each
-worker its own database or schema (derive the name from `VITEST_POOL_ID` / `JEST_WORKER_ID`), or run
-every test inside a transaction that is rolled back in `afterEach`, or truncate between tests and
-accept running those files serially. The rollback trick has a precondition people miss: the code
-under test must run on the *same connection* as the test's transaction. If it takes its own client
-from a pool, it neither sees the test's uncommitted fixtures nor gets rolled back, so inject the
-transaction-bound client (the dependency-injection lesson again), and if the code opens its own
-transactions, map them to savepoints. Shared mutable state across workers is the most common source
-of flaky integration suites.
+- **Keep Postgres, Redis and the queue real**, *because* the behaviours you depend on (constraint
+  violations, `SELECT … FOR UPDATE`, JSONB queries, Redis expiry, BullMQ retries) are what fakes get wrong.
+- **Two ways to start them.** A `globalSetup` that starts containers with Testcontainers and exports
+  connection strings, or a service started by CI (a GitHub Actions `services:` block, a compose file locally).
+- **Design isolation, since the runner is parallel.** Pick one:
+  - each worker gets its own database or schema, named from `VITEST_POOL_ID` / `JEST_WORKER_ID`;
+  - every test runs inside a transaction rolled back in `afterEach`;
+  - truncate between tests and run those files serially.
+- **The rollback trick's precondition.** The code under test must run on the *same connection* as the
+  test's transaction. If it takes its own pooled client, it neither sees the uncommitted fixtures nor gets
+  rolled back. Inject the transaction-bound client (dependency injection again), and map the code's own
+  transactions to savepoints.
+- **Shared mutable state across workers** is the most common source of flaky integration suites.
 
 ### Async, streams, time and cancellation
-Model code is asynchronous and often streamed, so the fakes must be too. An `async function*` is a
-perfect fake stream, and a fake that waits on a `signal` lets you assert that aborting the request
-stops iteration. Retries and backoff should run under fake timers (`vi.useFakeTimers()` plus
-`vi.advanceTimersByTimeAsync`) so a 30-second backoff test finishes in milliseconds; forgetting to
-await the async advance is the usual reason a retry test hangs. `expect.poll` and `vi.waitFor` cover
-eventually-consistent assertions against a queue.
+- **Fakes must be async too.** An `async function*` is a perfect fake stream; a fake that waits on a
+  `signal` lets you assert that aborting the request stops iteration.
+- **Backoff runs under fake timers.** `vi.useFakeTimers()` plus `vi.advanceTimersByTimeAsync` makes a
+  30-second backoff test finish in milliseconds. Forgetting to await the async advance is the usual reason
+  a retry test hangs.
+- **Eventually consistent assertions.** `expect.poll` and `vi.waitFor` cover assertions against a queue.
 
 ### Snapshots: prompts yes, completions no
-Inline snapshots of the *rendered prompt* (system text plus serialized tool definitions) are cheap
-regression tests: a prompt edit shows up as a diff in review rather than as a silent behaviour change.
-Snapshotting model output is the opposite: it either fails on every run or is updated blindly with
-`-u`, which trains people to ignore it.
+- **Snapshot the rendered prompt.** Inline snapshots of system text plus serialized tool definitions are
+  cheap regression tests: a prompt edit shows up as a diff in review, not a silent behaviour change.
+- **Never snapshot model output.** It fails every run or gets updated blindly with `-u`, which trains
+  people to ignore it.
 
 ### Where the real model lives
-Real-model tests belong in a separate suite, selected by a tag or directory, run on a schedule or on
-demand with a budget, and scored against a threshold (pass rate ≥ 0.9 on a golden set, judge score
-above a floor). They publish a metric; they do not block a merge on one bad sample. The evals module
-covers how to build that set and the harness around it.
+- **A separate suite**, selected by tag or directory, run on a schedule or on demand with a budget.
+- **Scored against a threshold** (pass rate ≥ 0.9 on a golden set, judge score above a floor).
+- **It publishes a metric**; it does not block a merge on one bad sample. The evals module covers how to
+  build the set and harness.
 
-## Example
-A `summarize` service that depends on a narrow `ModelClient` interface,
-`{ complete(prompt: string): Promise<string> }`. It calls `complete`, tries to parse
-`{"bullets": string[]}`, and on failure calls once more with a repair prompt that quotes the bad
-output. `anthropicAdapter(client)` implements `complete` with `client.messages.create` and joins the
-text blocks. The first test drives the repair loop with a scripted fake; the second constructs the
-real Anthropic SDK and intercepts the HTTP call with `msw`, so the request body and the response
-parsing are the real ones. Note that the handler *captures* the body and the assertion runs in the
-test: an `expect` thrown inside an msw handler becomes a 500, which surfaces as the SDK's
-`InternalServerError` rather than as the assertion message you wanted to read.
+## Diagram
+Each change flows through the fast deterministic layers on every PR; the real model is only touched by
+the scheduled, scored suite.
+
+```mermaid
+flowchart TD
+    C["Code change"] --> U["Unit: injected fake model"]
+    U --> I["Integration: real SDK via msw"]
+    I --> D[("Real Postgres and Redis")]
+    D --> G{"All asserted tests green?"}
+    G -->|"yes"| M["Merge"]
+    G -->|"no"| F["Fix before merge"]
+    M -.->|"nightly, with budget"| E["Eval: real model, scored"]
+    E --> T{"Pass rate at or above 0.9?"}
+    T -->|"no"| A["Alert owner, investigate drift"]
+    T -->|"yes"| P["Publish metric"]
+```
+
+## Examples
+### Fake model plus real SDK over msw
+A `summarize` service depends on a narrow `ModelClient` interface,
+`{ complete(prompt: string): Promise<string> }`.
+- It calls `complete`, tries to parse `{"bullets": string[]}`, and on failure calls once more with a
+  repair prompt that quotes the bad output.
+- `anthropicAdapter(client)` implements `complete` with `client.messages.create` and joins the text blocks.
+- Test one drives the repair loop with a scripted fake. Test two constructs the real Anthropic SDK and
+  intercepts the HTTP call with `msw`, so the request body and response parsing are real.
+- **The handler *captures* the body; the assertion runs in the test.** An `expect` thrown inside an msw
+  handler becomes a 500, which surfaces as the SDK's `InternalServerError`, not the assertion message.
 
 ```ts
 import { describe, it, expect, vi, beforeAll, afterAll, afterEach } from "vitest";
@@ -191,46 +202,116 @@ describe("summarize (integration, real SDK over intercepted HTTP)", () => {
 });
 ```
 
+### Backoff under fake timers
+A self-contained retry helper that sleeps 1 s, then 2 s. Under fake timers the test runs in
+milliseconds; each `advanceTimersByTimeAsync` is awaited so the promise chain between timers settles.
+
+```ts
+import { it, expect, vi, afterEach } from "vitest";
+
+async function withRetry<T>(fn: () => Promise<T>, attempts = 3, baseMs = 1000): Promise<T> {
+  for (let n = 0; ; n++) {
+    try { return await fn(); }
+    catch (e) {
+      if (n + 1 >= attempts) throw e;
+      await new Promise((r) => setTimeout(r, baseMs * 2 ** n));   // 1000 ms, then 2000 ms
+    }
+  }
+}
+
+afterEach(() => { vi.useRealTimers(); });
+
+it("retries twice with exponential backoff and no real waiting", async () => {
+  vi.useFakeTimers();
+  const fn = vi.fn()
+    .mockRejectedValueOnce(new Error("429"))
+    .mockRejectedValueOnce(new Error("429"))
+    .mockResolvedValueOnce("ok");
+  const p = withRetry(fn);
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(fn).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(2000);
+  await expect(p).resolves.toBe("ok");
+  expect(fn).toHaveBeenCalledTimes(3);
+});
+```
+
+### Worked scenario: restructuring a suite of twenty real-model tests
+Illustrative orders of magnitude for the Check yourself situation, not a benchmark.
+
+| Layer after the split | Tests | What it asserts | Runs |
+|---|---|---|---|
+| Unit, injected fake | 20 rewritten | parsing, retries, tool dispatch, persistence | every push, seconds |
+| Interception, real SDK + msw | 1 per provider adapter | request body, response and stream parsing | every push |
+| Integration, Testcontainers | per repository module | constraints, `SELECT … FOR UPDATE`, expiry | every push, per-worker schema |
+| Eval, real model | golden set | pass rate ≥ 0.9 | nightly, with a budget |
+
+- **Before:** each PR paid twenty model calls of seconds each, plus random red builds when the provider
+  was degraded.
+- **After:** the merge gate makes zero model calls and needs no provider key; quality is a tracked number.
+
+## Production patterns
+- **Fail closed on network.** Whenever the suite uses msw, call `server.listen({ onUnhandledRequest: "error" })`
+  so an unmatched URL fails the test instead of reaching the real provider. Pair it with CI jobs that
+  have no provider key at all, and monitor for any test that needs one.
+- **Per-worker schema.** When integration files run in parallel, derive a schema name such as
+  `` `test_${process.env.VITEST_POOL_ID}` `` (or `JEST_WORKER_ID`) in a setup file and run migrations into
+  it once per worker. Monitor flake rate per file; tests passing alone but failing together mean shared state.
+- **Separate type-check job.** Because Vitest strips types without checking them, run `tsc --noEmit` as
+  its own CI step next to the test run, so a type error cannot pass the suite. Watch that step's duration
+  as the repo grows.
+- **Fixture refresh on SDK upgrade.** When a dependency bot bumps `@anthropic-ai/sdk` or `openai`, re-record
+  the fixture set with a dedicated script and review the JSON diff in the same PR. Monitor the age of the
+  fixtures against the installed SDK version.
+- **Split suites by config.** Keep the scored real-model suite in its own config or directory and run it
+  from a scheduled CI workflow with `vitest run --config <eval config>`, never from the PR workflow.
+  Track its pass rate and spend per run as metrics with an owner.
+
 ## Trade-offs
-- An injected fake makes tests fast and deterministic but can drift from the real client's behaviour;
-  the interception layer is what keeps it honest, so you need both, not one.
-- Real containers in integration tests catch database semantics fakes miss, at the cost of slower
-  startup and CI complexity; an in-memory repository is acceptable only while the code relies on no
+- **Injected fake: speed vs drift.** Fast and deterministic, but it can drift from the real client's
+  behaviour. The interception layer keeps it honest, so you need both, not one.
+- **Real containers: fidelity vs startup cost.** They catch database semantics fakes miss, at the cost of
+  slower startup and CI complexity. An in-memory repository is acceptable only while the code relies on no
   constraint, isolation or JSON semantics, and stops being acceptable the day it does.
-- Recorded fixtures pin the provider's response shape, which is the point, but they go stale when the
-  provider adds fields; refresh them on SDK upgrades rather than letting them rot or auto-updating.
-- Vitest's Vite pipeline gives fast TS/ESM with little config, while Jest's maturity and ecosystem win
-  in large existing suites; switching an established Jest repo rarely pays for itself.
-- Keeping real-model tests out of the merge gate protects velocity, but only if the scheduled eval
-  actually runs and someone owns its threshold; otherwise quality regressions go unnoticed.
+- **Recorded fixtures: pinned shape vs staleness.** Pinning the provider's response shape is the point,
+  but fixtures go stale when the provider adds fields. Refresh on SDK upgrades rather than letting them rot
+  or auto-updating.
+- **Vitest vs Jest: setup speed vs maturity.** Vitest's Vite pipeline gives fast TS/ESM with little config;
+  Jest's maturity and ecosystem win in large existing suites. Switching an established Jest repo rarely
+  pays for itself.
+- **Real model out of the merge gate: velocity vs blind spots.** It protects velocity only if the scheduled
+  eval actually runs and someone owns its threshold; otherwise quality regressions go unnoticed.
 
 ## Pitfalls
-- Calling the real model in the PR suite; the symptom is intermittent red builds, a growing list of
-  `it.skip`, and a provider key visible in CI logs.
-- Mocking the SDK module instead of the network; the symptom is a green suite and a 400 from the
-  provider in production because a field was renamed or a tool schema was invalid.
-- Sharing one database between parallel workers; the symptom is tests that pass alone and fail in the
-  full run, with unique-constraint or "row not found" errors that depend on ordering.
-- Testing backoff with real timers; the symptom is a retry test that takes a minute or hits the default
-  test timeout, which then gets raised instead of fixed.
-- Forgetting `maxRetries: 0` on the client under test; the symptom is a test of a 500 response that
-  is slowed by real backoff sleeps and sees three requests where it expected one.
-- Snapshotting model text; the symptom is a snapshot file updated with `-u` on every change, so the
-  test no longer tests anything.
-- Using rollback-per-test isolation while the code under test takes its own pooled connection; the
-  symptom is "row not found" for fixtures the test just inserted, and rows that survive between tests.
-- Leaving `onUnhandledRequest` at its default (`"warn"`); the symptom is a test that hit the real
-  network because a URL did not match the handler, with only a warning buried in the output.
+- **Calling the real model in the PR suite.** Symptom: intermittent red builds, a growing list of
+  `it.skip`, and a provider key visible in CI logs. Fix: inject a fake and move real calls to the eval suite.
+- **Mocking the SDK module instead of the network.** Symptom: a green suite and a 400 from the provider in
+  production because a field was renamed or a tool schema was invalid. Fix: intercept HTTP with msw.
+- **Sharing one database between parallel workers.** Symptom: tests pass alone and fail in the full run,
+  with unique-constraint or "row not found" errors that depend on ordering. Fix: per-worker schemas.
+- **Testing backoff with real timers.** Symptom: a retry test takes a minute or hits the default test
+  timeout, which then gets raised instead of fixed. Fix: fake timers with awaited async advances.
+- **Forgetting `maxRetries: 0` on the client under test.** Symptom: a test of a 500 response is slowed by
+  real backoff sleeps and sees three requests where it expected one.
+- **Snapshotting model text.** Symptom: the snapshot file is updated with `-u` on every change, so the test
+  no longer tests anything. Fix: snapshot the prompt, score the output.
+- **Rollback isolation while the code takes its own pooled connection.** Symptom: "row not found" for
+  fixtures the test just inserted, and rows that survive between tests. Fix: inject the transaction client.
+- **Leaving `onUnhandledRequest` at its default (`"warn"`).** Symptom: a test hit the real network because
+  a URL did not match the handler, with only a warning buried in the output.
 
 ## When to use
-Reach for the injected fake whenever logic surrounds the model: prompt assembly, parsing, repair loops,
-budgets, tool dispatch, persistence. Add the interception layer for each provider adapter and for any
-stream-handling code, since that is where wire-format bugs live. Run real dependencies in integration
-tests for anything touching SQL, Redis or a queue, and design worker isolation before the suite grows.
-Keep the real model in a separate scored suite with a budget. Measure the suite's wall-clock time, its
-flake rate, and how many bugs reach production in the serialization layer; those three numbers tell you
-which layer is missing. Interviewers ask how you test non-deterministic code and what a fake cannot
-catch; the layered answer, with the merge-gate versus eval distinction, is what they are listening for.
+- **Injected fake:** whenever logic surrounds the model: prompt assembly, parsing, repair loops, budgets,
+  tool dispatch, persistence.
+- **Interception layer:** for each provider adapter and any stream-handling code, since that is where
+  wire-format bugs live.
+- **Real dependencies:** in integration tests for anything touching SQL, Redis or a queue; design worker
+  isolation before the suite grows.
+- **Real model:** a separate scored suite with a budget.
+- **Measure:** suite wall-clock time, flake rate, and how many bugs reach production in the serialization
+  layer; those three numbers tell you which layer is missing.
+- **Interviews:** expect "how do you test non-deterministic code" and "what can a fake not catch"; the
+  layered answer, with the merge-gate versus eval distinction, is what they listen for.
 
 ## Role lens
 - **Engineer:** Writes the `ModelClient` interface, the fakes and the msw handlers, keeps the unit
@@ -252,6 +333,36 @@ the lead is worried about. Keep real dependencies (Postgres, Redis) in integrati
 per-worker isolation. Move the real-model cases into a scored eval with a golden set and a pass-rate
 threshold, run on a schedule with a budget, so quality drift is measured rather than asserted. The
 merge gate becomes fast and deterministic without pretending the model is deterministic.
+
+## Interview questions
+### Why is `vi.mock` of the provider SDK not enough to test a model integration?
+- **Definition:** a module mock replaces the SDK with a canned object, so only your own branches run.
+- **Why it falls short:** serialization and parsing are skipped, so a renamed field, an invalid tool schema
+  or an unhandled stream event type passes the test and fails in production with a 400.
+- **Better:** keep the real SDK and intercept HTTP with msw, asserting the captured body in the test.
+
+### Your integration suite passes file by file but fails in the full parallel run. How do you debug it?
+- **Suspect shared state first:** parallel workers writing to one database cause ordering-dependent
+  unique-constraint and "row not found" errors.
+- **Confirm:** rerun with `fileParallelism: false` (or `--runInBand` in Jest); if it goes green, isolation is the bug.
+- **Fix:** a schema per worker from `VITEST_POOL_ID`, or rollback per test with the transaction client injected.
+
+### When would you keep Jest instead of moving to Vitest?
+- **Keep Jest** when a large suite already runs on it, because migration buys little and Jest's ecosystem
+  is mature.
+- **Choose Vitest** for a new TypeScript-first service: ESM by default, Vite aliases, little config.
+- **Either way** run `tsc --noEmit` separately if the transform strips types without checking them.
+
+### How would you test that cancelling a request stops a streamed model response?
+- **Fake stream:** an `async function*` that checks an `AbortSignal` before each yield, injected behind the
+  model interface.
+- **Assert:** abort mid-stream and check iteration stopped and no further chunks were persisted.
+- **Wire level:** with msw, return a `ReadableStream` that ends before `message_stop` to test the SDK path.
+
+### How do you keep real-model quality in check without making merges flaky?
+- **Separate scored suite** on a golden set, run nightly or on demand with a spend budget.
+- **Threshold, not assertion:** for example pass rate ≥ 0.9 or a judge score floor, published as a metric.
+- **Ownership:** someone owns the threshold and the alert, or regressions go unnoticed.
 
 ## Quiz
 ### Q: What does an HTTP-interception test with the real SDK catch that an injected fake model cannot?

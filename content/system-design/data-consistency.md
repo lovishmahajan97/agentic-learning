@@ -5,7 +5,7 @@ name: Data consistency
 kind: concept
 difficulty: core
 est_minutes: 17
-status: reviewed
+status: crisp
 related:
   - system-design/distributed-systems
   - system-design/saga-pattern-and-distributed-transactions
@@ -23,114 +23,137 @@ sources:
 ---
 
 ## TL;DR
-"Consistency" names two things: invariants inside one database (the C in ACID, enforced by constraints
-and isolation levels) and the guarantee about *which* value a read may return when copies exist
-(linearizable down to eventual). Strong guarantees cost coordination and latency, so good designs make a
-few invariants strong (permissions, quotas, idempotency keys) and let everything else lag, visibly. In AI
-systems the usual victims are the search index, the cache and the agent's memory, all copies of a source
-of truth.
+"Consistency" means invariants inside one database (ACID's C) and which value a read returns when copies
+exist (linearizable to eventual). Keep a few invariants strong (permissions, quotas, idempotency keys); let
+index, cache and agent memory lag visibly.
 
 ## Why it exists
-A single-node database with serializable transactions lets you forget this topic: every read sees the
-result of every committed write, and constraints keep invariants true. The moment you add a second copy
-of any data, you have to say what a reader may see, because the copies cannot be updated at the same
-instant. Copies are everywhere in an AI product: a read replica behind the API, a Redis cache in front of
-the database, a vector index built from documents, an agent memory store summarised from conversations,
-a permissions service mirrored into index metadata, a data warehouse fed by nightly jobs.
-
-The naive position is "it will catch up in a second, nobody will notice". Then a user uploads a contract,
-immediately asks a question about it, and the assistant answers "I don't have that document" because the
-index refresh had not run; or an admin revokes a contractor's access to a folder and the contractor's
-next query still retrieves chunks from it for thirty seconds; or an agent reads its own memory on a
-replica, misses the note it wrote a moment ago, and repeats a tool call. Each is a consistency anomaly
-with a precise name, and each has a precise fix, but only if you know which guarantee you need.
-
-The opposite naive position, "make everything strongly consistent", fails on physics and economics.
-Strong consistency across copies requires coordination: a write must be acknowledged by a quorum, or
-reads must go to the leader, before anyone can proceed. Round trips within a region cost roughly a
-millisecond; across continents tens to over a hundred milliseconds; and under a network partition the
-system must refuse requests to stay consistent. Paying that on every read of a product catalogue or a
-chunk embedding is waste. The skill is choosing per invariant, which requires knowing the ladder of
-guarantees and what each one rules out.
+- **One serializable database lets you forget this topic.** Every read sees every committed write, and
+  constraints keep invariants true.
+- **A second copy forces a decision** about what a reader may see, *because* copies cannot be updated at
+  the same instant. AI products are full of copies: a read replica behind the API, a Redis cache in front of
+  the database, a vector index built from documents, an agent memory store summarised from conversations,
+  a permissions service mirrored into index metadata, a data warehouse fed by nightly jobs.
+- **"It will catch up in a second, nobody will notice" fails visibly:**
+  - a user uploads a contract, asks about it, and hears "I don't have that document" because the index
+    refresh had not run;
+  - an admin revokes a contractor's folder access and the contractor still retrieves its chunks for thirty
+    seconds;
+  - an agent reads its memory on a replica, misses the note it just wrote, and repeats a tool call.
+- **Each is a named anomaly with a precise fix,** but only if you know which guarantee you need.
+- **"Make everything strongly consistent" fails on physics and economics.** A write must be acknowledged by
+  a quorum, or reads must go to the leader. Round trips cost roughly a millisecond within a region and
+  tens to over a hundred milliseconds across continents, and under a partition the system must refuse
+  requests. Paying that on every catalogue or chunk-embedding read is waste.
+- **The skill is choosing per invariant,** which requires knowing the ladder of guarantees and what each
+  one rules out.
 
 ## How it works
 ### Consistency inside one database: isolation
-Within a single database, concurrent transactions are isolated to a configurable degree. **Read
-committed** prevents dirty reads (seeing uncommitted data) but allows a row to change between two reads
-in the same transaction. **Snapshot isolation** (Postgres's `REPEATABLE READ`) gives each transaction a
-frozen view of the database as of its start, which rules out non-repeatable reads and phantoms but
-permits **write skew**: two transactions each read a condition, both find it true, and both write, leaving
-the invariant violated (two on-call doctors each see "at least one other doctor on call" and both go
-off duty). **Serializable** guarantees the outcome equals some serial order, at the cost of aborts under
-contention. The decisive question is whether the invariant spans rows that one transaction reads and
-another writes; if it does, you need serializable isolation or an explicit lock. This is covered in depth
-in the backend-fundamentals module.
+Concurrent transactions are isolated to a configurable degree:
+
+| Level | Prevents | Still allows |
+|---|---|---|
+| **Read committed** | dirty reads (seeing uncommitted data) | a row changing between two reads in the same transaction |
+| **Snapshot isolation** (Postgres's `REPEATABLE READ`) | non-repeatable reads and phantoms, via a frozen view as of transaction start | **write skew** |
+| **Serializable** | everything: the outcome equals some serial order | aborts under contention |
+
+- **Write skew:** two transactions each read a condition, both find it true, and both write, leaving the
+  invariant violated (two on-call doctors each see "at least one other doctor on call" and both go off duty).
+- **The decisive question:** does the invariant span rows that one transaction reads and another writes? If
+  so, you need serializable isolation or an explicit lock. Covered in depth in the backend-fundamentals
+  module.
 
 ### Consistency across copies: the ladder
-Ordered from strongest to weakest, each level is defined by the anomaly it forbids.
+Ordered strongest to weakest; each level is defined by the anomaly it forbids.
 
-- **Linearizable.** The system behaves as if there is one copy and every operation takes effect at a
-  single instant between its start and end. Once any client sees a write, every later read sees it.
-  Needed for locks, leader election, unique-name registration, quota debits. Costs a quorum or leader
-  round trip per operation and is unavailable to the minority side of a partition.
-- **Sequential, then causal.** Sequential consistency: every client sees the same total order of writes,
-  consistent with each client's program order, but not necessarily aligned with real time. Causal
-  consistency relaxes that further: only causally related writes must be seen in order (a reply never
-  appears before the message it answers); concurrent writes may be seen in different orders by
-  different clients. Cheaper than linearizable, and causal is enough for most collaborative and
-  conversational data.
-- **Session guarantees.** Promises scoped to one client's session: **read-your-writes** (you see your own
-  updates), **monotonic reads** (you never see time go backwards), **monotonic writes** (your writes apply
-  in order), **writes-follow-reads**. These are what users actually notice, and they are cheap to provide
-  by routing a session's reads to the leader for a short period after a write, or by carrying a version
-  token the replica must have caught up to before serving.
-- **Eventual.** If writes stop, all copies converge. No bound on *when*, and no promise about what a read
-  returns in the meantime. Right for analytics, recommendations, derived indexes, caches with TTLs.
+| Level | Guarantee | Needed for | Cost |
+|---|---|---|---|
+| **Linearizable** | behaves as one copy; each operation takes effect at a single instant between start and end; once any client sees a write, every later read sees it | locks, leader election, unique-name registration, quota debits | quorum or leader round trip per operation; unavailable to the minority side of a partition |
+| **Sequential** | every client sees the same total order of writes, consistent with each client's program order, not necessarily real time | | cheaper than linearizable |
+| **Causal** | only causally related writes must be seen in order (a reply never appears before the message it answers); concurrent writes may be seen in different orders | most collaborative and conversational data | cheaper still |
+| **Session guarantees** | promises scoped to one client's session (below) | what users actually notice | cheap |
+| **Eventual** | if writes stop, all copies converge; no bound on *when*, no promise about reads meanwhile | analytics, recommendations, derived indexes, caches with TTLs | cheapest |
+
+Session guarantees, and how to provide them cheaply:
+- **Read-your-writes:** you see your own updates.
+- **Monotonic reads:** you never see time go backwards.
+- **Monotonic writes:** your writes apply in order.
+- **Writes-follow-reads.**
+- **Implementation:** route a session's reads to the leader for a short period after a write, or carry a
+  version token the replica must have caught up to before serving.
 
 ### Converging needs a merge rule
 "All copies converge" hides a decision: when two copies accepted different writes to the same item
-(multi-leader replication, offline clients, two regions), something must decide the merged value.
-**Last-writer-wins** keeps the write with the highest timestamp; it always converges, *because* every
-replica applies the same rule, but it silently discards the other write and, with wall-clock
-timestamps, can discard the genuinely later one. **Version vectors** detect that two writes were
-concurrent rather than ordered and keep both as siblings for the application to merge (two edits to a
-shared prompt template surface as a conflict to resolve). **CRDTs** are data types whose merge is
-defined so that any order of applying updates yields the same result: a grow-only counter sums per-node
-counts, an observed-remove set keeps an add unless the remove saw it, and collaborative text editors
-use sequence CRDTs. They converge without coordination, but only for operations the type defines; an
-invariant such as "balance never below zero" cannot be kept by merging after the fact and needs
-coordination before the write.
+(multi-leader replication, offline clients, two regions), something must pick the merged value.
+
+| Rule | How it converges | Cost |
+|---|---|---|
+| **Last-writer-wins** | keeps the highest timestamp; always converges *because* every replica applies the same rule | silently discards the other write; with wall-clock timestamps, can discard the genuinely later one |
+| **Version vectors** | detect that two writes were concurrent rather than ordered and keep both as siblings | the application must merge (two edits to a shared prompt template surface as a conflict) |
+| **CRDTs** | the merge is defined so any order of applying updates gives the same result | only for operations the type defines |
+
+- **CRDT examples:** a grow-only counter sums per-node counts; an observed-remove set keeps an add unless
+  the remove saw it; collaborative text editors use sequence CRDTs.
+- **What merging cannot do:** an invariant such as "balance never below zero" cannot be kept by merging
+  after the fact and needs coordination before the write.
 
 ### Where lag comes from and how it is bounded
-Replication lag is the time between a commit on the leader and its visibility on a copy. Asynchronous
-database replicas lag milliseconds to seconds, more under load. Search and vector indexes commonly make
-new writes visible only after a periodic refresh (Elasticsearch's default refresh interval is one
-second). Caches lag until invalidation or TTL. Event-driven projections lag by queue depth. Bounding lag
-means measuring it (leader LSN minus replica LSN, event timestamp minus processing time) and routing
-sensitive reads around it.
+Replication lag is the time between a commit on the leader and its visibility on a copy.
+
+| Copy | Typical lag |
+|---|---|
+| Asynchronous database replica | milliseconds to seconds, more under load |
+| Search and vector indexes | until the next periodic refresh (Elasticsearch's default refresh interval is one second) |
+| Caches | until invalidation or TTL |
+| Event-driven projections | queue depth |
+
+- **Bounding lag means measuring it** (leader LSN minus replica LSN, event timestamp minus processing time)
+  and routing sensitive reads around it.
 
 ### Derived data and the permission problem
-A vector index is a *derived* copy of documents plus access metadata. Two consistency questions follow.
-Freshness: how long after a document changes or is deleted do stale chunks remain retrievable? Deletion
-must propagate as an explicit tombstone event, and the retention of embeddings for deleted documents is a
-compliance issue, not only a quality issue. Authorisation: if access control lists are copied into the
-index as filter metadata, a revocation is eventually consistent, and the window is a leak. The robust
-design checks permissions at query time against the authoritative store (a strongly consistent read of a
-small set), or filters by document id against a fresh ACL lookup after retrieval, and uses index metadata
-only as a pre-filter for efficiency.
+A vector index is a *derived* copy of documents plus access metadata, which raises two questions:
+- **Freshness:** how long after a document changes or is deleted do stale chunks stay retrievable?
+  Deletion must propagate as an explicit tombstone event, and retaining embeddings of deleted documents is
+  a compliance issue, not only a quality issue.
+- **Authorisation:** if access control lists are copied into the index as filter metadata, a revocation is
+  eventually consistent, and the window is a leak.
+- **Robust design:** check permissions at query time against the authoritative store (a strongly
+  consistent read of a small set), or filter by document id against a fresh ACL lookup after retrieval.
+  Use index metadata only as a pre-filter for efficiency.
 
 ### Choosing per invariant
-List each piece of state, name the invariant, and ask what a stale read costs. Money, permissions,
-uniqueness, quotas and idempotency records: strong, in one place, read from the leader. User-visible
-"did my action take" state: session guarantees. Everything derived: eventual, with a measured and
-displayed lag ("index updated 4 s ago"). Aggregates in domain-driven design express the same rule: strong
-consistency inside an aggregate, eventual between aggregates.
+List each piece of state, name the invariant, and ask what a stale read costs.
 
-## Example
+| State | Level | Where |
+|---|---|---|
+| Money, permissions, uniqueness, quotas, idempotency records | strong | in one place, read from the leader |
+| User-visible "did my action take" state | session guarantees | token or sticky routing |
+| Everything derived | eventual | with a measured and displayed lag ("index updated 4 s ago") |
+
+- **Domain-driven design says the same:** strong consistency inside an aggregate, eventual between
+  aggregates.
+
+## Diagram
+The per-invariant decision: ask what a stale read costs, then buy only the guarantee that cost justifies.
+
+```mermaid
+flowchart TD
+    S["A piece of state"] --> Q1{"Stale read costs money or access?"}
+    Q1 -->|"yes"| ST["Strong: leader read, serializable or lock"]
+    Q1 -->|"no"| Q2{"User checks their own action?"}
+    Q2 -->|"yes"| SE["Session: version token or sticky primary"]
+    Q2 -->|"no"| EV["Eventual: derived copy"]
+    EV --> M["Measure and show the lag"]
+    ST -.->|"spans rows"| SK["Guard against write skew"]
+```
+
+## Examples
+### Read-your-writes with a Postgres LSN token
 Read-your-writes across a Postgres primary and an asynchronous replica. After a write commits, the API
-returns a version token (the primary's write-ahead-log position at or after the commit record); later
-reads carry it, and the replica is used
-only if it has replayed past that position, otherwise the read is routed to the primary.
+returns a version token (the primary's write-ahead-log position at or after the commit record); later reads
+carry it, and the replica is used only if it has replayed past that position, otherwise the read is routed
+to the primary.
 
 ```python
 import psycopg
@@ -159,58 +182,117 @@ def read_memory(primary, replica, run_id, token=None):
 # Reads with no token (another user's dashboard) go to the replica and accept lag.
 ```
 
-The cost is one extra round trip to the replica when the token is present, and a primary read only when
-the replica is behind, which is exactly the small fraction of reads that would otherwise have been
-wrong. A cheaper variant with the same guarantee is to route all reads of a session to the primary for a
-fixed window (a few seconds) after any write, at the price of some unnecessary primary load, and a
-guarantee that breaks if replica lag ever exceeds the window. The same token also buys **monotonic
-reads** when there are several replicas: if the client keeps the highest LSN it has *read* as well as
-written, and sends that, a request load-balanced to a more-lagged replica is redirected instead of
-showing older data than the previous page did.
+- **Cost:** one extra round trip to the replica when the token is present, and a primary read only when the
+  replica is behind, which is exactly the small fraction of reads that would otherwise have been wrong.
+- **Cheaper variant:** route all reads of a session to the primary for a fixed window (a few seconds) after
+  any write. The price is some unnecessary primary load, and a guarantee that breaks if replica lag ever
+  exceeds the window.
+- **Monotonic reads for free:** with several replicas, if the client keeps the highest LSN it has *read* as
+  well as written and sends that, a request load-balanced to a more-lagged replica is redirected instead of
+  showing older data than the previous page did.
+
+### Runnable: last-writer-wins, a CRDT merge, and write skew
+Three anomalies in a few lines of pure Python: a skewed clock makes LWW drop the later write, a grow-only
+counter converges in any merge order, and two snapshot-isolated quota checks both pass.
+
+```python
+# Last-writer-wins with a skewed clock. Real order: A writes at 9.0 s, then B at 10.0 s,
+# but A's clock runs 2 s fast, so A's write is stamped 11.0.
+writes = [("A", 9.0 + 2.0, "tone=casual"), ("B", 10.0, "tone=formal")]   # (node, stamp, value)
+print(max(writes, key=lambda w: w[1])[2])     # tone=casual: the genuinely later write is lost
+
+# Grow-only counter CRDT: each node counts only its own increments.
+def merge(x, y):                              # per-node max: commutative, associative, idempotent
+    return {k: max(x.get(k, 0), y.get(k, 0)) for k in x.keys() | y.keys()}
+
+a, b = {"A": 3}, {"B": 2}                     # increments accepted on each side of a partition
+ab, ba = merge(a, b), merge(b, a)
+print(sum(ab.values()), ab == ba)             # 5 True: same value in either merge order
+print(merge(ab, ab) == ab)                    # True: re-merging (a redelivery) changes nothing
+
+# Write skew under snapshot isolation: quota 100, usage 90, two requests add 8 each.
+usage_rows, quota = [90], 100
+snapshot_t1, snapshot_t2 = sum(usage_rows), sum(usage_rows)    # both read before either commits
+if snapshot_t1 + 8 <= quota: usage_rows.append(8)               # T1 passes its check
+if snapshot_t2 + 8 <= quota: usage_rows.append(8)               # T2 passes its check too
+print(sum(usage_rows))                        # 106: both committed, invariant broken
+```
+
+### Worked scenario: fixing the quota write skew
+Quota 100, current usage 90, two concurrent requests of 8 each (the last block above).
+
+| Approach | What happens | Final usage |
+|---|---|---|
+| Snapshot isolation, insert a usage row each | both snapshots show 90, both insert different rows, no write-write conflict | 106 (broken) |
+| Serializable isolation | one transaction aborts with a serialization failure and retries, then sees 98 and is rejected | 98 |
+| `SELECT ... FOR UPDATE` on the tenant row before the check | the second request waits, then sees 98 and is rejected | 98 |
+| One counter, single atomic conditional `UPDATE` | the second update matches no row because 98 + 8 > 100 | 98 |
+
+## Production patterns
+- **Consistency tokens from the WAL position.** Return `pg_current_wal_lsn()` after a write and compare
+  with `pg_last_wal_replay_lsn()` on the replica before serving that client's reads, as in the example.
+  Monitor the fraction of token reads that fall back to the primary; a rising fraction means replicas are
+  lagging.
+- **Replication lag as a first-class metric.** On the Postgres primary, `pg_stat_replication` reports
+  per-replica lag (`replay_lag`); alert when it exceeds the product's promise, and take a replica out of
+  read rotation when it does.
+- **Atomic conditional updates for quotas.** Keep usage as one counter and debit with
+  `UPDATE quotas SET used = used + $1 WHERE tenant_id = $2 AND used + $1 <= quota_limit RETURNING used`;
+  zero rows returned means over quota. Monitor rejected debits per tenant.
+- **Serializable with retry for multi-row invariants.** Run the transaction at `SERIALIZABLE` and retry on
+  SQLSTATE `40001` (serialization failure) with a small bounded loop. Monitor the abort rate; a high rate
+  is the cue to switch that path to an explicit lock or a single counter.
+- **Wait for index refresh on user-facing writes.** When the user will search right after uploading, index
+  with Elasticsearch's `refresh=wait_for` on that request (or show "indexing" until the document's indexed
+  event arrives) instead of shortening the refresh interval for everyone. Monitor indexing latency.
+- **Query-time ACL check after retrieval.** Pre-filter by index metadata, then drop candidates whose current
+  permission, read from the authoritative store, denies the user. Measure revocation-to-enforcement time
+  and report it.
 
 ## Trade-offs
-- Linearizable reads make correctness trivial to reason about, but each costs a leader or quorum round
-  trip and disappears on the minority side of a partition; once an operation's error cost is lower than
-  its latency cost, drop to a weaker level.
-- Session guarantees give users almost everything they notice at a fraction of the cost of global strong
-  consistency, yet they require sticky routing or version tokens, which complicates stateless load
-  balancing.
-- Copying permissions into index metadata makes retrieval filters fast and self-contained, while turning
-  every revocation into an eventually consistent leak window; query-time checks against the source are
-  slower per request but close the window entirely.
-- Serializable isolation catches write skew automatically, but aborts rise with contention; for a hot
-  counter or quota, an explicit row lock or an atomic single-statement update is both faster and
-  simpler.
-- Displaying lag ("updated 4 s ago", "indexing…") costs UI work and admits imperfection, but it converts
-  a bug report into an understood state and lets you keep the cheap eventual path.
+- **Linearizable reads vs latency and availability.** They make correctness trivial to reason about, but each
+  costs a leader or quorum round trip and disappears on the minority side of a partition. Once an
+  operation's error cost is lower than its latency cost, drop to a weaker level.
+- **Session guarantees vs stateless routing.** They give users almost everything they notice at a fraction
+  of the cost of global strong consistency, yet they require sticky routing or version tokens, which
+  complicates stateless load balancing.
+- **Copied permissions vs query-time checks.** ACLs in index metadata make retrieval filters fast and
+  self-contained, but turn every revocation into an eventually consistent leak window; query-time checks
+  against the source are slower per request but close the window entirely.
+- **Serializable vs explicit locks.** Serializable isolation catches write skew automatically, but aborts rise
+  with contention; for a hot counter or quota, an explicit row lock or an atomic single-statement update is
+  both faster and simpler.
+- **Displaying lag vs hiding it.** Showing "updated 4 s ago" or "indexing…" costs UI work and admits
+  imperfection, but converts a bug report into an understood state and lets you keep the cheap eventual path.
 
 ## Pitfalls
-- Reading from a replica right after writing to the primary; users see their new document, setting or
+- **Reading from a replica right after writing to the primary.** Users see their new document, setting or
   memory vanish and reappear, and the bug cannot be reproduced on a single-node dev setup.
-- Treating snapshot isolation as serializable; two concurrent requests both pass a "seat is free" or
-  "usage is under quota" check, each inserts its own row, both commit, and the invariant is found
-  broken days later (a conflicting update to the *same* row would have been caught; disjoint writes
-  are not).
-- Enforcing authorisation only through copied index metadata; a revoked user still retrieves content
-  for the lag window, which audit logs reveal as access after revocation.
-- Deleting source documents without emitting a tombstone to derived stores; embeddings of deleted or
-  redacted content keep surfacing in answers, sometimes months later.
-- Assuming the cache is coherent with the database; after a write, one request path reads the fresh row
-  and another the stale cache entry, producing responses that contradict each other within one page
-  load.
-- Using wall-clock last-writer-wins to merge concurrent updates across replicas; an edit silently
-  disappears and no error is ever logged.
+- **Treating snapshot isolation as serializable.** Two concurrent requests both pass a "seat is free" or
+  "usage is under quota" check, each inserts its own row, both commit, and the invariant is found broken
+  days later (a conflicting update to the *same* row would have been caught; disjoint writes are not).
+- **Enforcing authorisation only through copied index metadata.** A revoked user still retrieves content for
+  the lag window, which audit logs reveal as access after revocation.
+- **Deleting source documents without a tombstone to derived stores.** Embeddings of deleted or redacted
+  content keep surfacing in answers, sometimes months later.
+- **Assuming the cache is coherent with the database.** After a write, one request path reads the fresh row
+  and another the stale cache entry, producing responses that contradict each other within one page load.
+- **Wall-clock last-writer-wins to merge concurrent updates across replicas.** An edit silently disappears and
+  no error is ever logged.
 
 ## When to use
 You are always choosing a consistency level, whether you name it or not; the default of "whatever the
-replica returns" is a choice. Make it explicit per invariant: write down which state is strong, which
-has session guarantees, and which is eventual with what bound, and encode the routing (primary versus
-replica, query-time ACL versus metadata filter, synchronous versus asynchronous indexing) accordingly.
-Measure replication lag, index freshness lag and cache hit-on-stale rates, and alert when the lag exceeds
-what the product promises. In day-to-day work this is the `read_from_primary=True` flag on a repository
-call, the tombstone event on document deletion, and the ACL check after retrieval. In interviews, be able
-to place linearizable, causal, read-your-writes and eventual on one ladder with the anomaly each forbids,
-explain write skew, and apply the ladder to a RAG index that mirrors permissions.
+replica returns" is a choice.
+- **Make it explicit per invariant:** write down which state is strong, which has session guarantees, and
+  which is eventual with what bound.
+- **Encode the routing:** primary versus replica, query-time ACL versus metadata filter, synchronous versus
+  asynchronous indexing.
+- **Measure:** replication lag, index freshness lag and cache hit-on-stale rates, and alert when lag exceeds
+  what the product promises.
+- **Day to day:** the `read_from_primary=True` flag on a repository call, the tombstone event on document
+  deletion, and the ACL check after retrieval.
+- **Interviews:** place linearizable, causal, read-your-writes and eventual on one ladder with the anomaly
+  each forbids, explain write skew, and apply the ladder to a RAG index that mirrors permissions.
 
 ## Role lens
 - **Engineer:** Routes post-write reads to the primary or carries version tokens, emits tombstones for
@@ -235,6 +317,45 @@ deletion so chunks are removed, not merely hidden. Third, state the residual: th
 only as fresh as the permission source's own consistency, and a strongly consistent read there costs
 latency per query, which you can bound by caching allow decisions for a few seconds at most. Measure
 revocation-to-enforcement time and report it.
+
+## Interview questions
+### What is the difference between the C in ACID and consistency in a replicated system?
+- **ACID's C is about invariants** inside one database: constraints and isolation keep rules such as
+  "balance not negative" true across transactions.
+- **Replication consistency is about which value a read returns** when several copies exist, from
+  linearizable (one-copy behaviour) down to eventual (copies converge sometime).
+- **Why the distinction matters:** a perfectly ACID primary can still serve stale reads from its replicas, so
+  you must pick a level for both.
+
+### A user uploads a document, immediately asks about it, and the assistant says it has no such document. Diagnose and fix.
+- **Diagnosis:** the read hit a derived copy that had not caught up, typically the vector or search index
+  before its refresh, or a replica behind the primary.
+- **Fix for the user who wrote:** read-your-writes, by waiting for the document's indexed event (or a
+  wait-for-refresh write) before enabling questions, or by carrying a version token.
+- **Fix the UX too:** show "indexing" until it is searchable, rather than making all indexing synchronous.
+
+### When would you not use serializable isolation?
+- **On hot contended rows,** where aborts and retries climb; a quota or counter is faster as one atomic
+  conditional `UPDATE` or behind a row lock.
+- **When the invariant lives in one row,** since snapshot isolation already catches write-write conflicts on
+  the same row.
+- **Use it** when an invariant spans rows that one transaction reads and another writes, the write-skew
+  shape, and you cannot restructure it into a single row.
+
+### Your RAG index copies ACLs and syncs them every hour. What is the leak window, and how do you shrink it to near zero?
+- **The window is up to an hour plus sync time:** a revoked user can retrieve chunks until the next sync.
+- **Close it at query time:** after retrieval, check each candidate's current permission against the
+  authoritative store and drop denials; keep metadata as a pre-filter.
+- **Shrink the pre-filter lag** with change events, emit tombstones on deletion, and report
+  revocation-to-enforcement time as a metric.
+
+### Two regions accept writes to the same prompt template while partitioned. How should the merge work?
+- **Not wall-clock last-writer-wins,** which silently drops one edit and may drop the genuinely later one if
+  clocks are skewed.
+- **Version vectors** detect that the edits were concurrent and keep both as siblings for an explicit merge
+  or a human choice.
+- **CRDTs** suit data whose merge can be defined up front (counters, sets, collaborative text), but cannot
+  protect invariants that need coordination before the write.
 
 ## Quiz
 ### Q: Which guarantee ensures a user always sees the memory note their agent wrote a moment ago, without requiring every read in the system to go to the leader?

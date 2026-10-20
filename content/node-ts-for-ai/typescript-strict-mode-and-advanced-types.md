@@ -5,7 +5,7 @@ name: TypeScript strict mode & advanced types
 kind: concept
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - node-ts-for-ai/runtime-schema-validation
   - node-ts-for-ai/promises-and-async-error-propagation
@@ -18,124 +18,146 @@ sources:
 ---
 
 ## TL;DR
-TypeScript types are erased before the code runs, so they only protect you if the compiler is allowed
-to be strict. `strict` turns on null checks, bans implicit `any` and makes function types sound; the
-advanced features (discriminated unions, constrained generics, conditional/mapped/template-literal
-types, `satisfies`, `unknown`) let you encode the shapes AI code actually handles — stream events, tool
-contracts, provider responses — so mismatches fail at compile time instead of as `undefined` crashes
-in the middle of a streamed answer.
+TypeScript types are erased before code runs, so they protect you only under `strict`. Strict mode plus
+discriminated unions, generics, `satisfies` and `unknown` encode stream events, tool contracts and
+provider responses, so mismatches fail at compile time, not as mid-stream `undefined` crashes.
 
 ## Why it exists
-A Node AI service is mostly glue between things that have no static shape: JSON from a model, tool-call
-arguments the model invented, server-sent events that come in four or five variants, SDK response
-objects with deeply optional fields (in OpenAI's Chat Completions shape, `choices[0]?.message?.content`
-is legitimately `null` when the model returned a tool call instead of text). JavaScript lets you read any property of anything, so the
-natural failure mode is `TypeError: Cannot read properties of undefined` thrown halfway through a
-request, after tokens have been billed and partially streamed to the user.
-
-The naive answer is "write tests". Tests exercise the paths you thought of; a type checker exercises
-every call site of every function on every change, including the provider SDK upgrade that silently
-made a field optional. The second naive answer is "use TypeScript, but leave the defaults": without
-`strict`, untyped parameters become `any`, `null` is a member of every type, and `JSON.parse` returns
-`any` that flows unchecked into your domain objects. That TypeScript catches almost nothing, and worse,
-it creates a false sense that the shapes are checked. Strict mode plus the advanced type features exist
-to make the compiler say *no* at the exact places where a dynamic language would have said *maybe*:
-null handling, variant handling, and the boundary where untrusted data becomes typed data.
+- **AI services are glue between shapeless data.** JSON from a model, tool-call arguments the model
+  invented, server-sent events in four or five variants, SDK objects with deeply optional fields. In
+  OpenAI's Chat Completions shape, `choices[0]?.message?.content` is legitimately `null` when the model
+  returned a tool call instead of text.
+- **JavaScript lets you read anything.** The natural failure is `TypeError: Cannot read properties of
+  undefined` thrown halfway through a request, after tokens have been billed and partially streamed.
+- **"Write tests" is not enough.** Tests exercise the paths you thought of; a type checker exercises every
+  call site on every change, including the SDK upgrade that silently made a field optional.
+- **Default TypeScript catches almost nothing.** Without `strict`, untyped parameters become `any`, `null`
+  is a member of every type, and `JSON.parse` returns `any` that flows unchecked into domain objects. Worse,
+  it creates a false sense that shapes are checked.
+- **What strictness buys.** The compiler says *no* exactly where a dynamic language says *maybe*: null
+  handling, variant handling, and the boundary where untrusted data becomes typed data.
 
 ## How it works
 ### What `strict` actually switches on
-`"strict": true` is an umbrella for a family of flags, each closing a specific hole:
+`"strict": true` is an umbrella for a family of flags, each closing a specific hole.
 
-- **`noImplicitAny`** — an untyped parameter or variable is an error rather than silently `any`.
-  Because `any` is viral: one untyped parameter turns everything derived from it into `any`.
-- **`strictNullChecks`** — `null` and `undefined` are their own types, not members of every type. A
-  `string | null` must be narrowed before `.trim()`. This is the flag that turns "Cannot read
-  properties of undefined" from a runtime surprise into a compile error.
-- **`strictFunctionTypes`** — parameters of function-typed values are checked contravariantly. A handler
-  typed to accept `TextEvent` cannot be passed where a handler of `StreamEvent` is expected, because it
-  would receive events it cannot handle. Parameters declared with method syntax (`onEvent(e: T): void`
-  in an interface) stay bivariant for compatibility, so prefer property syntax (`onEvent: (e: T) => void`)
-  for callback contracts.
-- **`strictPropertyInitialization`**, **`strictBindCallApply`**, **`noImplicitThis`**, **`alwaysStrict`**
-  — class fields must be initialised at declaration or in the constructor, `.call/.apply` are type-checked, `this` must have a
-  known type, and `"use strict"` is emitted.
-- **`useUnknownInCatchVariables`** — `catch (e)` makes `e: unknown`, so you must narrow before reading
-  `e.message`. Anything can be thrown in JS, including strings and `undefined`.
+| Flag | What it does | Because |
+|---|---|---|
+| **`noImplicitAny`** | An untyped parameter or variable is an error, not silently `any` | `any` is viral: one untyped parameter turns everything derived from it into `any` |
+| **`strictNullChecks`** | `null` and `undefined` are their own types; a `string \| null` must be narrowed before `.trim()` | Turns "Cannot read properties of undefined" from a runtime surprise into a compile error |
+| **`strictFunctionTypes`** | Parameters of function-typed values are checked contravariantly | A handler typed to accept `TextEvent` would receive events it cannot handle if passed where a handler of `StreamEvent` is expected |
+| **`strictPropertyInitialization`** | Class fields must be initialised at declaration or in the constructor | No half-built objects |
+| **`strictBindCallApply`** | `.call/.apply` are type-checked | Dynamic calls stay checked |
+| **`noImplicitThis`** | `this` must have a known type | No accidental global `this` |
+| **`alwaysStrict`** | `"use strict"` is emitted | JS strict semantics everywhere |
+| **`useUnknownInCatchVariables`** | `catch (e)` makes `e: unknown`; narrow before reading `e.message` | Anything can be thrown in JS, including strings and `undefined` |
 
-New TypeScript releases occasionally add flags to the `strict` family (5.6 added
-`strictBuiltinIteratorReturn`), so upgrading the compiler can surface new errors; that is the point.
+- **Method vs property syntax.** Parameters declared with method syntax (`onEvent(e: T): void` in an
+  interface) stay bivariant for compatibility, so prefer property syntax (`onEvent: (e: T) => void`) for
+  callback contracts.
+- **The family grows.** New TypeScript releases occasionally add flags to `strict` (5.6 added
+  `strictBuiltinIteratorReturn`), so upgrading the compiler can surface new errors; that is the point.
 
-Three flags are *not* in `strict` and are worth adding: `noUncheckedIndexedAccess` (`arr[i]` and
-`record[key]` are `T | undefined`, which is the truth — `choices[0]` can be missing),
-`exactOptionalPropertyTypes` (an optional property may be absent but may not be explicitly
-`undefined`; this matters because `{ ...defaults, ...overrides }` with `temperature: undefined`
-*overwrites* the default, and `"temperature" in opts` is true for a present-but-undefined key), and
-`noFallthroughCasesInSwitch`.
+### Three flags worth adding beyond `strict`
+- **`noUncheckedIndexedAccess`.** `arr[i]` and `record[key]` become `T | undefined`, which is the truth:
+  `choices[0]` can be missing.
+- **`exactOptionalPropertyTypes`.** An optional property may be absent but may not be explicitly
+  `undefined`. It matters because `{ ...defaults, ...overrides }` with `temperature: undefined`
+  *overwrites* the default, and `"temperature" in opts` is true for a present-but-undefined key.
+- **`noFallthroughCasesInSwitch`.** A `case` that falls into the next without `break` is an error.
 
 ### How narrowing works
-Strictness is livable only because the checker does *control-flow analysis*: it tracks, per code path,
-what a variable can be. After `if (x === null) return;` the type of `x` below is `T`, not `T | null`.
-Narrowing comes from `typeof x === "string"`, `x instanceof Error`, `"tool_calls" in msg`, equality on
-a literal field (`ev.type === "done"`), truthiness, and two user-written forms: a type predicate
-(`function isToolCall(x: unknown): x is ToolCall`) narrows in the caller's `if`, and an assertion
-function (`function assertDefined<T>(x: T): asserts x is NonNullable<T>`) narrows everything after the
-call or throws. Both are trusted blindly: if the body of a type guard is wrong, the compiler believes
-the lie, so keep guards tiny or generate them from a schema.
+Strictness is livable only because of *control-flow analysis*: the checker tracks, per code path, what a
+variable can be. After `if (x === null) return;` the type of `x` below is `T`, not `T | null`.
+
+- **Built-in narrowing:** `typeof x === "string"`, `x instanceof Error`, `"tool_calls" in msg`, equality on
+  a literal field (`ev.type === "done"`), and truthiness.
+- **Type predicate:** `function isToolCall(x: unknown): x is ToolCall` narrows in the caller's `if`.
+- **Assertion function:** `function assertDefined<T>(x: T): asserts x is NonNullable<T>` narrows everything
+  after the call, or throws.
+- **Both are trusted blindly.** If a guard's body is wrong, the compiler believes the lie, so keep guards
+  tiny or generate them from a schema.
 
 ### `unknown` versus `any`
-`any` switches the checker off for that value. `unknown` is the honest top type: you can hold it, but
-you cannot call, index or dereference it until you narrow it with `typeof`, `instanceof`, a user-defined
-type guard (`function isToolCall(x: unknown): x is ToolCall`), or a runtime validator. The rule that
-follows: wrap `JSON.parse` so it returns `unknown`, and make every boundary (HTTP body, model output,
-env var, webhook) go through a parse step that produces a typed value or throws. Types inside the
-boundary can then be trusted *because* nothing crosses it unvalidated.
+- **`any` switches the checker off** for that value.
+- **`unknown` is the honest top type.** You can hold it, but cannot call, index or dereference it until you
+  narrow it with `typeof`, `instanceof`, a user-defined type guard
+  (`function isToolCall(x: unknown): x is ToolCall`), or a runtime validator.
+- **The rule that follows.** Wrap `JSON.parse` so it returns `unknown`, and make every boundary (HTTP body,
+  model output, env var, webhook) go through a parse step that yields a typed value or throws. Types
+  inside the boundary can then be trusted *because* nothing crosses it unvalidated.
 
 ### Discriminated unions and exhaustiveness
-Model a stream as a union of object types sharing a literal `type` field:
-`{ type: "text_delta"; text: string } | { type: "tool_call"; name: string; args: unknown } |
-{ type: "done"; usage: Usage }`. A `switch (ev.type)` narrows `ev` in each branch, and a `default`
-branch that assigns `ev` to a variable of type `never` fails to compile the day a provider adds a new
-variant. This is why unions beat class hierarchies for protocol data: the compiler enumerates the
-call sites you must update.
+1. **Model the stream as a union** of object types sharing a literal `type` field:
+   `{ type: "text_delta"; text: string } | { type: "tool_call"; name: string; args: unknown } |
+   { type: "done"; usage: Usage }`.
+2. **Switch on the tag.** `switch (ev.type)` narrows `ev` in each branch, and a `default` branch that
+   assigns `ev` to a variable of type `never` fails to compile the day a provider adds a new variant.
+3. **Why unions beat class hierarchies** for protocol data: the compiler enumerates the call sites you must
+   update.
 
 ### Generics with constraints
-`function defineTool<A, R>(spec: { parse: (x: unknown) => A; run: (args: A) => Promise<R> })` ties the
-argument parser to the handler's parameter type, so a handler cannot be registered with a parser that
-produces a different shape. `extends` constrains what a type parameter may be (`K extends keyof T`),
-and inference from arguments means callers rarely write the type parameters by hand.
+- **Tie parser to handler.**
+  `function defineTool<A, R>(spec: { parse: (x: unknown) => A; run: (args: A) => Promise<R> })` means a
+  handler cannot be registered with a parser that produces a different shape.
+- **`extends` constrains** what a type parameter may be (`K extends keyof T`).
+- **Inference from arguments** means callers rarely write type parameters by hand.
 
 ### Conditional, mapped and template-literal types
-Mapped types transform every property (`Partial<T>`, `Readonly<T>`, `Record<K, V>`, or a custom
-`{ [P in keyof T]: T[P] | null }`). Conditional types branch on a type
-(`T extends Promise<infer U> ? U : T` is a simplified `Awaited`; the built-in one also recurses and
-unwraps any thenable; `ReturnType` and `Parameters` are built the same way with `infer`). Template-literal types build string unions
-(`` `${Provider}:${Model}` ``). They are for library and contract code — typing an SDK wrapper or a
-tool registry — not for everyday application logic, where they cost readability.
+| Kind | Examples | Notes |
+|---|---|---|
+| **Mapped** | `Partial<T>`, `Readonly<T>`, `Record<K, V>`, or a custom nullable map (below) | Transform every property |
+| **Conditional** | `T extends Promise<infer U> ? U : T` | A simplified `Awaited`; the built-in also recurses and unwraps any thenable. `ReturnType` and `Parameters` are built the same way with `infer` |
+| **Template-literal** | `` `${Provider}:${Model}` `` | Build string unions |
+
+- **Custom mapped type:** `{ [P in keyof T]: T[P] | null }` makes every property nullable.
+- **Where they belong.** Library and contract code (an SDK wrapper, a tool registry), not everyday
+  application logic, where they cost readability.
 
 ### Branded types
-TypeScript is structural: any `string` fits any `string` parameter, so an unvalidated user string and
-a sanitized SQL fragment, or a token count and a dollar amount, are interchangeable. A brand adds a
-phantom property that only one function can produce: `type ValidatedPrompt = string & { readonly
-__brand: "ValidatedPrompt" }`. Only `validatePrompt(s: string): ValidatedPrompt` returns one (via a
-single internal cast), so `callModel(p: ValidatedPrompt)` cannot be handed raw input by mistake. The
-brand costs nothing at runtime because it is erased; it encodes "this check already happened" in the
-type, which is the same idea as parsing at the boundary.
+- **The problem: TypeScript is structural.** Any `string` fits any `string` parameter, so an unvalidated
+  user string and a sanitized SQL fragment, or a token count and a dollar amount, are interchangeable.
+- **The fix: a phantom property** only one function can produce:
+  `type ValidatedPrompt = string & { readonly __brand: "ValidatedPrompt" }`. Only
+  `validatePrompt(s: string): ValidatedPrompt` returns one (via a single internal
+  cast), so `callModel(p: ValidatedPrompt)` cannot be handed raw input by mistake.
+- **Zero runtime cost** because the brand is erased; it encodes "this check already happened" in the type,
+  the same idea as parsing at the boundary.
 
 ### `as const` and `satisfies`
-`as const` makes a literal deeply readonly and keeps literal types (`"gpt-4o"` instead of `string`).
-`satisfies` checks a value against a type *without* widening it, so a model table can be validated
-as `Record<string, ModelSpec>` while `keyof typeof table` still yields the literal model names. A plain
-annotation would widen the keys to `string` and lose that.
+- **`as const`** makes a literal deeply readonly and keeps literal types (`"gpt-4o"` instead of `string`).
+- **`satisfies`** checks a value against a type *without* widening it, so a model table can be validated as
+  `Record<string, ModelSpec>` while `keyof typeof table` still yields the literal model names.
+- **A plain annotation** would widen the keys to `string` and lose that.
 
 ### What the compiler cannot do
-`tsc` emits JavaScript with every type removed; no check runs at runtime. A strict program that casts
-`JSON.parse(body) as Request` is exactly as unsafe as untyped JS. Strictness pays off only when paired
-with runtime validation at the edges, which is the subject of the schema-validation lesson.
+- **`tsc` erases every type;** no check runs at runtime.
+- **A cast is untyped JS.** A strict program that casts `JSON.parse(body) as Request` is exactly as unsafe
+  as untyped JS.
+- **Pair with runtime validation** at the edges, the subject of the schema-validation lesson.
 
-## Example
+## Diagram
+Untrusted data enters as `unknown`, is parsed once at the boundary, and from then on strict checking and
+exhaustive switches guard every use.
+
+```mermaid
+flowchart TD
+    I["HTTP body, model output, env"] --> U["JSON.parse returns unknown"]
+    U --> P{"Parse or type guard"}
+    P -->|"fails"| E["Throw at the boundary"]
+    P -->|"passes"| T["Typed value, e.g. StreamEvent"]
+    T --> S["switch on ev.type"]
+    S --> B1["text_delta branch"]
+    S --> B2["tool_call branch"]
+    S --> B3["done branch"]
+    S -.->|"unhandled variant"| N["never check: compile error"]
+```
+
+## Examples
+### Typed stream handler, model table and brand
 A typed stream handler, an exhaustiveness check, a model table that keeps literal keys, and a branded
-type that makes "validated" visible to the compiler. Compile with
-`"strict": true` and `"noUncheckedIndexedAccess": true` in `tsconfig.json`.
+type that makes "validated" visible to the compiler. Compile with `"strict": true` and
+`"noUncheckedIndexedAccess": true` in `tsconfig.json`.
 
 ```ts
 type Usage = { inputTokens: number; outputTokens: number };
@@ -182,50 +204,104 @@ try { parseJson("{"); } catch (e) {                        // e: unknown
 }
 ```
 
+### A typed tool registry with a constrained generic
+`defineTool` ties each tool's parser to its handler, so the registry cannot hold a mismatched pair. The
+type guard here is deliberately tiny, as the narrowing section advises.
+
+```ts
+type Tool<A, R> = { name: string; parse: (x: unknown) => A; run: (args: A) => Promise<R> };
+
+function defineTool<A, R>(spec: Tool<A, R>): Tool<A, R> { return spec; }
+
+function isRecord(x: unknown): x is Record<string, unknown> {
+  return typeof x === "object" && x !== null && !Array.isArray(x);
+}
+
+const getWeather = defineTool({
+  name: "get_weather",
+  parse: (x) => {
+    if (!isRecord(x) || typeof x.city !== "string") throw new Error("city must be a string");
+    return { city: x.city };                 // A inferred as { city: string }
+  },
+  run: async (args) => `Sunny in ${args.city}`,   // args is { city: string }, no annotation needed
+});
+
+async function dispatch<A, R>(tool: Tool<A, R>, rawArgs: unknown): Promise<R> {
+  return tool.run(tool.parse(rawArgs));      // model-invented args are parsed before use
+}
+// dispatch(getWeather, JSON.parse('{"city":"Oslo"}')) resolves to "Sunny in Oslo"
+```
+
+### Worked scenario: an SDK upgrade that made a field nullable
+A team upgraded a provider SDK; the response field holding text became `string | null` because tool calls
+now return no text.
+
+| Codebase setting | What happened |
+|---|---|
+| `strict: false`, result cast with `as` | Compiled cleanly; `content.trim()` threw `TypeError` in production on every tool-call turn |
+| `strict: true` | `tsc` flagged each `.trim()` call site on the upgrade PR; fixed before merge |
+| `strict` plus `never` default in the event switch | The new `tool_call` variant also failed to compile in the handler until a case was added |
+
+## Production patterns
+- **Strict baseline in a shared tsconfig.** Every service extends one base config with `"strict": true`,
+  `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes`, and CI runs `tsc --noEmit` on every PR.
+  Monitor the error count when bumping the TypeScript version, since new releases can add strict flags.
+- **Lint bans on escape hatches.** Enable `@typescript-eslint/no-explicit-any` and
+  `consistent-type-assertions` as errors, with reviewed per-line disables. Track the count of `any` and `as`
+  over time as a debt metric.
+- **`unknown` at the edge, parse once.** Wrap `JSON.parse`, request bodies, webhook payloads and model tool
+  arguments so they return `unknown`, then run one schema parse that yields a typed value. Monitor
+  boundary validation-failure rates per source.
+- **Exhaustive switches on provider events.** Model each provider's stream as a discriminated union with a
+  `never` default branch, so an SDK bump that adds a variant breaks the build, not the stream. Watch for
+  "stream ended early" reports after upgrades.
+- **Ratcheted migration for legacy code.** Turn flags on one at a time, fix or explicitly suppress the
+  errors, and set a deadline, because a half-strict codebase leaves types that lie.
+
 ## Trade-offs
-- Strict mode front-loads work: every `null` must be handled explicitly, which costs time on a fresh
-  codebase but pays back the first time a provider makes a field optional; it flips against you only
-  on throwaway scripts where no second reader exists.
-- Advanced types (conditional, mapped, template-literal) make contracts precise but raise compile times
-  and the reading cost for teammates; they pay off when many call sites consume one contract (an SDK
-  wrapper, a tool registry) and cost more than they save when a type has one or two users.
-- `unknown` at every boundary forces a parse step, which is extra code and a small runtime cost, but the
-  alternative is trusting casts; the trade only flips for data your own process produced and never
-  serialized, where the compiler already knows the shape.
-- Branded types prevent mixing up same-shaped values (raw vs validated input, tokens vs dollars), but
-  every construction site needs the brand's factory; worth it where a mix-up is a security or billing
-  bug, noise where it is merely a naming issue.
-- Discriminated unions give exhaustiveness checks, while class hierarchies give polymorphic dispatch;
-  unions win for protocol data that crosses the wire, classes win when behaviour outweighs shape.
-- Gradual adoption (`strict` off, flags turned on one by one) keeps a migration shippable but leaves the
-  codebase in a state where the types lie; set a deadline or the migration never finishes.
+- **Safety vs up-front work.** Strict mode front-loads work: every `null` must be handled explicitly, which
+  costs time on a fresh codebase but pays back the first time a provider makes a field optional. It flips
+  against you only on throwaway scripts where no second reader exists.
+- **Precision vs readability.** Advanced types (conditional, mapped, template-literal) make contracts
+  precise but raise compile times and reading cost. They pay off when many call sites consume one contract
+  (an SDK wrapper, a tool registry) and cost more than they save when a type has one or two users.
+- **Honesty vs boilerplate.** `unknown` at every boundary forces a parse step, extra code and a small
+  runtime cost, but the alternative is trusting casts. It only flips for data your own process produced and
+  never serialized, where the compiler already knows the shape.
+- **Brands vs friction.** Branded types prevent mixing up same-shaped values (raw vs validated input, tokens
+  vs dollars), but every construction site needs the brand's factory. Worth it where a mix-up is a
+  security or billing bug, noise where it is merely a naming issue.
+- **Unions vs classes.** Discriminated unions give exhaustiveness checks, class hierarchies give
+  polymorphic dispatch. Unions win for protocol data that crosses the wire; classes win when behaviour
+  outweighs shape.
+- **Gradual vs big-bang adoption.** `strict` off with flags turned on one by one keeps a migration
+  shippable but leaves types that lie; set a deadline or the migration never finishes.
 
 ## Pitfalls
-- Casting with `as` to silence an error (`JSON.parse(x) as Response`); the symptom is a runtime
-  `TypeError` on a field the type said was present, usually after an upstream API change.
-- Leaving `strict: false` and assuming the red squiggles mean the code is checked; the symptom is a
-  codebase full of implicit `any` where renaming a field breaks nothing at compile time and everything
-  at runtime.
-- Forgetting the `never` default branch in a `switch` over a union; the symptom is a new event type
-  silently dropped on the floor, often noticed as "the stream ends early for tool calls".
-- Annotating instead of using `satisfies`, so a config map loses its literal keys; the symptom is
-  `keyof typeof config` becoming `string` and typos in model names compiling cleanly.
-- Treating `catch (e: any)` as harmless; the symptom is `e.message` being `undefined` because a library
-  threw a string or a non-Error object, which then hides the real failure in logs.
-- Writing a type guard or assertion function whose body checks less than its signature claims (`x is
-  ToolCall` after only checking `typeof x === "object"`); the symptom is a crash on a field the guard
-  "proved" existed, with no cast anywhere to grep for.
+- **Casting with `as` to silence an error** (`JSON.parse(x) as Response`). Symptom: a runtime `TypeError` on
+  a field the type said was present, usually after an upstream API change. Fix: return `unknown` and parse.
+- **Leaving `strict: false` and trusting the red squiggles.** Symptom: implicit `any` everywhere, so renaming
+  a field breaks nothing at compile time and everything at runtime. Fix: enable `strict`.
+- **Forgetting the `never` default branch** in a `switch` over a union. Symptom: a new event type silently
+  dropped, often noticed as "the stream ends early for tool calls".
+- **Annotating instead of using `satisfies`,** so a config map loses its literal keys. Symptom:
+  `keyof typeof config` becomes `string` and typos in model names compile cleanly.
+- **Treating `catch (e: any)` as harmless.** Symptom: `e.message` is `undefined` because a library threw a
+  string or non-Error object, hiding the real failure in logs. Fix: keep `e: unknown` and narrow.
+- **A guard that checks less than it claims** (`x is ToolCall` after only checking `typeof x === "object"`).
+  Symptom: a crash on a field the guard "proved" existed, with no cast anywhere to grep for.
 
 ## When to use
-Turn on `strict` on day one of any Node AI service and add `noUncheckedIndexedAccess`; the cost of
-retrofitting grows with every file. Reach for discriminated unions whenever data has variants (stream
-events, tool results, provider error shapes) and for constrained generics when you build a registry or
-SDK wrapper that must tie an input type to a handler. Use conditional and mapped types only when a plain
-type would have to be repeated or kept in sync by hand. Measure success by the share of `any` and `as`
-in the codebase (lint for both with `@typescript-eslint/no-explicit-any` and
-`consistent-type-assertions`) and by how often runtime `TypeError`s reach production. In interviews,
-being able to explain *why* `strictNullChecks` matters, what `unknown` buys over `any`, and how
-exhaustiveness checking works is the expected depth; writing a mapped type from memory is not.
+- **Day one:** turn on `strict` in any Node AI service and add `noUncheckedIndexedAccess`; the cost of
+  retrofitting grows with every file.
+- **Use discriminated unions** whenever data has variants (stream events, tool results, provider error
+  shapes), and **constrained generics** when a registry or SDK wrapper must tie an input type to a handler.
+- **Use conditional and mapped types** only when a plain type would have to be repeated or kept in sync by
+  hand.
+- **Measure:** the share of `any` and `as` in the codebase (lint with `@typescript-eslint/no-explicit-any`
+  and `consistent-type-assertions`) and how often runtime `TypeError`s reach production.
+- **Interviews:** explaining *why* `strictNullChecks` matters, what `unknown` buys over `any`, and how
+  exhaustiveness checking works is the expected depth; writing a mapped type from memory is not.
 
 ## Role lens
 - **Engineer:** Models provider stream events and tool contracts as discriminated unions, keeps
@@ -246,6 +322,39 @@ variant nobody handled. Without `strict`, a validated value can still be derefer
 functions later. The right design is `unknown` at the edge, a schema parse that produces a typed value,
 and strict checking everywhere after that, so a mismatch surfaces either at compile time or at the
 boundary, never mid-request.
+
+## Interview questions
+### What does `strictNullChecks` change, and why is it the most valuable strict flag for AI services?
+- **Definition:** `null` and `undefined` stop being members of every type, so a `string | null` must be
+  narrowed before you call methods on it.
+- **Why it matters here:** provider responses are full of legitimately missing fields, such as message
+  content being `null` on a tool-call turn, and this flag turns those runtime crashes into compile errors.
+
+### A provider added a new stream event type and users report answers ending early. How do you debug and prevent it?
+- **Diagnose:** the handler's `switch` has no case for the new variant, so the event falls through and is
+  dropped silently; log unknown `type` values at the boundary to confirm.
+- **Prevent:** model events as a discriminated union and add a `default` that assigns `ev` to `never`, so
+  the next variant breaks the build on the upgrade PR instead of in production.
+
+### When would you not reach for conditional and mapped types?
+- **In application code with one or two users of a type,** where a plain type is clearer and the compile-time
+  and reading cost outweigh the precision.
+- **Use them in shared contracts** such as an SDK wrapper or tool registry, where one precise type is
+  consumed by many call sites and keeping hand-written copies in sync would be the bigger risk.
+
+### How would you migrate a 200-file service from `strict: false` to strict?
+- **Ratchet flag by flag:** start with `noImplicitAny` and `strictNullChecks`, fix or explicitly suppress
+  errors, and block new violations in CI.
+- **Track the debt:** count `any`, `as` and suppressions per release, and set a deadline, because a
+  half-migrated codebase has types that lie.
+- **Fix boundaries first:** wrap `JSON.parse` and SDK calls to return `unknown`, since that is where most
+  runtime `TypeError`s originate.
+
+### What is a branded type and where would you use one?
+- **Definition:** an intersection like `string & { readonly __brand: "ValidatedPrompt" }` that only one
+  factory function can produce, erased at runtime so it costs nothing.
+- **Where:** places where mixing same-shaped values is a security or billing bug, such as raw vs validated
+  prompt text, or token counts vs dollar amounts.
 
 ## Quiz
 ### Q: Why is `unknown` preferred over `any` for the result of `JSON.parse`?

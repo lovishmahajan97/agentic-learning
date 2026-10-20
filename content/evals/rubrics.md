@@ -124,6 +124,24 @@ Two layers work well:
 - **Validate the judge per criterion against human labels.** Judges are usually excellent on format
   compliance and weak on domain correctness, so you may keep humans on some criteria and automate the rest.
 
+## Diagram
+How one graded item becomes a score: applicability first, gates before aggregation, and N/A kept out of
+the denominator. The left branch is how the rubric itself is built and frozen.
+
+```mermaid
+flowchart TD
+    E["Error analysis on 50-100 outputs"] --> R["Rubric version: criteria, anchors, gates"]
+    R --> C["For each criterion"]
+    C --> A{"Applies to this item?"}
+    A -->|"no"| NA["N/A: out of denominator"]
+    A -->|"yes"| J["Judge call: evidence, then PASS or FAIL"]
+    J --> G{"Any gate failed?"}
+    G -->|"yes"| F["Item fails, counted in gate rate"]
+    G -->|"no"| S["Score = fraction of applicable checks"]
+    S --> D["Per-criterion pass rates"]
+    F --> D
+```
+
 ## Examples
 ### Rubric as data, one judge call per criterion, gate before aggregation
 Item-specific criteria are attached to the golden item and skipped for items that do not declare them.
@@ -285,6 +303,45 @@ on 40 items and compute per-criterion kappa; rewrite any criterion with low agre
 an anchor problem. Then run the judge per criterion and compare it with the SME majority; automate the
 criteria where judge agreement is near SME–SME agreement, keep humans on the rest, and freeze a rubric
 version so future scores are comparable.
+
+## Interview questions
+### What makes a rubric criterion usable, and why does "rate quality 1–10" fail?
+- **A usable criterion is observable and single-barreled:** someone who has never met you can apply it
+  and reach the same verdict, because the anchor describes the output, not a feeling.
+- **"Rate quality 1–10" leaves every boundary undefined,** so graders disagree about what a 7 means and
+  LLM judges fill the gap with length, confidence and formatting.
+- **The result is noise larger than real improvements,** which hides a half-point gain between prompts.
+
+### Agreement on one criterion is low while the rest are fine. How do you debug it?
+- **Treat it as an anchor problem first,** not an annotator problem, since the same people agree
+  elsewhere.
+- **Read the disagreed items side by side:** look for a double-barreled criterion ("accurate and
+  complete"), an unclear applicability condition, or a missing level example.
+- **Fix and re-pilot:** split the criterion, add an explicit N/A trigger or item-specific must-mention
+  lists, then re-measure per-criterion kappa on 30–50 items.
+
+### When would you choose a holistic rubric or a weighted score over an analytic, unweighted one?
+- **Holistic** when you only need a fast overall preference, such as a pairwise arena, and diagnosis per
+  dimension is not the goal.
+- **Weighted scalar** only when one number must rank many variants; report per-criterion rates beside it,
+  because weights hide trade-offs such as a tone regression under a 0.1 weight.
+- **Never weight a gate:** fabricated citations or leaked secrets override any average.
+
+### How would you roll out a rubric for an LLM judge on a live product without breaking trend lines?
+- **Version it with the dataset** and write the rubric version into every result row, because scores
+  are only comparable within a version.
+- **Regrade the baseline** with the new version before comparing, so an "improvement" is not a rubric
+  change.
+- **Validate per criterion against SME labels** and automate only criteria where judge agreement is close
+  to SME–SME agreement; keep humans on the rest.
+
+### What does N/A handling change in the reported numbers?
+- **Scoring N/A as pass inflates scores:** 2 of 3 real checks plus 3 inapplicable ones reports 5/6
+  instead of 2/3.
+- **It also hides rare-case failures:** an escalation criterion that applies to few items can show 97%
+  while most of those few items fail.
+- **So compute each criterion's pass rate only over items where it applied,** and decide applicability
+  before grading.
 
 ## Quiz
 ### Q: Why prefer several binary criteria over a single 1–10 "quality" score?

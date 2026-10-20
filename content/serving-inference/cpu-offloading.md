@@ -5,7 +5,7 @@ name: CPU offloading
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - serving-inference/gpu-memory-optimization
   - serving-inference/kv-cache-paging-and-eviction
@@ -22,107 +22,144 @@ sources:
 ---
 
 ## TL;DR
-CPU offloading keeps part of a model's weights or KV cache in host RAM (or on NVMe) and brings it to the
-GPU when needed, trading scarce GPU memory for PCIe bandwidth. PCIe moves data roughly 50–100× slower
-than GPU memory, and decode touches every weight every token, so offloading weights makes interactive
-latency collapse unless the offloaded share is tiny or batches are huge. It is a tool for fitting,
-offline throughput and tiering idle KV cache, not for low-latency serving.
+CPU offloading keeps some weights or KV cache in host RAM or NVMe, trading GPU memory for PCIe bandwidth
+roughly 50–100× slower. Decode touches every weight per token, so it suits fitting, offline throughput
+and parking idle KV cache, not low-latency serving.
 
 ## Why it exists
-The model does not fit. A 70B model is about 140 GB in bf16 and about 40 GB at 4-bit, and the GPU on
-the desk has 24 GB. Options are a smaller model, more aggressive quantization, more GPUs, or putting the
-overflow somewhere else and fetching it on demand. Host RAM is plentiful and cheap (hundreds of GB on a
-workstation), and the PCIe bus can move data in both directions while the GPU computes, so offloading
-looks like free capacity.
-
-The catch is in the arithmetic of decode. Each generated token needs every weight once. Whatever is not
-resident on the GPU must cross PCIe on every step. A Gen4 x16 link moves about 25 GB/s in practice (the
-theoretical figure is a little above 30 GB/s; Gen5 roughly doubles it), while an H100's HBM delivers
-around 3.35 TB/s and even a consumer GPU around 1 TB/s. Streaming 20 GB of weights per token therefore
-costs about 0.8 s per token, before any computation happens. Offloading just 10% of a 40 GB model still
-puts roughly 160 ms of bus transfer on every token, several times the resident compute.
-
-So "just offload the layers that don't fit" is a trap for interactive use. The idea survives because
-three situations change the arithmetic: the offloaded share is small enough to be a rounding error, the
-workload is offline and a huge batch amortises each weight transfer over thousands of tokens (FlexGen's
-design), or the thing offloaded is KV cache for sequences that are idle or preempted, which is read once
-when they resume rather than on every step.
+- **The model does not fit.** A 70B model is about 140 GB in bf16 and about 40 GB at 4-bit, and the GPU on
+  the desk has 24 GB. Options: a smaller model, more aggressive quantization, more GPUs, or putting the
+  overflow somewhere else and fetching it on demand.
+- **Host RAM looks like free capacity.** It is plentiful and cheap (hundreds of GB on a workstation), and
+  PCIe can move data both ways while the GPU computes.
+- **The catch is decode arithmetic.** Each token needs every weight once, so non-resident weights cross
+  PCIe every step. Gen4 x16 moves about 25 GB/s in practice (theoretical a little above 30 GB/s; Gen5
+  roughly doubles it). An H100's HBM delivers around 3.35 TB/s; even a consumer GPU around 1 TB/s.
+- **So small offloads hurt a lot.** Streaming 20 GB of weights per token costs about 0.8 s before any
+  compute. Offloading just 10% of a 40 GB model still adds roughly 160 ms of transfer to every token,
+  several times the resident compute.
+- **Three cases change the arithmetic.** The offloaded share is a rounding error; the workload is offline
+  and a huge batch amortises each transfer over thousands of tokens (FlexGen's design); or what is
+  offloaded is KV cache for idle or preempted sequences, read once on resume rather than every step.
 
 ## How it works
 ### What can live off the GPU
-1. **Weights**, usually at layer granularity. Hugging Face Accelerate's `device_map="auto"` places
-   layers on GPU until it is full and the rest on CPU (or disk via `offload_folder`); vLLM has a
-   `--cpu-offload-gb` option; DeepSpeed's ZeRO-Inference and FlexGen stream weights with prefetching.
-2. **KV cache**, at block granularity: vLLM's `--swap-space` (its V0 scheduler; the V1 engine preempts
-   by recomputation only) reserves pinned host memory to swap the blocks of preempted sequences; tiered prefix caches keep warm system-prompt blocks in CPU RAM.
-3. **Activations and optimizer state**, which matter for training (ZeRO-Offload, ZeRO-Infinity) and
-   barely at all for inference.
+1. **Weights**, usually at layer granularity.
+   - Hugging Face Accelerate's `device_map="auto"` places layers on GPU until full and the rest on CPU (or
+     disk via `offload_folder`).
+   - vLLM has a `--cpu-offload-gb` option.
+   - DeepSpeed's ZeRO-Inference and FlexGen stream weights with prefetching.
+2. **KV cache**, at block granularity.
+   - vLLM's `--swap-space` (its V0 scheduler; the V1 engine preempts by recomputation only) reserves
+     pinned host memory to swap the blocks of preempted sequences.
+   - Tiered prefix caches keep warm system-prompt blocks in CPU RAM.
+3. **Activations and optimizer state**, which matter for training (ZeRO-Offload, ZeRO-Infinity) and barely
+   at all for inference.
 
-### Two execution styles
-*Streaming offload* keeps the compute on the GPU and copies each offloaded layer's weights in before it
-runs, ideally prefetching layer i+1 on a second CUDA stream while layer i computes. The host buffers must
-be *pinned* (page-locked) memory *because* DMA engines cannot read pageable memory; an unpinned transfer
-goes through a staging copy and roughly halves effective bandwidth. Decode cannot hide the transfer
-behind compute because the compute per layer for one token is microseconds, so step time is essentially
-offloaded bytes ÷ PCIe bandwidth. Prefill of long prompts, or decode of very large batches, has enough
-compute per layer to overlap the copies, which is exactly FlexGen's regime.
+### Style 1: streaming offload
+- **Mechanism.** Compute stays on the GPU; each offloaded layer's weights are copied in before it runs,
+  ideally prefetching layer i+1 on a second CUDA stream while layer i computes.
+- **Pinned memory is required** *because* DMA engines cannot read pageable memory. An unpinned transfer
+  goes through a staging copy and roughly halves effective bandwidth.
+- **Decode cannot hide the transfer.** Compute per layer for one token is microseconds, so step time is
+  essentially offloaded bytes ÷ PCIe bandwidth.
+- **Where it works.** Prefill of long prompts, or decode of very large batches, has enough compute per
+  layer to overlap the copies: exactly FlexGen's regime.
 
-*Split execution* leaves CPU-resident layers on the CPU and computes them there. llama.cpp's
-`-ngl` (number of GPU layers) works this way: the first N layers run on the GPU, the rest on CPU cores
-using host memory bandwidth, typically tens of GB/s on a dual-channel desktop and a few hundred on a
-server. Nothing crosses PCIe except the activations at the boundary, so the cost is CPU memory bandwidth
-and CPU matmul speed rather than bus speed. This is why split execution usually beats streaming at batch
-size 1: host memory bandwidth (tens to hundreds of GB/s) is at least comparable to, and on a server well
-above, the 25–60 GB/s of a PCIe link, and the weights only have to be read where they already live. The
-two halves run one after the other for each token, so the costs add: `step ≈ gpu_bytes / HBM_bw +
-cpu_bytes / host_bw`. Half of a 40 GB model on a desktop with ~60 GB/s of host bandwidth is about
-20 ms + 330 ms; on a many-channel server it is far less, but the CPU half still dominates the step.
+### Style 2: split execution
+- **Mechanism.** CPU-resident layers are computed on the CPU. llama.cpp's `-ngl` (number of GPU layers)
+  works this way: the first N layers run on the GPU, the rest on CPU cores using host memory bandwidth.
+- **Host bandwidth.** Typically tens of GB/s on a dual-channel desktop and a few hundred on a server.
+- **Only boundary activations cross PCIe,** so the cost is CPU memory bandwidth and matmul speed, not bus
+  speed.
+- **Why it usually beats streaming at batch size 1.** Host bandwidth (tens to hundreds of GB/s) is at
+  least comparable to, and on a server well above, the 25–60 GB/s of a PCIe link, and weights are read
+  where they already live.
+- **The costs add,** because the two halves run one after the other for each token:
 
-### A timing model
-When transfer and compute overlap, `step_time ≈ max(resident_bytes / HBM_bw, offloaded_bytes /
-PCIe_bw) + overhead`; when they do not, add them. Because PCIe bandwidth is so much lower, the second
-term dominates as soon as more than a few percent of weights are offloaded. Solve the formula backwards
-to find how much you can offload while meeting a latency target; the answer is usually "less than you
-hoped", which is why quantizing first is nearly always the better lever.
+```
+step ≈ gpu_bytes / HBM_bw + cpu_bytes / host_bw
+```
+
+- **Worked:** half of a 40 GB model on a desktop with ~60 GB/s of host bandwidth is about 20 ms + 330 ms.
+  A many-channel server is far faster, but the CPU half still dominates the step.
+
+### A timing model for streaming
+```
+overlapped:      step_time ≈ max(resident_bytes / HBM_bw, offloaded_bytes / PCIe_bw) + overhead
+not overlapped:  add the two terms
+```
+- **The second term dominates** as soon as more than a few percent of weights are offloaded, because PCIe
+  bandwidth is so much lower.
+- **Solve it backwards** to find how much you can offload within a latency target. The answer is usually
+  "less than you hoped", which is why quantizing first is nearly always the better lever.
 
 ### KV cache swap versus recompute
-When the block pool runs dry, a preempted sequence's blocks can be swapped to pinned host memory and
-swapped back when it resumes, or dropped and recomputed by re-running prefill. Swapping an 8k-token
-context of a Llama-3-8B-class model moves about 1 GB, roughly 40 ms over Gen4, while recomputing its
-prefill costs on the order of a hundred TFLOP, several hundred milliseconds. For short prompts recompute
-is simpler and nearly free; for long prompts swap wins, although the crossover moves with GPU speed and
-link speed. Which one runs is an engine policy rather than a per-request optimisation: vLLM's V0
-scheduler, for instance, recomputed single-sequence requests by default and swapped multi-sequence
-groups (beam search, `n > 1`), for which it did not implement recomputation. The swap space size
-bounds how many sequences can be parked.
+When the block pool runs dry, a preempted sequence is either swapped to pinned host memory and back, or
+dropped and recomputed by re-running prefill.
+
+| 8k-token context, Llama-3-8B-class | Cost |
+|---|---|
+| Swap | about 1 GB moved, roughly 40 ms over Gen4 |
+| Recompute | on the order of a hundred TFLOP, several hundred milliseconds |
+
+- **Short prompts:** recompute is simpler and nearly free. **Long prompts:** swap wins. The crossover moves
+  with GPU and link speed.
+- **It is an engine policy, not a per-request choice.** vLLM's V0 scheduler recomputed single-sequence
+  requests by default and swapped multi-sequence groups (beam search, `n > 1`), for which it did not
+  implement recomputation.
+- **Swap space size bounds** how many sequences can be parked.
 
 ### Mixture-of-experts changes the arithmetic
-In an MoE model each token is routed to a few experts per layer, so a decode step reads only the routed
-experts' weights, not the whole expert set. That makes a split that would be hopeless for a dense model
-workable: keep attention, shared layers and the KV cache on the GPU, keep the large expert FFNs in host
-RAM, and compute the routed experts on the CPU. Bytes read on the CPU side per token scale with the
-*active* expert parameters while memory scales with the *total*, which is the right match for cheap,
-large host RAM. llama.cpp supports this kind of placement through its tensor-override options; batching
-erodes the advantage, because a batch of tokens routes to many different experts and the CPU ends up
-reading most of them each step.
+- **Each token reads only routed experts,** a few per layer, not the whole expert set.
+- **So a split hopeless for a dense model becomes workable:** keep attention, shared layers and the KV
+  cache on the GPU; keep the large expert FFNs in host RAM and compute routed experts on the CPU.
+- **Right match for cheap RAM.** CPU bytes read per token scale with *active* expert parameters, memory
+  with *total*.
+- **Tooling.** llama.cpp supports this placement through its tensor-override options.
+- **Batching erodes it,** because a batch routes to many different experts and the CPU ends up reading
+  most of them each step.
 
 ### NVMe and unified memory
-ZeRO-Infinity and FlexGen extend the hierarchy to NVMe (GPU ← CPU ← SSD), with GPUDirect Storage able to
-DMA from disk to GPU, at bandwidths of a few GB/s per drive. At the other end, Apple silicon and Grace
-Hopper systems expose unified memory shared by CPU and GPU, so a 40 GB model on a 64 GB Mac is not
-"offloaded" at all; it is simply bandwidth-limited by that machine's memory, which is why llama.cpp
-runs large models acceptably there.
+- **NVMe tier.** ZeRO-Infinity and FlexGen extend the hierarchy to GPU ← CPU ← SSD, with GPUDirect Storage
+  able to DMA from disk to GPU, at a few GB/s per drive.
+- **Unified memory.** Apple silicon and Grace Hopper systems share memory between CPU and GPU, so a 40 GB
+  model on a 64 GB Mac is not "offloaded" at all. It is bandwidth-limited by that machine's memory, which
+  is why llama.cpp runs large models acceptably there.
 
-## Example
-A 70B model quantized to about 4.5 bits per weight (the 4-bit `Q4_0` layout: 32 weights × 4 bits plus a
-16-bit scale is 144 bits per 32 weights) is roughly 40 GB across 80 layers, about 0.5 GB per layer. The
-target machine has a 24 GB GPU with about 1 TB/s of memory bandwidth and a Gen4 x16 slot. Reserving 4 GB
-for KV cache, activations and the CUDA context leaves 20 GB for weights: 40 layers resident, 40 layers
-streamed. The resident half costs 20 GB ÷ 1 TB/s = 20 ms per token; the streamed half costs 20 GB ÷ 25
-GB/s = 800 ms. Overlapped, the step is max(20, 800) = 800 ms, about 1.2 tokens/s, versus roughly 25
-tokens/s if the whole model were resident. Offloading only 10% (4 GB) still gives max(36, 160) = 160 ms,
-a 4× slowdown. The calculator below reproduces this and lets you solve for the resident share a latency
-budget allows.
+## Diagram
+The decision path for a model that does not fit: quantize first, and offload weights only when latency
+does not matter or the offloaded share is tiny.
+
+```mermaid
+flowchart TD
+    S["Model plus KV exceeds GPU"] --> Q["Quantize first"]
+    Q --> F{"Fits now?"}
+    F -->|"yes"| D["Serve fully resident"]
+    F -->|"no"| I{"Interactive latency SLO?"}
+    I -->|"yes"| T["More GPUs, TP, or smaller model"]
+    I -->|"no, offline batch"| B["Streaming offload, huge batch"]
+    I -->|"local or pilot"| L["Split execution, CPU layers"]
+    M{"MoE model?"} -->|"yes"| E["Experts in host RAM"]
+    L --> M
+    K["Idle or preempted KV"] -.->|"swap to pinned host RAM"| H[("Host memory")]
+```
+
+## Examples
+### Worked scenario: 4-bit 70B on a 24 GB GPU
+A 70B model at about 4.5 bits per weight (the 4-bit `Q4_0` layout: 32 weights × 4 bits plus a 16-bit
+scale is 144 bits per 32 weights) is roughly 40 GB across 80 layers, about 0.5 GB per layer.
+
+The GPU has about 1 TB/s and a Gen4 x16 slot. Reserving 4 GB for KV cache, activations and the CUDA
+context leaves 20 GB for weights.
+
+| Placement | Resident time | Bus time | Step (overlapped) | Speed |
+|---|---|---|---|---|
+| 40 layers resident, 40 streamed | 20 GB ÷ 1 TB/s = 20 ms | 20 GB ÷ 25 GB/s = 800 ms | max(20, 800) = 800 ms | about 1.2 tokens/s |
+| Only 10% (4 GB) offloaded | 36 ms | 160 ms | max(36, 160) = 160 ms | a 4× slowdown |
+| Whole model resident (hypothetical) | ~40 ms | 0 | ~40 ms | roughly 25 tokens/s |
+
+The calculator reproduces this and solves for the offload a latency budget allows:
 
 ```python
 def step_ms(total_gb, gpu_frac, hbm_tbs=1.0, pcie_gbs=25.0, overlap=True):
@@ -140,40 +177,82 @@ max_offload_gb = budget_ms / 1000 * 25.0         # bytes PCIe can move within th
 print(f"a {budget_ms} ms budget tolerates at most {max_offload_gb:.1f} GB offloaded")
 ```
 
+### Catch accidental offloading at load time
+`device_map="auto"` falls back to CPU or disk silently. This production guard caps GPU memory
+explicitly and fails the deploy if any module landed off the GPU.
+
+```python
+import torch
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen2.5-7B-Instruct",
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    max_memory={0: "20GiB", "cpu": "64GiB"},   # GPU 0 budget, host budget for overflow
+    offload_folder="offload",                  # used only if even host RAM runs out
+)
+placement = model.hf_device_map                # module name -> 0, "cpu" or "disk"
+off_gpu = [name for name, dev in placement.items() if dev in ("cpu", "disk")]
+if off_gpu:
+    raise RuntimeError(f"{len(off_gpu)} modules offloaded, e.g. {off_gpu[:3]}: "
+                       "expect seconds per token. Quantize or use a bigger GPU.")
+print("fully resident on GPU:", set(placement.values()))
+```
+
+## Production patterns
+- **Fail the deploy on silent offload.** For interactive services, check the placement after loading (as
+  above, or the engine's startup log) and refuse to serve if weights are off the GPU. Monitor GPU
+  utilisation: single digits with host RAM full is the signature.
+- **Quantize before offloading.** When a model is slightly too big, try a 4-bit or 8-bit build and an eval
+  run first, because it removes bytes instead of moving them over the bus. Monitor task quality, not just
+  tokens/s.
+- **Tune `-ngl` to the largest value that fits** for llama.cpp pilots on owned hardware. Raise it until
+  VRAM is nearly full with your target context, then back off one or two layers for headroom. Monitor
+  tokens/s and VRAM at the longest context you allow.
+- **Park MoE experts in host RAM.** For a large MoE model on one GPU, use llama.cpp's tensor-override
+  option (`--override-tensor`) to keep expert FFN tensors on CPU and everything else on GPU. Monitor
+  tokens/s as concurrency rises, since batching erodes the win.
+- **Use pinned buffers and side streams for custom streaming.** Allocate host buffers with
+  `pin_memory=True`, copy with `non_blocking=True` on a separate CUDA stream, and prefetch layer i+1.
+  Monitor measured transfer GB/s against the PCIe spec.
+
 ## Trade-offs
-- Offloading turns an impossible deployment into a possible one, but every offloaded gigabyte of weights
-  adds roughly 40 ms per token over Gen4 PCIe; worthwhile only when the share is tiny or latency is
-  irrelevant.
-- Large-batch offline generation amortises weight transfers across many tokens per step, so throughput
-  can be acceptable where single-stream latency is not; it flips back to useless when requests must be
-  answered one at a time.
-- KV swap preserves long contexts cheaply compared with recomputation, but pinned host memory is reserved
-  up front and PCIe traffic competes with any weight streaming on the same link.
-- Split execution on the CPU avoids bus traffic and suits a few layers on a fast machine, yet CPU matmul
-  throughput caps batch size, so it does not scale to many concurrent users.
+- **Possible deployment vs per-token cost.** Offloading turns an impossible deployment into a possible
+  one, but every offloaded gigabyte of weights adds roughly 40 ms per token over Gen4 PCIe. Worthwhile
+  only when the share is tiny or latency is irrelevant.
+- **Offline throughput vs interactive latency.** Large-batch generation amortises weight transfers over
+  many tokens per step, so throughput can be acceptable where single-stream latency is not. It flips back
+  to useless when requests must be answered one at a time.
+- **KV swap vs reserved host memory.** Swap preserves long contexts cheaply compared with recomputation,
+  but pinned host memory is reserved up front and PCIe traffic competes with any weight streaming on the
+  same link.
+- **Split execution vs concurrency.** Computing on the CPU avoids bus traffic and suits a few layers on a
+  fast machine, yet CPU matmul throughput caps batch size, so it does not scale to many users.
 
 ## Pitfalls
-- `device_map="auto"` silently placing layers on CPU when the GPU is slightly too small; the symptom is a
+- **`device_map="auto"` silently placing layers on CPU** when the GPU is slightly too small. Symptom: a
   model that "works" at one or two tokens per second with the GPU at 5% utilization and host RAM full.
-- Streaming from pageable instead of pinned memory, which halves effective bandwidth and adds CPU copy
-  overhead; visible as transfer time far above the PCIe spec.
-- Sizing swap space too small for the long-context tail. Depending on the engine, preemptions then fail
-  outright or fall back to recomputation; the symptom is aborted requests, or a throughput cliff with
+- **Streaming from pageable instead of pinned memory.** It halves effective bandwidth and adds CPU copy
+  overhead, visible as transfer time far above the PCIe spec.
+- **Swap space too small for the long-context tail.** Depending on the engine, preemptions then fail
+  outright or fall back to recomputation. Symptom: aborted requests, or a throughput cliff with
   prefill-heavy GPU traces, when concurrency rises.
-- Benchmarking on a workstation with a Gen5 x16 slot and deploying to a cloud instance whose GPU sits on
-  a shared or narrower link; identical settings, half the speed.
-- Treating offloading as an alternative to quantization. Quantizing from fp16 to 4-bit removes 75% of
+- **Benchmarking on a Gen5 x16 workstation** and deploying to a cloud instance whose GPU sits on a shared
+  or narrower link: identical settings, half the speed.
+- **Treating offloading as an alternative to quantization.** Quantizing from fp16 to 4-bit removes 75% of
   the bytes with modest quality cost; offloading 75% of the bytes multiplies latency by tens.
 
 ## When to use
-Reach for weight offloading when a model is a few percent too large for the GPU and a short-term fix is
-acceptable, for offline batch jobs where tokens per hour matter and latency does not, for local
-experimentation on a machine that is not going to serve anyone, or when the remaining layers can run on
-a strong CPU via split execution. Prefer quantization, a smaller model, or tensor parallelism for anything
-interactive. Use KV offloading deliberately: size the swap space for your long-context tail and watch
-preemption and swap metrics. Measure tokens/s with and without offload before deciding; the formula above
-predicts the result well. In interviews, the test is whether you can compute the PCIe penalty rather
-than assert that offloading "makes it fit".
+- **Use weight offloading when** a model is a few percent too large and a short-term fix is acceptable,
+  for offline batch jobs where tokens per hour matter and latency does not, for local experimentation on
+  a machine that serves no one, or when remaining layers can run on a strong CPU via split execution.
+- **Avoid for anything interactive:** prefer quantization, a smaller model, or tensor parallelism.
+- **Use KV offloading deliberately:** size the swap space for your long-context tail and watch preemption
+  and swap metrics.
+- **Measure** tokens/s with and without offload before deciding; the formula above predicts it well.
+- **Interviews:** the test is whether you can compute the PCIe penalty rather than assert that
+  offloading "makes it fit".
 
 ## Role lens
 - **Engineer:** Configures layer placement or swap space, pins host buffers, and reads GPU utilization
@@ -196,6 +275,34 @@ speed. The real fix is to remove the
 overflow: cap context length so the KV cache shrinks, use a slightly smaller quantization or a model
 with fewer KV heads, or add a second GPU with tensor parallelism. I would measure the offloaded size and
 transfer time first, then predict the gain of each option before they buy anything.
+
+## Interview questions
+### Why is offloading weights so much worse for decode than for prefill?
+- **Decode reads every weight per token** with microseconds of compute per layer, so transfer time cannot
+  hide behind compute and step time becomes offloaded bytes ÷ PCIe bandwidth.
+- **Prefill has thousands of tokens per layer,** enough compute to overlap the copies, which is the regime
+  FlexGen exploits with huge offline batches.
+
+### A model "works" after deployment but generates one token per second. How do you diagnose it?
+- **Check placement:** `hf_device_map` or the engine log for layers on CPU or disk.
+- **Check utilisation:** a GPU near idle with host RAM full and PCIe busy means streaming offload.
+- **Fix:** quantize, cap context to shrink the KV reserve, or move to a GPU that fits; then add a load-time
+  guard so it cannot recur silently.
+
+### When is CPU offloading the right call?
+- **Offline batch jobs** where tokens per hour matter and a big batch amortises each transfer.
+- **Pilots on owned hardware,** local experiments, or a model a few percent too big for a short-term fix.
+- **MoE models on one GPU,** with expert FFNs in host RAM, because each token reads only its routed experts.
+
+### Estimate the latency cost of offloading 4 GB of weights over Gen4 PCIe.
+- **Bus time:** 4 GB ÷ ~25 GB/s ≈ 160 ms per token, since decode moves it every step.
+- **Compare:** a fully resident 40 GB model on a ~1 TB/s GPU reads its weights in about 40 ms, so the
+  offload alone is about 4× the whole resident step.
+
+### Swap or recompute for a preempted 8k-token sequence?
+- **Swap:** about 1 GB over Gen4, roughly 40 ms, versus several hundred milliseconds to re-run prefill.
+- **But** it is an engine policy: vLLM's V1 engine recomputes only, so on it the lever is fewer
+  preemptions (smaller context caps, lower concurrency), not swap space.
 
 ## Quiz
 ### Q: Why does offloading even a small fraction of weights hurt decode latency so much?

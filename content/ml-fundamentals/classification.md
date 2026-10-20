@@ -5,7 +5,7 @@ name: Classification
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: reviewed
+status: crisp
 related:
   - ml-fundamentals/regression
   - ml-fundamentals/loss-functions
@@ -22,84 +22,119 @@ sources:
 ---
 
 ## TL;DR
-Classification predicts which of a fixed set of categories an input belongs to. A classifier produces a
-score per class (logits), converts scores to probabilities (sigmoid or softmax), and a separate decision
-rule, a threshold or argmax, turns probabilities into a label. Keeping scoring and deciding apart matters
-because the threshold encodes the business cost of each kind of mistake. Every token an LLM emits is a
-classification over its vocabulary, so this is the most common problem shape in AI engineering.
+Classification predicts which of a fixed set of categories an input belongs to: score each class, turn
+scores into probabilities, then apply a separate decision rule that encodes the cost of each mistake.
+Every LLM token is a classification over the vocabulary.
 
 ## Why it exists
-Many decisions are discrete: spam or not, which team handles this ticket, which intent, is this answer
-grounded in the source, which token comes next. Two naive approaches fail in instructive ways.
-
-Hand-written rules are brittle, do not scale to thousands of edge cases, and produce no notion of
-confidence; a rule either fires or it does not, so there is no way to send borderline cases to a human.
-
-Treating the problem as regression on a class index 0..K−1 fails for a subtler reason. It imposes an
-ordering and a distance that do not exist: class 3 is not "between" classes 2 and 4, yet squared error
-would punish predicting 0 instead of 4 sixteen times harder than predicting 3. The model wastes capacity
-learning an arbitrary numbering.
-
-What is needed is a model that outputs one score per class, a loss that rewards putting probability on
-the correct class and nothing else, and a decision rule that accounts for asymmetric costs. The
-probability matters on its own: a 0.51 spam score and a 0.99 spam score should lead to different actions
-(flag for review versus delete), and a downstream system can only make that distinction if the
-classifier exposes it. Classification formalises the split: estimate P(class | input), then decide.
+- **Many decisions are discrete.** Spam or not, which team handles this ticket, which intent, is this
+  answer grounded in the source, which token comes next.
+- **Hand-written rules fail.** They are brittle, do not scale to thousands of edge cases, and produce no
+  notion of confidence; a rule either fires or it does not, so there is no way to send borderline cases to
+  a human.
+- **Regression on a class index 0..K−1 fails more subtly.** It imposes an ordering and a distance that do
+  not exist: class 3 is not "between" classes 2 and 4, yet squared error would punish predicting 0 instead
+  of 4 sixteen times harder than predicting 3. The model wastes capacity learning an arbitrary numbering.
+- **What is needed:** one score per class, a loss that rewards putting probability on the correct class
+  and nothing else, and a decision rule that accounts for asymmetric costs.
+- **The probability matters on its own.** A 0.51 spam score and a 0.99 spam score should lead to
+  different actions (flag for review versus delete), and a downstream system can only make that
+  distinction if the classifier exposes it. Classification formalises the split: estimate
+  P(class | input), then decide.
 
 ## How it works
 ### From features to scores
-A linear classifier computes z = Wx + b: one score per class, from a weight vector per class. Logistic
-regression is the binary case with one logit and p = σ(z) = 1/(1 + e^(−z)). Inverting the sigmoid shows
-what the logit means: z = log(p / (1 − p)), the log-odds. A weight is therefore "change in log-odds per
-unit of this feature", and the decision boundary p = 0.5 is the hyperplane wᵀx + b = 0, which is why a
-linear classifier can only separate classes that a flat boundary can split. For K classes the softmax
-p_k = exp(z_k) / Σ_j exp(z_j) turns K logits into a distribution that sums to one. A neural network
-replaces the raw features x with learned features and keeps the same final linear layer; in a
-transformer the "LM head" is exactly this, a linear map from the hidden state to vocabulary-sized logits
-followed by softmax. Tree ensembles partition the feature space instead of drawing linear boundaries,
-and k-nearest-neighbours votes among similar training points, but all of them end with a score per class.
-These are *discriminative* models: they estimate P(y | x) directly. *Generative* classifiers such as
-naive Bayes model P(x | y) and P(y) and apply Bayes' rule; they need less data when their independence
-assumptions roughly hold, but usually lose once data is plentiful.
+1. **Linear scores.** A linear classifier computes z = Wx + b: one score per class, from a weight vector
+   per class.
+2. **Binary: sigmoid.** Logistic regression has one logit and p = σ(z) = 1/(1 + e^(−z)). Inverting the
+   sigmoid gives z = log(p / (1 − p)), the log-odds. A weight is "change in log-odds per unit of this
+   feature".
+3. **The boundary is flat.** The decision boundary p = 0.5 is the hyperplane wᵀx + b = 0, which is why a
+   linear classifier can only separate classes that a flat boundary can split.
+4. **K classes: softmax.** p_k = exp(z_k) / Σ_j exp(z_j) turns K logits into a distribution that sums to
+   one.
+
+Other model families end the same way, with a score per class:
+- **Neural networks** replace the raw features x with learned features and keep the same final linear
+  layer. In a transformer the "LM head" is exactly this: a linear map from the hidden state to
+  vocabulary-sized logits followed by softmax.
+- **Tree ensembles** partition the feature space instead of drawing linear boundaries.
+- **k-nearest-neighbours** votes among similar training points.
+
+| Family | Models | Data need |
+|---|---|---|
+| Discriminative | logistic regression, neural nets, trees: estimate P(y \| x) directly | usually win once data is plentiful |
+| Generative | naive Bayes: model P(x \| y) and P(y), apply Bayes' rule | need less data when independence assumptions roughly hold |
 
 ### The loss
-Training minimises cross-entropy, −log p_y, the negative log probability assigned to the true class. It
-is used because it is the maximum-likelihood objective for a categorical outcome and because its
-gradient with respect to the logits is simply p − onehot(y): large when the model is confidently wrong,
-near zero when it is confidently right. Squared error on probabilities loses that property, which is why
-it trains badly for classes. The loss-functions lesson derives this.
+- **Cross-entropy, −log p_y,** the negative log probability assigned to the true class.
+- **Why:** it is the maximum-likelihood objective for a categorical outcome, and its gradient with
+  respect to the logits is simply p − onehot(y): large when the model is confidently wrong, near zero when
+  it is confidently right.
+- **Squared error on probabilities loses that property,** which is why it trains badly for classes. The
+  loss-functions lesson derives this.
 
 ### Decision rule and threshold
-For a binary problem you predict positive when p ≥ τ. The default τ = 0.5 is only optimal when both
-errors cost the same and the training distribution matches production. Otherwise use the expected-cost
-rule: predicting positive costs (1 − p)·C_FP in expectation, predicting negative costs p·C_FN, so predict
-positive when p > C_FP / (C_FP + C_FN). If a missed fraud costs ten times a false alarm, the threshold is
-1/11 ≈ 0.09, not 0.5. This only works if p is calibrated, which is why calibration is a separate lesson.
+- **Binary rule:** predict positive when p ≥ τ.
+- **τ = 0.5 is rarely right.** The default is only optimal when both errors cost the same and the training
+  distribution matches production.
+- **Expected-cost rule.** Predicting positive costs (1 − p)·C_FP in expectation, predicting negative
+  costs p·C_FN, so:
+
+```
+predict positive when  p > C_FP / (C_FP + C_FN)
+missed fraud costs 10x a false alarm  ->  threshold = 1/11 ≈ 0.09, not 0.5
+```
+
+- **Needs calibration.** This only works if p is calibrated, which is why calibration is a separate lesson.
 
 ### Binary, multiclass, multilabel
-- Binary: one logit, sigmoid, one threshold.
-- Multiclass (exactly one label): K logits, softmax, argmax, or a threshold on the top probability
-  with an "abstain" branch for low-confidence cases.
-- Multilabel (any subset of K tags): K logits with independent sigmoids and per-tag thresholds. Softmax
-  is wrong here because it forces the tags to compete for a total of one.
-- Ordinal (small, medium, large) and hierarchical (department, then team) labels need their own
+| Shape | Output layer | Decision |
+|---|---|---|
+| Binary | one logit, sigmoid | one threshold |
+| Multiclass (exactly one label) | K logits, softmax | argmax, or a threshold on the top probability with an "abstain" branch for low-confidence cases |
+| Multilabel (any subset of K tags) | K logits, independent sigmoids | per-tag thresholds |
+
+- **Softmax is wrong for multilabel,** because it forces the tags to compete for a total of one.
+- **Ordinal and hierarchical labels** (small, medium, large; department, then team) need their own
   treatment; forcing them into flat multiclass throws away structure.
 
 ### Evaluation
-Accuracy misleads whenever classes are imbalanced: with 1% positives, predicting "negative" always
-scores 99%. The confusion matrix shows where errors go; precision, recall and F1 summarise it at one
-threshold; ROC-AUC and PR-AUC summarise ranking quality across thresholds; calibration checks whether a
-0.8 means 80%. The metric lessons in this module cover each.
+- **Accuracy misleads whenever classes are imbalanced:** with 1% positives, predicting "negative" always
+  scores 99%.
+- **Use the metric family:** the confusion matrix shows where errors go; precision, recall and F1
+  summarise it at one threshold; ROC-AUC and PR-AUC summarise ranking quality across thresholds;
+  calibration checks whether a 0.8 means 80%. The metric lessons in this module cover each.
 
 ### Classification in the LLM era
-Three ways to build a classifier today: prompt an LLM to output the label (no training data, flexible,
-but slow, costly per call and with no calibrated probability unless you read token log-probabilities);
-fine-tune a small encoder on labelled data (fast, cheap per call, reasonably calibrated, needs labels);
-or embed inputs with a pre-trained encoder and fit logistic regression on top (a strong middle ground).
+| Approach | Strengths | Costs |
+|---|---|---|
+| Prompt an LLM to output the label | no training data, flexible | slow, costly per call, no calibrated probability unless you read token log-probabilities |
+| Fine-tune a small encoder on labelled data | fast, cheap per call, reasonably calibrated | needs labels |
+| Embed with a pre-trained encoder, fit logistic regression on top | a strong middle ground | needs some labels |
+
 Routers, guardrails, intent detectors and LLM-as-judge pass/fail checks are all classifiers and deserve
 the same rigour: a held-out set, a confusion matrix, and a threshold chosen from costs.
 
-## Example
+## Diagram
+Scoring and deciding are separate stages; the threshold is where business cost enters.
+
+```mermaid
+flowchart TD
+    X["Input features"] --> M["Model: linear, tree or network"]
+    M --> Z["Logits, one per class"]
+    Z --> SH{"Label shape?"}
+    SH -->|"binary or multilabel"| SG["Sigmoid per logit"]
+    SH -->|"exactly one class"| SM["Softmax over classes"]
+    SG --> P["Calibrated probabilities"]
+    SM --> P
+    P --> D{"Decision rule"}
+    C["Cost of FP vs FN"] -->|"sets threshold"| D
+    D --> L["Label, or abstain to a human"]
+```
+
+## Examples
+### Same model, two thresholds
 A fraud-style problem with 3% positives. The same trained model gives very different operating points
 depending on the threshold; the threshold, not the model, is where the business decision lives.
 
@@ -128,43 +163,88 @@ for tau in (0.5, 1 / 11):
 # Same model, same probabilities; only the decision rule changed.
 ```
 
+### Worked scenario: undoing a rebalanced training set
+A team trained on a 50/50 rebalanced set; production has 3% positives. For a single binary logit, add the
+log of the ratio of prior odds: log((0.03/0.97) / (0.5/0.5)) ≈ −3.48.
+
+| Score from the rebalanced model | Corrected probability at 3% prior |
+|---|---|
+| 0.50 | 0.03 |
+| 0.80 | 0.11 |
+| 0.95 | 0.37 |
+| 0.99 | 0.75 |
+
+Without the correction, every row above would be flagged at τ = 0.5 and the minority class would be
+heavily over-predicted. With it, the expected-cost threshold can be applied to honest probabilities.
+
+```python
+import math
+
+def correct_prior(p_train, pi_train=0.5, pi_prod=0.03):
+    z = math.log(p_train / (1 - p_train))
+    z += math.log((pi_prod / (1 - pi_prod)) / (pi_train / (1 - pi_train)))
+    return 1 / (1 + math.exp(-z))
+
+print(round(correct_prior(0.8), 2))   # 0.11
+```
+
+## Production patterns
+- **Return probabilities, decide in config.** The service returns the score; the threshold lives in
+  configuration per route or customer, so changing an operating point needs no retrain. Monitor flag rate
+  and precision on a weekly labelled sample.
+- **Pick the threshold on a held-out set at the natural distribution.** Sweep τ with scikit-learn
+  `precision_recall_curve`, pick the point that meets the cost or recall target, and record it with the
+  model version. Monitor recall on the rare class after each deploy.
+- **Calibrate before thresholding.** Wrap the model in scikit-learn `CalibratedClassifierCV` (sigmoid or
+  isotonic) or fit temperature scaling on a validation set. Monitor a reliability curve and expected
+  calibration error per release.
+- **Abstain to a human on low confidence.** Route predictions whose top probability falls below a cutoff
+  to a review queue. Monitor queue volume and the accuracy of auto-handled cases.
+- **Embed-then-logistic-regression baseline.** Before fine-tuning or prompting, fit logistic regression
+  on frozen embeddings; it is cheap and often good enough. Monitor per-class recall against the prompted
+  LLM on the same held-out set.
+- **Watch class-distribution drift.** Log the predicted class distribution daily and alert when it moves
+  sharply from the training mix, then re-label a fresh sample.
+
 ## Trade-offs
-- Exposing probabilities with a tunable threshold is more flexible than emitting hard labels, but it
-  obliges you to keep the probabilities calibrated; if calibration cannot be maintained, a fixed decision
-  boundary validated on a confusion matrix is the honest alternative.
-- Softmax multiclass yields a proper distribution for mutually exclusive classes, but is wrong for
-  overlapping labels; switch to per-label sigmoids the moment one input can legitimately carry two tags.
-- An LLM prompted as a classifier needs no labelled data and changes in minutes, but costs more per call,
-  adds latency and gives no calibrated score; once you have a few thousand labels and real throughput, a
-  trained small classifier usually wins on all three.
-- A finer taxonomy gives more useful labels but fewer examples per class, so tail classes degrade; a
-  coarse classifier followed by a fine one within each branch flips the balance when tail classes matter.
+- **Tunable probabilities vs calibration upkeep.** Exposing probabilities with a tunable threshold is more
+  flexible than emitting hard labels, but obliges you to keep them calibrated. If calibration cannot be
+  maintained, a fixed decision boundary validated on a confusion matrix is the honest alternative.
+- **Softmax vs per-label sigmoids.** Softmax yields a proper distribution for mutually exclusive classes,
+  but is wrong for overlapping labels; switch to per-label sigmoids the moment one input can legitimately
+  carry two tags.
+- **Prompted LLM vs trained classifier.** The LLM needs no labelled data and changes in minutes, but costs
+  more per call, adds latency and gives no calibrated score. Once you have a few thousand labels and real
+  throughput, a trained small classifier usually wins on all three.
+- **Fine taxonomy vs examples per class.** Finer labels are more useful but give fewer examples per class,
+  so tail classes degrade. A coarse classifier followed by a fine one within each branch flips the balance
+  when tail classes matter.
 
 ## Pitfalls
-- Reporting accuracy on imbalanced data; the symptom is 99% accuracy from a model that never predicts
-  the minority class, visible instantly in the confusion matrix.
-- Leaving the threshold at 0.5; the symptom is a respectable AUC with collapsed recall on the rare
-  class, because the probabilities for that class rarely exceed 0.5.
-- Trusting an LLM's verbal confidence ("I am 90% sure") as a probability; the symptom is a calibration
-  curve where stated confidence has little relation to observed accuracy.
-- Using softmax for a multilabel task; the symptom is a model that can never assign two tags to one
-  document and splits probability between them instead.
-- Vague or overlapping class definitions; the symptom is low inter-annotator agreement and a confusion
+- **Reporting accuracy on imbalanced data.** Symptom: 99% accuracy from a model that never predicts the
+  minority class, visible instantly in the confusion matrix.
+- **Leaving the threshold at 0.5.** Symptom: a respectable AUC with collapsed recall on the rare class,
+  because the probabilities for that class rarely exceed 0.5.
+- **Trusting an LLM's verbal confidence as a probability.** "I am 90% sure" is not one; the calibration
+  curve shows stated confidence has little relation to observed accuracy.
+- **Using softmax for a multilabel task.** Symptom: the model can never assign two tags to one document
+  and splits probability between them instead.
+- **Vague or overlapping class definitions.** Symptom: low inter-annotator agreement and a confusion
   matrix whose errors concentrate between the same two classes, a ceiling no model can break.
-- Training on a rebalanced dataset and deploying on the natural distribution; the symptom is systematic
-  over-prediction of the minority class and miscalibrated probabilities. If only the class priors
-  changed, add log(π_prod / π_train) to each class's softmax logit (for a single binary logit, the
-  log of the ratio of prior odds) to undo the shift.
+- **Training rebalanced, deploying on the natural distribution.** Symptom: systematic over-prediction of
+  the minority class and miscalibrated probabilities. If only the class priors changed, add
+  log(π_prod / π_train) to each class's softmax logit (for a single binary logit, the log of the ratio of
+  prior odds) to undo the shift.
 
 ## When to use
-Reach for classification whenever the output is a choice from a fixed set and you can state what each
-kind of error costs. Do not use it when the label set is open-ended or changes weekly (use extraction,
-retrieval or generation), or when the "class" is really a quantity in disguise (regression). Measure
-with a confusion matrix at the deployed threshold, one threshold-free metric for ranking quality, a
-calibration check, and per-class recall so tail classes are not hidden by the average. Day to day it
-appears as routing, guardrails, intent detection, triage and judge pass/fail decisions. In interviews,
-the recurring questions are how you choose the threshold, why cross-entropy rather than squared error,
-and when accuracy is the wrong metric.
+- **Use when** the output is a choice from a fixed set and you can state what each kind of error costs.
+  Day to day it appears as routing, guardrails, intent detection, triage and judge pass/fail decisions.
+- **Avoid when** the label set is open-ended or changes weekly (use extraction, retrieval or generation),
+  or when the "class" is really a quantity in disguise (regression).
+- **Measure** with a confusion matrix at the deployed threshold, one threshold-free metric for ranking
+  quality, a calibration check, and per-class recall so tail classes are not hidden by the average.
+- **Interviews:** the recurring questions are how you choose the threshold, why cross-entropy rather than
+  squared error, and when accuracy is the wrong metric.
 
 ## Role lens
 - **Engineer:** Builds the router or guardrail classifier, returns probabilities rather than bare labels,
@@ -186,6 +266,42 @@ no score and therefore nothing to tune; switch to the log-probability of the lab
 classifier that outputs a probability, check its calibration, and choose the threshold from the cost of a
 missed unsafe request versus a wrongly blocked user. Finally add monitoring for drift in the flag rate
 and periodic re-labelling, because the input distribution will move.
+
+## Interview questions
+### Why train classifiers with cross-entropy instead of squared error?
+- **Maximum likelihood:** cross-entropy is the negative log-likelihood of a categorical outcome, so it is
+  the principled objective for P(y | x).
+- **Gradient shape:** with respect to the logits the gradient is p − onehot(y), large when confidently
+  wrong, near zero when confidently right.
+- **Squared error on probabilities** gives tiny gradients when a sigmoid saturates on the wrong side, so
+  learning stalls exactly where it is needed.
+
+### A missed fraud costs $500 and a false alarm costs $5. How do you set the threshold?
+- **Expected-cost rule:** τ = C_FP / (C_FP + C_FN) = 5 / 505 ≈ 0.01, so act on even small probabilities.
+- **Precondition:** the probabilities must be calibrated at the production base rate; check a
+  reliability curve first.
+- **Sanity check:** confirm the resulting flag volume is something operations can actually review.
+
+### Your intent router has 95% accuracy but users complain about one intent. How do you debug it?
+- **Per-class recall and the confusion matrix** show whether that intent is being absorbed by a
+  neighbour.
+- **Check label definitions:** if errors concentrate between two classes, look at annotator agreement on
+  that pair; overlapping definitions set a ceiling.
+- **Fix** with clearer guidelines, more examples for the tail class, or a per-class threshold, then
+  re-measure that class specifically.
+
+### When would you use a prompted LLM instead of a trained classifier?
+- **Use the LLM** with no labels, a label set that changes often, or low volume where per-call cost does
+  not matter.
+- **Switch to a trained classifier** once you have a few thousand labels and real throughput: cheaper,
+  faster and calibrated.
+- **Hybrid:** use the LLM to pre-label data that humans verify, then train the small model.
+
+### How do you get a usable confidence score from an LLM classifier?
+- **Not from its words:** verbal confidence is poorly calibrated.
+- **Read token log-probabilities** of the label tokens, constrained to the label set, and normalise across
+  labels.
+- **Calibrate** those scores on a labelled validation set, then threshold them like any other classifier.
 
 ## Quiz
 ### Q: Why not treat a K-class problem as regression on the label index 0..K−1?

@@ -5,7 +5,7 @@ name: Eval-driven development
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - evals/golden-dataset
   - evals/eval-harness
@@ -22,101 +22,126 @@ sources:
 ---
 
 ## TL;DR
-Eval-driven development treats the eval suite as the executable specification of an LLM feature:
-write the acceptance criteria and a seed golden set before building, judge every change by the eval's
-numbers rather than by a demo, and grow the suite from the failures each round of error analysis
-finds. It exists because prompt, retrieval and model changes have non-local effects that "it looked
-fine in the playground" cannot detect, and because a bug without a failing eval item is never
-reliably fixed.
+Eval-driven development makes the eval suite the executable spec of an LLM feature: criteria and a seed
+golden set come first, every change is judged by eval numbers, and failures grow the suite, because
+"looked fine in the playground" misses non-local regressions.
 
 ## Why it exists
-LLM features break the ordinary development loop in three ways. They are non-deterministic: the same
-input gives different outputs. They are non-local: a sentence added to the prompt for case A changes
-behaviour on cases B and C that nobody re-checked. And their outputs are open-ended: no compiler or
-type checker flags a wrong answer. The playground loop of tweak, try three examples, ship survives
-none of these. The usual trajectory is that a user hits a failure, a line is added to the prompt, and
-six months later the prompt is two thousand tokens of special cases and nobody can say which lines
-still matter or what the last change broke.
-
-Model deprecations make it worse. The vendor retires the model your feature runs on; the replacement is
-"better on benchmarks"; you swap it and have no way to say whether your feature got better or worse.
-
-The naive alternatives each fail for a specific reason. Writing evals after the system is built means
-the evals encode what the system already does, so they pass by construction and say nothing about the
-goal. Relying on vendor benchmarks measures a model on generic tasks, not your task with your prompt
-and your data. Relying on production metrics alone is weeks too slow, too noisy to attribute to a
-single change, and the damage is done before the metric moves. Test-driven development solved the same
-problem for ordinary code: write the failing test first so the test describes the requirement rather
-than the implementation. Eval-driven development is that discipline with two adjustments: the tests
-are probabilistic and graded with thresholds, and the suite grows from production data rather than
-from the specification alone.
+- **LLM features break the ordinary loop three ways.** Non-deterministic: the same input gives different
+  outputs. Non-local: a prompt sentence added for case A changes cases B and C nobody re-checked.
+  Open-ended: no compiler or type checker flags a wrong answer. Tweak, try three examples, ship survives
+  none of these.
+- **The usual trajectory is a prompt nobody understands.** A user hits a failure, a line is added, and six
+  months later the prompt is two thousand tokens of special cases; nobody knows which lines still matter
+  or what the last change broke. And a bug without a failing eval item is never reliably fixed.
+- **Model deprecations make it worse.** The vendor retires your model; the replacement is "better on
+  benchmarks"; you swap it with no way to say whether your feature got better or worse.
+- **The naive alternatives each fail.** Evals written after building encode what the system already does,
+  so they pass by construction. Vendor benchmarks measure generic tasks, not your prompt and data.
+  Production metrics alone are weeks too slow, too noisy to attribute to one change, and arrive after
+  the damage.
+- **TDD solved this for ordinary code.** Write the failing test first, so it describes the requirement,
+  not the implementation. Eval-driven development adds two adjustments: tests are probabilistic and graded
+  with thresholds, and the suite grows from production data, not from the specification alone.
 
 ## How it works
 ### The loop
 1. **Define before building.** With the domain owner, write the task, the acceptance criteria (metric,
-   threshold, and the slices on which it must hold), the budgets that are also requirements (p95
-   latency, cost per request, benign refusal rate), and a handful of hand-written good and bad outputs.
-   Doing this before seeing model outputs matters *because* criteria written afterwards anchor on
-   current behaviour; Shankar et al. observed this drift in people grading outputs.
-2. **Seed the golden set.** A few dozen items (an illustrative size) covering the main input types and
-   the known hard cases, with expected outputs or a rubric, and the first graders: deterministic where
-   possible (schema valid, cites an id present in the context, within length limits), an LLM judge for
-   what cannot be checked by code.
-3. **Build the simplest version** — one prompt, one model — and run the eval to get a per-slice
-   baseline, not just an overall number.
-4. **Error analysis on the failures** produces new categories; each becomes new items and, when stable,
-   a new grader. The rule that makes the suite grow: a bug is not fixed until an eval item fails before
-   the change and passes after.
-5. **Change one variable at a time** (prompt, retrieval, model, decoding) and compare to the baseline
-   with the harness's confidence intervals, recording the configuration hash with the score, *because*
-   a number without its configuration cannot be compared with anything.
-6. **Gate by cost.** Deterministic graders run on every commit, judge-graded evals on each pull request
-   or nightly, and human review or an online A/B before release. This pyramid exists *because* judge
-   calls cost money and minutes, and a gate that takes an hour gets skipped.
+   threshold, and the slices where it must hold), the budgets that are also requirements (p95 latency,
+   cost per request, benign refusal rate), and a handful of hand-written good and bad outputs. Do it
+   before seeing outputs *because* criteria written afterwards anchor on current behaviour; Shankar et al.
+   observed this drift in people grading outputs.
+2. **Seed the golden set.** A few dozen items (illustrative size) covering the main input types and known
+   hard cases, with expected outputs or a rubric. First graders are deterministic where possible (schema
+   valid, cites an id present in the context, within length limits), plus an LLM judge for what code
+   cannot check.
+3. **Build the simplest version** (one prompt, one model) and run the eval for a per-slice baseline, not
+   just an overall number.
+4. **Error analysis on the failures** produces new categories; each becomes items and, when stable, a
+   grader. The rule that grows the suite: a bug is not fixed until an eval item fails before the change
+   and passes after.
+5. **Change one variable at a time** (prompt, retrieval, model, decoding). Compare to the baseline with
+   the harness's confidence intervals and record the configuration hash with the score, *because* a
+   number without its configuration cannot be compared with anything.
+6. **Gate by cost.** See the pyramid below; it exists *because* judge calls cost money and minutes, and a
+   gate that takes an hour gets skipped.
 7. **Ship and close the loop.** Sample production traces back into the golden set; use online metrics to
    check that the offline score still predicts what users experience.
 
-### One iteration, concretely
-An illustrative round: a user reports that the assistant quotes the 30-day refund window to customers
-on the annual plan, whose window is 14 days. The engineer first adds six items for annual-plan refund
-questions and runs the current system: 1 of 6 passes, so the bug is now a failing eval rather than an
-anecdote. The fix, adding plan tier to the retrieval filter, is one change. The eval diff on the
-pull request then reads: the six new items 1 → 6 passing; across the other 194 items, 3 improved, 2
-regressed, mean 0.81 → 0.84; every slice still above its floor. The reviewer reads the two regressed
-traces, finds one is noise (it passes on re-run) and one is a real loss on a question spanning both
-tiers, adds that case as an item, and the next iteration starts from there. Nothing in this loop
-required anyone to have "tried it in the playground".
+| Gate tier | What runs | When |
+|---|---|---|
+| Fast | deterministic graders | every commit |
+| Medium | judge-graded evals | each pull request or nightly |
+| Slow | human review or an online A/B | before release |
 
 ### Why thresholds rather than exact assertions
-Because of sampling noise, an item may pass seven times in ten. Temperature zero reduces but does not
-remove variance. So the gate runs *k* samples per item and compares against the previous accepted run
-with a tolerance band, and lists per-item regressions rather than asserting 100%. A flaky gate is worse
-than none, *because* people learn to re-run it until it is green.
+- **Sampling noise:** an item may pass seven times in ten. Temperature zero reduces but does not remove
+  variance.
+- **So the gate** runs *k* samples per item, compares against the previous accepted run with a tolerance
+  band, and lists per-item regressions rather than asserting 100%.
+- **A flaky gate is worse than none,** *because* people learn to re-run it until it is green.
 
-Compare runs *paired*, item by item, rather than as two independent means. Most of the variance in a
-pass rate comes from which items are hard, and that variance is identical in both runs, so the
-per-item difference (candidate minus baseline) has a much smaller spread than either mean. A paired
-test, or simply counting items that flipped in each direction, detects a real 2-point change on a set
-where comparing two unpaired means could not.
+### Compare runs paired, item by item
+- **Why:** most variance in a pass rate comes from which items are hard, and that variance is identical
+  in both runs. The per-item difference (candidate minus baseline) has a much smaller spread than either
+  mean.
+- **How:** a paired test, or simply counting items that flipped in each direction.
+- **Payoff:** it detects a real 2-point change on a set where comparing two unpaired means could not.
 
 ### Keeping the evals honest
-Keep a held-out subset you rarely inspect, *because* tuning a prompt against the items you look at
-overfits them exactly as training on the test set would. Version prompts and datasets together with
-their scores. Calibrate every judge against human labels before it gates anything, otherwise you are
-optimising the judge rather than the product. Retire or harden items that have passed for months; a
-suite at 100% carries no information, though a few should stay as smoke tests.
+- **Held-out subset you rarely inspect,** *because* tuning a prompt against the items you look at
+  overfits them exactly as training on the test set would.
+- **Version prompts and datasets together** with their scores.
+- **Calibrate every judge against human labels** before it gates anything; otherwise you optimise the
+  judge rather than the product.
+- **Retire or harden items** that have passed for months; a suite at 100% carries no information, though
+  a few should stay as smoke tests.
 
 ### What changes for the team
-A prompt change is a pull request with an eval diff attached, like a test report. "Did you run the
-evals?" replaces "did you try it?". The golden set is reviewed like code, and product owners write and
-accept eval items, because the eval is the specification they can read.
+- **A prompt change is a pull request with an eval diff attached,** like a test report.
+- **"Did you run the evals?"** replaces "did you try it?".
+- **The golden set is reviewed like code,** and product owners write and accept eval items, because the
+  eval is the specification they can read.
 
-## Example
-A CI gate in pytest. It runs each golden item *k* times, scores with a deterministic check and a
-calibrated judge, and fails only on a drop larger than a noise band against the last accepted run or
-on a slice falling below its floor, so sampling noise does not turn it into a gate people ignore. The
-band is not a constant to copy: its right width depends on the number of items and on how much the
-score moves between identical runs.
+## Diagram
+Read it as TDD with probabilistic tests: criteria come first, every change is compared against the last
+accepted baseline, and production traffic feeds new items back in.
+
+```mermaid
+flowchart TD
+    C["Acceptance criteria and budgets"] --> G[("Seed golden set and graders")]
+    G --> B["Simplest version: per-slice baseline"]
+    B --> E["Error analysis on failures"]
+    E -->|"new failing items"| G
+    E --> X["Change one variable"]
+    X --> P["Gate: k samples, paired diff, slice floors"]
+    P -->|"regressed"| E
+    P -->|"accepted"| A["Write new baseline"]
+    A --> S["Ship, canary, online metrics"]
+    S -->|"sample traces"| G
+```
+
+## Examples
+### One iteration, concretely
+Illustrative round: a user reports the assistant quotes the 30-day refund window to customers on the
+annual plan, whose window is 14 days.
+
+| Step | What happens |
+|---|---|
+| Reproduce as an eval | add six items for annual-plan refund questions; current system passes 1 of 6, so the bug is now a failing eval, not an anecdote |
+| One change | add plan tier to the retrieval filter |
+| Eval diff on the PR | six new items 1 → 6 passing; across the other 194 items, 3 improved, 2 regressed; mean 0.81 → 0.84; every slice still above its floor |
+| Review regressions | of the two regressed traces, one is noise (passes on re-run), one is a real loss on a question spanning both tiers |
+| Grow the suite | that cross-tier case becomes an item; the next iteration starts from there |
+
+Nothing in this loop required anyone to have "tried it in the playground".
+
+### CI gate in pytest
+It runs each golden item *k* times, scores with a deterministic check and a calibrated judge, and fails
+only on a drop beyond a noise band against the last accepted run, or a slice below its floor.
+
+The band is not a constant to copy: its width depends on item count and on how much the score moves
+between identical runs.
 
 ```python
 # tests/test_eval_gate.py — runs in CI on every prompt, retrieval or model change
@@ -152,53 +177,104 @@ def test_every_slice_above_floor():
         assert statistics.mean(run()[i] for i in ids) >= 0.80, f"slice {name} below floor"
 ```
 
-When the gate passes and the change is accepted, the new per-item scores are written to
-`baseline_v7.json`, so the next change is compared against the state that actually shipped. To size
-`TOLERANCE`, re-run the unchanged system a handful of times and look at the spread of the mean: as a
-rough guide, the run-to-run standard error of a pass rate near 0.8 over the same 200 items × 3
-samples is at most √(0.8 × 0.2 / 600) ≈ 0.016 (less when many items always pass or always fail), and
-the difference between two such runs at most about 0.023, so a 0.03 band can still trip on pure noise
-now and then. A larger set, or a paired per-item test, narrows it.
+- **Baseline update:** when the gate passes and the change is accepted, the new per-item scores are
+  written to `baseline_v7.json`, so the next change is compared against what actually shipped.
+- **Sizing `TOLERANCE`:** re-run the unchanged system a handful of times and look at the spread of the
+  mean. Rough guide below; a 0.03 band can still trip on pure noise now and then, and a larger set or a
+  paired per-item test narrows it.
+
+```
+pass rate ≈ 0.8, same 200 items × 3 samples = 600 graded outputs
+SE of one run   ≤ √(0.8 × 0.2 / 600) ≈ 0.016   (less when many items always pass or always fail)
+SE of a diff    ≤ about 0.023                    (two such runs)
+```
+
+### Paired flip count with an exact sign test
+Pure Python, no dependencies: count the items that flipped each way and ask whether the imbalance could
+be chance.
+
+```python
+from math import comb
+
+def flips(base, cand):
+    """Items that went fail->pass (b) and pass->fail (c) between two runs."""
+    b = sum(1 for i in base if base[i] < 0.5 <= cand[i])
+    c = sum(1 for i in base if cand[i] < 0.5 <= base[i])
+    return b, c
+
+def sign_test(b, c):
+    """Exact two-sided sign test on the flipped items only."""
+    n, k = b + c, min(b, c)
+    if n == 0:
+        return 1.0
+    tail = sum(comb(n, j) for j in range(k + 1)) / 2 ** n
+    return min(1.0, 2 * tail)
+
+base = {"q1": 1.0, "q2": 0.0, "q3": 1.0, "q4": 0.0, "q5": 0.33}
+cand = {"q1": 1.0, "q2": 1.0, "q3": 0.33, "q4": 0.67, "q5": 0.0}
+print(flips(base, cand))                 # (2, 1)
+print(round(sign_test(8, 2), 3))         # 0.109: 8 up, 2 down could still be noise
+print(round(sign_test(15, 3), 3))        # 0.008: unlikely to be chance
+```
+
+## Production patterns
+- **Eval diff as a PR comment.** When any prompt, retrieval or model file changes, a CI job runs the
+  gate and posts the per-slice table, the mean with its interval, and the list of regressed item ids
+  with trace links. Monitor how often PRs merge with unread regressions; reviewers should open each one.
+- **Configuration hash on every score.** Hash the prompt template, model id, decoding settings, retrieval
+  parameters, grader versions and dataset version, and store it with each run. Refuse to compare runs
+  whose hashes differ in more than the variable under test. Monitor runs stored without a hash.
+- **Failing item before the fix.** Make "link the eval item that failed before this change" a required
+  field in the bug-fix PR template. Monitor time from "bug reported" to "failing eval item added".
+- **Accept-only baseline refresh.** Write the baseline file only on merge to main, never from a branch
+  run, so every gate compares against what actually shipped. Pair the tolerance band with a trend chart
+  across accepted runs to catch slow drift.
+- **Offline-to-online check.** After each release, compare the offline score change with the online
+  metric it should predict (task completion, escalation rate, thumbs-down rate). Monitor the correlation
+  over releases; when it weakens, the golden set has drifted from real traffic.
 
 ## Trade-offs
-- Writing evals before building delays the first demo by days but makes every later iteration
-  measurable; it flips for a throwaway spike whose purpose is to learn what the task even is, and even
-  then the evals come before the second iteration.
-- A larger golden set gives tighter confidence intervals but a slower and costlier loop; split it into
-  a fast smoke subset per commit and the full set nightly or per release.
-- A tolerance band absorbs sampling noise but lets slow drift through across many small accepted drops;
-  pair the gate with a trend chart across runs.
-- Deterministic graders are cheap and trustworthy but cover only part of quality; judge graders cover
-  the rest at the cost of calibration work and per-run spend. Use a judge in the gate only once its
-  agreement with human labels has been measured; until then it informs review but should not block.
-- Holding out items prevents overfitting but means you cannot freely inspect their failures; rotate
-  items between the dev and held-out sets periodically.
+- **Evals first vs a fast first demo.** Writing evals before building delays the first demo by days but
+  makes every later iteration measurable. It flips for a throwaway spike whose purpose is to learn what
+  the task even is; even then the evals come before the second iteration.
+- **Larger golden set vs loop speed.** A larger set gives tighter confidence intervals but a slower,
+  costlier loop. Split it into a fast smoke subset per commit and the full set nightly or per release.
+- **Tolerance band vs slow drift.** A band absorbs sampling noise but lets slow drift through across many
+  small accepted drops. Pair the gate with a trend chart across runs.
+- **Deterministic graders vs judges.** Deterministic graders are cheap and trustworthy but cover only part
+  of quality; judges cover the rest at the cost of calibration work and per-run spend. Use a judge in the
+  gate only once its agreement with human labels has been measured; until then it informs review but
+  should not block.
+- **Held-out items vs inspectability.** Holding out items prevents overfitting but means you cannot freely
+  inspect their failures. Rotate items between the dev and held-out sets periodically.
 
 ## Pitfalls
-- Evals written after the system exists. Symptom: 100% from day one while users keep reporting
+- **Evals written after the system exists.** Symptom: 100% from day one while users keep reporting
   failures, because the items describe current behaviour rather than the requirement.
-- Tuning the prompt against the full eval set repeatedly. Symptom: the eval climbs while production
+- **Tuning the prompt against the full eval set repeatedly.** Symptom: the eval climbs while production
   quality does not, and the held-out slice, if there is one, stays flat.
-- A hard threshold on a noisy metric. Symptom: CI fails every third run with no change, and engineers
+- **A hard threshold on a noisy metric.** Symptom: CI fails every third run with no change, and engineers
   re-run until green or mark the test skipped.
-- Treating the vendor's benchmark as your eval. Symptom: a model swap "improves" on a leaderboard
+- **Treating the vendor's benchmark as your eval.** Symptom: a model swap "improves" on a leaderboard
   while a key slice of your task regresses unnoticed.
-- Judge-only evals with no human calibration. Symptom: scores rise after changes that only make
+- **Judge-only evals with no human calibration.** Symptom: scores rise after changes that only make
   outputs longer or more confident, which the judge happens to prefer.
-- A golden set that never grows from production. Symptom: the same forty items for a year while the
+- **A golden set that never grows from production.** Symptom: the same forty items for a year while the
   input distribution moves, and an eval that predicts nothing about user complaints.
-- Scores stored without prompt and dataset versions. Symptom: nobody can say whether Tuesday's 83% and
-  Friday's 80% were measured on the same thing.
+- **Scores stored without prompt and dataset versions.** Symptom: nobody can say whether Tuesday's 83%
+  and Friday's 80% were measured on the same thing.
 
 ## When to use
-Apply it to every feature whose model output reaches users or triggers actions, and most strictly
-before model swaps, prompt refactors and retrieval changes. Skip it only for a one-day spike. Measure
-the eval's coverage of known failure modes, the time from "bug reported" to "failing eval item
-added", CI eval runtime and cost, and the correlation between the offline score and the online metric
-it is supposed to predict. Day to day it looks like a pull request whose description is an eval diff.
-In interviews, "how do you know your prompt change is an improvement?" should be answered with a
-baseline run, *k* samples per item, per-slice scores, a list of regressed items you have read, a
-held-out check, and a calibrated judge; "it looked better" is the wrong answer.
+- **Use when** model output reaches users or triggers actions; most strictly before model swaps, prompt
+  refactors and retrieval changes.
+- **Skip only** for a one-day spike.
+- **Measure:** the eval's coverage of known failure modes, time from "bug reported" to "failing eval item
+  added", CI eval runtime and cost, and the correlation between the offline score and the online metric
+  it should predict.
+- **Day to day:** a pull request whose description is an eval diff.
+- **Interviews:** answer "how do you know your prompt change is an improvement?" with a baseline run,
+  *k* samples per item, per-slice scores, a list of regressed items you have read, a held-out check, and
+  a calibrated judge. "It looked better" is the wrong answer.
 
 ## Role lens
 - **Engineer:** Writes the graders and the CI gate, adds a failing eval item before fixing any reported
@@ -221,6 +297,39 @@ agrees with humans on the new model's outputs, because a different style can foo
 adaptations as separate, recorded experiments. Canary in production and compare online metrics with
 the offline prediction. Refuse to switch if a high-severity slice regresses with no fix, if cost,
 latency or benign refusals exceed budget, or if the judge cannot yet be trusted on the new outputs.
+
+## Interview questions
+### How is eval-driven development different from test-driven development?
+- **Same core idea:** write the failing check first so it describes the requirement, not the
+  implementation, and never call a bug fixed without a failing-then-passing item.
+- **Two differences:** the checks are probabilistic and graded with thresholds and *k* samples, and the
+  suite grows from production traces and error analysis, not from the specification alone.
+
+### Your CI eval gate fails every third run with no code change. What do you do?
+- **Diagnose noise:** re-run the unchanged system several times and measure the spread of the mean.
+- **Fix the gate:** run *k* samples per item, compare against the last accepted baseline with a tolerance
+  band of roughly 2-3 standard deviations, and list per-item regressions.
+- **Do not** lower the bar or allow re-runs until green, because that trains the team to ignore the gate.
+
+### When would you not write evals before building?
+- **A one-day throwaway spike** whose purpose is to learn what the task even is; there is no stable
+  requirement to encode yet.
+- **But** the evals come before the second iteration, because from then on every change needs a
+  baseline to be compared with.
+
+### A candidate prompt lifts the mean from 0.81 to 0.83. Is that real?
+- **Compare paired, not as two means:** count items that flipped each way and run a sign test or paired
+  test, because item difficulty variance cancels in the per-item difference.
+- **Check noise:** at 200 items × 3 samples near 0.8, one run's SE is about 0.016 and a difference of two
+  runs about 0.023, so a 2-point change of means alone is not convincing.
+- **Read the regressed traces** and check the held-out slice before accepting.
+
+### How do you keep a golden set from going stale or being overfit?
+- **Hold out a subset** you rarely inspect and rotate items between dev and held-out periodically.
+- **Grow it from production:** sample recent traces and add items for new failure modes after each round
+  of error analysis.
+- **Retire or harden** items that have passed for months, keeping a few as smoke tests, because a suite
+  at 100% carries no information.
 
 ## Quiz
 ### Q: Why write acceptance criteria and golden items before building the first version?

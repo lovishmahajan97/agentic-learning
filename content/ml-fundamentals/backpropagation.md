@@ -5,7 +5,7 @@ name: Backpropagation
 kind: concept
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - ml-fundamentals/gradient-descent
   - ml-fundamentals/loss-functions
@@ -23,102 +23,141 @@ sources:
 ---
 
 ## TL;DR
-Backpropagation computes the gradient of a scalar loss with respect to every parameter in one backward
-sweep, by applying the chain rule from the loss back through the recorded computation graph. It costs a
-small constant multiple of the forward pass no matter how many parameters there are, which is the only
-reason training billion-parameter models is possible. The price is memory: the backward pass needs the
-forward activations, so training memory scales with batch × sequence length × depth, not just with
-parameter count.
+Backpropagation gets the loss gradient for every parameter in one backward sweep of the chain rule, at a
+small multiple of the forward cost regardless of parameter count. The price is memory: saved activations
+scale with batch × sequence length × depth.
 
 ## Why it exists
-Gradient descent needs ∇L, one partial derivative per parameter. The obvious way to get it is finite
-differences: nudge a parameter, re-run the forward pass, measure the change. That is P + 1 forward
-passes per step; for a model with seven billion parameters it is seven billion forward passes to make one
-update, and the result is numerically poor besides. Symbolic differentiation of the whole network
-produces expressions whose size explodes with depth. Forward-mode automatic differentiation, which
-carries derivatives alongside values through the forward pass, is exact and cheap per direction, but it
-computes the derivative along one input direction at a time, so it also needs P passes.
-
-The decisive observation is the shape of the problem: one output (the scalar loss) and millions of
-inputs (the parameters). Reverse-mode differentiation propagates "how sensitive is the loss to this
-value" backwards from the output, and because there is a single output, one backward sweep yields the
-sensitivity of the loss to every intermediate value and every parameter. Its cost is a small constant
-times the forward pass, independent of P. Backpropagation is reverse-mode automatic differentiation
-specialised to layered networks; it was derived several times before the 1986 paper made it standard.
-It is not a learning algorithm by itself. It computes gradients; gradient descent and its descendants
-decide what to do with them.
+- **Gradient descent needs ∇L,** one partial derivative per parameter.
+- **Finite differences are hopeless.** Nudge a parameter, re-run the forward pass, measure the change:
+  P + 1 forward passes per step. For seven billion parameters that is seven billion forward passes per
+  update, and numerically poor besides.
+- **Other options also fail.** Symbolic differentiation of the whole network produces expressions whose
+  size explodes with depth. Forward-mode automatic differentiation is exact and cheap per direction, but
+  computes one input direction at a time, so it also needs P passes.
+- **The shape of the problem decides it.** One output (the scalar loss) and millions of inputs (the
+  parameters). Reverse mode propagates "how sensitive is the loss to this value" backwards from the output;
+  with a single output, one sweep yields the sensitivity to every intermediate value and parameter, at a
+  small constant times the forward cost, independent of P.
+- **What it is and is not.** Backpropagation is reverse-mode automatic differentiation specialised to
+  layered networks; it was derived several times before the 1986 paper made it standard. It is not a
+  learning algorithm by itself: it computes gradients; gradient descent and its descendants decide what to
+  do with them.
 
 ## How it works
 ### The computation graph and adjoints
-A forward pass is a sequence of primitive operations, each recording its inputs, its output and which
-operation it was. The loss L sits at the end. For every intermediate value v define its adjoint
-v̄ = ∂L/∂v, with L̄ = 1. Walk the graph in reverse topological order. For an operation y = f(x₁, …, xₙ),
-add to each input's adjoint the product of the upstream adjoint and the local derivative:
-x̄ᵢ += ȳ · ∂f/∂xᵢ. The products are vector–Jacobian products, never full Jacobians, which is what keeps
-the cost linear. The addition matters: a value used in several places collects a contribution from each
-use, which is the multivariable chain rule. When the sweep reaches the parameters, their adjoints are the
-gradient.
+1. **Record.** A forward pass is a sequence of primitive operations, each recording its inputs, its output
+   and which operation it was. The loss L sits at the end.
+2. **Define adjoints.** For every intermediate value v, v̄ = ∂L/∂v, with L̄ = 1.
+3. **Walk in reverse topological order.** For an operation y = f(x₁, …, xₙ), add to each input's adjoint
+   the upstream adjoint times the local derivative: x̄ᵢ += ȳ · ∂f/∂xᵢ.
+4. **Vector–Jacobian products, never full Jacobians,** which is what keeps the cost linear.
+5. **The addition matters.** A value used in several places collects a contribution from each use: the
+   multivariable chain rule.
+6. **Read off the gradient.** When the sweep reaches the parameters, their adjoints are the gradient.
 
-A three-line case makes the fan-out rule concrete. Let a = 3, b = a², c = 2a, L = b + c. Forward:
-b = 9, c = 6, L = 15. Backward: L̄ = 1, so b̄ = 1 and c̄ = 1; a receives b̄·2a = 6 from the square and
-c̄·2 = 2 from the doubling, so ā = 8, which matches dL/da = 2a + 2 = 8. Forgetting the "+=" and keeping
-only the last contribution would give 2 or 6, a silently wrong gradient.
+**The fan-out rule, concretely.** Let a = 3, b = a², c = 2a, L = b + c.
+
+| Pass | Computation | Value |
+|---|---|---|
+| Forward | b = 9, c = 6, L = 15 | |
+| Backward | L̄ = 1, so b̄ = 1 and c̄ = 1 | |
+| Backward | a receives b̄·2a = 6 from the square and c̄·2 = 2 from the doubling | ā = 8 |
+| Check | dL/da = 2a + 2 | 8 |
+
+Forgetting the "+=" and keeping only the last contribution would give 2 or 6, a silently wrong gradient.
 
 ### What the framework actually does
-In PyTorch the graph is recorded during the forward pass itself: every tensor produced by a
-differentiable op carries a `grad_fn` pointing at the op and the values it saved. `loss.backward()`
-walks those pointers in reverse, writes each parameter's adjoint into `.grad`, and then frees the graph
-and its saved tensors (unless `retain_graph=True`). `.grad` is *added to*, not overwritten, which is the
-same += rule applied across calls; that is why `zero_grad()` is needed between steps and why gradient
-accumulation over several micro-batches works by simply calling `backward()` several times before
-`step()`.
+- **Graph recorded during the forward pass.** In PyTorch every tensor produced by a differentiable op
+  carries a `grad_fn` pointing at the op and the values it saved.
+- **`loss.backward()`** walks those pointers in reverse, writes each parameter's adjoint into `.grad`, and
+  then frees the graph and its saved tensors (unless `retain_graph=True`).
+- **`.grad` is *added to*, not overwritten,** the same += rule applied across calls. That is why
+  `zero_grad()` is needed between steps, and why gradient accumulation over several micro-batches works by
+  calling `backward()` several times before `step()`.
 
 ### Why reverse rather than forward
-Forward mode costs one pass per input direction; reverse mode costs one pass per output. With one
-scalar output and P inputs, reverse mode wins by a factor of P. The cheap-gradient result from automatic
-differentiation theory bounds the backward sweep by a small constant multiple of the forward cost. For
-matrix-multiply-dominated networks it is about twice the forward FLOPs, because each linear layer
-needs two matmuls in the backward pass against one in the forward pass. That is the origin of the rule
-of thumb that a training step costs about three forward passes.
+| Mode | Cost | Training (1 output, P inputs) |
+|---|---|---|
+| Forward | one pass per input direction | P passes |
+| Reverse | one pass per output | 1 pass: wins by a factor of P |
+
+- **Cheap-gradient result.** Automatic differentiation theory bounds the backward sweep by a small
+  constant multiple of the forward cost.
+- **About 2× forward FLOPs** for matrix-multiply-dominated networks, because each linear layer needs two
+  matmuls in the backward pass against one in the forward pass. Hence the rule of thumb that a training
+  step costs about three forward passes.
 
 ### A linear layer, worked out
 For y = xW with x of shape [B, d_in] and W of shape [d_in, d_out], given the upstream adjoint ȳ of shape
-[B, d_out]: W̄ = xᵀȳ (shape [d_in, d_out]) and x̄ = ȳWᵀ (shape [B, d_in]). Note what W̄ needs: x, the
-layer's input activation from the forward pass. ReLU's backward is x̄ = ȳ ⊙ 1[x > 0], which needs the
-sign of its input. Softmax followed by cross-entropy has the fused backward z̄ = q − onehot(y). Attention
-and normalisation layers are more involved but follow the same recipe: a local derivative applied to the
-upstream adjoint, using saved forward values.
+[B, d_out]:
+
+```
+W̄ = xᵀȳ      shape [d_in, d_out]   -> needs x, the layer's saved input activation
+x̄ = ȳWᵀ      shape [B, d_in]
+ReLU:        x̄ = ȳ ⊙ 1[x > 0]      -> needs the sign of its input
+softmax + cross-entropy (fused):  z̄ = q − onehot(y)
+```
+
+Attention and normalisation layers are more involved but follow the same recipe: a local derivative
+applied to the upstream adjoint, using saved forward values.
 
 ### Where training memory goes
-Each saved forward value is memory held from the forward pass until its backward step. Per layer that is
-several tensors of shape [batch, sequence, hidden], so activation memory scales with B × T × d × depth
-and for long sequences dwarfs the parameters. Gradient checkpointing stores only each block's input and
-recomputes the interior during the backward pass, trading roughly a third more compute for a large
-memory reduction. Fused attention kernels recompute attention probabilities in the backward pass rather
-than storing the T × T matrix. Freezing weights, as in LoRA, removes their gradient and optimizer-state
-memory, but the backward sweep still has to pass through the frozen layers to reach trainable ones
-earlier in the network, so activation memory does not disappear. What is skipped is the weight-gradient
-matmul for each frozen layer, roughly half the backward FLOPs, so compute per step falls by at most about a
-third, nowhere near in proportion to the parameter count.
+- **Saved forward values are held until their backward step.** Per layer that is several tensors of shape
+  [batch, sequence, hidden], so activation memory scales with B × T × d × depth and for long sequences
+  dwarfs the parameters.
+- **Gradient checkpointing** stores only each block's input and recomputes the interior during the
+  backward pass, trading roughly a third more compute for a large memory reduction.
+- **Fused attention kernels** recompute attention probabilities in the backward pass rather than storing
+  the T × T matrix.
+- **Freezing weights (as in LoRA)** removes their gradient and optimizer-state memory. But the backward
+  sweep still passes through frozen layers to reach trainable ones earlier in the network, so activation
+  memory does not disappear.
+- **Compute falls less than you think.** What is skipped is the weight-gradient matmul for each frozen
+  layer, roughly half the backward FLOPs, so compute per step falls by at most about a third, nowhere near
+  in proportion to the parameter count.
 
 ### Vanishing and exploding gradients
-The adjoint at the first layer is the upstream adjoint multiplied by the Jacobian of every layer above
-it. A product of many matrices shrinks or grows exponentially. A sigmoid's derivative is at most 0.25, so
-twenty sigmoid layers scale the gradient by at most 0.25²⁰ ≈ 10⁻¹²; early layers simply stop learning.
-Every standard remedy is a response to this arithmetic: ReLU and GELU have derivative near 1 on their
-active side; residual connections make each block's Jacobian I plus something small, so the product
-stays near the identity and gradients have a highway to early layers; normalisation keeps activation
-scales from drifting; variance-preserving initialisation starts the product near 1; clipping bounds the
-explosions that remain.
+- **Products of Jacobians.** The adjoint at the first layer is the upstream adjoint multiplied by the
+  Jacobian of every layer above it; a product of many matrices shrinks or grows exponentially.
+- **Sigmoid arithmetic.** A sigmoid's derivative is at most 0.25, so twenty sigmoid layers scale the
+  gradient by at most 0.25²⁰ ≈ 10⁻¹²; early layers simply stop learning.
+
+Every standard remedy is a response to this arithmetic:
+- **ReLU and GELU** have derivative near 1 on their active side.
+- **Residual connections** make each block's Jacobian I plus something small, so the product stays near
+  the identity and gradients have a highway to early layers.
+- **Normalisation** keeps activation scales from drifting.
+- **Variance-preserving initialisation** starts the product near 1.
+- **Clipping** bounds the explosions that remain.
 
 ### Where the graph stops
-Argmax, sampling, string operations and external tool calls have no useful derivative, so you cannot
-backpropagate through "generate a response and score it". That gap is why policy-gradient methods exist
-for RLHF, and why straight-through estimators and Gumbel-softmax are used when a discrete step must sit
-inside a differentiable model. `detach()` cuts the graph deliberately, for example to stop gradients
-flowing into a target network or a teacher.
+- **No useful derivative:** argmax, sampling, string operations and external tool calls. You cannot
+  backpropagate through "generate a response and score it".
+- **That gap is why** policy-gradient methods exist for RLHF, and why straight-through estimators and
+  Gumbel-softmax are used when a discrete step must sit inside a differentiable model.
+- **`detach()` cuts the graph deliberately,** for example to stop gradients flowing into a target network
+  or a teacher.
 
-## Example
+## Diagram
+The forward pass saves activations; the backward pass consumes them in reverse to produce every gradient.
+
+```mermaid
+flowchart TD
+    X["Input x"] --> L1["Layer 1: save x"]
+    L1 --> L2["Layer 2: save h"]
+    L2 --> LS["Loss L"]
+    LS -->|"L bar = 1"| B2["Backward layer 2"]
+    B2 -->|"uses saved h"| G2["grad W2"]
+    B2 -->|"adjoint h bar"| B1["Backward layer 1"]
+    B1 -->|"uses saved x"| G1["grad W1"]
+    G1 --> ACC["Added into .grad"]
+    G2 --> ACC
+    ACC --> OPT["Optimizer step, then zero_grad"]
+```
+
+## Examples
+### A two-layer network by hand, checked numerically
 A two-layer network with ReLU and softmax cross-entropy, differentiated by hand and checked against a
 finite difference. Each backward line is one local derivative multiplied by the upstream adjoint; the
 numeric check should agree to around 1e-10.
@@ -152,41 +191,115 @@ numeric = (forward(W1p, W2)[0] - forward(W1m, W2)[0]) / (2 * eps)
 print(dW1[i, j], numeric)        # agree to ~1e-10; the saved h, h_pre, X are the "activation memory"
 ```
 
+### The fan-out rule in code, then in autograd
+The three-line graph from How it works, first by hand in plain Python, then confirmed by PyTorch.
+
+```python
+a = 3.0
+b = a ** 2; c = 2 * a; L = b + c          # forward: 9, 6, 15
+b_bar = c_bar = 1.0                       # L = b + c, and L_bar = 1
+a_bar = 0.0
+a_bar += b_bar * 2 * a                    # from b = a^2 -> +6
+a_bar += c_bar * 2                        # from c = 2a  -> +2
+print(L, a_bar)                           # 15.0 8.0, and dL/da = 2a + 2 = 8
+
+import torch
+t = torch.tensor(3.0, requires_grad=True)
+(t ** 2 + 2 * t).backward()
+print(t.grad)                             # tensor(8.)
+```
+
+### Worked numbers: how fast sigmoid gradients vanish
+Upper bound on the gradient scale after n sigmoid layers, from the 0.25 maximum derivative.
+
+| Sigmoid layers | Bound 0.25ⁿ | Effect on early layers |
+|---|---|---|
+| 5 | about 1e-3 | learning is slow |
+| 10 | about 1e-6 | barely move |
+| 20 | about 1e-12 | effectively frozen |
+
+With ReLU on its active side the per-layer factor is near 1, and a residual block's Jacobian is near I,
+which is why modern deep stacks still train.
+
+### Per-layer gradient norms in a real training loop
+The first diagnostic when "the model is not learning": print the gradient norm of every parameter after
+`backward()`.
+
+```python
+import torch
+
+def grad_norms(model):
+    return {name: p.grad.norm().item()
+            for name, p in model.named_parameters()
+            if p.requires_grad and p.grad is not None}
+
+model = torch.nn.Sequential(*[torch.nn.Sequential(torch.nn.Linear(64, 64), torch.nn.Sigmoid())
+                              for _ in range(12)], torch.nn.Linear(64, 3))
+x, y = torch.randn(32, 64), torch.randint(0, 3, (32,))
+torch.nn.functional.cross_entropy(model(x), y).backward()
+for name, n in grad_norms(model).items():
+    if name.endswith("weight"):
+        print(f"{name:12s} {n:.2e}")       # norms shrink by orders of magnitude toward layer 0
+```
+
+## Production patterns
+- **Log per-layer gradient norms.** Compute norms from `named_parameters()` after `backward()` every N
+  steps and send them to your experiment tracker. Monitor the ratio of first-layer to last-layer norms; a
+  collapse of several orders of magnitude means vanishing gradients.
+- **Gradient checkpointing to fit longer sequences.** In Hugging Face Transformers call
+  `model.gradient_checkpointing_enable()`, or wrap blocks with `torch.utils.checkpoint.checkpoint`. Expect
+  roughly a third more compute per step; monitor peak memory and step time.
+- **Gradient accumulation for large effective batches.** Call `backward()` on several micro-batches
+  (scale each loss by 1/k) before one `step()` and one `zero_grad()`. Monitor that the effective batch and
+  learning rate match the intended recipe.
+- **Log scalars, not tensors.** Use `loss.item()` or `loss.detach()` for metrics so the graph is freed
+  each step. Monitor allocated memory per step; steady growth means a graph is being retained.
+- **Gradient-check custom ops in float64.** For a custom `torch.autograd.Function`, run
+  `torch.autograd.gradcheck` on small double-precision inputs before training. Monitor nothing in
+  production; this is a pre-merge test.
+- **Profile activation memory before buying hardware.** Use `torch.cuda.max_memory_allocated()` across a
+  few sequence lengths and batch sizes to see how memory scales, then choose checkpointing, length and
+  batch. Monitor peak memory against the GPU limit.
+
 ## Trade-offs
-- Reverse mode gives every gradient for about twice the forward compute, but must keep forward
-  activations alive; when memory binds, checkpointing trades recompute for memory, and forward-mode
-  (Jacobian–vector products) wins only when you need a few directional derivatives rather than the full gradient.
-- Dynamic graphs built eagerly are flexible and easy to debug with ordinary Python, while compiled
-  graphs fuse operations and run faster; the compiled route pays off once the model is stable and the
-  step time matters more than iteration speed.
-- Freezing most weights cuts gradient and optimizer memory sharply, but the backward pass still
-  traverses the frozen layers, so step time (at most about a third less) and activation memory fall far
-  less than parameter counts suggest.
-- Fused kernels that recompute intermediate results in the backward pass trade FLOPs for memory
-  bandwidth and capacity; they win when the saved tensors would dominate memory, as attention does at long sequence lengths.
+- **Reverse mode: cheap gradients vs stored activations.** Every gradient for about twice the forward
+  compute, but forward activations must stay alive. When memory binds, checkpointing trades recompute for
+  memory; forward mode (Jacobian–vector products) wins only when you need a few directional derivatives
+  rather than the full gradient.
+- **Eager vs compiled graphs.** Dynamic graphs built eagerly are flexible and easy to debug with ordinary
+  Python; compiled graphs fuse operations and run faster. The compiled route pays off once the model is
+  stable and step time matters more than iteration speed.
+- **Freezing weights: memory vs compute expectations.** It cuts gradient and optimizer memory sharply, but
+  the backward pass still traverses the frozen layers, so step time (at most about a third less) and
+  activation memory fall far less than parameter counts suggest.
+- **Recompute in fused kernels: FLOPs vs memory.** Kernels that recompute intermediate results in the
+  backward pass trade FLOPs for memory bandwidth and capacity; they win when saved tensors would dominate
+  memory, as attention does at long sequence lengths.
 
 ## Pitfalls
-- Forgetting `optimizer.zero_grad()`, so gradients accumulate across steps; the symptom is a gradient
-  norm that grows step by step and a run that diverges without any change in the data.
-- Modifying a tensor in place after it was saved for backward; the symptom is the autograd error about a
-  variable needed for gradient computation having been modified by an in-place operation.
-- Breaking the graph by converting to NumPy, calling `.item()` or using a leaf created with
-  `requires_grad=False` in the middle of the model; the symptom is parameters that never change.
-- Vanishing gradients in a deep stack without residuals or normalisation; the symptom is per-layer
-  gradient norms that fall by orders of magnitude from the last layer to the first.
-- Keeping references to the loss tensor (for logging) instead of `loss.item()`, which keeps the whole
-  graph alive; the symptom is memory growing every step until an out-of-memory error.
-- Gradient-checking in fp16 or bf16; the symptom is "mismatches" that are nothing but rounding noise. Do
-  the check in float64.
+- **Forgetting `optimizer.zero_grad()`.** Gradients accumulate across steps; the gradient norm grows step
+  by step and the run diverges without any change in the data.
+- **Modifying a saved tensor in place.** Symptom: the autograd error about a variable needed for gradient
+  computation having been modified by an in-place operation.
+- **Breaking the graph mid-model.** Converting to NumPy, calling `.item()` or using a leaf created with
+  `requires_grad=False` in the middle of the model; symptom: parameters that never change.
+- **Vanishing gradients in a deep stack without residuals or normalisation.** Symptom: per-layer gradient
+  norms that fall by orders of magnitude from the last layer to the first.
+- **Keeping references to the loss tensor for logging** instead of `loss.item()`, which keeps the whole
+  graph alive. Symptom: memory growing every step until an out-of-memory error.
+- **Gradient-checking in fp16 or bf16.** Symptom: "mismatches" that are nothing but rounding noise. Do the
+  check in float64.
 
 ## When to use
-You do not choose backpropagation; the framework performs it. What you choose follows from its
-arithmetic: which parameters to freeze, where to checkpoint, what sequence length and batch fit in
-memory, when a custom autograd function is needed for a non-differentiable step, and how to debug a
-model that is not learning. Measure per-layer gradient norms with hooks and peak activation memory with
-the framework's memory profiler. In interviews, be able to run the chain rule through a two-layer network
-on a whiteboard, explain why reverse mode beats forward mode, account for where training memory goes, and
-say why residual connections keep gradients alive. Those four questions cover most of what is asked.
+You do not choose backpropagation; the framework performs it. What you choose follows from its arithmetic.
+- **Decide:** which parameters to freeze, where to checkpoint, what sequence length and batch fit in
+  memory, and when a custom autograd function is needed for a non-differentiable step.
+- **Debug** a model that is not learning by following gradients layer by layer.
+- **Measure** per-layer gradient norms with hooks and peak activation memory with the framework's memory
+  profiler.
+- **Interviews:** run the chain rule through a two-layer network on a whiteboard, explain why reverse mode
+  beats forward mode, account for where training memory goes, and say why residual connections keep
+  gradients alive. Those four questions cover most of what is asked.
 
 ## Role lens
 - **Engineer:** Debugs "the model is not learning" with gradient-norm hooks, fixes graph breaks and
@@ -207,6 +320,41 @@ data problem and not simply a learning-rate problem, since raising the rate enou
 would blow up the late ones. Replace sigmoids with ReLU or GELU, add residual connections so each block's
 Jacobian is near the identity, add normalisation, and use variance-preserving initialisation. Confirm the
 diagnosis before and after by logging per-layer gradient norms.
+
+## Interview questions
+### Walk me through what happens when you call loss.backward() in PyTorch.
+- **Graph walk:** each tensor's `grad_fn` links to the op that made it and its saved inputs; backward
+  visits them in reverse topological order.
+- **Local rule:** each op multiplies the upstream adjoint by its local derivative and adds the result into
+  its inputs' adjoints.
+- **Result:** parameter adjoints are added into `.grad`, then the graph and saved tensors are freed unless
+  `retain_graph=True`.
+
+### Your fine-tune runs out of memory at sequence length 8k but not 4k. Where is the memory going and what do you do?
+- **Activations, not weights:** saved tensors scale with B × T × d × depth, so doubling T roughly doubles
+  them, and naive attention stores T × T matrices.
+- **Levers:** enable gradient checkpointing (about a third more compute), use a fused attention kernel,
+  lower the micro-batch and use gradient accumulation.
+- **Measure** peak memory at a few lengths to confirm the scaling before changing hardware.
+
+### Why does a training step cost about three forward passes?
+- **Forward:** one matmul per linear layer.
+- **Backward:** two matmuls per linear layer, one for the weight gradient (xᵀȳ) and one for the input
+  adjoint (ȳWᵀ).
+- **So** about 1 + 2 = 3 forward-equivalents, which is the basis of training compute estimates.
+
+### LoRA freezes 99% of weights. Why is the step not 99% cheaper?
+- **Backward still traverses frozen layers** to deliver adjoints to adapters earlier in the network, so
+  activations must still be saved.
+- **Only the weight-gradient matmul is skipped,** about half the backward FLOPs, so compute falls by at
+  most about a third.
+- **What does fall sharply** is gradient and optimizer-state memory for the frozen weights.
+
+### Gradients in your early layers are tiny. What is the mechanism and which fixes address it?
+- **Mechanism:** the early-layer adjoint is a product of every later layer's Jacobian; norms below 1
+  shrink it exponentially (sigmoid bound 0.25 per layer).
+- **Fixes:** ReLU or GELU, residual connections, normalisation, variance-preserving initialisation.
+- **Verify** with per-layer gradient norms before and after.
 
 ## Quiz
 ### Q: Why is reverse-mode automatic differentiation the right choice for training neural networks?

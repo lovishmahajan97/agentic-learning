@@ -149,6 +149,25 @@ The last two terms are what people forget.
 - **Observe per layer:** hit rate, cost saved and latency saved, sampled false-hit rate, and the age of
   served entries.
 
+## Diagram
+The request path through the response caches, cheapest check first, and the two invalidation routes:
+versions in the key make old entries unreachable, while document events purge through the reverse index.
+
+```mermaid
+flowchart TD
+    Q["Request: tenant, model, params, messages"] --> K["Build key with model, prompt, index and embed versions plus tenant"]
+    K --> E{"Exact hit with current doc versions?"}
+    E -->|"yes"| R1["Return cached answer"]
+    E -->|"no"| S{"Semantic hit above threshold, same scope?"}
+    S -->|"yes, borderline verified"| R2["Return cached answer, labelled"]
+    S -->|"no"| L["Single-flight lock, call model with static-first prompt"]
+    L -->|"prefix reuse in provider or engine"| M["Model response"]
+    M --> C{"Complete, not refused?"}
+    C -->|"yes"| W[("Store answer, doc versions, reverse index")]
+    C -->|"no"| R3["Return without caching"]
+    D["Document updated or erased"] -.->|"purge dependents via reverse index"| W
+```
+
 ## Examples
 ### Exact-match cache in Redis
 Versioned, tenant-scoped keys, single-flight on misses, a rule against caching partial or refused answers,
@@ -347,6 +366,46 @@ document ids it used and purge dependents on document update; set TTLs per conte
 policy; verify borderline semantic hits with a cheap check or exclude queries mentioning dates and policy
 names; sample hits for a false-hit rate; and show the source freshness on cached answers so users can
 see what the answer was based on.
+
+## Interview questions
+### What goes into the cache key for an LLM response, and why each part?
+- **Model id and version, and sampling parameters,** because outputs are sampled and a provider update or
+  temperature change means a different correct response.
+- **The full normalised messages, tool schemas and response format,** because any of them changes the
+  answer.
+- **Prompt template, index and embedding versions, plus tenant or user scope** whenever the prompt carries
+  private context, so a deploy cold-starts the cache and no answer crosses a trust boundary.
+
+### Prompt caching is enabled but the bill did not change. How do you debug it?
+- **Read the cached-token share** in usage reports, such as `cache_read_input_tokens` on Anthropic or
+  `prompt_tokens_details.cached_tokens` on OpenAI.
+- **If it is near zero, look at the top of the prompt:** a timestamp, the user's name or unstable ordering
+  changes the prefix, invalidating everything after it.
+- **Check the minimum cacheable prefix:** most providers need roughly a thousand tokens or more, so a short
+  system prompt alone may never cache.
+
+### When would you not use a semantic cache?
+- **For personalised or transactional queries,** where an answer depends on the user, an account or a live
+  value.
+- **When a wrong answer is expensive:** at $0.50 per wrong answer, loosening the threshold from 0.97 to 0.92
+  turns +$145 into −$156 per 100k requests in the illustrative example.
+- **For queries with numbers, dates, names or negations,** unless they are excluded or entity-keyed, since a
+  one-detail paraphrase is a different question.
+
+### A user must be erased. How do you make sure the cache stops answering from their document?
+- **Event-driven purge:** generation writes a reverse index from document id to cache keys, and the same
+  ingestion hook that deletes from the vector index purges those keys.
+- **Close the in-flight race:** store each answer's document versions and treat a hit as a miss when any
+  version is no longer current, because a generation that read the old document can finish after the
+  purge.
+- **TTL alone is not enough,** because it bounds staleness but never eliminates it.
+
+### Popular keys cause periodic latency and cost spikes. What is happening and what do you change?
+- **A stampede on expiry:** many simultaneous misses on one hot key each call the model.
+- **Single-flight locking or request coalescing** turns a thousand misses into one call; use a token lock with
+  compare-and-delete so a slow call cannot release another caller's lock.
+- **Jitter TTLs** so popular keys do not expire together, or use stale-while-revalidate where staleness is
+  not incorrectness.
 
 ## Quiz
 ### Q: What is the simplest robust way to invalidate every cached response when the prompt template changes?

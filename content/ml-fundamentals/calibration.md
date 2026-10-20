@@ -5,7 +5,7 @@ name: Calibration
 kind: concept
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - ml-fundamentals/roc-auc
   - ml-fundamentals/class-imbalance
@@ -23,112 +23,111 @@ sources:
 ---
 
 ## TL;DR
-A model is calibrated when its stated confidence matches its hit rate: of everything it calls "90%",
-about 90% should be right. Ranking metrics like AUC do not need this; decisions do: cost-based
-thresholds, abstaining, escalating to a human or a bigger model, combining scores. Modern neural
-networks are usually overconfident, so you measure calibration on held-out data (reliability diagram,
-ECE, Brier score) and fix it after training, most often with temperature scaling.
+A calibrated model's confidence matches its hit rate: of everything it calls "90%", about 90% is right.
+Decisions such as thresholds, abstention and escalation need this; ranking does not. Measure it on held-out
+data and fix it post hoc, usually with temperature scaling.
 
 ## Why it exists
-A score and a probability are different contracts. A score only promises an ordering. A probability
-promises that expected-value arithmetic works on it: that predicting positive when p ≥ C_FP / (C_FP +
-C_FN) minimises expected cost, that "escalate when p < 0.8" escalates the cases that are wrong about
-one time in five, that averaging two models' probabilities or feeding one into a Bayesian update gives
-something meaningful. Every one of those uses breaks if "0.8" means "very sure" for one model and
-"coin flip" for another, or means different things for the same model on Monday and on Friday.
-
-Models do not deliver that contract by default, for reasons that are mostly understood. Cross-entropy
-is a proper scoring rule, so in principle it rewards calibrated probabilities; in practice Guo et al.
-showed that deep, wide networks with batch normalisation and little weight decay keep driving training
-NLL down after accuracy has saturated, which pushes confidence toward 1 on everything and leaves the
-test set overconfident. Margin-based learners such as SVMs and boosted trees emit scores with a
-characteristic sigmoid-shaped distortion (Niculescu-Mizil & Caruana). Any class reweighting or
-resampling done to fight imbalance shifts the model's implied base rate, so its probabilities are off
-by a known but usually ignored factor. Large language models add their own variants: token
-probabilities, verbalised confidence and sampling agreement are three different signals with
-different calibration.
-
-The naive alternative, "just tune the threshold on the raw score", works for a single fixed decision on
-a fixed distribution and nowhere else: not when the threshold must transfer across customers, not when
-the probability is consumed downstream, and not when the base rate drifts.
+- **A score and a probability are different contracts.** A score only promises an ordering. A probability
+  promises that expected-value arithmetic works: predicting positive when p ≥ C_FP / (C_FP + C_FN) minimises
+  expected cost, and "escalate when p < 0.8" escalates cases that are wrong about one time in five.
+- **Downstream uses break without it.** Averaging two models' probabilities or feeding one into a Bayesian
+  update is meaningless if "0.8" means "very sure" for one model and "coin flip" for another, or means
+  different things for the same model on Monday and on Friday.
+- **Models do not deliver the contract by default.** Cross-entropy is a proper scoring rule, but Guo et al.
+  showed deep, wide networks with batch normalisation and little weight decay keep driving training NLL
+  down after accuracy saturates, pushing confidence toward 1 and leaving the test set overconfident.
+- **Other sources of distortion.** Margin-based learners (SVMs, boosted trees) emit scores with a
+  characteristic sigmoid-shaped distortion (Niculescu-Mizil & Caruana). Class reweighting or resampling
+  shifts the implied base rate by a known but usually ignored factor. LLMs have three signals (token
+  probabilities, verbalised confidence, sampling agreement) with different calibration.
+- **"Just tune the threshold on the raw score" is the naive fix.** It works for one fixed decision on a fixed
+  distribution and nowhere else: not across customers, not when the probability is consumed downstream,
+  not when the base rate drifts.
 
 ## How it works
 ### Definition, and why it is separate from accuracy
-A binary model is perfectly calibrated when P(Y = 1 | p̂ = p) = p for every p; for multi-class the usual
-version is top-label calibration, P(ŷ = y | confidence = c) = c. Calibration is orthogonal to
-discrimination. A model that outputs the base rate for every input is perfectly calibrated and
-useless; a model that ranks perfectly but emits every score in [0.49, 0.51] is useless as a
-probability. AUC measures the second property, calibration metrics the first, and proper scoring
-rules such as the Brier score and log loss blend both.
+- **Binary:** perfectly calibrated when P(Y = 1 | p̂ = p) = p for every p.
+- **Multi-class:** usually top-label calibration, P(ŷ = y | confidence = c) = c.
+- **Orthogonal to discrimination:**
+
+| Model | Calibrated? | Discriminates? |
+|---|---|---|
+| Outputs the base rate for every input | perfectly | useless |
+| Ranks perfectly, every score in [0.49, 0.51] | useless as a probability | perfectly |
+
+- **Which metric measures what:** AUC measures discrimination, calibration metrics measure calibration, and
+  proper scoring rules such as the Brier score and log loss blend both.
 
 ### Measuring it
-A **reliability diagram** bins predictions by confidence (equal-width or equal-mass bins), then plots
-the observed accuracy in each bin against the mean confidence in it. Perfect calibration is the
-diagonal; points below it are overconfidence. **Expected calibration error** turns the diagram into a
-number:
+- **Reliability diagram:** bin predictions by confidence (equal-width or equal-mass bins), plot observed
+  accuracy per bin against mean confidence. Perfect calibration is the diagonal; points below it are
+  overconfidence.
+- **Expected calibration error** turns the diagram into a number:
 
 ```
 ECE = sum over bins m of  (|B_m| / n) * | acc(B_m) - conf(B_m) |
 ```
 
-and **maximum calibration error** takes the worst bin instead. ECE depends on the binning and is biased
-upward on small samples, so never compare ECEs computed with different bin counts. The **Brier
-score**, mean (p̂ − y)², is a proper scoring rule and decomposes into a calibration term, a resolution
-term and the irreducible uncertainty, so it rewards both calibration and sharpness without saying
-which one moved. **Log loss** is also proper but penalises a confident mistake without bound, which is
-why it is the training loss and Brier the reporting metric.
+| Metric | What it is | Caveat |
+|---|---|---|
+| ECE | weighted gap per bin | depends on binning, biased upward on small samples; never compare ECEs with different bin counts |
+| Maximum calibration error | the worst bin instead | noisy on small bins |
+| Brier score, mean (p̂ − y)² | proper; decomposes into calibration, resolution and irreducible uncertainty | rewards calibration and sharpness without saying which moved |
+| Log loss | proper | penalises a confident mistake without bound, which is why it is the training loss and Brier the reporting metric |
 
 ### Fixing it after training
-Every post-hoc method learns a monotone map g from raw score to probability on a **calibration split
-that was not used for training**, because fitting g on training data re-learns the overconfidence. You
-then report on a third split; fitting and reporting on the same split flatters every method, isotonic
-regression most.
-- **Platt scaling** fits g(z) = σ(a·z + b) to the logit z by minimising NLL: two parameters, good when
-  the distortion is sigmoid-shaped, originally built for SVM margins.
-- **Temperature scaling** is the multi-class version with one parameter: softmax(z / T). T > 1 flattens
-  the distribution (fixes overconfidence), T < 1 sharpens it. Because every logit is divided by the same
-  positive constant, the argmax is unchanged, so accuracy and ROC-AUC are untouched by construction.
-  Guo et al. found this single scalar as effective as far more flexible methods on the networks they
-  tested. It cannot fix miscalibration that differs by class or is non-monotone in the score.
-- **Isotonic regression** fits a non-parametric monotone step function. It can repair any monotone
-  distortion but needs thousands of calibration points, overfits on fewer, and its flat steps create
-  ties that can shave a little AUC. scikit-learn exposes both as `CalibratedClassifierCV` with
-  `method="sigmoid"` or `method="isotonic"`.
-- **Training-time influences** change the starting point rather than fixing it: label smoothing, mixup,
-  stronger weight decay, early stopping on NLL rather than on accuracy, and ensembles, whose averaged
+Every post-hoc method learns a monotone map g from raw score to probability on a **calibration split not
+used for training**, because fitting g on training data re-learns the overconfidence. Report on a third
+split; fitting and reporting on the same split flatters every method, isotonic regression most.
+
+| Method | Form | Strength | Limit |
+|---|---|---|---|
+| Platt scaling | g(z) = σ(a·z + b) on the logit z, fit by NLL | two parameters; good for sigmoid-shaped distortion; built for SVM margins | only that shape |
+| Temperature scaling | softmax(z / T), one parameter | multi-class; argmax unchanged | cannot fix class-dependent or non-monotone miscalibration |
+| Isotonic regression | non-parametric monotone step function | repairs any monotone distortion | needs thousands of points, overfits on fewer, ties can shave a little AUC |
+
+- **Temperature direction:** T > 1 flattens the distribution (fixes overconfidence), T < 1 sharpens it.
+- **Why accuracy is safe:** every logit is divided by the same positive constant, so the argmax is unchanged
+  and accuracy and ROC-AUC are untouched by construction.
+- **Evidence:** Guo et al. found this single scalar as effective as far more flexible methods on the networks
+  they tested.
+- **In scikit-learn:** `CalibratedClassifierCV` with `method="sigmoid"` or `method="isotonic"`.
+- **Training-time influences change the starting point** rather than fixing it: label smoothing, mixup,
+  stronger weight decay, early stopping on NLL rather than accuracy, and ensembles, whose averaged
   probabilities are less extreme than any member's.
 
 ### Prior shift and resampling
-If the model learned on data with positive rate π_s (because you rebalanced it) and will serve at rate
-π_t, its probabilities are off by the ratio of the odds. The correction, assuming the class-conditional
-distributions did not change, is
+If the model learned at positive rate π_s (because you rebalanced) and serves at π_t, its probabilities are
+off by the ratio of the odds. Assuming the class-conditional distributions did not change:
 
 ```
 w   = (pi_t * (1 - pi_s)) / (pi_s * (1 - pi_t))
 p_t = p_s * w / (p_s * w + (1 - p_s))
 ```
 
-A model trained on a 50/50 rebalanced set that says 0.6 for an item means about 0.07 at a true
-prevalence of 5%. The alternative is simpler: calibrate on a validation set drawn at the deployment
-prevalence and skip the algebra.
+- **Example:** trained on a 50/50 rebalanced set, a model that says 0.6 means about 0.07 at a true prevalence of 5%.
+- **Simpler alternative:** calibrate on a validation set drawn at the deployment prevalence and skip the algebra.
 
 ### Calibration does not survive drift
-Calibration is measured against one data distribution. Under distribution shift, models typically
-become more overconfident on inputs unlike their training data, so a calibrated model in the eval
-harness is not a calibrated model six months later. Treat ECE on fresh labelled samples as a
-production monitor, not a one-time certificate.
+- **It is measured against one distribution.** Under shift, models typically become more overconfident on
+  inputs unlike their training data.
+- **So** a calibrated model in the eval harness is not a calibrated model six months later. Treat ECE on fresh
+  labelled samples as a production monitor, not a one-time certificate.
 
 ### Abstention needs ranking *and* calibration
-An "answer or escalate" rule asks two separate questions of the confidence. Does sorting by confidence
-put the wrong answers at the bottom? That is discrimination, measured by the AUROC of confidence
-against correctness, or by the risk–coverage curve: error rate among the kept answers as you keep the
-top 100%, 90%, 80%… Then, where do I cut? That is where calibration matters, because with calibrated
-confidence a threshold c means the marginal kept answer is wrong with probability 1 − c, the expected
-error among kept answers is the mean of 1 − confidence over them, and the escalation rate can be
-predicted before launch. Temperature scaling fixes only the second: it cannot reorder answers, so a confidence
-signal whose risk–coverage curve is flat stays useless however well it is calibrated. Measure both
-before building a cascade; if the curve is flat, the fix is a better signal (sampling agreement, a
-trained verifier), not a better calibrator.
+An "answer or escalate" rule asks two separate questions:
+1. **Does sorting by confidence put wrong answers at the bottom?** That is discrimination: the AUROC of
+   confidence against correctness, or the risk–coverage curve (error rate among kept answers as you keep the
+   top 100%, 90%, 80%…).
+2. **Where do I cut?** That needs calibration. With calibrated confidence, a threshold c means the marginal
+   kept answer is wrong with probability 1 − c, the expected error among kept answers is the mean of
+   1 − confidence over them, and the escalation rate can be predicted before launch.
+
+- **Temperature scaling fixes only the second.** It cannot reorder answers, so a signal whose risk–coverage
+  curve is flat stays useless however well calibrated.
+- **Measure both before building a cascade.** If the curve is flat, the fix is a better signal (sampling
+  agreement, a trained verifier), not a better calibrator.
 
 ### Three confidences in an LLM
 1. **Token probabilities.** For multiple-choice or classification formats, the probability mass on the
@@ -142,18 +141,43 @@ trained verifier), not a better calibrator.
    agreement rate. This behaves like an ensemble and is often the best cheap confidence signal for a
    black-box model, at n times the cost.
 
-For LLM-as-judge, the same applies to the judge's score against human labels; for routers and
-cascades, a calibrated "probability the small model is right" is what makes a cost-versus-quality
-threshold mean anything.
+- **LLM-as-judge:** the same applies to the judge's score against human labels.
+- **Routers and cascades:** a calibrated "probability the small model is right" is what makes a
+  cost-versus-quality threshold mean anything.
 
-## Example
-Suppose a five-class classifier's predictions on 1,000 held-out items fall into five confidence bins
-of 200 each, with mean confidences 0.55, 0.65, 0.75, 0.85, 0.96 and observed accuracies 0.52, 0.58,
-0.64, 0.70, 0.80. Every bin sits below the diagonal; ECE = 0.2 × (0.03 + 0.07 + 0.11 + 0.15 + 0.16) =
-0.104, and mean confidence is 0.75 against an overall accuracy of 0.65: a classic overconfident
-network. The code fits a temperature on synthetic logits built to be exactly twice as sharp as they
-should be, so the fitted T should land near 2, ECE should drop by roughly an order of magnitude, and
-accuracy should not move.
+## Diagram
+Three disjoint splits, then a production loop: the calibrator is fitted once but checked forever.
+
+```mermaid
+flowchart TD
+    TR[("Training split")] --> M["Train model"]
+    M --> CAL["Fit T or isotonic on calibration split"]
+    CAL --> REP["Report ECE and Brier on test split"]
+    REP --> TH["Pick threshold from costs"]
+    TH --> P["Serve calibrated probabilities"]
+    P --> MON["Label fresh samples, per-class ECE"]
+    MON -->|"ECE drifts up"| CAL
+    MON -->|"stable"| P
+```
+
+## Examples
+### Worked scenario: reading an overconfident reliability table
+A five-class classifier's predictions on 1,000 held-out items fall into five confidence bins of 200 each.
+
+| Bin | Mean confidence | Observed accuracy | Gap |
+|---|---|---|---|
+| 1 | 0.55 | 0.52 | 0.03 |
+| 2 | 0.65 | 0.58 | 0.07 |
+| 3 | 0.75 | 0.64 | 0.11 |
+| 4 | 0.85 | 0.70 | 0.15 |
+| 5 | 0.96 | 0.80 | 0.16 |
+
+- **Every bin sits below the diagonal.** ECE = 0.2 × (0.03 + 0.07 + 0.11 + 0.15 + 0.16) = 0.104.
+- **Mean confidence is 0.75 against an overall accuracy of 0.65:** a classic overconfident network.
+
+### Temperature scaling on synthetic overconfident logits
+The code fits a temperature on synthetic logits built to be exactly twice as sharp as they should be, so the
+fitted T should land near 2, ECE should drop by roughly an order of magnitude, and accuracy should not move.
 
 ```python
 import torch, torch.nn.functional as F
@@ -197,48 +221,82 @@ print(f"T={T:.2f}  ECE {ece(F.softmax(logits_test, 1), y_test):.3f} -> "
 # On this data T comes out close to 2 (about 1.94) and ECE falls from roughly 0.16 to below 0.02; accuracy is identical
 ```
 
+### Production snippet: calibrate a scikit-learn model and check it
+Calibration is fitted by internal cross-validation on the training data; the test split only reports.
+
+```python
+from sklearn.calibration import CalibratedClassifierCV, calibration_curve
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.metrics import brier_score_loss
+
+def calibrate_and_report(X_train, y_train, X_test, y_test):
+    base = HistGradientBoostingClassifier()
+    cal = CalibratedClassifierCV(base, method="isotonic", cv=5).fit(X_train, y_train)
+    p = cal.predict_proba(X_test)[:, 1]
+    frac_pos, mean_pred = calibration_curve(y_test, p, n_bins=10, strategy="quantile")
+    worst_gap = max(abs(a - b) for a, b in zip(frac_pos, mean_pred))
+    return cal, brier_score_loss(y_test, p), worst_gap   # store and alert on both
+```
+
+Use `method="sigmoid"` instead when the calibration data is small, because isotonic overfits on few points.
+
+## Production patterns
+- **Ship the calibrator with the model.** Fit T (or the isotonic map) in the training pipeline on the
+  validation split, save it in the same artefact, and apply it inside the serving code so no consumer sees
+  raw logits. Monitor that the deployed T matches the artefact's recorded value.
+- **ECE as a scheduled monitor.** Label a fresh production sample weekly, compute ECE with equal-mass bins
+  and a fixed bin count, per class, plus Brier. Alert when ECE rises past a reviewed bound or mean predicted
+  probability departs from the observed rate.
+- **Calibrate at deployment prevalence.** After any reweighting or resampling, recalibrate on data drawn at
+  production prevalence, or apply the prior-shift correction with recorded π_s and π_t. Monitor base-rate
+  drift, which silently invalidates the correction.
+- **Predict the escalation rate before launch.** For a cascade, pick the threshold on calibrated confidence
+  from the cost of escalation versus a wrong answer, and forecast escalation rate and kept-answer error from
+  validation. After launch, alert when either departs from the forecast.
+- **Sampling agreement for black-box LLMs.** When no log-probabilities are available, sample n answers at
+  non-zero temperature, use the agreement rate, and fit an isotonic map from agreement to correctness on
+  labelled data. Monitor cost per request, which grows n times.
+
 ## Trade-offs
-- Temperature scaling has one parameter, preserves accuracy and ranking and needs little data, but it
-  can only correct a global over- or under-confidence; switch to isotonic or per-class scaling when the
+- **One-parameter temperature scaling vs flexibility.** It preserves accuracy and ranking and needs little
+  data, but only corrects global over- or under-confidence; switch to isotonic or per-class scaling when the
   reliability curve is S-shaped or class-dependent and you have thousands of calibration points.
-- Post-hoc calibration is cheap and model-agnostic but is fitted to one distribution; under drift it
-  degrades, so it buys you a production monitor to maintain rather than a one-time fix.
-- Proper scoring rules reward calibration and sharpness in one number but cannot tell you which one
-  moved; ECE isolates calibration but depends on binning and is biased on small samples. Report both
+- **Cheap post-hoc calibration vs drift.** It is model-agnostic but fitted to one distribution and degrades
+  under drift, so it buys you a production monitor to maintain rather than a one-time fix.
+- **Proper scoring rules vs ECE.** Proper rules reward calibration and sharpness in one number but cannot say
+  which moved; ECE isolates calibration but depends on binning and is biased on small samples. Report both
   when someone downstream will act on the probability.
-- Spending a labelled split on calibration costs training data; worth it whenever a threshold, cascade,
-  human escalation or user-facing confidence consumes the probability, pointless when only the ranking
-  is consumed.
-- Sampling-based confidence for LLMs is the most reliable black-box signal but costs n calls per
-  answer; flip to token log-probabilities when the API exposes them and the output format is
-  constrained enough for them to mean something.
+- **A labelled calibration split vs training data.** Worth it whenever a threshold, cascade, human escalation
+  or user-facing confidence consumes the probability; pointless when only the ranking is consumed.
+- **Sampling confidence vs cost for LLMs.** It is the most reliable black-box signal but costs n calls per
+  answer; flip to token log-probabilities when the API exposes them and the output format is constrained
+  enough for them to mean something.
 
 ## Pitfalls
-- Fitting the calibrator on training data; the symptom is an ECE that looks fine offline while
-  production overconfidence persists untouched.
-- Fitting and reporting on the same split; the symptom is an optimistic ECE, worst with isotonic
-  regression, that does not reproduce on new data.
-- Class-weighting or resampling for imbalance and shipping the raw probabilities; the symptom is a mean
-  predicted probability far above the observed base rate and a flooded queue at any sensible threshold.
-- Assuming a better AUC means better probabilities, or vice versa; the symptom is a calibration fix
-  judged useless because AUC did not move, or a new model trusted because AUC rose.
-- Trusting verbalised LLM confidence as a probability; the symptom is a reliability diagram that is
-  flat at 85–95% confidence across correct and incorrect answers alike.
-- Ten equal-width bins on 200 examples; the symptom is ECE moving by 0.05 when you change the bin
-  count.
-- Reporting only the average ECE; the symptom is a minority class that is badly overconfident hiding
-  behind a calibrated majority.
+- **Fitting the calibrator on training data.** Symptom: ECE looks fine offline while production
+  overconfidence persists untouched.
+- **Fitting and reporting on the same split.** Symptom: an optimistic ECE, worst with isotonic regression,
+  that does not reproduce on new data.
+- **Shipping raw probabilities after class-weighting or resampling.** Symptom: mean predicted probability far
+  above the observed base rate and a flooded queue at any sensible threshold.
+- **Assuming better AUC means better probabilities, or vice versa.** Symptom: a calibration fix judged
+  useless because AUC did not move, or a new model trusted because AUC rose.
+- **Trusting verbalised LLM confidence as a probability.** Symptom: a reliability diagram flat at 85–95%
+  confidence across correct and incorrect answers alike.
+- **Ten equal-width bins on 200 examples.** Symptom: ECE moving by 0.05 when you change the bin count.
+- **Reporting only the average ECE.** Symptom: a badly overconfident minority class hiding behind a
+  calibrated majority.
 
 ## When to use
-Calibrate whenever something consumes the probability rather than the ranking: a cost-based
-threshold, an abstain-or-escalate rule, a cascade to a larger model, a human-review queue sized by
-confidence, a user-facing "likely" or "unlikely", or any averaging of scores across models. Skip it
-when only the order matters, as in top-k retrieval or a leaderboard. Measure with a reliability
-diagram plus ECE and Brier on a split the calibrator never saw, per class when classes are
-imbalanced, and again on fresh production labels on a schedule. Default fix: temperature scaling;
-escalate to isotonic with enough data. In interviews, expect to define calibration, distinguish it
-from discrimination, explain why temperature scaling preserves accuracy, and say how you would get a
-usable confidence out of a black-box LLM.
+- **Calibrate whenever something consumes the probability rather than the ranking:** a cost-based threshold,
+  an abstain-or-escalate rule, a cascade to a larger model, a human-review queue sized by confidence, a
+  user-facing "likely" or "unlikely", or any averaging of scores across models.
+- **Skip it when only the order matters,** as in top-k retrieval or a leaderboard.
+- **Measure:** a reliability diagram plus ECE and Brier on a split the calibrator never saw, per class when
+  classes are imbalanced, and again on fresh production labels on a schedule.
+- **Default fix:** temperature scaling; escalate to isotonic with enough data.
+- **Interviews:** define calibration, distinguish it from discrimination, explain why temperature scaling
+  preserves accuracy, and say how you would get a usable confidence out of a black-box LLM.
 
 ## Role lens
 - **Engineer:** Fits the temperature on the validation split inside the training pipeline, stores T with
@@ -259,6 +317,37 @@ Platt scaling) on it, and re-pick the threshold against the real costs: the pric
 versus the price of a wrong answer. The escalation rate will rise, which is the honest number. If the
 confidence is a verbalised one from a black-box model, replace it with sampling agreement or a trained
 verifier. Then monitor ECE on fresh labels, because drift will undo the fix.
+
+## Interview questions
+### What does it mean for a model to be calibrated, and how is that different from being accurate?
+- **Definition:** confidence matches hit rate; of everything called 0.9, about 90% is right.
+- **Different property:** a base-rate predictor is perfectly calibrated and useless, while a perfect ranker
+  with scores squeezed into [0.49, 0.51] is useless as a probability. AUC measures ranking, ECE calibration.
+
+### Why are modern neural networks often overconfident, and what is the cheapest fix?
+- **Cause (Guo et al.):** deep, wide networks with batch normalisation and little weight decay keep lowering
+  training NLL after accuracy saturates, which pushes confidence toward 1.
+- **Cheapest fix:** temperature scaling on a held-out split, one parameter, with accuracy and ranking
+  unchanged because the argmax and score order are preserved.
+
+### When would you pick isotonic regression over temperature scaling, and when not?
+- **Pick isotonic** when the reliability curve is S-shaped or otherwise non-linear and you have thousands of
+  calibration points.
+- **Avoid it** with small calibration sets, where it overfits, and when tied scores shaving a little AUC
+  would hurt a ranking consumer.
+- **Per-class scaling** is the middle ground when miscalibration differs by class.
+
+### An LLM says it is 95% confident on every answer. How do you get a usable confidence?
+- **Do not use the verbalised number as p:** it clusters in a narrow high band regardless of correctness.
+- **Use a better signal:** token probabilities on a constrained answer format if the API exposes them, or
+  agreement across n samples at non-zero temperature.
+- **Then calibrate and check ranking:** fit a map on labelled data and confirm the risk–coverage curve is not
+  flat, because calibration cannot reorder answers.
+
+### Your rebalanced fraud model outputs 0.6 and the real fraud rate is 5%. What do you tell the downstream team?
+- **The 0.6 assumed 50/50 classes.** Prior correction gives odds 1.5 × (0.05/0.95) ≈ 0.079, so p ≈ 0.07.
+- **Operationally:** apply the correction or recalibrate on data at deployment prevalence before they set any
+  threshold, and monitor base-rate drift, which breaks the correction.
 
 ## Quiz
 ### Q: Why does temperature scaling leave accuracy and ROC-AUC unchanged?

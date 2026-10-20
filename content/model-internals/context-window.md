@@ -5,7 +5,7 @@ name: Context window
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: reviewed
+status: crisp
 related:
   - model-internals/kv-cache
   - model-internals/positional-encoding
@@ -22,88 +22,110 @@ sources:
 ---
 
 ## TL;DR
-The context window is the maximum number of tokens a model can attend over in one request: system
-prompt, conversation history, retrieved documents, tool results and the answer all share it. It is
-finite because attention cost grows with length, the KV cache grows with length, and positional
-encodings are only trained up to some length. The model has no memory beyond it, so everything the
-model "knows" about this conversation has to fit, and managing that budget is a core engineering job.
+The context window is the maximum tokens a model attends over in one request, shared by system prompt,
+history, documents, tool results and the answer. It is finite because of attention cost, KV-cache memory
+and trained positions, so budgeting it is core engineering work.
 
 ## Why it exists
-A transformer processes a fixed set of positions at once, and three costs scale with how many. Attention
-compares every token with every earlier token, so prefill compute has a term quadratic in length.
-The KV cache stores keys and values for every position in every layer, so memory grows linearly with
-length and the cache of a single long request can exceed the model's own weights. Positional encodings
-are learned or tuned for the lengths seen in training; feed a model positions it has never seen and
-quality degrades sharply unless the encoding is deliberately extended. Vendors therefore publish a hard
-limit, and serving engines enforce one (`max_model_len` in vLLM) because the memory for the worst case
-must be reserved in advance.
-
-The naive mental model, "the chatbot remembers our conversation", is wrong in a way that matters. The
-model is stateless between calls. The client re-sends the entire transcript each turn, and the model
-re-reads it. Memory is an illusion maintained by the application, paid for in tokens on every request,
-and it ends abruptly at the window boundary: either the request is rejected or something has to be
-dropped. Deciding what to drop, summarize or retrieve is the problem the context window forces on you.
+- **Attention compute grows with length.** Every token is compared with every earlier token, so prefill
+  compute has a term quadratic in length.
+- **KV-cache memory grows with length.** Keys and values are stored for every position in every layer, so
+  memory grows linearly and a single long request's cache can exceed the model's own weights.
+- **Positions are trained up to a length.** Positional encodings are learned or tuned for training
+  lengths; unseen positions degrade quality sharply unless the encoding is deliberately extended. So
+  vendors publish a hard limit and engines enforce one (`max_model_len` in vLLM), because worst-case memory
+  must be reserved in advance.
+- **The model is stateless between calls.** "The chatbot remembers our conversation" is wrong in a way
+  that matters: the client re-sends the entire transcript each turn and the model re-reads it. Memory is an
+  illusion the application maintains, paid in tokens on every request.
+- **And it ends abruptly.** At the window boundary the request is rejected or something is dropped.
+  Deciding what to drop, summarize or retrieve is the problem the context window forces on you.
 
 ## How it works
 ### Accounting
-Every request must satisfy `input_tokens + max_output_tokens ≤ window`. Input is everything in the
-prompt after chat templating: system prompt, each prior user and assistant turn, tool definitions, tool
-outputs, retrieved chunks, and the template's own role markers. Many APIs cap output separately at a
-figure well below the window, so the practical limit on a long answer is the output cap, not the window.
-Tokens are counted by the model's own tokenizer, and the same text can differ in token count by tens of
-percent across tokenizers (more for non-English text and code), so budgets must be computed with the
-right one. Less visible consumers count too: images and audio are converted to tokens, and on reasoning
-models the hidden thinking tokens are generated into the same window and usually billed and capped as
-output, so a request that "only" asks for a short answer can still run out of room. APIs differ in what
-happens at the edge: most reject an over-long request outright, some truncate silently.
+Every request must satisfy `input_tokens + max_output_tokens ≤ window`.
+
+- **Input is everything after chat templating:** system prompt, each prior user and assistant turn, tool
+  definitions, tool outputs, retrieved chunks, and the template's own role markers.
+- **Output is often capped separately.** Many APIs cap output at a figure well below the window, so the
+  practical limit on a long answer is the output cap, not the window.
+- **Count with the model's own tokenizer.** The same text can differ in token count by tens of percent
+  across tokenizers (more for non-English text and code), so budgets need the right one.
+- **Hidden consumers count too.** Images and audio are converted to tokens. On reasoning models the hidden
+  thinking tokens are generated into the same window and usually billed and capped as output, so a request
+  for a short answer can still run out of room.
+- **Edge behaviour differs.** Most APIs reject an over-long request outright; some truncate silently.
 
 ### What a full window costs
-Put numbers on the first two constraints with a GQA model such as Llama-3-8B (32 layers, 8 KV heads,
-head dimension 128, fp16). The KV cache costs 2 × 32 × 8 × 128 × 2 bytes = 128 KiB per token, so a
-single 128k-token request holds about 16 GiB of cache, roughly the size of the model's own fp16 weights.
-A model without GQA (32 KV heads) would need four times that. Compute grows faster: per layer, the
-projections and MLP cost on the order of 24·d² FLOPs per token regardless of length, while attention
-scores and the weighted sum cost about 4·n·d for a token that attends over *n* positions. The attention
-term overtakes the rest once *n* exceeds roughly 6·d, around 25k tokens at d = 4,096 (a rule of thumb
-for orders of magnitude, not a measurement). Below that, long prompts cost roughly linearly; above it,
-every doubling of the prompt costs more than double.
+Take a GQA model such as Llama-3-8B (32 layers, 8 KV heads, head dimension 128, fp16):
+
+```
+KV per token = 2 × 32 × 8 × 128 × 2 bytes = 128 KiB
+128k-token request ≈ 16 GiB of cache   (roughly the model's own fp16 weights)
+```
+
+- **Without GQA** (32 KV heads) the same request needs four times that.
+- **Compute grows faster than memory.** Per layer, projections and MLP cost on the order of 24·d² FLOPs
+  per token regardless of length, while attention scores and the weighted sum cost about 4·n·d for a
+  token attending over *n* positions.
+- **The crossover.** The attention term overtakes the rest once *n* exceeds roughly 6·d, around 25k tokens
+  at d = 4,096 (a rule of thumb for orders of magnitude, not a measurement).
+- **So** below that, long prompts cost roughly linearly; above it, every doubling costs more than double.
 
 ### Why the limit sits where it does
-Three constraints set the number. **Training length**: models are pre-trained at some length and often
-extended afterwards by continued training at longer lengths with the rotary base frequency adjusted
-(RoPE scaling methods such as YaRN); the advertised window is where that extension was validated.
-**Memory**: the serving engine must be able to hold the KV cache for the longest allowed request, so the
-operator may configure a smaller window than the model supports to fit more concurrent users. **Compute
-and latency**: prefill time grows faster than linearly in prompt length, so time-to-first-token on a
-window-filling prompt can be seconds, and every turn re-pays it unless the prefix is cached.
+| Constraint | What sets it |
+|---|---|
+| **Training length** | Models are pre-trained at some length, often extended by continued training at longer lengths with the rotary base frequency adjusted (RoPE scaling methods such as YaRN). The advertised window is where that extension was validated. |
+| **Memory** | The engine must hold the KV cache for the longest allowed request, so operators may configure a smaller window than the model supports to fit more concurrent users. |
+| **Compute and latency** | Prefill time grows faster than linearly in prompt length, so time-to-first-token on a window-filling prompt can be seconds, re-paid every turn unless the prefix is cached. |
 
-Published windows have grown from about 2k tokens (GPT-3 era) through 4k, 8k and 32k to 128k, 200k and,
-for some models, a million or more. Treat the exact figures as moving targets; the mechanisms are not.
+- **Published windows keep growing:** from about 2k tokens (GPT-3 era) through 4k, 8k and 32k to 128k,
+  200k and, for some models, a million or more.
+- **Treat the exact figures as moving targets;** the mechanisms are not.
 
 ### Nominal versus effective window
-A model accepting 128k tokens does not use all of them equally. Liu et al. (2023) showed accuracy on a
-retrieval-style task is highest when the relevant passage sits at the start or end of the context and
-drops when it sits in the middle. Needle-in-a-haystack tests probe the same thing. The effective window,
-the length over which the model reliably uses information, is task-dependent and usually shorter than the
-nominal one, and it must be measured for your task rather than read off a spec sheet.
+- **Not all positions are equal.** A model accepting 128k tokens does not use them equally. Liu et al.
+  (2023) showed retrieval-style accuracy is highest when the relevant passage sits at the start or end of
+  the context, and drops in the middle. Needle-in-a-haystack tests probe the same thing.
+- **The effective window** is the length over which the model reliably uses information. It is
+  task-dependent, usually shorter than the nominal one, and must be measured for your task rather than
+  read off a spec sheet.
 
 ### Living within it
-- **Sliding window**: drop the oldest turns. Simple, loses early instructions and facts.
-- **Summarization / compaction**: replace old turns with a model-written summary. Keeps the gist, loses
+- **Sliding window:** drop the oldest turns. Simple, loses early instructions and facts.
+- **Summarization / compaction:** replace old turns with a model-written summary. Keeps the gist, loses
   detail and costs a call.
-- **Retrieval**: keep history or documents outside the prompt and pull in only what the current turn
+- **Retrieval:** keep history or documents outside the prompt and pull in only what the current turn
   needs. The default for large corpora; the `long-context-vs-rag` topic covers the trade.
-- **Prompt caching**: does not enlarge the window, but makes a long shared prefix cheap to re-send by
+- **Prompt caching:** does not enlarge the window, but makes a long shared prefix cheap to re-send by
   reusing its KV cache across requests, which changes the economics of a big system prompt.
 - **Sliding-window attention** in the model itself (Mistral 7B v0.1 attends over a 4,096-token window per
-  layer) bounds per-layer cost while deeper layers still propagate information further back; it is an
+  layer) bounds per-layer cost while deeper layers still propagate information further back. It is an
   architectural choice, not something you configure per request.
 
-## Example
-A token budgeter for a support assistant on an 8,192-token window. The fixed parts (system prompt,
-retrieved chunks, the new question) are paid first, the output reservation is held back, and history is
-admitted newest-first until the budget runs out. Count with the deployed model's tokenizer; `tiktoken`
-is used here only as a stand-in.
+## Diagram
+Each turn the application rebuilds the whole prompt; fixed parts and the output reservation are paid
+first, and history gets whatever is left.
+
+```mermaid
+flowchart TD
+    A["New user turn"] --> B["Count fixed parts with model tokenizer"]
+    B --> C["Reserve max output tokens"]
+    C --> D{"Budget left for history?"}
+    D -->|"no"| E["Trim chunks or reject"]
+    D -->|"yes"| F["Admit history newest first"]
+    F --> G{"Old turns still matter?"}
+    G -->|"yes"| H["Summarize or retrieve them"]
+    G -->|"no"| I["Drop oldest turns"]
+    H --> J["Send full prompt, model re-reads all"]
+    I --> J
+```
+
+## Examples
+### Token budgeter for a support assistant
+An 8,192-token window. The fixed parts (system prompt, retrieved chunks, the new question) are paid first,
+the output reservation is held back, and history is admitted newest-first until the budget runs out.
+Count with the deployed model's tokenizer; `tiktoken` is used here only as a stand-in.
 
 ```python
 import tiktoken
@@ -136,42 +158,88 @@ print(f"kept {len(kept)} of {len(history)} turns, {left} tokens spare")
 # usual upgrade, and it is what you would do before ever cutting the system prompt or chunks.
 ```
 
+### What filling the window costs on Llama-3-8B
+Pure Python using the two formulas above: KV memory per request, and the share of per-layer FLOPs spent
+on attention for the last token (rule of thumb, d = 4,096).
+
+```python
+def kv_gib(tokens, layers=32, kv_heads=8, head_dim=128, bytes_per_el=2):
+    return 2 * layers * kv_heads * head_dim * bytes_per_el * tokens / 2**30
+
+def attention_share(n, d=4_096):
+    return 4 * n * d / (24 * d * d + 4 * n * d)
+
+for n in (8_192, 32_768, 131_072):
+    print(f"{n:>7} tokens: KV {kv_gib(n):5.1f} GiB, attention share {attention_share(n):.0%}")
+#    8192 tokens: KV   1.0 GiB, attention share 25%
+#   32768 tokens: KV   4.0 GiB, attention share 57%
+#  131072 tokens: KV  16.0 GiB, attention share 84%
+```
+
+| Request length | KV cache | Attention share of compute | Practical consequence |
+|---|---|---|---|
+| 8k | ~1 GiB | ~25% | dozens of such requests fit beside the weights on an 80 GB GPU |
+| 32k | ~4 GiB | ~57% | attention now dominates; TTFT grows faster than length |
+| 128k | ~16 GiB | ~84% | one request holds as much memory as the weights |
+
+## Production patterns
+- **Budget before you call.** Count every request with the deployed model's tokenizer, including template
+  and tool-definition overhead, and trim or reject before the API call. Monitor "context length exceeded"
+  errors and truncation events per route as first-class metrics.
+- **Compact long agent runs.** Keep the last few turns verbatim, summarize older turns and large tool
+  outputs, and store raw outputs outside the prompt for retrieval. Monitor input tokens per turn; it
+  should plateau, not grow linearly.
+- **Size the engine window per deployment.** Set `max_model_len` in vLLM to the length the traffic
+  actually uses and route long-document work to a separate deployment, so a few long requests cannot
+  starve short chats. Monitor KV utilization and preemptions.
+- **Size `max_tokens` from real answers.** Set it near the high percentiles of observed output length, not
+  the cap, and alert on the rate of truncated finishes (`finish_reason` of `"length"` on OpenAI-style
+  APIs, `stop_reason` of `"max_tokens"` on Anthropic's).
+- **Cache the stable prefix.** Put the system prompt and tool definitions first and byte-identical, then
+  enable prompt caching. Monitor cached input tokens (for example `cache_read_input_tokens` in Anthropic
+  usage) and time to first token.
+- **Measure the effective window on your data.** Plant known facts at the start, middle and end of
+  realistic prompts at several lengths and score answers. Re-run when the model or prompt layout changes.
+
 ## Trade-offs
-- A larger window lets you skip retrieval and paste everything in, but prefill latency and per-request
-  cost grow with every token on every turn; retrieval wins once the corpus no longer fits, changes too
-  often to keep cached, or costs more to re-read per request than an occasional retrieval miss costs you.
-- Keeping full history maximizes fidelity, while summarizing it cuts tokens and latency at the price of
-  lost detail; the flip happens when old turns stop being referenced.
-- Reserving a large output budget protects long answers but shrinks the space for input; size it to the
-  real distribution of answer lengths rather than the maximum.
-- Operators can shrink the engine's window to fit more concurrent users in GPU memory, trading
-  per-request capability for throughput; raise it only when traffic actually uses it.
+- **Bigger window vs retrieval.** A larger window lets you skip retrieval and paste everything in, but
+  prefill latency and per-request cost grow with every token on every turn. Retrieval wins once the corpus
+  no longer fits, changes too often to keep cached, or costs more to re-read than a retrieval miss costs.
+- **Full history vs summary.** Keeping full history maximizes fidelity; summarizing cuts tokens and latency
+  at the price of lost detail. The flip happens when old turns stop being referenced.
+- **Output reservation vs input room.** A large output budget protects long answers but shrinks the space
+  for input; size it to the real distribution of answer lengths rather than the maximum.
+- **Window vs concurrency.** Operators can shrink the engine's window to fit more concurrent users in GPU
+  memory, trading per-request capability for throughput; raise it only when traffic actually uses it.
 
 ## Pitfalls
-- Counting tokens with the wrong tokenizer or forgetting template and tool-definition overhead; the
-  symptom is intermittent "context length exceeded" errors on requests that looked within budget.
-- Assuming the model will find a fact anywhere in a 100k-token prompt; the symptom is answers that ignore
-  material placed in the middle while the same material at the end works.
-- Letting an agent loop append tool outputs forever; latency climbs turn by turn, cost per turn grows
+- **Wrong tokenizer or missing overhead.** Counting with the wrong tokenizer or forgetting template and
+  tool-definition overhead. Symptom: intermittent "context length exceeded" errors on requests that looked
+  within budget.
+- **Assuming the model finds a fact anywhere.** In a 100k-token prompt, the symptom is answers that ignore
+  material in the middle while the same material at the end works.
+- **Letting an agent loop append tool outputs forever.** Latency climbs turn by turn, cost per turn grows
   linearly, and the run eventually fails at the boundary.
-- Truncating from the front and cutting the system prompt or the schema of a tool; behaviour changes
-  abruptly mid-conversation with no error.
-- Setting `max_tokens` far above real answer lengths; engines whose schedulers budget KV memory against
+- **Truncating from the front.** Cutting the system prompt or a tool's schema changes behaviour abruptly
+  mid-conversation with no error.
+- **Setting `max_tokens` far above real answer lengths.** Engines whose schedulers budget KV memory against
   a request's worst-case length then admit fewer concurrent requests even though answers are short.
-- Forgetting that reasoning models spend hidden thinking tokens from the same budget; the symptom is
-  empty or cut-off answers with a "length" finish reason on hard prompts while easy ones work.
+- **Forgetting hidden thinking tokens.** Reasoning models spend them from the same budget. Symptom: empty
+  or cut-off answers with a "length" finish reason on hard prompts while easy ones work.
 
 ## When to use
-There is no opting out; every request has a window. The decisions are how much of it to spend on
-instructions, on examples, on retrieved material, on history, and on the answer. Measure the token
-distribution of real requests, the rate of truncation events, and task accuracy as a function of where
-key information sits in the prompt. Watch for the RoPE-scaling trap too: some model cards note that statically enabling a context-extension
-method for all requests can slightly degrade quality on short inputs, so enable it only on deployments
-that actually receive long prompts. Prefer retrieval when the corpus is large or changes, long context
-when a single document must be reasoned over as a whole, and compaction for long agent runs. In
-day-to-day work the window appears as a budgeting function, a truncation policy and a cost line; in
-interviews, expect to be asked why windows are finite, what the KV cache has to do with it, and whether
-a bigger window makes RAG unnecessary.
+- **There is no opting out;** every request has a window. The decisions are how much of it to spend on
+  instructions, on examples, on retrieved material, on history, and on the answer.
+- **Measure** the token distribution of real requests, the rate of truncation events, and task accuracy
+  as a function of where key information sits in the prompt.
+- **Watch for the RoPE-scaling trap.** Some model cards note that statically enabling a context-extension
+  method for all requests can slightly degrade quality on short inputs, so enable it only on deployments
+  that actually receive long prompts.
+- **Prefer retrieval** when the corpus is large or changes, long context when a single document must be
+  reasoned over as a whole, and compaction for long agent runs.
+- **Day to day** the window appears as a budgeting function, a truncation policy and a cost line.
+- **Interviews:** expect why windows are finite, what the KV cache has to do with it, and whether a bigger
+  window makes RAG unnecessary.
 
 ## Role lens
 - **Engineer:** Writes the budgeting and truncation logic, counts tokens with the right tokenizer, and
@@ -192,6 +260,37 @@ large; the KV cache for a 200k-token request is large enough to cut concurrency 
 hit vendor rate limits. Prompt caching softens the cost if the manual is a stable prefix, but not the
 attention-quality issue. The right test is accuracy, latency and cost on real questions with the manual
 pasted versus retrieved, measured before the pipeline is deleted.
+
+## Interview questions
+### What actually sets the context window of a deployed model?
+- **Training length:** the advertised window is where pre-training or RoPE-scaled continued training was
+  validated; beyond it positions are unseen and quality degrades.
+- **Memory:** the engine reserves KV cache for the longest allowed request, so an operator may configure a
+  smaller window than the model supports.
+- **Latency:** prefill grows faster than linearly with prompt length, which bounds what users will wait for.
+
+### An agent's latency climbs every turn until it fails with a context error. How do you debug and fix it?
+- **Confirm the cause.** Log input tokens per turn; linear growth with tool-output size means the loop
+  appends raw tool results forever.
+- **Fix the loop.** Summarize or truncate large tool outputs, keep only the last few turns verbatim, and
+  store raw results outside the prompt for retrieval. Input tokens per turn should then plateau.
+
+### How much KV memory does a 128k-token request need on Llama-3-8B, and what does that imply?
+- **Per token:** 2 × 32 layers × 8 KV heads × 128 × 2 bytes = 128 KiB.
+- **Per request:** about 16 GiB, roughly the model's own fp16 weights, so a handful of such requests fill a
+  GPU that could serve many short chats. Route long-document traffic separately.
+
+### What is the difference between the nominal and the effective window, and how would you measure it?
+- **Nominal** is what the API accepts; **effective** is the length over which the model reliably uses
+  information, which is usually shorter and weakest in the middle of the prompt.
+- **Measure** by planting known facts at different positions in realistic prompts of increasing length
+  and scoring answers on your own task, not by trusting a needle test from a spec sheet.
+
+### Why can setting `max_tokens` very high hurt throughput even when answers are short?
+- **Some schedulers budget for the worst case.** They reserve KV memory for prompt plus maximum output, so
+  an inflated cap means fewer requests admitted at once.
+- **It also shrinks input room,** because input plus reserved output must fit the window. Size the cap
+  from the observed answer-length distribution.
 
 ## Quiz
 ### Q: Which of these is NOT a reason the context window is finite?

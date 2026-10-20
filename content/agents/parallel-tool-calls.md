@@ -5,7 +5,7 @@ name: Parallel tool calls
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: reviewed
+status: crisp
 related:
   - agents/tool-calling
   - agents/agent-loop
@@ -21,88 +21,112 @@ sources:
 ---
 
 ## TL;DR
-A model can emit several tool calls in a single turn. The harness runs the independent ones
-concurrently and answers every call before the next model turn (on the Claude API, all results in one
-user message), which removes a full model
-round trip per call and cuts latency for independent reads. The model decides what to batch, but only
-the harness knows which tools are safe to run at the same time, so it must schedule, cap concurrency,
-isolate failures and keep the result message intact.
+A model can emit several tool calls in one turn; the harness runs independent ones concurrently and
+answers every call before the next turn, saving a round trip per call. The model picks the batch; only
+the harness knows what may overlap.
 
 ## Why it exists
-The latency of an agent step is a model call plus a tool call, and the model call is usually the
-slower part, often seconds. An agent that needs three documents, or the status of four orders, or the
-weather in two cities, pays that model latency three or four times if it fetches sequentially, and
-grows the transcript by an assistant turn and a user turn each time. Nothing in those fetches depends
-on the others; the model is only in the loop between them because the loop is sequential.
-
-The naive fixes both fall short. Telling the model to call one tool at a time is simple and keeps
-ordering trivial, but it is the slow path above. Adding a special batch tool that accepts a list of
-ids works for one tool at a time but cannot express "look up this order *and* that customer *and* fetch
-this page", and it moves the batching logic into every tool. Parallel tool calls generalize the idea:
-by emitting several `tool_use` blocks in one response the model says "these do not depend on each
-other", and the harness, which knows what each tool does, decides how to run them.
+- **The model call dominates step latency.** A step is a model call plus a tool call, and the model call is
+  usually slower, often seconds.
+- **Sequential fan-out pays that latency repeatedly.** An agent needing three documents, four order
+  statuses or the weather in two cities pays the model latency three or four times, and grows the
+  transcript by an assistant turn and a user turn each time.
+- **Nothing in those fetches depends on the others;** the model is only between them because the loop is
+  sequential.
+- **"One tool at a time" is simple** and keeps ordering trivial, but it is that slow path.
+- **A special batch tool taking a list of ids** works for one tool but cannot express "look up this order
+  *and* that customer *and* fetch this page", and moves batching logic into every tool.
+- **Parallel calls generalize it.** Several `tool_use` blocks in one response say "these do not depend on
+  each other", and the harness, which knows what each tool does, decides how to run them.
 
 ## How it works
 ### The model's side
-Models trained for tool use emit multiple `tool_use` blocks in one turn when the calls are independent;
-on the major APIs this is on by default, and it can be switched off: `disable_parallel_tool_use: true`
-inside `tool_choice` on the Claude API, `parallel_tool_calls: false` on OpenAI's. What the model cannot express in a single turn is a dependency: "use the
-customer id from call A as the argument of call B". For that it emits A, waits for the result, then
-emits B, which is correct and sequential. How eagerly a model batches varies by model and by context;
-if traces show independent reads arriving one per turn, an explicit system-prompt instruction ("when
-several lookups do not depend on each other, request them in the same turn") usually raises the batch
-rate, and the calls-per-turn metric below tells you whether it did. If the chain is long, programmatic tool calling (the model
-writes a script that calls tools from inside a sandbox) is the alternative that keeps intermediate
-results out of the transcript (Anthropic offers this as "programmatic tool calling"; code-as-action
-agent frameworks implement the same idea).
+- **Batching is on by default** on the major APIs for models trained for tool use. It can be switched off:
+
+| API | Switch off with |
+|---|---|
+| Claude API | `disable_parallel_tool_use: true` inside `tool_choice` |
+| OpenAI | `parallel_tool_calls: false` |
+
+- **Dependencies cannot be expressed in one turn.** "Use the customer id from call A as the argument of
+  call B" means the model emits A, waits, then emits B, which is correct and sequential.
+- **Batch eagerness varies by model and context.** If traces show independent reads arriving one per turn,
+  a system-prompt instruction ("when several lookups do not depend on each other, request them in the same
+  turn") usually raises the batch rate; the calls-per-turn metric tells you whether it did.
+- **For long dependent chains, use programmatic tool calling:** the model writes a script that calls tools
+  inside a sandbox, keeping intermediate results out of the transcript. Anthropic offers this as
+  "programmatic tool calling"; code-as-action agent frameworks implement the same idea.
 
 ### The harness's side
-1. Collect every `tool_use` block from the response, not just the first.
-2. Classify each by the tool's contract metadata: read-only calls are parallel-safe; side-effecting
-   calls run one at a time, in the order the model emitted them, or go through an approval gate.
-   Idempotency does not make a write parallel-safe: "set status to shipped" and "set status to
-   cancelled" are each idempotent, yet run concurrently they race on which lands last. Running the
-   safe reads first and the writes after, as the example below does, also reorders the model's turn; that
-   is acceptable *because* calls in one turn are by definition ones the model considered independent, but
-   if a read and a write in the same turn touch the same record, the read reports the pre-write state and
-   the write tool should return the new state itself.
-3. Run the safe set concurrently (`asyncio.gather`, a thread pool, a task group) under a concurrency
+1. **Collect every `tool_use` block** from the response, not just the first.
+2. **Classify each by contract metadata.** Read-only calls are parallel-safe; side-effecting calls run one
+   at a time in the model's order, or go through an approval gate.
+3. **Run the safe set concurrently** (`asyncio.gather`, a thread pool, a task group) under a concurrency
    cap, because a model that emits ten calls to the same API is a burst your rate limits did not plan for.
-4. Isolate failures. Each call gets its own result, and one exception must not cancel the others,
-   because the model needs every result to reason, and a missing `tool_result` for any `tool_use` is a
-   protocol error.
-5. Apply a per-call timeout and convert a timeout into an `is_error` result, so one slow upstream does
-   not hold the whole turn.
-6. Build a single user message with one `tool_result` per `tool_use`, bound by id. Order is cosmetic;
+4. **Isolate failures.** Each call gets its own result and one exception must not cancel the others,
+   because the model needs every result, and a missing `tool_result` for any `tool_use` is a protocol error.
+5. **Apply a per-call timeout** and convert it into an `is_error` result, so one slow upstream does not
+   hold the whole turn.
+6. **Build a single user message** with one `tool_result` per `tool_use`, bound by id. Order is cosmetic;
    completeness is mandatory.
 
+- **Idempotency does not make a write parallel-safe.** "Set status to shipped" and "set status to
+  cancelled" are each idempotent, yet run concurrently they race on which lands last.
+- **Reads-first reorders the turn, and that is acceptable** *because* calls in one turn are ones the model
+  considered independent. If a read and a write in the same turn touch the same record, the read reports
+  the pre-write state, so the write tool should return the new state itself.
+
 ### Why all results go back together
-Every API expects each tool call in an assistant turn to be answered before the next assistant turn.
-The wire shape differs: the Claude API wants all `tool_result` blocks in the single user message that
-follows, and rejects a request that leaves a `tool_use` unanswered there; OpenAI's Chat Completions
-uses one `role: "tool"` message per call, all placed directly after the assistant message. There is a
-subtler reason as well: the transcript is also the model's example of how this conversation works. A
-history in which calls appear to have been answered one at a time teaches the model, in context, to
-make them one at a time, and the speedup quietly disappears.
+- **Every API requires each call in an assistant turn to be answered before the next assistant turn.**
+- **Wire shapes differ.** The Claude API wants all `tool_result` blocks in the single following user
+  message and rejects a request leaving a `tool_use` unanswered there; OpenAI's Chat Completions uses one
+  `role: "tool"` message per call, all placed directly after the assistant message.
+- **The transcript is also an in-context example.** A history in which calls appear answered one at a time
+  teaches the model to make them one at a time, and the speedup quietly disappears.
 
 ### Side effects and ordering
-Two writes emitted together have no guaranteed ordering once you run them concurrently. If tool A
-creates a record and tool B updates it, the model should not have batched them, but it sometimes will;
-the harness's `parallel_safe` flag is what prevents a race. Idempotency keys on write tools make a
-retried or duplicated call harmless, which is the other half of running anything concurrently, but they
-protect against duplicates, not against two different writes landing in the wrong order.
+- **Two writes emitted together have no guaranteed order** once run concurrently.
+- **The model sometimes batches dependent writes.** If tool A creates a record and tool B updates it, it
+  should not have batched them; the harness's `parallel_safe` flag is what prevents the race.
+- **Idempotency keys are the other half.** They make a retried or duplicated call harmless, but protect
+  against duplicates, not against two different writes landing in the wrong order.
 
 ### The latency arithmetic
-Illustrative numbers: a model call of 3 s and tool calls of 1 s each. Four independent reads done
-sequentially cost four model calls each followed by one tool call, then the final model call:
-4 × (3 + 1) + 3 = 19 s. Batched, they cost one model call, the slowest of the four tool calls, and the
-final model call: 3 + 1 + 3 = 7 s. The transcript also gains one assistant
-turn instead of four, which compounds across the rest of the run.
+Illustrative numbers: a model call of 3 s and tool calls of 1 s each, four independent reads.
 
-## Example
-A harness function for one turn: safe calls run concurrently with a semaphore and a timeout, unsafe
-calls run in order, every call gets exactly one result, and all results go back in one message.
-`HANDLERS` maps tool names to async functions; `PARALLEL_SAFE` comes from the tool contracts.
+| Plan | Cost | Total |
+|---|---|---|
+| Sequential | four model calls each followed by one tool call, then the final model call: 4 × (3 + 1) + 3 | 19 s |
+| Batched | one model call, the slowest of the four tool calls, the final model call: 3 + 1 + 3 | 7 s |
+
+- **The transcript also gains one assistant turn instead of four,** which compounds across the rest of the run.
+
+## Diagram
+One assistant turn with three calls: reads overlap under a cap, the write waits its turn, and one message
+answers every call.
+
+```mermaid
+sequenceDiagram
+    participant M as Model
+    participant H as Harness
+    participant R as Read APIs
+    participant W as Write API
+    M->>H: tool_use A, B read and C write
+    par concurrent reads, capped
+        H->>R: A
+        H->>R: B
+    end
+    R-->>H: A ok, B timed out
+    H->>W: C after reads, model order
+    W-->>H: C new state
+    H->>M: one message: results A, B is_error, C
+```
+
+## Examples
+### A harness function for one turn
+Safe calls run concurrently with a semaphore and a timeout, unsafe calls run in order, every call gets
+exactly one result, and all results go back in one message. `HANDLERS` maps tool names to async functions;
+`PARALLEL_SAFE` comes from the tool contracts.
 
 ```python
 import asyncio, json
@@ -141,41 +165,91 @@ async def execute_turn(response) -> dict:
 #   messages.append(await execute_turn(response))
 ```
 
+### See the speedup and the isolation locally
+Runnable with only the standard library: four simulated 1 s calls, one of which fails. Sequential takes
+about 4 s; concurrent takes about 1 s and still returns all four results.
+
+```python
+import asyncio, time
+
+async def fetch(name: str, delay: float, fail: bool = False) -> str:
+    await asyncio.sleep(delay)                       # stands in for a 1 s upstream call
+    if fail:
+        raise LookupError(f"{name}: 404")
+    return f"{name}: ok"
+
+async def safe(coro) -> str:                         # isolate: an exception becomes a value
+    try:
+        return await coro
+    except Exception as e:
+        return f"error: {e}"
+
+async def main():
+    jobs = [("A", 1.0, False), ("B", 1.0, True), ("C", 1.0, False), ("D", 1.0, False)]
+    t = time.perf_counter()
+    for j in jobs:
+        await safe(fetch(*j))
+    print(f"sequential: {time.perf_counter() - t:.1f}s")       # ~4.0s
+    t = time.perf_counter()
+    results = await asyncio.gather(*(safe(fetch(*j)) for j in jobs))
+    print(f"concurrent: {time.perf_counter() - t:.1f}s", results)   # ~1.0s, B is an error value
+
+asyncio.run(main())
+```
+
+## Production patterns
+- **Concurrency caps per downstream, not one global cap.** When tools hit different systems; keep one
+  `asyncio.Semaphore` per upstream sized to its rate limit, so a burst to one API does not starve another.
+  Monitor 429s and queue wait time per upstream.
+- **Watch calls per assistant turn.** Once parallel calls are enabled; log the number of `tool_use` blocks per
+  turn. A value stuck at one usually means the transcript taught the model not to batch, or results were
+  split across messages; add the batching instruction to the system prompt and re-measure.
+- **"Outcome unknown" for timed-out writes.** For any write tool; the timeout result says the outcome is
+  unknown and to check before retrying, and the write carries an idempotency key. Monitor duplicate-write
+  incidents and timeout rate per tool.
+- **Per-result size caps sized for a batch.** For fan-out agents; cap each result, because eight large pages
+  arriving at once make the context jump in one step. Monitor context tokens added per turn.
+- **Turn batching off for write-heavy agents.** When correctness dominates latency; set
+  `tool_choice={"type": "auto", "disable_parallel_tool_use": True}` on the Claude API or
+  `parallel_tool_calls=False` on OpenAI. Monitor wall-clock per task to confirm the cost is acceptable.
+- **Declined calls still get a result.** When policy refuses a call; return an `is_error` result saying it
+  was declined, never drop it. Monitor declined calls per tool.
+
 ## Trade-offs
-- Lower latency and fewer model turns for independent calls, but a burst of concurrent load on
-  downstream systems; without a concurrency cap the speedup turns into rate-limit errors.
-- Model-decided batching is convenient, but the model may batch calls that are dependent or
-  side-effecting; the harness needs contract metadata to serialize them, which is extra design work.
-- Returning all results at once makes one large message; with big results the context jumps in a
-  single step, so per-result size caps matter more than in the sequential case.
-- Disabling parallel calls simplifies the harness and guarantees ordering but gives up the speedup; a
-  fair choice for low-volume, write-heavy agents where correctness dominates latency.
+- **Latency vs downstream burst.** Independent calls finish sooner with fewer model turns, but downstream
+  systems get a burst of concurrent load; without a concurrency cap the speedup turns into rate-limit errors.
+- **Model-decided batching vs harness design.** It is convenient, but the model may batch dependent or
+  side-effecting calls; the harness needs contract metadata to serialize them, which is extra design work.
+- **One message vs context jump.** Returning all results at once makes one large message; with big results
+  the context jumps in a single step, so per-result size caps matter more than in the sequential case.
+- **Disabling vs speed.** Turning parallel calls off simplifies the harness and guarantees ordering but gives
+  up the speedup; a fair choice for low-volume, write-heavy agents where correctness dominates latency.
 
 ## Pitfalls
-- On the Claude API, splitting results into separate user messages; the symptom is an API error about
-  unanswered tool calls, or a model that stops batching after a few turns.
-- Using `gather` without isolating failures; the symptom is one 404 cancelling every sibling call and
-  a turn with no results at all.
-- Running writes concurrently; the symptom is duplicated or out-of-order side effects that only appear
-  under load.
-- No per-call timeout; the symptom is a whole turn stalled on one slow upstream while the others
-  finished long ago.
-- Telling the model to "retry" a write that timed out; the timeout cancelled your wait, not necessarily
-  the downstream operation, so the symptom is a double charge or a duplicate ticket unless the write
-  carries an idempotency key or the model is told the outcome is unknown and checks first.
-- Dropping the result for a call the policy refused to run; the symptom is a protocol error, when the
-  correct move is an `is_error` result saying the call was declined.
+- **On the Claude API, splitting results into separate user messages.** Symptom: an API error about
+  unanswered tool calls, or a model that stops batching after a few turns. Fix: one message, every call.
+- **Using `gather` without isolating failures.** Symptom: one 404 cancelling every sibling call and a turn
+  with no results at all. Fix: a `run_one` that never raises.
+- **Running writes concurrently.** Symptom: duplicated or out-of-order side effects that only appear under
+  load. Fix: serialize anything not marked parallel-safe.
+- **No per-call timeout.** Symptom: a whole turn stalled on one slow upstream while the others finished long
+  ago. Fix: `asyncio.wait_for` per call.
+- **Telling the model to "retry" a write that timed out.** The timeout cancelled your wait, not necessarily
+  the downstream operation. Symptom: a double charge or duplicate ticket, unless the write carries an
+  idempotency key or the model is told the outcome is unknown and checks first.
+- **Dropping the result for a call the policy refused to run.** Symptom: a protocol error. Fix: an `is_error`
+  result saying the call was declined.
 
 ## When to use
-Enable parallel calls whenever an agent does many independent reads: research across sources, fan-out
-lookups, multi-entity status checks. Keep them disabled, or serialize in the harness, for agents whose
-tools are mostly writes or whose downstream systems cannot absorb bursts. Measure the average number of
-calls per assistant turn (a value stuck at one means the model is not batching, usually because the
-transcript taught it not to), the wall-clock per step, and the error rate under concurrency. In
-day-to-day work the bugs are in the harness: isolation, timeouts, caps and the one-message rule. In
-interviews, "what changes in your loop to support parallel calls" is a good test of whether someone
-has built one; the answer is scheduling by contract metadata, failure isolation, and completeness of
-the result message.
+- **Use when** an agent does many independent reads: research across sources, fan-out lookups,
+  multi-entity status checks.
+- **Avoid when** tools are mostly writes or downstream systems cannot absorb bursts; keep parallel calls
+  disabled or serialize in the harness.
+- **Measure** average calls per assistant turn (stuck at one means the model is not batching, usually
+  because the transcript taught it not to), wall-clock per step, and error rate under concurrency.
+- **Day to day** the bugs are in the harness: isolation, timeouts, caps and the one-message rule.
+- **Interviews:** "what changes in your loop to support parallel calls" tests whether someone has built one;
+  answer scheduling by contract metadata, failure isolation, and completeness of the result message.
 
 ## Role lens
 - **Engineer:** Implements concurrent execution with a semaphore, per-call timeouts and failure
@@ -197,6 +271,37 @@ all eight results in one user message. Then watch three risks: eight large pages
 blow the context, so cap each result's size; fetched pages are untrusted and now arrive in bulk, so
 the provenance labels and action gates must already be in place; and if any tool in the set has side
 effects it must be excluded from the concurrent group. Confirm with calls per turn and wall-clock per task.
+
+## Interview questions
+### What changes in your loop to support parallel tool calls?
+- **Collect every `tool_use` block,** classify by contract metadata, and run only parallel-safe calls
+  concurrently under a cap.
+- **Isolate failures and time out each call,** converting both into `is_error` results.
+- **Return exactly one result per call in one message,** because completeness is a protocol rule and the
+  transcript teaches the model how batching is handled.
+
+### Why is an idempotent write still not safe to run in parallel?
+- **Idempotency removes duplication, not ordering races:** "set shipped" and "set cancelled" are each
+  idempotent, but concurrently they race on which lands last.
+- **So** writes run sequentially in the model's order, or behind an approval gate, unless the contract marks
+  them parallel-safe.
+
+### Estimate the latency saved by batching four independent lookups.
+- **Illustrative:** 3 s per model call and 1 s per tool call.
+- **Sequential:** 4 × (3 + 1) + 3 = 19 s. **Batched:** 3 + 1 + 3 = 7 s.
+- **Plus** one assistant turn instead of four, so later turns resend a shorter transcript.
+
+### You enabled parallel calls but the model still calls one tool per turn. Why?
+- **Check the transcript shape first:** results split across messages teach the model, in context, to make
+  calls one at a time.
+- **Check the instructions:** add "request independent lookups in the same turn" to the system prompt.
+- **Check for real dependencies:** if B needs A's output, sequential is correct; consider programmatic tool
+  calling for long chains.
+
+### When would you disable parallel tool calls entirely?
+- **Write-heavy, low-volume agents** where ordering and correctness matter more than seconds.
+- **Fragile downstream systems** that cannot absorb bursts even with caps.
+- **The cost** is giving up the latency win, so measure wall-clock per task before and after.
 
 ## Quiz
 ### Q: On the Claude API, why must all the tool results for one assistant turn be returned in a single user message?

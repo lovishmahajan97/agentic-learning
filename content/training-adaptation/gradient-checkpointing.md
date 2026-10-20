@@ -128,6 +128,23 @@ implementations:
 - **With FSDP:** checkpoint per block *inside* each FSDP unit, so recomputation does not trigger extra
   parameter all-gathers.
 
+## Diagram
+Forward keeps only each block's input; backward re-runs one block at a time from that input, so only
+one block's internals are ever alive.
+
+```mermaid
+flowchart TD
+    X["Block k input"] --> F["Forward block k, no graph"]
+    F --> S[("Stored: block inputs only")]
+    F --> N["Next block, then loss"]
+    N --> G["Gradient reaches block k output"]
+    G --> R["Re-run block k forward from input"]
+    S -.->|"read input k"| R
+    R --> B["Backward through local graph"]
+    B --> FR["Free block k internals"]
+    FR -->|"move to block k minus 1"| G
+```
+
 ## Examples
 ### Residual MLP stack with and without checkpointing
 Work the budget out before running it:
@@ -292,6 +309,45 @@ then enable gradient checkpointing in non-reentrant mode (or call `enable_input_
 cuts stored activations to one block input per layer (~67 MB each, ~2 GB total) plus a single live block
 (~1.1 GB). That fits with room to raise the micro-batch, at roughly a 20–30% per-step cost. Verify with
 `max_memory_allocated()` before and after, and judge the change by tokens per second.
+
+## Interview questions
+### What is gradient checkpointing, and why does it save memory?
+- **Definition:** activation recomputation. The forward pass keeps only each segment's (usually each
+  block's) input and frees the internals; backward re-runs that segment's forward to rebuild them.
+- **Why it saves memory:** autograd otherwise keeps every layer's activations alive until backward, so
+  peak memory scales with layers. Checkpointing turns that into "all block inputs plus one live block".
+- **Not to be confused with** saving model state to disk, which is a separate setting.
+
+### A LoRA run with checkpointing on shows a flat loss. How do you debug it?
+- **Check gradients first:** after one step, list trainable parameters whose `.grad` is `None` or whose
+  gradient norm is zero. All adapter gradients missing points at the reentrant trap.
+- **Cause:** reentrant mode only records a segment when an input requires grad, and frozen embeddings
+  produce inputs that do not.
+- **Fix:** pass `use_reentrant=False`, or call `model.enable_input_require_grads()`, then rerun the
+  one-step assertion before the full run.
+
+### When would you turn gradient checkpointing off?
+- **When memory is not the constraint:** small models or short sequences where the GPU is compute-bound,
+  because the extra forward pass (roughly a third more compute in the worst case) is then pure loss.
+- **When the batch already saturates the GPU:** the usual win, a bigger micro-batch, is gone, so the
+  20–30% step-time cost (illustrative) is not repaid.
+- **Prefer selective recompute** at pretraining scale, recomputing only attention internals, when full
+  recompute costs too much model FLOPs utilisation.
+
+### Peak memory dropped sharply but the run still OOMs at 8k. What is going on?
+- **The live block sets a floor.** With eager attention, the block being recomputed still materialises
+  its `5·a·s²·b` score tensors, about 10.7 GB for one 7B layer at 8k.
+- **Checkpointing cannot remove that,** because it only cuts the "× layers" factor. Switch to
+  FlashAttention or SDPA so the score matrix is never materialised.
+- **Then verify** with `torch.cuda.max_memory_allocated()` before and after.
+
+### Steps got 25% slower after enabling it. Is that a regression?
+- **Not necessarily.** Seconds per step is the wrong metric; tokens per second is the right one.
+- **Spend the freed memory:** raise `per_device_train_batch_size` and lower
+  `gradient_accumulation_steps` to keep the effective batch, because a GPU at micro-batch 1 is badly
+  under-utilised.
+- **Compare against the baseline** in tokens per second and GPU utilisation; throughput often rises
+  despite the recompute.
 
 ## Quiz
 ### Q: What does gradient checkpointing trade, and for what?

@@ -133,6 +133,25 @@ where p is the true (human) pass rate.
 - **Always publish the judge's agreement with humans next to it.** A win rate without an agreement number
   is an unlabeled gauge.
 
+## Diagram
+The calibration loop: a judge earns the right to gate only after its agreement with humans is close to
+human–human agreement; every bias found feeds a protocol change and a re-measure.
+
+```mermaid
+flowchart TD
+    S["Sample 100-300 real inputs"] --> H["Humans label with the rubric"]
+    H --> IAA["Human-human agreement: the ceiling"]
+    H --> J["Judge labels the same items"]
+    J --> M["Agreement, TPR, TNR vs humans"]
+    M --> P["Probe: swap order, length, style, family"]
+    P --> Q{"Close to the ceiling and no tilt?"}
+    IAA --> Q
+    Q -->|"no"| F["Mitigate: swap, anchors, reference, other family"]
+    F --> J
+    Q -->|"yes"| G["Judge may gate, pinned version"]
+    G -.->|"model or prompt changes"| J
+```
+
 ## Examples
 ### Both-order calibration harness
 Runs each pair in both orders and measures position inconsistency, agreement with human labels on the
@@ -300,6 +319,45 @@ subset of about a hundred pairs, compared with human–human agreement, to confi
 quality on this task. Fourth, self-preference: if the change involved a model swap, make sure the judge is
 from a different family. Finally, bootstrap a confidence interval; if it still excludes 50% after these
 controls, ship behind an online A/B to confirm.
+
+## Interview questions
+### What is the difference between judge variance and judge bias, and why does it matter?
+- **Variance is noise.** Running the same judge twice gives slightly different numbers; repeating and
+  averaging shrinks it.
+- **Bias is a systematic tilt** (first position, longer answer, own family) that every repeat reproduces,
+  so averaging only makes the wrong answer look more certain.
+- **So the remedy differs:** variance needs more samples; bias needs human labels to detect it and a
+  protocol change (swap order, length control, other family) to remove it.
+
+### Your judge says a new prompt improved pass rate from 80% to 86%, but support tickets went up. How do you debug it?
+- **Check what changed in the outputs.** If the new prompt made answers longer or more formatted,
+  suspect verbosity or style bias first.
+- **Measure against humans on fresh items:** label 100 or so recent outputs from both prompts and compute
+  the judge's TPR and TNR separately, because a lenient judge with low TNR passes the new failures.
+- **Probe directly:** compare judge length preference against human length preference on the same pairs;
+  a gap of double digits explains a manufactured gain.
+
+### When would you not use an LLM judge at all?
+- **When an executable check exists:** unit tests, exact match, schema validation or a numeric
+  tolerance are cheaper, deterministic and unbiased.
+- **When the judge cannot do the task itself,** such as checking a hard proof or a domain calculation;
+  knowledge-gap leniency means fluent wrong answers pass. Use reference-guided grading or experts.
+- **When TPR + TNR − 1 is near zero** on your calibration set, the judge carries no information and cannot
+  gate anything.
+
+### A pass/fail judge has TPR 0.95 and TNR 0.70. It reports 82% pass. What is the true rate and what does this do to comparisons?
+- **Invert the formula:** p = (0.82 + 0.70 − 1) / (0.95 + 0.70 − 1) = 0.52 / 0.65 = 0.80, so the true pass
+  rate is about 80%.
+- **Differences shrink:** every true gap is scaled by 0.65, so a real 10-point gap shows as 6.5 points
+  and small real improvements fall inside the noise.
+- **Bootstrap the correction** over the calibration set, because TPR and TNR are themselves estimates.
+
+### How do you keep a judge trustworthy over months in production?
+- **Pin a dated judge model and version the judge prompt,** storing both with every score.
+- **Re-run the calibration set in CI** whenever the judge, its prompt or the task changes, and fail the
+  build if agreement or TNR drops below the agreed threshold.
+- **Spot-check weekly:** route a small sample of production-judged items to humans and add them to the
+  calibration set, so drift shows up as falling agreement.
 
 ## Quiz
 ### Q: A judge's verdict changes for 30% of pairs when the two answers are swapped. What is being measured, and what is the fix?

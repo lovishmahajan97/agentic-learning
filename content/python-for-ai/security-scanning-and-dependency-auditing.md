@@ -107,6 +107,24 @@ A finding is the start of a decision, not the decision. A useful order:
 | **Model artifacts** | prefer safetensors over pickle-based checkpoints, pin model revisions, avoid `trust_remote_code=True` for unreviewed repositories |
 | **Reachability** (vulnerable function present but never called) | tools such as OSV-Scanner, Dependabot alerts, Safety or Snyk differ in databases and triage features; choose by workflow |
 
+## Diagram
+The CI gate runs two independent scanners over two different inputs, and every pip-audit finding goes
+through the same triage path before it is fixed or deferred with a recorded exception.
+
+```mermaid
+flowchart TD
+    PR["Pull request or scheduled job"] --> EX["Export the lock: uv export"]
+    PR --> BA["Bandit or Ruff S rules on src"]
+    EX --> PA["pip-audit -r req.txt --no-deps --disable-pip"]
+    PA -->|"advisory found"| FX{"Fixed version available?"}
+    FX -->|"yes, direct"| UP["uv lock --upgrade-package, then sync"]
+    FX -->|"yes, but parent range blocks it"| PU["Upgrade parent, or tested override as stopgap"]
+    FX -->|"no fix yet"| RE{"Vulnerable path reachable?"}
+    RE -->|"yes"| MI["Mitigate in code or config now"]
+    RE -->|"no"| IG["--ignore-vuln ID with reason and review date"]
+    BA -->|"finding"| BF["Fix pattern, or nosec Bxxx with a reason"]
+```
+
 ## Examples
 ### What Bandit flags in an agent, and the safer equivalents
 The scenario: an agent that loads a classifier, runs a shell tool and stores results.
@@ -241,6 +259,39 @@ our source; neither inspects model artifacts. Pickle-based checkpoints, and repo
 remote code execution by design unless constrained. Mitigations: accept only safetensors, pin model revisions
 or checksums, allowlist sources, scan or review artifacts, and run loading in a sandbox with minimal
 credentials. Clean scanner output narrows risk; it does not certify the system.
+
+## Interview questions
+### What do pip-audit and Bandit each check, and why do you need both?
+- **pip-audit:** your exact installed or locked package versions against advisory data (PyPI's by default, OSV
+  with `-s osv`), so it finds known vulnerabilities in third-party code.
+- **Bandit:** your own source, parsed into a syntax tree, for risky patterns such as `pickle.load`, `eval`,
+  `shell=True` and SQL built by string formatting.
+- **Different blind spots:** one knows nothing about your code, the other nothing about dependencies.
+
+### pip-audit flags a vulnerability in a transitive dependency and the parent's range excludes the fix. Walk me through it.
+- **Prefer upgrading the parent** to a release whose range allows the fixed version, then re-lock.
+- **If blocked,** a constraint or override forcing the fixed version is a stopgap that must be tested,
+  because the parent now runs against a version it never declared support for.
+- **If no fix exists,** check reachability in the advisory and record `--ignore-vuln ID` with a reason and a
+  review date.
+
+### Why is a clean pip-audit run not evidence that your supply chain is safe?
+- **It only knows published advisories,** so a malicious or typosquatted package with no CVE passes.
+- **Defences are elsewhere:** locks with hashes, approved indexes or mirrors, and reviewing new dependencies.
+- **It also never looks inside model files,** where pickle-based checkpoints execute code on load.
+
+### Bandit produces so many findings that the team ignores it. How do you restore signal?
+- **Exclude tests** (asserts and fixtures drown real findings) via `exclude_dirs` or Ruff per-file ignores.
+- **Set a severity floor** such as `-ll` for gating, and run the full set periodically, since B105 and B101
+  are rated low.
+- **Suppress narrowly** with `# nosec B602` plus a reason, and move to a data-flow tool such as Semgrep or
+  CodeQL if false positives remain the bottleneck.
+
+### An agent passes LLM output to `subprocess.run(..., shell=True)`. What do you change?
+- **Drop the shell:** split with `shlex.split` and pass an argument list, so `;`, `|` and `$(...)` are not
+  expanded.
+- **Allowlist commands** and validate arguments such as paths, because a permitted binary can still be misused.
+- **Add a timeout and minimal credentials** for the process; Bandit's B602 would have flagged the original.
 
 ## Quiz
 ### Q: Why should pip-audit run against the lockfile rather than the version ranges in pyproject.toml?

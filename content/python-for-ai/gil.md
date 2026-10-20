@@ -96,6 +96,27 @@ A thread must hold the GIL to run bytecode or touch Python objects. It gives the
 - **Status changes by release**, so check the docs for your version and dependencies before planning
   around it.
 
+## Diagram
+Handover between a CPU-bound thread and an I/O thread: the I/O thread is woken by the kernel but still
+waits for the GIL, and only a drop request after the switch interval gets it back.
+
+```mermaid
+sequenceDiagram
+    participant A as Thread A (pure-Python CPU loop)
+    participant G as GIL
+    participant B as Thread B (I/O, event loop)
+    participant K as Kernel
+    B->>G: release before socket read system call
+    A->>G: acquire, run bytecode
+    K-->>B: socket ready, thread woken
+    B->>G: request GIL, must wait
+    Note over B,G: waits up to the switch interval (5 ms default)
+    B->>G: set drop request flag
+    A->>G: drop at next eval-loop check point
+    G-->>B: acquired, run Python for this task step
+    Note over A,B: native code (NumPy, hashlib) can release the GIL and run in parallel
+```
+
 ## Examples
 ### Threads vs processes vs GIL-releasing C code
 ```python
@@ -242,6 +263,44 @@ pickling is amortised, or moving the hot loop into native code: Polars string ex
 library. Fewer, larger `re` calls also cut per-document interpreter overhead, but the `re` module holds the
 GIL, so regex work still does not parallelise across threads. I would time a small sample sequentially and with processes to confirm the gain before running
 the full million. Threads would be right only if the work were I/O or GIL-releasing native code.
+
+## Interview questions
+### What is the GIL, and why does CPython have one?
+- **A single interpreter mutex:** a thread must hold it to run bytecode or touch Python objects, so only
+  one thread executes Python at a time per interpreter.
+- **It protects reference counts and shared internals**, which change on nearly every operation; without
+  coordination objects get freed while in use or leak.
+- **One lock was the cheap option**, because fine-grained locks or atomic refcounts slow the common
+  single-threaded case and burden every C extension author.
+
+### Does the GIL make my shared dict or counter thread-safe?
+- **No, it protects the interpreter, not your invariants.** `counter += 1` is several bytecodes (load,
+  add, store), and a switch between them loses updates.
+- **Check-then-act needs a `threading.Lock`**, or hand work through `queue.Queue`.
+- **Single operations like `list.append` happen to be atomic**, but relying on that is an implementation
+  accident; the free-threaded build had to add per-object locks to preserve it.
+
+### Streaming responses get jittery after a teammate moved text cleaning into asyncio.to_thread. Why?
+- **The loop is unblocked but not unaffected.** The cleaning thread holds the GIL running pure Python,
+  and the event loop needs the GIL for every task step.
+- **Each loop step can wait** up to about the switch interval (5 ms by default) for a handover, so token
+  delivery becomes uneven.
+- **Fix:** move the CPU work to a process pool or a separate worker service, and monitor loop lag and
+  inter-token jitter.
+
+### When are Python threads a good choice for CPU-heavy AI work despite the GIL?
+- **When the hot path is GIL-releasing native code:** NumPy on large arrays, most PyTorch tensor ops,
+  `hashlib` and compression on large buffers.
+- **Threads then share memory and weights**, avoiding process pickling and duplicated models.
+- **Verify per function**, because some C libraries hold the GIL for the whole call; and cap native pools
+  with `OMP_NUM_THREADS` or `torch.set_num_threads(...)` to avoid oversubscribing cores.
+
+### How do you prove, with numbers, that the GIL is your bottleneck?
+- **Measure process CPU time over wall time with N threads.** A ratio near 1.0 means the GIL serialises
+  you; close to N means the work releases it.
+- **Confirm with a sampling profiler** such as py-spy to see which thread holds the GIL.
+- **On free-threaded builds**, also log `sys._is_gil_enabled()` (3.13+), since an incompatible
+  extension can silently re-enable it.
 
 ## Quiz
 ### Q: Why did CPython adopt a single global lock rather than fine-grained locks?

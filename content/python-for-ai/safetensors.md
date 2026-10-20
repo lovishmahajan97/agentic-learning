@@ -94,6 +94,24 @@ Nothing in a checkpoint file distinguishes "rebuild a tensor" from "call os.syst
 - **No aliases.** Tensors sharing memory (tied embedding weights) cannot be saved as aliases: `save_file`
   refuses them, while helpers such as `save_model` deduplicate them and rely on the loading code to re-tie.
 
+## Diagram
+Compare the two load paths: a pickle checkpoint runs an interpreter over the file, while a safetensors
+load only reads, validates and maps bytes, so each rank can page in just its slice.
+
+```mermaid
+flowchart TD
+    F["Checkpoint file"] --> K{"Format?"}
+    K -->|"pickle .bin or .pt"| P["Unpickler executes rebuild calls"]
+    P -.->|"any importable function, even os.system"| X["Code runs during load"]
+    K -->|"safetensors"| H["Read 8-byte header size N"]
+    H --> J["Parse N bytes of JSON: dtype, shape, data_offsets"]
+    J --> V{"Offsets in bounds, sizes match dtype times shape?"}
+    V -->|"no"| R["Reject malformed file"]
+    V -->|"yes"| MM["Memory-map the data buffer"]
+    MM --> G["get_tensor: one whole tensor"]
+    MM --> SL["get_slice: only this rank's rows"]
+```
+
 ## Examples
 ### Save, load lazily, and read the header by hand
 ```python
@@ -222,6 +240,44 @@ can still require `trust_remote_code`, which runs Python model code; tokenizers 
 same source; and other files in the repo may still be pickles. A sound policy combines safetensors-only
 weights, pinned revisions, disallowing remote code unless reviewed, provenance checks, and behavioural
 evaluation before deployment.
+
+## Interview questions
+### Why is loading a pickle checkpoint a security risk, and how does safetensors remove it?
+- **Pickle is a program, not data:** the unpickler executes rebuild instructions, and `__reduce__` can
+  name any importable callable, including `os.system`, so a downloaded `.bin` is executable code.
+- **safetensors cannot express code:** an 8-byte header size, a JSON header and raw bytes, validated
+  before any tensor is touched.
+- **So there is no interpreter to restrict**, unlike `weights_only=True`, which still parses untrusted
+  pickle through an allow-list.
+
+### A load fails on a legacy checkpoint and a teammate proposes `weights_only=False`. What do you do?
+- **Refuse the quick fix:** it re-enables arbitrary code execution, and the error was the safety check
+  working.
+- **Convert in a sandbox instead:** load with `weights_only=True` in an isolated job, make tensors
+  contiguous, write with `save_file` (or `save_model` for tied weights) and ship only the safetensors file.
+- **Then enforce it:** pass `use_safetensors=True` to `from_pretrained` so pickle fallbacks error.
+
+### When would you still use `torch.save` rather than safetensors?
+- **Internal training-resume checkpoints:** optimizer and scheduler state are Python objects, which
+  safetensors deliberately does not store.
+- **Condition:** only for files your own jobs wrote and never for anything from an untrusted location.
+- **Local llama.cpp-style inference** uses GGUF instead, which also embeds tokenizer metadata and
+  quantized types, so conversion is a separate deployment step.
+
+### How many bytes does each of 8 tensor-parallel ranks read for a 4096 by 4096 BF16 matrix?
+- **Whole matrix:** 4096 × 4096 × 2 = 33,554,432 bytes.
+- **One rank's 512 rows with `get_slice`:** 512 × 4096 × 2 = 4,194,304 bytes, so all 8 ranks read
+  33,554,432 bytes in total, each byte once.
+- **With full loads** they read 268,435,456 bytes and discard 7/8, which is why offsets plus memory
+  mapping matter for cold start.
+
+### Cold starts are slow even with safetensors. Where do you look?
+- **Storage path first:** memory-mapped loading pages in bytes on demand, and page faults over network
+  filesystems or object storage mounts can be slow.
+- **Fix:** stage checkpoints on local NVMe before loading and compare time to first token per storage
+  path.
+- **Also check sharding:** a missing `model.safetensors.index.json` makes loaders fail or load only part
+  of the model.
 
 ## Quiz
 ### Q: What makes loading a pickle-based PyTorch checkpoint dangerous?

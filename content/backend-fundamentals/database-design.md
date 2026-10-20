@@ -5,7 +5,7 @@ name: Database design
 kind: concept
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - backend-fundamentals/sql
   - backend-fundamentals/nosql
@@ -22,115 +22,142 @@ sources:
 ---
 
 ## TL;DR
-A schema is the one part of a system that outlives every version of the code, so it has to encode the
-facts that must stay true (keys, constraints, ownership) rather than the shape of today's screens.
-Normalize so each fact lives in one place and cannot drift, then denormalize deliberately where a measured
-read path needs it. Design indexes from the queries you will actually run, not from the columns you have.
+The schema outlives every version of the code, so encode the facts that must stay true (keys,
+constraints, ownership). Normalize so each fact lives once, denormalize only where a measured read needs
+it, and design indexes from real queries.
 
 ## Why it exists
-Code is rewritten every year; the data it produced is still there a decade later. If the storage layout is
-whatever the first endpoint happened to need, three things break quickly. First, the same fact ends up
-stored in several rows (a user's email copied into every order), and the copies disagree after the first
-update that misses one. That is an *update anomaly*, and no amount of application discipline fixes it,
-because the next engineer does not know the copies exist. Second, invariants that live only in code
-("a message always belongs to exactly one conversation") get violated by the one script, migration or
-manual fix that bypasses the code, leaving orphans that crash reads months later. Third, queries that were
-fast at ten thousand rows become table scans at ten million, and by then the data layout is load-bearing
-for a dozen services.
-
-The naive alternative, "store JSON blobs and figure it out later", postpones all three problems to the
-moment the data is largest and the original authors are gone. Database design is the practice of deciding
-up front which facts exist, which entity owns each one, which rules the database itself must enforce, and
-which access paths need to be cheap. For AI systems this matters more, not less: conversation history,
-tool-call logs, embeddings and evaluation results are the product's memory, and they are queried by
-humans, dashboards and retrieval code long after the request that wrote them.
+- **Data outlives code.** Code is rewritten every year; the data it produced is still there a decade
+  later. A layout shaped by whatever the first endpoint needed breaks in three ways.
+- **Copies drift (update anomaly).** The same fact stored in several rows (a user's email copied into
+  every order) disagrees after the first update that misses one. Application discipline cannot fix it,
+  because the next engineer does not know the copies exist.
+- **Invariants in code get bypassed.** "A message always belongs to exactly one conversation" is violated
+  by the one script, migration or manual fix that skips the code, leaving orphans that crash reads months later.
+- **Fast queries become scans.** What was fast at ten thousand rows is a table scan at ten million, and by
+  then the layout is load-bearing for a dozen services. "Store JSON blobs and figure it out later" just
+  postpones all three to when the data is largest and the authors are gone.
+- **AI systems raise the stakes.** Conversation history, tool-call logs, embeddings and evaluation results
+  are the product's memory, queried by humans, dashboards and retrieval code long after the request that
+  wrote them. Design decides up front which facts exist, who owns each, which rules the database enforces
+  and which access paths must be cheap.
 
 ## How it works
 ### Entities, keys and relationships
-Start by naming the nouns the business reasons about (tenant, user, conversation, message, tool call, run,
-document, chunk) and the relationships between them with their cardinality: a conversation has many
-messages, a message has zero or more tool calls, a document has many chunks. Each entity gets a table
-and a primary key. A **surrogate key** (bigint identity or UUID) is the default *because* natural keys
-(email, external IDs) change, get reused, or turn out not to be unique. If you use UUIDs, prefer a
-time-ordered variant (UUIDv7) over random UUIDv4 for primary keys, because a B-tree index on random keys
-inserts into random pages, which defeats cache locality and bloats the index as the table grows.
-Relationships become foreign keys, and the database enforces them so an orphan cannot exist even when
-a script bypasses the application.
+1. **Name the nouns** the business reasons about: tenant, user, conversation, message, tool call, run,
+   document, chunk.
+2. **State relationships with cardinality:** a conversation has many messages, a message has zero or more
+   tool calls, a document has many chunks.
+3. **Give each entity a table and a primary key.** A **surrogate key** (bigint identity or UUID) is the
+   default *because* natural keys (email, external IDs) change, get reused, or turn out not to be unique.
+4. **Prefer time-ordered UUIDs.** Use UUIDv7 over random UUIDv4 for primary keys, because a B-tree on
+   random keys inserts into random pages, which defeats cache locality and bloats the index as it grows.
+5. **Turn relationships into foreign keys** the database enforces, so an orphan cannot exist even when a
+   script bypasses the application.
 
 ### Normalization: one fact, one place
-Normal forms are rules for removing redundancy, and they follow from one idea: a table should describe
-one kind of thing, and every non-key column should depend on the whole key and nothing else. In practice:
+A table describes one kind of thing, and every non-key column depends on the whole key and nothing else.
 
-1. **1NF:** no repeating groups or lists packed into a column; `tags = "a,b,c"` becomes a `tags` table or
-   an array column with proper indexing.
-2. **2NF:** with a composite key, no column may depend on only part of it; in a
-   `(conversation_id, user_id)` membership table, `user_name` depends on `user_id` alone and belongs in
-   `users`.
-3. **3NF:** no non-key column may depend on another non-key column. If `messages` stores `user_id` and
-   `user_email`, the email depends on `user_id` rather than on the message, so it belongs in `users`.
-   Otherwise changing an email means rewriting every message row.
+| Form | Rule | Example fix |
+|---|---|---|
+| 1NF | No repeating groups or lists packed into a column | `tags = "a,b,c"` becomes a `tags` table or an array column with proper indexing |
+| 2NF | With a composite key, no column depends on only part of it | In a `(conversation_id, user_id)` membership table, `user_name` depends on `user_id` alone and belongs in `users` |
+| 3NF | No non-key column depends on another non-key column | If `messages` stores `user_id` and `user_email`, the email belongs in `users`; otherwise changing an email rewrites every message row |
 
-Normalization is the default *because* writes are where consistency is decided; a normalized schema makes
-the correct write the only possible write. The cost is joins on read, which is where denormalization comes
-in: a `conversations.last_message_at` column duplicated from `messages` makes the inbox query cheap, but
-now it must be maintained in the same transaction as the insert. Denormalize when a specific query is
-measured to be slow, and write down the invariant you are now responsible for.
+- **Normalize by default** *because* writes are where consistency is decided; a normalized schema makes
+  the correct write the only possible write.
+- **The cost is joins on read.** A `conversations.last_message_at` column duplicated from `messages` makes
+  the inbox query cheap, but must be maintained in the same transaction as the insert.
+- **Denormalize on measurement.** Do it when a specific query is measured to be slow, and write down the
+  invariant you are now responsible for.
 
 ### Constraints are invariants the database guarantees
-`NOT NULL`, `UNIQUE`, `CHECK (tokens_used >= 0)`, foreign keys with explicit `ON DELETE` behaviour, and
-enum-like `CHECK (role IN ('user','assistant','tool'))` are the cheapest tests you will ever write: they
-run on every write path, including the ones you forgot. A partial unique index (`CREATE UNIQUE INDEX ... ON
-documents (tenant_id, external_id) WHERE deleted_at IS NULL`; a plain `UNIQUE` constraint cannot take a
-`WHERE`) encodes "unique among live rows", which code alone gets wrong under concurrent inserts.
+- **The cheapest tests you will write:** `NOT NULL`, `UNIQUE`, `CHECK (tokens_used >= 0)`, foreign keys
+  with explicit `ON DELETE` behaviour, and enum-like `CHECK (role IN ('user','assistant','tool'))`. They
+  run on every write path, including the ones you forgot.
+- **Partial unique indexes** encode "unique among live rows":
+  `CREATE UNIQUE INDEX ... ON documents (tenant_id, external_id) WHERE deleted_at IS NULL`; a plain
+  `UNIQUE` constraint cannot take a `WHERE`, and code alone gets this wrong under concurrent inserts.
 
 ### Types carry meaning
-Use `timestamptz`, never bare `timestamp`. A `timestamptz` is stored as an absolute instant (UTC
-internally); a bare `timestamp` stores only a wall-clock reading, so which instant it means depends on
-whatever zone the writer happened to assume, and rows written from servers in different zones cannot be
-compared. Use `numeric` for money and token prices, never `float`, because binary floats cannot
-represent 0.1 exactly and the rounding errors accumulate in invoices. Use `jsonb` for genuinely
-semi-structured payloads (raw model responses, tool arguments), and pull out any field you filter or join
-on into a real column with a real index. Store a `schema_version` next to any jsonb you will parse later.
+| Use | Never | Because |
+|---|---|---|
+| `timestamptz` | bare `timestamp` | `timestamptz` stores an absolute instant (UTC internally); `timestamp` stores a wall-clock reading whose meaning depends on the writer's assumed zone, so rows from servers in different zones cannot be compared |
+| `numeric` for money and token prices | `float` | binary floats cannot represent 0.1 exactly, and rounding errors accumulate in invoices |
+| `jsonb` for semi-structured payloads (raw model responses, tool arguments) | jsonb for fields you filter or join on | pull those fields into a real column with a real index |
+
+- **Version your JSON.** Store a `schema_version` next to any jsonb you will parse later.
 
 ### Multi-tenancy and deletion from day one
-Every tenant-owned row carries `tenant_id`, every index that serves a tenant-scoped query leads with it,
-and every query filters on it; PostgreSQL row-level security can enforce the filter when you do not trust
-every code path. A plain foreign key on `conversation_id` still lets a message carry tenant A's id while
-pointing at tenant B's conversation, because nothing compares the two columns. Make the parent's
-`(tenant_id, id)` unique and have the child reference that pair, so the database itself refuses a
-cross-tenant link. Decide how deletion works before the first user asks for it: a `deleted_at` soft-delete
-column keeps audit history but every query must exclude it; hard deletes with `ON DELETE CASCADE` are
-simpler but irreversible. Retention and right-to-erasure requests are much easier when data is owned by
-one clear parent row.
+- **Tenant on every row.** Every tenant-owned row carries `tenant_id`, every tenant-scoped index leads
+  with it, and every query filters on it. PostgreSQL row-level security can enforce the filter when you do
+  not trust every code path.
+- **Plain FKs allow cross-tenant links.** A foreign key on `conversation_id` still lets a message carry
+  tenant A's id while pointing at tenant B's conversation, because nothing compares the two columns.
+- **Composite FK fix.** Make the parent's `(tenant_id, id)` unique and have the child reference that pair,
+  so the database itself refuses a cross-tenant link.
+- **Decide deletion before the first user asks.** A `deleted_at` soft-delete column keeps audit history
+  but every query must exclude it. Hard deletes with `ON DELETE CASCADE` are simpler but irreversible.
+- **One clear owner.** Retention and right-to-erasure requests are much easier when data is owned by one
+  clear parent row.
 
 ### Indexes follow queries
-An index is a sorted copy of some columns that makes one access path cheap and every write slightly more
-expensive. The design question is never "which columns are important" but "which `WHERE`/`ORDER BY`
-patterns run often". A composite index on `(conversation_id, created_at)` serves "messages of this
-conversation in order" in one range scan; the same two columns in the other order do not. Equality
-columns go first, the range or sort column last, *because* the B-tree is sorted by the first column, then
-the second within ties: equality on the leading column narrows to one contiguous slice, inside which the
-next column is already in order. Put the range column first and the matching entries for one conversation
-are scattered across the whole range. Foreign-key columns usually need an index because joins
-and cascading deletes look rows up by them, and PostgreSQL does not create one automatically on the
-referencing side.
+- **An index is a sorted copy of some columns.** It makes one access path cheap and every write slightly
+  more expensive.
+- **Ask the right question.** Not "which columns are important" but which `WHERE` and `ORDER BY` patterns
+  run often.
+- **Column order matters.** `(conversation_id, created_at)` serves "messages of this conversation in
+  order" in one range scan; the same columns reversed do not.
+- **Equality first, range or sort last,** *because* the B-tree sorts by the first column, then the second
+  within ties. Equality on the leading column narrows to one contiguous slice already ordered by the next.
+  Put the range column first and one conversation's entries scatter across the whole range.
+- **Index foreign-key columns.** Joins and cascading deletes look rows up by them, and PostgreSQL does not
+  create one automatically on the referencing side.
 
 ### Evolving the schema
-The schema will change while the old code is still running, so every change is designed to be compatible
-with both versions for the length of a deploy. That is the **expand/contract** rule: add the new column or
-table, write to both, backfill in batches, move reads, and only then drop the old one. Renaming a column
-in one step breaks every instance still running the previous release. Some operations are cheap and some
-rewrite or lock the table: since PostgreSQL 11, adding a column with a constant default does not rewrite
-existing rows, while changing a column's type generally does; `CREATE INDEX CONCURRENTLY` builds an index
-without blocking writes at the cost of a slower build that can fail and leave an invalid index to drop.
+The schema changes while old code still runs, so every change must work with both versions for the length
+of a deploy. That is the **expand/contract** rule:
+
+1. Add the new column or table.
+2. Write to both.
+3. Backfill in batches.
+4. Move reads.
+5. Only then drop the old one. A one-step column rename breaks every instance still on the previous release.
+
+| Operation | Cost |
+|---|---|
+| Add a column with a constant default (since PostgreSQL 11) | does not rewrite existing rows |
+| Change a column's type | generally rewrites the table |
+| `CREATE INDEX CONCURRENTLY` | builds without blocking writes, but slower, and a failure leaves an invalid index to drop |
+
 Review every migration for which locks it takes on a large, hot table.
 
-## Example
-A minimal schema for an LLM application. Note the tenant column on every row (and the composite foreign
-key that keeps a message in its conversation's tenant), the constraints that encode
-rules, the jsonb for raw payloads next to the extracted columns (`model`, token counts) that queries
-actually filter and aggregate on, the composite index built for the one hot query (load a conversation's
-messages in order), and the plain index on the foreign key that cascading deletes need.
+## Diagram
+Read it top to bottom: design starts from entities and invariants, indexes come from queries, and
+denormalization is a measured exception, not a default.
+
+```mermaid
+flowchart TD
+    N["Name entities and cardinality"] --> K["Tables with surrogate keys"]
+    K --> C["FKs, CHECK, NOT NULL, UNIQUE"]
+    C --> NF["Normalize to 3NF"]
+    NF --> Q["List hot WHERE and ORDER BY"]
+    Q --> I["Composite indexes, equality first"]
+    I --> M{"Read measured slow?"}
+    M -->|"yes"| D["Denormalize one column, same transaction"]
+    M -->|"no"| KEEP["Keep normalized"]
+    D --> E["Ship via expand/contract migration"]
+    KEEP --> E
+```
+
+## Examples
+### A schema for an LLM application
+Note the tenant column on every row (and the composite foreign key that keeps a message in its
+conversation's tenant), the constraints that encode rules, and the jsonb for raw payloads next to the
+extracted columns (`model`, token counts) that queries actually filter and aggregate on.
+
+The composite index serves the one hot query (load a conversation's messages in order), and the plain
+index on the foreign key is what cascading deletes need.
 
 ```sql
 CREATE TABLE conversations (
@@ -178,47 +205,114 @@ CREATE TABLE tool_calls (
 CREATE INDEX tool_calls_by_message ON tool_calls (message_id);
 ```
 
+### Runnable: the database refuses bad writes
+Standard-library SQLite, so it runs anywhere. It shows the composite foreign key rejecting a cross-tenant
+link, a `CHECK` rejecting a bad role, and the composite index serving the ordered read without a sort.
+
+```python
+import sqlite3
+db = sqlite3.connect(":memory:")
+db.execute("PRAGMA foreign_keys = ON")            # SQLite enforces FKs only when asked
+db.executescript("""
+CREATE TABLE conversations (
+  id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+  UNIQUE (tenant_id, id));
+CREATE TABLE messages (
+  id INTEGER PRIMARY KEY, tenant_id TEXT NOT NULL, conversation_id TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('system','user','assistant','tool')),
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (tenant_id, conversation_id) REFERENCES conversations (tenant_id, id));
+CREATE INDEX messages_by_conversation ON messages (conversation_id, created_at);
+""")
+db.execute("INSERT INTO conversations VALUES ('c1', 'tenantA')")
+db.execute("INSERT INTO messages VALUES (1, 'tenantA', 'c1', 'user', '2025-01-01')")
+
+for bad in [(2, 'tenantB', 'c1', 'user', '2025-01-01'),       # cross-tenant link
+            (3, 'tenantA', 'c1', 'robot', '2025-01-01')]:     # role not allowed
+    try:
+        db.execute("INSERT INTO messages VALUES (?, ?, ?, ?, ?)", bad)
+    except sqlite3.IntegrityError as e:
+        print("rejected:", bad[0], e)
+
+plan = db.execute("EXPLAIN QUERY PLAN SELECT * FROM messages "
+                  "WHERE conversation_id = 'c1' ORDER BY created_at").fetchall()
+print(plan[-1][-1])   # SEARCH messages USING INDEX messages_by_conversation (conversation_id=?)
+```
+
+### Worked scenario: renaming a column with zero downtime
+The team wants `messages.content` renamed to `body` on a large, hot table while three app versions roll out.
+
+| Step | Deploy | What runs |
+|---|---|---|
+| 1. Expand | migration | add nullable `body` column (no table rewrite) |
+| 2. Dual write | app v2 | writes `content` and `body`; still reads `content` |
+| 3. Backfill | job | copy `content` into `body` in small batches by primary-key range |
+| 4. Move reads | app v3 | reads `body`, still writes both |
+| 5. Contract | app v4 + migration | stop writing `content`, then drop it |
+
+A one-step `ALTER TABLE ... RENAME COLUMN` would have broken every v1 instance still serving traffic.
+
+## Production patterns
+- **Lock-safe migrations.** For any migration on a hot table, set `SET lock_timeout = '5s'` in the
+  migration session so a blocked `ALTER` fails fast instead of queueing every write behind it, and build
+  indexes with `CREATE INDEX CONCURRENTLY`. Monitor lock waits in `pg_stat_activity` and drop invalid indexes.
+- **Add constraints without a long lock.** On large tables add a `CHECK` or foreign key as `NOT VALID`,
+  then run `ALTER TABLE ... VALIDATE CONSTRAINT` separately; new writes are checked immediately and
+  validation does not block them. Monitor validation duration.
+- **Row-level security for tenancy.** `ALTER TABLE messages ENABLE ROW LEVEL SECURITY` plus a policy on
+  `tenant_id = current_setting('app.tenant_id')::uuid`, set per request. Table owners bypass policies
+  unless you also `FORCE ROW LEVEL SECURITY`. Monitor with a CI test that tries a cross-tenant read.
+- **Index review from statistics.** Periodically list indexes with `idx_scan = 0` in
+  `pg_stat_user_indexes` (candidates to drop) and slow statements from `pg_stat_statements` (candidates
+  for a composite index). Monitor write latency on tables you add indexes to.
+- **Keep big payloads out of the hot table.** Full prompts and document text go in a side table or object
+  storage keyed by message id, so the hot table's working set fits in cache. Monitor table size with
+  `pg_total_relation_size` and cache hit ratio.
+
 ## Trade-offs
-- Normalization guarantees one fact in one place at the cost of joins; it flips toward denormalization
-  only when a specific read path is measured to be slow and its duplicate can be maintained transactionally.
-- Surrogate keys are stable and cheap to join, but you must still add a unique constraint on the natural
-  identifier or duplicates will silently appear.
-- UUID keys can be generated client-side and merged across systems, but random UUIDs cost index locality
-  and 16 bytes per reference versus 8 for bigint; time-ordered UUIDs recover most of the locality.
-- `jsonb` absorbs schema changes without migrations, but every field you later filter on without a
-  column and index becomes a sequential scan, and nothing enforces its shape.
-- Every index speeds one read pattern and taxes every insert and update; on write-heavy tables such as
-  event logs, each extra index is a measurable throughput cost.
-- Foreign keys and `CHECK`s cost a lookup per write but catch bugs at the only point that sees every path;
-  dropping them "for speed" trades a few microseconds for data you can no longer trust.
+- **Normalization vs joins.** One fact in one place costs joins; flip to denormalization only when a
+  specific read path is measured slow and its duplicate can be maintained transactionally.
+- **Surrogate keys vs natural identifiers.** Surrogate keys are stable and cheap to join, but you still
+  need a unique constraint on the natural identifier or duplicates silently appear.
+- **UUID vs bigint keys.** UUIDs can be generated client-side and merged across systems, but random UUIDs
+  cost index locality and 16 bytes per reference versus 8 for bigint; time-ordered UUIDs recover most of
+  the locality.
+- **`jsonb` flexibility vs queryability.** It absorbs schema changes without migrations, but every field
+  later filtered without a column and index becomes a sequential scan, and nothing enforces its shape.
+- **Read speed vs write cost.** Every index speeds one read pattern and taxes every insert and update; on
+  write-heavy tables such as event logs, each extra index is a measurable throughput cost.
+- **Constraint checks vs trust.** Foreign keys and `CHECK`s cost a lookup per write but catch bugs at the
+  only point that sees every path; dropping them "for speed" trades microseconds for untrustworthy data.
 
 ## Pitfalls
-- Omitting `tenant_id` from child tables and relying on joins to the parent for scoping; the symptom is a
-  query that returns another tenant's rows the first time someone forgets the join.
-- Using `float` for money or token prices; the symptom is invoices that are off by a cent and tests that
-  compare with tolerances.
-- Bare `timestamp` columns; the symptom is rows written before and after a server or container time-zone
-  change that are hours apart in meaning but adjacent in value, and "yesterday" reports that disagree.
-- Indexing columns rather than queries; the symptom is ten single-column indexes, slow writes, and the one
-  hot query still doing a sort because no composite index matches its `WHERE` and `ORDER BY`.
-- Entity-attribute-value tables ("one table of key/value pairs for everything") to avoid migrations; the
-  symptom is five-way self-joins to reconstruct one object and no constraints on anything.
-- Storing multi-megabyte payloads (full prompts, document text) in the hottest table; the symptom is
-  bloated tables, slow vacuums and a cache that no longer holds the working set.
-- Shipping a one-step rename or type change on a large table; the symptom is errors from instances still
-  on the previous release, or a migration that holds a lock for minutes while every write queues behind it.
-- Designing deletion last; the symptom is a right-to-erasure request that takes a week because data is
-  scattered across tables with no ownership chain.
+- **Omitting `tenant_id` from child tables.** Relying on joins to the parent for scoping; the symptom is
+  a query that returns another tenant's rows the first time someone forgets the join.
+- **Using `float` for money or token prices.** Symptom: invoices off by a cent and tests that compare
+  with tolerances.
+- **Bare `timestamp` columns.** Symptom: rows written before and after a server or container time-zone
+  change are hours apart in meaning but adjacent in value, and "yesterday" reports disagree.
+- **Indexing columns rather than queries.** Symptom: ten single-column indexes, slow writes, and the hot
+  query still sorting because no composite index matches its `WHERE` and `ORDER BY`.
+- **Entity-attribute-value tables to avoid migrations.** "One table of key/value pairs for everything";
+  the symptom is five-way self-joins to rebuild one object and no constraints on anything.
+- **Multi-megabyte payloads in the hottest table.** Full prompts or document text; the symptom is bloated
+  tables, slow vacuums and a cache that no longer holds the working set.
+- **One-step rename or type change on a large table.** Symptom: errors from instances on the previous
+  release, or a migration holding a lock for minutes while every write queues behind it.
+- **Designing deletion last.** Symptom: a right-to-erasure request takes a week because data is scattered
+  across tables with no ownership chain.
 
 ## When to use
-Reach for deliberate design whenever data will be read by anything other than the code that wrote it:
-dashboards, evaluations, audits, other services, or future you. For a throwaway prototype, a single jsonb
-column is fine; the moment a second query pattern appears, extract real columns. Measure before
-denormalizing: look at `EXPLAIN ANALYZE` on the slow query and at the write rate of the table you would
-duplicate into. In day-to-day work this shows up as migration reviews ("why is there no index for the
-query this endpoint runs?", "what happens to messages when a conversation is deleted?"). In interviews,
-expect to be handed a product description and asked to draw tables, keys and indexes, then defend each
-constraint and explain which query each index serves.
+- **Use when:** data will be read by anything other than the code that wrote it: dashboards, evaluations,
+  audits, other services, or future you.
+- **Prototype exception:** for a throwaway prototype a single jsonb column is fine; the moment a second
+  query pattern appears, extract real columns.
+- **Measure before denormalizing:** run `EXPLAIN ANALYZE` on the slow query and check the write rate of
+  the table you would duplicate into.
+- **Day to day:** migration reviews ("why is there no index for the query this endpoint runs?", "what
+  happens to messages when a conversation is deleted?").
+- **Interviews:** expect a product description and a request to draw tables, keys and indexes, then defend
+  each constraint and say which query each index serves.
 
 ## Role lens
 - **Engineer:** Writes the migration, picks types and constraints, and adds the composite index that
@@ -240,6 +334,41 @@ Deleting one message or one user's data means rewriting documents. The fix is a 
 reporting; keep the raw provider response in a jsonb column on the message row, where it is not filtered
 on. If the inbox view needs `last_message_at`, denormalize that single column and maintain it in the same
 transaction as the insert.
+
+## Interview questions
+### Why default to surrogate keys, and why UUIDv7 rather than UUIDv4?
+- **Surrogate keys are stable.** Natural keys like email or external IDs change, get reused or turn out
+  not unique, so a bigint identity or UUID is the primary key and the natural key gets its own unique constraint.
+- **UUIDv7 is time-ordered.** New keys land at the right edge of the B-tree, while random UUIDv4 inserts
+  into random pages, hurting cache locality and bloating the index as the table grows.
+
+### How would you stop a message from pointing at another tenant's conversation?
+- **A plain FK is not enough,** because nothing compares the child's `tenant_id` with the parent's.
+- **Use a composite key:** make `(tenant_id, id)` unique on conversations and reference that pair from
+  messages, so the database rejects a cross-tenant link on every write path.
+- **Add defence in depth** with row-level security on `tenant_id` and tenant-leading indexes so every query
+  is scoped and cheap.
+
+### The "load conversation" query is slow even though both columns are indexed. What do you check?
+- **Run `EXPLAIN ANALYZE`** and look for a sort node or bitmap combination of two single-column indexes.
+- **Fix the index shape:** one composite index with the equality column first and the sort column last,
+  `(conversation_id, created_at)`, returns rows already ordered in one range scan.
+- **Then check write cost,** dropping single-column indexes the composite one makes redundant.
+
+### When would you choose jsonb or denormalization over a normalized design?
+- **jsonb for payloads you do not query:** raw provider responses and tool arguments, with a
+  `schema_version`, and extracted columns for anything filtered or joined.
+- **Denormalize after measurement:** a single column like `last_message_at` for a hot inbox query,
+  maintained in the same transaction as the insert, with the invariant written down.
+- **Avoid both** when several teams query the data in ways you cannot predict; normalized tables keep it
+  correct for unknown readers.
+
+### How do you change a schema on a large production table without downtime?
+- **Expand/contract:** add the new column, dual-write, backfill in batches, move reads, then drop the old
+  column a release later, so every running version stays compatible.
+- **Watch locks:** adding a column with a constant default is cheap since PostgreSQL 11, a type change
+  generally rewrites the table, and indexes go in with `CREATE INDEX CONCURRENTLY`.
+- **Fail fast:** set a short lock timeout in migration sessions so a blocked DDL does not queue all writes.
 
 ## Quiz
 ### Q: Why is a composite index on (conversation_id, created_at) better than two single-column indexes for loading a conversation's messages in order?

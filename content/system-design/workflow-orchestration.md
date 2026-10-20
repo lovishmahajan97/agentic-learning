@@ -132,6 +132,28 @@ A worker crashes in the middle of step 3 of a five-step run.
 - **So:** every activity or task that acts on the outside world needs an idempotency key derived from the
   run and the step.
 
+## Diagram
+Temporal recovery for the extraction workflow in the examples. Watch the second worker: it replays
+from history, gets the extraction result without calling the LLM again, and only `write_record` is new
+work.
+
+```mermaid
+sequenceDiagram
+    participant W1 as Worker 1
+    participant S as Temporal server
+    participant W2 as Worker 2
+    W1->>S: schedule activity extract_fields
+    S->>W1: run extract_fields, retried per policy on a 503
+    W1->>S: activity completed with fields, confidence 0.62
+    W1->>S: start 3 day timer for the approval wait
+    Note over W1: deploy restarts every worker
+    S->>S: record approve signal from reviewer
+    S->>W2: workflow task with full event history
+    Note over W2: replay returns recorded fields, no LLM call
+    W2->>S: schedule write_record, the first new command
+    S->>W2: run write_record, idempotent by key
+```
+
 ## Examples
 ### Temporal: document extraction with a durable approval wait
 Activities carry the side effects and retry policies; the workflow carries only deterministic
@@ -308,6 +330,52 @@ external side effect happened. Safety therefore depends on the payment activity 
 must use an idempotency key derived from the workflow id and step so the payment provider deduplicates
 the second call. This is the general rule for every orchestrator: durable progress plus idempotent steps
 is the achievable form of exactly-once.
+
+## Interview questions
+### Explain deterministic replay. Why does Temporal need it?
+
+- **Mechanism:** the server keeps an append-only event history; after a crash, a worker re-runs the
+  workflow code from the top and completed activity results come from history instead of re-execution.
+- **Why determinism:** replay only reaches the same point if the code makes the same decisions, so no
+  wall-clock reads, random numbers or direct I/O in workflow code; use activities and SDK APIs such as
+  `workflow.now()`.
+
+### Place Airflow, Prefect and Temporal against three AI workloads.
+
+- **Nightly re-chunk and re-embed with backfill over past days:** Airflow, because data intervals make
+  retries and backfills overwrite one day's partition.
+- **Hourly parse-and-index branching per document type:** Prefect, because the graph is ordinary Python
+  shaped by runtime data (or Airflow with dynamic task mapping).
+- **An agent run waiting days for approval that must never refund twice:** Temporal, with durable
+  signals, timers and idempotent activities.
+
+### After a deploy, in-flight workflows fail with non-determinism errors. What happened and how do you fix it?
+
+- **Cause:** the workflow code changed while runs were in flight, so replaying old histories against new
+  code produces different commands than were recorded.
+- **Fix:** wrap the change in `workflow.patched("change-id")` so old histories take the old branch and new
+  runs the new one, then remove the patch once old runs finish; monitor open runs on old versions.
+
+### A backfill doubled the rows for exactly the days that were retried. What is the bug?
+
+- **The task appends instead of overwriting its interval.** Airflow's retry safety rests on each run
+  reading only its `data_interval_start` to `data_interval_end` and overwriting that partition.
+- **Detect it** by comparing row counts per partition before and after retries or backfills; any growth
+  on a re-run is the bug.
+
+### When would you not add a workflow orchestrator at all?
+
+- **Short chains inside a request:** a ten-second chain of three model calls needs only an in-process
+  orchestrator with good logging.
+- **The cost of adding one** is an operational component, a learning curve and, for Temporal, a server
+  to run or buy plus determinism discipline.
+
+### Why keep document text and embeddings out of workflow history, and how do you bound history?
+
+- **Every activity input and output lands in history,** so megabyte payloads slow UIs, hit size limits
+  and fail runs on large documents; pass references to object storage instead.
+- **Long-lived loops** should call `workflow.continue_as_new(...)` with compact state; monitor history
+  event count and size per workflow against the server's limits.
 
 ## Quiz
 ### Q: Why must Temporal workflow code be deterministic?

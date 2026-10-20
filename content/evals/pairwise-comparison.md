@@ -109,6 +109,27 @@ bootstrapped intervals for this reason.
   preference for length, say) is learned by the policy. Debiasing the judge is also debiasing the
   training data.
 
+## Diagram
+One pair travels through both orders, ties are split, and the verdicts feed two aggregations: a win rate
+against production for a ship decision, or a Bradley–Terry fit for a ranking.
+
+```mermaid
+flowchart TD
+    P["Prompt plus answers A and B"] --> O1["Judge: A shown first"]
+    P --> O2["Judge: B shown first"]
+    O1 --> C{"Same verdict both orders?"}
+    O2 --> C
+    C -->|"no"| T["Count as tie, 0.5 each"]
+    C -->|"yes"| V["Record A, B or tie"]
+    T --> L[("Verdict log with order and judge")]
+    V --> L
+    L --> W["Win rate vs baseline plus bootstrap CI"]
+    L --> BT["Bradley-Terry fit for many systems"]
+    W --> D{"Lower bound above 50% and gates pass?"}
+    D -->|"yes"| S["Ship or confirm with online A/B"]
+    D -->|"no"| M["More comparisons or reject"]
+```
+
 ## Examples
 ### Fitting Bradley–Terry strengths for four systems
 Four systems compared on 100 prompts per pair; `wins[i, j]` counts how often system i beat system j,
@@ -256,6 +277,42 @@ is used anywhere, judge both orders. Fit Bradley–Terry on every comparison for
 bootstrap intervals on the strengths. The decision rule is a variant whose interval against production
 excludes 50% and which passes the rubric gates, with per-category win rates and the length difference
 checked. If intervals overlap, buy more comparisons or move to an online A/B test.
+
+## Interview questions
+### Why do pairwise judgments tend to be more reliable than absolute scores?
+- **No shared scale is needed.** Raters disagree about what a 7 means and drift between sessions, but
+  usually agree on which of two answers is better, and repeat that verdict later.
+- **Omissions become visible** because the second answer shows what the first left out.
+- **It answers the release question directly:** "is B better than A" is what the comparison measures,
+  with no subtraction of two noisy averages.
+
+### Your new prompt wins 68% against production, then loses in an online A/B. What went wrong?
+- **Check position and length first:** were both orders judged, and is the new prompt's output longer?
+  Side-by-side presentation amplifies length and style bias.
+- **Check categories:** a global win can hide a loss on the traffic slice that dominates production.
+- **Check the prompt set:** if the offline prompts do not match the live distribution, the win rate
+  measured a different product. Rebuild the set from sampled production traffic.
+
+### When would you not use pairwise comparison?
+- **As the only release gate,** because a high win rate against a weak baseline says nothing about
+  absolute acceptability; pair it with rubric gates.
+- **When an executable check exists** such as tests or exact match.
+- **When you must rank many systems all-pairs:** n(n−1)/2 pairs grows quadratically, so anchor to a
+  baseline or a few reference systems instead.
+
+### How many comparisons do you need to detect a 5-point win-rate difference?
+- **Use the binomial interval:** n ≈ z² p(1−p) / h². For p = 0.55 and half-width 0.05 that is about 381.
+- **Halving the interval costs about 4x** the comparisons, because the standard error scales with 1/√n.
+- **Spend adaptively:** a cheap first round drops clear losers, and the remaining budget goes where
+  intervals overlap.
+
+### Why use Bradley–Terry instead of Elo for a static leaderboard?
+- **Bradley–Terry is a joint maximum-likelihood fit** over all comparisons, so the ranking does not depend
+  on the order games were fed in, and missing pairs are handled naturally.
+- **Elo is sequential** with step size K, designed for live play, and gives different ratings when a
+  static dataset is shuffled.
+- **The likelihood supports bootstrap intervals,** which is what a leaderboard needs to say two systems
+  are tied.
 
 ## Quiz
 ### Q: Why did large preference leaderboards move from Elo-style updates to Bradley–Terry maximum likelihood?

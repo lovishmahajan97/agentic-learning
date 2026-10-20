@@ -92,6 +92,22 @@ as `tenant=acme/`, which prune whole files.
   over Arrow arrays.
 - **Light work only.** For analytical queries you usually reach for Polars or DuckDB on top of Arrow.
 
+## Diagram
+A selective Parquet read: the footer's statistics decide which row groups are fetched, only requested
+column chunks are decoded, and the resulting Arrow table moves on by pointer unless a conversion copies it.
+
+```mermaid
+flowchart TD
+    Q["read_table with columns and filters"] --> F["Read the footer: schema and min-max statistics"]
+    F --> RG{"Can this row group match the filter?"}
+    RG -->|"no"| SK["Skip the row group"]
+    RG -->|"yes"| CC["Fetch only the requested column chunks"]
+    CC --> DE["Decompress and decode into Arrow buffers"]
+    DE --> T["Arrow Table of ChunkedArrays"]
+    T -->|"zero-copy by pointer"| L["Polars, DuckDB, NumPy for fixed-width columns"]
+    T -->|"default to_pandas"| C["Full copy: strings become Python objects"]
+```
+
 ## Examples
 ### A RAG chunk-and-embedding table in Parquet
 Storing chunk text and embeddings for a RAG corpus in Parquet with an explicit schema, then reading back
@@ -224,6 +240,45 @@ skip data: partition the dataset by tenant (`tenant=x/` directories) or sort by 
 row-group statistics exclude other tenants. Third, tune file and row-group sizes so there are not
 thousands of tiny files. If queries are frequent and latency matters, Parquet is the source of truth but
 not the serving layer; build an ANN index per tenant from it.
+
+## Interview questions
+### What is the difference between Arrow and Parquet, and why do you need both?
+- **Arrow is an in-memory columnar spec:** contiguous values buffers, a validity bitmap for nulls and
+  offsets for strings, so libraries share tables by passing pointers instead of serializing.
+- **Parquet is an on-disk columnar file format:** row groups, dictionary and run-length encoding,
+  compression and min and max statistics, so readers skip columns and row groups.
+- **pyarrow bridges them:** Parquet is small on disk and selectively readable, Arrow is fast to compute
+  on, and pyarrow converts efficiently between the two.
+
+### Peak memory is several times `table.nbytes` after converting to pandas. Why, and what do you do?
+- **Default `to_pandas()` copies strings:** each Arrow string becomes a Python object in an `object`
+  column, a full copy that is often several times larger.
+- **Keep Arrow types:** use `to_pandas(types_mapper=pd.ArrowDtype)`, or hand the table to Polars or
+  DuckDB, which read Arrow buffers directly.
+- **Check other copies too:** `to_numpy()` on columns with nulls or several chunks also copies or fails;
+  `combine_chunks()` and null handling come first.
+
+### A streaming ingestion job produces thousands of tiny Parquet files and reads are slow. What happened?
+- **Cause:** each file has its own footer to open and parse, so per-file overhead dominates and row
+  groups are too small to compress well or skip usefully.
+- **Fix:** a scheduled compaction job that rewrites partitions with `ds.write_dataset` using its
+  `max_rows_per_file` and `min_rows_per_group` limits.
+- **Monitor:** file count and average file size per partition, plus files opened per query.
+
+### How do you choose row-group size and partitioning?
+- **Large row groups** compress better and scan faster; **small ones** skip at finer grain and use less
+  memory per read, so pick by whether workloads scan or seek.
+- **Statistics only help when data is sorted:** on unsorted files every row group's min and max overlap
+  the predicate, and a filtered read costs a full scan.
+- **Partition by the dominant filter,** such as `tenant=acme/`, with tens to thousands of values; one
+  directory per document recreates the tiny-files problem.
+
+### A write fails with an offset overflow on a large text column. What is going on?
+- **32-bit offsets:** Arrow's `string` type stores row boundaries as 32-bit offsets into one shared data
+  buffer, so a single array's text cannot exceed about 2 GB.
+- **Fix:** declare the column as `pa.large_string()`, which uses 64-bit offsets, or write in smaller
+  chunks.
+- **Prevent it:** put `large_string` for chunk text in the explicit schema, as in the RAG example.
 
 ## Quiz
 ### Q: What lets a Parquet reader skip entire row groups when a query filters on `tenant = "acme"`?

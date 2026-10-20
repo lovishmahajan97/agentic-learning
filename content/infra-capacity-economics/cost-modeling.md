@@ -5,7 +5,7 @@ name: Cost modeling (cost per request, token economics)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - infra-capacity-economics/unit-economics-per-successful-task
   - infra-capacity-economics/cost-optimization
@@ -20,26 +20,25 @@ sources:
 ---
 
 ## TL;DR
-A cost model turns a request's shape into dollars: fresh, cached and output tokens (including hidden
-reasoning) times their prices, plus the non-model calls around them. Token economics explains the
-prices: output costs more because decode is sequential, and agents re-send the whole history every
-turn, so cost grows roughly quadratically with turns. Model the logged distribution, not a typical
-request, because costs are heavy-tailed and the tail sets the bill.
+A cost model turns request shape into dollars: fresh, cached and output tokens (including hidden
+reasoning) times prices, plus non-model calls. Output costs more because decode is sequential, agent
+cost grows roughly quadratically with turns, and the heavy tail sets the bill.
 
 ## Why it exists
-LLM spend is metered per token, so cost is set by the shape of each request, not by servers running.
-Two features that look alike on a product roadmap can differ in cost by a hundred times: a one-shot
-classification with a 300-token prompt versus a 20-turn agent that pastes tool results into its context
-each step. Teams that estimate cost as "requests per day × a typical price" are routinely surprised,
-because they miss three things.
-
-First, input and output are priced differently, and models that reason emit billed tokens the user never
-sees. Second, conversation and agent loops re-send everything each turn, so a long session is not N
-times a short one but closer to N². Third, the cost distribution is heavy-tailed: a small share of long
-documents, runaway agent loops or retries can dominate the invoice. A cost model makes these visible
-*before* launch, which is when you can still change the design (cap turns, cache prefixes, route to a
-smaller model) instead of explaining an invoice. It is also the input to break-even analysis, pricing
-and unit economics: none of those are possible without a defensible cost per request.
+- **Spend is metered per token.** Cost is set by the shape of each request, not by servers running.
+- **Similar-looking features differ a hundredfold.** A one-shot classification with a 300-token prompt
+  versus a 20-turn agent that pastes tool results into its context each step.
+- **"Requests per day × a typical price" misses three things:**
+  1. **Input and output are priced differently,** and reasoning models emit billed tokens the user never
+     sees.
+  2. **Loops re-send everything each turn,** so a long session is not N times a short one but closer
+     to N².
+  3. **The distribution is heavy-tailed:** a small share of long documents, runaway agent loops or
+     retries can dominate the invoice.
+- **It works before launch,** when you can still change the design (cap turns, cache prefixes, route to a
+  smaller model) instead of explaining an invoice.
+- **It feeds everything else:** break-even analysis, pricing and unit economics all need a defensible
+  cost per request.
 
 ## How it works
 ### The per-call formula
@@ -49,49 +48,77 @@ cost = fresh_input_tokens × p_in
      + output_tokens × p_out            # includes reasoning/thinking tokens where billed
      + non-model costs (embeddings, rerank, vector search, tool APIs, guardrail models)
 ```
-Some providers also charge a premium to *write* a prompt-cache entry, a discount for asynchronous batch
-processing, or different rates above a context-length threshold. Pricing structures are vendor- and
-model-specific and change often, so a cost model should read prices from configuration, never hard-code
-them.
+- **Other price terms exist:** some providers charge a premium to *write* a prompt-cache entry, discount
+  asynchronous batch processing, or use different rates above a context-length threshold.
+- **Read prices from configuration, never hard-code them,** because pricing is vendor- and
+  model-specific and changes often.
 
 ### Why output costs more
-Prefill processes the whole prompt in one parallel pass, which uses GPU compute efficiently. Decode
-produces output one token at a time, and each step reads the full weights and KV cache for very little
-arithmetic, so a GPU produces far fewer output tokens per second than it ingests input tokens. Providers
-price that: output is commonly several times the input price. The design consequence is that verbosity
-is expensive, and a reasoning model that "thinks" for thousands of tokens can cost more than a larger
-model that answers directly.
+| Phase | How it runs | GPU efficiency |
+|---|---|---|
+| Prefill (input) | Whole prompt in one parallel pass | Uses compute efficiently |
+| Decode (output) | One token at a time; each step reads full weights and KV cache for little arithmetic | Far fewer tokens per second than input |
+
+- **Providers price that:** output is commonly several times the input price.
+- **Design consequence:** verbosity is expensive, and a reasoning model that "thinks" for thousands of
+  tokens can cost more than a larger model that answers directly.
 
 ### Tokens are not words, and not portable
-Token counts depend on the tokenizer. The same text yields different counts on different model
-families, and code, non-English text and JSON tend to tokenize less efficiently than English prose. A
-per-word estimate built on one model is wrong on another; measure with the target model's tokenizer.
+- **Counts depend on the tokenizer.** The same text yields different counts on different model families.
+- **Code, non-English text and JSON** tend to tokenize less efficiently than English prose.
+- **So** a per-word estimate built on one model is wrong on another; measure with the target model's
+  tokenizer.
 
 ### Multi-turn growth
-In a chat or agent loop, turn t sends the system prompt, tool schemas and every earlier message. If each
-turn adds d tokens, the total input over T turns is about T·prefix + d·T²/2. The quadratic term dominates
-long sessions. Two levers attack it: prompt (prefix) caching, which bills repeated prefixes at a
-discount, and context compaction, which shrinks the history itself. They act differently: caching
-leaves the T² shape intact but multiplies its coefficient by the cached-to-fresh price ratio (0.1 in the
-example below), while compaction caps how large the history can grow, turning the quadratic back into
-roughly linear growth once the cap is reached. Caching also only helps if the next turn arrives within
-the cache lifetime; human think time between turns can exceed it, so measure the cached-token share
-rather than assuming it.
+Turn t sends the system prompt, tool schemas and every earlier message. If each turn adds d tokens:
+
+```
+total input over T turns ≈ T·prefix + d·T²/2
+```
+
+- **The quadratic term dominates long sessions.**
+- **Prompt (prefix) caching** bills repeated prefixes at a discount. It leaves the T² shape intact but
+  multiplies its coefficient by the cached-to-fresh price ratio (0.1 in the example below).
+- **Context compaction** shrinks the history itself, capping how large it can grow and turning the
+  quadratic back into roughly linear growth once the cap is reached.
+- **Caching needs the next turn within the cache lifetime.** Human think time between turns can exceed
+  it, so measure the cached-token share rather than assuming it.
 
 ### Self-hosted token cost
-For your own GPUs, the "price" is derived: cost per token = (GPU $/hour) / (tokens produced per hour at
-the utilization you actually achieve). The utilization term is decisive. A fleet that is busy a third
-of the time pays three times as much per token as the same fleet kept full.
+```
+cost per token = (GPU $/hour) / (tokens produced per hour at the utilization you actually achieve)
+```
+- **Utilization is decisive.** A fleet busy a third of the time pays three times as much per token as the
+  same fleet kept full.
 
 ### Model the distribution
-Build the model from logged traces: for each feature, the distribution of input, cached and output
-tokens and of turns per session. Report p50, p95 and p99 cost per request and the share of spend from the
-top 1% of requests. For the monthly forecast the right statistic is the true mean from that distribution
-(forecast = Σ over features of volume × mean cost per request), and it is usually well above the cost of
-the "typical" request people reason from. For risk, the mean alone hides the runaway sessions that
-budgets and step caps must bound, so the forecast should state how much of it comes from the tail.
+1. **Build from logged traces:** per feature, the distribution of input, cached and output tokens and of
+   turns per session.
+2. **Report** p50, p95 and p99 cost per request and the share of spend from the top 1% of requests.
+3. **Forecast with the true mean:** forecast = Σ over features of volume × mean cost per request. It is
+   usually well above the cost of the "typical" request people reason from.
+4. **State the tail share,** because the mean alone hides the runaway sessions that budgets and step caps
+   must bound.
 
-## Example
+## Diagram
+From traces to a forecast: per-call costs roll up into per-session costs, whose distribution gives both
+the forecast (mean) and the risk (tail) that caps must bound.
+
+```mermaid
+flowchart TD
+    T[("Logged traces per feature")] --> K["Tokens by type per call"]
+    P["Price config by model"] --> C["Per-call cost"]
+    K --> C
+    N["Non-model costs"] --> C
+    C --> S["Per-session cost: sum over turns"]
+    S --> D["Distribution: p50, p95, p99"]
+    D --> F["Forecast: volume x mean"]
+    D --> R["Tail share: top 1 percent"]
+    R --> L["Turn and token caps"]
+```
+
+## Examples
+### Per-call, agent-loop and self-hosted cost
 Illustrative prices: $3 per million input tokens, $15 per million output, $0.30 per million cached input
 (cache-write premiums ignored). Substitute your provider's current sheet.
 
@@ -121,37 +148,96 @@ for util in (0.9, 0.3):
 # 0.9 -> $0.82/M ; 0.3 -> $2.47/M
 ```
 
-Going from 4 to 24 turns is 6× the turns but about 14× the cost without caching; prefix caching cuts the
-24-turn run by more than 4×. The self-hosted number shows why utilization, not GPU list price, decides
-whether owning hardware is cheap.
+| Run | No cache | Prefix cache |
+|---|---|---|
+| 4 turns | $0.074 | $0.036 |
+| 12 turns | $0.338 | $0.101 |
+| 24 turns | $1.022 | $0.228 |
+
+- **Quadratic:** 4 to 24 turns is 6× the turns but about 14× the cost without caching.
+- **Caching:** cuts the 24-turn run by more than 4×.
+- **Self-hosted:** utilization, not GPU list price, decides whether owning hardware is cheap.
+
+### Forecasting from a heavy-tailed distribution
+Synthetic lognormal token counts stand in for logged traces; with your own logs, replace the loop with
+real per-request token counts.
+
+```python
+import random
+
+random.seed(1)
+P_IN, P_OUT = 3.00, 15.00                          # $ per million tokens (illustrative)
+
+costs = []
+for _ in range(50_000):
+    fresh_in = random.lognormvariate(8.3, 0.9)     # median ~4,000 tokens
+    out = random.lognormvariate(5.7, 0.7)          # median ~300 tokens
+    costs.append((fresh_in * P_IN + out * P_OUT) / 1e6)
+
+costs.sort()
+n = len(costs)
+pct = lambda q: costs[int(q * (n - 1))]
+mean = sum(costs) / n
+top1 = sum(costs[int(0.99 * n):]) / sum(costs)
+
+print(f"p50 ${pct(0.50):.4f}  p95 ${pct(0.95):.4f}  p99 ${pct(0.99):.4f}")   # ~0.018, 0.061, 0.106
+print(f"top 1% of requests = {top1:.0%} of spend")                           # ~6%
+print(f"forecast at 2M req/month: ${mean * 2_000_000:,.0f} "                 # ~$47.8k
+      f"(median-based: ${pct(0.5) * 2_000_000:,.0f})")                       # ~$36.2k
+```
+
+- **The median underforecasts by about a quarter** even in this mild tail; real agent traffic with
+  runaway sessions has a fatter tail and a larger gap.
+- **p99 is almost 6× p50**, which is where per-session caps earn their keep.
+
+## Production patterns
+- **Price table as versioned config.** Keep per-model prices (input, cached input, cache write, output,
+  batch) in a config file with an effective date, and compute cost from it at query time. Monitor for
+  calls to models missing from the table.
+- **Log provider usage fields, not estimates.** Record the token counts each response returns (for
+  example Anthropic's `cache_read_input_tokens` and `cache_creation_input_tokens`, OpenAI's
+  `reasoning_tokens` under completion token details) tagged with feature and request IDs. Monitor billed
+  tokens against visible text length to catch hidden reasoning or schema bloat.
+- **Count tokens with the target tokenizer before launch.** Use the provider's counter (for example
+  `tiktoken` for OpenAI models or Anthropic's token-counting endpoint) on real sample documents, not a
+  words-to-tokens ratio. Re-run it on every model switch.
+- **Per-session budget guards.** Enforce maximum turns, maximum tokens and a cumulative-cost cap per
+  agent session, stopping or escalating when hit. Monitor how often caps fire and the p99 cost per
+  session.
+- **Monthly forecast review from traces.** Recompute volume × mean cost per feature and the top-1% share,
+  and compare with the invoice. Monitor forecast error; a growing gap usually means a new tail.
 
 ## Trade-offs
-- A detailed per-feature model catches design choices that will be expensive, but costs time to build
+- **Detailed per-feature model vs effort.** It catches expensive design choices, but costs time to build
   and maintain; for a prototype a spreadsheet of token counts per call is enough until traffic is real.
-- Prompt caching cuts repeated-prefix cost sharply, but only pays when prefixes are byte-identical and
-  reused within the cache lifetime; it flips to a small loss where writes carry a premium and reuse is rare.
-- Reasoning models raise output tokens per task, but can lower total cost when they replace several
-  retries or a multi-step chain; measure cost per *successful* task, not per call.
-- Self-hosting lowers marginal token cost at high utilization, but turns cost fixed; it flips to more
-  expensive than an API when traffic is low or spiky.
+- **Prompt caching vs reuse.** It cuts repeated-prefix cost sharply, but only pays when prefixes are
+  byte-identical and reused within the cache lifetime; it flips to a small loss where writes carry a
+  premium and reuse is rare.
+- **Reasoning models vs output tokens.** They raise output tokens per task, but can lower total cost when
+  they replace several retries or a multi-step chain; measure cost per *successful* task, not per call.
+- **Self-hosting vs fixed cost.** It lowers marginal token cost at high utilization, but turns cost fixed;
+  it flips to more expensive than an API when traffic is low or spiky.
 
 ## Pitfalls
-- Estimating from a typical or hand-picked request instead of the logged distribution; the symptom is an invoice several times the forecast,
-  driven by a long tail of large documents or long agent sessions.
-- Forgetting hidden reasoning tokens or tool-schema tokens in the prompt; visible as billed input or
-  output counts far above what the visible text suggests.
-- Reusing a token-per-word ratio from one model family on another; the forecast drifts after a model
-  switch even though the traffic did not change.
-- Ignoring non-model costs such as embeddings, reranking, guardrail models and trace storage; total
-  spend per request comes out well above the LLM line item.
+- **Estimating from a typical or hand-picked request instead of the logged distribution.** Symptom: an
+  invoice several times the forecast, driven by a long tail of large documents or long agent sessions.
+  Fix: forecast with the mean of the logged distribution and report the tail.
+- **Forgetting hidden reasoning tokens or tool-schema tokens in the prompt.** Symptom: billed input or
+  output counts far above what the visible text suggests. Fix: log provider usage fields.
+- **Reusing a token-per-word ratio from one model family on another.** Symptom: the forecast drifts after
+  a model switch even though traffic did not change. Fix: re-count with the new tokenizer.
+- **Ignoring non-model costs** such as embeddings, reranking, guardrail models and trace storage.
+  Symptom: total spend per request well above the LLM line item. Fix: include them in the formula.
 
 ## When to use
-Build a cost model before committing to any feature design that calls a model in a loop, ingests
-user-supplied documents, or will run at volume; rebuild it from real traces after launch. Use it to set
-max-turn and max-token limits, to decide where prompt caching and smaller models pay off, and as the
-input to pricing and break-even decisions. Measure tokens by type (fresh, cached, output, reasoning) per
-feature and per request, and watch the p95 and p99, not only the mean. In interviews, deriving the
-quadratic growth of agent cost and the utilization term in self-hosted cost shows real understanding.
+- **Use before** committing to any design that calls a model in a loop, ingests user-supplied documents,
+  or will run at volume; rebuild it from real traces after launch.
+- **Use it to** set max-turn and max-token limits, decide where prompt caching and smaller models pay off,
+  and feed pricing and break-even decisions.
+- **Measure** tokens by type (fresh, cached, output, reasoning) per feature and per request, and watch the
+  p95 and p99, not only the mean.
+- **Interviews:** deriving the quadratic growth of agent cost and the utilization term in self-hosted cost
+  shows real understanding.
 
 ## Role lens
 - **Engineer:** Logs token counts by type for every call, tags them with feature and request IDs, and
@@ -170,6 +256,39 @@ undercounts badly. The tail also matters: a few 30-turn sessions dominate. I wou
 traces with token distributions per turn, enable prompt caching for the stable prefix, compact or
 summarize history past a threshold, cap turns and tokens per session, and route simple tickets to a
 smaller model, then track p95 cost per resolved ticket rather than per call.
+
+## Interview questions
+### Walk me through estimating the cost of one request to an LLM feature.
+- **Tokens by type:** fresh input, cached input and output including reasoning, each times its price.
+- **Plus non-model calls:** embeddings, reranking, vector search, tool APIs and guardrail models.
+- **From real data:** count with the target model's tokenizer on real samples, and read prices from
+  config because they change.
+
+### Why does a 24-turn agent cost far more than 6 times a 4-turn one?
+- **Each turn re-sends the whole history,** so total input is about T·prefix + d·T²/2.
+- **In the illustrative example** 6× the turns is about 14× the cost.
+- **Levers:** prefix caching lowers the quadratic coefficient; compaction caps history growth so cost
+  becomes roughly linear; turn caps bound the tail.
+
+### When is a reasoning model cheaper than a non-reasoning one despite more output tokens?
+- **When it replaces retries or chains:** one longer call that succeeds can beat several short calls that
+  fail or need a multi-step pipeline.
+- **When failure is expensive:** human review or escalation dwarfs token cost.
+- **Measure cost per successful task,** and cap reasoning with a budget or effort setting.
+
+### Your monthly forecast was $36k and the invoice was $48k with the forecast volume. What went wrong?
+- **Likely a median-based forecast:** the mean of a heavy-tailed distribution sits well above the
+  typical request.
+- **Check the tail:** p99 cost and the top-1% share per feature, plus hidden reasoning and schema tokens.
+- **Fix:** forecast as volume × mean from traces, state the tail share, and add per-session caps.
+
+### How do you compare self-hosting with an API on cost per token?
+- **Self-hosted cost per token** is GPU $/hour divided by tokens produced per hour at achieved
+  utilization.
+- **Utilization dominates:** in the illustrative example 90% gives $0.82 per million output tokens and
+  30% gives $2.47.
+- **Self-hosting wins** only with steady high utilization; low or spiky traffic favors the API because
+  its cost stays variable.
 
 ## Quiz
 ### Q: Why do hosted providers typically price output tokens higher than input tokens?

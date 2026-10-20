@@ -5,7 +5,7 @@ name: Offline vs online evaluation
 kind: decision
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - evals/a-b-testing
   - evals/golden-dataset
@@ -20,150 +20,246 @@ sources:
 ---
 
 ## TL;DR
-Offline evaluation scores a system on a fixed dataset before it meets users; online evaluation measures
-it on live traffic through user behaviour, sampled judging of real traces, or controlled experiments.
-Offline is fast, cheap, reproducible and safe but only as good as its dataset and graders; online is the
-truth about outcomes but slow, noisy, risky and confounded. Neither replaces the other: offline gates
-what ships, online tells you whether offline measured the right thing, and sampled online traffic
-refills the offline set.
+Offline evaluation scores a fixed dataset before users see a change; online evaluation measures live
+traffic. Offline is fast and safe but proxy-bound; online is outcome truth but slow and noisy. Offline
+gates releases, online validates offline, traces refill it.
 
 ## Why it exists
-Offline scores and real outcomes drift apart for four structural reasons. The golden set is last
-quarter's traffic, and the mix of intents shifts every week. The grader is a proxy: "the judge says the
-answer is correct" is not "the customer's ticket was resolved without a human". Users adapt to the
-system: they rephrase, retry, give up, or learn which questions it answers well, so the inputs change in
-response to the outputs. And production has effects the harness does not model: tool latencies, an
-index refreshed hours later than the eval copy, conversations that run eight turns instead of one. A
-team that only evaluates offline ships a version that scores higher and performs worse, and cannot see
-why.
+Offline scores and real outcomes drift apart for four structural reasons:
+- **The golden set ages.** It is last quarter's traffic, and the intent mix shifts every week.
+- **The grader is a proxy.** "The judge says the answer is correct" is not "the customer's ticket was
+  resolved without a human".
+- **Users adapt.** They rephrase, retry, give up, or learn which questions the system answers well, so
+  inputs change in response to outputs.
+- **Production has unmodelled effects.** Tool latencies, an index refreshed hours later than the eval
+  copy, conversations that run eight turns instead of one. An offline-only team ships a version that
+  scores higher, performs worse, and cannot see why.
 
-The opposite habit, "ship it and watch the dashboard", fails just as reliably. There is no
-counterfactual: did satisfaction move because of the prompt or because of the holiday, the marketing
-campaign, or the provider's silent model update? Outcome signals are sparse and noisy, so detecting a
-real change takes weeks of traffic. Failures reach users before anyone measures them, and when a
-regression is noticed there is no way to bisect it across the ten changes shipped that fortnight.
+"Ship it and watch the dashboard" fails just as reliably:
+- **No counterfactual.** Did satisfaction move because of the prompt, the holiday, the marketing
+  campaign, or the provider's silent model update?
+- **Sparse, noisy outcomes.** Detecting a real change takes weeks of traffic.
+- **Failures reach users first**, and a regression cannot be bisected across the ten changes shipped
+  that fortnight.
 
-The resolution is not to pick one but to arrange them as a ladder, each rung more expensive and more
-truthful than the one below, with defined hand-offs: offline catches what can be caught cheaply, online
-confirms what only users can confirm, and the two are reconciled whenever they disagree.
+The resolution is a ladder, each rung more expensive and more truthful than the one below, with defined
+hand-offs: offline catches what is cheap to catch, online confirms what only users can, and the two are
+reconciled whenever they disagree.
 
 ## How it works
 ### What each one measures
-Offline evaluation fixes the inputs (a golden set with slices) and the graders (code checks, reference
-comparisons, judges), so its output is a set of per-slice scores that are comparable across versions and
-reproducible on demand. It measures capability under the dataset's distribution. Online evaluation
-takes whatever inputs arrive and measures with four kinds of signal: implicit behaviour (thumbs,
-regenerate, copy, abandonment, escalation to a human, a task-completion event such as an order placed
-or a PR merged, return visits); explicit ratings; sampled-trace judging, where a judge or rubric scores
-a stratified sample of production traces continuously; and controlled experiments, where traffic is
-randomised between variants to obtain a causal estimate. Only the last one answers "did the change
-cause the difference".
+| | Offline | Online |
+|---|---|---|
+| Inputs | Fixed golden set with slices | Whatever arrives |
+| Graders | Code checks, reference comparisons, judges | Implicit behaviour, explicit ratings, sampled-trace judging, controlled experiments |
+| Output | Per-slice scores, comparable across versions, reproducible on demand | Outcome signals on the real distribution |
+| Measures | Capability under the dataset's distribution | What users actually experience |
+
+Online signal types:
+- **Implicit behaviour:** thumbs, regenerate, copy, abandonment, escalation to a human, a
+  task-completion event (an order placed, a PR merged), return visits.
+- **Explicit ratings.**
+- **Sampled-trace judging:** a judge or rubric scores a stratified sample of production traces
+  continuously.
+- **Controlled experiments:** traffic randomised between variants for a causal estimate. Only this one
+  answers "did the change cause the difference".
 
 ### The ladder
-1. **Regression and unit tests** (offline, on every change): catches breakage in minutes.
-2. **Golden-set evaluation** (offline, before release): capability per slice, with confidence
-   intervals.
+1. **Regression and unit tests** (offline, every change): catch breakage in minutes.
+2. **Golden-set evaluation** (offline, before release): capability per slice, with confidence intervals.
 3. **Shadow mode** (online inputs, no user exposure): the candidate runs alongside production on live
-   traffic; its outputs are logged, never shown, and graded against production's by judge or pairwise
-   comparison. It gives the real input distribution without user risk, *because* nobody sees the
-   candidate; for the same reason it cannot measure user reaction, latency under real load, or
-   multi-turn effects where the user's next message depends on the candidate's reply.
-4. **Canary** (a small percentage of users): guardrail metrics such as error rate, latency, cost,
-   refusal rate and safety flags, with automatic rollback. It exists to catch catastrophes, not to
-   measure quality; a slice of a few percent watched for hours or a day collects far too few
-   conversations to detect a modest quality change.
-5. **A/B test** (randomised, sized in advance for the primary metric): the causal answer about
-   outcomes.
+   traffic; outputs are logged, never shown, and graded against production's by judge or pairwise
+   comparison.
+   - *Gives* the real input distribution without user risk, *because* nobody sees the candidate.
+   - *Cannot* measure, for the same reason: user reaction, latency under real load, or multi-turn effects
+     where the user's next message depends on the candidate's reply.
+4. **Canary** (a small percentage of users): guardrail metrics (error rate, latency, cost, refusal rate,
+   safety flags) with automatic rollback. It catches catastrophes, not quality: a few percent watched for
+   hours or a day collects far too few conversations to detect a modest quality change.
+5. **A/B test** (randomised, sized in advance for the primary metric): the causal answer about outcomes.
 6. **Monitoring** (ongoing): drift alerts on input mix, sampled judging, outcome dashboards.
 
-Promote only after the rung below passes, because a cheaper rung that fails stops you earlier and
-tells you more precisely what broke.
+Promote only after the rung below passes, because a cheaper rung that fails stops you earlier and tells
+you more precisely what broke.
 
 ### Closing the loop
-Online traffic feeds offline. Sample production traces, stratified by intent and including the ones
-users flagged or judges scored low, label them, and add them to the golden set, so the next offline run
-measures this quarter's distribution. And validate the proxy: periodically score the same traces with
-the offline judge and with the online outcome, and look at the agreement. When offline says better and
-the A/B test says flat or worse, the offline metric is wrong; fix the grader, do not argue with the
-users.
+- **Online feeds offline.** Sample production traces stratified by intent, including ones users flagged
+  or judges scored low, label them, and add them to the golden set, so the next offline run measures
+  this quarter's distribution.
+- **Validate the proxy.** Periodically score the same traces with the offline judge and the online
+  outcome and compare. When offline says better and the A/B says flat or worse, the offline metric is
+  wrong: fix the grader, do not argue with the users.
 
-Make that agreement a tracked number rather than an impression. Keep a launch log with one row per
-change that went through an online test: the offline delta, the online delta with its interval, and the
-decision. Two readings matter. Directional agreement: of the changes where the online result was
-conclusive, how often did the offline metric point the same way? And rank agreement: does a bigger
-offline gain predict a bigger online gain? A metric that agrees on direction but not magnitude is
-still a usable gate; one that agrees no better than a coin flip should stop gating releases until it is
-repaired. Expect agreement to decay over time even with no one changing the grader, because teams
-optimise against whatever the offline metric rewards (Goodhart's law), which is a second reason to
-re-validate it on every A/B test you run.
+### Track offline-online agreement as a number
+Keep a launch log, one row per change that went through an online test: offline delta, online delta
+with its interval, decision. Two readings matter:
+- **Directional agreement:** of changes with a conclusive online result, how often did offline point the
+  same way?
+- **Rank agreement:** does a bigger offline gain predict a bigger online gain?
+
+| Agreement | Verdict |
+|---|---|
+| Direction yes, magnitude no | Still a usable gate |
+| No better than a coin flip | Stop gating releases on it until repaired |
+
+- **Expect decay** even with nobody changing the grader, because teams optimise against whatever the
+  offline metric rewards (Goodhart's law). That is a second reason to re-validate on every A/B test.
 
 ### Signal quality online
-Implicit signals are biased. Thumbs come from users at the extremes; "regenerate" may mean a bad answer
-or a curious user; a longer session may mean engagement or struggle. Define one primary outcome per
-product (resolution without escalation, task completed, code merged) and treat the rest as guardrails
-or diagnostics.
+- **Implicit signals are biased.** Thumbs come from users at the extremes; "regenerate" may mean a bad
+  answer or a curious user; a longer session may mean engagement or struggle.
+- **Define one primary outcome per product** (resolution without escalation, task completed, code
+  merged) and treat the rest as guardrails or diagnostics.
 
 ### The latency of truth
-Offline results arrive in minutes, shadow results in hours or days, A/B results in days or weeks. The
-decision cadence has to match: prompt iteration runs on offline evals, a model swap earns a shadow run
-and an A/B test, and no team should wait two weeks to learn that a prompt broke JSON output.
+| Signal | Arrives in | Drives |
+|---|---|---|
+| Offline | Minutes | Prompt iteration |
+| Shadow | Hours or days | Model swaps, large prompt changes |
+| A/B | Days or weeks | Expensive or strategic changes |
 
-## Example
+No team should wait two weeks to learn that a prompt broke JSON output.
+
+## Diagram
+Each rung is more expensive and more truthful than the one below; a failure stops promotion, and
+production traces flow back to refresh the golden set and re-validate the offline metric.
+
+```mermaid
+flowchart TD
+    C["Candidate change"] --> R["Regression and unit tests"]
+    R -->|"pass"| G["Golden-set eval per slice"]
+    G -->|"pass"| S["Shadow mode on live inputs"]
+    S -->|"pass"| CA["Canary: guardrails, auto rollback"]
+    CA -->|"pass"| AB["A/B test, sized in advance"]
+    AB -->|"win"| M["Ship and monitor"]
+    R -->|"fail"| X["Stop and fix"]
+    G -->|"fail"| X
+    S -->|"fail"| X
+    CA -->|"trip"| X
+    AB -->|"flat or worse"| X
+    M -.->|"sampled traces refresh golden set"| G
+    AB -.->|"offline vs online agreement"| G
+```
+
+## Examples
+### Worked scenario: offline win, online flat
 Illustrative numbers for a support assistant, chosen to show the failure mode rather than to report any
 real system.
 
-Version 2 of the prompt raises the offline judge's helpfulness score from 78% to 86% on a 600-item
-golden set, with faithfulness unchanged at 94%. Shadow mode on 5,000 live tickets has a pairwise judge
-preferring v2 on 58% of comparisons. The canary at 5% of traffic trips no guardrail, but p95 latency is
-up 40% because v2's replies are about 60% longer, and escalation to a human moves from 14.0% to 15.5%,
-which at a few hundred conversations is inside the noise. The A/B test, sized in advance and run for two
-weeks over roughly 40,000 conversations split evenly, reports resolution-without-escalation at 60.2% for
-v1 and 61.0% for v2, with a confidence interval that includes zero; satisfaction ratings are flat; cost
-per conversation is up 35%.
+| Rung | v1 | v2 | Reading |
+|---|---|---|---|
+| Offline judge helpfulness (600-item golden set) | 78% | 86% | Looks like a big win |
+| Offline faithfulness | 94% | 94% | Unchanged |
+| Shadow, 5,000 live tickets, pairwise judge | | prefers v2 on 58% | Same judge, same bias |
+| Canary at 5% of traffic | | no guardrail tripped | p95 latency up 40%; replies about 60% longer |
+| Canary escalation to a human | 14.0% | 15.5% | Inside the noise at a few hundred conversations |
+| A/B, two weeks, roughly 40,000 conversations split evenly | 60.2% resolution | 61.0% | Confidence interval includes zero; satisfaction flat |
+| Cost per conversation | | up 35% | Paid for length |
 
-The decision is not to ship v2 as it stands, and the more important output is the diagnosis: the
-offline judge rewarded length and thoroughness, which users did not value, and the golden set contained
-no cost or length criterion. The fix is to the offline measurement, adding a length penalty and a
-resolution-shaped rubric, and to re-validate the judge against the A/B traces before the next
-iteration. Had the team shipped on the 86%, they would have paid 35% more for nothing.
+- **Decision:** do not ship v2 as it stands.
+- **Diagnosis, the more important output:** the offline judge rewarded length and thoroughness, which
+  users did not value, and the golden set had no cost or length criterion.
+- **Fix the measurement:** add a length penalty and a resolution-shaped rubric, then re-validate the judge
+  against the A/B traces before the next iteration. Shipping on the 86% would have paid 35% more for
+  nothing.
+
+### Launch-log agreement and A/B sizing
+Pure Python, runnable. It scores how well the offline metric predicted online results and sizes an A/B
+test for a two-proportion outcome.
+
+```python
+from math import ceil
+
+def n_per_arm(p: float, delta: float, z_alpha: float = 1.96, z_power: float = 0.8416) -> int:
+    q = p + delta                                  # two-proportion test, two-sided alpha 0.05, 80% power
+    return ceil((z_alpha + z_power) ** 2 * (p * (1 - p) + q * (1 - q)) / delta ** 2)
+
+def ranks(xs):
+    order = sorted(range(len(xs)), key=lambda i: xs[i])
+    r = [0] * len(xs)
+    for rank, i in enumerate(order):
+        r[i] = rank
+    return r
+
+def spearman(xs, ys):                              # no-ties version, enough for a launch log
+    rx, ry, n = ranks(xs), ranks(ys), len(xs)
+    d2 = sum((a - b) ** 2 for a, b in zip(rx, ry))
+    return 1 - 6 * d2 / (n * (n * n - 1))
+
+# launch log: (offline delta in points, online delta in points, online CI excludes zero?)
+LOG = [(+8.0, +0.8, False), (+3.0, +1.9, True), (+5.0, +2.6, True), (+1.0, -1.2, True),
+       (+2.0, +0.4, False), (+6.0, +3.1, True), (+4.0, -0.5, False)]
+
+conclusive = [(off, on) for off, on, sig in LOG if sig]
+direction = sum((off > 0) == (on > 0) for off, on in conclusive) / len(conclusive)
+print(f"directional agreement on {len(conclusive)} conclusive launches: {direction:.0%}")   # 75%
+print(f"rank agreement (Spearman): {spearman(*zip(*conclusive)):.2f}")                      # 1.00
+print(n_per_arm(0.60, 0.03), n_per_arm(0.60, 0.01))   # 4126 37511: ~4,000 and ~37,000 per arm
+```
+
+- **Reading the log:** only 4 of 7 launches were conclusive online, which is itself a finding about
+  traffic. Of those, the offline metric got direction right 3 times in 4 and ranked them perfectly: a
+  usable gate, with the +1-point offline gain that lost online worth investigating.
+
+## Production patterns
+- **Shadow traffic mirroring.** Duplicate live requests to the candidate asynchronously, never return its
+  output, and log both responses under the same request ID for a pairwise judge. Monitor shadow
+  preference, candidate latency and cost per request.
+- **Canary with automatic rollback.** Route a few percent of traffic to the new version and roll back
+  automatically when error rate, p95 latency, cost per conversation or refusal rate crosses a threshold.
+  Monitor these in short windows; do not read quality from the canary.
+- **Weekly stratified trace sampling.** Pull production traces by intent, oversampling flagged and
+  low-scored ones, label them, and add them to the golden set with a version bump. Monitor the distance
+  between the golden set's intent mix and production's.
+- **Launch log with agreement metrics.** One row per online-tested change with both deltas and the
+  decision, as in the example. Monitor directional agreement; stop gating on a metric that falls to
+  coin-flip level.
+- **Sampled online judging off the request path.** Judge a fixed sample of live traces asynchronously,
+  with the same pinned judge version as offline, so the two are comparable. Monitor judge score against
+  the primary outcome on the same conversations.
+- **One instrumented primary outcome.** Emit an explicit event (escalated, resolved, order placed) keyed
+  by conversation ID so outcomes join to traces. Monitor event coverage, since missing events silently
+  bias the metric.
 
 ## Trade-offs
-- Offline runs are reproducible and cheap enough to run on every commit, but they measure a frozen
+- **Reproducible offline vs frozen distribution.** Cheap enough for every commit, but a frozen
   distribution with proxy graders; the gap grows with every week the golden set is not refreshed.
-- Shadow mode gives the real input distribution with no user risk, but it cannot see user reaction or
+- **Shadow safety vs blindness to users.** Real inputs with no user risk, but no user reaction or
   multi-turn effects, which matters more the more conversational the product.
-- A/B tests give causal answers about outcomes, but they need traffic, time and tolerance for exposing
-  users to a worse variant; detecting a 3-point change in a 60% resolution rate needs roughly 4,000
-  conversations per arm (80% power, α = 0.05) and a 1-point change roughly 37,000, so low-traffic
-  products rarely get a conclusive answer.
-- Sampled online judging is continuous and cheap, but it inherits every judge bias and must be
-  re-validated against outcomes, or it becomes a second offline metric with a live data feed.
-- Canaries catch catastrophes fast but detect nothing subtle, so a team that relies on them alone will
+- **A/B causality vs traffic.** Causal answers need traffic, time and tolerance for exposing users to a
+  worse variant. A 3-point change in a 60% resolution rate needs roughly 4,000 conversations per arm
+  (80% power, α = 0.05), a 1-point change roughly 37,000, so low-traffic products rarely get a
+  conclusive answer.
+- **Sampled online judging vs judge bias.** Continuous and cheap, but it inherits every judge bias and
+  must be re-validated against outcomes, or it becomes a second offline metric with a live data feed.
+- **Canary speed vs sensitivity.** Catches catastrophes fast but nothing subtle, so canary-only teams
   ship slow quality regressions invisibly.
 
 ## Pitfalls
-- Shipping on an offline gain without an online confirmation; the symptom is higher scores on the
-  dashboard and higher cost or escalation in the field, as in the example above.
-- Reading shadow-mode preference as user preference; the symptom is a candidate that "wins" shadow and
-  loses the A/B because its replies are slower or longer.
-- Using implicit signals as the primary metric; the symptom is optimising thumbs-up from the vocal few
-  while the silent majority escalates.
-- Never feeding production traces back into the golden set; the symptom is an offline score that stays
-  high while the intent mix in production has moved on.
-- Treating the offline metric's validity as settled once; the symptom is a run of launches that each
-  win offline by a few points while the online outcome stays flat quarter after quarter.
-- Comparing this week's online metric to last week's as if it were an experiment; the symptom is a
-  "regression" that was a holiday, a campaign or a provider update.
+- **Shipping on an offline gain without online confirmation.** Symptom: higher dashboard scores and
+  higher cost or escalation in the field, as in the example. Fix: climb the ladder.
+- **Reading shadow preference as user preference.** Symptom: a candidate that "wins" shadow and loses the
+  A/B because its replies are slower or longer. Fix: treat shadow as a distribution check.
+- **Implicit signals as the primary metric.** Symptom: optimising thumbs-up from the vocal few while the
+  silent majority escalates. Fix: one primary outcome per product.
+- **Never feeding traces back into the golden set.** Symptom: a steady high offline score while
+  production's intent mix has moved on. Fix: scheduled stratified sampling.
+- **Treating offline validity as settled once.** Symptom: launches that each win offline by a few points
+  while the online outcome stays flat quarter after quarter. Fix: the launch log.
+- **Week-over-week comparisons as experiments.** Symptom: a "regression" that was a holiday, a campaign
+  or a provider update. Fix: randomise.
 
 ## When to use
-Use offline evaluation for every iteration decision: prompt edits, retriever settings, parser changes,
-regression gates. Use shadow mode when the candidate is a different model or a large prompt change and
-you need the real distribution before exposure. Use a canary for every production rollout, for
-guardrails only. Use an A/B test when the change is expensive or strategic enough to need a causal
-answer on outcomes and the traffic exists to get one. Measure, over time, the agreement between your
-offline metric and your online outcome; that number is the health of the whole evaluation stack. In
-interviews, the expected depth is to describe the ladder, say what shadow mode cannot measure, and
-explain what you do when offline and online disagree.
+- **Offline:** every iteration decision: prompt edits, retriever settings, parser changes, regression
+  gates.
+- **Shadow mode:** the candidate is a different model or a large prompt change and you need the real
+  distribution before exposure.
+- **Canary:** every production rollout, for guardrails only.
+- **A/B test:** the change is expensive or strategic enough to need a causal answer on outcomes, and the
+  traffic exists to get one.
+- **Measure:** offline-online agreement over time; that number is the health of the whole evaluation stack.
+- **Interviews:** describe the ladder, say what shadow mode cannot measure, and explain what you do when
+  offline and online disagree.
 
 ## Role lens
 - **Engineer:** Builds the shadow pipeline and the trace sampler, keeps the golden set refreshed from
@@ -184,6 +280,41 @@ conversations, find what the judge rewards that outcomes do not, and add that to
 penalty or a constraint. Then add cost and length as offline criteria and guardrails, refresh the
 golden set from the A/B traffic, and re-run the candidate offline. If the repaired offline metric now
 calls the candidate flat, the evaluation stack is consistent again and the next iteration can trust it.
+
+## Interview questions
+### What is the difference between offline and online evaluation, and why do you need both?
+- **Offline:** fixed dataset and graders, minutes per run, reproducible and safe, but a proxy on last
+  quarter's distribution.
+- **Online:** live traffic and real outcomes, the truth, but slow, noisy and confounded without
+  randomisation.
+- **Together:** offline gates what ships, online checks offline measured the right thing, and production
+  traces refresh the offline set.
+
+### What can shadow mode not tell you?
+- **User reaction:** nobody sees the candidate, so there are no thumbs, escalations or retries.
+- **Multi-turn effects:** the user's next message responds to production's reply, not the candidate's.
+- **Latency under real load** and anything else that depends on serving the candidate for real.
+
+### Why is a canary not a quality test?
+- **Too little data:** a few percent of traffic for hours or a day is a few hundred conversations; a
+  1.5-point escalation move sits inside the noise.
+- **Its job is catastrophes:** error rate, latency, cost, refusals and safety flags with automatic
+  rollback.
+- **Quality needs an A/B test** sized in advance for the primary metric.
+
+### Your product gets 2,000 conversations a week. How do you evaluate a prompt change?
+- **A/B is mostly out of reach:** a 3-point change on a 60% rate needs roughly 4,000 per arm, about a
+  month of all traffic.
+- **Lean on the lower rungs:** offline golden set with intervals, shadow mode on live inputs, a canary
+  for guardrails.
+- **Strengthen the proxy:** validate the offline judge against outcomes on past traces so offline gains
+  can be trusted.
+
+### How do you know your offline metric is still trustworthy?
+- **Keep a launch log** of offline and online deltas per change.
+- **Track directional and rank agreement**; a metric no better than a coin flip stops gating.
+- **Re-validate after every A/B,** because Goodhart's law erodes agreement as teams optimise against the
+  metric.
 
 ## Quiz
 ### Q: What does shadow mode give you that a golden-set eval does not, and what can it still not measure?

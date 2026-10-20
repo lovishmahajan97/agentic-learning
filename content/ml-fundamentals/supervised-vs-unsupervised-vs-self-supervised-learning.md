@@ -5,7 +5,7 @@ name: Supervised vs unsupervised vs self-supervised learning
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: reviewed
+status: crisp
 related:
   - ml-fundamentals/classification
   - ml-fundamentals/regression
@@ -22,120 +22,134 @@ sources:
 ---
 
 ## TL;DR
-The three paradigms differ in one thing: where the training signal comes from. Supervised learning takes
-each label from outside the input, usually a paid human. Unsupervised learning has inputs only and
-optimises a property of the data, such as how tightly points group. Self-supervised learning
-manufactures labels from the input (the next token, the masked word, the matching caption), so the
-signal is free and unlimited. Modern LLMs exist because self-supervision turned the internet into
-training labels, with human supervision added at the end.
+The three paradigms differ only in where the training signal comes from: a human label (supervised), a
+property of the data (unsupervised), or a label manufactured from the input (self-supervised). LLMs exist
+because self-supervision turned the internet into free labels.
 
 ## Why it exists
-Every learning algorithm minimises a loss, and a loss needs something to compare the model's output
-against. The entire question is who supplies that target.
-
-The first answer was: a human. Supervised learning works well when the task is narrow and labels are
-cheap, but labels are the bottleneck. A routing label on a support ticket costs a few seconds of a
-trained agent's time; a radiology label costs a specialist's time; and however cheap one label is, you
-cannot buy billions of them. Meanwhile text, images, code and logs exist in enormous quantities with no
-labels attached.
-
-Unsupervised learning was the first attempt to use that data. With no target, you optimise structure
-instead: compact clusters, directions of maximum variance, a density that assigns the data high
-likelihood. The weakness is that the objective is not your task. Clustering tickets does not tell you
-which ones to escalate, and there is no ground truth to score against, so you cannot say how good the
-result is except by looking.
-
-Self-supervised learning resolved the tension with a trick: hide part of the data and train the model
-to predict it from the rest. The signal is now as plentiful as the data, and predicting the hidden part
-well requires learning exactly the regularities you care about, because grammar, facts, visual
-structure and code semantics are what make the hidden part predictable. This is what "pre-training"
-means. Once that representation exists, a small amount of supervised data is enough to teach a
-specific behaviour, which is why fine-tuning on a few thousand examples works where training from
-scratch on them would not.
+- **Every loss needs a target.** Every learning algorithm minimises a loss, and a loss needs something to
+  compare the model's output against. The entire question is who supplies that target.
+- **Human labels are the bottleneck.** Supervised learning works when the task is narrow and labels are
+  cheap. A routing label on a support ticket costs a few seconds of a trained agent's time; a radiology
+  label costs a specialist's time; however cheap one label is, you cannot buy billions of them.
+- **Unlabelled data is enormous, but structure is not your task.** Text, images, code and logs exist in
+  huge quantities with no labels. Unsupervised learning optimises structure instead (compact clusters,
+  directions of maximum variance, a density that assigns the data high likelihood). Clustering tickets
+  does not tell you which to escalate, and with no ground truth you can only judge the result by looking.
+- **Self-supervision hides part of the data and predicts it.** The signal is as plentiful as the data,
+  and predicting the hidden part well requires learning grammar, facts, visual structure and code
+  semantics, because those are what make the hidden part predictable. This is what "pre-training" means.
+- **A small supervised step then suffices.** Once that representation exists, fine-tuning on a few
+  thousand examples works where training from scratch on them would not.
 
 ## How it works
+### The three paradigms at a glance
+| Paradigm | Data | Target | Typical loss | How you evaluate |
+|---|---|---|---|---|
+| Supervised | pairs (x, y) | given by a person or system | cross-entropy, squared error | held-out accuracy or error |
+| Unsupervised | x only | a property of the data | distance to centre, variance, likelihood | internal metrics, stability, downstream decision |
+| Self-supervised | x only | manufactured from x by a pretext task | cross-entropy, contrastive | downstream task performance |
+
 ### Supervised: the target is given
-The dataset is pairs (x, y). The model is a function f_θ(x). The loss compares f_θ(x) with y:
-cross-entropy when y is a class, squared error when y is a number (see the classification and
-regression lessons). Gradient descent pushes θ toward reproducing the human judgements. Two
-consequences follow directly. Generalisation depends on the labelled set covering the distribution you
-will see in production, because the model has no signal about anything else. And the quality ceiling is
-the label quality: if two annotators disagree on 15% of examples, a model cannot agree with both of them
-on more than 85% of examples, so when scored against either one, up to 15 points of apparent "error"
-can be annotator disagreement rather than model error. Measure agreement before blaming the model.
+- **Setup.** The dataset is pairs (x, y). The model is a function f_θ(x). The loss compares f_θ(x) with
+  y: cross-entropy when y is a class, squared error when y is a number (see the classification and
+  regression lessons). Gradient descent pushes θ toward reproducing the human judgements.
+- **Coverage limits generalisation.** It depends on the labelled set covering the distribution you will
+  see in production, because the model has no signal about anything else.
+- **Label quality is the ceiling.** If two annotators disagree on 15% of examples, a model cannot agree
+  with both of them on more than 85% of examples. Scored against either one, up to 15 points of apparent
+  "error" can be annotator disagreement rather than model error. Measure agreement before blaming the model.
 
 ### Unsupervised: the target is a property of the data
-Only x is available. The objective is defined on the data itself. k-means minimises the distance from
-each point to its cluster centre; PCA keeps the directions of largest variance; a density model
-maximises the likelihood it assigns to the observed points. The output is structure for a human to
-interpret. Because there is no y, "accuracy" does not exist; evaluation is by internal metrics, by
-stability, or by whether the structure helps a downstream decision. The clustering lesson covers the
-main algorithms.
+- **Only x is available**, and the objective is defined on the data itself:
+  - k-means minimises the distance from each point to its cluster centre;
+  - PCA keeps the directions of largest variance;
+  - a density model maximises the likelihood it assigns to the observed points.
+- **The output is structure for a human to interpret.** Because there is no y, "accuracy" does not exist;
+  evaluation is by internal metrics, by stability, or by whether the structure helps a downstream
+  decision. The clustering lesson covers the main algorithms.
 
 ### Self-supervised: the target is manufactured from the data
 Only x is available, but a *pretext task* turns each x into one or more (x', y') pairs automatically.
 Three designs dominate:
 
-- **Autoregressive (GPT-style).** Input: the tokens so far; label: the next token. A document of n
-  tokens yields n − 1 training examples. The loss is ordinary cross-entropy over the vocabulary, so this
-  is a classification problem with on the order of 100k classes whose labels cost nothing.
+- **Autoregressive (GPT-style).** Input: the tokens so far; label: the next token. A document of n tokens
+  yields n − 1 training examples. The loss is ordinary cross-entropy over the vocabulary, so this is a
+  classification problem with on the order of 100k classes whose labels cost nothing.
 - **Masked (BERT-style).** Replace a fraction of tokens (15% in the original recipe) with a mask and
   predict the originals from both sides. It produces strong encoders for embeddings and classification
   but is awkward for generation, because the model never learned to produce text left to right.
-- **Contrastive (SimCLR, CLIP, most embedding models).** Build pairs that should match (two
-  augmentations of one image, an image and its caption, a query and the document that answered it) and
-  train the model to pick the true partner out of a batch of impostors. The label "which one matches"
-  is known because you constructed the pair. The loss-functions lesson derives the objective.
+- **Contrastive (SimCLR, CLIP, most embedding models).** Build pairs that should match (two augmentations
+  of one image, an image and its caption, a query and the document that answered it) and train the model
+  to pick the true partner out of a batch of impostors. The label "which one matches" is known because you
+  constructed the pair. The loss-functions lesson derives the objective.
 
-The reason this works is compression. To predict the next token of "the capital of France is", the model
-must store a fact. To predict a masked verb, it must learn agreement. The pretext task is a proxy, but
-the representation it forces into existence transfers to tasks nobody labelled.
+**Why it works: compression.** To predict the next token of "the capital of France is", the model must
+store a fact. To predict a masked verb, it must learn agreement. The pretext task is a proxy, but the
+representation it forces into existence transfers to tasks nobody labelled.
 
 ### How they combine in a real system
-A modern LLM pipeline uses all three in sequence. Pre-training is self-supervised on trillions of tokens.
-Supervised fine-tuning teaches instruction following on thousands to millions of human-written
-(prompt, response) pairs. Preference optimisation (RLHF, DPO) uses human *comparisons* between
-responses, a form of supervision at the level of preferences rather than exact outputs. Underneath,
-unsupervised methods run constantly: clustering embeddings of production traffic to discover what to
-label next, deduplicating training data, finding outliers. Between supervised and unsupervised sit two
-pragmatic hybrids: **semi-supervised** learning trains on a few labels plus many unlabelled inputs (for
-example pseudo-labelling, where a model's confident predictions on unlabelled data are added as labels,
-which works only if those confident predictions are mostly right), and **weak supervision**, where noisy
-labels come cheaply from heuristics, metadata or an LLM and are cleaned or combined before training.
-Reinforcement learning, where the signal is a
-scalar reward from an environment rather than a label, is the fourth paradigm and underlies the RL part
-of RLHF; it is covered in the training module.
+A modern LLM pipeline uses all three in sequence:
+1. **Pre-training** is self-supervised on trillions of tokens.
+2. **Supervised fine-tuning** teaches instruction following on thousands to millions of human-written
+   (prompt, response) pairs.
+3. **Preference optimisation** (RLHF, DPO) uses human *comparisons* between responses, a form of
+   supervision at the level of preferences rather than exact outputs.
+4. **Unsupervised methods run constantly underneath:** clustering embeddings of production traffic to
+   discover what to label next, deduplicating training data, finding outliers.
+
+Hybrids and neighbours:
+- **Semi-supervised** learning trains on a few labels plus many unlabelled inputs, for example
+  pseudo-labelling, where a model's confident predictions on unlabelled data are added as labels. It works
+  only if those confident predictions are mostly right.
+- **Weak supervision** takes noisy labels cheaply from heuristics, metadata or an LLM and cleans or
+  combines them before training.
+- **Reinforcement learning**, where the signal is a scalar reward from an environment rather than a label,
+  is the fourth paradigm and underlies the RL part of RLHF; it is covered in the training module.
 
 ### Where the boundary blurs
-The labels are conventions, not laws, and an expert should know where they leak. Next-token prediction
-is literally maximum-likelihood density estimation of p(text), which is the textbook definition of an
-unsupervised objective; it is called self-supervised because the computation is a per-position
-classification with a known target. Autoencoders, which reconstruct their own input, are filed under
-either heading depending on the author. A useful working test: if the loss compares each example's
-output with a specific target, whatever produced that target, the supervised toolkit (cross-entropy,
-held-out accuracy, label-noise reasoning) applies; if the loss scores a global property such as
-cluster compactness, it does not, and evaluation becomes a judgement call.
+The labels are conventions, not laws, and an expert should know where they leak:
+- **Next-token prediction is density estimation.** It is literally maximum-likelihood estimation of
+  p(text), the textbook unsupervised objective. It is called self-supervised because the computation is a
+  per-position classification with a known target.
+- **Autoencoders**, which reconstruct their own input, are filed under either heading depending on the
+  author.
+- **Working test.** If the loss compares each example's output with a specific target, whatever produced
+  that target, the supervised toolkit (cross-entropy, held-out accuracy, label-noise reasoning) applies.
+  If the loss scores a global property such as cluster compactness, it does not, and evaluation becomes a
+  judgement call.
 
-## Example
+## Diagram
+Follow the question "where does the target come from?" to the paradigm, then to how you evaluate it.
+
+```mermaid
+flowchart TD
+    Q["Where does the target come from?"] --> H{"Each example has a target?"}
+    H -->|"yes, from a person or system"| S["Supervised"]
+    H -->|"yes, made from the input"| SS["Self-supervised"]
+    H -->|"no, global property"| U["Unsupervised"]
+    S --> E1["Held-out accuracy"]
+    SS --> P["Pretext task: next token, mask, pair"]
+    P --> E2["Downstream task score"]
+    U --> E3["Stability or decision changed"]
+    SS -.->|"pre-trained encoder"| S
+```
+
+## Examples
+### One corpus, three paradigms: support ticket routing
 A support organisation has about 2,000,000 historical tickets and budget to hand-label roughly 5,000 of
-them with one of 12 routing categories (illustrative numbers). The three paradigms use the same corpus
-differently.
+them with one of 12 routing categories (illustrative numbers).
 
-Supervised only: train a classifier on the 5,000 labelled tickets. It works, but categories with 40
-examples are learned poorly, and the model knows nothing about the 1,995,000 unlabelled tickets.
+| Approach | What it does | Result |
+|---|---|---|
+| Supervised only | train a classifier on the 5,000 labelled tickets | works, but categories with 40 examples are learned poorly, and the model knows nothing about the 1,995,000 unlabelled tickets |
+| Unsupervised | embed all 2,000,000 tickets with a pretrained sentence encoder and cluster into 40 groups | humans read central examples and find three recurring problems the 12-category taxonomy never had; cluster ids are not labels, but show what to label and how to sample |
+| Self-supervised | the encoder was trained contrastively on hundreds of millions of unlabelled text pairs; continued pre-training on tickets (60 tokens average) creates about 120,000,000 next-token targets for free | fine-tuning that adapted model on the 5,000 labels usually gives the best classifier |
 
-Unsupervised: embed all 2,000,000 tickets with a pretrained sentence encoder and cluster them into 40
-groups. Humans read the central examples of each cluster and discover three recurring problems that the
-12-category taxonomy never had. Cluster ids are not routing labels, but they tell you what to label and
-how to sample it so the 5,000 labels cover the real distribution.
+The last row wins because the supervised step only has to teach the category boundaries, not the language
+of the domain. The encoder's contrastive training is also why its notion of "similar" is useful at all.
 
-Self-supervised: the sentence encoder used above was itself trained contrastively on hundreds of
-millions of unlabelled text pairs, which is why its notion of "similar" is useful at all. If the tickets
-average 60 tokens, continued pre-training on them with the next-token objective would create about
-120,000,000 training targets from the same data, for free. Fine-tuning that adapted model on the 5,000
-labels usually gives the best classifier of the three, because the supervised step only has to teach the
-category boundaries, not the language of the domain.
-
+### Labels as a function of the input
 The code shows the one operation that makes self-supervision different: the labels are produced by a
 function of the input, not by a person.
 
@@ -162,43 +176,83 @@ print(len(next_token_pairs(ids)))          # 5 labelled examples from one unlabe
 print(masked_pairs(ids))                   # ([0, 7, 2201, 54, 887, 19], {0: 312}) with seed=1; seed=0 happens to mask nothing
 ```
 
+### Contrastive pairs from a batch
+In-batch contrastive training: the diagonal of the similarity matrix holds the true pairs, so the
+"label" for row i is simply i.
+
+```python
+import torch
+import torch.nn.functional as F
+
+def in_batch_contrastive_loss(q_emb, d_emb, temperature=0.05):
+    q = F.normalize(q_emb, dim=-1)
+    d = F.normalize(d_emb, dim=-1)
+    logits = q @ d.T / temperature              # [batch, batch] similarity matrix
+    labels = torch.arange(q.size(0))            # query i matches document i: a free label
+    return F.cross_entropy(logits, labels)
+
+q, d = torch.randn(8, 384), torch.randn(8, 384)
+print(in_batch_contrastive_loss(q, d))          # random embeddings: loss near log(8) or above
+```
+
+## Production patterns
+- **Harvest implicit labels before buying annotation.** When the system already records a decision (the
+  category an agent picks on close, a merged PR, a click), log it with the input snapshot at decision
+  time. Monitor label noise by having experts re-label a small random sample each month.
+- **Cluster, then stratify the labelling queue.** Embed the corpus with a pre-trained encoder, run k-means
+  (for example scikit-learn `KMeans`), and sample a fixed number per cluster for experts. Monitor per-class
+  counts in the labelled set and per-class recall on the held-out set.
+- **Measure inter-annotator agreement first.** Double-label a few hundred examples and compute agreement
+  (for example Cohen's kappa via scikit-learn `cohen_kappa_score`) before training. Treat the agreement
+  rate as the accuracy ceiling when reading model scores.
+- **Fine-tune a public checkpoint instead of pre-training.** For a narrow domain, start from an open
+  pre-trained model and, if needed, run a short continued pre-training pass on in-domain raw text before
+  supervised fine-tuning. Monitor a general-capability eval alongside the task metric to catch forgetting.
+- **Gate pseudo-labels on confidence and audit them.** Add only predictions above a high confidence
+  threshold, and spot-check a random sample by hand. Monitor the human agreement rate on the audited
+  pseudo-labels; stop if it falls.
+
 ## Trade-offs
-- Supervised learning gives the highest task accuracy per example and a directly measurable score, but
-  every example costs human time and the model inherits the annotators' blind spots; the cost argument
-  flips when labels fall out of the system for free (resolved-ticket categories, clicks, merged PRs).
-- Unsupervised methods need no labels and surface structure nobody asked about, but produce no accuracy
-  number and need a human to interpret the output; they win when the goal is exploration, not prediction.
-- Self-supervised pre-training yields transferable representations from unlimited data, but needs large
-  compute and the pretext task is only a proxy: a model excellent at next-token prediction is not
-  automatically good at following instructions. For a narrow domain, fine-tuning a public checkpoint
-  almost always beats pre-training your own.
-- Combining paradigms (pre-train, cluster, label, fine-tune) gives the best result but multiplies the
-  stages that must be evaluated, versioned and debugged.
+- **Supervised: accuracy per example vs label cost.** Highest task accuracy per example and a directly
+  measurable score, but every example costs human time and the model inherits the annotators' blind
+  spots. The cost argument flips when labels fall out of the system for free (resolved-ticket
+  categories, clicks, merged PRs).
+- **Unsupervised: no labels vs no score.** Needs no labels and surfaces structure nobody asked about, but
+  produces no accuracy number and needs a human to interpret the output. It wins when the goal is
+  exploration, not prediction.
+- **Self-supervised: transfer vs compute and proxy gap.** Transferable representations from unlimited
+  data, but large compute, and the pretext task is only a proxy: a model excellent at next-token
+  prediction is not automatically good at following instructions. For a narrow domain, fine-tuning a
+  public checkpoint almost always beats pre-training your own.
+- **Combining paradigms: best result vs more stages.** Pre-train, cluster, label, fine-tune gives the best
+  result but multiplies the stages that must be evaluated, versioned and debugged.
 
 ## Pitfalls
-- Treating cluster ids as labels and training a supervised model on them; the symptom is high
-  "accuracy" against the pseudo-labels and poor agreement with human review, because the model learned
-  the clustering's artefacts rather than the intended categories.
-- Fine-tuning on a large narrow supervised set until the pre-trained knowledge is overwritten; the
-  symptom is the task metric rising while general capability and out-of-distribution behaviour degrade.
-- Assuming unlabelled data is neutral because nobody labelled it; pre-training text carries the biases
+- **Treating cluster ids as labels.** Training a supervised model on them gives high "accuracy" against
+  the pseudo-labels and poor agreement with human review, because the model learned the clustering's
+  artefacts rather than the intended categories.
+- **Fine-tuning until pre-trained knowledge is overwritten.** On a large narrow supervised set, the task
+  metric rises while general capability and out-of-distribution behaviour degrade.
+- **Assuming unlabelled data is neutral.** Nobody labelled it, but pre-training text carries the biases
   and errors of its sources, and self-supervision reproduces them faithfully.
-- Judging self-supervised pre-training by its own loss alone; the symptom is perplexity falling while
-  the downstream task you care about does not move, because the proxy and the task diverged.
-- Building a supervised label from a field that will not exist at inference time (the agent's final
-  resolution note as a feature for routing); the symptom is near-perfect offline scores and a useless
-  model in production. The train-test-leakage lesson covers this in depth.
+- **Judging pre-training by its own loss alone.** Perplexity falls while the downstream task you care
+  about does not move, because the proxy and the task diverged.
+- **Building a label from a field that will not exist at inference time.** For example, the agent's final
+  resolution note as a feature for routing. Symptom: near-perfect offline scores and a useless model in
+  production. The train-test-leakage lesson covers this in depth.
 
 ## When to use
-Start from the question "what signal do I have, and what does more of it cost?" If you have labels and a
-narrow, stable target, supervised learning with a small model is usually the cheapest, fastest and most
-measurable option. If you have a large unlabelled domain corpus, you almost never pre-train from
-scratch; use a pre-trained model and either embed and cluster to understand the data, or label a
-stratified few thousand examples and fine-tune. Measure supervised work with held-out accuracy at the
-natural class distribution, unsupervised work by whether it changed a decision, and self-supervised work
-by downstream task performance, never only by its own loss. In interviews, expect "why is next-token
-prediction self-supervised rather than unsupervised?" The answer is that the loss is a normal supervised
-loss against a target; the target just came from the data instead of a person.
+Start from the question "what signal do I have, and what does more of it cost?"
+- **Use supervised when** you have labels and a narrow, stable target: a small model is usually the
+  cheapest, fastest and most measurable option.
+- **With a large unlabelled domain corpus,** you almost never pre-train from scratch. Use a pre-trained
+  model and either embed and cluster to understand the data, or label a stratified few thousand examples
+  and fine-tune.
+- **Measure** supervised work with held-out accuracy at the natural class distribution, unsupervised work
+  by whether it changed a decision, and self-supervised work by downstream task performance, never only by
+  its own loss.
+- **Interviews:** expect "why is next-token prediction self-supervised rather than unsupervised?" The loss
+  is a normal supervised loss against a target; the target just came from the data instead of a person.
 
 ## Role lens
 - **Engineer:** Chooses the fine-tuning data format that matches the signal available, labelled pairs
@@ -221,6 +275,41 @@ inter-annotator agreement so the ceiling is known; train a supervised classifier
 evaluate on a held-out labelled set at the natural class distribution; and use the clusters afterwards
 to find categories the taxonomy misses and to prioritise further labelling. The labels are what make the
 categories theirs; the unsupervised step makes the labelling cheap.
+
+## Interview questions
+### What is the difference between supervised, unsupervised and self-supervised learning?
+- **Definition:** they differ in the source of the target. Supervised uses labels from outside the input,
+  unsupervised optimises a property of the data, self-supervised builds labels from the input itself.
+- **Why it matters:** self-supervision gives as many targets as there are tokens or pixels, which is what
+  made pre-training on internet-scale data possible.
+- **Evaluation follows the paradigm:** held-out accuracy for supervised, downstream impact for
+  unsupervised, downstream task score for self-supervised.
+
+### Your classifier plateaus at 84% accuracy and the team wants a bigger model. What do you check first?
+- **Label agreement.** Double-label a sample; if annotators agree on only about 85%, the model is near the
+  ceiling and the remaining "error" is disagreement.
+- **Coverage.** Compare the labelled set's class and input distribution with production traffic; missing
+  regions cannot be learned.
+- **Then** fix the label guidelines or sample more data before scaling the model.
+
+### When would you not pre-train your own model on a large internal corpus?
+- **Almost always for a narrow domain.** Fine-tuning a public checkpoint beats pre-training, because
+  pre-training needs large compute and the general language is already learned.
+- **Middle ground:** short continued pre-training on in-domain text, then supervised fine-tuning.
+- **Cost of the proxy:** a low next-token loss does not guarantee instruction following or task accuracy.
+
+### How would you use 2 million unlabelled tickets and budget for 5,000 labels?
+- **Embed and cluster** all tickets to find the real structure and missing categories.
+- **Stratify the 5,000 labels** across clusters so rare categories get enough examples.
+- **Fine-tune** a pre-trained encoder or model on those labels, optionally after continued pre-training
+  on the tickets, and evaluate at the natural class distribution.
+
+### Is pseudo-labelling safe? How do you control it in production?
+- **Only if confident predictions are mostly right;** otherwise the model trains on its own mistakes and
+  confirms them.
+- **Controls:** a high confidence threshold, a hand-audited random sample of pseudo-labels, and a held-out
+  human-labelled set that pseudo-labels never touch.
+- **Monitor** audited agreement and per-class recall over time.
 
 ## Quiz
 ### Q: Why is next-token prediction described as self-supervised rather than unsupervised?

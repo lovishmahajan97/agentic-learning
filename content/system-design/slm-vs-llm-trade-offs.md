@@ -113,6 +113,25 @@ knowledge they do not. Decide by task narrowness, tail-error cost and data locat
 - **Rarely binary.** Routing and cascading have their own lesson; the point here is the choice is
   rarely SLM-or-LLM.
 
+## Diagram
+The usual answer is a cascade: the distilled SLM takes every request first, and only low-confidence or
+invalid outputs pay for the LLM. The threshold on the confidence check is the cost-quality dial.
+
+```mermaid
+flowchart LR
+    T["LLM as teacher on task inputs"] -->|"labels, sample human-verified"| FT["Fine-tune SLM, parameter-efficient"]
+    FT --> EV{"Exact deployed artefact meets bar on human-labelled set?"}
+    EV -->|"no"| L["Stay on LLM or larger open-weight model"]
+    EV -->|"yes"| S["SLM serves every request"]
+    R["Request"] --> S
+    S --> C{"Confidence above calibrated threshold and output valid?"}
+    C -->|"yes, most traffic"| OK["Accept SLM answer"]
+    C -->|"no, the tail"| ESC["Escalate to LLM or human review queue"]
+    OK -.->|"sampled reviews"| CAL["Recalibrate threshold on fresh labels"]
+    ESC -.-> CAL
+    CAL -.-> C
+```
+
 ## Examples
 ### Worked scenario: classifying 5M support messages a day
 **Illustrative figures.** A support platform classifies 5,000,000 inbound messages a day into intents
@@ -274,6 +293,47 @@ Check the memory arithmetic: a 7B model at 4-bit is a few gigabytes of weights, 
 mean a large KV cache, so chunk pages and bound context. Plan operations: serving engine, monitoring,
 a retraining trigger when templates change. Because there is no LLM to escalate to inside the VPC, add
 a human review queue for low-confidence outputs, or budget a larger open-weight model for the tail.
+
+## Interview questions
+### When does a small language model match a large one, and when does it not?
+- **It matches on narrow, in-distribution pattern tasks** such as classify, extract, reformat or answer
+  from supplied text, because these saturate early and fine-tuning covers the small region of input
+  space directly.
+- **It falls behind on stored world knowledge, multi-step reasoning, long intricate instructions and
+  long-context use,** because those keep improving with scale.
+- **So the real question is whether this task saturates,** and that must be measured on your own data.
+
+### Explain where the latency advantage of a 7B model over a 70B model comes from.
+- **Decode is memory-bandwidth bound.** Each generated token reads the active weights once, so
+  single-stream tokens per second is roughly bandwidth divided by weight bytes.
+- **Ten times fewer bytes is roughly ten times faster:** about 14 GB versus 140 GB at fp16, and the KV
+  cache is smaller too.
+- **Mixture-of-experts breaks the size label:** speed tracks active parameters, but memory must hold all
+  experts.
+
+### The self-hosted SLM looked 94% cheaper in the business case. Why might the real saving be near zero?
+- **The error-cost term was missing.** One point of accuracy on 5M messages a day is 50,000 misrouted
+  messages; at 0.02 units of rework each that is 1,000 units a day, cutting the saving to 550 units.
+- **The interval matters:** with about ±1 point on the fine-tuned score, the saving could be close to
+  zero.
+- **The fixed GPU cost needs volume.** Break-even is about 300,000 requests a day in the scenario, and
+  a second node for the peak doubles it.
+
+### How do you set the confidence threshold for an SLM-first cascade?
+- **Use a held-out human-labelled set,** because raw probabilities from fine-tuned models are often
+  overconfident.
+- **Sort by confidence and pick the cut-off** at which accuracy on accepted items still meets the bar;
+  everything below escalates.
+- **Recalibrate monthly or after any retrain,** and watch escalation rate: drift in it usually signals
+  drifting inputs.
+
+### When would you keep a task on the LLM even though an SLM scores well today?
+- **When the task definition shifts monthly,** because retraining becomes a treadmill and the
+  fine-tuned artefact goes stale.
+- **When volume is low,** because a self-hosted SLM's fixed GPU-hour cost never amortises; a small model
+  behind a hosted API is the better middle.
+- **When no one owns serving, monitoring and upgrades,** since the operational capacity is part of the
+  cost.
 
 ## Quiz
 ### Q: Which capabilities degrade first as a language model gets smaller?

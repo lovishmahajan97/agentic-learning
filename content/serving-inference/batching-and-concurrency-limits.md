@@ -5,7 +5,7 @@ name: Batching & concurrency limits
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - serving-inference/continuous-batching
   - serving-inference/prefill-vs-decode
@@ -23,104 +23,126 @@ sources:
 ---
 
 ## TL;DR
-Decode is memory-bandwidth bound: each step streams the whole weight set through the GPU once, no
-matter how many sequences are in the batch, so batching multiplies throughput almost for free until the
-GPU becomes compute-bound or the KV cache fills. Concurrency limits exist because past that knee each
-added request raises everyone's latency, and because unbounded admission ends in preemption thrash or
-OOM. The work is to find the knee for your traffic shape and enforce it at the engine, the gateway and
-the client.
+Decode streams all weights once per step regardless of batch size, so batching multiplies throughput
+almost free until compute or KV-cache reads bind. Concurrency limits stop past-the-knee latency growth
+and preemption thrash; enforce them at engine, gateway and client.
 
 ## Why it exists
-Take a Llama-3-8B-class model in fp16: about 16 GB of weights. On a GPU with roughly 3.35 TB/s of memory
-bandwidth (an H100 SXM's published figure), simply reading the weights once takes about 4.8 ms, which
-caps a single sequence at roughly 200 tokens per second regardless of how fast the tensor cores are. The
-FLOPs for that one token, about 2 × 8 billion = 16 GFLOP, take a small fraction of that time. The GPU is
-mostly waiting on memory.
-
-Now put 64 sequences in the step. The weights are read once and reused for all 64 tokens, so the step
-takes about the same 4.8 ms plus the extra KV-cache reads, and aggregate throughput rises toward 64×.
-That is the whole reason serving systems batch: arithmetic intensity grows linearly with batch size until
-it reaches the hardware's ridge point (peak FLOPs ÷ bandwidth, roughly 300 FLOP/byte for that GPU in
-bf16), after which the step becomes compute-bound and latency per token starts growing with the batch.
-The arithmetic is simple: each 2-byte bf16 weight does 2 FLOPs (a multiply and an add) per sequence, so
-a batch of B gives about B FLOPs per weight byte, and the weight matmuls alone would stay bandwidth-bound
-up to a batch in the low hundreds. In practice the knee usually arrives earlier, for the reason in the
-latency section below: each sequence also brings its own KV cache to read, and that traffic does not
-amortise across the batch.
-
-So why not admit everything? Three reasons. KV memory is finite and each admitted sequence consumes it
-for its whole lifetime, so over-admission leads to preemption, swap traffic and eventually OOM. Latency
-objectives: beyond the knee, time per output token (TPOT) climbs with every extra sequence and time to
-first token (TTFT) climbs with queue depth, so throughput keeps rising while the fraction of requests
-meeting their SLO, the goodput, falls. And blast radius: one tenant sending 10,000-token prompts can
-stall everyone's decode if nothing bounds how many prefill tokens enter a step. Limits turn an engine
-that degrades for everyone into one that queues or rejects predictably.
+- **Decode is bandwidth-bound.** A Llama-3-8B-class model in fp16 has about 16 GB of weights. At roughly
+  3.35 TB/s (an H100 SXM's published figure), reading them once takes about 4.8 ms, capping one sequence
+  at roughly 200 tokens per second however fast the tensor cores are. Its FLOPs, about 2 × 8 billion = 16
+  GFLOP, take a small fraction of that time.
+- **Batching reuses each weight read.** With 64 sequences the weights are read once for all 64 tokens, so
+  the step takes about the same 4.8 ms plus extra KV-cache reads, and throughput rises toward 64×.
+- **Over-admission ends badly.** KV memory is finite and each sequence holds it for its whole lifetime,
+  so admitting everything leads to preemption, swap traffic and eventually OOM.
+- **Latency objectives.** Past the knee, time per output token (TPOT) climbs with every extra sequence and
+  time to first token (TTFT) climbs with queue depth. Throughput keeps rising while goodput, the fraction
+  of requests meeting their SLO, falls.
+- **Blast radius.** One tenant sending 10,000-token prompts can stall everyone's decode unless something
+  bounds the prefill tokens entering a step. Limits make an engine queue or reject predictably instead of
+  degrading for everyone.
 
 ## How it works
-### Static versus continuous batching
-Static batching groups N requests, runs them until the longest finishes, and only then admits more; the
-GPU idles on finished slots. *Dynamic* batching, the classic model-server approach (Triton's
-queue-delay setting is the familiar example), waits up to a few milliseconds to collect requests into
-one batch, then runs it as a unit; that suits single-pass models such as embedders and classifiers,
-where every request takes the same one forward pass, but for generation it still holds the batch until
-the longest output finishes. Continuous (iteration-level) batching, introduced by Orca, re-forms the
-batch every decode step: finished sequences leave, waiting ones join. The continuous-batching lesson
-covers the scheduler; here the point is that it makes "batch size" a dynamic quantity bounded by limits
-rather than a fixed number you pick.
+### Where batching stops being free
+- **Arithmetic intensity grows with batch.** Each 2-byte bf16 weight does 2 FLOPs (a multiply and an add)
+  per sequence, so a batch of B gives about B FLOPs per weight byte.
+- **The ridge point.** Peak FLOPs ÷ bandwidth is roughly 300 FLOP/byte for that GPU in bf16. Past it the
+  step is compute-bound and latency per token grows with the batch.
+- **Weight matmuls alone** would stay bandwidth-bound up to a batch in the low hundreds.
+- **The knee usually arrives earlier** because each sequence also brings its own KV cache to read, and
+  that traffic does not amortise across the batch (see the latency section below).
+
+### Static, dynamic and continuous batching
+| Mode | How it batches | Fits |
+|---|---|---|
+| Static | groups N requests, runs until the longest finishes, then admits more; GPU idles on finished slots | offline jobs |
+| Dynamic | waits up to a few ms to collect a batch, runs it as a unit (Triton's queue-delay setting is the familiar example) | single-pass models (embedders, classifiers), where every request is one forward pass |
+| Continuous (iteration-level, from Orca) | re-forms the batch every decode step: finished sequences leave, waiting ones join | generation |
+
+- **Dynamic batching still holds a generation batch** until its longest output finishes.
+- **Continuous batching makes batch size dynamic,** bounded by limits rather than a fixed number you
+  pick. The continuous-batching lesson covers the scheduler.
 
 ### The three limits inside an engine
 Every engine exposes some version of these (vLLM's names in parentheses):
-1. **Maximum sequences per step** (`max_num_seqs`): bounds decode batch size and therefore worst-case
-   TPOT once compute-bound, and bounds the per-step sampling buffers.
-2. **Maximum tokens per step** (`max_num_batched_tokens`): bounds how many tokens, prompt and decode
-   together, are processed in one step. With chunked prefill (Sarathi-Serve's idea), a long prompt is split into chunks that
-   ride along with decode tokens, so a 20k-token prompt cannot monopolise a step and stall every
-   in-flight conversation. Lower values give smoother TPOT; higher values give faster prefill. The
-   budget can be modest *because* prefill is already batched across positions: a chunk of T prompt
-   tokens reuses each weight T times, so a chunk of a few hundred to a few thousand tokens already
-   saturates the tensor cores, and making it larger mainly lengthens the step that decode tokens wait on.
-3. **KV-cache capacity** (the block pool): the hard ceiling on tokens in flight. The scheduler admits a
+1. **Maximum sequences per step** (`max_num_seqs`). Bounds decode batch size, and so worst-case TPOT once
+   compute-bound, plus the per-step sampling buffers.
+2. **Maximum tokens per step** (`max_num_batched_tokens`). Bounds prompt and decode tokens together in one
+   step. With chunked prefill (Sarathi-Serve's idea) a long prompt is split into chunks that ride along
+   with decode tokens, so a 20k-token prompt cannot monopolise a step and stall every conversation.
+   Lower values give smoother TPOT; higher values give faster prefill.
+3. **KV-cache capacity** (the block pool). The hard ceiling on tokens in flight. The scheduler admits a
    request only if its prompt fits, and preempts when generation outgrows the pool.
-Each step the scheduler fills the step with decode tokens first, then admits waiting prompts up to the
-token budget, *because* stalling in-flight sequences is visible to users while delaying a new one by a
-few steps usually is not.
+
+- **Why the token budget can be modest.** Prefill is already batched across positions: a chunk of T
+  prompt tokens reuses each weight T times, so a few hundred to a few thousand tokens already saturate the
+  tensor cores. A larger chunk mainly lengthens the step decode tokens wait on.
+- **Fill order.** Each step takes decode tokens first, then admits waiting prompts up to the token budget,
+  *because* stalling in-flight sequences is visible to users while delaying a new one by a few steps
+  usually is not.
 
 ### Where the latency actually goes
-Step time is roughly `max(bytes_read / bandwidth, FLOPs / peak_FLOPs) + fixed overhead`. Bytes read
-include the weights *and the KV cache of every active sequence*, and the second term is the one people
-forget. With 64 sequences each at 6k tokens on the model above (128 KB of KV per token), the step reads
-64 × 6,144 × 128 KB = 48 GiB (about 51.5 GB) of cache on top of 16 GB of weights: about 20 ms, so
-roughly 50 tokens per second per user instead of 200. The cache reads now outweigh the weights three to
-one, and they grow with every sequence added. Notice also that this configuration nearly fills an 80 GB
-card: when the KV pool is full, each decode step reads close to all of HBM, so the step-time floor is
-roughly HBM capacity ÷ bandwidth (about 24 ms here) however the bytes divide between weights and cache.
-The safe concurrency therefore depends on context length, not just request count, which is why limits
-should be expressed in tokens.
+```
+step_time ≈ max(bytes_read / bandwidth, FLOPs / peak_FLOPs) + fixed overhead
+bytes_read = weights + KV cache of every active sequence
+```
+- **The forgotten term is the KV cache.** With 64 sequences at 6k tokens each on the model above (128 KB
+  of KV per token), the step reads 64 × 6,144 × 128 KB = 48 GiB (about 51.5 GB) of cache on top of 16 GB
+  of weights.
+- **Result:** about 20 ms per step, roughly 50 tokens per second per user instead of 200. Cache reads
+  outweigh the weights three to one and grow with every sequence added.
+- **The full-pool floor.** That configuration nearly fills an 80 GB card. With the pool full, each step
+  reads close to all of HBM, so the step-time floor is roughly HBM capacity ÷ bandwidth (about 24 ms here)
+  however bytes divide between weights and cache.
+- **So express limits in tokens.** Safe concurrency depends on context length, not just request count.
 
 ### Little's law and the queue
-Concurrency in the system equals arrival rate × residence time. If you need 10 requests/s and each
-lives 8 s, you need 80 in flight. If the knee for your traffic shape is 48, the queue grows without
-bound; no scheduler setting fixes that, only more replicas, a smaller model, shorter outputs or load
-shedding. This is the calculation that converts an engine benchmark into a replica count.
+- **Concurrency = arrival rate × residence time.** 10 requests/s that each live 8 s need 80 in flight.
+- **Past the knee the queue never drains.** If the knee for your traffic shape is 48, the queue grows
+  without bound. No scheduler setting fixes that; only more replicas, a smaller model, shorter outputs or
+  load shedding do.
+- **This converts an engine benchmark into a replica count.**
 
 ### Enforcing the limit at three layers
-- **Engine:** the parameters above plus a bounded waiting queue; when it is full, fail fast with 429/503
-  rather than accepting a request that will time out anyway.
-- **Gateway:** per-tenant concurrency and token-rate caps so one client cannot consume the whole knee,
-  and priority or fair-share queuing where SLOs differ.
-- **Client:** a semaphore sized to the share it was given, retries with jitter only on explicit
-  retry-after signals, and timeouts longer than expected queueing time so retries do not amplify load.
+| Layer | Mechanism |
+|---|---|
+| Engine | the parameters above plus a bounded waiting queue; when full, fail fast with 429/503 rather than accept a request that will time out anyway |
+| Gateway | per-tenant concurrency and token-rate caps so one client cannot consume the whole knee; priority or fair-share queuing where SLOs differ |
+| Client | a semaphore sized to its share, retries with jitter only on explicit retry-after signals, timeouts longer than expected queueing time so retries do not amplify load |
 
 ### Measuring the knee
-Sweep concurrency with prompts and output lengths that match production, record aggregate tokens/s, p50
-and p95 TTFT and TPOT, and plot throughput against p95 latency. Throughput rises steeply, flattens, and
-p95 latency bends upward; the bend is the knee. Re-run whenever the model, quantization, context
-distribution or GPU changes, because every one of them moves it.
+1. **Sweep concurrency** with prompts and output lengths that match production.
+2. **Record** aggregate tokens/s, p50 and p95 TTFT and TPOT.
+3. **Plot** throughput against p95 latency: throughput rises steeply then flattens while p95 bends
+   upward. The bend is the knee.
+4. **Re-run** whenever the model, quantization, context distribution or GPU changes, because every one of
+   them moves it.
 
-## Example
-A load sweep against an OpenAI-compatible endpoint. The client-side semaphore is the concurrency
-limit; the script reports throughput and tail latency per level so you can see where the curve flattens.
-Streaming is used so TTFT and TPOT can be separated; each streamed chunk is counted as one token.
+## Diagram
+One scheduler step: decode tokens go in first, waiting prompts fill the remaining token budget in
+chunks, and a full queue rejects instead of accepting work that will time out.
+
+```mermaid
+flowchart TD
+    Q["Waiting queue (bounded)"] --> S["Scheduler step"]
+    I["In-flight sequences"] -->|"decode tokens first"| S
+    S --> B{"Token budget left?"}
+    B -->|"yes"| K{"Prompt fits in KV pool?"}
+    K -->|"yes"| C["Admit prompt chunk"]
+    K -->|"no"| Q
+    B -->|"no"| R["Run step on GPU"]
+    C --> R
+    R --> I
+    G["Gateway: per-tenant caps"] --> Q
+    Q -.->|"queue full"| E["Fail fast: 429 or 503"]
+```
+
+## Examples
+### Load sweep against an OpenAI-compatible endpoint
+The client-side semaphore is the concurrency limit; the script reports throughput and tail latency per
+level so you can see where the curve flattens. Streaming separates TTFT and TPOT; each streamed chunk
+counts as one token.
 
 ```python
 import asyncio, time, httpx
@@ -156,37 +178,97 @@ for level in (1, 4, 16, 64):
 # Re-run with your real prompt and output length distribution before choosing limits.
 ```
 
+### Step-time model: why context length moves the knee
+A roofline estimate of the formula above in pure Python. It ignores fixed overhead, so treat outputs as
+illustrative orders of magnitude, not benchmarks.
+
+```python
+BW, PEAK = 3.35e12, 989e12          # H100 SXM: bytes/s, dense bf16 FLOP/s (published figures)
+W_BYTES, PARAMS = 16e9, 8e9         # Llama-3-8B-class in bf16
+KV_PER_TOKEN = 128 * 1024           # 32 layers x 8 KV heads x 128 dim x 2 (K,V) x 2 bytes
+
+def step_ms(batch, ctx):
+    bytes_read = W_BYTES + batch * ctx * KV_PER_TOKEN      # weights once + every sequence's cache
+    flops = 2 * PARAMS * batch                             # one token per sequence
+    return max(bytes_read / BW, flops / PEAK) * 1e3        # ignores fixed overhead
+
+for batch, ctx in [(1, 1000), (64, 1000), (64, 6144), (256, 1000)]:
+    ms = step_ms(batch, ctx)
+    print(f"batch={batch:3d} ctx={ctx:5d} step={ms:5.1f}ms "
+          f"per-user={1e3/ms:4.0f} tok/s total={batch*1e3/ms:6.0f} tok/s")
+```
+
+| Batch | Context | Step | Per user | Total |
+|---|---|---|---|---|
+| 1 | 1,000 | 4.8 ms | ~208 tok/s | ~208 tok/s |
+| 64 | 1,000 | 7.3 ms | ~137 tok/s | ~8,800 tok/s |
+| 64 | 6,144 | 20.2 ms | ~50 tok/s | ~3,200 tok/s |
+| 256 | 1,000 | 14.8 ms | ~68 tok/s | ~17,300 tok/s |
+
+Same batch of 64, six times the context: total throughput falls by almost two thirds, because the KV
+reads, not the weights, now set the step time.
+
+### Worked scenario: from benchmark to replica count
+| Step | Number |
+|---|---|
+| Target traffic | 10 requests/s |
+| Residence time per request (queue + prefill + decode) | 8 s |
+| Required concurrency (Little's law) | 10 × 8 = 80 in flight |
+| Measured knee per replica, production-shaped traffic | 48 |
+| Replicas | 80 ÷ 48 ≈ 1.7, so 2 at the knee, 3 with headroom for bursts and one replica down |
+
+## Production patterns
+- **Limit in tokens, not just requests.** When contexts vary widely, set `max_num_seqs` near the measured
+  knee and size `max_num_batched_tokens` so one long prompt cannot dominate a step. Monitor KV-cache
+  usage, preemptions and p95 TPOT together.
+- **Keep chunked prefill on for chat.** When long prompts share a GPU with live conversations, use
+  chunked prefill (default in recent vLLM, otherwise `--enable-chunked-prefill`) and tune the token budget
+  down if TPOT spikes on prompt bursts. Monitor p95 TPOT during long-prompt arrivals.
+- **Bound the queue and shed early.** Return 429 or 503 with a `Retry-After` header once queue depth or
+  expected wait exceeds the client timeout. Monitor queue depth, rejection rate and the fraction of
+  requests that time out after admission.
+- **Per-tenant semaphores at the gateway.** When several teams share an engine, give each a concurrency
+  and tokens-per-minute cap and lend idle share only if the gateway supports it. Monitor per-tenant
+  in-flight count and rejections.
+- **Re-sweep on every model or traffic change.** Run a load sweep (the script above, or vLLM's serving
+  benchmark) with production-shaped prompts before changing limits. Track the knee as a dashboard number
+  per model and GPU type.
+
 ## Trade-offs
-- A higher sequence limit raises throughput and lowers cost per token, but once the step is compute-bound
-  or KV-read-bound every extra sequence adds to every user's TPOT.
-- A lower tokens-per-step budget keeps TPOT smooth during prompt bursts, but stretches TTFT for long
-  prompts because their prefill is spread over more steps.
-- Rejecting at the queue (429/503) protects latency for admitted requests, but pushes retry logic and
-  fairness onto clients; accepting everything is simpler and fails slowly for all.
-- Per-tenant caps guarantee isolation, yet leave capacity idle when one tenant is quiet unless the
-  gateway can lend unused share, which adds scheduling complexity.
+- **Higher sequence limit vs per-user TPOT.** It raises throughput and lowers cost per token, but once the
+  step is compute-bound or KV-read-bound every extra sequence adds to every user's TPOT.
+- **Low tokens-per-step budget vs TTFT.** It keeps TPOT smooth during prompt bursts, but stretches TTFT for
+  long prompts because their prefill is spread over more steps.
+- **Rejecting vs accepting everything.** Rejecting at the queue (429/503) protects latency for admitted
+  requests but pushes retry logic and fairness onto clients; accepting everything is simpler and fails
+  slowly for all.
+- **Per-tenant caps vs utilisation.** Caps guarantee isolation, yet leave capacity idle when one tenant is
+  quiet unless the gateway can lend unused share, which adds scheduling complexity.
 
 ## Pitfalls
-- Limiting by request count only; a handful of 100k-token requests exhausts the KV pool while the count
-  looks healthy. The symptom is preemption spikes and latency jitter at low request rates.
-- Measuring the knee with short synthetic prompts, then deploying to traffic with long retrieved
-  context. Throughput looks fine in the benchmark and TPOT doubles in production.
-- Client timeouts shorter than queueing time under load, so clients retry while the original request is
-  still running: load doubles exactly when the system is saturated.
-- Disabling chunked prefill for peak prefill speed and then seeing in-flight conversations stall for
-  hundreds of milliseconds each time a long prompt arrives.
-- Setting the tokens-per-step budget very high. Engines that profile the activation peak at startup
-  (vLLM) respond by shrinking the KV pool, so capacity silently drops; engines that do not profile OOM
-  on a large prefill, a failure that only shows up when a big prompt and a full decode batch coincide.
+- **Limiting by request count only.** A handful of 100k-token requests exhausts the KV pool while the
+  count looks healthy. Symptom: preemption spikes and latency jitter at low request rates.
+- **Benchmarking with short synthetic prompts.** Deployed to traffic with long retrieved context,
+  throughput looks fine in the benchmark and TPOT doubles in production.
+- **Client timeouts shorter than queueing time.** Clients retry while the original request is still
+  running, so load doubles exactly when the system is saturated.
+- **Disabling chunked prefill for peak prefill speed.** In-flight conversations then stall for hundreds of
+  milliseconds each time a long prompt arrives.
+- **Setting the tokens-per-step budget very high.** Engines that profile the activation peak at startup
+  (vLLM) respond by shrinking the KV pool, so capacity silently drops. Engines that do not profile OOM on
+  a large prefill, a failure that only appears when a big prompt and a full decode batch coincide.
 
 ## When to use
-Every self-hosted deployment needs explicit limits; the question is their values. Start from the VRAM
-budget to get a token ceiling, run the sweep above with production-shaped traffic to find the latency
-knee, and set the sequence and token limits a little below it. Use Little's law to convert the target
-request rate into replicas. Apply per-tenant caps whenever more than one team or customer shares an
-engine, and always bound the queue. When using a hosted API the same thinking applies to provider rate
-limits: a client-side semaphore and token budget avoid 429 storms. In interviews, be ready to derive why
-batching is nearly free for decode, where it stops being free, and what you would measure to find out.
+Every self-hosted deployment needs explicit limits; the question is their values.
+- **Start from VRAM** to get a token ceiling, run the sweep with production-shaped traffic to find the
+  latency knee, and set the sequence and token limits a little below it.
+- **Use Little's law** to convert the target request rate into replicas.
+- **Apply per-tenant caps** whenever more than one team or customer shares an engine, and always bound the
+  queue.
+- **Hosted APIs too:** the same thinking applies to provider rate limits; a client-side semaphore and
+  token budget avoid 429 storms.
+- **Interviews:** derive why batching is nearly free for decode, where it stops being free, and what you
+  would measure to find out.
 
 ## Role lens
 - **Engineer:** Sets engine limits, writes the load-sweep harness, sizes client semaphores, and adds
@@ -208,6 +290,37 @@ latency SLO probably fell. I would check p95 TPOT and TTFT at both levels, preem
 metrics, and KV block utilization, and I would re-run the sweep with production prompt and output length
 distributions. If more throughput is needed, the answer is a second replica, a quantized or smaller
 model, or shorter contexts, not a higher limit on the same GPU.
+
+## Interview questions
+### Why is batching nearly free for decode but not for prefill?
+- **Decode is bandwidth-bound:** one token per sequence means each weight read does ~2 FLOPs per sequence,
+  so adding sequences reuses the same read and costs little extra time.
+- **Prefill is already compute-bound:** a prompt of T tokens reuses each weight T times, so batching more
+  prompts adds proportional compute time instead of riding on idle tensor cores.
+
+### Users report TPOT doubling after a RAG feature launched, with the same request rate. What happened?
+- **Context grew:** retrieved passages raise tokens per sequence, and every active sequence's KV cache is
+  read each step, so step time rises even at constant concurrency.
+- **Confirm** with KV-cache usage, prompt-length p95 and preemption counters.
+- **Fix:** lower `max_num_seqs` for that route, trim retrieved context, use an fp8 KV cache, or add
+  replicas.
+
+### When would you choose dynamic batching over continuous batching?
+- **Single-pass models:** embedders, rerankers and classifiers do one forward pass per request, so
+  collecting a batch for a few milliseconds is simple and efficient.
+- **Not for generation:** a dynamic batch holds every slot until the longest output finishes, wasting the
+  GPU on finished sequences.
+
+### You need 30 requests/s, each lives 4 s, and your knee is 40. How many replicas, and what else matters?
+- **Little's law:** 30 × 4 = 120 in flight, so 3 replicas at the knee, more with headroom.
+- **Residence time is not fixed:** past the knee queueing raises it, which raises required concurrency
+  again, so size with margin and bound the queue.
+
+### Why should clients retry only on explicit retry-after signals?
+- **Blind retries amplify overload:** a client that times out while its request still runs adds a second
+  copy exactly when the engine is saturated.
+- **So** set client timeouts above expected queueing time, add jitter, and let the server say when to come
+  back.
 
 ## Quiz
 ### Q: Why does adding sequences to a decode batch raise throughput almost linearly at first?

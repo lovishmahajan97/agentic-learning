@@ -5,7 +5,7 @@ name: NoSQL
 kind: concept
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - backend-fundamentals/database-design
   - backend-fundamentals/sql
@@ -22,113 +22,144 @@ sources:
 ---
 
 ## TL;DR
-NoSQL stores give up general joins and cross-record transactions so that data can be partitioned across
-many machines by a key and served with predictable latency at any size. The price is that you must design
-the data around the exact queries you will run, and accept weaker consistency on some reads. Choose one
-for a known, narrow access pattern at scale, not because "schemaless" sounds easier.
+NoSQL stores give up general joins and cross-record transactions to partition data by key and serve it
+with predictable latency at any size. You design around exact queries and accept weaker consistency on
+some reads; choose one for a known access pattern at scale.
 
 ## Why it exists
-A relational database on one machine answers any question you can write in SQL, but it has a ceiling:
-one machine's disk, memory and write throughput. Past that you must partition, and the moment rows live
-on different machines, a join between them becomes a network operation and a transaction across them
-becomes a distributed commit. Both are possible, but they are slow and fragile, and they are exactly the
-operations the relational model makes casual. Early web-scale systems hit this wall and responded by
-restricting the data model: if every operation touches one partition, identified by a key, then each
-machine can serve its partition independently, nodes can be added without coordination, and a machine
-failure affects only its share of keys.
-
-The naive alternative, sharding a relational database by hand, pushes the join and transaction problem
-into application code where every engineer must know the sharding scheme, and it keeps the schema rigid
-while the data is spread across nodes that cannot be migrated atomically. NoSQL systems make the
-constraint explicit instead: you declare a partition key, the store guarantees cheap operations within a
-partition, and anything across partitions is either unsupported or clearly expensive. A second
-motivation is the data model itself rather than scale: a document store lets items of one collection carry
-different fields and nests read-together data in one record, which suits event payloads and tool outputs
-whose shape varies by type, and a graph database makes multi-hop traversals cheap that would be chains
-of self-joins in SQL. "NoSQL" is therefore a bundle of different answers to different problems, and the
-first design question is which problem you actually have.
-
-The cost is real. Every query you did not design a key or index for is a full scan or impossible, and
-"schemaless" simply means the schema lives in your code, unenforced.
+- **One machine has a ceiling.** A relational database answers any SQL question, but only within one
+  machine's disk, memory and write throughput. Past that you must partition.
+- **Partitioning breaks the casual operations.** Once rows live on different machines, a join is a network
+  operation and a transaction is a distributed commit: possible, but slow and fragile.
+- **Restrict the model, gain scale.** If every operation touches one partition identified by a key, each
+  machine serves its partition independently, nodes are added without coordination, and a failure affects
+  only its share of keys.
+- **Hand-sharding SQL is worse.** It pushes joins and transactions into application code where every
+  engineer must know the scheme, and keeps the schema rigid across nodes that cannot migrate atomically.
+  NoSQL makes the constraint explicit: declare a partition key; cross-partition work is unsupported or
+  clearly expensive.
+- **Some stores exist for the model, not scale.** Documents let items carry different fields and nest
+  read-together data (event payloads, tool outputs whose shape varies by type); graphs make multi-hop
+  traversals cheap that would be chains of self-joins. "NoSQL" is a bundle of answers, so first ask which
+  problem you have. The cost: unplanned queries are full scans or impossible, and "schemaless" means the
+  schema lives in your code, unenforced.
 
 ## How it works
 ### The families
-- **Key-value** (Redis, DynamoDB used simply, Riak): get and put a value by key. The simplest and the
-  fastest; no queries other than by key.
-- **Document** (MongoDB, Couchbase, DynamoDB with nested attributes): the value is a JSON-like document
-  with nested fields; you can index and query on fields inside it, within a collection.
-- **Wide-column** (Cassandra, ScyllaDB, Bigtable): rows grouped by a partition key and ordered within the
-  partition by clustering columns; built for very high write rates and time-ordered reads within a key.
-- **Graph** (Neo4j): nodes and edges, for queries that are mostly traversals ("friends of friends").
+| Family | Examples | Model | Best at |
+|---|---|---|---|
+| **Key-value** | Redis, DynamoDB used simply, Riak | get and put a value by key | the simplest and fastest; no queries other than by key |
+| **Document** | MongoDB, Couchbase, DynamoDB with nested attributes | JSON-like documents with nested fields | indexing and querying fields inside documents, within a collection |
+| **Wide-column** | Cassandra, ScyllaDB, Bigtable | rows grouped by partition key, ordered by clustering columns | very high write rates and time-ordered reads within a key |
+| **Graph** | Neo4j | nodes and edges | traversals ("friends of friends") |
+
 Search engines and vector databases are specialised stores that behave like document stores with a
 different index at the core; they are covered in their own lessons.
 
 ### Partitioning by key
-The store hashes the partition key to pick a node (or a range of keys maps to a node). Every operation
-that carries the key is routed to one node and costs one lookup regardless of total data size, which is
-the whole point. Operations without the key must fan out to every node, so a design question is: "which
-key will every hot query have in hand?" In DynamoDB this is the partition key plus an optional sort key;
-in Cassandra the partition key plus clustering columns; in MongoDB the shard key.
+1. **Route by key.** The store hashes the partition key to pick a node (or a key range maps to a node).
+2. **One lookup at any size.** Every operation carrying the key goes to one node and costs one lookup
+   regardless of total data size, which is the whole point.
+3. **No key, fan out.** Operations without the key must hit every node, so ask: "which key will every hot
+   query have in hand?"
+
+| Store | Key that routes |
+|---|---|
+| DynamoDB | partition key plus an optional sort key |
+| Cassandra | partition key plus clustering columns |
+| MongoDB | shard key |
 
 ### Replication and consistency
-Each partition is replicated to N nodes for durability. Writes are acknowledged after W replicas accept
-them and reads consult R replicas; when W + R > N the read set must overlap the write set, so a read
-reaches at least one replica holding the latest acknowledged write (a strict quorum). Edge cases weaken
-this in practice: sloppy quorums that accept writes on stand-in nodes, concurrent writes resolved by
-last-write-wins, and writes that failed on some replicas but were not rolled back.
-Choosing W = 1 gives the fastest writes and the possibility that a read a moment later sees the old value:
-**eventual consistency**. Most stores let you choose per operation (Cassandra consistency levels,
-DynamoDB's `ConsistentRead`), and strongly consistent reads cost more and may fail when a replica is
-down. This is the practical face of the CAP trade-off: during a partition, a store either refuses some
-requests or serves possibly-stale data.
+- **N replicas per partition** for durability. Writes are acknowledged after W replicas accept; reads
+  consult R replicas.
+- **Strict quorum: W + R > N.** The read set must overlap the write set, so a read reaches at least one
+  replica holding the latest acknowledged write.
+- **Edge cases weaken it:** sloppy quorums that accept writes on stand-in nodes, concurrent writes resolved
+  by last-write-wins, and writes that failed on some replicas but were not rolled back.
+- **W = 1 is fastest** and allows a read a moment later to see the old value: **eventual consistency**.
+- **Per-operation choice.** Cassandra consistency levels and DynamoDB's `ConsistentRead`; strongly
+  consistent reads cost more and may fail when a replica is down.
+- **CAP in practice:** during a partition, a store either refuses some requests or serves possibly-stale data.
 
 ### Modelling: access patterns first
-Relational design starts from entities and normalizes; NoSQL design starts from the list of queries and
-shapes the data so each one is a single-partition read. Two decisions dominate:
-1. **Embed or reference.** Embed child data inside the parent document when it is read together and
-   bounded in size (a message with its tool calls). Reference by id when the child set is unbounded or
-   shared (all messages of a conversation that may run to thousands). Documents have hard size limits
-   (16 MB in MongoDB, 400 KB per item in DynamoDB), and an unbounded embedded array will hit them.
-2. **Denormalize and duplicate.** Because there are no joins, data needed by two queries is often stored
-   twice, in two key layouts, and the application updates both. DynamoDB's single-table design takes this
-   to its conclusion: every entity type in one table with composite keys like `TENANT#t1#USER#u9` /
-   `SESSION#2026-10-20T10:00`, and global secondary indexes (GSIs) that re-key the same items for a second
-   access pattern. A GSI is maintained asynchronously, so reads through it are eventually consistent.
+Relational design starts from entities and normalizes; NoSQL starts from the list of queries and shapes
+data so each is a single-partition read. Two decisions dominate:
+
+1. **Embed or reference.**
+   - Embed child data when it is read together and bounded in size (a message with its tool calls).
+   - Reference by id when the child set is unbounded or shared (all messages of a conversation that may
+     run to thousands).
+   - Documents have hard size limits (16 MB in MongoDB, 400 KB per item in DynamoDB); an unbounded
+     embedded array will hit them.
+2. **Denormalize and duplicate.**
+   - With no joins, data needed by two queries is often stored twice in two key layouts, and the
+     application updates both.
+   - DynamoDB single-table design takes this to its conclusion: every entity type in one table with
+     composite keys like `TENANT#t1#USER#u9` / `SESSION#2026-10-20T10:00`.
+   - Global secondary indexes (GSIs) re-key the same items for a second access pattern. A GSI is
+     maintained asynchronously, so reads through it are eventually consistent.
 
 ### Hot partitions
-Capacity is configured per table, but each physical partition has its own throughput ceiling (in
-DynamoDB, documented as roughly 3,000 read units and 1,000 write units per second per partition). If one
-tenant produces 40% of all writes and tenant id is the partition key, that partition throttles while the
-rest of the cluster idles. DynamoDB's adaptive capacity and split-for-heat soften this for some
-workloads, but they are not something to design around. Fixes are
-to add a high-cardinality component to the key (tenant + conversation, or tenant + a shard suffix) so a
-busy tenant spreads over several partitions, at the cost of fan-out reads for "everything for this tenant".
+- **Per-partition ceilings.** Capacity is configured per table, but each physical partition has its own
+  throughput ceiling (in DynamoDB, documented as roughly 3,000 read units and 1,000 write units per second
+  per partition).
+- **The failure.** If one tenant produces 40% of all writes and tenant id is the partition key, that
+  partition throttles while the rest of the cluster idles.
+- **Do not design around auto-healing.** DynamoDB's adaptive capacity and split-for-heat soften this for
+  some workloads, but are not something to rely on.
+- **Fix: a high-cardinality key.** Tenant + conversation, or tenant + a shard suffix, spreads a busy tenant
+  over several partitions, at the cost of fan-out reads for "everything for this tenant".
 
 ### Why wide-column stores write so fast
-Cassandra, ScyllaDB and Bigtable sit on a log-structured merge tree (LSM) rather than the update-in-place
-B-tree of a relational engine. A write is appended to a commit log and inserted into an in-memory sorted
-table; when that fills, it is flushed to disk as an immutable sorted file, and background compaction later
-merges files and discards overwritten and deleted versions. Every write is sequential I/O with no read
-first, which is why ingest rates are high. The cost lands on reads, which may consult several files
-(bloom filters skip most), and on compaction, which consumes disk bandwidth in the background. Deletes
-are written as tombstones, so a partition that receives many deletes gets slower to read until compaction
-removes them, a well-known operational trap with queue-like access patterns.
+Cassandra, ScyllaDB and Bigtable use a log-structured merge tree (LSM), not an update-in-place B-tree:
+
+1. A write is appended to a commit log and inserted into an in-memory sorted table.
+2. When that fills, it is flushed to disk as an immutable sorted file.
+3. Background compaction merges files and discards overwritten and deleted versions.
+
+- **Gain:** every write is sequential I/O with no read first, which is why ingest rates are high.
+- **Cost on reads:** a read may consult several files (bloom filters skip most), and compaction consumes
+  disk bandwidth in the background.
+- **Tombstones:** deletes are written as markers, so a partition with many deletes reads slower until
+  compaction removes them, a well-known trap with queue-like access patterns.
 
 ### Transactions and indexes
-Modern document stores support multi-document transactions, and DynamoDB offers transactional reads and
-writes across a bounded set of items (up to 100 per transaction at the time of writing), but they cost
-more capacity, are limited in scope and are not the default idiom. Secondary indexes exist in all of them,
-and each one is a copy of the data maintained on every write; in DynamoDB every GSI also consumes its own
-write capacity and storage, so "index everything" shows up directly on the bill.
+- **Transactions exist but are not the idiom.** Modern document stores support multi-document
+  transactions; DynamoDB offers transactional reads and writes across a bounded set of items (up to 100
+  per transaction at the time of writing). They cost more capacity and are limited in scope.
+- **Every secondary index is a copy** maintained on every write. In DynamoDB each GSI also consumes its own
+  write capacity and storage, so "index everything" shows up directly on the bill.
 
-## Example
-Agent sessions and their messages in DynamoDB, designed from two access patterns: "list a user's recent
-sessions" and "load the last 20 messages of a session". Each is a single-partition `Query`. Messages are
-referenced, not embedded, because a session can grow without bound. The sort key carries a zero-padded
-sequence so lexical order is chronological (`MSG#00000010` sorts after `MSG#00000009`; unpadded, `MSG#10`
-would sort before `MSG#9`). The caller assigns `seq` (for example from a counter on the session item), and
-the conditional put is what makes a collision visible: it distinguishes "my own retry already landed"
-from "another writer took this sequence number", which must not be silently swallowed.
+## Diagram
+Every request either carries the partition key and goes to one replica set, or it fans out to every node;
+the W and R settings decide whether the read is fresh.
+
+```mermaid
+flowchart TD
+    C["Client request"] --> K{"Has partition key?"}
+    K -->|"yes"| H["Hash key to partition"]
+    K -->|"no"| SG["Scatter-gather to every node"]
+    H --> RS[("Replica set of N nodes")]
+    RS --> WQ["Write acked by W replicas"]
+    RS --> RQ["Read consults R replicas"]
+    WQ --> Q{"W + R greater than N?"}
+    RQ --> Q
+    Q -->|"yes"| F["Read sees latest acked write"]
+    Q -->|"no"| E["Read may be stale"]
+    SG --> SL["Cost grows with cluster size"]
+```
+
+## Examples
+### Agent sessions and messages in DynamoDB
+Designed from two access patterns, "list a user's recent sessions" and "load the last 20 messages of a
+session", each a single-partition `Query`.
+
+- **Messages are referenced, not embedded,** because a session can grow without bound.
+- **Zero-padded sequence in the sort key** makes lexical order chronological: `MSG#00000010` sorts after
+  `MSG#00000009`; unpadded, `MSG#10` would sort before `MSG#9`.
+- **The caller assigns `seq`** (for example from a counter on the session item).
+- **The conditional put makes collisions visible.** It distinguishes "my own retry already landed" from
+  "another writer took this sequence number", which must not be silently swallowed.
 
 ```python
 import boto3, time
@@ -171,48 +202,101 @@ def last_messages(session_id, limit=20):
     return list(reversed(r["Items"]))
 ```
 
-A query the design does not support, "all messages mentioning refunds across all tenants", would be a
-full table scan; if it matters, the data also goes to a search index.
+A query the design does not support, "all messages mentioning refunds across all tenants", would be a full
+table scan; if it matters, the data also goes to a search index.
+
+### Runnable: why W + R > N gives fresh reads
+Pure Python. It enumerates every write set and read set for N = 3, as if replicas were picked uniformly at
+random, and counts reads that miss every replica holding the write.
+
+```python
+from itertools import combinations
+
+def stale_read_fraction(n, w, r):
+    """Share of (write set, read set) pairs where the read misses every replica that took the write."""
+    nodes = range(n)
+    pairs = [(ws, rs) for ws in combinations(nodes, w) for rs in combinations(nodes, r)]
+    stale = sum(1 for ws, rs in pairs if not set(ws) & set(rs))
+    return stale / len(pairs)
+
+for w, r in [(1, 1), (1, 2), (2, 1), (2, 2), (3, 1)]:
+    print(f"N=3 W={w} R={r}  W+R>N={w + r > 3}  stale reads: {stale_read_fraction(3, w, r):.0%}")
+# N=3 W=1 R=1  W+R>N=False  stale reads: 67%
+# N=3 W=1 R=2  W+R>N=False  stale reads: 33%
+# N=3 W=2 R=1  W+R>N=False  stale reads: 33%
+# N=3 W=2 R=2  W+R>N=True  stale reads: 0%
+# N=3 W=3 R=1  W+R>N=True  stale reads: 0%
+```
+
+### Worked scenario: one tenant melts one partition
+A DynamoDB table takes 5,000 writes per second overall; one tenant produces 40% of them and `tenant_id`
+is the partition key. Ceiling figure from the per-partition limit above; arithmetic only, not a benchmark.
+
+| Key design | Writes/s on hottest partition | Against 1,000 write units/s ceiling |
+|---|---|---|
+| `tenant_id` | 2,000 | throttles about half the tenant's writes |
+| `tenant_id#shard` with 4 shards | ~500 per shard | fits, with headroom |
+| Cost of the fix | "all runs for the tenant" queries 4 partitions and merges | keep a summary item or GSI for tenant-wide views |
+
+Raising table capacity does not help, because the limit is per partition.
+
+## Production patterns
+- **Find hot keys before they page you.** Enable CloudWatch Contributor Insights on DynamoDB tables to see
+  the most-accessed and most-throttled keys, and alarm on `WriteThrottleEvents` and `ReadThrottleEvents`.
+  When one key dominates, add a shard suffix derived from a hash of the item id.
+- **Conditional writes as the idempotency primitive.** Use `ConditionExpression="attribute_not_exists(sk)"`
+  for inserts and a version attribute check for updates, so retries cannot overwrite. Monitor the
+  `ConditionalCheckFailedRequests` metric; a spike means competing writers or a retry storm.
+- **TTL for ephemeral agent state.** Put an expiry epoch-seconds attribute on session and cache items and
+  enable DynamoDB TTL (or a MongoDB TTL index with `expireAfterSeconds`). Deletion is asynchronous, so
+  filter expired items on read. Monitor table size trend.
+- **Validate shape at the edge.** Write a `schema_version` on every document and validate with a typed
+  model on read and write; in MongoDB add a `$jsonSchema` collection validator. Monitor validation
+  failures by version to know when old shapes can be retired.
+- **Stream changes to the stores that answer other questions.** Feed DynamoDB Streams or MongoDB change
+  streams into search, analytics or the warehouse instead of scanning. Monitor consumer lag (iterator age).
 
 ## Trade-offs
-- Single-partition operations scale horizontally with no ceiling in practice, but any query that lacks
-  the partition key becomes a scatter-gather or a scan; the trade flips when ad-hoc questions dominate.
-- Flexible schemas let different record shapes coexist and evolve without migrations, but nothing
+- **Horizontal scale vs query freedom.** Single-partition operations scale with no ceiling in practice,
+  but any query lacking the partition key is a scatter-gather or a scan; the trade flips when ad-hoc
+  questions dominate.
+- **Flexible schema vs enforcement.** Different shapes coexist and evolve without migrations, but nothing
   enforces them, so validation moves into code and old shapes linger in the data forever.
-- Eventual consistency gives low latency and availability during failures, but a client that writes then
-  reads may see stale data; pay for consistent reads on the paths where users would notice.
-- Denormalizing for read patterns makes each read one call, but every update must touch every copy, and a
-  missed copy is a silent inconsistency with no foreign key to catch it.
-- Managed stores like DynamoDB remove operations work and give predictable per-request cost, but a new
-  access pattern can mean a new index or a data migration rather than a new query.
-- A document store avoids the object-relational mismatch for nested, read-together data, but it loses the
+- **Eventual consistency vs freshness.** Low latency and availability during failures, but a client that
+  writes then reads may see stale data; pay for consistent reads where users would notice.
+- **Denormalized reads vs update fan-out.** Each read is one call, but every update must touch every copy,
+  and a missed copy is a silent inconsistency with no foreign key to catch it.
+- **Managed simplicity vs agility.** DynamoDB removes operations work and gives predictable per-request
+  cost, but a new access pattern can mean a new index or a data migration, not a new query.
+- **No object-relational mismatch vs no joins.** Documents suit nested, read-together data but lose the
   database's ability to join, constrain and aggregate across entities.
 
 ## Pitfalls
-- Choosing NoSQL "for scale" at tens of gigabytes; the symptom is a team rebuilding joins, aggregates and
-  constraints in application code for data that a single PostgreSQL instance would handle easily.
-- Partitioning by tenant alone; the symptom is throttling errors on one partition while the cluster's
-  overall utilisation is low.
-- Embedding an unbounded array (all messages inside the session document); the symptom is writes that get
-  slower as the conversation grows, then a hard document-size error.
-- Expecting read-your-own-write on default eventually consistent reads; the symptom is a user who posts a
-  message and does not see it on the next refresh, intermittently.
-- Issuing scans or non-key queries from request paths; the symptom is latency that rises with table size
-  and a bill dominated by read capacity.
-- Letting document shapes drift (some records with `tokens`, some with `token_count`); the symptom is
-  code full of defensive `get` calls and analytics that undercount.
-- Relying on secondary indexes as if they were free; the symptom is write cost multiplying with each
-  index and GSI reads that lag the base table.
+- **Choosing NoSQL "for scale" at tens of gigabytes.** Symptom: a team rebuilding joins, aggregates and
+  constraints in code for data one PostgreSQL instance would handle easily.
+- **Partitioning by tenant alone.** Symptom: throttling errors on one partition while overall cluster
+  utilisation is low.
+- **Embedding an unbounded array** (all messages inside the session document). Symptom: writes slow as the
+  conversation grows, then a hard document-size error.
+- **Expecting read-your-own-write on default eventually consistent reads.** Symptom: a user posts a
+  message and intermittently does not see it on the next refresh.
+- **Scans or non-key queries on request paths.** Symptom: latency that rises with table size and a bill
+  dominated by read capacity.
+- **Letting document shapes drift** (some records with `tokens`, some with `token_count`). Symptom: code
+  full of defensive `get` calls and analytics that undercount.
+- **Treating secondary indexes as free.** Symptom: write cost multiplying with each index, and GSI reads
+  that lag the base table.
 
 ## When to use
-Reach for a NoSQL store when you can write down the handful of access patterns up front, when each one
-can be keyed to a single partition, and when the write rate, data volume or availability requirement
-exceeds what one relational node provides comfortably. Typical fits in AI systems: per-session agent
-state and message logs keyed by session, high-volume event and trace ingestion, feature or cache lookups
-by id. Stay relational while the data fits one machine and the questions are still changing; add a
-specialised store (search, vector, key-value cache) beside PostgreSQL rather than replacing it. Measure
-partition heat and consistent-read usage once live. In interviews, expect to design keys for a given set
-of queries and to explain what happens to the query you forgot.
+- **Use when:** you can write down the handful of access patterns up front, each keys to a single
+  partition, and write rate, data volume or availability needs exceed one relational node comfortably.
+- **Typical AI fits:** per-session agent state and message logs keyed by session, high-volume event and
+  trace ingestion, feature or cache lookups by id.
+- **Avoid when:** the data fits one machine and the questions are still changing; stay relational and add
+  a specialised store (search, vector, key-value cache) beside PostgreSQL rather than replacing it.
+- **Measure:** partition heat and consistent-read usage once live.
+- **Interviews:** expect to design keys for a given set of queries and explain what happens to the query
+  you forgot.
 
 ## Role lens
 - **Engineer:** Designs partition and sort keys from the query list, writes conditional puts for
@@ -233,6 +317,37 @@ partitions by adding high-cardinality data to the key, for example `tenant_id#us
 requires querying each shard and merging, so you keep a GSI or a separate summary item for tenant-wide
 views, accepting that it is eventually consistent. The general lesson is that the key must distribute
 load, not just identify ownership.
+
+## Interview questions
+### What does a NoSQL store give up compared with PostgreSQL, and what does it buy?
+- **Gives up:** general joins, cross-record transactions and ad-hoc queries, plus database-enforced schema.
+- **Buys:** partitioning by key so each operation touches one node, which keeps latency flat at any size
+  and lets you add nodes without coordination.
+- **So** it fits narrow, known access patterns at scale, not evolving relational questions.
+
+### Design the keys for storing agent conversations so you can list a user's sessions and page a session's messages.
+- **Sessions:** partition `TENANT#t#USER#u`, sort key `SESSION#<timestamp>#<id>`, queried newest first.
+- **Messages:** separate items, partition `SESSION#<id>`, sort key with a zero-padded sequence so lexical
+  order is chronological, because a session grows without bound.
+- **Writes:** conditional puts on `attribute_not_exists(sk)` so retries are safe and collisions visible.
+
+### A user posts a message and sometimes does not see it on refresh. What is going on?
+- **Eventually consistent read.** The default read hit a replica that had not yet applied the write, or the
+  read went through a GSI, which is always asynchronous.
+- **Fix:** use a strongly consistent read on the base table for the read-after-write path only (it costs
+  more and can fail when a replica is down), or return the written item to the client directly.
+
+### When would you advise against moving a product's data to DynamoDB or MongoDB?
+- **Small data, changing questions:** at tens of gigabytes with evolving reporting needs, one PostgreSQL
+  instance gives joins, constraints and aggregates for free.
+- **Better move:** keep PostgreSQL as the system of record and add a specialised store beside it for the
+  one access pattern that actually needs scale.
+
+### Why do Cassandra-style stores ingest writes so fast, and what does it cost?
+- **LSM tree:** writes go to a commit log and an in-memory sorted table, then flush as immutable files,
+  so each write is sequential I/O with no read first.
+- **Costs:** reads may check several files (bloom filters help), compaction uses background disk bandwidth,
+  and deletes leave tombstones that slow reads on queue-like partitions until compaction.
 
 ## Quiz
 ### Q: Why does a document store make joins across collections expensive or unsupported?

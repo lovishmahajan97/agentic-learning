@@ -5,7 +5,7 @@ name: Trade-off analysis
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - system-design/nfrs
   - system-design/adrs
@@ -22,105 +22,136 @@ sources:
 ---
 
 ## TL;DR
-Trade-off analysis is the disciplined way to choose between architectural options when none dominates:
-frame the decision and its hard constraints, enumerate real options, score them against the NFRs that
-matter using evidence rather than opinion, find the sensitivity points where the ranking flips, weigh
-reversibility, then decide and record. It exists because every architectural choice gives something up
-and "best practice" hides what. In AI systems the usual battleground is quality against latency against
-cost, with vendor risk as the fourth corner.
+Trade-off analysis chooses between options when none dominates: filter by hard constraints, score real
+options on NFR evidence, find where the ranking flips, weigh reversibility, then record. In AI it is
+usually quality vs latency vs cost, plus vendor risk.
 
 ## Why it exists
-Richards and Ford's first law of software architecture is that everything is a trade-off, and their
-corollary is that if you think you have found a choice without one, you have not yet found the
-trade-off. The practice exists because teams keep making architectural decisions in ways that hide the
-cost until it is paid.
-
-The common failure modes are recognisable. The **pros-and-cons list** has no weights, no evidence and no
-conditions, so it can justify anything. The **weighted scoring matrix** looks rigorous but is usually
-built backwards: the favourite is chosen first and the weights are adjusted until it wins, with
-single-digit precision pretending to be measurement. **Best-practice** and **vendor-benchmark**
-decisions import someone else's context, which is the one thing a trade-off is sensitive to. And
-**analysis paralysis** is the opposite failure, where the absence of a method makes every decision a
-debate that ends with the loudest voice.
-
-AI systems make this worse in a specific way. The options change monthly, published benchmarks do not
-transfer to your data, and the honest answer to most questions, hosted or self-hosted, large model or
-small, long context or retrieval, fine-tune or prompt, is "it depends on volume, quality threshold and
-how often you will need to switch". A good analysis does not pretend otherwise; it tells you exactly what
-it depends on, at what value the answer changes, and how expensive it is to be wrong. That is a
-different output from "we picked X", and it is the one that survives contact with next quarter.
+- **Everything is a trade-off.** Richards and Ford's first law; their corollary is that if you think a
+  choice has none, you have not found it yet. The practice exists because teams keep deciding in ways that
+  hide the cost until it is paid.
+- **The common methods fail predictably.**
+  - **Pros-and-cons lists** have no weights, evidence or conditions, so they can justify anything.
+  - **Weighted scoring matrices** look rigorous but are usually built backwards: favourite first, weights
+    tuned until it wins, single-digit precision pretending to be measurement.
+  - **Best-practice and vendor-benchmark decisions** import someone else's context, the one thing a
+    trade-off is sensitive to.
+  - **Analysis paralysis:** with no method, every decision is a debate won by the loudest voice.
+- **AI makes it worse.** Options change monthly and published benchmarks do not transfer to your data.
+  Hosted or self-hosted, large or small model, long context or retrieval, fine-tune or prompt: the honest
+  answer is "it depends on volume, quality threshold and how often you will need to switch".
+- **What a good analysis outputs.** Not "we picked X", but what the choice depends on, at what value the
+  answer changes, and how expensive being wrong is. That output survives contact with next quarter.
 
 ## How it works
 ### 1. Frame the decision
-State the decision in one sentence, its scope, and who decides by when. Then separate **hard
-constraints** from **dimensions**. Hard constraints (EU residency, a licence that forbids commercial
-use, a budget ceiling, a launch date) are filters: an option that violates one is removed before
-scoring. Treating a constraint as a weighted dimension is how a disqualified option "wins on points".
-The constraints come from the NFRs, which is why trade-off analysis without written NFRs degrades into
-opinion.
+- **One sentence:** the decision, its scope, who decides, by when.
+- **Separate hard constraints from dimensions.** Constraints (EU residency, a licence forbidding
+  commercial use, a budget ceiling, a launch date) are filters: an option violating one is removed before
+  scoring.
+- **Why filter first:** treating a constraint as a weighted dimension is how a disqualified option "wins
+  on points".
+- **Constraints come from the NFRs**, which is why trade-off analysis without written NFRs degrades into
+  opinion.
 
 ### 2. Enumerate real options
-At least three, including "do nothing or defer" and usually a hybrid. A decision with one option is a
-ratification, and a decision between two is often a false dichotomy; the hybrid (hosted model for
-generation, self-hosted for embeddings; small model with escalation to a large one) is frequently the
-answer and is only found if it is on the list.
+- **At least three**, including "do nothing or defer", and usually a hybrid.
+- **Why:** one option is a ratification; two is often a false dichotomy.
+- **The hybrid is frequently the answer** (hosted model for generation, self-hosted for embeddings; small
+  model escalating to a large one), but only found if it is on the list.
 
 ### 3. Choose the dimensions from the NFR priorities
-Four to seven dimensions, drawn from the architecturally significant requirements rather than a generic
-template: quality on your golden set, p95 latency, cost per successful task, operational burden,
-vendor or lock-in risk, time to deliver, reversibility. Fewer dimensions with real evidence beat a
-twelve-column matrix of guesses. The priority order among them must be the one the business already
-agreed in the NFRs, so that the tie-breaker is not invented during the analysis.
+- **Four to seven dimensions**, drawn from the architecturally significant requirements, not a generic
+  template: quality on your golden set, p95 latency, cost per successful task, operational burden, vendor
+  or lock-in risk, time to deliver, reversibility.
+- **Fewer dimensions with real evidence** beat a twelve-column matrix of guesses.
+- **The priority order is the one the business already agreed in the NFRs**, so the tie-breaker is not
+  invented during the analysis.
 
 ### 4. Fill each cell with evidence, and label its grade
-Every cell is one of: **measured** (your workload, your eval set), **prototyped** (a spike on
-representative data), **estimated** (back-of-envelope from known prices and throughput), or
-**asserted** (someone's belief). Write the grade next to the number. The two cells with the highest
-weight and the lowest grade are where to spend a prototyping day, because they decide the outcome and
-are the most likely to be wrong. Carry ranges, not points: "cost per 1k conversations $30–55 depending on
-cache hit rate" is more useful than "$42".
+| Grade | Source |
+|---|---|
+| **Measured** | Your workload, your eval set |
+| **Prototyped** | A spike on representative data |
+| **Estimated** | Back-of-envelope from known prices and throughput |
+| **Asserted** | Someone's belief |
+
+- **Write the grade next to the number.**
+- **Spend a prototyping day on the two cells with the highest weight and lowest grade**, *because* they
+  decide the outcome and are the most likely to be wrong.
+- **Carry ranges, not points:** "cost per 1k conversations $30–55 depending on cache hit rate" beats
+  "$42".
 
 ### 5. Find the sensitivity points and the flip conditions
-This is the step that distinguishes analysis from scoring. For each important input, ask at what value
-the ranking changes: monthly volume, GPU utilisation, provider price, the quality threshold, team size.
-ATAM calls these sensitivity points, and a parameter that moves two quality attributes in opposite
-directions is a trade-off point. If a flip condition sits close to your expected operating point, the
-decision is fragile, and the right output is not a winner but a design that makes switching cheap (an
-abstraction such as a gateway) plus a trigger to re-run the analysis.
+This step distinguishes analysis from scoring.
+- **For each important input, ask at what value the ranking changes:** monthly volume, GPU utilisation,
+  provider price, the quality threshold, team size.
+- **ATAM vocabulary:** these are sensitivity points; a parameter that moves two quality attributes in
+  opposite directions is a trade-off point.
+- **A flip condition close to your expected operating point means the decision is fragile.** The right
+  output is then not a winner but a design that makes switching cheap (an abstraction such as a gateway)
+  plus a trigger to re-run the analysis.
 
 ### 6. Weigh reversibility and the cost of being wrong
-A two-way door (swap the model behind a gateway, change a chunking strategy) can be decided quickly on
-thin evidence because the cost of error is small. A one-way door (train on customer data, commit to an
-embedding model that fixes a billion-vector index, sign a multi-year commitment) deserves prototypes,
-ranges and a pre-mortem. Under uncertainty the reversible option carries an option value that a static
-matrix does not show, so it should get explicit credit.
+- **Two-way doors** (swap the model behind a gateway, change a chunking strategy) can be decided quickly on
+  thin evidence, because the cost of error is small.
+- **One-way doors** (train on customer data, commit to an embedding model that fixes a billion-vector
+  index, sign a multi-year commitment) deserve prototypes, ranges and a pre-mortem.
+- **Under uncertainty, reversibility has option value** that a static matrix does not show, so give it
+  explicit credit.
 
 ### 7. Decide, record, schedule the revisit
-Write the outcome as an ADR: the constraints, the options, the matrix with evidence grades, the flip
-conditions and the revisit triggers. The analysis is reusable only if the inputs were recorded; "we
-chose hosted" is unreproducible, "we chose hosted because break-even was 18B tokens a month at 50%
-utilisation and we expect 2B" can be re-run in five minutes next year.
+- **Write the outcome as an ADR:** constraints, options, the matrix with evidence grades, flip conditions
+  and revisit triggers.
+- **Record the inputs, or the analysis is not reusable.** "We chose hosted" is unreproducible; "we chose
+  hosted because break-even was 18B tokens a month at 50% utilisation and we expect 2B" can be re-run in
+  five minutes next year.
 
 ### Techniques that fit inside the steps
-Break-even arithmetic for cost cells; scenario walkthroughs (run the top NFR scenarios through each
-option on a whiteboard) for availability and operability; a utility tree to agree which dimensions
-matter; a pre-mortem ("it is a year later and this choice failed, why?") to surface risks the matrix
-missed; and the halving test ("would we still choose this if volume halved or doubled?") as a cheap
-sensitivity check.
+| Technique | Use it for |
+|---|---|
+| Break-even arithmetic | Cost cells |
+| Scenario walkthroughs (top NFR scenarios through each option on a whiteboard) | Availability and operability |
+| Utility tree | Agreeing which dimensions matter |
+| Pre-mortem ("a year later this choice failed, why?") | Risks the matrix missed |
+| Halving test ("still choose this if volume halved or doubled?") | A cheap sensitivity check |
 
-When the forecast itself is the uncertainty, score options per scenario rather than at one point:
-compute each option's cost at the low, expected and high ends of the range, and its **regret** in each
-(its cost minus the best option's cost in that scenario). Choosing the option whose worst-case regret is
-smallest is a defensible rule when nobody can honestly narrow the range, and the table makes visible
-which scenario each option is betting on.
+### Scoring under forecast uncertainty: regret
+When the forecast itself is the uncertainty, score per scenario rather than at one point:
+1. Compute each option's cost at the low, expected and high ends of the range.
+2. Its **regret** in each scenario is its cost minus the best option's cost in that scenario.
+3. Choose the option whose worst-case regret is smallest.
 
-## Example
-The cost dimension of a hosted-versus-self-hosted decision, done as a break-even with an explicit flip
-condition. Every figure is illustrative and must be replaced with your own quotes and a load-tested
-throughput number; the script is the shape of the reasoning, not a benchmark. Note what it shows: at
-these inputs self-hosting only wins above roughly 18 billion tokens a month, and a drop in utilisation
-from 50% to 40% makes it never win, because idle GPUs still bill. That utilisation sensitivity is the
-finding, and it belongs in the ADR alongside the quality and risk dimensions this cell says nothing about.
+This is a defensible rule when nobody can honestly narrow the range, and the table makes visible which
+scenario each option is betting on.
+
+## Diagram
+The seven steps as a pipeline; the sensitivity check decides whether you pick a winner or design for cheap
+switching, and the revisit trigger loops back to the start.
+
+```mermaid
+flowchart TD
+    F["Frame decision and owner"] --> C["Filter by hard constraints"]
+    C --> O["Three or more options incl. hybrid"]
+    O --> D["Dimensions from NFR priorities"]
+    D --> E["Cells with evidence grades and ranges"]
+    E --> S{"Flip condition near operating point?"}
+    S -->|"no"| W["Pick the winner"]
+    S -->|"yes"| G["Design for cheap switching"]
+    W --> R["Weigh reversibility"]
+    G --> R
+    R --> A["Record ADR with triggers"]
+    A -.->|"trigger fires"| F
+```
+
+## Examples
+### Break-even: the cost cell of hosted vs self-hosted
+- **Illustrative figures only:** replace them with your own quotes and a load-tested throughput number.
+  The script is the shape of the reasoning, not a benchmark.
+- **The finding:** at these inputs self-hosting only wins above roughly 18 billion tokens a month, and a
+  drop in utilisation from 50% to 40% makes it never win, *because* idle GPUs still bill.
+- **That utilisation sensitivity belongs in the ADR**, alongside the quality and risk dimensions this cell
+  says nothing about.
 
 ```python
 # Illustrative figures only. Replace with your provider quote and your measured throughput.
@@ -157,57 +188,112 @@ for util in (0.5, 0.4):
 #     50.0B tokens   hosted $  100,000   self-hosted $  110,167
 ```
 
-One input deserves suspicion: utilisation is not a free parameter. It is served tokens divided by the
-capacity you pay for, and two things cap it. A fleet sized for peak traffic idles off-peak, so with a
-peak-to-average ratio of 2 and no autoscaling, utilisation cannot exceed 50%. And a minimum fleet, say two
-GPUs for redundancy running 24/7 (~1,460 GPU-hours, ~$3,650 a month here), is billed at any volume: at
-0.5B tokens it would run about 11% utilised, so the real self-hosted cost is ~$9,650, not $6,833. The floor
-does not move the 18B break-even, where the fleet is already ~16 GPUs, but it shows why the utilisation
-cell should be derived from a traffic profile rather than typed in.
+**Utilisation is not a free parameter.** It is served tokens divided by the capacity you pay for, and two
+things cap it:
+- **Peak sizing.** A fleet sized for peak idles off-peak, so with a peak-to-average ratio of 2 and no
+  autoscaling, utilisation cannot exceed 50%.
+- **A minimum fleet.** Say two GPUs for redundancy running 24/7 (~1,460 GPU-hours, ~$3,650 a month here),
+  billed at any volume. At 0.5B tokens it would run about 11% utilised, so the real self-hosted cost is
+  ~$9,650, not $6,833.
+- **What it changes.** The floor does not move the 18B break-even, where the fleet is already ~16 GPUs,
+  but it shows why the utilisation cell should be derived from a traffic profile, not typed in.
+
+### Runnable: minimax regret when the forecast is a range
+Same illustrative cost model at 50% utilisation, scored across a low, expected and high volume. The choice
+flips with the high end of the forecast, which is exactly what the ADR must record.
+
+```python
+# Illustrative: same cost model as the break-even script, at 50% utilisation.
+def hosted(t):      return t / 1e6 * 2.00
+def self_hosted(t): return t / (3_000_000 * 0.5) * 2.50 + 6_000
+
+OPTIONS = {"hosted": hosted, "self-hosted": self_hosted}
+
+def minimax_regret(scenarios: dict[str, float]) -> str:
+    cost = {o: {s: f(t) for s, t in scenarios.items()} for o, f in OPTIONS.items()}
+    best = {s: min(cost[o][s] for o in OPTIONS) for s in scenarios}
+    worst_regret = {o: max(cost[o][s] - best[s] for s in scenarios) for o in OPTIONS}
+    for o in OPTIONS:
+        print(f"  {o:<12}" + "".join(f"{s}: ${cost[o][s]:>7,.0f}  " for s in scenarios)
+              + f"worst regret ${worst_regret[o]:,.0f}")
+    return min(worst_regret, key=worst_regret.get)
+
+for high in (30e9, 50e9):
+    print(f"forecast 1B / 5B / {high / 1e9:.0f}B tokens per month")
+    pick = minimax_regret({"low": 1e9, "expected": 5e9, "high": high})
+    print("  minimax-regret choice:", pick)
+```
+
+| Forecast (tokens/month) | Hosted worst regret | Self-hosted worst regret | Choice |
+|---|---|---|---|
+| 1B / 5B / 30B | $4,000 | $5,667 | Hosted |
+| 1B / 5B / 50B | $10,667 | $5,667 | Self-hosted |
+
+- **Read it as a sensitivity finding**, not a verdict: the answer depends on how plausible the high
+  scenario is.
+- **Add the minimum-fleet floor** from the note above and self-hosting's low-volume regret grows, which
+  pushes back toward hosted behind a gateway plus a volume trigger.
+
+## Production patterns
+- **Evidence-graded matrix in the ADR.** Use for every one-way door. Each cell holds a range and a grade
+  (measured, prototyped, estimated, asserted), and the ADR template has a column for both. Monitor the
+  share of high-weight cells still graded "asserted" at decision time.
+- **Time-boxed spike on the riskiest cells.** Use when the two highest-weight, lowest-grade cells could
+  flip the result. Run the spike on your golden set and your traffic shape, not a vendor demo. Monitor
+  whether spike results changed the ranking; if they never do, the matrix is being built backwards.
+- **Pin priorities before scoring.** Use in every review. Commit the NFR priority order and the dimension
+  list before any option is scored, so the history shows weights did not move afterwards. Monitor weight
+  changes after the first scoring pass.
+- **Gateway plus flip-input dashboard.** Use when the flip condition is near the operating point. Put the
+  choice behind an abstraction (an LLM gateway, a retriever interface) and chart the flip input (monthly
+  tokens, utilisation, price) against its threshold. Alert when it crosses and link the ADR.
+- **Pre-mortem and halving test in the review agenda.** Use for one-way doors. Ask "a year later this
+  failed, why?" and "would we still choose this at half or double the volume?" before deciding. Monitor
+  risks raised there that later appear in incidents.
 
 ## Trade-offs
-- A full matrix with evidence grades and sensitivity analysis produces decisions that survive review,
-  but it costs days; for two-way doors a one-paragraph analysis with a named flip condition is the
-  right amount of rigour.
-- Prototyping the uncertain cells replaces guesses with measurements, but a spike on unrepresentative
+- **Full matrix: decisions that survive review vs days of work.** For two-way doors, a one-paragraph
+  analysis with a named flip condition is the right amount of rigour.
+- **Prototyping uncertain cells: measurements vs unrepresentative spikes.** A spike on unrepresentative
   data is worse than an honest estimate; the prototype must use your golden set and your traffic shape.
-- Explicit weights make priorities arguable in the open, but they invite tuning toward a favourite; the
-  defence is to fix the priority order in the NFRs before any option is scored.
-- Optimising for reversibility keeps options open, but every abstraction that enables switching costs
-  something and can hide capabilities of the thing behind it; it pays off when the flip condition is
-  near, not when one option clearly dominates.
-- Sensitivity analysis tells you what the decision depends on, but it needs real inputs (volume
-  forecasts, utilisation, prices); with none available, say so and set a short revisit date instead of
-  inventing them.
+- **Explicit weights: arguable priorities vs tuning toward a favourite.** The defence is fixing the
+  priority order in the NFRs before any option is scored.
+- **Optimising for reversibility: open options vs abstraction cost.** Every switching abstraction costs
+  something and can hide capabilities of what sits behind it. It pays off when the flip condition is near,
+  not when one option clearly dominates.
+- **Sensitivity analysis: knowing what matters vs needing real inputs.** It needs volume forecasts,
+  utilisation and prices; with none, say so and set a short revisit date instead of inventing them.
 
 ## Pitfalls
-- Weights adjusted after the first scoring pass; the symptom is a matrix whose history shows the
-  favourite losing, then the weights changing, then the favourite winning.
-- Dimensions copied from a generic template rather than from the NFRs; the symptom is a column such as
-  "community size" outweighing the quality threshold the product will be judged on.
-- Point estimates with false precision; the symptom is a decision resting on a 7.4 versus 7.1 total
-  that no one can reproduce.
-- Using the provider's or a paper's benchmark as the quality cell; the symptom is a model that wins on
-  the leaderboard and loses on your golden set after the contract is signed.
-- Forgetting the fixed operational cost of running things yourself; the symptom is a self-hosting plan
+- **Weights adjusted after the first scoring pass.** Symptom: the matrix history shows the favourite
+  losing, then the weights changing, then the favourite winning.
+- **Dimensions copied from a generic template, not the NFRs.** Symptom: a column such as "community size"
+  outweighs the quality threshold the product will be judged on.
+- **Point estimates with false precision.** Symptom: a decision resting on a 7.4 versus 7.1 total that no
+  one can reproduce.
+- **A provider's or paper's benchmark as the quality cell.** Symptom: a model wins on the leaderboard and
+  loses on your golden set after the contract is signed.
+- **Forgetting the fixed operational cost of running things yourself.** Symptom: a self-hosting plan
   whose per-token cost looked lower and whose monthly bill is higher.
-- Typing in a utilisation figure instead of deriving it from the traffic profile; the symptom is a GPU
-  bill well above plan because the fleet is sized for peak and idles overnight and at weekends.
-- Treating a hard constraint as a weighted dimension; the symptom is a vendor that "scored best" and
-  cannot satisfy the customer's residency requirement.
-- Never recording the inputs; the symptom is the same debate, from scratch, every time a new model or a
-  new price list appears.
+- **Typing in a utilisation figure instead of deriving it from the traffic profile.** Symptom: a GPU bill
+  well above plan, because the fleet is sized for peak and idles overnight and at weekends.
+- **Treating a hard constraint as a weighted dimension.** Symptom: a vendor that "scored best" cannot
+  satisfy the customer's residency requirement.
+- **Never recording the inputs.** Symptom: the same debate, from scratch, every time a new model or price
+  list appears.
 
 ## When to use
-Run the full method for one-way doors and for any choice whose flip condition is plausibly near your
-operating point: hosted versus self-hosted, embedding model and vector store, tenancy model, fine-tune
-versus retrieval, build versus buy on a core capability. Run the short form, constraints, three options,
-one flip condition, a reversibility note, for everything else, and resist the urge to run anything for
-decisions that are cheap to undo. What to measure: your own quality numbers on your own golden set, your
-own throughput under your own load, and your own volume forecast with a range. In interviews, the
-strongest answers to "would you use X or Y" name the dimensions, state the assumption that decides it,
-give the value at which the answer flips, and say how they would keep the choice reversible until the
-data arrives.
+- **Full method:** one-way doors and any choice whose flip condition is plausibly near your operating
+  point: hosted versus self-hosted, embedding model and vector store, tenancy model, fine-tune versus
+  retrieval, build versus buy on a core capability.
+- **Short form for everything else:** constraints, three options, one flip condition, a reversibility
+  note.
+- **Skip it** for decisions that are cheap to undo.
+- **Measure:** your own quality on your own golden set, your own throughput under your own load, and your
+  own volume forecast with a range.
+- **Interviews:** the strongest answers to "would you use X or Y" name the dimensions, state the deciding
+  assumption, give the value at which the answer flips, and say how they keep the choice reversible until
+  the data arrives.
 
 ## Role lens
 - **Engineer:** Produces the measured cells, latency under load, eval scores, token counts, cache hit
@@ -230,6 +316,42 @@ compare that to their forecast range. If the forecast is well below it, the answ
 gateway so the switch stays cheap, with a revisit trigger at a stated volume or when an open-weight model
 reaches eval parity. If the forecast straddles the flip point, the recommendation is the hybrid and a
 measured pilot rather than a bet.
+
+## Interview questions
+### Why is a weighted scoring matrix often worse than it looks?
+- **It is usually built backwards:** the favourite is chosen first and weights are tuned until it wins.
+- **It hides uncertainty:** single-digit totals such as 7.4 vs 7.1 pretend to be measurements when most
+  cells are asserted.
+- **Fix:** fix the priority order from the NFRs before scoring, grade every cell's evidence, carry ranges,
+  and run a sensitivity analysis instead of trusting the total.
+
+### Walk me through deciding between a large hosted model and a small self-hosted one.
+- **Filter:** residency, licence, security review, and whether anyone can operate GPUs.
+- **Options:** hosted large, self-hosted small, and a hybrid where the small model escalates hard cases.
+- **Evidence:** quality on your golden set, p95 latency under load, cost per successful task, operational
+  burden, each graded.
+- **Decide on the flip:** compute break-even volume and utilisation, compare with the forecast range, and
+  keep the choice behind a gateway.
+
+### Self-hosting looked cheaper on paper but the bill is higher. What went wrong?
+- **Utilisation was typed in, not derived:** a fleet sized for peak with a peak-to-average ratio of 2
+  cannot exceed 50% utilisation without autoscaling.
+- **Fixed costs were missed:** the operations team and a minimum redundant fleet bill at any volume; in the
+  example, two GPUs 24/7 add ~$3,650 a month.
+- **At 40% utilisation** the illustrative model never breaks even, because cost per served token exceeds
+  the hosted price.
+
+### When would you not run a full trade-off analysis?
+- **For two-way doors**, such as swapping a model behind a gateway or changing a chunking strategy: the cost
+  of being wrong is small, so a paragraph with one flip condition is enough.
+- **When inputs do not exist yet:** say so, choose the most reversible option, and set a short revisit date
+  rather than inventing numbers.
+
+### What is a sensitivity point, and what do you do when one is near your operating point?
+- **Definition (ATAM):** an input whose change shifts the ranking; one that moves two quality attributes in
+  opposite directions is a trade-off point.
+- **Near the operating point the decision is fragile:** design for cheap switching, monitor the input on a
+  dashboard, and record a trigger to re-run the analysis when it crosses.
 
 ## Quiz
 ### Q: Why should hard constraints be applied as filters before scoring, rather than as heavily weighted dimensions?

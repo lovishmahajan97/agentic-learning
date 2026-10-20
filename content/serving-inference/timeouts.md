@@ -5,7 +5,7 @@ name: Timeouts
 kind: practice
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - serving-inference/streaming
   - serving-inference/cancellation
@@ -22,100 +22,118 @@ sources:
 ---
 
 ## TL;DR
-LLM calls last from under a second to several minutes, and the duration depends on an output length
-nobody knows in advance plus queueing nobody controls. A single flat timeout therefore either kills
-legitimate work or lets hung connections hold resources for minutes. Use layered timers (connect,
-first token, idle gap between chunks, total deadline derived from `max_tokens × TPOT`), propagate
-the remaining budget downstream, pair every expiry with cancellation, and audit the default timeouts
-of every proxy between you and the model.
+LLM calls last from under a second to minutes, so one flat timeout kills good work or lets hung calls
+hold resources. Layer connect, first-token, idle and total timers, derive the total from
+`max_tokens × TPOT`, propagate the remaining budget, and cancel on every expiry.
 
 ## Why it exists
-Ordinary HTTP timeouts assume a response takes tens of milliseconds and that anything slower is
-broken. An LLM response at 20 ms per token takes 20 s for 1,000 tokens when everything is healthy;
-a reasoning model can pause for a long stretch before emitting anything; and a request queued behind
-a burst can wait seconds before prefill even starts. Variance of 100× between fast and slow legitimate
-calls is normal. Under those conditions a "30 seconds and give up" rule silently fails a large share
-of long outputs, while "ten minutes to be safe" lets a dead upstream pin a worker, a connection-pool
-slot and a user for ten minutes.
-
-The damage compounds. Hung requests hold slots, so healthy requests queue behind them; the client
-times out and retries, adding load to an upstream that is already slow; the retries time out too.
-This is the classic overload spiral, and LLM backends are unusually prone to it because each request
-is expensive and long. Meanwhile infrastructure you forgot about has its own opinions: reverse
-proxies and load balancers ship with idle timeouts of about a minute, so a non-streaming generation
-that takes 70 s is cut off with a gateway error and the engine keeps generating for nobody.
-
-The naive alternative, "stream and never time out", is not enough either. Streaming turns "no bytes
-for N seconds" into a usable liveness signal, but you still need a bound on total time so a stuck
-stream cannot run until `max_tokens`, and you still need every downstream call in an agent step to
-know how much of the user's patience remains.
+- **Legitimate durations vary by 100×.** Ordinary HTTP timeouts assume tens of milliseconds. An LLM
+  response at 20 ms per token takes 20 s for 1,000 tokens when healthy; a reasoning model can pause
+  before emitting anything; a request queued behind a burst can wait seconds before prefill starts.
+- **Both flat choices fail.** "30 seconds and give up" silently fails a large share of long outputs.
+  "Ten minutes to be safe" lets a dead upstream pin a worker, a connection-pool slot and a user for ten
+  minutes.
+- **The damage compounds into an overload spiral.** Hung requests hold slots, so healthy ones queue;
+  clients time out and retry, adding load to an already slow upstream; the retries time out too. LLM
+  backends are unusually prone to this because each request is expensive and long.
+- **Forgotten infrastructure has its own timers.** Reverse proxies and load balancers ship with idle
+  timeouts of about a minute, so a non-streaming generation that takes 70 s is cut off with a gateway
+  error while the engine keeps generating for nobody.
+- **"Stream and never time out" is not enough.** Streaming turns "no bytes for N seconds" into a
+  liveness signal, but you still need a total bound so a stuck stream cannot run to `max_tokens`, and
+  every downstream call in an agent step must know how much of the user's patience remains.
 
 ## How it works
 ### The timeout stack
-A single call crosses several layers, each with its own timer: the SDK (the OpenAI Python client
-defaults to a 10-minute timeout and two retries), the HTTP library under it (httpx splits a timeout
-into connect, read, write and pool phases, each defaulting to five seconds), your own server's
-handler, the proxy or load balancer in front of it (nginx's `proxy_read_timeout` and an AWS ALB's
-idle timeout both default to 60 s), the provider's gateway, and finally the engine's scheduler, which
-may hold a request in its admission queue. The effective timeout is the *shortest* of these, and the
-one that fires is rarely the one you configured. Retries stack on top: because that SDK retries a
-timed-out request by default, its worst case is three full timeouts, half an hour, before your code
-sees an error, unless you lower `timeout` or `max_retries`.
+A single call crosses several layers, each with its own timer:
+
+| Layer | Default or behaviour |
+|---|---|
+| SDK | The OpenAI Python client defaults to a 10-minute timeout and two retries |
+| HTTP library under it | httpx splits a timeout into connect, read, write and pool phases, each defaulting to five seconds |
+| Your server's handler | Whatever you configured |
+| Proxy or load balancer | nginx's `proxy_read_timeout` and an AWS ALB's idle timeout both default to 60 s |
+| Provider's gateway | The provider's own limits |
+| Engine scheduler | May hold a request in its admission queue |
+
+- **The effective timeout is the *shortest* of these**, and the one that fires is rarely the one you
+  configured.
+- **Retries stack on top.** Because that SDK retries a timed-out request by default, its worst case is
+  three full timeouts, half an hour, before your code sees an error, unless you lower `timeout` or
+  `max_retries`.
 
 ### Which timers, and what each one means
-- **Connect timeout.** TCP and TLS handshake. Short (a few seconds); failure here means the host is
-  unreachable, and retrying elsewhere is cheap and safe.
-- **Time to first byte / first token.** Covers queueing plus prefill. Set it from your TTFT p99 with
-  margin (illustratively 10–30 s for long-prompt workloads); when it fires the request has consumed
-  little, so a fallback or retry on another replica is reasonable.
-- **Idle (read) timeout between chunks.** The liveness signal for a stream. A healthy stream emits a
-  token every few tens of milliseconds, so an idle timer of 15–30 s only fires when the upstream is
-  stuck, provided the server sends heartbeats during legitimate pauses such as hidden reasoning.
-- **Total deadline.** The budget for the whole call, and for non-streaming calls the only timer that
-  distinguishes "slow" from "dead". It must cover the longest *legitimate* response.
+| Timer | Covers | Setting | When it fires |
+|---|---|---|---|
+| **Connect** | TCP and TLS handshake | Short, a few seconds | Host unreachable; retrying elsewhere is cheap and safe |
+| **First byte / first token** | Queueing plus prefill | From TTFT p99 with margin (illustratively 10–30 s for long-prompt workloads) | Little consumed, so a fallback or retry on another replica is reasonable |
+| **Idle (read) between chunks** | Liveness of a stream | 15–30 s, since a healthy stream emits a token every few tens of milliseconds | Upstream is stuck, provided the server heartbeats through legitimate pauses such as hidden reasoning |
+| **Total deadline** | The whole call | Must cover the longest *legitimate* response | For non-streaming calls, the only timer that tells "slow" from "dead" |
 
 ### Budget arithmetic
-For a non-streaming call the deadline has to be `TTFT_p99 + max_tokens × TPOT_p99 + margin`. With
-`max_tokens = 4096` and a TPOT of 30 ms that is already over two minutes before queueing, which is
-why non-streaming calls with large `max_tokens` collide with 60-second proxies and why some SDKs
-refuse very long non-streaming requests and tell you to stream. Derive the number from `max_tokens`
-per call rather than hard-coding one constant, and cap `max_tokens` to what the product needs; a
-smaller cap is the cheapest timeout fix there is.
+- **Non-streaming deadline:** `TTFT_p99 + max_tokens × TPOT_p99 + margin`.
+- **Example:** with `max_tokens = 4096` and a TPOT of 30 ms that is already over two minutes before
+  queueing. That is why non-streaming calls with large `max_tokens` collide with 60-second proxies, and
+  why some SDKs refuse very long non-streaming requests and tell you to stream.
+- **Derive it per call** from `max_tokens` rather than hard-coding one constant.
+- **Cap `max_tokens`** to what the product needs; a smaller cap is the cheapest timeout fix there is.
 
 ### Deadline propagation
-An agent step that must answer within 60 s and makes four LLM calls and two tool calls cannot give
-each of them 60 s. Carry a deadline (an absolute timestamp) through the call chain, and give every
-downstream call `remaining = deadline − now`. When `remaining` falls below the minimum useful time
-for a step, fail fast with a partial result rather than start work that cannot finish. gRPC carries
-deadlines natively; over HTTP you pass it as a header or in your own context object.
+1. **Set one absolute deadline at entry.** An agent step that must answer within 60 s and makes four
+   LLM calls and two tool calls cannot give each of them 60 s.
+2. **Pass it down the call chain.** Every downstream call gets `remaining = deadline − now`.
+3. **Fail fast near the end.** When `remaining` falls below the minimum useful time for a step, return
+   a partial result rather than start work that cannot finish.
+4. **Carry it on the wire.** gRPC carries deadlines natively; over HTTP pass it as a header or in your
+   own context object.
 
 ### What happens when a timer fires
-Nothing stops upstream unless you make it. A client-side timeout that merely raises an exception
-leaves the engine decoding, the provider billing, and the connection half-open until the server's
-own timers notice. Every timeout must therefore close the connection or abort the request so the
-signal reaches the engine; that is the cancellation lesson's job, and timeouts are its most common
-trigger.
+- **Nothing stops upstream unless you make it.** A client-side timeout that merely raises leaves the
+  engine decoding, the provider billing, and the connection half-open until the server's own timers
+  notice.
+- **So every timeout must close the connection or abort the request**, so the signal reaches the engine.
+  That is the cancellation lesson's job, and timeouts are its most common trigger.
 
 ### Retrying after a timeout
-A timeout is the most expensive failure to retry: the first attempt may still be running, it signals
-overload more often than a transient glitch, and the retry needs the same long budget again. Retry
-only when the remaining deadline allows it, with jitter, and only for idempotent requests. Prefer
-falling back (a smaller or different model, a cached answer, a degraded response) over retrying the
-same call, and open a circuit breaker when timeouts cluster, so a sick upstream is not hammered.
+- **It is the most expensive failure to retry.** The first attempt may still be running, timeouts signal
+  overload more often than a transient glitch, and the retry needs the same long budget again.
+- **Retry only** when the remaining deadline allows it, with jitter, and only for idempotent requests.
+- **Prefer falling back:** a smaller or different model, a cached answer, a degraded response.
+- **Open a circuit breaker** when timeouts cluster, so a sick upstream is not hammered.
 
 ### Server-side timers if you run the engine
-Bound the admission queue: a request that has waited longer than its first-token budget should be
-rejected with a fast 429 or 503 rather than served late. Cap per-request generation time and
-`max_tokens` at the API boundary, and expose queue wait as a metric so you can see the budget being
-spent before clients time out.
+- **Bound the admission queue.** A request that has waited longer than its first-token budget should get
+  a fast 429 or 503 rather than be served late.
+- **Cap per-request generation time and `max_tokens`** at the API boundary.
+- **Expose queue wait as a metric**, so you can see the budget being spent before clients time out.
 
-## Example
-Layered timeouts around a streaming call with `httpx`: a short connect timeout, a cumulative
-first-token timer, an idle timer that resets on every line (heartbeats included), and a total
-deadline derived from `max_tokens` and measured TPOT, capped by the caller's absolute deadline so an
-agent can share one budget across several steps. With these numbers a 512-token call gets
-`8 + 512 × 0.05 × 1.5 ≈ 46 s`, and the first-token timer turns a stuck queue into an error after
-15 s instead of 46.
+## Diagram
+Each phase of a streaming call has its own timer, and every expiry routes through cancellation before
+any fallback or retry.
+
+```mermaid
+flowchart TD
+    S["Start: check remaining budget"] --> C["Connect"]
+    C -->|"connected"| F["Wait for first token"]
+    F -->|"first content"| R["Read stream"]
+    R -->|"chunk or heartbeat resets idle"| R
+    R -->|"done"| OK["Return answer"]
+    C -.->|"connect timeout"| X["Close connection, cancel upstream"]
+    F -.->|"first-token timeout"| X
+    R -.->|"idle or total timeout"| X
+    X --> D{"Budget left and idempotent?"}
+    D -->|"yes"| B["Fallback or one retry"]
+    D -->|"no"| P["Partial result or clear failure"]
+```
+
+## Examples
+### Layered timeouts around a streaming call
+Layered timeouts around a streaming call with `httpx`: a short connect timeout, a cumulative first-token
+timer, an idle timer that resets on every line (heartbeats included), and a total deadline derived from
+`max_tokens` and measured TPOT, capped by the caller's absolute deadline.
+- **Why the cap:** an agent can share one budget across several steps.
+- **With these numbers** a 512-token call gets `8 + 512 × 0.05 × 1.5 ≈ 46 s`, and the first-token timer
+  turns a stuck queue into an error after 15 s instead of 46.
 
 ```python
 import asyncio, json, time
@@ -157,44 +175,109 @@ async def stream_completion(client: httpx.AsyncClient, payload: dict, deadline: 
     return "".join(text)
 ```
 
+### One deadline shared by an agent's steps
+Runnable with sleeps standing in for LLM and tool calls: a 1 s budget for four steps. Each step gets at
+most what is left, and the last one is skipped because it could not finish usefully.
+
+```python
+import asyncio, time
+
+class Deadline:
+    def __init__(self, seconds: float):
+        self.at = time.monotonic() + seconds          # absolute, so it survives being passed around
+    def remaining(self) -> float:
+        return self.at - time.monotonic()
+
+async def step(name, duration, deadline, min_useful=0.2):
+    left = deadline.remaining()
+    if left < min_useful:                             # fail fast instead of starting doomed work
+        raise TimeoutError(f"skipped {name}: only {left:.1f}s left")
+    await asyncio.wait_for(asyncio.sleep(duration), timeout=left)   # never longer than what is left
+    return name
+
+async def agent(budget_s=1.0):
+    d, done = Deadline(budget_s), []
+    try:
+        for name, dur in [("plan", 0.3), ("search", 0.2), ("draft", 0.4), ("review", 0.3)]:
+            done.append(await step(name, dur, d))
+    except (TimeoutError, asyncio.TimeoutError) as e:
+        return done, f"partial ({e})"
+    return done, "complete"
+
+print(asyncio.run(agent()))
+# (['plan', 'search', 'draft'], 'partial (skipped review: only 0.1s left)')
+```
+
+### Worked scenario: the 60-second wall
+A non-streaming endpoint behind a load balancer with the default 60 s idle timeout, TTFT p99 8 s, TPOT
+30 ms (illustrative).
+
+| `max_tokens` | Needed deadline (8 s + tokens × 30 ms, before margin) | Behind a 60 s idle timeout |
+|---|---|---|
+| 512 | about 23 s | Fine |
+| 1,500 | about 53 s | Fails on queueing spikes |
+| 4,096 | about 131 s | Always cut off; engine keeps generating |
+
+Fixes, cheapest first: cap `max_tokens`, stream with heartbeats so the idle timer never fires on a live
+call, then raise the idle timeout on hops you own.
+
+## Production patterns
+- **Configure SDK timeouts and retries explicitly.** Construct the client with a timeout and retry count
+  you chose (the OpenAI Python SDK accepts `timeout`, including an `httpx.Timeout`, and `max_retries`,
+  and `client.with_options(...)` overrides them per call). Monitor timeout counts per call site.
+- **Audit and raise idle timeouts on streaming routes.** Set nginx `proxy_read_timeout` for the streaming
+  location and the ALB `idle_timeout.timeout_seconds` attribute above your longest heartbeat gap. Monitor
+  disconnects clustered at exactly the old default.
+- **Propagate one deadline.** Put an absolute deadline on the request context at the edge, pass it to
+  services in a header of your own (or as a gRPC deadline), and compute each call's timeout as
+  `min(derived budget, remaining)`. Monitor which step consumes the budget.
+- **Bound the admission queue.** Reject requests that have waited past their first-token budget with 429
+  or 503 at the serving layer. Monitor queue wait percentiles next to client timeout rate.
+- **Circuit-break on clustered timeouts.** When the timeout rate for an upstream crosses a threshold, open
+  a breaker and route to a fallback model for a cool-down period. Monitor breaker state changes and
+  fallback share.
+- **Label timeouts by cause.** Emit first-token, idle and total timeouts as separate metric labels per
+  layer; a rise in first-token timeouts is usually the first visible sign of upstream overload.
+
 ## Trade-offs
-- A short first-token timeout fails fast and enables cheap fallback, but under a traffic burst it
-  turns a recoverable queue into a wave of errors; the balance flips when callers can wait and
+- **Short first-token timeout vs bursts.** It fails fast and enables cheap fallback, but under a traffic
+  burst turns a recoverable queue into a wave of errors; the balance flips when callers can wait and
   nothing else can serve them.
-- Idle timeouts give a precise liveness signal for streams at the cost of needing heartbeats during
-  legitimate pauses; without heartbeats they are worse than a plain total deadline.
-- Deriving deadlines from `max_tokens` is accurate but means a generous cap buys a long timeout;
-  tighter caps make timeouts tighter at the cost of truncating rare long answers.
-- Retrying after a timeout can rescue a transient failure and can also double load on an overloaded
-  upstream; the decision flips on whether remaining budget exists and whether the timeout rate is
-  rising fleet-wide.
-- Long server-side timeouts maximise the chance a slow request completes and let hung requests
-  hold capacity; shorter ones protect the pool and shed work that would have finished.
+- **Idle timeouts vs heartbeats.** They give a precise liveness signal for streams at the cost of needing
+  heartbeats during legitimate pauses; without heartbeats they are worse than a plain total deadline.
+- **Derived deadlines vs generous caps.** Deriving from `max_tokens` is accurate but means a generous cap
+  buys a long timeout; tighter caps make timeouts tighter at the cost of truncating rare long answers.
+- **Retry vs overload.** Retrying can rescue a transient failure and can also double load on an
+  overloaded upstream; the decision flips on whether remaining budget exists and whether the timeout
+  rate is rising fleet-wide.
+- **Long vs short server-side timeouts.** Long ones maximise the chance a slow request completes and let
+  hung requests hold capacity; shorter ones protect the pool and shed work that would have finished.
 
 ## Pitfalls
-- Inheriting defaults: a 60-second proxy or load balancer idle timeout in front of a non-streaming
-  endpoint; the symptom is gateway errors at exactly 60 s on long generations while the engine keeps
-  running.
-- Treating the HTTP read timeout as a total timeout; the symptom is a "timeout" that never fires on a
+- **Inheriting defaults.** A 60-second proxy or load balancer idle timeout in front of a non-streaming
+  endpoint shows up as gateway errors at exactly 60 s on long generations while the engine keeps running.
+- **Treating the HTTP read timeout as a total timeout.** Symptom: a "timeout" that never fires on a
   slow-but-alive stream, since it resets on every chunk.
-- Timing out without cancelling; the symptom is provider usage and GPU load that stay high after the
-  clients have given up, and tokens billed for answers nobody saw.
-- One timeout constant for every call regardless of `max_tokens`; the symptom is short calls waiting
-  minutes to fail and long calls being cut off while healthy.
-- Agent steps that each get the full user budget; the symptom is a 60-second SLO breached by a
-  request whose individual calls all "succeeded within timeout".
-- Retrying timeouts immediately and without a budget check; the symptom is an overload that gets
-  worse as clients time out, the signature of a retry storm.
+- **Timing out without cancelling.** Symptom: provider usage and GPU load that stay high after clients
+  have given up, and tokens billed for answers nobody saw.
+- **One timeout constant regardless of `max_tokens`.** Symptom: short calls waiting minutes to fail and
+  long calls cut off while healthy.
+- **Agent steps that each get the full user budget.** Symptom: a 60-second SLO breached by a request
+  whose individual calls all "succeeded within timeout".
+- **Retrying timeouts immediately, without a budget check.** Symptom: an overload that worsens as clients
+  time out, the signature of a retry storm.
 
 ## When to use
-Every call to a model, a retriever or a tool needs the layered timers above; the question is only the
-values. Derive them from measured percentiles and from `max_tokens`, revisit them when you change
-models or prompt lengths, and give agents a single propagated deadline rather than per-call constants.
-Stream whenever `max_tokens` is large, so liveness comes from the idle timer instead of a multi-minute
-total. Measure timeout rate by layer and by cause (first-token versus idle versus total), and alert
-when it rises, because it is usually the first visible sign of upstream overload. In interviews,
-expect "how would you set timeouts for an LLM call" and answer with the stack, the arithmetic and the
-cancel-and-fallback behaviour, not a number.
+- **Every call** to a model, a retriever or a tool needs the layered timers above; the question is only
+  the values.
+- **Derive values** from measured percentiles and `max_tokens`, revisit them when models or prompt
+  lengths change, and give agents one propagated deadline rather than per-call constants.
+- **Stream whenever `max_tokens` is large**, so liveness comes from the idle timer instead of a
+  multi-minute total.
+- **Measure** timeout rate by layer and by cause (first-token versus idle versus total), and alert when
+  it rises, because it is usually the first visible sign of upstream overload.
+- **Interviews:** for "how would you set timeouts for an LLM call", answer with the stack, the
+  arithmetic and the cancel-and-fallback behaviour, not a number.
 
 ## Role lens
 - **Engineer:** Configures connect, first-token, idle and total timers per call from `max_tokens` and
@@ -216,6 +299,42 @@ than start a call that will be cut off. Never retry a timed-out step unless the 
 covers it, and prefer a cheaper fallback model. Every expiry must cancel the in-flight call so the
 upstream stops. Measure which step consumes the budget in practice and shrink `max_tokens` or move
 work earlier accordingly.
+
+## Interview questions
+### Why is a single flat timeout wrong for LLM calls?
+- **Legitimate durations span 100×:** queueing, prefill and an unknown output length mean a healthy call
+  can take under a second or several minutes.
+- **A short constant** fails long outputs; **a long one** lets dead upstreams pin workers and pool slots.
+- **Layered timers** separate "unreachable" (connect), "stuck in queue" (first token), "stalled" (idle)
+  and "too slow overall" (total), each with its own response.
+
+### What is your effective timeout if the SDK says 10 minutes and nginx sits in front?
+- **The shortest timer wins:** nginx `proxy_read_timeout` defaults to 60 s, so a non-streaming call that
+  sends nothing for a minute is cut there, whatever the SDK says.
+- **Retries multiply the worst case:** the OpenAI SDK's default of two retries means up to three full
+  timeouts before your code sees an error.
+- **Fix:** stream with heartbeats, set SDK `timeout` and `max_retries` deliberately, and raise idle
+  timeouts on hops you own.
+
+### How do you size the total timeout for a non-streaming call with max_tokens 4096?
+- **Formula:** TTFT p99 + max_tokens × TPOT p99 + margin.
+- **Numbers:** at 30 ms TPOT, 4096 tokens is about 123 s of decode alone, so over two minutes before
+  queueing, which no 60-second proxy will allow.
+- **Better:** cap max_tokens to what the product needs, or stream so liveness comes from the idle timer.
+
+### A timed-out call is still running upstream. Do you retry?
+- **Not by default:** the first attempt may still be consuming capacity, and timeouts usually signal
+  overload, so a retry adds load to the cause.
+- **Cancel first**, then retry only if the remaining deadline covers a full attempt and the request is
+  idempotent, with jitter.
+- **Prefer fallback** to a cheaper model or a degraded answer, and open a circuit breaker if timeouts
+  cluster.
+
+### Your timeout rate doubled overnight. How do you find the cause?
+- **Split by cause and layer:** first-token timeouts point at queueing or longer prompts; idle timeouts
+  at stalled streams or missing heartbeats; total timeouts at longer outputs or slower decode.
+- **Correlate** with engine queue wait, prompt-length percentiles and any infrastructure change (a new
+  proxy or gateway with a 60 s default).
 
 ## Quiz
 ### Q: What is the most useful liveness signal for a streaming LLM response?

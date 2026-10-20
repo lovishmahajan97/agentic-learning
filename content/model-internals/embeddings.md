@@ -5,7 +5,7 @@ name: Embeddings
 kind: concept
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - model-internals/tokenization
   - model-internals/transformer
@@ -23,98 +23,127 @@ sources:
 ---
 
 ## TL;DR
-An embedding is a learned dense vector that stands in for a discrete thing (a token, a sentence) so a
-network can do arithmetic on it. Inside an LLM, the embedding table turns token ids into the vectors
-the transformer consumes, and a matrix of the same shape (sometimes the very same one) turns hidden
-states back into logits. Outside the LLM, an
-embedding *model* compresses whole passages into vectors whose distance tracks meaning, which is what
-makes semantic search possible. Same word, two different training objectives.
+An embedding is a learned dense vector standing in for a discrete thing (a token, a sentence). Inside an
+LLM it turns token ids into vectors; an embedding *model* turns whole passages into vectors whose distance
+tracks meaning, which powers semantic search.
 
 ## Why it exists
-A transformer is a stack of matrix multiplications. It cannot consume the string "cat"; it needs a
-vector. The obvious encoding is one-hot: a vector of length *V* (the vocabulary size, tens of thousands
-to over a hundred thousand entries) with a single 1. One-hot has two fatal properties. It is enormous
-and almost entirely zero, so the first layer would multiply a 100k-wide sparse vector on every token.
-Worse, every pair of one-hot vectors is equidistant and orthogonal, so "cat" is exactly as far from "kitten"
-as from "parliament". The representation carries no information the model can exploit; every regularity
-would have to be relearned from scratch for every token.
-
-An embedding replaces the one-hot with a short dense vector, typically a few hundred to several thousand
-dimensions, whose values are learned. Because the vectors are trained by gradient descent on the task
-(next-token prediction), tokens that behave similarly in context are pushed to similar places, and that
-geometry is free information for every later layer. It also makes learning transfer: a gradient step
-taken because of a sentence about "cat" moves a vector that sits near "kitten", so evidence about one
-token partly informs its neighbours instead of being locked in one orthogonal axis. The same reasoning applies one level up: if you want
-to find the document most relevant to a question, comparing strings fails on paraphrase, while comparing
-learned vectors succeeds, because the vectors were trained so that meaning, not spelling, determines
-distance.
+- **A transformer needs vectors, not strings.** It is a stack of matrix multiplications and cannot consume
+  "cat". The obvious encoding is one-hot: a vector of length *V* (the vocabulary size, tens of thousands
+  to over a hundred thousand entries) with a single 1.
+- **One-hot is enormous and almost all zero.** The first layer would multiply a 100k-wide sparse vector
+  on every token.
+- **One-hot carries no similarity.** Every pair of one-hot vectors is equidistant and orthogonal, so
+  "cat" is exactly as far from "kitten" as from "parliament". Every regularity would have to be relearned
+  from scratch for every token.
+- **A learned dense vector fixes both.** It is a few hundred to several thousand dimensions, trained by
+  gradient descent on the task (next-token prediction). Tokens that behave similarly in context land in
+  similar places, and that geometry is free information for every later layer. Learning transfers too: a
+  gradient step from a sentence about "cat" moves a vector that sits near "kitten".
+- **The same idea works one level up.** Comparing strings fails on paraphrase when you look for the most
+  relevant document. Comparing learned vectors succeeds, because they were trained so that meaning, not
+  spelling, determines distance.
 
 ## How it works
 ### Token embeddings inside an LLM
-The model owns a matrix `E` of shape `[V, d_model]`. Looking up token id *i* means taking row *i*; this
-is exactly `one_hot(i) · E`, so an embedding layer is a linear layer applied to a one-hot input, with the
-multiplication skipped *because* all but one row would be multiplied by zero. The row is a trainable
-parameter like any weight, updated by backpropagation through the whole network. Nothing about the
-geometry is hand-designed; it emerges because tokens that predict similar continuations receive similar
-gradients.
+- **The table.** The model owns a matrix `E` of shape `[V, d_model]`. Looking up token id *i* means taking
+  row *i*.
+- **Lookup is a linear layer.** It equals `one_hot(i) · E`, with the multiplication skipped *because* all
+  but one row would be multiplied by zero.
+- **It is trained like any weight.** Each row is a trainable parameter updated by backpropagation through
+  the whole network. Nothing about the geometry is hand-designed; it emerges because tokens that predict
+  similar continuations receive similar gradients.
 
-The table is a real fraction of the parameter budget. GPT-2 small has 50,257 × 768 ≈ 38.6M embedding
-parameters out of ~124M. Llama-2-7B has 32,000 × 4,096 ≈ 131M; Llama 3's 128,256-token vocabulary at the
-same width is ≈ 525M. Larger vocabularies tokenize text into fewer tokens (cheaper context, better
-multilingual coverage) at the price of a bigger table, which is one of the trade-offs behind choosing a
-tokenizer.
+The table is a real fraction of the parameter budget:
 
-After lookup, the model needs to know *where* each token is, because attention itself is permutation
-invariant. Older models add a learned positional vector to the token embedding; most current models apply
-rotary position embeddings inside attention instead, so the input embedding carries only identity. The
-`positional-encoding` topic covers that choice. (The original transformer also multiplied the looked-up
-vector by √d_model to put it on a scale comparable to the positional signal; some current models, Gemma
-among them, keep a similar scaling.)
+| Model | Vocabulary × width | Embedding parameters |
+|---|---|---|
+| GPT-2 small | 50,257 × 768 | ≈ 38.6M of ~124M total |
+| Llama-2-7B | 32,000 × 4,096 | ≈ 131M |
+| Llama 3 (same width) | 128,256 × 4,096 | ≈ 525M |
+
+- **Vocabulary size is a trade-off.** Larger vocabularies tokenize text into fewer tokens (cheaper
+  context, better multilingual coverage) at the price of a bigger table. This is one of the trade-offs
+  behind choosing a tokenizer.
+- **Position comes separately.** Attention itself is permutation invariant, so the model must learn where
+  each token is. Older models add a learned positional vector to the token embedding; most current models
+  apply rotary position embeddings inside attention, so the input embedding carries only identity. The
+  `positional-encoding` topic covers that choice.
+- **Scaling.** The original transformer multiplied the looked-up vector by √d_model to put it on a scale
+  comparable to the positional signal; some current models, Gemma among them, keep a similar scaling.
 
 ### The unembedding and weight tying
-At the top of the stack, the final hidden state `h` (dimension `d_model`) is projected to a score per
-vocabulary entry: `logits = h · W_Uᵀ` with `W_U` of shape `[V, d_model]`. This matrix has the same shape
-as `E`, and some models (GPT-2 among them) **tie** them, using one matrix for both. Tying saves a full
-table of parameters and encourages consistency, *because* the vector used to recognize a token on the
-way in is the same one used to predict it on the way out. Many larger models (Llama-2, for instance)
-untie them, trading parameters for flexibility. Either way, the output of the model is a dot product
-between a hidden state and every token's output embedding, which is why embeddings and logits are two
-ends of one mechanism.
+1. **Project to the vocabulary.** The final hidden state `h` (dimension `d_model`) becomes a score per
+   vocabulary entry: `logits = h · W_Uᵀ` with `W_U` of shape `[V, d_model]`.
+2. **Same shape as `E`.** Some models (GPT-2 among them) **tie** them, using one matrix for both. Tying
+   saves a full table of parameters and encourages consistency, *because* the vector used to recognize a
+   token on the way in is the one used to predict it on the way out.
+3. **Or untie.** Many larger models (Llama-2, for instance) untie them, trading parameters for
+   flexibility.
+4. **One mechanism, two ends.** Either way the model's output is a dot product between a hidden state and
+   every token's output embedding, which is why embeddings and logits are two ends of one mechanism.
 
 ### Sentence and document embeddings
-An embedding *model* produces one vector for an entire input. Architecturally it is usually a
-transformer encoder followed by a pooling step: mean-pool the last hidden states, take a special
-first-token state, or take the last token for decoder-based embedders. Pooling alone is not enough. The
-raw hidden states of a language model trained only on next-token prediction make poor sentence vectors,
-because nothing in that objective asks the pooled vector of two paraphrases to coincide. Embedding models
-are therefore trained **contrastively**: given (query, relevant passage) pairs, pull each pair together
-and push the query away from the other passages in the batch (in-batch negatives, InfoNCE loss). For a
-batch of *B* pairs with similarity `s(q, p) = cos(q, p)` and temperature τ:
+- **Architecture.** An embedding *model* produces one vector for an entire input: usually a transformer
+  encoder plus a pooling step (mean-pool the last hidden states, take a special first-token state, or take
+  the last token for decoder-based embedders).
+- **Pooling alone is not enough.** Raw hidden states of a language model trained only on next-token
+  prediction make poor sentence vectors, because nothing in that objective asks the pooled vectors of two
+  paraphrases to coincide.
+- **So they are trained contrastively.** Given (query, relevant passage) pairs, pull each pair together
+  and push the query away from the other passages in the batch (in-batch negatives, InfoNCE loss).
+
+For a batch of *B* pairs with similarity `s(q, p) = cos(q, p)` and temperature τ:
 
 ```
 L = − (1/B) Σ_i log [ exp(s(q_i, p_i)/τ) / Σ_j exp(s(q_i, p_j)/τ) ]
 ```
 
-It is a *B*-way softmax classification: "which passage in this batch is mine?". That framing explains
-the training recipe. Bigger batches mean more negatives per query and a harder, more informative task;
-**hard negatives** (passages that look relevant but are not, often mined with BM25 or an earlier model)
-are added because random in-batch negatives are too easy to teach fine distinctions; and τ (small, for
-example 0.05) sharpens the softmax so near-misses are penalized. The objective directly optimizes the
-quantity you later query with, which is what makes cosine similarity meaningful.
+It is a *B*-way softmax classification: "which passage in this batch is mine?". That framing explains the
+recipe:
 
-Practical consequences of that training:
-- Vectors are compared with cosine similarity or dot product; with L2-normalized vectors these are
-  identical, and most models expect normalization.
-- Dimension is a design choice, from 384 (the `all-MiniLM-L6-v2` family) to 1,536 or 3,072 (OpenAI's
-  `text-embedding-3` models). Matryoshka-trained models order information so the first *k* dimensions
-  are usable on their own, letting you truncate to save index memory with a measured recall cost.
-- Some models are **asymmetric**: queries and passages are prefixed differently (the E5 family uses
-  `query:` and `passage:`), because a short question and a long document should not be embedded the same
-  way even when they mean the same thing.
-- A vector is only comparable to vectors from the *same model and version*; re-embedding everything is
-  mandatory when the model changes.
+| Ingredient | Why it is there |
+|---|---|
+| Bigger batches | more negatives per query, a harder and more informative task |
+| **Hard negatives** (look relevant but are not, often mined with BM25 or an earlier model) | random in-batch negatives are too easy to teach fine distinctions |
+| Small τ (for example 0.05) | sharpens the softmax so near-misses are penalized |
 
-## Example
+The objective directly optimizes the quantity you later query with, which is what makes cosine similarity
+meaningful.
+
+### Practical consequences of that training
+- **Metric.** Vectors are compared with cosine similarity or dot product; with L2-normalized vectors these
+  are identical, and most models expect normalization.
+- **Dimension is a design choice.** From 384 (the `all-MiniLM-L6-v2` family) to 1,536 or 3,072 (OpenAI's
+  `text-embedding-3` models).
+- **Matryoshka truncation.** Matryoshka-trained models order information so the first *k* dimensions are
+  usable on their own. You can truncate to save index memory, with a measured recall cost.
+- **Asymmetric models.** Some prefix queries and passages differently (the E5 family uses `query:` and
+  `passage:`), because a short question and a long document should not be embedded the same way even when
+  they mean the same thing.
+- **No cross-model comparison.** A vector is only comparable to vectors from the *same model and
+  version*; re-embedding everything is mandatory when the model changes.
+
+## Diagram
+Inside the LLM, the same `[V, d_model]` shape appears at both ends; outside it, an embedding model maps
+whole texts into one space that an index searches.
+
+```mermaid
+flowchart TD
+    T["Token ids"] --> E["Lookup row in E"]
+    E --> X["Transformer layers"]
+    X --> H["Final hidden state h"]
+    H --> U["h times W_U transpose"]
+    U --> L["Logits per vocab entry"]
+    E -.->|"tied in GPT-2"| U
+    D["Query or passage text"] --> M["Encoder plus pooling"]
+    M --> V["Normalized vector"]
+    V --> I[("Vector index, one model")]
+    I -->|"cosine top-k"| R["Retrieved passages"]
+```
+
+## Examples
+### Lookup, weight tying and paraphrase geometry
 The first block shows that an LLM's embedding layer is a row lookup equal to a one-hot matmul, and that
 GPT-2 ties its input and output embeddings. The second uses a contrastively trained encoder to show the
 geometry that retrieval relies on: two paraphrases score far higher than an unrelated sentence.
@@ -143,46 +172,94 @@ v = st.encode(sents, normalize_embeddings=True)        # [3, 384], unit length
 print((v @ v.T).round(2))     # cosine matrix: [0,1] clearly highest, [0,2] and [1,2] low
 ```
 
+### Sizing the table and the vector index
+Pure Python, no downloads: embedding-table parameters, and raw float32 index memory for a corpus at
+different dimensions (index structures add overhead on top).
+
+```python
+def table_params(vocab, d_model):
+    return vocab * d_model
+
+for name, v, d in [("GPT-2 small", 50_257, 768), ("Llama-2-7B", 32_000, 4_096),
+                   ("Llama 3", 128_256, 4_096)]:
+    print(f"{name:12s} {table_params(v, d) / 1e6:6.1f}M embedding params")
+
+def index_gb(n_vectors, dim, bytes_per_el=4):          # float32 vectors, no index overhead
+    return n_vectors * dim * bytes_per_el / 1e9
+
+for dim in (384, 1_536, 3_072):
+    print(f"10M chunks x {dim:5d} dims = {index_gb(10_000_000, dim):6.2f} GB")
+# GPT-2 small 38.6M, Llama-2-7B 131.1M, Llama 3 525.3M
+# 384 -> 15.36 GB, 1536 -> 61.44 GB, 3072 -> 122.88 GB
+```
+
+| Choice for 10M chunks | Raw vector memory | What to check before adopting |
+|---|---|---|
+| 3,072 dims | ~123 GB | does recall@k beat 1,536 enough to pay 2× memory? |
+| 1,536 dims | ~61 GB | baseline |
+| Matryoshka truncation to 384 | ~15 GB | recall@k drop on your labelled set |
+
+## Production patterns
+- **Store the model id with every vector.** When any index is written, save the embedding model name and
+  version as metadata and keep one model per index. Monitor for mixed versions with a periodic count by
+  model field; a non-zero second value means a partial migration.
+- **Re-index blue/green behind an alias.** On a model upgrade, embed the full corpus into a fresh index,
+  run recall@k on a labelled set that covers old documents, then switch the alias the application queries.
+  Monitor backfill progress and recall@k before and after the switch.
+- **Normalize once, at write time.** Pass `normalize_embeddings=True` (sentence-transformers) or L2-normalize
+  yourself, and configure the index for inner product or cosine to match. Monitor that offline evaluation
+  and production use the same metric.
+- **Truncate dimensions only with a measured budget.** For Matryoshka-trained models, keep the first *k*
+  dimensions (re-normalize after cutting) to shrink index memory. Gate the change on recall@k against the
+  full-dimension baseline.
+- **Chunk to the model's input limit.** Count tokens with the embedder's own tokenizer and split before
+  embedding (sentence-transformers exposes `max_seq_length`). Monitor the share of chunks that would be
+  truncated.
+- **Add lexical search for exact tokens.** Run BM25 next to vector search and merge by rank (reciprocal
+  rank fusion) for IDs, error codes and rare names. Monitor recall on a query slice of exact-match lookups.
+
 ## Trade-offs
-- A bigger vocabulary means fewer tokens per document and cheaper context, but a larger embedding table
-  and more rarely-updated rows; it pays off when the corpus is multilingual or code-heavy.
-- Higher embedding dimension stores finer distinctions but multiplies vector-index memory and search
-  cost linearly; the recall gained per extra dimension shrinks quickly, so the bigger vector pays off
-  only on large, diverse corpora, and the break-even point must be measured with recall@k, not assumed.
-- Rows for tokens that are rare in training get few gradient updates and stay near their initialization;
-  a large vocabulary built on one corpus and trained on another can contain such under-trained tokens,
-  which surface as bizarre outputs when a prompt contains them (the "glitch token" phenomenon).
-- Tying input and output embeddings saves parameters and helps small models, while untying gives large
-  models more capacity; the benefit flips as the table becomes a small fraction of total parameters.
-- A general-purpose embedding model works out of the box, whereas a fine-tuned one on domain pairs
-  improves retrieval on jargon-heavy corpora at the cost of a training pipeline and re-indexing on
-  every model change.
+- **Bigger vocabulary vs bigger table.** Fewer tokens per document and cheaper context, but a larger
+  embedding table and more rarely-updated rows. It pays off when the corpus is multilingual or code-heavy.
+- **Higher dimension vs index cost.** It stores finer distinctions but multiplies vector-index memory and
+  search cost linearly. Recall gained per extra dimension shrinks quickly, so the bigger vector pays off
+  only on large, diverse corpora; measure the break-even with recall@k, do not assume it.
+- **Large vocabulary vs under-trained rows.** Rows for tokens rare in training get few gradient updates
+  and stay near initialization. A vocabulary built on one corpus and trained on another can contain such
+  tokens, which surface as bizarre outputs when a prompt contains them (the "glitch token" phenomenon).
+- **Tying vs untying.** Tying saves parameters and helps small models; untying gives large models more
+  capacity. The benefit flips as the table becomes a small fraction of total parameters.
+- **General vs fine-tuned embedder.** A general-purpose model works out of the box. One fine-tuned on
+  domain pairs improves retrieval on jargon-heavy corpora, at the cost of a training pipeline and
+  re-indexing on every model change.
 
 ## Pitfalls
-- Mixing vectors from two embedding models or two versions of one model in a single index; the symptom
-  is retrieval that looks random for part of the corpus, exactly the part embedded with the other model.
-- Using an LLM's raw hidden states, or mean-pooled token embeddings, as sentence vectors; similarity
-  scores cluster in a narrow band and nearest neighbours are dominated by length and frequent words.
-- Forgetting the query/passage prefixes an asymmetric model was trained with; recall silently drops,
-  often by a lot, with no error anywhere.
-- Comparing unnormalized vectors with cosine in one place and dot product in another; rankings disagree
-  between your offline evaluation and the production index.
-- Embedding chunks that are longer than the model's input limit; the tail is truncated silently and
-  content past the cut is never retrievable.
-- Copying a similarity threshold ("treat cosine > 0.8 as relevant") from another model; score
-  distributions differ by model, some put unrelated pairs well above zero, and the symptom is a filter
-  that passes everything or nothing. Calibrate thresholds per model on labelled pairs.
+- **Mixing models or versions in one index.** Symptom: retrieval looks random for part of the corpus,
+  exactly the part embedded with the other model. Fix: one model per index, model id stored per vector.
+- **Using raw LLM hidden states as sentence vectors.** Including mean-pooled token embeddings. Symptom:
+  similarity scores cluster in a narrow band and nearest neighbours are dominated by length and frequent
+  words. Fix: use a contrastively trained embedding model.
+- **Forgetting asymmetric prefixes.** Dropping the query/passage prefixes a model was trained with makes
+  recall drop silently, often by a lot, with no error anywhere.
+- **Mixing cosine and dot product on unnormalized vectors.** Cosine in one place, dot product in another,
+  and rankings disagree between offline evaluation and the production index.
+- **Embedding chunks longer than the input limit.** The tail is truncated silently and content past the
+  cut is never retrievable.
+- **Copying a similarity threshold from another model.** "Treat cosine > 0.8 as relevant" does not
+  transfer: score distributions differ by model and some put unrelated pairs well above zero. Symptom: a
+  filter that passes everything or nothing. Fix: calibrate thresholds per model on labelled pairs.
 
 ## When to use
-Token embeddings are not a choice; every LLM has them, and you meet them when you count parameters,
-extend a vocabulary (new rows must be initialized and trained), or inspect why two tokens behave alike.
-Sentence embeddings are a choice: reach for them whenever the problem is "find things that mean the
-same as this" at scale, including semantic search, RAG retrieval, deduplication, clustering and
-classification with a light head on top. Do not reach for them when exact lexical match matters (IDs,
-error codes, rare names), where BM25 or hybrid search wins. Measure with recall@k on a labelled set of
-query–passage pairs before and after any change of model, dimension or chunking. In interviews, expect
-to explain the difference between the LLM's embedding table and an embedding model, why cosine
-similarity works for one and not the other, and what re-embedding costs when a model is upgraded.
+- **Token embeddings are not a choice.** Every LLM has them. You meet them when you count parameters,
+  extend a vocabulary (new rows must be initialized and trained), or inspect why two tokens behave alike.
+- **Use sentence embeddings when** the problem is "find things that mean the same as this" at scale:
+  semantic search, RAG retrieval, deduplication, clustering, and classification with a light head on top.
+- **Avoid them when** exact lexical match matters (IDs, error codes, rare names); BM25 or hybrid search
+  wins there.
+- **Measure** with recall@k on a labelled set of query–passage pairs before and after any change of
+  model, dimension or chunking.
+- **Interviews:** explain the difference between the LLM's embedding table and an embedding model, why
+  cosine similarity works for one and not the other, and what re-embedding costs when a model is upgraded.
 
 ## Role lens
 - **Engineer:** Picks the embedding model, normalizes and stores vectors, versions them alongside the
@@ -205,6 +282,37 @@ querying the old index or run both and merge results per index, never across the
 two models are on different scales, so merge by rank (for example reciprocal rank fusion) rather than by
 score. A strong answer also mentions the evaluation that should have caught it: recall@k on a labelled
 set covering old documents, run before the cutover.
+
+## Interview questions
+### What is the difference between an LLM's embedding table and an embedding model?
+- **The table** is a `[V, d_model]` matrix inside the LLM, one row per token id, trained as a side effect
+  of next-token prediction. It feeds the transformer, and its geometry is not meant for comparing texts.
+- **An embedding model** maps a whole input to one vector and is trained contrastively, so cosine
+  similarity between two outputs tracks meaning. That is why you use it, not pooled LLM states, for search.
+
+### Why do batch size and hard negatives matter when training an embedding model?
+- **InfoNCE is a B-way classification.** Each query must pick its passage out of the batch, so more
+  passages per batch means more negatives and a harder, more informative task.
+- **Random negatives are too easy.** Hard negatives mined with BM25 or an earlier model look relevant but
+  are not, which forces the model to learn fine distinctions; a small temperature penalizes near-misses.
+
+### Users say semantic search misses queries containing product codes like "AX-4471". How do you debug it?
+- **Check the slice first.** Build a small labelled set of exact-identifier queries and measure recall@k
+  on it separately; dense vectors often blur rare strings because they encode meaning, not spelling.
+- **Then fix the retrieval mix.** Add BM25 alongside vector search and fuse by rank, or route
+  identifier-shaped queries to lexical search. Re-measure both the identifier slice and general queries.
+
+### How would you decide between 384, 1,536 and 3,072 dimensions for a 10M-chunk corpus?
+- **Cost is linear.** Raw float32 vectors take about 15, 61 and 123 GB, before index overhead, and search
+  cost grows with dimension too.
+- **Benefit is not.** Recall per extra dimension shrinks quickly, so compare recall@k on your own labelled
+  pairs. With a Matryoshka model you can test truncation of one embedding run instead of re-embedding.
+
+### When would you tie input and output embeddings, and when not?
+- **Tie in small models.** The table is a large share of parameters (about 38.6M of ~124M in GPT-2 small),
+  so sharing one matrix saves real capacity and keeps recognition and prediction consistent.
+- **Untie in large models.** The table becomes a small fraction of the total, so the saving is minor and
+  separate matrices add flexibility, which is the choice Llama-2 makes.
 
 ## Quiz
 ### Q: Why is an embedding lookup mathematically identical to a linear layer applied to a one-hot vector?

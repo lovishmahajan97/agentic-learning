@@ -5,7 +5,7 @@ name: TTFT (time to first token)
 kind: metric
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - serving-inference/prefill-vs-decode
   - serving-inference/streaming
@@ -22,59 +22,65 @@ sources:
 ---
 
 ## TL;DR
-Time to first token (TTFT) is the delay between sending a request and receiving the first generated
-token. It is made of queueing wait plus prefill, the single compute-bound pass over the whole prompt,
-so it grows with prompt length and with load, not with answer length. In a streaming UI it is the
-latency users actually feel. You cut it with shorter prompts, prefix caching, admission control and
-scheduling; faster decode tricks such as speculative decoding do nothing for it.
+Time to first token (TTFT) is queueing wait plus prefill over the whole prompt, so it grows with prompt
+length and load, not answer length. It is the latency a streaming user feels; cut it with shorter
+prompts, prefix caching, admission control and scheduling.
 
 ## Why it exists
-"Request latency" is a useless number for an LLM call because it mixes two phases with different
-physics. Prefill processes every prompt token in one batched forward pass; it is dominated by large
-matrix multiplications and scales with prompt length. Decode then produces tokens one at a time,
-each step bound by memory bandwidth and scaling with output length. If you only track end-to-end
-latency, a regression could be either phase and you cannot tell which lever to pull.
-
-TTFT isolates the first phase. It matters on its own because once a stream has started the user has
-something to read and tolerates the rest; before it starts they see nothing and assume the product is
-broken. The same request can have a perfectly acceptable total time and an unacceptable TTFT if the
-first second is spent queueing or chewing through a 20k-token retrieved context.
-
-The naive alternative, "just watch mean latency", fails twice. Means hide the queueing tail, which is
-where TTFT breaks first under load. And a team that measured TTFT with 200-token test prompts will
-ship a RAG feature that stuffs 8k tokens into the context and never understand why the product
-suddenly feels slow: the answer is in the prefill arithmetic, which this metric forces you to look at.
+- **End-to-end latency mixes two phases with different physics.** Prefill processes every prompt token
+  in one batched forward pass, dominated by large matrix multiplications and scaling with prompt
+  length. Decode produces tokens one at a time, bound by memory bandwidth and scaling with output
+  length. A regression in "request latency" could be either, and you cannot tell which lever to pull.
+- **TTFT isolates the first phase, which users judge.** Once a stream starts, users have something to
+  read and tolerate the rest; before it starts they see nothing and assume the product is broken. A
+  request can have an acceptable total time and an unacceptable TTFT if the first second goes to
+  queueing or a 20k-token retrieved context.
+- **"Just watch mean latency" fails twice.**
+  - Means hide the queueing tail, which is where TTFT breaks first under load.
+  - A team that measured TTFT with 200-token test prompts ships a RAG feature with 8k tokens of context
+    and never understands why it feels slow. The answer is in the prefill arithmetic, which this metric
+    forces you to look at.
+- **Speculative decoding and other decode tricks do nothing for it.** They target the second phase.
 
 ## How it works
 ### What is inside the number
-From the client's clock, TTFT is the sum of: network to the server (plus TCP and TLS handshakes,
-several round trips, unless the client reuses a pooled connection); time spent waiting for
-admission (a free slot in the batch and free KV-cache memory); tokenisation; the prefill forward
-pass over all prompt tokens; sampling the first token from the logits of the last prompt position
-(the first token falls out of the prefill pass itself, there is no separate decode step for it);
-serialisation and the first flush of the response; and network back. Only two of those terms are
-large and variable: the queue and prefill.
+From the client's clock, TTFT is the sum of:
+
+| Term | Size |
+|---|---|
+| Network to the server, plus TCP and TLS handshakes (several round trips) unless the client reuses a pooled connection | Small, fixed |
+| Waiting for admission: a free batch slot and free KV-cache memory | **Large, variable** |
+| Tokenisation | Small |
+| Prefill forward pass over all prompt tokens | **Large, variable** |
+| Sampling the first token from the logits of the last prompt position | Small |
+| Serialisation and the first flush of the response | Small |
+| Network back | Small |
+
+- **The first token falls out of the prefill pass itself.** There is no separate decode step for it.
+- **Only two terms are large and variable:** the queue and prefill.
 
 ### Prefill cost
-For a dense transformer with *N* parameters, the forward pass costs roughly `2 × N` FLOPs per token
-for the weight matrices, plus an attention term that grows with the square of the prompt length but
-is small until contexts get very long. So prefill FLOPs ≈ `2 × N × n_prompt`. Illustrative
-arithmetic: an 8-billion-parameter model on a 4,000-token prompt needs about 2 × 8e9 × 4e3 = 6.4e13
-FLOPs. An H100-class GPU has a dense bf16 peak around 1e15 FLOP/s; at a realistic 40–50 % utilisation
-that is roughly 130–160 ms of pure prefill. Double the prompt and you double it. A 70B model is
-nearly nine times more. This is why TTFT tracks prompt length almost linearly in practice and why
-"we added RAG and TTFT went from 300 ms to 2 s" is expected, not a bug.
+- **Rule of thumb.** A dense transformer with *N* parameters costs roughly `2 × N` FLOPs per token for
+  the weight matrices. An attention term grows with the square of prompt length but is small until
+  contexts get very long. So prefill FLOPs ≈ `2 × N × n_prompt`.
+- **Illustrative arithmetic.** An 8-billion-parameter model on a 4,000-token prompt needs about
+  2 × 8e9 × 4e3 = 6.4e13 FLOPs. An H100-class GPU has a dense bf16 peak around 1e15 FLOP/s; at a
+  realistic 40–50 % utilisation that is roughly 130–160 ms of pure prefill.
+- **It scales linearly.** Double the prompt and you double it. A 70B model is nearly nine times more.
+- **So the RAG jump is expected.** TTFT tracks prompt length almost linearly in practice, which is why
+  "we added RAG and TTFT went from 300 ms to 2 s" is not a bug.
 
 ### Queueing under continuous batching
-A continuous-batching engine admits a new request only when it has a scheduling slot and enough KV
-memory for its prompt. When either is exhausted, the request waits for others to finish or be
-preempted, and that wait lands entirely in TTFT. So TTFT p99 is a capacity signal: if it climbs
-while prompt lengths have not changed, you are queueing. Prefill also interacts with running
-requests: a long prompt entering the batch makes that step expensive, which stalls every other
-stream's next token. Chunked prefill splits a long prompt across several steps to protect those
-streams, at the cost of slightly longer TTFT for the long request itself. Disaggregated serving goes
-further and runs prefill on separate GPUs so decode latency and TTFT stop competing at all, paying
-with a KV-cache transfer between machines.
+- **Admission needs a slot and KV memory.** When either is exhausted, the request waits for others to
+  finish or be preempted, and that wait lands entirely in TTFT.
+- **TTFT p99 is a capacity signal.** If it climbs while prompt lengths have not changed, you are
+  queueing.
+- **Prefill stalls running streams.** A long prompt entering the batch makes that step expensive,
+  which delays every other stream's next token.
+- **Chunked prefill** splits a long prompt across several steps to protect those streams, at the cost
+  of slightly longer TTFT for the long request itself.
+- **Disaggregated serving** runs prefill on separate GPUs so decode latency and TTFT stop competing at
+  all, paying with a KV-cache transfer between machines.
 
 ### Levers, in order of leverage
 1. **Send fewer tokens.** Tighter retrieval (fewer, shorter chunks), summarised history, and no
@@ -91,14 +97,34 @@ with a KV-cache transfer between machines.
    weight-only quantisation mostly do not; they target the decode phase.
 
 ### Measuring it honestly
-Measure at the client from "request sent" to the first *non-empty content* delta; the first SSE
-frame is often a role-only chunk or a `message_start` event and arrives before any prefill has
-finished. Report percentiles bucketed by prompt length, and keep a separate "time to first visible
-token" when a model emits hidden reasoning before its answer, because that gap can be many seconds
-while TTFT looks fine. Server-side TTFT, measured from arrival, strips out network and is the number
-to compare across engine configurations.
+- **Stop the clock at the first *non-empty content* delta.** The first SSE frame is often a role-only
+  chunk or a `message_start` event and arrives before any prefill has finished.
+- **Report percentiles bucketed by prompt length**, so a prompt-size regression is distinguishable from
+  a capacity problem.
+- **Track "time to first visible token" separately** when a model emits hidden reasoning before its
+  answer, because that gap can be many seconds while TTFT looks fine.
+- **Use server-side TTFT, measured from arrival,** to compare engine configurations; it strips out
+  network.
 
-## Example
+## Diagram
+Follow a request from send to first visible token. The two boxes that move with load and prompt size,
+the admission queue and prefill, are where almost all of TTFT goes.
+
+```mermaid
+flowchart TD
+    A["Client sends request"] --> B["Network and TLS handshake"]
+    B --> C["Admission queue"]
+    C -->|"slot and KV memory free"| D["Tokenise prompt"]
+    D --> E["Prefill: all prompt tokens"]
+    E --> F["Sample first token"]
+    F --> G["Serialise and flush"]
+    G --> H["First content delta at client"]
+    C -.->|"grows with load"| Q["Queueing tail, p99"]
+    E -.->|"grows with prompt length"| R["Linear prefill cost"]
+```
+
+## Examples
+### Probe TTFT and TPOT against any OpenAI-compatible server
 A short probe against any OpenAI-compatible streaming server (a provider, or vLLM/SGLang locally)
 that measures TTFT to the first content delta and TPOT over the rest, then shows how TTFT grows with
 prompt length while TPOT stays flat.
@@ -134,43 +160,86 @@ for words in (50, 500, 5000):
 # Run it again with 20 concurrent copies: TTFT climbs (queueing) long before TPOT does.
 ```
 
+### Worked scenario: predicting the TTFT cost of adding RAG
+Pure arithmetic from the prefill rule, before any load test. Assumes ~1e15 FLOP/s bf16 peak at 45 %
+utilisation and no queueing; these are illustrative orders of magnitude, not benchmarks.
+
+```python
+def prefill_ms(params: float, prompt_tokens: int, peak=1e15, util=0.45) -> float:
+    return 2 * params * prompt_tokens / (peak * util) * 1000
+
+for label, n, toks in [("8B, chat 500", 8e9, 500), ("8B, RAG 8k", 8e9, 8_000),
+                       ("8B, RAG 20k", 8e9, 20_000), ("70B, RAG 8k", 70e9, 8_000)]:
+    print(f"{label:14s} {prefill_ms(n, toks):7.0f} ms")
+```
+
+| Workload | Prompt tokens | Prefill (illustrative) | Takeaway |
+|---|---|---|---|
+| 8B, plain chat | 500 | ~18 ms | Network and queue dominate |
+| 8B, RAG | 8,000 | ~280 ms | Prefill now dominates TTFT |
+| 8B, wide RAG | 20,000 | ~710 ms | Trim chunks before buying GPUs |
+| 70B, RAG | 8,000 | ~2.5 s | Nearly nine times the 8B cost |
+
+Real numbers will be worse once queueing and attention overhead are added; the ratios are the point.
+
+## Production patterns
+- **Stable prefix first, cached.** Put the system prompt, tool schemas and shared documents first and
+  byte-identical, with timestamps and user fields after them, and run the engine with automatic prefix
+  caching on (vLLM `--enable-prefix-caching`). Monitor prefix-cache hit rate and TTFT per route.
+- **Cap concurrency and fail fast.** Set the per-replica limit (vLLM `--max-num-seqs`) from a load test
+  and return a fast 429 with `Retry-After` beyond it. Monitor the engine's waiting-queue length, which
+  vLLM exports as `vllm:num_requests_waiting`.
+- **Chunked prefill for mixed traffic.** When long prompts share a replica with live streams, enable
+  chunked prefill and tune the per-step token budget (`--max-num-batched-tokens`). Monitor p99
+  inter-token latency for running streams and TTFT for the longest prompt bucket.
+- **Bucketed TTFT SLOs.** Alert on TTFT p95 per prompt-length bucket (for example under 1k, 1k-8k,
+  over 8k tokens) and per concurrency band, so you know whether a breach is prompt size or capacity.
+- **Separate pool for long context.** Route requests above a token threshold to their own replicas or
+  a disaggregated prefill tier, so a few huge prompts cannot queue every short chat. Monitor queue
+  depth per pool.
+- **Reuse one HTTP client per process.** Create the SDK client once so connections are pooled and
+  handshakes leave the TTFT path. Monitor TTFT for tiny prompts from each region as the network floor.
+
 ## Trade-offs
-- Prefix caching slashes TTFT for repeated prefixes but only when they are byte-identical and still
-  resident; it buys nothing for one-off prompts or when dynamic fields sit before the shared part.
-- Chunked prefill protects the inter-token latency of running streams but lengthens TTFT for the
-  long prompt being chunked; the balance flips for prefill-heavy workloads with few concurrent
-  decodes, such as summarisation batches, where you would rather prefill at full speed.
-- Prioritising short prompts improves median TTFT at the risk of starving long ones; it only works
-  with ageing or a separate pool for long-context requests.
-- Trimming retrieved context lowers TTFT linearly but can cut answer quality, so the cut must be
-  checked against an eval set rather than assumed harmless.
-- Disaggregating prefill and decode isolates TTFT from decode load, but adds machines and a
-  KV-cache transfer whose cost is only worth it at high, steady traffic.
+- **Prefix caching vs one-off prompts.** It slashes TTFT for repeated prefixes, but only when they are
+  byte-identical and still resident; it buys nothing for one-off prompts or when dynamic fields sit
+  before the shared part.
+- **Chunked prefill vs the long prompt's TTFT.** It protects the inter-token latency of running
+  streams but lengthens TTFT for the long prompt being chunked. The balance flips for prefill-heavy
+  workloads with few concurrent decodes, such as summarisation batches, where you would rather
+  prefill at full speed.
+- **Short-prompt priority vs starvation.** Prioritising short prompts improves median TTFT at the risk
+  of starving long ones; it only works with ageing or a separate pool for long-context requests.
+- **Less context vs quality.** Trimming retrieved context lowers TTFT linearly but can cut answer
+  quality, so the cut must be checked against an eval set rather than assumed harmless.
+- **Disaggregation vs cost.** Splitting prefill and decode isolates TTFT from decode load, but adds
+  machines and a KV-cache transfer whose cost is only worth it at high, steady traffic.
 
 ## Pitfalls
-- Measuring to the first SSE frame rather than the first content token; the symptom is a TTFT that
-  looks great and does not move when prompt length triples.
-- Reporting mean TTFT; the symptom is a green dashboard while users complain, because queueing shows
-  up only in p95 and p99.
-- Blaming the model for high TTFT when it is queueing; the tell is that TTFT correlates with
-  concurrency, not with prompt length, and drops at night.
-- Load-testing with short prompts and shipping long retrieved contexts; the symptom is a product that
-  "got slow when we added RAG" with no change in the serving stack.
-- Ignoring hidden reasoning tokens; TTFT is fine but the user sees a blank screen for ten seconds, so
-  measure time to first visible token separately.
-- Opening a new HTTPS connection per request from a distant region; the symptom is a TTFT floor of
-  a few hundred milliseconds even for tiny prompts, which disappears with a reused client.
-- Counting cold starts (model load on a fresh replica, serverless GPU wake-up) inside TTFT; the
-  symptom is a p99 dominated by a handful of 30-second outliers after each scale-out.
+- **Measuring to the first SSE frame.** Symptom: a TTFT that looks great and does not move when prompt
+  length triples. Fix: stop at the first content token.
+- **Reporting mean TTFT.** Symptom: a green dashboard while users complain, because queueing shows up
+  only in p95 and p99.
+- **Blaming the model when it is queueing.** The tell: TTFT correlates with concurrency, not with
+  prompt length, and drops at night.
+- **Load-testing with short prompts, shipping long contexts.** Symptom: a product that "got slow when
+  we added RAG" with no change in the serving stack.
+- **Ignoring hidden reasoning tokens.** TTFT is fine but the user sees a blank screen for ten seconds,
+  so measure time to first visible token separately.
+- **A new HTTPS connection per request from a distant region.** Symptom: a TTFT floor of a few hundred
+  milliseconds even for tiny prompts, which disappears with a reused client.
+- **Counting cold starts inside TTFT.** Model load on a fresh replica or serverless GPU wake-up shows
+  up as a p99 dominated by a handful of 30-second outliers after each scale-out.
 
 ## When to use
-Give every user-facing surface a TTFT target before launch: a chat UI usually aims for well under a
-second at p95, inline completion needs a few hundred milliseconds, and a nightly batch job has no
-TTFT target at all. Budget it as network + queue + prefill and check which term you can actually
-control. Watch it bucketed by prompt length and by concurrency so you can tell a prompt-size
-regression from a capacity problem. In day-to-day work it is the first number to look at when
-"the assistant feels slow", and in interviews the expected answer to "latency doubled after we added
-retrieval" is a decomposition of TTFT into prefill arithmetic plus the levers above.
+- **Set a target per surface before launch.** A chat UI usually aims for well under a second at p95,
+  inline completion needs a few hundred milliseconds, and a nightly batch job has no TTFT target at all.
+- **Budget it as network + queue + prefill** and check which term you can actually control.
+- **Watch it bucketed** by prompt length and by concurrency, to tell a prompt-size regression from a
+  capacity problem.
+- **First number to check** when "the assistant feels slow".
+- **Interviews:** the expected answer to "latency doubled after we added retrieval" is a decomposition
+  of TTFT into prefill arithmetic plus the levers above.
 
 ## Role lens
 - **Engineer:** Instruments TTFT to the first content delta, enables prefix caching for the shared
@@ -191,6 +260,41 @@ a few long prompts as the cause. Fixes, cheapest first: cap per-replica concurre
 429 or visible queue position instead of a silent 9 s wait; enable prefix caching if prompts share a
 system prefix; turn on chunked prefill so long prompts stop stalling admission; autoscale on queue
 depth rather than GPU utilisation; and move long-context or batch traffic to a separate pool.
+
+## Interview questions
+### What is TTFT made of, and why does speculative decoding not improve it?
+- **Definition:** network plus admission wait plus tokenisation plus prefill over the whole prompt,
+  then sampling the first token from the last prompt position's logits.
+- **Speculative decoding** drafts and verifies several output tokens per decode step, so it shortens the
+  decode phase only; the first token still waits for the full prefill.
+
+### Latency doubled after we added retrieval. Walk me through it.
+- **Decompose first:** compare TTFT and TPOT before and after. Retrieval adds prompt tokens, so expect
+  TTFT to rise and TPOT to stay roughly flat.
+- **Check the arithmetic:** prefill FLOPs ≈ 2 × parameters × prompt tokens, so going from hundreds to
+  thousands of tokens moves prefill from tens to hundreds of milliseconds.
+- **Then the levers:** fewer or shorter chunks (checked on an eval set), the stable prefix first for
+  prefix caching, and chunked prefill if long prompts stall other streams.
+
+### When would you not turn on chunked prefill?
+- **It costs the long prompt.** Splitting its prefill across steps lengthens that request's own TTFT.
+- **So skip it** for prefill-heavy, low-concurrency work such as summarisation batches, where few
+  decodes are running and finishing prefill at full speed matters more.
+- **Use it** when long prompts share replicas with many live streams, because it bounds their stalls.
+
+### Roughly what TTFT should a 70B model have on an 8k-token prompt with no queue?
+- **FLOPs:** 2 × 70e9 × 8e3 ≈ 1.1e15.
+- **Throughput:** about 1e15 FLOP/s bf16 peak at 40–50 % utilisation is roughly 4.5e14 FLOP/s, so about
+  2.5 s on one GPU (illustrative).
+- **Implication:** tensor parallelism across GPUs or a smaller prompt is required for a sub-second
+  target, because prefill is compute-bound and does scale with more compute.
+
+### How do you measure TTFT for a reasoning model that thinks before answering?
+- **Two clocks:** TTFT to the first generated token, and time to first visible token for the answer
+  the user reads; the gap can be many seconds.
+- **Client side,** stop at the first non-empty content delta, not the role-only first frame or
+  `message_start`.
+- **Report percentiles** bucketed by prompt length, with cold starts tracked separately.
 
 ## Quiz
 ### Q: Which change most directly reduces TTFT for requests with a 10k-token prompt?

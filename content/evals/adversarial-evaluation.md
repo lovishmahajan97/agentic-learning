@@ -5,7 +5,7 @@ name: Adversarial evaluation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - evals/red-teaming
   - prompting/prompt-injection
@@ -23,105 +23,132 @@ sources:
 ---
 
 ## TL;DR
-Adversarial evaluation measures how a system behaves on inputs chosen to make it fail: jailbreaks,
-instructions injected through retrieved content, perturbed or out-of-distribution inputs, and outputs
-crafted to fool the grader. Red teaming discovers such inputs; adversarial evaluation turns them into a
-versioned suite with an attack success rate per class, run every release and reported next to the
-over-refusal rate on benign inputs. It exists because average-case evals say nothing about the worst
-case, which is what attackers find.
+Adversarial evaluation turns inputs chosen to make a system fail (jailbreaks, injected instructions,
+perturbations, grader-fooling outputs) into a versioned suite with attack success per class, run every
+release next to over-refusal, because average-case evals miss the worst case.
 
 ## Why it exists
-A golden set sampled from typical traffic measures the centre of the distribution. The failures that
-end up in incident reports and newspapers live in the tail, and the tail is not sampled: someone goes
-looking for it. An assistant can score 97% on its golden set and still follow an instruction hidden in a
-vendor's PDF that says to email the contract to an outside address, or produce a refund code when asked
-in the right role-play. Those are not rare inputs; they are inputs that nobody in the eval sampled
-because no normal user sends them.
-
-"We ran a red-team exercise before launch" does not hold either. Every prompt edit and every model
-update re-opens holes that were closed, and new attack techniques appear monthly. Findings that live in
-a slide deck are forgotten; findings that live in a test suite are checked every release. Measurement
-also has to cover the other direction. The cheapest way to drive attack success to zero is to refuse
-anything that smells risky, and then the assistant refuses "how do I kill a Python process" and "what
-drugs interact with warfarin". Without a benign-but-edgy set, hardening is optimised blind.
-
-The naive alternatives all leave the gap. Relying on the provider's safety training covers generic
-harm, not your injection surface or your business rules. Buying a guardrail product adds a layer that
-also needs measuring. A one-off penetration test is a snapshot. Adversarial evaluation makes the worst
-case a number, per attack class, tracked over versions, paired with the cost in false refusals.
+- **Golden sets measure the centre; incidents live in the tail.** The tail is not sampled: someone goes
+  looking for it. An assistant can score 97% on its golden set and still obey an instruction hidden in a
+  vendor's PDF to email the contract outside, or produce a refund code in the right role-play.
+- **These are not rare inputs.** They are inputs nobody in the eval sampled, because no normal user
+  sends them.
+- **"We red-teamed before launch" does not hold.** Every prompt edit and model update re-opens closed
+  holes, and new techniques appear monthly. Findings in a slide deck are forgotten; findings in a test
+  suite are checked every release.
+- **The other direction must be measured too.** The cheapest way to zero attack success is refusing
+  anything risky-looking, and then the assistant refuses "how do I kill a Python process" and "what
+  drugs interact with warfarin". Without a benign-but-edgy set, hardening is optimised blind.
+- **The naive alternatives leave the gap.** Provider safety training covers generic harm, not your
+  injection surface or business rules. A guardrail product is a layer that also needs measuring. A
+  one-off penetration test is a snapshot. This practice makes the worst case a tracked number, per attack
+  class, paired with the false-refusal cost.
 
 ## How it works
 ### Start from a threat model
 Decide who attacks, what they want and through which channel, because the suite is organised by that.
-Channels: direct user input; indirect input through retrieved documents, tool results, web pages,
-emails or calendar entries (prompt injection); multi-turn setups that build context slowly; multimodal
-carriers such as text inside an image. Goals: harmful content, data exfiltration, unauthorised actions
-by an agent, violations of business rules (discounts, refunds, access), brand damage, and resource
-exhaustion. Each (channel, goal) cell gets its own attack set and its own number.
+
+| Channels | Goals |
+|---|---|
+| Direct user input | Harmful content |
+| Indirect input via retrieved documents, tool results, web pages, emails, calendar entries (prompt injection) | Data exfiltration |
+| Multi-turn setups that build context slowly | Unauthorised actions by an agent |
+| Multimodal carriers, such as text inside an image | Business-rule violations (discounts, refunds, access) |
+| | Brand damage, resource exhaustion |
+
+Each (channel, goal) cell gets its own attack set and its own number.
 
 ### Four sources of attacks
-1. **Human red-team findings.** Highest quality, lowest volume. Each finding is generalised into a
-   template with slots (the harmful request, the persona, the carrier document) so one finding yields
-   many cases.
-2. **Templated and mutated attacks.** Known jailbreak families (role-play personas, "ignore previous
-   instructions", encodings such as base64 or leetspeak, language switching, payload splitting across
-   turns) applied to a base set of requests; surface perturbations (typos, homoglyphs, spacing,
-   Unicode tricks) applied to both attacks and benign tasks. This is the metamorphic transform
-   catalogue aimed at breaking instead of preserving.
-3. **Model-generated attacks.** A red-team model generates candidate inputs at scale (Perez et al.), or
-   an attacker model iterates against the target using its responses as feedback (PAIR-style, Chao et
-   al.). Gradient-based suffix search (GCG, Zou et al.) needs white-box access to an open-weight model,
-   but the suffixes it finds transfer to other models, so they belong in the suite even for API models.
-4. **Mined from production.** Inputs flagged by guardrails, judge-flagged outputs, and near-misses,
-   because real attackers are more creative than templates.
+1. **Human red-team findings.** Highest quality, lowest volume. Generalise each into a template with
+   slots (the harmful request, the persona, the carrier document) so one finding yields many cases.
+2. **Templated and mutated attacks.**
+   - Known jailbreak families applied to a base set of requests: role-play personas, "ignore previous
+     instructions", encodings such as base64 or leetspeak, language switching, payload splitting across
+     turns.
+   - Surface perturbations (typos, homoglyphs, spacing, Unicode tricks) on both attacks and benign tasks:
+     the metamorphic transform catalogue aimed at breaking instead of preserving.
+3. **Model-generated attacks.**
+   - A red-team model generates candidate inputs at scale (Perez et al.).
+   - An attacker model iterates against the target using its responses as feedback (PAIR-style, Chao et al.).
+   - Gradient-based suffix search (GCG, Zou et al.) needs white-box access to an open-weight model, but
+     its suffixes transfer to other models, so they belong in the suite even for API models.
+4. **Mined from production.** Guardrail-flagged inputs, judge-flagged outputs and near-misses, because
+   real attackers are more creative than templates.
 
 ### Grade success deterministically where possible
-Attack success means the attacker's goal was reached, not that the output looked bad. Plant canaries:
-the injected instruction says "include the token ZEBRA-4471" or "call `send_email` with the document",
-so success is a string match or a tool-call match with no judge involved. For harmful-content goals a
-judge is unavoidable; calibrate it on human-labelled attack outcomes, because attack outputs are
-exactly where judges fail (partial compliance, refusals that leak the answer anyway, content encoded in
-base64 that the judge reads as gibberish). Grade refusals separately from compliance so "refused but
-then complied" is not scored as safe.
+- **Success means the attacker's goal was reached**, not that the output looked bad.
+- **Plant canaries.** The injected instruction says "include the token ZEBRA-4471" or "call `send_email`
+  with the document", so success is a string or tool-call match with no judge involved.
+- **Calibrate the judge for content harm.** There a judge is unavoidable; calibrate it on human-labelled
+  attack outcomes, because attack outputs are where judges fail: partial compliance, refusals that leak
+  the answer anyway, base64 content the judge reads as gibberish.
+- **Grade refusal and compliance separately**, so "refused but then complied" is not scored as safe.
 
 ### The metrics
 - **Attack success rate (ASR)** per goal, per channel, per technique.
-- **Worst case, not average.** Report the *maximum* ASR across techniques for each goal, because the
-  attacker chooses the technique; an average over twenty techniques where one works every time is a
-  system that is broken every time.
+- **Worst case, not average.** Report the *maximum* ASR across techniques per goal, because the attacker
+  chooses the technique; an average over twenty techniques where one always works describes a system
+  that is broken every time.
 - **Robustness gap** on benign tasks: accuracy on clean inputs minus accuracy on perturbed inputs.
-- **Over-refusal rate** on a benign-but-edgy set (XSTest is the public template): prompts that mention
-  violence, drugs or secrets in harmless contexts. Plotted against ASR this is the frontier a release
+- **Over-refusal rate** on a benign-but-edgy set (XSTest is the public template): prompts mentioning
+  violence, drugs or secrets in harmless contexts. Plotted against ASR, it is the frontier a release
   moves along.
-- **Cost to break** for adaptive attackers: how many queries an attacker model needed, which is the
-  closest thing to a security margin.
+- **Cost to break** for adaptive attackers: queries an attacker model needed, the closest thing to a
+  security margin.
 
 ### Attacks are stochastic, and zero is a bound, not a fact
-Two counting rules follow from sampling. First, run each attack several times: an attack that succeeds
-on one sample in ten is a working attack, because a real attacker simply retries, so record both the
-per-sample rate and whether *any* of *k* attempts succeeded, and gate critical cells on the latter.
-Second, "0 successes" only bounds the true rate. With *n* independent trials and no successes, the 95%
-upper bound on the success rate is about 3/*n* (the rule of three): 0 of 20 still allows roughly 14%, 0 of
-100 about 3%. If the gate says "zero on known attacks" for data exfiltration, the cell needs enough
-trials for that bound to be one the business accepts.
+1. **Run each attack several times.** An attack that succeeds on one sample in ten is a working attack,
+   because a real attacker retries. Record the per-sample rate and whether *any* of *k* attempts
+   succeeded, and gate critical cells on the latter.
+2. **"0 successes" only bounds the true rate.** With *n* independent trials and no successes, the 95%
+   upper bound is about 3/*n* (the rule of three).
+
+| Trials, 0 successes | 95% upper bound on true rate |
+|---|---|
+| 20 | roughly 14% |
+| 100 | about 3% |
+
+- **Size critical cells.** If the gate says "zero on known attacks" for data exfiltration, the cell needs
+  enough trials for that bound to be one the business accepts.
 
 ### Make it repeatable, and keep part of it hidden
-Version the attack set like a golden set. Known attacks are regression tests: a critical cell (data
-exfiltration through tool calls, for instance) is gated at zero successes on known attacks. Adaptive
-attack generation runs nightly or weekly as discovery, and its successes are promoted into the fixed
-set. Because defences tuned against a fixed set overfit it, hold out a slice of templates and rotate
-them, and periodically run a human red team against the current best to re-seed the suite.
+- **Version the attack set** like a golden set; known attacks are regression tests.
+- **Gate critical cells** (data exfiltration through tool calls, for instance) at zero successes on
+  known attacks.
+- **Run adaptive generation** nightly or weekly as discovery, and promote its successes into the fixed set.
+- **Hold out and rotate templates,** because defences tuned against a fixed set overfit it.
+- **Re-seed with humans:** periodically run a human red team against the current best.
 
 ### Evaluate the evaluator
-Adversarial inputs also target the grader: outputs that look like refusals to a judge while delivering
-the content, or benign outputs the judge flags because they quote the attack. Keep a hand-labelled set
-of attack outcomes and report the judge's precision and recall on it, otherwise the ASR number is a
-property of the judge rather than of the system.
+- **Attacks also target the grader:** outputs that look like refusals to a judge while delivering the
+  content, or benign outputs flagged because they quote the attack.
+- **Keep a hand-labelled set of attack outcomes** and report the judge's precision and recall on it;
+  otherwise ASR is a property of the judge, not the system.
 
-## Example
-A small indirect-injection suite for an agent that reads retrieved documents. Payloads are placed in a
-*retrieved* document, crossed with surface perturbations, and success is graded deterministically with
-a canary string or a canary tool call. The gate is on the worst case per injection goal.
+## Diagram
+Attacks flow from four sources into a versioned suite crossed with channels; deterministic canaries grade
+where possible, and the release gate reads worst-case ASR together with over-refusal.
+
+```mermaid
+flowchart TD
+    TM["Threat model: channel x goal cells"] --> SU[("Versioned attack suite")]
+    H["Human red team"] --> SU
+    TP["Templates and mutations"] --> SU
+    AM["Attacker models: PAIR, GCG suffixes"] --> SU
+    PR["Production flags and near-misses"] --> SU
+    SU --> RUN["Run each attack k times"]
+    RUN --> GR{"Canary checkable?"}
+    GR -->|"yes"| CN["String or tool-call match"]
+    GR -->|"no"| JD["Calibrated judge"]
+    CN --> GT["Gate: worst-case ASR per goal plus over-refusal"]
+    JD --> GT
+    AM -.->|"new successes promoted"| SU
+```
+
+## Examples
+### Indirect-injection suite with canary grading
+An agent reads retrieved documents. Payloads go into a *retrieved* document, crossed with surface
+perturbations; success is a canary string or canary tool call. The gate is the worst case per goal.
 
 ```python
 import itertools, statistics
@@ -161,44 +188,102 @@ def asr_table(clean_docs: list[str]) -> dict:
 # Run the benign-but-edgy over-refusal set alongside, or ASR will fall by refusing everything.
 ```
 
+### How many trials does a zero need, and what does a retry buy the attacker?
+Pure Python, runnable. The exact zero-success bound is 1 − 0.05^(1/n), which the rule of three
+approximates as 3/n.
+
+```python
+import math
+
+def zero_success_bound(n: int, conf: float = 0.95) -> float:
+    return 1 - (1 - conf) ** (1 / n)
+
+def trials_needed(bound: float, conf: float = 0.95) -> int:
+    return math.ceil(math.log(1 - conf) / math.log(1 - bound))
+
+def any_success(p: float, k: int) -> float:       # attacker retries k times
+    return 1 - (1 - p) ** k
+
+print(round(zero_success_bound(20), 3))    # 0.139  ~14%, rule of three says 15%
+print(round(zero_success_bound(100), 3))   # 0.03
+print(trials_needed(0.01))                 # 299 clean trials to claim "under 1%"
+print(round(any_success(0.10, 10), 2))     # 0.65: a 1-in-10 attack works 65% of the time with 10 retries
+```
+
+### Worked scenario: the "8% ASR" report
+Illustrative numbers. A support agent's report averages ASR over technique cells for one goal,
+"issue an unauthorised refund".
+
+| Technique | ASR |
+|---|---|
+| Plain instruction | 0% |
+| Role-play persona | 0% |
+| Base64 encoding | 0% |
+| Payload split across turns | 0% |
+| Injection inside a ticket attachment | 40% |
+| **Mean across these five** | **8%** |
+| **Worst case (what the attacker uses)** | **40%** |
+
+- **The headline is the 40%:** the attacker picks the attachment channel, so the goal is badly exposed.
+- **The fix is targeted:** treat attachment text as data (delimit it, strip instructions, require
+  confirmation for refund tools), then re-run that cell with enough trials for a meaningful zero.
+
+## Production patterns
+- **Known-attack slice as a CI gate.** Run canary-graded known attacks on every prompt, tool or model
+  change; block on any success in critical cells (exfiltration, unauthorised tool calls). Monitor ASR per
+  cell per release and the trial count behind each zero.
+- **Scheduled adaptive discovery.** Run an attacker model (PAIR-style) against the current build nightly
+  or weekly, and promote every success into the fixed suite with its cell tag. Monitor queries-to-break
+  as the security margin.
+- **Held-out rotating templates.** Keep a slice of templates out of any prompt or guardrail tuning and
+  rotate it each cycle. Monitor the gap between fixed-suite ASR and held-out ASR as the overfitting signal.
+- **Over-refusal ceiling beside every ASR gate.** Run an XSTest-style benign-but-edgy set built from
+  your own domain with the same suite. Monitor over-refusal and ASR together as a frontier per release.
+- **System-prompt canary in production.** Put a unique canary token in the system prompt and alert when
+  any output contains it, a cheap leakage detector. Monitor alert counts and route hits into the suite.
+- **Judge calibration on attack outcomes.** Keep hand-labelled attack transcripts, including partial
+  compliance and encoded outputs, and re-measure judge precision and recall when the judge changes.
+
 ## Trade-offs
-- A fixed attack set gives repeatable numbers and a CI gate, but defences overfit it; adaptive attacks
-  find new holes but are slow, costly and non-reproducible, so both are needed on different cadences.
-- Canary-based grading is exact and cheap, but it only covers goals that can be expressed as a token or
-  a tool call; content-harm goals still need a calibrated judge.
-- Reporting worst-case ASR is honest about risk but makes every number look bad; averages look better
-  and mislead, so publish both and gate on the worst case.
-- Lowering ASR by tightening the system prompt or guardrails raises over-refusal; the acceptable point
-  on that frontier depends on the product, and it flips entirely between a consumer chatbot and an
-  internal engineering tool.
-- Gradient-based attacks need an open-weight stand-in and GPU time, which is only worth it when the
+- **Fixed set vs adaptive attacks.** A fixed set gives repeatable numbers and a CI gate but defences
+  overfit it; adaptive attacks find new holes but are slow, costly and non-reproducible, so run both on
+  different cadences.
+- **Canary grading vs coverage.** Exact and cheap, but only for goals expressible as a token or tool
+  call; content-harm goals still need a calibrated judge.
+- **Worst-case vs average reporting.** Worst case is honest but makes every number look bad; averages
+  look better and mislead, so publish both and gate on the worst case.
+- **Lower ASR vs over-refusal.** Tighter system prompts or guardrails raise over-refusal; the acceptable
+  point depends on the product and flips entirely between a consumer chatbot and an internal
+  engineering tool.
+- **Gradient attacks vs cost.** They need an open-weight stand-in and GPU time, worth it only when the
   transferred suffixes measurably raise ASR against your actual model.
 
 ## Pitfalls
-- Grading with a judge that reads "I cannot help with that, but here is the information" as a refusal;
-  the symptom is a low ASR and leaked content in the transcripts.
-- Averaging ASR across techniques; the symptom is "8% ASR" on a system where one technique succeeds
-  every time.
-- Testing only the user channel; the symptom is a clean jailbreak score and an agent that obeys
-  instructions hidden in a retrieved web page.
-- Hardening against the suite until ASR hits zero with no benign-edgy set; the symptom is support
-  tickets about refusals on ordinary questions.
-- Letting attack cases leak into the prompt or fine-tuning data; the symptom is zero ASR on the suite
-  and unchanged success for any fresh phrasing.
-- Running each attack once and reading 0% as safe; the symptom is an attacker in production who
-  succeeds on the third retry of a payload the suite marked as blocked.
-- Treating ASR as static; the symptom is a model update that silently raises a cell from 0% to 40%
-  because the suite only ran at launch.
+- **A judge that reads "I cannot help with that, but here is the information" as a refusal.** Symptom:
+  low ASR and leaked content in the transcripts. Fix: grade refusal and compliance separately.
+- **Averaging ASR across techniques.** Symptom: "8% ASR" on a system where one technique succeeds every
+  time. Fix: worst case per goal.
+- **Testing only the user channel.** Symptom: a clean jailbreak score and an agent obeying instructions
+  hidden in a retrieved web page. Fix: indirect-injection cells.
+- **Hardening to zero with no benign-edgy set.** Symptom: support tickets about refusals on ordinary
+  questions. Fix: an over-refusal ceiling.
+- **Attack cases leaking into prompts or fine-tuning data.** Symptom: zero ASR on the suite and
+  unchanged success for any fresh phrasing. Fix: held-out templates.
+- **Running each attack once and reading 0% as safe.** Symptom: a production attacker succeeds on the
+  third retry of a payload the suite marked blocked. Fix: *k* samples, any-of-*k* gating.
+- **Treating ASR as static.** Symptom: a model update silently raises a cell from 0% to 40% because the
+  suite only ran at launch. Fix: run on every change and on a schedule.
 
 ## When to use
-Reach for adversarial evaluation as soon as the system can take an action, read untrusted content, or
-answer in a regulated domain; for a pure summariser over trusted documents a small perturbation suite
-may be enough. Build the threat model first, then the cells, then the gates: zero on known attacks for
-critical goals, thresholds elsewhere, over-refusal ceiling alongside. Run the fixed suite on every
-prompt or model change and adaptive discovery on a schedule. Measure ASR per cell and worst case per
-goal, robustness gap, over-refusal, and the judge's own precision on attack outcomes. In interviews,
-the expected depth is to distinguish red teaming from adversarial evaluation, explain canary grading,
-and argue for worst-case reporting and the over-refusal counterweight.
+- **Use when:** the system can take an action, read untrusted content, or answer in a regulated domain.
+- **Lighter option:** for a pure summariser over trusted documents a small perturbation suite may be enough.
+- **Order of work:** threat model, then cells, then gates: zero on known attacks for critical goals,
+  thresholds elsewhere, an over-refusal ceiling alongside.
+- **Cadence:** fixed suite on every prompt or model change, adaptive discovery on a schedule.
+- **Measure:** ASR per cell and worst case per goal, robustness gap, over-refusal, and the judge's own
+  precision on attack outcomes.
+- **Interviews:** distinguish red teaming from adversarial evaluation, explain canary grading, and argue
+  for worst-case reporting and the over-refusal counterweight.
 
 ## Role lens
 - **Engineer:** Builds the attack generators, canary graders and the ASR table, wires the known-attack
@@ -219,6 +304,38 @@ Third, the grader: how was success judged, and what is the judge's recall on hum
 outcomes, since partial compliance and encoded outputs fool judges. Fourth, the counterweight: what is
 the over-refusal rate on benign-but-edgy support questions. Finally, the cadence: when did the suite
 last run, and does it run on every prompt and model change with a held-out slice.
+
+## Interview questions
+### How does adversarial evaluation differ from red teaming?
+- **Red teaming discovers:** humans or attacker models search for inputs that make the system fail.
+- **Adversarial evaluation measures:** those findings become a versioned suite with ASR per channel and
+  goal, re-run every release.
+- **Why both:** discovery without a suite is forgotten, and a suite without discovery overfits.
+
+### Design an eval for prompt injection in an agent that reads emails and can send them.
+- **Cells:** indirect channel (email body, attachments) crossed with goals (exfiltrate, send on the user's
+  behalf, leak the system prompt).
+- **Grading:** canary tool calls such as a `send_email` to an attacker address, matched in the trace, no
+  judge needed.
+- **Gate:** zero successes on known attacks with enough trials per cell, plus an over-refusal ceiling on
+  ordinary email tasks.
+
+### Your suite shows 0 successes in 20 trials for data exfiltration. Is that good enough?
+- **No, not for a critical cell:** the 95% upper bound with zero successes is about 14% at 20 trials.
+- **To claim under 1%** you need roughly 300 clean trials (rule of three: 3/n).
+- **Also check retries:** gate on whether any of *k* samples succeeded, since attackers retry.
+
+### Hardening cut ASR sharply but support complaints rose. What happened and what do you do?
+- **Likely over-refusal:** the cheapest route to low ASR is refusing anything that looks risky.
+- **Measure it:** a benign-but-edgy set (XSTest style) from your domain, reported beside ASR.
+- **Rebalance:** target the cells that were actually broken instead of broad refusals, and gate both
+  numbers together.
+
+### Why can you not trust a judge-graded ASR number by default?
+- **Adversarial outputs fool judges:** partial compliance, refusals that leak the answer, base64 content.
+- **Fix:** prefer canaries where the goal allows, and calibrate the judge's precision and recall on
+  hand-labelled attack outcomes.
+- **Otherwise** ASR measures the judge, not the system.
 
 ## Quiz
 ### Q: Why report the maximum attack success rate across techniques for a goal rather than the mean?

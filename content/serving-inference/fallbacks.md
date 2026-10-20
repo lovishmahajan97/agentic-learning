@@ -5,7 +5,7 @@ name: Fallbacks
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - system-design/model-fallback-strategies
   - reliability/circuit-breakers
@@ -22,97 +22,125 @@ sources:
 ---
 
 ## TL;DR
-A fallback is a pre-decided alternative path taken when the primary one fails or is too slow: the same
-model on another endpoint or region, a smaller model, a cached or templated answer, or an honest
-"unavailable". It exists because LLM dependencies fail partially and often, and retrying a broken target
-only burns the latency budget. The hard parts are deciding fast, keeping the alternative behaviourally
-compatible, and not letting everyone's fallback crush the backup.
+A fallback is a pre-decided alternative path when the primary fails or is too slow: another endpoint, a
+smaller model, a cached answer, or an honest "unavailable". The hard parts are deciding fast, staying
+compatible, and not crushing the backup.
 
 ## Why it exists
-Hosted models fail in ways a retry cannot fix: a provider returns 529 overloaded or 429 for minutes
-during a demand spike, a region has an incident, a deployment pushes elevated 5xx, a model is deprecated,
-a content filter refuses, latency triples under load. Self-hosted engines add their own: a GPU node dies,
-a rollout ships a bad build, a long-context burst preempts everything. A retry assumes the target will be
-healthy a second later; during an incident it is not, and three attempts against a 30-second timeout is a
-90-second path to the same error. The alternative to a fallback is showing the user an error, which is
-sometimes right (a medical triage assistant should fail closed) but for most product surfaces a slightly
-worse answer beats none.
-
-The naive implementation, a `try/except` that calls model B, fails for reasons that only show up in
-production. Model B may not support your tool schema, JSON mode or context length, and you discover this
-when A is already down. Your evaluation suite never ran against B, so quality in fallback mode is
-unknown. When A fails for all your traffic at once, B's rate limit, which you never provisioned, is
-exceeded within seconds: the fallback storm. A timeout on A may have fired after A executed a side effect
-inside an agent loop, so B duplicates it. And if tokens were already streamed from A, you cannot switch
-mid-sentence. Fallbacks are a designed subsystem, not an exception handler.
+- **Hosted models fail in ways a retry cannot fix.** A provider returns 529 overloaded or 429 for minutes
+  during a demand spike, a region has an incident, a deployment pushes elevated 5xx, a model is
+  deprecated, a content filter refuses, latency triples under load.
+- **Self-hosted engines add their own.** A GPU node dies, a rollout ships a bad build, a long-context
+  burst preempts everything.
+- **Retries assume health a second later.** During an incident there is none: three attempts against a
+  30-second timeout is a 90-second path to the same error.
+- **The alternative is an error.** Sometimes right (a medical triage assistant should fail closed), but
+  for most product surfaces a slightly worse answer beats none.
+- **A naive `try/except` that calls model B fails in production.** B may lack your tool schema, JSON mode
+  or context length; your evals never ran on B; B's unprovisioned rate limit is exceeded in seconds (the
+  fallback storm); a timeout may fire after A ran a side effect; and streamed tokens cannot switch
+  mid-sentence. Fallbacks are a designed subsystem, not an exception handler.
 
 ## How it works
 ### The ladder
-Order alternatives by behavioural distance from the primary, not by cost. A typical ladder: the same
-model on a different endpoint or region (the major models are available through more than one cloud,
-which keeps prompts and evals valid); a sibling model from the same family one size down; a different
-vendor's model with a translated request; a non-generative degraded answer (cached response, retrieval
-results without synthesis, a template); and finally an explicit error with a retry affordance. Each rung
-costs quality, so the ladder is built to exhaust the cheapest-in-quality options first.
+Order alternatives by **behavioural distance from the primary, not by cost**. Each rung costs quality, so
+exhaust the cheapest-in-quality options first:
+
+1. **Same model, different endpoint or region.** The major models are available through more than one
+   cloud, which keeps prompts and evals valid.
+2. **Sibling model** from the same family, one size down.
+3. **Different vendor's model** with a translated request.
+4. **Non-generative degraded answer:** cached response, retrieval results without synthesis, a template.
+5. **Explicit error** with a retry affordance.
 
 ### Trigger classification
-Only some failures justify a fallback. Transient capacity errors (429, 500, 502, 503, 504, 529 (Anthropic's
-overloaded status), connection failures, timeouts before the first token) justify one retry on the same target and then a
-fallback. Request-specific errors (400 for a malformed body, a context-length overflow, an unsupported
-parameter) will fail identically on any equivalent target; the one exception is a context overflow,
-which may legitimately route to a model with a larger window. Authentication and billing errors are
-configuration faults and should page a human rather than fail over. Latency is also a trigger: if time
-to first token exceeds a budget, cancel and try the next rung, because the user cannot tell the
-difference between slow and down. A softer variant is a *hedge*: once the primary has been silent past
-roughly its p95 time to first token, start the fallback in parallel, keep whichever produces a first
-token first and cancel the other. Because only the slowest few percent of calls spawn a hedge, the extra
-load is small, but each hedge is billed on both targets until the loser is cancelled.
+Only some failures justify a fallback:
+
+| Failure | Examples | Action |
+|---|---|---|
+| Transient capacity | 429, 500, 502, 503, 504, 529 (Anthropic's overloaded status), connection failures, timeouts before the first token | one retry on the same target, then fall back |
+| Request-specific | 400 malformed body, context-length overflow, unsupported parameter | do not fail over: it fails identically on any equivalent target |
+| Context overflow (exception) | prompt too long for this window | may legitimately route to a model with a larger window |
+| Auth and billing | invalid key, exhausted credit | configuration fault: page a human, do not fail over |
+| Latency | time to first token over budget | cancel and try the next rung |
+
+- **Latency is a trigger** because the user cannot tell the difference between slow and down.
+- **Hedging is a softer variant.** Once the primary has been silent past roughly its p95 time to first
+  token, start the fallback in parallel, keep whichever produces a first token first and cancel the other.
+- **Hedge cost.** Only the slowest few percent of calls spawn a hedge, so the extra load is small, but each
+  hedge is billed on both targets until the loser is cancelled.
 
 ### Circuit breaker per target
-Without a breaker, every request during an outage pays the primary's full timeout before falling back,
-so latency doubles at exactly the moment the system is under stress. A breaker tracks the failure *rate*
-over a sliding window of recent calls per target, opens when that rate crosses a threshold (with a
-minimum call count, so three failures out of three at 2 a.m. do not trip it), routes straight to the
-fallback while open, and after a cooldown moves to *half-open*, letting a single probe through whose
-result decides whether to close or reopen. It converts "try and wait" into "skip, because we already
-know".
+Without a breaker, every request during an outage pays the primary's full timeout before falling back, so
+latency doubles exactly when the system is under stress. The breaker converts "try and wait" into "skip,
+because we already know":
 
-How much a breaker buys depends on how failures arrive. A slow failure (a 30-second timeout, a stalled
-stream) is what makes "try the primary first" expensive, so breakers pay off most there. A fast failure
-(a 529 or 503 returned in tens of milliseconds) costs almost nothing to attempt, so for a *partial*
-outage it is often better to leave the breaker closed and let each request try the primary once, keeping
-the healthy fraction of capacity in use. Count-of-consecutive-failures breakers, the common naive
-version, behave badly here: at a 20% independent error rate five failures in a row happen only once every few
-thousand calls, so the breaker almost never opens, while at a 60% rate it flaps.
+1. **Track the failure *rate*** over a sliding window of recent calls per target.
+2. **Open when the rate crosses a threshold,** with a minimum call count, so three failures out of three at
+   2 a.m. do not trip it.
+3. **While open,** route straight to the fallback.
+4. **After a cooldown, go *half-open*:** let a single probe through; its result decides close or reopen.
+
+How much a breaker buys depends on how failures arrive:
+- **Slow failures** (a 30-second timeout, a stalled stream) make "try the primary first" expensive, so
+  breakers pay off most there.
+- **Fast failures** (a 529 or 503 in tens of milliseconds) cost almost nothing to attempt. For a *partial*
+  outage it is often better to leave the breaker closed and let each request try the primary once,
+  keeping the healthy fraction of capacity in use.
+- **Consecutive-failure counters behave badly.** At a 20% independent error rate, five failures in a row
+  happen only once every few thousand calls, so the breaker almost never opens; at a 60% rate it flaps.
 
 ### Compatibility layer
-The fallback must receive an equivalent request. That means normalising message formats, translating
-tool schemas, mapping parameter names and ranges, re-checking that the prompt fits the target's context
-window using the target's tokenizer, and knowing whether structured output is supported. Gateways
-(self-built, or products such as LiteLLM, OpenRouter or Portkey) exist largely to own this translation.
-Prompts should be evaluated on every rung; where a model needs a variant prompt, version it alongside the
-primary's.
+The fallback must receive an equivalent request:
+- **Normalise** message formats, translate tool schemas, map parameter names and ranges.
+- **Re-check the context window** using the target's tokenizer.
+- **Know** whether structured output is supported.
+- **Gateways own this translation:** self-built, or products such as LiteLLM, OpenRouter or Portkey.
+- **Evaluate prompts on every rung;** where a model needs a variant prompt, version it alongside the
+  primary's.
 
 ### One deadline for the whole chain
-Give the request a single deadline, for example 20 seconds, and hand each rung the remainder rather than
-its own timeout. Otherwise chained timeouts add up to a wait no user will tolerate.
+- **Give the request a single deadline,** for example 20 seconds, and hand each rung the remainder rather
+  than its own timeout.
+- **Otherwise chained timeouts add up** to a wait no user will tolerate.
 
 ### Keeping the backup real
-Provision quota on the fallback deliberately and route a trickle of live traffic (a few percent) to it,
-so its credentials, quota, prompts and evals are continuously verified. An unexercised fallback is an
-untested one.
+- **Provision quota on the fallback deliberately.**
+- **Route a trickle of live traffic** (a few percent) to it, so credentials, quota, prompts and evals are
+  continuously verified. An unexercised fallback is an untested one.
 
 ### Observability and streaming
-Tag every response with the target that served it and the reason for any fallback; alert when the
-fallback rate rises, because quality regressions in fallback mode are invisible otherwise. For streaming,
-decide before the first byte: a failure after tokens have been emitted either restarts the response
-under a new message id (so the client can discard the partial one) or surfaces an error with a retry
-button.
+- **Tag every response** with the target that served it and the reason for any fallback.
+- **Alert when the fallback rate rises,** because quality regressions in fallback mode are invisible
+  otherwise.
+- **Streaming: decide before the first byte.** A failure after tokens were emitted either restarts the
+  response under a new message id (so the client can discard the partial one) or surfaces an error with a
+  retry button.
 
-## Example
-The chain below tries each target in order, skips any whose breaker is open, gives each the remaining
-share of one deadline, refuses to fail over on request-specific errors, and labels the response with what
-served it. Per-target retries live inside `call`, where the SDK already does them.
+## Diagram
+Trace one request down the ladder: each rung is skipped if its breaker is open, request-specific errors
+stop the chain, and every rung shares the same remaining deadline.
+
+```mermaid
+flowchart TD
+    R["Request with one deadline"] --> B1{"Primary breaker closed?"}
+    B1 -->|"yes"| P["Call primary"]
+    B1 -->|"open"| B2{"Second endpoint breaker closed?"}
+    P -->|"ok"| OK["Return, tag served_by"]
+    P -->|"400, auth, policy"| ERR["Raise, no failover"]
+    P -->|"429, 5xx, 529, timeout"| B2
+    B2 -->|"yes"| S["Same model, other region"]
+    S -->|"ok"| OK
+    S -->|"transient or open"| SM["Smaller evaluated model"]
+    SM -->|"ok"| OK
+    SM -->|"fails or deadline spent"| DG["Degraded answer or honest error"]
+```
+
+## Examples
+### Fallback chain with a rate-based breaker
+The chain tries each target in order, skips any whose breaker is open, gives each the remaining share of
+one deadline, refuses to fail over on request-specific errors, and labels the response with what served
+it. Per-target retries live inside `call`, where the SDK already does them.
 
 ```python
 import time
@@ -159,50 +187,81 @@ def generate(req, deadline_s=20.0):
     return degraded_response(req, last_err)            # cached/template answer, or an explicit error
 ```
 
-Trace it through an incident. With a 50% threshold over 20 calls, a primary returning 529s on 20% of
-requests stays closed: each failing request pays one fast 529 and moves to the second endpoint, and the
-80% that succeed keep using the primary. If the primary starts timing out on most calls, the window
-crosses 50% after at least ten calls, the breaker opens, and for the next 30 seconds every request goes
-straight to the second endpoint without paying a 10-second timeout; one probe then tests recovery. The
-numbers are starting points to tune against your own error and latency distributions.
+### Worked incident trace
+With a 50% threshold over 20 calls (numbers are starting points to tune against your own error and
+latency distributions):
+
+| Incident | Breaker | What each request pays |
+|---|---|---|
+| Primary returns 529 on 20% of requests | stays closed | failing requests pay one fast 529 and move to the second endpoint; the 80% that succeed keep using the primary |
+| Primary times out on most calls | window crosses 50% after at least ten calls, opens | for the next 30 seconds, requests go straight to the second endpoint without paying a 10-second timeout |
+| Cooldown ends | half-open | one probe tests recovery and decides close or reopen |
+
+### Why consecutive-failure breakers misbehave
+Pure Python, runs as is: the chance that five calls in a row fail at independent error rate p is p⁵.
+
+```python
+for p in (0.2, 0.6):
+    run5 = p ** 5
+    print(f"error rate {p:.0%}: P(5 in a row) = {run5:.4f}, about 1 in {round(1 / run5):,} windows")
+# error rate 20%: P(5 in a row) = 0.0003, about 1 in 3,125 windows  -> almost never opens
+# error rate 60%: P(5 in a row) = 0.0778, about 1 in 13 windows     -> opens and closes repeatedly
+```
+
+## Production patterns
+- **Same model in a second region first.** When a provider or cloud offers the model in several regions
+  or platforms, make that rung one, because prompts and evals carry over. Monitor per-target error rate
+  and latency per rung.
+- **Gateway-owned fallback chains.** Put the ladder, request adaptation and served-by tagging in one AI
+  gateway (self-built, or LiteLLM, OpenRouter or Portkey) instead of in each service. Monitor fallback
+  rate per route and alert when it rises.
+- **Warm backups with a live trickle.** Send a few percent of real traffic to each fallback all the time
+  and reserve quota sized for the share that would move. Monitor the backup's own 429 rate during
+  primary incidents to catch a fallback storm early.
+- **Hedge at p95 time to first token.** For latency-sensitive chat, start the next rung in parallel once
+  the primary is silent past its p95, then cancel the loser. Monitor hedge rate and double-billed tokens.
+- **Quality by served-by tag.** Run the eval suite against every rung and break production quality
+  metrics (JSON parse errors, refusal rate, thumbs-down) down by serving target, because silent model
+  swaps hide there.
 
 ## Trade-offs
-- Availability rises, but quality in fallback mode is lower and, unless you evaluate every rung, unknown;
-  when the fallback cannot meet the product's accuracy bar, failing closed is the better design.
-- Breakers cut incident latency sharply but can trip on a noisy error burst and divert healthy traffic;
-  a low threshold and short window react fast but flap, a high threshold and minimum call count are
-  stable but leave users paying timeouts for longer, and the right point moves toward "react fast" the
-  slower the target's failures are.
-- A second vendor removes correlated outage risk but doubles compliance scope (data residency, DPAs),
-  prompt maintenance and eval cost; a second region of the same provider is cheaper when the risk you
-  fear is regional rather than vendor-wide.
-- Degraded non-LLM answers keep the interface alive, but presenting a cached or templated response as
-  fresh can be worse than an honest error for time-sensitive questions.
+- **Availability vs known quality.** Availability rises, but fallback quality is lower and, unless you
+  evaluate every rung, unknown. When the fallback cannot meet the product's accuracy bar, failing closed
+  is the better design.
+- **Fast breakers vs stable breakers.** Breakers cut incident latency sharply but can trip on a noisy
+  error burst and divert healthy traffic. A low threshold and short window react fast but flap; a high
+  threshold and minimum call count are stable but leave users paying timeouts longer. The slower the
+  target's failures, the more "react fast" wins.
+- **Second vendor vs second region.** A second vendor removes correlated outage risk but doubles
+  compliance scope (data residency, DPAs), prompt maintenance and eval cost. A second region of the same
+  provider is cheaper when the risk you fear is regional rather than vendor-wide.
+- **Degraded answers vs honesty.** Non-LLM answers keep the interface alive, but presenting a cached or
+  templated response as fresh can be worse than an honest error for time-sensitive questions.
 
 ## Pitfalls
-- A fallback that has never served traffic; the symptom is fallback rate and error rate spiking together
-  during the first real incident, because the key expired, the quota was zero or the schema never matched.
-- Failing over on non-transient errors; the symptom is every request costing two or three calls and still
-  failing, with identical 400s from each target in the trace.
-- Independent timeouts per rung instead of one shared deadline; the symptom is p99 latency during
-  incidents equal to the sum of all the timeouts.
-- A fallback storm; the symptom is the secondary provider returning 429 within seconds of the primary's
-  incident, because the whole fleet moved at once onto unprovisioned quota.
-- Silent model swaps; the symptom is JSON parse errors or refusal-rate changes that correlate with the
-  fallback rate, because output formatting quirks differ between models and the downstream parser was
-  tuned to one.
-- Falling back after a side effect; the symptom is duplicate tickets or emails whenever the primary times
-  out mid-tool-call, which is an idempotency problem the fallback exposes.
+- **A fallback that has never served traffic.** Symptom: fallback rate and error rate spike together in
+  the first real incident, because the key expired, the quota was zero or the schema never matched.
+- **Failing over on non-transient errors.** Symptom: every request costs two or three calls and still
+  fails, with identical 400s from each target in the trace.
+- **Independent timeouts per rung.** Symptom: p99 latency during incidents equals the sum of all the
+  timeouts. Use one shared deadline.
+- **A fallback storm.** Symptom: the secondary returns 429 within seconds of the primary's incident,
+  because the whole fleet moved at once onto unprovisioned quota.
+- **Silent model swaps.** Symptom: JSON parse errors or refusal-rate changes that correlate with fallback
+  rate, because output formatting quirks differ between models and the parser was tuned to one.
+- **Falling back after a side effect.** Symptom: duplicate tickets or emails whenever the primary times
+  out mid-tool-call, an idempotency problem the fallback exposes.
 
 ## When to use
-Add a fallback wherever an LLM call sits on a user-facing path with an availability target the single
-provider cannot meet alone, and wherever a cheaper degraded answer is genuinely acceptable. Do not add one
-where a worse answer is worse than no answer, or where the "fallback" would silently change compliance
-posture. Start with the same model on a second endpoint, because that preserves prompts and evals; add a
-smaller model only after evaluating it; add a non-LLM degraded response as the last rung. Measure fallback
-rate, per-target error rate, latency per rung and quality by served-by tag. In interviews, the expected
-depth is: classify the trigger, break the circuit, share one deadline, keep the fallback compatible and
-warm, and explain why streaming and side effects make "just try B" unsafe.
+- **Use when** an LLM call sits on a user-facing path with an availability target one provider cannot
+  meet alone, and wherever a cheaper degraded answer is genuinely acceptable.
+- **Avoid when** a worse answer is worse than no answer, or when the "fallback" would silently change
+  compliance posture.
+- **Build order:** same model on a second endpoint first (preserves prompts and evals), a smaller model
+  only after evaluating it, a non-LLM degraded response as the last rung.
+- **Measure** fallback rate, per-target error rate, latency per rung and quality by served-by tag.
+- **Interviews:** classify the trigger, break the circuit, share one deadline, keep the fallback
+  compatible and warm, and explain why streaming and side effects make "just try B" unsafe.
 
 ## Role lens
 - **Engineer:** Builds the target ladder, breaker state and request adapters, writes evals that run
@@ -231,6 +290,35 @@ before streaming starts; a mid-stream failure shows the partial answer with a re
 silently restarting. Tag every reply with served-by and watch quality metrics in fallback mode. Avoid:
 failing over on 400s, letting the entire fleet shift onto a backup with no pre-provisioned quota, and
 failing over tool-executing turns without idempotency keys, which would duplicate ticket creation.
+
+## Interview questions
+### What is the difference between a retry and a fallback, and why do you need both?
+- **A retry repeats the same call** on the same target, betting the fault clears in a second; a fallback
+  switches to a different, pre-decided path.
+- **During an incident retries only burn the deadline,** because the target stays unhealthy; the fallback
+  is what actually returns an answer. One quick retry on transient errors, then fall back.
+
+### During an outage, p99 latency equals the sum of every timeout in your chain. What went wrong?
+- **Each rung has its own timeout** instead of sharing one deadline, so a request waits out each one in turn.
+- **No breaker is open,** so every request still pays the primary's full timeout first.
+- **Fix:** one deadline per request with each rung given the remainder, plus a rate-based breaker per target.
+
+### When would you deliberately not add a fallback?
+- **When a worse answer is worse than none,** such as medical triage, where failing closed is correct.
+- **When the backup changes compliance posture,** for example moving data to a vendor or region the
+  customer has not approved.
+- **When the fallback has not been evaluated** against the product's accuracy bar.
+
+### How do you size and verify quota on a backup provider?
+- **Size for the share that will move:** if the primary fails on about 20% of requests, the backup needs
+  quota for about a fifth of peak; for a full outage, all of it.
+- **Verify continuously** by routing a few percent of live traffic to it, and watch its 429 rate during
+  primary incidents, because an untested backup fails in the first real outage.
+
+### Why can you not just switch models when a stream fails halfway?
+- **Tokens are already on the user's screen,** and a different model will not continue the same sentence.
+- **Decide before the first byte;** after that, restart under a new message id so the client discards the
+  partial answer, or surface an error with a retry button.
 
 ## Quiz
 ### Q: Why put a circuit breaker in front of the primary model instead of simply catching its errors and calling the fallback?

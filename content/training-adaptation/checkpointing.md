@@ -121,6 +121,27 @@ T_opt ≈ sqrt(2 · C · M)
 - **Adapters need their base.** The checkpoint is the adapter weights plus an exact reference (name and
   hash) to the base model they were trained on; without it the adapter is unusable.
 
+## Diagram
+One save and one resume: the GPU stalls only for the snapshot, the manifest is written last so a
+half-written checkpoint is never trusted, and resume restores every piece of state, not just weights.
+
+```mermaid
+sequenceDiagram
+    participant T as Training job
+    participant H as Host memory
+    participant S as Durable storage
+    T->>H: Snapshot weights, optimizer, scheduler, RNG, data position
+    Note over T: GPU stall is only this copy
+    T->>T: Continue training
+    H->>S: Write shards to temp paths in the background
+    H->>S: Write manifest with hashes, then update latest pointer
+    S->>S: Retention keeps last k, best on validation, periodic
+    Note over T: Preemption or hardware fault
+    T->>S: Read latest pointer, verify manifest hashes
+    S-->>T: Full training state
+    T->>T: Restore RNG, reseed sampler, skip consumed batches, resume
+```
+
 ## Examples
 ### Save and load the full state in PyTorch
 A compact pair for a single-process loop: full state, atomic rename, keep-last-*k* retention, and RNG
@@ -272,6 +293,42 @@ its first save. Young–Daly gives sqrt(2 × 180 s × 14,400 s) ≈ 2,280 s, abo
 total overhead; moving to an asynchronous snapshot with a stall of ten seconds or so brings the interval
 under ten minutes and the overhead to a few percent. Finally, test the design by killing the job on
 purpose and checking that the resumed loss curve overlays the uninterrupted one.
+
+## Interview questions
+### What must a resumable training checkpoint contain, and why is a weights file not enough?
+- **Everything that influences the next step:** model weights (plus fp32 master weights under mixed
+  precision), optimizer moments, scheduler state and step counter, loss-scaler state, RNG states and
+  data-loader position, plus config and tokenizer.
+- **Why weights alone fail:** fresh Adam moments make the first steps badly scaled, the scheduler
+  restarts warmup, and the sampler loses the epoch's order, so the run never rejoins its original curve.
+
+### How big is the checkpoint for a 7B full fine-tune, and how often would you save it?
+- **Size:** about 14 bytes per parameter in mixed precision (2 for bf16 weights plus 12 for the fp32
+  master copy and two moments), so roughly 100 GB.
+- **Interval:** Young–Daly, `T_opt ≈ sqrt(2 · C · M)`. A 100 s synchronous save with a failure every three
+  hours gives about 25 minutes and roughly 14% overhead.
+- **Better lever:** an asynchronous snapshot with a 5 s stall cuts the interval to about 5.5 minutes and
+  overhead to near 3%.
+
+### A crash during a save left your latest checkpoint truncated. How do you design so this cannot happen?
+- **Local or network filesystem:** write to a temp path, flush, then atomically rename, so the final name
+  only ever points at a complete file.
+- **Object stores have no atomic directory rename:** upload every shard, then write a manifest with hashes,
+  then update a "latest" pointer. Resume trusts only checkpoints with a valid manifest.
+- **Monitor** for orphaned shard directories and failed background writes.
+
+### When would you not keep sharded checkpoints as your only artefact?
+- **When anything other than the same training job must read them.** Sharded ZeRO or FSDP state is tied
+  to a world size and sharding scheme, and resuming on a different GPU count needs a resharding step.
+- **So keep two artefacts:** the full sharded state for resume and a consolidated weights-only
+  `safetensors` export for evaluation, serving and the model registry.
+
+### Why should you avoid loading `.pt` checkpoints from an untrusted source?
+- **They are pickles:** a pickle can execute arbitrary code on load.
+- **That is why** `torch.load` defaults to `weights_only=True` since PyTorch 2.6, and why weights from
+  untrusted sources should be exported and loaded as `safetensors`.
+- **Only your own trusted training state** should be loaded with `weights_only=False`, as in the resume
+  example.
 
 ## Quiz
 ### Q: Why does resuming from a weights-only checkpoint typically produce a loss spike?

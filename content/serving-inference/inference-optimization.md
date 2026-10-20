@@ -5,7 +5,7 @@ name: Inference optimization
 kind: concept
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - serving-inference/prefill-vs-decode
   - serving-inference/continuous-batching
@@ -22,30 +22,26 @@ sources:
 ---
 
 ## TL;DR
-Inference optimization is the set of levers that make a fixed model cheaper or faster to run. Almost all
-of them work by attacking one of two bottlenecks: decode is bound by memory bandwidth (every token
-re-reads the weights and the KV cache), prefill is bound by compute. Knowing which bound you are hitting
-tells you which lever can possibly help, which is why the roofline model, not a list of tricks, is the
-thing to learn.
+Inference optimization is the set of levers that make a fixed model cheaper or faster. Nearly all attack
+one of two bounds: decode is memory-bandwidth bound, prefill is compute bound. Learn the roofline that
+tells them apart, not a list of tricks.
 
 ## Why it exists
-A GPU has a fixed ratio of arithmetic throughput to memory bandwidth. An H100 can do on the order of a
-thousand teraFLOPs of dense fp16 math but move only a few terabytes per second from HBM, so it needs
-roughly a few hundred floating-point operations per byte loaded to keep its arithmetic units busy. Each
-transformer matmul applied to a batch of *B* tokens performs about 2·B FLOPs per weight element while
-reading that element once, so its arithmetic intensity is about *B* FLOPs per byte. A single-request
-decode step has *B* = 1. The GPU spends essentially all of its time streaming weights and cache through
-memory and almost none computing. That is a tensor-core utilization well under one percent (an 8B model
-at batch 1 does ~16 GFLOPs in a ~5 ms step, a few TFLOP/s against a peak near a thousand), and it is the
-default state of a naive LLM server.
-
-The naive response, "buy a bigger GPU", fails because a GPU with more FLOPs and similar bandwidth makes
-decode no faster. The second naive response, "run more requests at once", is actually correct, but it
-runs into memory: each concurrent request pins a KV cache, and the pool fills long before the batch is
-large enough to be compute-bound. Every optimization technique is a way around one of those two walls:
-move fewer bytes per token, do less work per request, or fit more requests into the same bytes. The
-discipline is matching the lever to the wall you are actually hitting, which is why measurement precedes
-tuning.
+- **GPUs have a fixed compute-to-bandwidth ratio.** An H100 does on the order of a thousand teraFLOPs of
+  dense fp16 math but moves only a few terabytes per second from HBM. It needs roughly a few hundred
+  FLOPs per byte loaded to keep its arithmetic busy.
+- **Decode at batch 1 is nowhere near that.** A matmul over *B* tokens does about 2·B FLOPs per weight
+  element while reading it once, so intensity is about *B* FLOPs per byte, and single-request decode has
+  *B* = 1.
+- **So the tensor cores idle.** An 8B model at batch 1 does ~16 GFLOPs in a ~5 ms step: a few TFLOP/s
+  against a peak near a thousand, a utilization well under one percent. That is the default state of a
+  naive LLM server.
+- **"Buy a bigger GPU" fails.** More FLOPs with similar bandwidth makes decode no faster.
+- **"Run more requests at once" is correct but hits memory.** Each concurrent request pins a KV cache, and
+  the pool fills long before the batch is large enough to be compute-bound.
+- **Every technique gets around one of those two walls:** move fewer bytes per token, do less work per
+  request, or fit more requests into the same bytes. Matching lever to wall is the discipline, which is
+  why measurement precedes tuning.
 
 ## How it works
 ### Start from the roofline
@@ -56,74 +52,104 @@ batch:
 time_per_step ≈ max( (W + C) / bandwidth ,  2·B·params / FLOPs )
 ```
 
-The left term is the bandwidth floor and dominates until *B* reaches the GPU's ridge point (a few hundred
-tokens per step on current hardware). Prefill processes the whole prompt as one batch of *B* = prompt
-length tokens, so it sits on the right-hand, compute-bound side. Each lever below shrinks one term.
+- **Left term, the bandwidth floor,** dominates until *B* reaches the GPU's ridge point (a few hundred
+  tokens per step on current hardware).
+- **Prefill** processes the whole prompt as one batch of *B* = prompt length tokens, so it sits on the
+  right-hand, compute-bound side.
+- **Each lever below shrinks one term.**
 
 ### Levers that move fewer bytes (help decode)
-- **Weight quantization** (int8, fp8, 4-bit formats such as AWQ or GPTQ): halves or quarters *W*, so the
-  batch-1 bandwidth floor drops proportionally. It also frees VRAM for more cache. Quality must be
-  evaluated per model and task, because the loss is not uniform.
-- **KV-cache quantization** (fp8 or int8 cache): shrinks *C*, which matters once the batch is large enough
-  that cache reads rival weight reads. Long-context, high-concurrency workloads benefit most.
-- **Architecture choices**: grouped-query attention and multi-head latent attention cut cache bytes per
-  token by sharing or compressing K/V. You pick these by picking the model, not by tuning.
+| Lever | What it shrinks | Note |
+|---|---|---|
+| **Weight quantization** (int8, fp8, 4-bit formats such as AWQ or GPTQ) | Halves or quarters *W*, so the batch-1 floor drops proportionally; frees VRAM for cache | Evaluate per model and task, because the loss is not uniform |
+| **KV-cache quantization** (fp8 or int8 cache) | Shrinks *C* | Matters once cache reads rival weight reads; long-context, high-concurrency workloads benefit most |
+| **Architecture choices** (grouped-query attention, multi-head latent attention) | Cache bytes per token, by sharing or compressing K/V | You pick these by picking the model, not by tuning |
 
 ### Levers that do less work per request
-- **Prefix caching**: skip prefill for a prompt prefix already in cache. Cuts TTFT and compute for shared
+- **Prefix caching.** Skip prefill for a prompt prefix already in cache. Cuts TTFT and compute for shared
   system prompts, few-shot blocks and multi-turn chat.
-- **Prompt and output discipline**: shorter prompts cut prefill compute linearly; a sensible `max_tokens`
+- **Prompt and output discipline.** Shorter prompts cut prefill compute linearly; a sensible `max_tokens`
   and stop sequences stop decode from generating tokens nobody uses.
-- **Speculative decoding**: a small draft model (or a lightweight head) proposes several tokens; the large
-  model verifies them in one forward pass. Verification of *k* tokens costs barely more than one decode
-  step because that step was bandwidth-bound anyway, so accepted drafts come almost free. If each drafted
-  token is accepted with probability *α* and *k* are drafted, the expected tokens produced per target
-  pass is (1 − α^(k+1)) / (1 − α): with α = 0.8 and k = 4 that is about 3.4 tokens per pass instead of 1,
-  minus the draft's own cost. The output distribution is unchanged, because rejection sampling corrects
-  every draft to the target model's distribution. It helps when the batch is small and the draft is
-  accurate (acceptance falls on creative or unusual text); at large batch the GPU is already busy and
-  it can hurt.
-- **Constrained decoding**: masking logits with a grammar or JSON schema removes retries for invalid
-  output, an optimization at the request level rather than the kernel level. Computing the mask is CPU
-  work per step, so a slow grammar engine can itself become the bottleneck at high batch.
+- **Constrained decoding.** Masking logits with a grammar or JSON schema removes retries for invalid
+  output, a request-level optimization. Computing the mask is CPU work per step, so a slow grammar engine
+  can itself bottleneck at high batch.
+
+### Speculative decoding
+1. **Draft.** A small draft model (or a lightweight head) proposes *k* tokens.
+2. **Verify.** The large model checks all of them in one forward pass. That costs barely more than one
+   decode step, because the step was bandwidth-bound anyway, so accepted drafts come almost free.
+3. **Correct.** Rejection sampling corrects every draft to the target model's distribution, so the
+   output distribution is unchanged.
+
+```
+expected tokens per target pass = (1 − α^(k+1)) / (1 − α)      # α = per-token acceptance
+α = 0.8, k = 4  ->  about 3.4 tokens per pass instead of 1, minus the draft's own cost
+```
+
+- **When it helps:** small batch and an accurate draft. Acceptance falls on creative or unusual text.
+- **When it hurts:** at large batch the GPU is already busy, so verification competes with real work.
 
 ### Levers that fit more work into the same bytes
-- **Continuous batching**: keep the running batch full by admitting and retiring requests every iteration.
+- **Continuous batching.** Admit and retire requests every iteration so the running batch stays full.
   Each weight read then serves many tokens, pushing *B* toward the ridge point.
-- **Paged KV cache**: eliminate fragmentation so the memory pool holds more sequences, which is what makes
-  large batches reachable.
-- **Chunked prefill**: split long prompts into chunks interleaved with decode steps so prefill's compute
+- **Paged KV cache.** Eliminates fragmentation so the pool holds more sequences, which is what makes large
+  batches reachable.
+- **Chunked prefill.** Split long prompts into chunks interleaved with decode steps, so prefill's compute
   and decode's bandwidth demand overlap rather than queue.
-- **Disaggregated prefill and decode**: run the phases on separate GPU pools and ship the KV cache
-  between them, so long prefills stop stalling decode batches and each pool is sized for its own bound.
-  It pays at large scale with mixed traffic; below that, chunked prefill gets most of the benefit.
-- **Tensor parallelism**: shard weights across GPUs so each reads a fraction of *W* per step; adds
-  all-reduce communication per layer, so it pays off when a model does not fit or when per-GPU bandwidth is
-  the limit.
+- **Disaggregated prefill and decode.** Run the phases on separate GPU pools and ship the KV cache between
+  them, so long prefills stop stalling decode and each pool is sized for its own bound. Pays at large
+  scale with mixed traffic; below that, chunked prefill gets most of the benefit.
+- **Tensor parallelism.** Shard weights so each GPU reads a fraction of *W* per step. It adds an
+  all-reduce per layer, so it pays when a model does not fit or per-GPU bandwidth is the limit.
 
 ### Levers at the kernel level
-- **Fused attention kernels** (FlashAttention and its successors) avoid materializing the full attention
-  matrix, cutting memory traffic in prefill and enabling long contexts.
+- **Fused attention kernels** (FlashAttention and successors) avoid materializing the full attention
+  matrix, cutting prefill memory traffic and enabling long contexts.
 - **Fused elementwise ops and CUDA graphs** remove per-kernel launch overhead, which at batch 1 can be a
   surprisingly large fraction of a step.
 - **Compiled or engine-specific runtimes** (TensorRT-LLM style) specialize kernels to the model shape.
 
 ### Levers outside the engine
-Route easy requests to a smaller model, cache whole responses for repeated queries, distill a task-specific
-small model, or precompute embeddings. These often beat any engine knob because they cut the number of
-tokens that touch an expensive GPU in the first place.
+- **Route easy requests to a smaller model, cache whole responses, distill a task-specific small model, or
+  precompute embeddings.**
+- **These often beat any engine knob,** because they cut the number of tokens that touch an expensive GPU
+  in the first place.
 
 ### The order of operations
-Measure TTFT, TPOT, tokens/sec per GPU, batch size per step and KV-cache utilization. If batch size is
-small and the pool is far from full, you are latency-bound per request: quantize weights, add speculative
-decoding, trim prompts. If the pool is full, you are memory-bound: quantize cache, enable prefix caching,
-choose a GQA model, add GPUs. If prefill dominates and TTFT is the complaint, enable chunked prefill,
-prefix caching and shorter prompts. Changing a knob without knowing which regime you are in is how teams
-"optimize" into a slower system.
+1. **Measure** TTFT, TPOT, tokens/sec per GPU, batch size per step and KV-cache utilization.
+2. **Classify and pick:**
 
-## Example
-A tiny roofline calculator that reproduces the reasoning above. The hardware numbers are rounded, publicly
-quoted figures and are only meant to show the shape of the result, not to predict a benchmark.
+| Signal | Regime | Levers |
+|---|---|---|
+| Small batch, pool far from full | Latency-bound per request | Quantize weights, add speculative decoding, trim prompts |
+| Pool full | Memory-bound | Quantize cache, enable prefix caching, choose a GQA model, add GPUs |
+| Prefill dominates, TTFT is the complaint | Compute-bound prefill | Chunked prefill, prefix caching, shorter prompts |
+
+3. **Change one knob, re-measure.** Changing a knob without knowing the regime is how teams "optimize"
+   into a slower system.
+
+## Diagram
+Measure first, then let the regime pick the lever; each branch attacks a different term of the roofline.
+
+```mermaid
+flowchart TD
+    M["Measure TTFT, TPOT, batch, KV use"] --> Q{"Which number misses target?"}
+    Q -->|"TTFT, prefill heavy"| P["Compute-bound prefill"]
+    Q -->|"TPOT, small batch"| L["Bandwidth-bound decode"]
+    Q -->|"pool full, preemptions"| C["Memory-capacity bound"]
+    P --> P1["Chunked prefill, prefix cache, shorter prompts"]
+    L --> L1["Weight quant, speculative decoding, CUDA graphs"]
+    C --> C1["KV quant, GQA model, paging, more GPUs"]
+    P1 --> R["Re-run load test plus quality eval"]
+    L1 --> R
+    C1 --> R
+    R --> M
+```
+
+## Examples
+### A roofline calculator
+The hardware numbers are rounded, publicly quoted figures, meant to show the shape of the result, not to
+predict a benchmark.
 
 ```python
 def decode_step_ms(params_b, batch, ctx_tokens, kv_bytes_per_token,
@@ -149,46 +175,87 @@ print(f"4-bit batch=1: {ms4:.2f} ms/step  -> weight bytes were the floor, so ~3-
 # not fit beside 16 GB of weights on an 80 GB card; the memory-estimation lesson covers that.
 ```
 
-Read it as: at batch 1 the step time is almost entirely weight traffic, so quantizing weights is the lever;
-at batch 256 with 2k contexts the cache reads already exceed the weight reads, so cache size (GQA, cache
-quantization) is the lever, and the compute term only takes over at larger batches with short contexts. The same script with `ctx_tokens=32000` shows cache reads overtaking weight reads at modest
-batch sizes, which is when KV quantization and GQA start to pay.
+- **At batch 1** the step time is almost entirely weight traffic, so quantizing weights is the lever.
+- **At batch 256 with 2k contexts** cache reads already exceed weight reads, so cache size (GQA, cache
+  quantization) is the lever. The compute term only takes over at larger batches with short contexts.
+- **With `ctx_tokens=32000`** cache reads overtake weight reads at modest batch sizes (about batch 4 here),
+  which is when KV quantization and GQA start to pay.
+
+### What speculative decoding buys at different acceptance rates
+The formula from above, swept over α. Real speedup is lower, because the draft model costs time too.
+
+```python
+def tokens_per_pass(alpha, k):
+    return (1 - alpha ** (k + 1)) / (1 - alpha)
+
+for alpha in (0.5, 0.7, 0.8, 0.9):
+    print(alpha, [round(tokens_per_pass(alpha, k), 2) for k in (2, 4, 8)])
+# 0.5 -> [1.75, 1.94, 2.0]   drafting more than a few tokens is wasted
+# 0.8 -> [2.44, 3.36, 4.33]  the lesson's ~3.4 at k = 4
+# 0.9 -> [2.71, 4.1, 6.13]   predictable text (code, templates) rewards longer drafts
+```
+
+### Worked triage: three slow deployments
+| Deployment | Measured | Regime | First lever |
+|---|---|---|---|
+| Internal copilot, 70B on 2 GPUs | Batch 3, pool 30% used, slow streaming | Bandwidth-bound decode | fp8 or 4-bit weights with an eval, then speculative decoding |
+| Support chat at peak | Pool pinned near 100%, preemptions climbing | Memory-capacity bound | fp8 KV cache, prefix caching for the shared system prompt |
+| Contract review, 30k-token prompts | TTFT is the complaint, decode fine | Compute-bound prefill | Chunked prefill, prefix caching, trimming boilerplate from prompts |
+
+## Production patterns
+- **Load test with the production length mix.** Replay real prompt/output length distributions (for
+  example 6k in / 800 out, not 500 in / 100 out) at target concurrency with a serving benchmark such as
+  vLLM's, before and after each flag. Monitor TTFT p95, TPOT p95 and tokens/s per GPU together.
+- **One flag per change, with a quality gate.** Treat quantization (`--quantization` with an AWQ, GPTQ or
+  fp8 checkpoint in vLLM) and `--kv-cache-dtype fp8` as releases: run the task eval set, especially its
+  hard tail, and roll back on regression. Monitor eval score alongside latency.
+- **Chunked prefill for mixed traffic.** Enable it (`--enable-chunked-prefill` in vLLM, on by default in
+  recent versions) and tune `--max-num-batched-tokens` to bound how much prefill rides in each step.
+  Monitor TPOT p99 during long-prompt bursts.
+- **Speculative decoding only on low-batch routes.** Enable it for latency-sensitive, low-concurrency
+  deployments and keep it off on high-utilization batch pools. Monitor acceptance rate and throughput; turn
+  it off when acceptance drops or throughput falls.
+- **Cheap path first.** Route easy intents to a smaller model and cache whole responses for repeated
+  queries, gated by an eval proving the cheaper path meets the bar. Monitor share of traffic on the cheap
+  path and its quality score.
 
 ## Trade-offs
-- Weight quantization cuts bytes per step and VRAM but costs some accuracy; it flips against you when the
-  task is sensitive (math, code, long reasoning) and no evaluation has been run on it.
-- Speculative decoding lowers per-token latency at small batch by spending extra compute; at high
-  utilization the GPU has no spare compute and it can reduce throughput.
-- Larger batches raise throughput per GPU but lengthen every user's TPOT; the right point depends on
-  whether you sell tokens per dollar or seconds per answer.
-- Tensor parallelism spreads bandwidth across GPUs but adds inter-GPU communication every layer; it stops
-  helping once the model fits comfortably and the interconnect is slow.
-- Routing to a smaller model or caching responses can beat every engine knob, but only if you have an
-  evaluation that proves the cheaper path meets the quality bar.
+- **Weight quantization vs accuracy.** Cuts bytes per step and VRAM but costs some accuracy. Flips against
+  you when the task is sensitive (math, code, long reasoning) and no evaluation has been run on it.
+- **Speculative decoding vs throughput.** Lowers per-token latency at small batch by spending extra
+  compute. At high utilization the GPU has no spare compute and it can reduce throughput.
+- **Larger batches vs TPOT.** They raise throughput per GPU but lengthen every user's TPOT. The right point
+  depends on whether you sell tokens per dollar or seconds per answer.
+- **Tensor parallelism vs communication.** Spreads bandwidth across GPUs but adds inter-GPU communication
+  every layer. It stops helping once the model fits comfortably and the interconnect is slow.
+- **Smaller models and response caches vs proof.** They can beat every engine knob, but only if an
+  evaluation proves the cheaper path meets the quality bar.
 
 ## Pitfalls
-- Tuning for throughput on a batch benchmark and shipping to an interactive product; symptom is good
-  tokens/sec dashboards alongside user complaints about slow typing.
-- Enabling speculative decoding under heavy load; symptom is throughput dropping while per-request latency
-  barely improves, because verification steals compute from the batch.
-- Quantizing to 4-bit without a task-specific eval; symptom is a regression that only appears on the hard
+- **Tuning for batch throughput, shipping to an interactive product.** Symptom: good tokens/sec dashboards
+  alongside user complaints about slow typing.
+- **Speculative decoding under heavy load.** Symptom: throughput drops while per-request latency barely
+  improves, because verification steals compute from the batch.
+- **Quantizing to 4-bit without a task-specific eval.** Symptom: a regression that only appears on the hard
   tail of the evaluation set, weeks after deployment.
-- Chasing kernel-level gains while prompts carry thousands of tokens of boilerplate; symptom is prefill
-  dominating TTFT no matter what engine flags change.
-- Reading vendor peak FLOPS as a throughput promise; symptom is utilization in the single digits and a
+- **Chasing kernel gains while prompts carry thousands of tokens of boilerplate.** Symptom: prefill
+  dominates TTFT no matter what engine flags change.
+- **Reading vendor peak FLOPS as a throughput promise.** Symptom: utilization in the single digits and a
   purchase order for faster GPUs that do not help decode.
-- Load-testing with a prompt/output length mix that differs from production (say, 500 in / 100 out when
-  real traffic is 6k in / 800 out); symptom is a lever that won in the benchmark doing nothing, or harm,
-  in production, because the benchmark sat in a different regime.
+- **Load-testing with the wrong length mix** (say, 500 in / 100 out when real traffic is 6k in / 800 out).
+  Symptom: a lever that won in the benchmark does nothing, or harm, in production, because the benchmark
+  sat in a different regime.
 
 ## When to use
-Reach for optimization when a measured number misses a target: TTFT above the budget, TPOT making text
-feel slow, or cost per million tokens above plan. Classify the regime first (bandwidth-bound decode,
-compute-bound prefill, or memory-capacity-bound concurrency) and pick the lever that attacks it. Do not
-optimize a workload you have not profiled, and do not stack levers blindly: quantization plus speculative
-decoding plus aggressive batching interact. In day-to-day work this is a loop of change one flag, re-run
-the load test, compare TTFT/TPOT/throughput and a quality eval. In interviews, the expected answer to "how
-would you make this faster" starts with "which bound are we hitting", not with a technique.
+- **Use when a measured number misses a target:** TTFT above budget, TPOT making text feel slow, or cost
+  per million tokens above plan.
+- **Classify the regime first** (bandwidth-bound decode, compute-bound prefill, or memory-capacity-bound
+  concurrency) and pick the lever that attacks it.
+- **Avoid** optimizing a workload you have not profiled, and stacking levers blindly: quantization plus
+  speculative decoding plus aggressive batching interact.
+- **Day to day:** change one flag, re-run the load test, compare TTFT/TPOT/throughput and a quality eval.
+- **Interviews:** "how would you make this faster" starts with "which bound are we hitting", not with a
+  technique.
 
 ## Role lens
 - **Engineer:** Runs the load test, reads batch size and cache utilization from engine metrics, and
@@ -209,6 +276,38 @@ decoding, which is ideal at low batch because the verification step is nearly fr
 graphs and a fused attention kernel are enabled is cheap. Avoid adding GPUs for capacity or quantizing the
 KV cache: the pool is not the constraint and cache traffic is small at batch 3. Also avoid raising batch
 limits; there is no demand to fill them. If traffic later grows and the pool fills, the answer changes.
+
+## Interview questions
+### What is the roofline model and why does it matter for LLM inference?
+- **Definition:** step time is the larger of bytes moved divided by bandwidth and FLOPs divided by peak
+  compute. Arithmetic intensity (FLOPs per byte) decides which term wins.
+- **Why it matters:** decode at small batch has intensity near *B* FLOPs per byte, far below the few
+  hundred an H100 needs, so it is bandwidth-bound and only byte-cutting levers help it. Prefill is
+  compute-bound and needs different levers.
+
+### A faster, more expensive GPU gave you almost no decode speedup. Explain and propose what to do instead.
+- **Diagnosis:** if its bandwidth is similar, the bandwidth floor of a decode step barely moves, because
+  each step still streams all weights and cache.
+- **Instead:** quantize weights to cut *W*, raise effective batch with continuous batching, add speculative
+  decoding at low batch, or pick a GPU on memory bandwidth rather than peak FLOPS.
+
+### When would you not use speculative decoding?
+- **High-utilization batches:** the GPU is already compute-busy, so verification steals compute and
+  throughput falls.
+- **Low acceptance:** creative or unusual text lowers α; at α = 0.5 even long drafts yield about 2 tokens
+  per pass, which the draft's cost can erase.
+- **Use it** for small-batch, latency-sensitive routes with predictable output.
+
+### Your pool is at 100% and preemptions are climbing. Which levers and in what order?
+- **Confirm the regime:** pool full means memory-capacity bound, not bandwidth or compute.
+- **Cheap first:** prefix caching for shared prompts, tighter `max_tokens`, fp8 KV cache after an eval.
+- **Then structural:** a GQA model, more GPUs or replicas. Weight quantization helps only by freeing VRAM
+  for cache.
+
+### Estimate the decode latency floor of an 8B fp16 model on a ~3 TB/s GPU.
+- **Bytes per step:** ~16 GB of weights plus the batch's cache.
+- **Floor:** 16 GB ÷ 3 TB/s ≈ 5.3 ms, so ~5.4 ms with a 2k-token cache at batch 1, about 180 tokens/s.
+- **4-bit weights** cut that to about 1.4 ms, roughly 3-4x faster, because weight bytes were the floor.
 
 ## Quiz
 ### Q: Why does weight quantization speed up single-request decode even though the GPU was not compute-limited?

@@ -97,6 +97,29 @@ executed instruction). An ordinary call discards its frame on return; a generato
   need to await, so handle early exit with `contextlib.aclosing()` (3.10+) to close deterministically rather
   than leaving cleanup to the event loop's finaliser.
 
+## Diagram
+One pull through the embedding pipeline below: each `next()` travels up the chain, one line is read,
+and each stage suspends at `yield` again with its state intact. Nothing moves until the consumer asks.
+
+```mermaid
+sequenceDiagram
+    participant C as Consumer (embed loop)
+    participant B as itertools.batched
+    participant K as chunks()
+    participant R as read_jsonl()
+    participant F as Open file
+    C->>B: next() for a batch
+    B->>K: next() for a chunk
+    K->>R: next() for a document
+    R->>F: read one line
+    F-->>R: line text
+    R-->>K: yield parsed doc (frame suspended, file still open)
+    K-->>B: yield (id, chunk) and suspend mid-loop
+    Note over B,K: repeats until 64 chunks or end of input
+    B-->>C: tuple of 64 chunks
+    Note over C: slow embedding API means slow pulls, which is backpressure with no queue
+```
+
 ## Examples
 ### A lazy embedding pipeline
 ```python
@@ -248,6 +271,43 @@ on size: if the cases fit in memory, materialise once with `cases = [load(x) for
 `len(cases)`; if not, count while scoring in the same pass, or rebuild the generator from `paths` for each
 pass. A good answer also notes that generators raise no error on reuse, so a test asserting the scored
 count equals the loaded count would have caught this.
+
+## Interview questions
+### What is a generator in Python, and why does it save memory?
+- **A function that pauses at `yield`.** Calling it returns a generator object without running the
+  body; each `next()` resumes the saved frame until the next `yield`.
+- **It saves memory because items flow one at a time**, so a pipeline holds the current item or batch
+  instead of the whole dataset.
+- **The kept frame is the trick:** locals, the open file and the loop position survive between items.
+
+### A streaming endpoint exhausts its HTTP connection pool when clients disconnect early. What is wrong?
+- **The async generator wrapping the upstream stream is not closed deterministically.** Breaking out
+  without `contextlib.aclosing()` leaves its async `finally` to the event loop's finaliser.
+- **Fix:** iterate inside `async with aclosing(stream) as s:` and release the upstream response in the
+  generator's `finally`.
+- **Monitor** open upstream connections and stream duration after disconnect, and watch for "unclosed"
+  warnings under load.
+
+### When would you not use a generator pipeline?
+- **When you need the data more than once**, random access or `len()`, because a generator is
+  single-pass and a second iteration silently yields nothing.
+- **For numeric hot loops over millions of small values**, where vectorised NumPy or Polars beats yielding
+  Python objects.
+- **For complex multi-producer flows**, where a bounded `asyncio.Queue` between tasks can be clearer.
+
+### How would you make a 10-hour embedding job over a JSONL corpus resumable?
+- **Yield the position with each item**, such as the line number or record id, alongside the data.
+- **Persist the last fully processed position every N batches**, so a crash at item 900,000 resumes
+  there instead of restarting from zero.
+- **Make upserts idempotent by id**, so replaying a partly written batch is harmless, and alert on
+  checkpoint age.
+
+### What do send(), throw() and yield from add beyond plain iteration?
+- **`send(value)`** resumes the generator with the `yield` evaluating to that value; **`throw(exc)`**
+  raises an exception at the paused `yield`; **`close()`** raises `GeneratorExit` so `finally` runs.
+- **`yield from sub`** (PEP 380) delegates to a sub-generator, forwarding sends and throws and evaluating
+  to its return value.
+- **This machinery is the ancestor of `async`/`await`**, through generator-based coroutines.
 
 ## Quiz
 ### Q: What happens when you call a function whose body contains `yield`?

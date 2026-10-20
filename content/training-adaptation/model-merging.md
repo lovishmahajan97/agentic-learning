@@ -131,6 +131,24 @@ Four-parameter walkthrough (trim to top 50%, two entries each):
 - **Nothing is trained, so nothing is verified.** Every merge needs the full eval suite, including chat
   template, end-of-turn behaviour and safety checks, before anyone calls it a model.
 
+## Diagram
+Follow one tensor through a TIES or dare_ties merge: deltas are taken against the shared base, sparsified,
+sign-voted, averaged among agreeing tasks, then added back and gated by evals.
+
+```mermaid
+flowchart TD
+    B[("Shared base weights")] --> T["Task vectors: tau_i = fine-tune_i minus base"]
+    F[("Fine-tunes of the same base revision")] --> T
+    T --> D["Optional DARE: drop random p, rescale by 1 / (1 - p)"]
+    D --> TR["Trim: keep top k% of each tau by magnitude"]
+    TR --> EL["Elect: per-parameter sign with more total magnitude"]
+    EL --> DM["Disjoint merge: average only agreeing entries"]
+    DM --> M["theta = base + lambda times tau_merged"]
+    B --> M
+    M --> G["Per-task evals, template smoke test, safety suite"]
+    G -->|"fails"| R["Fall back to routed specialists"]
+```
+
 ## Examples
 ### TIES merge over Hugging Face state dicts
 PyTorch. All checkpoints must share the base model and tensor shapes. It works tensor by tensor, so peak
@@ -288,6 +306,46 @@ support tickets and general chat prompts. Evaluate per-task metrics against each
 benchmark for collateral damage, a chat-template smoke test for end-of-turn behaviour, and the safety
 suite, because merging can erode refusals. Ship only if support quality holds within tolerance and the
 conversational gain is measurable; otherwise fall back to routing.
+
+## Interview questions
+### What is a task vector, and why can you add fine-tunes together at all?
+- **Definition:** τ_i = θ_i − θ_base, computed tensor by tensor; merging is θ_base + λ Σ τ_i, and
+  θ_base − λ τ removes a behaviour.
+- **Why it works:** fine-tunes from the same pretrained weights stay in one loss basin, so the line
+  between them has no loss barrier (linear mode connectivity) and the deltas behave like additive vectors.
+- **Tuning:** λ around 0.3–1.0 in total usually works; bigger sums push activations out of range.
+
+### Your merged model produces repetitive, degenerate text. Walk through the debugging.
+- **Check the weights first:** merge weights summing well above one, or λ too high, push activations out
+  of the range the base expects.
+- **Check lineage:** parents fine-tuned from different base revisions, or deltas taken against the wrong
+  origin, give incoherent output.
+- **Check the template:** a mixture of parents' chat templates shows up as leaked role tags and never
+  emitting end-of-turn.
+
+### SLERP or TIES: when would you pick each?
+- **SLERP** for exactly two closely related tunes: it moves along the arc between them, preserving norms
+  that a straight-line midpoint would shrink.
+- **TIES** for three or more parents or conflicting deltas: trimming removes noise and sign election stops
+  disagreeing updates from cancelling.
+- **Plain averaging or soups** when the models learned the same thing differently, such as different seeds
+  or learning rates on the same data.
+
+### When would you not merge, and what would you do instead?
+- **When you own the data and compute:** multi-task SFT is more reliable, because merging has no
+  training signal to fix interference.
+- **When there are many tasks:** past a handful, per-task quality usually slips below the specialists, so
+  keep them behind a router.
+- **When parents differ in lineage or vocabulary:** different initialisations average into noise unless
+  aligned, and shape mismatches should block the merge rather than be padded.
+
+### A merge tops a public leaderboard. Why might you still refuse to ship it?
+- **Contamination accumulates:** each parent may have seen benchmark data, so the merge can top a board
+  and still underperform its parents on your tasks.
+- **Safety can silently erode:** merging can undo refusal training, so run the red-team set and track
+  refusal rate across merges.
+- **Ship on your own gate:** per-task evals against each parent, a general benchmark and a template smoke
+  test, with any parent's drop counted as the merge's cost.
 
 ## Quiz
 ### Q: Why does TIES-Merging elect a sign per parameter before averaging?

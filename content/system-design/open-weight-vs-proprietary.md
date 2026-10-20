@@ -108,6 +108,25 @@ The common outcome is a portfolio: proprietary frontier for the hardest and lowe
 weights (hosted or self-hosted, often fine-tuned) for high-volume narrow tasks, both behind a gateway so
 the split can move as the models do.
 
+## Diagram
+The decision runs constraints first, then capability, cost and lifecycle; note that the isolation
+question picks a deployment, not just a weight type.
+
+```mermaid
+flowchart TD
+    S["Task family"] --> I{"Isolation requirement: legal or architectural?"}
+    I -->|"architectural: only hosts you operate"| OW["Open weights, self-hosted, pinned by hash"]
+    I -->|"legal: contract and network path suffice"| L{"Licence fits how you ship? Customisation needed?"}
+    L -->|"deep customisation or on-device"| OWH["Open weights, self-hosted or hosted API"]
+    L -->|"prompting suffices"| CAP["Measure capability on your eval"]
+    OWH --> CAP
+    CAP --> COST["Cost at real utilisation"]
+    OW --> COST
+    COST --> LIFE["Lifecycle risk and exit cost"]
+    LIFE --> P["Portfolio entry behind one gateway"]
+    P -.->|"model release or deprecation notice"| CAP
+```
+
 ## Examples
 ### Pinned bytes and the full next-token distribution
 Three things an open-weight artefact allows that an API-only model does not: pin the exact bytes, read
@@ -272,6 +291,42 @@ option: pick a permissively licensed model, pin by hash, verify safetensors, ser
 engine, size the GPU from the memory arithmetic, and add explicit guardrails because the API's implicit
 safety tuning is gone. Either way, build the eval on their data first and keep the model behind a
 gateway so the decision stays reversible.
+
+## Interview questions
+### Is open-weight the same as open source? Why does the difference matter?
+- **No.** Open weights publish the parameters under a licence; training data and code are usually
+  withheld.
+- **Licences range widely,** from permissive (Apache-2.0, MIT) to custom community licences with
+  acceptable-use policies, scale thresholds and limits on using outputs to train other models.
+- **It matters because the licence decides how you can ship:** on-device, redistributed fine-tunes or
+  embedded in a product you sell. Skipping legal review surfaces later in due diligence.
+
+### Why is open-weight versus proprietary a separate axis from self-host versus API?
+- **Open weights can be served by a hosting provider** as a per-token API, with no GPUs of your own.
+- **Proprietary models can be reached through your cloud provider's managed service** over a private
+  endpoint in-region, so data need not cross the public internet.
+- **So "no data leaves" is a deployment requirement first.** Classify it as legal or architectural
+  before picking a weight type.
+
+### You migrated a workload from a proprietary API to an open-weight model and jailbreak success rose. What happened?
+- **The API's safety tuning, moderation layers and policy checks were implicit,** and they did not come
+  with the weights.
+- **Fix it explicitly:** add input and output moderation and policy checks, then run a red-team and
+  jailbreak eval against the API baseline before cutover.
+- **Keep monitoring** policy-violation and jailbreak success rates after cutover.
+
+### What supply-chain checks would you require before an open-weight model reaches production?
+- **Pin the repository revision** to a commit hash, never a moving branch.
+- **Download only safetensors,** because pickle-format checkpoints can execute code on load.
+- **Verify file hashes against a reviewed, committed manifest** in CI and at deploy time, and read the
+  model card; a popular fine-tune may carry behaviour nobody audited.
+
+### When does proprietary win even for a company that wants vendor independence?
+- **When frontier capability is needed now** and the open-weight gap on your own eval is material.
+- **When volume is low or spiky and the team is small,** because self-hosted GPUs at a small fraction of
+  capacity cost more per task than the API.
+- **Contain the dependency instead:** pin versions, keep a deprecation calendar, and put the model
+  behind a gateway with the same eval harness, so exit stays possible.
 
 ## Quiz
 ### Q: What does "open-weight" actually guarantee about a model?

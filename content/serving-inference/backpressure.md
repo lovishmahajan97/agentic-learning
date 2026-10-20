@@ -5,7 +5,7 @@ name: Backpressure
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - serving-inference/batching-and-concurrency-limits
   - serving-inference/timeouts
@@ -22,95 +22,122 @@ sources:
 ---
 
 ## TL;DR
-Backpressure is how an overloaded stage tells the stage feeding it to slow down, instead of silently
-buffering work until memory or latency blows up. An inference server has a hard ceiling set by KV-cache
-memory and decode bandwidth, so it must bound how much it admits, measure how long work waits, and reject
-the rest quickly with a 429 or 503 and a `Retry-After`. Without it a traffic spike becomes slow timeouts
-for everyone instead of fast rejections for some.
+Backpressure is how an overloaded stage tells its feeder to slow down instead of buffering until memory
+or latency blows up. Bound admission, measure queue wait, and reject the rest fast with 429 or 503 plus
+`Retry-After`.
 
 ## Why it exists
-An inference server has a fixed capacity. The running batch is capped by KV-cache memory (`max_num_seqs`
-and free cache blocks in vLLM) and the rate at which it emits tokens is capped by memory bandwidth.
-Arrivals do not know this. When the arrival rate λ exceeds the service rate μ for even a few seconds, the
-difference has to accumulate somewhere.
-
-The naive design, accept every connection and park it in an unbounded queue, moves the problem rather
-than solving it. Little's law, L = λW, says the number of requests in the system equals arrival rate
-times time-in-system. If the queue is unbounded, W grows without limit, and every queued request
-eventually outlives its client's timeout. The client retries, which raises λ further on a system that
-was already saturated. Meanwhile the GPU keeps prefilling 8k-token prompts for connections nobody is
-listening to, so *useful* throughput falls exactly when demand is highest. That is the cascading-failure
-pattern, and LLM workloads make it worse because each unit of work is expensive and long-lived.
-
-"Just autoscale" is the second naive answer. Adding a GPU node means pulling an image, loading tens of
-gigabytes of weights and warming up, which takes minutes; the spike is either over or the service has
-already collapsed. Backpressure is what keeps the system serving *some* traffic correctly while scaling
-catches up. The principle: fail fast and selectively at the edge, where rejection costs microseconds,
-rather than slowly and universally in the middle, where every failure has already consumed GPU time.
+- **Capacity is fixed.** The running batch is capped by KV-cache memory (`max_num_seqs` and free cache
+  blocks in vLLM), and token output is capped by memory bandwidth. Arrivals do not know this: when
+  arrival rate λ exceeds service rate μ for even a few seconds, the difference accumulates somewhere.
+- **An unbounded queue moves the problem.** Little's law, L = λW: requests in system equal arrival rate
+  times time-in-system. Unbounded, W grows without limit and every queued request outlives its client's
+  timeout. The client retries, raising λ on a system already saturated.
+- **Useful throughput falls when demand peaks.** The GPU keeps prefilling 8k-token prompts for
+  connections nobody is listening to. That is the cascading-failure pattern, and LLM work makes it worse
+  because each unit is expensive and long-lived.
+- **"Just autoscale" is too slow.** A new GPU node pulls an image, loads tens of gigabytes of weights and
+  warms up, which takes minutes; the spike is over or the service has already collapsed.
+- **What it buys.** The system keeps serving *some* traffic correctly while scaling catches up. Fail fast
+  and selectively at the edge, where rejection costs microseconds, not slowly and universally in the
+  middle, where every failure has already consumed GPU time.
 
 ## How it works
 ### Where the pressure originates
-In a continuous-batching engine the scheduler holds a running batch and a waiting queue. Each decode
-step it tries to admit waiting requests; admission fails when the sequence count would exceed
-`max_num_seqs` or when no free KV blocks remain. When a *running* request needs a block and none is
-free, the engine preempts a sequence (swapping or recomputing its cache), which is the first sign of
-overload. Engines expose these as metrics, for instance vLLM's running and waiting request gauges and
-its KV-cache usage percentage. Queue wait time, not GPU utilisation, is the pressure signal: a GPU at
-95% with an empty queue is healthy; at 95% with a queue growing by eight requests a second it is minutes
-from collapse.
+- **Scheduler state.** A continuous-batching engine holds a running batch and a waiting queue. Each
+  decode step it tries to admit waiting requests.
+- **Admission fails** when the sequence count would exceed `max_num_seqs` or no free KV blocks remain.
+- **Preemption is the first sign of overload.** When a *running* request needs a block and none is free,
+  the engine preempts a sequence (swapping or recomputing its cache).
+- **Engines expose it as metrics,** for instance vLLM's running and waiting request gauges and its
+  KV-cache usage percentage.
+- **Queue wait time, not GPU utilisation, is the pressure signal.** A GPU at 95% with an empty queue is
+  healthy; at 95% with a queue growing by eight requests a second it is minutes from collapse.
 
 ### Propagating it upstream
-A request path is client → gateway → application → engine, and each hop must do two things: bound its
-own buffer, and translate "I am full" into something the previous hop understands. HTTP already has the
-vocabulary: 429 means *this caller* exceeded its allowance, 503 means *the server* is out of capacity;
-both carry `Retry-After`. Two rules follow from the economics. The rejection decision must be made
-before any GPU work starts, because rejecting after prefill wastes the most expensive part of the
-request. And the decision must be cheap, ideally a counter check, because under overload you make it
-thousands of times a second.
+The path is client → gateway → application → engine. Each hop must:
+1. **Bound its own buffer.**
+2. **Translate "I am full"** into something the previous hop understands.
+
+| Status | Meaning | Header |
+|---|---|---|
+| 429 | *this caller* exceeded its allowance | `Retry-After` |
+| 503 | *the server* is out of capacity | `Retry-After` |
+
+Two rules follow from the economics:
+- **Decide before any GPU work starts,** because rejecting after prefill wastes the most expensive part of
+  the request.
+- **Make the decision cheap,** ideally a counter check, because under overload you make it thousands of
+  times a second.
 
 ### Admission policies, simplest first
 1. **Concurrency limit.** A semaphore sized from Little's law: at 4 requests/s and 8 s mean latency you
-   need about 32 in flight; set the limit near the engine's real capacity and reject beyond it. Simple,
+   need about 32 in flight. Set the limit near the engine's real capacity and reject beyond it. Simple,
    but one number cannot describe a mix of 500-token and 50,000-token requests.
-2. **Bounded queue with a wait budget.** Allow a short queue, but reject any request that has waited
-   longer than a budget (say 1–2 s for interactive traffic). This is the CoDel insight from network
-   queue management: control queue *delay*, not queue *length*, because length is meaningless when
-   service times vary 100× between requests.
+2. **Bounded queue with a wait budget.** Allow a short queue, but reject any request that waited longer
+   than a budget (say 1–2 s for interactive traffic). This is the CoDel insight from network queue
+   management: control queue *delay*, not *length*, because length is meaningless when service times
+   vary 100× between requests.
 3. **Token-aware admission.** The real cost is tokens. Admit against a budget of prompt tokens plus
-   `max_tokens`, because one 100k-token document request displaces fifty chat turns and a request
-   count hides that.
-4. **Priority shedding.** When over capacity, drop batch and background work before interactive
-   traffic, because the cost of a dropped request differs by an order of magnitude between them.
-5. **Adaptive limits.** Measure the latency gradient and shrink the limit when it rises, the TCP-Vegas
-   idea used by adaptive concurrency libraries, because any static limit drifts as the prompt mix and
-   the model change.
+   `max_tokens`, because one 100k-token document request displaces fifty chat turns and a request count
+   hides that.
+4. **Priority shedding.** Over capacity, drop batch and background work before interactive traffic,
+   because the cost of a dropped request differs by an order of magnitude between them.
+5. **Adaptive limits.** Measure the latency gradient and shrink the limit when it rises (the TCP-Vegas
+   idea used by adaptive concurrency libraries), because any static limit drifts as prompt mix and model
+   change.
 
 ### Streaming and slow consumers
-Streaming adds pressure in the reverse direction. The server produces tokens faster than a slow client
-reads them, so the application buffers; the engine keeps generating and holding KV memory for a consumer
-that may have gone away. Bound the per-connection buffer, detect disconnects, and cancel the generation
-(see cancellation), otherwise capacity leaks to dead streams.
+- **Pressure runs in reverse too.** The server produces tokens faster than a slow client reads them, so
+  the application buffers.
+- **Capacity leaks to dead streams.** The engine keeps generating and holding KV memory for a consumer that
+  may have gone away.
+- **Fix:** bound the per-connection buffer, detect disconnects, and cancel the generation (see
+  cancellation).
 
 ### The caller's half of the loop
-A rejection only relieves pressure if the caller slows down. Well-behaved clients honour `Retry-After`,
-back off with jitter, and cap retries with a budget (see retry strategies); a good internal client also
-shrinks its own concurrency when it sees 503s and grows it slowly on success (additive increase,
-multiplicative decrease, the same rule TCP uses), because that converges on the server's real capacity
-without either side knowing the number in advance. If your callers are your own services, enforce this
-in the shared client library; if they are external, assume some will retry immediately and size the
-edge rejection path to absorb it. Three controls are easy to confuse here: *rate limiting* caps one
-caller's share regardless of server health, *backpressure* is the signal that the server as a whole is
-full, and *load shedding* is the act of dropping work once that signal fires. A system needs all three.
+- **Rejection only helps if the caller slows down.** Well-behaved clients honour `Retry-After`, back off
+  with jitter, and cap retries with a budget (see retry strategies).
+- **AIMD in internal clients.** Shrink concurrency on 503s and grow it slowly on success (additive
+  increase, multiplicative decrease, the TCP rule), because that converges on the server's real capacity
+  without either side knowing the number in advance.
+- **Own callers vs external callers.** Enforce this in the shared client library for your own services;
+  for external callers, assume some retry immediately and size the edge rejection path to absorb it.
+
+| Control | What it does |
+|---|---|
+| Rate limiting | caps one caller's share regardless of server health |
+| Backpressure | the signal that the server as a whole is full |
+| Load shedding | the act of dropping work once that signal fires |
+
+A system needs all three.
 
 ### Queues as deliberate backpressure
-For non-interactive work a durable queue with a bounded consumer pool turns rejection into latency:
-producers enqueue freely, consumers pull at the GPU's pace. This only works if the queue has a maximum
-depth or age; an unbounded queue is the original problem wearing a different hat.
+- **For non-interactive work,** a durable queue with a bounded consumer pool turns rejection into latency:
+  producers enqueue freely, consumers pull at the GPU's pace.
+- **Only with a maximum depth or age;** an unbounded queue is the original problem wearing a different hat.
 
-## Example
-An admission gate in front of an engine: a semaphore sized from Little's law, a wait budget after which
-the request is shed with a `503` and `Retry-After`, a disconnect check so no GPU work is done for a
-caller who left while queued, and the queue-wait histogram that is the real pressure signal.
+## Diagram
+Follow a request from arrival: it is shed at the edge if the wait budget runs out, and work starts only
+after the disconnect check, so no GPU time goes to callers who left.
+
+```mermaid
+flowchart TD
+    R["Request arrives"] --> S{"Slot free within wait budget?"}
+    S -->|"no"| X["503 + Retry-After"]
+    S -->|"yes"| D{"Client still connected?"}
+    D -->|"no"| Q["499, no GPU work"]
+    D -->|"yes"| E["Engine: prefill and decode"]
+    E --> O["Stream response"]
+    X -.->|"backoff with jitter"| C["Client slows down"]
+    E -.->|"queue wait, KV usage"| M["Metrics and autoscaler"]
+```
+
+## Examples
+### Admission gate in front of an engine
+A semaphore sized from Little's law, a wait budget after which the request is shed with a `503` and
+`Retry-After`, a disconnect check so no GPU work is done for a caller who left while queued, and the
+queue-wait histogram that is the real pressure signal.
 
 ```python
 import asyncio, time
@@ -139,48 +166,106 @@ async def generate(req: Request):
         sem.release()
 ```
 
-The two numbers to tune are the concurrency limit (start from Little's law, then lower it until the
-engine's waiting queue stays near zero under load) and the wait budget (from the product's latency
-budget: if users abandon at 5 s and generation takes 3 s, queueing longer than 1.5–2 s is pointless).
-In production the semaphore is usually token-weighted and per-priority, and the same shape appears
-inside the engine as `--max-num-seqs`.
+Tuning the two numbers:
+- **Concurrency limit.** Start from Little's law, then lower it until the engine's waiting queue stays
+  near zero under load.
+- **Wait budget.** From the product's latency budget: if users abandon at 5 s and generation takes 3 s,
+  queueing longer than 1.5–2 s is pointless.
+- **In production** the semaphore is usually token-weighted and per-priority, and the same shape appears
+  inside the engine as `--max-num-seqs`.
+
+### Little's law sizing and a token-weighted gate
+Size the limit, then admit by tokens rather than requests. Pure Python, runs as is.
+
+```python
+def littles_law(rate_per_s, latency_s):
+    return rate_per_s * latency_s                 # L = λW: requests in flight
+
+print(littles_law(4, 8))    # 32 in flight at steady state
+print(littles_law(12, 8))   # 96 needed when traffic triples
+
+class TokenGate:
+    """Admit while in-flight tokens (prompt + max_tokens) stay under a budget."""
+    def __init__(self, budget):
+        self.budget, self.used = budget, 0
+    def try_admit(self, prompt_tokens, max_tokens):
+        cost = prompt_tokens + max_tokens
+        if self.used + cost > self.budget:
+            return False                          # caller returns 503 + Retry-After
+        self.used += cost
+        return True
+    def release(self, prompt_tokens, max_tokens):
+        self.used -= prompt_tokens + max_tokens
+
+gate = TokenGate(budget=200_000)
+print(gate.try_admit(100_000, 1_000))  # True: one long document
+print(gate.try_admit(2_000, 500))      # True: a chat turn still fits
+print(gate.try_admit(100_000, 1_000))  # False: a second document would exceed the budget
+```
+
+### Worked scenario: traffic triples with no backpressure
+Illustrative numbers from 4 req/s at 8 s mean latency, engine capped near 32 concurrent.
+
+| Time | Arrivals | Served | Waiting | Wait for a new arrival |
+|---|---|---|---|---|
+| Before | 4/s | 4/s | ~0 | ~0 s |
+| +10 s | 12/s | 4/s | ~80 | ~20 s |
+| +60 s | 12/s | 4/s | ~480 | ~120 s, past a 30 s client timeout |
+| +60 s with a 1.5 s wait budget | 12/s | 4/s | ≤ ~6 | ≤ 1.5 s, the rest get fast 503s |
+
+The wait grows by about 2 s every second (8 join, 4 leave), so after about 15 s of overload new arrivals
+already wait past a 30 s client timeout; from then on the GPU serves mostly clients who have left.
+
+## Production patterns
+- **Semaphore plus wait budget at the API layer.** Use for every route that fronts a GPU or metered quota.
+  Size it with Little's law, set a 1–2 s budget for interactive traffic, return 503 with `Retry-After`.
+  Monitor the queue-wait histogram and rejection rate.
+- **Engine-side limits that match the gate.** Set `--max-num-seqs` in vLLM so the engine's own waiting
+  queue stays near zero; the application gate then holds the real queue. Monitor vLLM's running and
+  waiting gauges, KV-cache usage and preemption counts.
+- **Priority lanes on shared GPUs.** When batch and chat share a deployment, give each class its own
+  limit and shed batch first. Monitor rejections per class so batch is not starved forever.
+- **AIMD in the shared client library.** Internal callers halve their concurrency on a 503 and add one
+  slot per success window. Monitor client-side concurrency over time; a sawtooth shows it working.
+- **Autoscale on queue wait, not GPU utilisation.** Trigger scale-out when p95 queue wait crosses part of
+  the budget, because utilisation stays near 95% whether the queue is empty or exploding.
 
 ## Trade-offs
-- Shedding early converts some requests into fast 503s instead of all requests into slow timeouts; it
-  flips when callers cannot retry (synchronous webhooks, batch jobs with no scheduler), where a longer
-  queue with a strict age limit is kinder.
-- A static concurrency limit is predictable and trivial to reason about, but it is tuned for one prompt
-  mix; when 50k-token documents start arriving it is either too high (OOM, preemption) or too low (idle
-  GPU), and token-aware or adaptive limits cost that simplicity back.
-- Queue-delay control keeps latency bounded regardless of request size, but the wait budget is a product
-  decision that must be revisited whenever generation length or the latency SLO changes.
-- A durable queue hides overload from producers entirely, which is right for pipelines and wrong for
-  chat: once a reply takes longer than a user will wait, finishing it is wasted GPU time, so interactive
-  paths need explicit rejection.
+- **Fast 503s vs slow timeouts.** Shedding early turns some requests into fast 503s instead of all into
+  slow timeouts. It flips when callers cannot retry (synchronous webhooks, batch jobs with no scheduler),
+  where a longer queue with a strict age limit is kinder.
+- **Static limit vs adaptive.** A static concurrency limit is predictable and trivial to reason about, but
+  is tuned for one prompt mix; when 50k-token documents arrive it is too high (OOM, preemption) or too low
+  (idle GPU). Token-aware or adaptive limits cost that simplicity back.
+- **Delay control vs maintenance.** Queue-delay control bounds latency regardless of request size, but the
+  wait budget is a product decision to revisit whenever generation length or the latency SLO changes.
+- **Durable queue vs explicit rejection.** A durable queue hides overload from producers, right for
+  pipelines and wrong for chat: once a reply takes longer than a user will wait, finishing it is wasted
+  GPU time, so interactive paths need explicit rejection.
 
 ## Pitfalls
-- Unbounded in-memory queues, which many frameworks give you by default; the symptom is p99 latency
-  climbing for minutes with a flat error rate, then an out-of-memory crash with no 5xx warning before it.
-- Watching queue length instead of queue time; the symptom is a "healthy" queue depth of ten while p99
-  explodes, because those ten are long-document requests.
-- Rejecting after expensive work (after retrieval, prompt assembly or, worst, after prefill); the symptom
-  is a GPU at 100% while completed requests per second falls.
-- Omitting `Retry-After`, or clients ignoring it; the symptom is a sawtooth of load spikes at a fixed
-  interval after each shedding episode as every rejected client retries together.
-- Wiring load shedding into the load balancer's health check; the symptom is a total outage during a
-  partial overload, because every instance reports unhealthy at once and is removed. Keep liveness
-  separate from load.
+- **Unbounded in-memory queues,** which many frameworks give you by default. Symptom: p99 latency climbs
+  for minutes with a flat error rate, then an out-of-memory crash with no 5xx warning.
+- **Watching queue length instead of queue time.** Symptom: a "healthy" depth of ten while p99 explodes,
+  because those ten are long-document requests.
+- **Rejecting after expensive work** (after retrieval, prompt assembly or, worst, after prefill). Symptom:
+  GPU at 100% while completed requests per second falls.
+- **Omitting `Retry-After`, or clients ignoring it.** Symptom: a sawtooth of load spikes at a fixed
+  interval after each shedding episode, as every rejected client retries together.
+- **Wiring load shedding into the load balancer's health check.** Symptom: total outage during a partial
+  overload, because every instance reports unhealthy at once and is removed. Keep liveness separate from
+  load.
 
 ## When to use
-Every boundary that fronts a GPU or a metered provider quota needs explicit backpressure: the gateway in
-front of your API, the application in front of the engine, and the engine's own scheduler limits. Reach
-for the simple semaphore-plus-wait-budget first, add token weighting when prompt lengths vary widely, and
-add priority tiers when batch and interactive traffic share a deployment. Measure queue wait time,
-rejection rate, in-flight tokens and KV-cache usage, and alert on wait time rather than on errors because
-it moves first. In day-to-day work it shows up as the question "what happens when traffic doubles for
-ten minutes"; in interviews, the expected answer walks from Little's law to bounded queues to
-503-with-Retry-After, and distinguishes that from rate limiting, which protects against a single caller
-rather than against aggregate load.
+- **Use at every boundary that fronts a GPU or a metered provider quota:** the gateway in front of your
+  API, the application in front of the engine, and the engine's own scheduler limits.
+- **Start simple.** Semaphore plus wait budget first; add token weighting when prompt lengths vary widely,
+  and priority tiers when batch and interactive traffic share a deployment.
+- **Measure** queue wait time, rejection rate, in-flight tokens and KV-cache usage. Alert on wait time
+  rather than errors, because it moves first.
+- **Day to day** it is the question "what happens when traffic doubles for ten minutes".
+- **Interviews:** walk from Little's law to bounded queues to 503-with-Retry-After, and distinguish it
+  from rate limiting, which protects against a single caller rather than aggregate load.
 
 ## Role lens
 - **Engineer:** Implements the admission gate in the API layer, sizes `max_num_seqs` and queue limits on
@@ -207,6 +292,37 @@ interactive. Roughly two thirds of requests get a fast rejection, but the third 
 normal latency, and queue-wait time becomes the autoscaling trigger. A strong answer also mentions
 token-aware admission if prompt lengths vary, and notes that per-tenant rate limiting is a separate
 control for a different problem.
+
+## Interview questions
+### What is backpressure, and why is an unbounded queue not a solution?
+- **Definition:** a stage that is full signals its upstream to slow down, by bounding admission and
+  rejecting the excess quickly.
+- **Why not queue everything:** by Little's law an unbounded queue lets wait time grow without limit, so
+  requests outlive client timeouts, clients retry, and the GPU works for callers who already left.
+
+### p99 latency is climbing for minutes but the error rate is flat. How do you debug it?
+- **Suspect an unbounded queue.** Check queue-wait time and the engine's waiting gauge, not GPU
+  utilisation, which looks the same whether the queue is empty or exploding.
+- **Check preemption and KV-cache usage** to see if the engine is over-admitting.
+- **Fix** with a wait budget and fast 503s at the edge, then lower the engine limit until its own queue
+  stays near zero.
+
+### When would you queue work instead of rejecting it?
+- **Queue when callers can wait:** batch pipelines and offline jobs, behind a durable queue with a bounded
+  consumer pool and a maximum depth or age.
+- **Reject for interactive traffic,** because once a reply takes longer than the user will wait, finishing
+  it is wasted GPU time.
+
+### Your server is full but the caller is within quota. Which status do you return, and what else matters?
+- **503 with `Retry-After`,** because the server is the bottleneck; 429 would wrongly blame the caller.
+- **The header prevents a synchronized retry storm,** especially when clients add jitter.
+- **Do it before prefill** so the rejection costs microseconds, not GPU time.
+
+### Why can a single concurrency number not protect a mixed workload?
+- **Costs differ by orders of magnitude.** One 100k-token document displaces about fifty chat turns, so a
+  request count hides the real load.
+- **Use token-aware admission** (prompt tokens plus `max_tokens`) or an adaptive limit driven by the
+  latency gradient, which tracks shifts in prompt mix and model.
 
 ## Quiz
 ### Q: Why should an admission controller for LLM requests bound queue *time* rather than queue *length*?

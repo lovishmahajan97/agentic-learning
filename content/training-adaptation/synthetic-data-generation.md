@@ -116,6 +116,24 @@ compound, and each generation is a blurrier copy. The defences follow from the m
 - **Check the generator's terms.** Some API providers prohibit using outputs to train competing models,
   and some open-weight licences attach conditions to derived models.
 
+## Diagram
+The generate-verify loop: verification decides what survives, real held-out data decides whether it
+worked, and failures flow back into the specification rather than into more generation.
+
+```mermaid
+flowchart TD
+    S["Seeds, personas, real artefacts"] --> SP["Specify: task, schema, diversity axes"]
+    SP --> G["Generate several samples per prompt"]
+    G --> V["Verify: execution, construction, consistency, judge, humans"]
+    V -->|"fails"| RJ[("Rejects, read by hand")]
+    V -->|"passes"| DD["Deduplicate and balance, check distinct-n"]
+    DD --> MX["Mix with accumulated real data"]
+    MX --> T["Train"]
+    T --> E["Evaluate on REAL held-out data"]
+    E --> F["Inspect failures"]
+    F -->|"adjust the specification"| SP
+```
+
 ## Examples
 ### Construction-first generation with a round-trip check
 An extraction task. A program samples the record, so the label is correct before any model is involved;
@@ -292,6 +310,46 @@ or report those types as unmeasured rather than averaging them away. Trust comes
 round-trip pass rate per form type, SME review of a stratified sample of kept and rejected items, and the
 eval score on the thirty real examples, with any gap between synthetic and real scores treated as the
 pipeline's error bar, not noise.
+
+## Interview questions
+### Temperature alone does not give a diverse synthetic set. What do you do instead?
+- **Seeds with a novelty filter:** Self-Instruct sampled tasks from a seed pool and rejected candidates
+  whose ROUGE-L overlap with existing tasks was too high, so each round pushed outward.
+- **Evolution and personas:** Evol-Instruct rewrites prompts along explicit axes (add a constraint,
+  deepen, mutate topic); conditioning on who is asking spreads vocabulary, intent and style.
+- **Ground in real artefacts:** generating questions from real documents, records or code keeps inputs on
+  the real distribution, then dedup by n-gram and embedding similarity.
+
+### Your model scores very well on a synthetic eval but disappoints in production. How do you debug it?
+- **Check eval provenance:** if the eval came from the same generator and prompt as training, the score
+  measures template-matching; rebuild it from real held-out data.
+- **Check diversity:** a low distinct-n ratio or repeated names and openings means the model learned a
+  narrow template that real inputs do not follow.
+- **Check style and verifier drift:** inherited generator style, or a filter that kept only easy cases,
+  show up as fine accuracy on easy inputs and misses on the hardest real ones.
+
+### Can a student trained on synthetic data beat its generator? When would you not use synthetic data?
+- **Only with outside information:** test results or ground truth from a verifier let self-improvement
+  loops exceed the generator; without one, expect a slightly worse copy.
+- **Avoid leaning on it** when real curated data is abundant: use it to anchor the set and generate only
+  for gaps found by error analysis.
+- **Also avoid** when the generator's terms or licence forbid training on its outputs.
+
+### You want an LLM judge to filter 500,000 generated examples. How do you decide whether to trust it?
+- **Calibrate first:** score a few hundred human-labelled items and measure agreement before the judge
+  filters the full run.
+- **Know its biases:** length, position and self-preference bias can skew what survives, so inspect
+  rejects as well as keeps.
+- **Recalibrate on change:** whenever the judge model or rubric changes, rerun the agreement check, and
+  spend human effort calibrating verifiers rather than labelling everything.
+
+### Design the verifier for a synthetic code-generation dataset. What do you monitor?
+- **Execution:** run each candidate with its unit tests in a separate process with a timeout, counting
+  infinite loops as failures, and keep only clean exits.
+- **Isolation:** `subprocess` is not a security sandbox, so run untrusted generations in a locked-down
+  container.
+- **Monitor:** pass rate and distinct-n per batch against previous accepted batches, plus per-row
+  provenance so a bad batch can be regenerated alone.
 
 ## Quiz
 ### Q: What most determines the quality of a synthetic training set?

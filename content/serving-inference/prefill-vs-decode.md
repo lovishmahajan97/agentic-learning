@@ -5,7 +5,7 @@ name: Prefill vs decode
 kind: concept
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - model-internals/kv-cache
   - serving-inference/ttft
@@ -21,138 +21,195 @@ sources:
 ---
 
 ## TL;DR
-Every LLM request runs in two phases with opposite hardware profiles. Prefill processes the whole prompt in
-one pass: thousands of tokens per weight read, compute-bound, and it sets time-to-first-token. Decode then
-produces one token per step: one token per weight read, memory-bandwidth-bound, and it sets time per
-output token. Because the phases stress different resources, mixing them on one GPU causes interference,
-and most scheduling techniques exist to manage that collision.
+Every LLM request has two phases with opposite hardware profiles. Prefill runs the whole prompt at once,
+is compute-bound and sets TTFT. Decode makes one token per step, is bandwidth-bound and sets TPOT. Mixing
+them on one GPU causes interference.
 
 ## Why it exists
-The split is not a design choice; it falls out of autoregression. The prompt is known in full before
-generation starts, so all of its tokens can be pushed through the model together as one big matrix
-multiplication per layer. Generated tokens are not known in advance, so each depends on the previous one
-and must be produced sequentially. Same weights, same layers, radically different shapes of work.
-
-Why does that matter enough to deserve its own lesson? Because a GPU's efficiency depends almost entirely
-on the shape of the work. A matmul over 2,000 prompt tokens reads each weight once and uses it 2,000
-times; the arithmetic units are saturated. A decode step over one token reads the same weights and uses
-each once; the GPU spends the step waiting on memory. The result is that prefill of a 4,000-token prompt
-takes about as long as a dozen or so decode steps, not 4,000 of them (with the illustrative numbers
-below: ~70 ms of compute-bound prefill against ~5.5 ms per bandwidth-bound step), and that a faster GPU
-helps prefill a lot and decode barely at all.
-
-The naive mental model, "cost is proportional to tokens", gets both pricing and scheduling wrong. It
-predicts that a long prompt with a short answer and a short prompt with a long answer cost the same; in
-practice the second one occupies the GPU far longer. It also predicts that batching helps uniformly, when
-in fact batching is what rescues decode and does almost nothing for prefill. Every serving metric that
-matters, TTFT, TPOT, throughput, is really a statement about one phase or the other, and you cannot tune
-what you have not separated.
+- **The split falls out of autoregression, not design.** The prompt is known in full, so all its tokens go
+  through the model together as one big matmul per layer. Generated tokens are not known in advance, so
+  each depends on the previous one and is produced sequentially. Same weights, radically different shapes
+  of work.
+- **GPU efficiency depends on that shape.** A matmul over 2,000 prompt tokens reads each weight once and
+  uses it 2,000 times, saturating the arithmetic units. A decode step over one token uses each weight once,
+  so the GPU waits on memory.
+- **So prefill is cheap per token.** Prefill of a 4,000-token prompt takes about as long as a dozen or so
+  decode steps, not 4,000 of them (illustrative: ~70 ms of compute-bound prefill against ~5.5 ms per
+  bandwidth-bound step). A faster GPU helps prefill a lot and decode barely at all.
+- **"Cost is proportional to tokens" is wrong.** It predicts a long prompt with a short answer costs the
+  same as a short prompt with a long answer; the second occupies the GPU far longer. It also predicts
+  batching helps uniformly, when batching rescues decode and does almost nothing for prefill.
+- **Every serving metric belongs to one phase.** TTFT, TPOT and throughput are each a statement about
+  prefill or decode, and you cannot tune what you have not separated.
 
 ## How it works
+### The two phases side by side
+| | Prefill | Decode |
+|---|---|---|
+| Input per request | *P* prompt embeddings, `[P, d_model]` | one new token, `[1, d_model]` |
+| Work per layer | dense matmuls over all *P* rows, causal attention among *P* positions | same matmuls over one row, one query against every cached K and V |
+| Cache effect | writes K and V for every position | appends one K and one V |
+| Arithmetic intensity | roughly *P* FLOPs per weight byte | a handful of FLOPs per byte |
+| Bound | compute (for prompts over a few hundred tokens) | memory bandwidth |
+| Sets | TTFT; the last position's logits give the first token | TPOT |
+| Batching helps? | barely | it is the throughput lever |
+
 ### Prefill
-Input: the prompt's *P* token embeddings as a `[P, d_model]` matrix. Each layer runs its projections and
-MLP as dense matmuls over all *P* rows at once, computes causal attention among the *P* positions, and
-writes K and V for every position into the KV cache. The last position's logits produce the first output
-token. Cost scales with *P* for the matmuls and with *P²* for attention (mitigated by fused attention
-kernels that avoid materializing the full matrix). Arithmetic intensity is roughly *P* FLOPs per weight
-byte, so for any prompt longer than a few hundred tokens the phase is compute-bound: TTFT grows roughly
-linearly with prompt length and shrinks with more FLOPs.
+- **Cost** scales with *P* for the matmuls and with *P²* for attention, mitigated by fused attention
+  kernels that avoid materializing the full matrix.
+- **Compute-bound,** so TTFT grows roughly linearly with prompt length and shrinks with more FLOPs.
 
 ### Decode
-Input: one new token, shape `[1, d_model]` per request. Each layer runs the same matmuls over a single row,
-computes attention of that one query against every cached K and V, and appends one K and one V. Per step,
-the GPU must read all weights plus the entire KV cache of the request, and the useful work is a handful of
-FLOPs per byte. Step time is therefore approximately `(weight_bytes + cache_bytes) / bandwidth`, and
-TPOT is almost independent of prompt length except through the cache-read term. Batching *B* requests
-reads the weights once for *B* tokens, which is why continuous batching is the throughput lever for decode
-and irrelevant for prefill. The amortization is only partial, though: every request's KV cache is its own
-and must still be read separately, so the cache term grows linearly with *B* and context length, and at
-large batches of long contexts it, not the weights, sets the step time. That is why decode at scale is
-limited by cache bytes (GQA, cache quantization) as much as by weight bytes.
+- **Per step** the GPU reads all weights plus the request's entire KV cache:
+
+```
+step_time ≈ (weight_bytes + cache_bytes) / bandwidth
+```
+
+- **TPOT is almost independent of prompt length,** except through the cache-read term.
+- **Batching *B* requests** reads the weights once for *B* tokens, which is why continuous batching is the
+  throughput lever for decode and irrelevant for prefill.
+- **The amortization is partial.** Every request's KV cache is its own and is read separately, so the cache
+  term grows linearly with *B* and context length. At large batches of long contexts it, not the weights,
+  sets step time, which is why decode at scale is limited by cache bytes (GQA, cache quantization) as much
+  as by weight bytes.
 
 ### Why they interfere
-Both phases run on the same GPU inside the same iteration. If the scheduler admits a 10k-token prompt
-into a batch of 50 decoding requests, that iteration takes as long as the prefill, and all 50 users see a
-pause in their token stream: a TPOT spike caused by someone else's TTFT. Conversely, prioritizing decode
-makes new arrivals wait and TTFT climbs. The two phases trade against each other inside every scheduling
-decision.
+- **Same GPU, same iteration.** Admit a 10k-token prompt into a batch of 50 decoding requests and that
+  iteration takes as long as the prefill. All 50 users see a pause: a TPOT spike caused by someone else's
+  TTFT.
+- **The reverse also hurts.** Prioritizing decode makes new arrivals wait, and TTFT climbs.
+- **So the two phases trade against each other inside every scheduling decision.**
 
 ### Techniques that manage the collision
-- **Chunked prefill.** Split long prompts into fixed-size chunks (a token budget per iteration) and run
-  each chunk alongside the decode batch. The decode tokens ride along at near-zero marginal cost because
-  the iteration was going to be compute-bound anyway, and no single iteration becomes a stall. The cost
-  is slightly longer TTFT for the long prompt.
-- **Prefill priority versus decode priority.** Engines expose this as scheduler policy; prefill-first
-  minimizes TTFT, decode-first smooths TPOT. The right setting depends on the product.
-- **Disaggregated serving.** Run prefill on one pool of GPUs and decode on another, transferring the KV
-  cache between them over the interconnect. Each pool is then tuned for its phase (prefill wants FLOPs,
-  decode wants bandwidth and memory capacity), and one phase's load can no longer spike the other's
-  latency. The price is the transfer and a more complex system; it pays at scale.
-- **Prefix caching.** Reuse an already-computed KV prefix so part of the prefill is skipped entirely; the
-  biggest TTFT lever when prompts share a long system prompt.
-- **Speculative decoding.** Turns several decode steps into one verification pass, exploiting the slack
-  compute that bandwidth-bound decode leaves idle.
+| Technique | How | Cost |
+|---|---|---|
+| **Chunked prefill** | Split long prompts into fixed-size chunks (a token budget per iteration) run alongside the decode batch. Decode tokens ride along at near-zero marginal cost because the iteration was compute-bound anyway | Slightly longer TTFT for the long prompt |
+| **Prefill vs decode priority** | Scheduler policy: prefill-first minimizes TTFT, decode-first smooths TPOT | Depends on the product |
+| **Disaggregated serving** | Prefill on one GPU pool, decode on another, KV cache transferred over the interconnect. Each pool is tuned for its phase (prefill wants FLOPs, decode wants bandwidth and memory) and one phase cannot spike the other | The transfer and a more complex system; pays at scale |
+| **Prefix caching** | Reuse an already-computed KV prefix so part of prefill is skipped | The biggest TTFT lever when prompts share a long system prompt |
+| **Speculative decoding** | Turns several decode steps into one verification pass | Uses the slack compute bandwidth-bound decode leaves idle |
 
 ### What the metrics mean
-- TTFT ≈ queue wait + prefill time (+ a cache transfer in disaggregated setups).
-- TPOT ≈ decode step time, which rises with batch size and with the total cache the batch reads.
-- Throughput in tokens/sec is dominated by decode batching; prefill throughput is a separate number and
-  is what a long-document, short-answer workload actually consumes.
+- **TTFT** ≈ queue wait + prefill time (+ a cache transfer in disaggregated setups).
+- **TPOT** ≈ decode step time, which rises with batch size and with the total cache the batch reads.
+- **Throughput** in tokens/sec is dominated by decode batching. Prefill throughput is a separate number,
+  and it is what a long-document, short-answer workload actually consumes.
 
-## Example
-A worked scenario on one 80 GB GPU serving an 8B GQA model in fp16 (weights ~16 GB, cache ~128 KB per
-token), with rounded, illustrative hardware figures of ~3 TB/s bandwidth and ~900 TFLOPs.
+## Diagram
+One request's path: prefill fills the cache once, then decode loops, and an unchunked long prompt from
+another user can stall that loop.
 
+```mermaid
+flowchart TD
+    A["Request arrives"] --> Q["Queue wait"]
+    Q --> P["Prefill: all P tokens, compute-bound"]
+    P --> KV[("KV cache written")]
+    P -->|"first token, ends TTFT"| D["Decode step: 1 token, bandwidth-bound"]
+    KV --> D
+    D -->|"append k, v"| KV
+    D -->|"not done, each gap is TPOT"| D
+    D -->|"EOS or max_tokens"| E["Done, free cache"]
+    L["Long prompt from another user"] -.->|"unchunked, stalls the step"| D
+    L -.->|"chunked, rides along"| C["Chunk plus decode batch"]
+```
+
+## Examples
+### A phase cost calculator
+Rounded, illustrative figures for one 80 GB GPU serving an 8B GQA model in fp16 (weights ~16 GB, cache
+~128 KB per token) at ~3 TB/s and ~900 TFLOPs. Pure Python; it reproduces the scenario below.
+
+```python
+BW, FLOPS = 3e12, 900e12            # illustrative: ~3 TB/s, ~900 TFLOPs
+W, KV = 16e9, 2 * 32 * 8 * 128 * 2  # 8B fp16 weights, bytes of KV per token
+
+def prefill_s(prompt):              # compute-bound: 2 FLOPs per param per token
+    return 2 * 8e9 * prompt / FLOPS
+
+def decode_step_s(ctx_tokens_in_batch):  # bandwidth-bound: weights once + every cache
+    return (W + ctx_tokens_in_batch * KV) / BW
+
+for name, p, o in [("A", 4000, 50), ("B", 200, 1000)]:
+    dec = sum(decode_step_s(p + i) for i in range(o))
+    print(f"{name}: prefill {prefill_s(p)*1e3:5.1f} ms, decode {dec:5.2f} s, "
+          f"{dec/o*1e3:.1f} ms per output token")
+print(f"32 B-like requests near the end: {decode_step_s(32 * 1200)*1e3:.1f} ms/step")
+# A: prefill  71.1 ms, decode  0.28 s, 5.5 ms per output token
+# B: prefill   3.6 ms, decode  5.36 s, 5.4 ms per output token
+# 32 B-like requests near the end: 7.0 ms/step
+```
+
+### Worked scenario: a long prompt and a long answer
 Request A: 4,000-token prompt, 50-token answer. Request B: 200-token prompt, 1,000-token answer.
 
-Prefill A: 2 × 8e9 × 4,000 = 64 TFLOPs of matmul work; at ~900 TFLOPs that is roughly 70 ms, plus
-attention and overhead, so TTFT on the order of 100 ms when the GPU is otherwise idle. Prefill B is 20× less
-work: a few milliseconds, so TTFT is dominated by queueing.
+| | Request A | Request B |
+|---|---|---|
+| Prefill work | 2 × 8e9 × 4,000 = 64 TFLOPs; ~70 ms at ~900 TFLOPs | 20× less work: a few milliseconds |
+| TTFT on an idle GPU | ~100 ms (plus attention and overhead) | dominated by queueing |
+| Bytes per decode step | ~16 GB weights + ~0.5 GB cache (4,050 tokens × 128 KB) | ~16 GB + ~0.15 GB |
+| Decode step | ~5.5 ms | ~5.4 ms |
+| Decode total | 50 tokens ≈ ~280 ms | 1,000 tokens ≈ 5.4 s |
+| Total GPU time | 0.1 + 0.28 ≈ 0.4 s | 0.005 + 5.4 ≈ 5.4 s |
 
-Decode A: each step reads ~16 GB of weights plus ~0.5 GB of cache (4,050 tokens × 128 KB); at ~3 TB/s
-that is ~5.5 ms per step, so the 50 tokens take ~280 ms. Decode B: ~16 GB + ~0.15 GB per step, ~5.4 ms,
-times 1,000 tokens ≈ 5.4 s.
+- **B has one-twentieth the prompt tokens but occupies the GPU 13× longer,** nearly all of it streaming the
+  same 16 GB of weights over and over.
+- **Batch 32 B-like requests** and the step rises only to ~7 ms (weights read once, cache reads grow), so
+  aggregate throughput goes up ~25× while each user's TPOT rises from 5.4 to 7 ms.
+- **Admit one A-like prompt without chunked prefill:** that iteration takes ~100 ms instead of 7 ms, and all
+  32 users see a visible hitch.
+- **With chunked prefill at a 512-token budget,** A's prefill spreads over 8 iterations of ~15 ms each. A's
+  TTFT becomes ~120 ms instead of ~100 ms, and nobody else stalls.
 
-Total GPU time: A ≈ 0.1 + 0.28 ≈ 0.4 s; B ≈ 0.005 + 5.4 ≈ 5.4 s. B has one-twentieth the prompt tokens
-but occupies the GPU 13× longer, and nearly all of that time the GPU is streaming the same 16 GB of
-weights over and over. Batch 32 B-like requests together and the per-step cost rises only to ~7 ms
-(weights read once, cache reads grow), so aggregate throughput goes up ~25× while each user's TPOT
-rises from 5.4 to 7 ms. Now admit one A-like prompt into that batch without chunked prefill: that
-iteration takes ~100 ms instead of 7 ms, and all 32 users see a visible hitch. With chunked prefill at a
-512-token budget, A's prefill is spread over 8 iterations of ~15 ms each: A's TTFT becomes ~120 ms
-instead of ~100 ms, and nobody else stalls.
+## Production patterns
+- **Chunked prefill with a deliberate budget.** For mixed workloads enable chunked prefill
+  (`--enable-chunked-prefill` in vLLM, on by default in recent versions) and set the per-iteration token
+  budget with `--max-num-batched-tokens`: smaller favours TPOT, larger favours TTFT and prefill throughput.
+  Monitor TPOT p99 when long prompts arrive.
+- **Separate histograms per phase.** Export TTFT and per-token latency as separate histograms (engines
+  such as vLLM publish both on `/metrics`) and set an SLO on each. Monitor them against prompt-length and
+  output-length percentiles, not a blended "latency".
+- **Split pools by workload shape.** Put long-document, short-answer traffic and chat on separate
+  deployments with different scheduler settings, routed by endpoint. Monitor each pool's utilization;
+  move to full prefill/decode disaggregation (supported in frameworks such as SGLang and NVIDIA Dynamo)
+  only when interference is measurable at scale.
+- **Meter input and output tokens separately.** Bill and budget per phase, with output priced well above
+  input, as public API price lists do. Monitor GPU-seconds per input token and per output token per tenant.
+- **Reproduce stutter on purpose.** In load tests, inject a long prompt into a loaded replica and confirm
+  TPOT of the other streams stays within budget. Monitor the per-iteration step time during the injection.
 
 ## Trade-offs
-- Chunked prefill smooths TPOT for everyone and raises utilization, but lengthens TTFT for long prompts;
-  flips when the workload is mostly long prompts with short answers and TTFT is the metric sold.
-- Disaggregating prefill and decode isolates the phases and lets each pool be sized for its bottleneck,
-  but adds KV transfer and operational complexity; it pays only at a scale where interference is measurable.
-- Prefill-first scheduling minimizes TTFT at the cost of decode stalls; decode-first does the opposite;
-  the right choice depends on whether users wait for the first token or read the stream.
-- Faster-FLOPs hardware shortens prefill substantially but barely moves decode; buying it makes sense for
-  document-heavy, short-output workloads and not for chat with long answers.
+- **Chunked prefill: smooth TPOT vs long-prompt TTFT.** It smooths TPOT for everyone and raises
+  utilization, but lengthens TTFT for long prompts. Flips when the workload is mostly long prompts with
+  short answers and TTFT is the metric sold.
+- **Disaggregation: isolation vs complexity.** Separate phases let each pool be sized for its bottleneck,
+  but add KV transfer and operational complexity. It pays only at a scale where interference is
+  measurable.
+- **Prefill-first vs decode-first.** Prefill-first minimizes TTFT at the cost of decode stalls; decode-first
+  does the opposite. Choose by whether users wait for the first token or read the stream.
+- **More FLOPs vs more bandwidth.** Faster-FLOPs hardware shortens prefill substantially but barely moves
+  decode. Worth it for document-heavy, short-output workloads, not for chat with long answers.
 
 ## Pitfalls
-- Benchmarking "latency" as a single number; symptom is a product with fine average latency whose users
-  complain either about the pause before text appears or about stuttering mid-stream.
-- Assuming cost is proportional to total tokens; symptom is a pricing or capacity model that is wildly
-  wrong for long-output workloads, because output tokens cost far more GPU time than input tokens.
-- Leaving chunked prefill off on a mixed workload; symptom is periodic TPOT spikes across all users that
+- **Benchmarking "latency" as a single number.** Symptom: fine average latency, but users complain about
+  the pause before text appears or about stuttering mid-stream.
+- **Assuming cost is proportional to total tokens.** Symptom: a pricing or capacity model wildly wrong for
+  long-output workloads, because output tokens cost far more GPU time than input tokens.
+- **Leaving chunked prefill off on a mixed workload.** Symptom: periodic TPOT spikes across all users that
   coincide with the arrival of long prompts, not with request rate.
-- Expecting a GPU upgrade to speed up chat decode; symptom is TTFT improving while tokens/sec per user is
+- **Expecting a GPU upgrade to speed up chat decode.** Symptom: TTFT improves while tokens/sec per user is
   unchanged, because bandwidth did not change much.
-- Reporting prefill throughput and decode throughput as one "tokens/sec"; symptom is capacity estimates
-  that are off by an order of magnitude when the input/output mix shifts.
+- **Reporting prefill and decode throughput as one "tokens/sec".** Symptom: capacity estimates off by an
+  order of magnitude when the input/output mix shifts.
 
 ## When to use
-This split is the first thing to apply when a latency or cost number looks wrong. Ask which phase the
-metric belongs to: TTFT problems lead to prefill (prompt length, queueing, prefix caching, chunking);
-TPOT problems lead to decode (batch size, cache size, bandwidth, quantization). Use it when sizing
-hardware: a summarization service of long documents wants FLOPs and prefill throughput, a chat service
-with long answers wants bandwidth and memory. Use it when pricing or budgeting: count input and output
-tokens separately because they cost different resources. In interviews, explaining why decode is
-bandwidth-bound and prefill is compute-bound, with the arithmetic-intensity reasoning, is the baseline
-expectation for any serving question.
+This split is the first thing to apply when a latency or cost number looks wrong.
+- **Attribute the metric:** TTFT problems lead to prefill (prompt length, queueing, prefix caching,
+  chunking); TPOT problems lead to decode (batch size, cache size, bandwidth, quantization).
+- **Size hardware:** summarizing long documents wants FLOPs and prefill throughput; chat with long answers
+  wants bandwidth and memory.
+- **Price and budget:** count input and output tokens separately, because they cost different resources.
+- **Interviews:** explaining why decode is bandwidth-bound and prefill compute-bound, with the
+  arithmetic-intensity reasoning, is the baseline for any serving question.
 
 ## Role lens
 - **Engineer:** Enables chunked prefill and sets the per-iteration token budget, reads TTFT and TPOT as
@@ -179,6 +236,39 @@ of a ~7 ms step, ≈ 0.2 ms even when 32 users share each step: roughly an order
 input and output tokens must be metered and priced separately, with output well above input, which is
 the shape of public API price lists. A blended per-token price would undercharge the chat product and
 overcharge the summarizer.
+
+## Interview questions
+### Why is prefill compute-bound and decode bandwidth-bound if they run the same weights?
+- **Arithmetic intensity differs.** Prefill multiplies each weight by all *P* prompt rows, roughly *P* FLOPs
+  per weight byte, enough to saturate tensor cores.
+- **Decode has one row per request.** Each step reads all weights and the cache for a handful of FLOPs per
+  byte, so memory bandwidth sets the step time.
+
+### Every few minutes all chat users see their stream freeze for a fraction of a second. How do you debug it?
+- **Correlate:** check whether freezes line up with long-prompt arrivals rather than request rate, using
+  per-iteration step time and the prompt-length log.
+- **Mechanism:** an unchunked long prefill makes one iteration as long as the prefill, so every decoding
+  user's TPOT spikes.
+- **Fix:** enable chunked prefill with a token budget, or route long-document traffic to its own pool.
+
+### When would you not disaggregate prefill and decode?
+- **Below the scale where interference is measurable.** Chunked prefill gets most of the benefit on one
+  pool without KV transfer.
+- **When the interconnect is slow or the system must stay simple,** because each request's cache must move
+  between pools and both pools need capacity planning.
+- **Do it** at large scale with mixed traffic, when each pool can be sized for its own bound.
+
+### Roughly how much more GPU time does an output token cost than an input token?
+- **Input:** ~70 ms of prefill for 4,000 tokens is ≈ 0.02 ms per token on the illustrative 8B setup.
+- **Output:** a ~7 ms decode step shared by 32 users is ≈ 0.2 ms per token, about an order of magnitude
+  more.
+- **So** meter and price them separately; blended per-token pricing misprices both workloads.
+
+### A team doubles GPU FLOPs. Which workloads benefit and which do not?
+- **Benefit:** long-prompt, short-output workloads (summarization, classification over documents), because
+  prefill and TTFT are compute-bound.
+- **Barely benefit:** chat with long answers, because decode tracks memory bandwidth, which did not change
+  much. Measure TTFT and per-user tokens/sec separately to show it.
 
 ## Quiz
 ### Q: Why is the decode phase memory-bandwidth-bound while prefill is compute-bound?

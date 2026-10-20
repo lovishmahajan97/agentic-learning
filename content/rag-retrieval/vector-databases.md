@@ -116,6 +116,25 @@ a document, then ask about it" flows, where the first question can miss the new 
 4. **Write throughput is the second wall.** HNSW inserts are expensive, so bulk loads should finish
    before the index is built.
 
+## Diagram
+A filtered query's path decides whether you get k results: post-filtering can starve a selective
+tenant, while iterative scans, filter-aware traversal or a partition keep the result list full.
+
+```mermaid
+flowchart TD
+    Q["Query vector plus filter, LIMIT k"] --> S{"How does the store filter?"}
+    S -->|"post-filter"| PF["ANN returns ef candidates, then WHERE drops non-matching"]
+    S -->|"filter in traversal"| FT["HNSW walk skips non-matching points"]
+    S -->|"partition or namespace"| PT["Search only the tenant's own index"]
+    PF --> C{"At least k rows survive?"}
+    C -->|"yes"| R["Top-k results"]
+    C -->|"no, iterative scan on"| W["Keep walking the graph"]
+    W --> C
+    C -->|"no, iterative scan off"| SHORT["Fewer than k, or empty"]
+    FT --> R
+    PT --> R
+```
+
 ## Examples
 ### pgvector end to end
 A chunk table keyed by the pipeline's content hash, an HNSW index on cosine distance, a tenant filter and
@@ -285,6 +304,40 @@ tenants, index build time during re-indexing, and memory as the corpus grows. I 
 engine or a managed service when the corpus passes tens of millions of vectors, when filtered queries
 start returning short result lists, when write bursts from re-indexing hurt the production database, or
 when hybrid sparse-dense search and quantization become requirements.
+
+## Interview questions
+### What does a vector database give you that FAISS or hnswlib alone does not?
+- **Database properties around the ANN index:** persistence through a write-ahead log and snapshots,
+  CRUD with soft-deletes, payload storage and filtering, access control, replication and sharding.
+- **Why it matters:** a library index lives in memory with none of these, so teams that start with "FAISS
+  and a pickle file" end up rebuilding each one after an incident.
+
+### A small tenant's filtered queries return empty results while big tenants are fine. Walk me through it.
+- **Diagnose:** the store post-filters, so at 1% selectivity about one row survives per 100 candidates and
+  `LIMIT 10` needs on the order of 1,000 candidates.
+- **Fix in pgvector:** raise `hnsw.ef_search` or enable `hnsw.iterative_scan` (0.8.0+).
+- **Structural fix:** a store with filter-aware HNSW, a payload index on the tenant field, or a per-tenant
+  namespace, shard or partition.
+
+### When would you not pick a dedicated vector database?
+- **Already on Postgres, low millions of vectors:** pgvector adds no new system, keeps chunks
+  transactional with business tables and lets row-level security enforce tenant isolation.
+- **Prototype or tests:** Chroma, Milvus Lite or LanceDB embed in the process with no infrastructure.
+- **No ops staff:** a managed service beats self-hosting an engine nobody can run, if data residency allows.
+
+### Size the memory for 80 million 1536-dimensional chunks and say how you would fit it.
+- **Raw float32:** 80M × 1536 × 4 bytes ≈ 491.5 GB before the HNSW graph and payloads.
+- **Quantize:** int8 is about 122.9 GB, binary about 15.4 GB, with full-precision rescoring to recover
+  recall.
+- **Scale out:** shard by id hash across nodes with replicas for reads, or use a disk-based index and
+  accept higher latency.
+
+### A user uploads a document and the first question about it misses it. Why, and what do you change?
+- **Cause:** the store is not read-your-writes for that path, for example eventually consistent in
+  Pinecone or a Qdrant upsert sent without waiting.
+- **Fix:** pass `wait=True` on Qdrant upserts, use Strong consistency in Milvus, or poll until the record
+  is queryable before confirming the upload.
+- **Monitor** the time from upsert to first successful query.
 
 ## Quiz
 ### Q: Why can a filtered nearest-neighbour query return fewer results than requested even though many rows match the filter?

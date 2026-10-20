@@ -105,6 +105,25 @@ def call(): ...
   receives. Put it below `@retry` and the framework registers the un-retried function, while the retrying
   wrapper is bound to a module name nobody calls.
 
+## Diagram
+Two phases for the stacked `@tool` over `@timed` example below: decorators run bottom-up once at import,
+then every call enters the outermost wrapper first.
+
+```mermaid
+flowchart TD
+    subgraph IMPORT["Definition time, runs once at import"]
+        D["def search_docs(query, k)"] --> T["timed(fn) returns async_wrapper"]
+        T -->|"functools.wraps copies name, doc, __wrapped__"| R["tool(async_wrapper) records schema"]
+        R --> N["Name search_docs bound to async_wrapper"]
+    end
+    subgraph CALL["Call time, every invocation"]
+        C["await search_docs(q)"] --> W["async_wrapper: start timer"]
+        W --> O["await original search_docs"]
+        O -->|"return or raise"| F["finally: report elapsed ms"]
+    end
+    N --> C
+```
+
 ## Examples
 ### An async retry decorator with backoff and jitter
 ```python
@@ -288,6 +307,43 @@ the framework awaits the returned coroutine. Frameworks that decide how to call 
 missing docstring and `(*args, **kwargs)` signature, so the framework generates tool schemas with no
 parameter names or descriptions, and the model guesses the arguments. The fix is an `async def` wrapper
 that awaits the call, decorated with `functools.wraps(fn)` so name, docstring and signature survive.
+
+## Interview questions
+### What does the @ decorator syntax actually do, and when does it run?
+- **It is a rebinding:** `@timed` above `def embed` is exactly `embed = timed(embed)`, executed once at
+  definition time, usually import.
+- **The wrapper is a closure** that keeps a reference to the original function and runs per call, while
+  the decorator body itself never runs again.
+- **So expensive work in the decorator body** slows startup or freezes a value that should be read per
+  call.
+
+### Write a decorator that takes arguments, such as retry(attempts=3). Why three levels?
+- **Factory, decorator, wrapper.** `retry(attempts=3)` is called first and returns the real decorator,
+  which receives the function and returns the wrapper.
+- **The arguments live in the factory's closure**, so every decorated function gets its own settings.
+- **For async targets** the wrapper must be `async def` and await the call, and `ParamSpec` (PEP 612,
+  3.10+) keeps parameter types visible to mypy and the IDE.
+
+### Traces show one span covering three retry attempts, but you wanted a span per attempt. What happened?
+- **Stacking order.** Decorators apply bottom-up, so `@traced` above `@retry(...)` makes the span wrap
+  all attempts.
+- **Swap them** so `@retry` is outermost and each attempt gets its own span; the same reasoning puts
+  `@retry` above a per-attempt timeout decorator.
+- **Keep registration decorators on top**, or the framework registers the unwrapped function.
+
+### When would you avoid a decorator, or a functools cache, in an AI service?
+- **When behaviour depends on per-call context** the reader must see; an explicit wrapper or context
+  manager is clearer than hidden control flow.
+- **`lru_cache` on methods or per-user data** keeps `self` alive in every key and never expires, so
+  memory grows steadily; use a TTL cache instead.
+- **Generic retries on non-idempotent tools** (email, CRM writes) duplicate side effects after a timeout.
+
+### With 4 attempts and a 50% transient failure rate, how many calls still fail, and how long do they take?
+- **All four fail with probability 0.5⁴ = 1/16**, so about 6% of calls still raise: retries change the
+  error rate, they do not remove it.
+- **Backoff of 0.1, 0.2 and 0.4 s** adds roughly 0.7 s before giving up, plus the four call durations,
+  and jitter of ±50% stops clients retrying in lockstep.
+- **Monitor** retries per call and the final failure rate, not just the success count.
 
 ## Quiz
 ### Q: What is `@a` stacked above `@b` above `def f` equivalent to?

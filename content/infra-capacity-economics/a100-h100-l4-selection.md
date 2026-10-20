@@ -5,7 +5,7 @@ name: A100 / H100 / L4 selection
 kind: decision
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - infra-capacity-economics/gpu-sizing
   - infra-capacity-economics/gpu-utilization-and-memory-bandwidth
@@ -20,34 +20,30 @@ sources:
 ---
 
 ## TL;DR
-Choose a card by the constraint that binds first: does the model fit (memory capacity), is per-stream
-decode fast enough (memory bandwidth), and what does a token cost at the utilisation you will
-actually run (price ÷ throughput ceiling). The L4 is a cheap, 24 GB, low-bandwidth card for small
-models and light traffic; the A100 is the mature 40/80 GB workhorse without FP8; the H100 is the
-80 GB, ~3.35 TB/s, FP8-capable card that wins per token at high load and for training.
+Pick the card by the first binding constraint: fit (memory), per-stream decode (bandwidth), then cost
+per token at real load. L4: cheap 24 GB. A100: 40/80 GB, no FP8. H100: 80 GB, ~3.35 TB/s, FP8,
+cheapest per token when busy.
 
 ## Why it exists
-Three cards from the same vendor can differ by an order of magnitude in price and in decode speed,
-and the cheapest option per hour is frequently the most expensive per token, or simply cannot run the
-model at all. Teams that pick by hourly price end up with L4s that cannot hold a 70B model or that
-deliver 15 tokens per second to a chat user; teams that pick by prestige put an 8B internal tool on
-an H100 that idles 95% of the day. Neither error shows up until the bill or the latency complaints
-arrive.
-
-The naive heuristic, "buy the newest card", fails because inference is usually bound by memory
-capacity and bandwidth, not by the compute that generation-over-generation marketing emphasises, and
-because the cost of a token depends on how full the card is, which depends on your traffic, not on
-the card. The other naive heuristic, "buy the cheapest card that fits", fails because fitting is not
-serving: a card that holds the weights with no room for KV cache serves one user, and a card with
-300 GB/s of bandwidth cannot reach interactive decode speeds on anything beyond a few billion
-parameters. Selection is therefore a short, repeatable procedure over four numbers — memory,
-bandwidth, price and expected load — followed by a feature checklist. This lesson gives the
-procedure and the datasheet facts it runs on.
+- **Price and speed differ by an order of magnitude.** Three cards from the same vendor can differ that
+  much in price and in decode speed, and the cheapest per hour is frequently the most expensive per
+  token, or simply cannot run the model.
+- **Picking by hourly price fails.** Teams end up with L4s that cannot hold a 70B model or that deliver
+  15 tokens per second to a chat user.
+- **Picking by prestige fails too.** An 8B internal tool on an H100 idles 95% of the day. Neither error
+  shows up until the bill or the latency complaints arrive.
+- **"Buy the newest card" misreads the workload.** Inference is usually bound by memory capacity and
+  bandwidth, not by the compute that generation-over-generation marketing emphasises. Cost per token
+  depends on how full the card is, which depends on your traffic, not the card.
+- **"Buy the cheapest card that fits" confuses fitting with serving.** A card that holds the weights with
+  no KV room serves one user; 300 GB/s of bandwidth cannot reach interactive decode on anything beyond a
+  few billion parameters. Selection is a short procedure over four numbers — memory, bandwidth, price,
+  expected load — plus a feature checklist.
 
 ## How it works
 ### The cards, by the numbers that matter
-Rounded figures from NVIDIA's datasheets; variants differ (A100 40 GB has ~1.55 TB/s, H100 PCIe
-~2 TB/s and lower TFLOPs, H100 NVL 94 GB, H200 141 GB at ~4.8 TB/s), so confirm the exact SKU.
+Rounded figures from NVIDIA's datasheets. Variants differ (A100 40 GB has ~1.55 TB/s, H100 PCIe ~2 TB/s
+and lower TFLOPs, H100 NVL 94 GB, H200 141 GB at ~4.8 TB/s), so confirm the exact SKU.
 
 | | L4 | A100 80 GB SXM | H100 80 GB SXM |
 |---|---|---|---|
@@ -60,108 +56,212 @@ Rounded figures from NVIDIA's datasheets; variants differ (A100 40 GB has ~1.55 
 | Interconnect | PCIe only, no NVLink | NVLink 600 GB/s (SXM) | NVLink 900 GB/s (SXM) |
 | Power / form | 72 W, single-slot PCIe | 400 W SXM (PCIe variant 300 W) | up to 700 W SXM (PCIe 350 W) |
 
-The bandwidth column is the decode column: the H100 streams weights ~11× faster than the L4 and
-~1.7× faster than the A100, and single-stream tokens/s follow those ratios almost directly. The
-memory column is the fit column. The FP8 row matters *because* fp8 weights halve the bytes per decode
-step and double the KV room with far less quality loss than int4. The A100 has no fp8 tensor cores:
-it falls back to int8 or int4 schemes, or to engine-specific fp8 *weight-only* kernels that dequantise
-to bf16 on the fly, which save memory and bandwidth but not compute. MIG matters for packing many small models onto one
-card with isolation; the L4 cannot do it, but at its price you simply buy more L4s.
+- **Bandwidth is the decode column.** The H100 streams weights ~11× faster than the L4 and ~1.7× faster
+  than the A100, and single-stream tokens/s follow those ratios almost directly.
+- **Memory is the fit column.**
+- **FP8 matters** *because* fp8 weights halve the bytes per decode step and double the KV room with far
+  less quality loss than int4.
+- **The A100 has no fp8 tensor cores.** It falls back to int8 or int4 schemes, or to engine-specific fp8
+  *weight-only* kernels that dequantise to bf16 on the fly, which save memory and bandwidth but not compute.
+- **MIG** matters for packing many small models onto one card with isolation; the L4 cannot do it, but at
+  its price you simply buy more L4s.
 
 ### The procedure
-1. **Fit.** Weights at your precision plus KV headroom, from the sizing lesson. Roughly: an L4 holds
-   an 8B model in bf16 with a few concurrent 4k contexts, or a ~13B model in int4; an 80 GB card holds
-   8B with hundreds of contexts, 30B-class models in bf16, or 70B in int4; 70B in fp8 or bf16 needs
-   two or four 80 GB cards with NVLink. Anything that does not fit ends the discussion.
-2. **Per-stream latency.** Decode step time is at least `bytes per step ÷ bandwidth`. For 8B bf16:
-   ~53 ms on L4 (≤19 tokens/s), ~8 ms on A100 (≤125), ~5 ms on H100 (≤200). If the SLO needs
-   30 tokens/s per user, the L4 is out regardless of price.
+1. **Fit.** Weights at your precision plus KV headroom, from the sizing lesson. Anything that does not fit
+   ends the discussion. Roughly:
+   - an L4 holds an 8B model in bf16 with a few concurrent 4k contexts, or a ~13B model in int4;
+   - an 80 GB card holds 8B with hundreds of contexts, 30B-class models in bf16, or 70B in int4;
+   - 70B in fp8 or bf16 needs two or four 80 GB cards with NVLink.
+2. **Per-stream latency.** Decode step time is at least `bytes per step ÷ bandwidth`. For 8B bf16: ~53 ms
+   on L4 (≤19 tokens/s), ~8 ms on A100 (≤125), ~5 ms on H100 (≤200). If the SLO needs 30 tokens/s per
+   user, the L4 is out regardless of price.
 3. **Cost per token at your load.** Estimate the throughput ceiling at the batch your memory allows,
-   multiply by expected utilisation, divide price by it. The expensive card wins when traffic keeps
-   it busy; the cheap card wins when traffic is sparse. The example below runs this.
-4. **Features.** FP8 (H100, L4) for cheap precision reduction; MIG (A100, H100) for isolated sharing;
-   NVLink (SXM) for tensor parallelism; L4's low power and single-slot size for edge boxes and ordinary
-   servers; L4's video encode/decode engines for vision pipelines.
-5. **Availability and procurement.** Quotas, regions, reservation terms and spot pricing differ by
-   card; A100 supply is typically easier than H100, and L4s are widely available in small counts.
-   Cloud families to look for: AWS p4d/p4de (A100 40/80 GB), p5 (H100), g6 (L4); GCP a2 (A100),
-   a3 (H100), g2 (L4); Azure ND A100 v4 and ND H100 v5. Check the current catalogue before planning.
+   multiply by expected utilisation, divide price by it. The expensive card wins when traffic keeps it
+   busy; the cheap card wins when traffic is sparse. The examples below run this.
+4. **Features.**
+   - FP8 (H100, L4) for cheap precision reduction;
+   - MIG (A100, H100) for isolated sharing;
+   - NVLink (SXM) for tensor parallelism;
+   - L4's low power and single-slot size for edge boxes and ordinary servers, and its video encode/decode
+     engines for vision pipelines.
+5. **Availability and procurement.** Quotas, regions, reservation terms and spot pricing differ by card;
+   A100 supply is typically easier than H100, and L4s are widely available in small counts.
+
+Cloud families to look for (check the current catalogue before planning):
+
+| Cloud | A100 | H100 | L4 |
+|---|---|---|---|
+| AWS | p4d/p4de (A100 40/80 GB) | p5 | g6 |
+| GCP | a2 | a3 | g2 |
+| Azure | ND A100 v4 | ND H100 v5 | |
 
 ### Training versus serving
-Training and full fine-tuning are compute- and interconnect-bound: H100's bf16 and fp8 throughput and
-NVLink make it the default, A100 remains cost-effective for smaller runs, and the L4 is only sensible
-for LoRA on small models because 24 GB and PCIe-only links cap everything else. For serving, step 2
-and 3 dominate, which is why the "A100 is obsolete" claim is wrong for inference: its bandwidth is
-60% of an H100's at a typically lower price, and for models under 30B it is often the best value.
+- **Training and full fine-tuning are compute- and interconnect-bound.** H100's bf16 and fp8 throughput
+  and NVLink make it the default; A100 remains cost-effective for smaller runs.
+- **The L4 is only sensible for LoRA on small models,** *because* 24 GB and PCIe-only links cap
+  everything else.
+- **For serving, steps 2 and 3 dominate.** That is why "A100 is obsolete" is wrong for inference: its
+  bandwidth is 60% of an H100's at a typically lower price, and for models under 30B it is often the best
+  value.
 
 ### Neighbours you will see
-A10G (24 GB, ~600 GB/s) and L40S (48 GB, ~860 GB/s) sit between the L4 and the A100 in price and
-bandwidth; H200 is an H100
-with more and faster memory for long contexts; newer generations exist and follow the same procedure
-with their own datasheet numbers.
+| Card | Memory | Bandwidth | Where it sits |
+|---|---|---|---|
+| A10G | 24 GB | ~600 GB/s | Between L4 and A100 in price and bandwidth |
+| L40S | 48 GB | ~860 GB/s | Between L4 and A100 in price and bandwidth |
+| H200 | more and faster than H100 | | An H100 with more memory, for long contexts |
 
-## Example
-An 8B bf16 chat model, two traffic levels, illustrative on-demand prices of roughly $0.80 per hour
-for an L4 and $4.00 per hour for an H100 (ballpark only; prices vary by provider and over time).
+Newer generations exist and follow the same procedure with their own datasheet numbers.
 
-*Ceilings.* On the L4, KV room allows about eight 4k-token contexts, so batch 8: a step reads 16 GB
-of weights plus ~4.3 GB of cache, ≈ 68 ms at 300 GB/s, so ≈ 120 tokens/s aggregate. On the H100,
-KV room allows about a hundred contexts: a step reads 16 GB plus ~54 GB of cache, ≈ 21 ms at
-3.35 TB/s, so ≈ 4,800 tokens/s aggregate. Both are upper bounds.
+## Diagram
+The procedure as a decision path: each gate can eliminate a card before price is even considered, and
+only the survivors are compared on cost per token at your load.
 
-*Cost per million tokens at full load.* L4: 120 × 3,600 ≈ 430k tokens per hour, so $0.80 ÷ 0.43M ≈
-$1.90 per million. H100: 4,800 × 3,600 ≈ 17M tokens per hour, $4.00 ÷ 17M ≈ $0.23 per million. At full
-load the H100 is roughly eight times cheaper per token despite costing five times more per hour.
+```mermaid
+flowchart TD
+    A["Model, precision, SLO, traffic forecast"] --> B{"Fits with KV headroom?"}
+    B -->|"no"| C["Quantise or add NVLink cards"]
+    C --> B
+    B -->|"yes"| D{"Per-stream floor meets tokens/s SLO?"}
+    D -->|"no"| E["Drop the low-bandwidth card"]
+    E --> F["Cost per token at expected load"]
+    D -->|"yes"| F
+    F --> G{"Sustained load keeps big card busy?"}
+    G -->|"yes"| H["H100 or A100"]
+    G -->|"no"| I["L4, A100, or serverless"]
+    H --> J["Check FP8, MIG, NVLink, quota"]
+    I --> J
+```
 
-*Scenario A, internal tool:* 0.3 requests/s averaging 300 output tokens is ~90 tokens/s, which keeps
-the L4 at about 75% of its ceiling and the H100 at under 2%. Hourly cost is what you pay: $0.80 versus
-$4.00; the L4 wins five to one, and per-user decode (≤19 tokens/s) is acceptable for an internal
-tool.
+## Examples
+### Worked comparison: an 8B chat model at two traffic levels
+Illustrative on-demand prices of roughly $0.80 per hour for an L4 and $4.00 per hour for an H100
+(ballpark only; prices vary by provider and over time).
 
-*Scenario B, public product:* 10 requests/s averaging 300 tokens is 3,000 tokens/s. That needs 25 L4s
-($20/h) or one H100 at ~60% of ceiling ($4/h), and the H100 users also get several times faster
-per-stream decode (the batch-1 bandwidth ratio is ~11×; at these batch sizes the gap is smaller).
+**Ceilings** (both are upper bounds):
 
-The crossover is wherever the H100's higher hourly price is covered by the tokens it actually serves.
-One H100 costs the same as five L4s, which together top out near 600 tokens/s, so here the crossover is
-roughly 500–600 tokens/s of sustained demand. Two corrections move it in practice. Redundancy: a
-production service needs at least two replicas, and two H100s ($8/h) cost as much as ten L4s, pushing
-the crossover toward ~1,200 tokens/s unless the second replica can be shared with other models. Latency:
-L4s at batch 8 deliver ~15 tokens/s per user; if the product SLO is higher, the L4 is out at any demand
-and the comparison is H100 against A100. If the demand is bursty, read the serverless lesson before
-buying either.
+| | L4 | H100 |
+|---|---|---|
+| Batch the KV room allows | about eight 4k-token contexts, so batch 8 | about a hundred contexts |
+| Bytes per step | 16 GB weights + ~4.3 GB cache | 16 GB + ~54 GB cache |
+| Step time | ≈ 68 ms at 300 GB/s | ≈ 21 ms at 3.35 TB/s |
+| Aggregate ceiling | ≈ 120 tokens/s | ≈ 4,800 tokens/s |
+
+**Cost per million tokens at full load:**
+- **L4:** 120 × 3,600 ≈ 430k tokens per hour, so $0.80 ÷ 0.43M ≈ $1.90 per million.
+- **H100:** 4,800 × 3,600 ≈ 17M tokens per hour, $4.00 ÷ 17M ≈ $0.23 per million.
+- **So** at full load the H100 is roughly eight times cheaper per token despite costing five times more
+  per hour.
+
+**Two scenarios:**
+
+| Scenario | Demand | L4 | H100 | Winner |
+|---|---|---|---|---|
+| A, internal tool | 0.3 requests/s × 300 output tokens ≈ 90 tokens/s | about 75% of ceiling, $0.80/h | under 2% of ceiling, $4.00/h | L4, five to one; ≤19 tokens/s per user is acceptable internally |
+| B, public product | 10 requests/s × 300 tokens = 3,000 tokens/s | 25 L4s, $20/h | one H100 at ~60% of ceiling, $4/h | H100, and users get several times faster per-stream decode |
+
+In scenario B the batch-1 bandwidth ratio is ~11×; at these batch sizes the per-user gap is smaller.
+
+**Where the crossover sits:**
+- **Base case.** The crossover is wherever the H100's higher hourly price is covered by the tokens it
+  actually serves. One H100 costs the same as five L4s, which together top out near 600 tokens/s, so the
+  crossover is roughly 500–600 tokens/s of sustained demand.
+- **Redundancy moves it.** A production service needs at least two replicas, and two H100s ($8/h) cost as
+  much as ten L4s, pushing the crossover toward ~1,200 tokens/s unless the second replica can be shared
+  with other models.
+- **Latency can remove the L4 entirely.** L4s at batch 8 deliver ~15 tokens/s per user; if the product SLO
+  is higher, the L4 is out at any demand and the comparison is H100 against A100.
+- **Bursty demand:** read the serverless lesson before buying either.
+
+### Card planner: cards, cost and utilisation for a demand figure
+Reproduces the worked comparison with the bandwidth-bound ceiling and a two-replica minimum. Prices and
+batch limits are the illustrative figures above; swap in your own quotes and sizing results.
+
+```python
+import math
+
+CARDS = {  # (bandwidth B/s, illustrative $/hour, max concurrent 4k contexts for 8B bf16)
+    "L4":   (300e9,  0.80, 8),
+    "H100": (3.35e12, 4.00, 100),
+}
+
+def ceiling_tps(bw, batch, weights=16e9, ctx=4096, kv_per_token=131072):
+    step = (weights + batch * ctx * kv_per_token) / bw     # bandwidth-bound step time
+    return batch / step
+
+def plan(card, demand_tps, min_replicas=2):
+    bw, price, batch = CARDS[card]
+    cap = ceiling_tps(bw, batch)
+    n = max(min_replicas, math.ceil(demand_tps / cap))
+    per_m = price / (cap * 3600 / 1e6)
+    print(f"{card:5s} ceiling={cap:6.0f} tok/s  ${per_m:.2f}/M at full load  "
+          f"{n:3d} cards  ${n*price:5.2f}/h  util={demand_tps/(n*cap):4.0%}")
+
+for demand in (90, 3000):          # scenario A, scenario B (tokens/s)
+    for card in CARDS:
+        plan(card, demand)
+# L4    ceiling=   118 tok/s  $1.88/M at full load    2 cards  $ 1.60/h  util= 38%
+# H100  ceiling=  4807 tok/s  $0.23/M at full load    2 cards  $ 8.00/h  util=  1%
+# L4    ceiling=   118 tok/s  $1.88/M at full load   26 cards  $20.80/h  util= 98%
+# H100  ceiling=  4807 tok/s  $0.23/M at full load    2 cards  $ 8.00/h  util= 31%
+```
+
+The planner's 26 L4s versus the prose's 25 is rounding (118 versus 120 tokens/s). Running near 98% of a
+bandwidth ceiling is not realistic, which strengthens the case for the H100 in scenario B.
+
+## Production patterns
+- **One node pool per card tier.** Use when more than one card type serves production. Create a pool per
+  card and steer workloads with the `nvidia.com/gpu.product` label from GPU feature discovery, so a
+  model cannot silently land on the wrong tier. Monitor pods per tier against the card-tier matrix.
+- **Benchmark the shortlist at real batch and context.** Use before any reservation or purchase. Run the
+  engine's serving benchmark with your prompt and output lengths at target concurrency on each candidate,
+  and record tokens/s per dollar. Monitor measured throughput against the bandwidth ceiling.
+- **Reserve the baseline, burst elsewhere.** Use when traffic has a steady floor and peaks. Commit to
+  reserved capacity for the floor on the card that is cheapest per token when busy, and absorb peaks with
+  on-demand or serverless capacity. Monitor reserved-card utilisation; idle reservations are sunk cost.
+- **Pack small models with MIG.** Use for embeddings, rerankers or several small models that need isolation
+  on A100 or H100. Expose MIG profiles through the GPU Operator and request them as separate resources.
+  Monitor per-instance memory and latency, because each slice gets a fraction of bandwidth.
+- **Re-run the selection on a schedule.** Use whenever prices, quotas, models or SLOs change, and at least
+  at each budget cycle. Keep the planner inputs in version control next to the capacity plan. Monitor
+  actual cost per million tokens against the plan's figure.
 
 ## Trade-offs
-- H100 delivers the lowest cost per token and fastest decode, but only when load keeps it busy; at
-  low or bursty utilisation its hourly price makes the L4 or an API provider cheaper.
-- A100 is often the best value for sub-30B serving and small training runs, but its lack of FP8
-  forces int8/int4 for memory relief, with the quality evaluation that implies.
-- L4 is cheap, low-power and easy to get, yet its 300 GB/s bandwidth caps per-stream decode and its
-  24 GB caps model size, so it flips from "obvious choice" to "cannot do it" at roughly 8B–13B.
-- SXM nodes with NVLink make tensor parallelism efficient for 70B-class models, at the cost of buying
-  eight-card blocks; PCIe cards are flexible but make multi-card sharding slow.
+- **H100 lowest cost per token vs needing load.** It delivers the lowest cost per token and fastest
+  decode, but only when load keeps it busy; at low or bursty utilisation its hourly price makes the L4 or
+  an API provider cheaper.
+- **A100 value vs no FP8.** It is often the best value for sub-30B serving and small training runs, but
+  its lack of FP8 forces int8/int4 for memory relief, with the quality evaluation that implies.
+- **L4 cheap and available vs bandwidth and size caps.** Low-power and easy to get, yet its 300 GB/s
+  bandwidth caps per-stream decode and its 24 GB caps model size, so it flips from "obvious choice" to
+  "cannot do it" at roughly 8B–13B.
+- **SXM/NVLink vs flexibility.** NVLink makes tensor parallelism efficient for 70B-class models, at the
+  cost of buying eight-card blocks; PCIe cards are flexible but make multi-card sharding slow.
 
 ## Pitfalls
-- Choosing by hourly price alone; symptom is a fleet of L4s that cannot meet a per-user tokens/s SLO
-  or cannot load the model the product team actually wants.
-- Choosing by TFLOPs for an inference workload; symptom is paying H100 prices for decode throughput
-  that an A100 would have delivered at 60%.
-- Forgetting the A100 has no FP8; symptom is a quantisation plan validated on H100 that must be redone
-  with int8/int4 kernels and re-evaluated for quality.
-- Sizing to the 80 GB figure without KV headroom; symptom is a 70B bf16 model that loads on two
-  cards and serves one request at a time.
-- Ignoring quota and region availability; symptom is an architecture built around H100s that cannot
-  be launched where the data must stay.
+- **Choosing by hourly price alone.** Symptom: a fleet of L4s that cannot meet a per-user tokens/s SLO or
+  cannot load the model the product team actually wants. Fix: run fit and latency gates first.
+- **Choosing by TFLOPs for an inference workload.** Symptom: paying H100 prices for decode throughput that
+  an A100 would have delivered at 60%. Fix: compare on bandwidth and cost per token.
+- **Forgetting the A100 has no FP8.** Symptom: a quantisation plan validated on H100 that must be redone
+  with int8/int4 kernels and re-evaluated for quality. Fix: validate on the target card.
+- **Sizing to the 80 GB figure without KV headroom.** Symptom: a 70B bf16 model that loads on two cards
+  and serves one request at a time. Fix: use the sizing arithmetic.
+- **Ignoring quota and region availability.** Symptom: an architecture built around H100s that cannot be
+  launched where the data must stay. Fix: confirm quota per region before design sign-off.
 
 ## When to use
-Run the five-step procedure whenever a new model, SLO or traffic forecast arrives, and re-run it when
-prices or quotas change. Reach for the L4 for embeddings, rerankers, vision models, small LLMs and
-anything with sparse traffic; for the A100 when a 7B–30B model needs real concurrency at the best
-price, or when H100 quota is unavailable; for the H100 for 70B-class serving, fp8, training, or any
-service whose sustained load would keep it busy. Measure tokens/s per card against the bandwidth
-ceiling and the actual utilisation against the plan. In interviews, expect "which card for X and
-why"; the strong answer names the binding constraint (fit, bandwidth or cost per token) before naming
-the card.
+- **Run the five-step procedure when:** a new model, SLO or traffic forecast arrives, and re-run it when
+  prices or quotas change.
+- **Reach for the L4 for:** embeddings, rerankers, vision models, small LLMs and anything with sparse
+  traffic.
+- **Reach for the A100 when:** a 7B–30B model needs real concurrency at the best price, or when H100
+  quota is unavailable.
+- **Reach for the H100 for:** 70B-class serving, fp8, training, or any service whose sustained load would
+  keep it busy.
+- **Measure:** tokens/s per card against the bandwidth ceiling, and actual utilisation against the plan.
+- **Interviews:** expect "which card for X and why"; the strong answer names the binding constraint (fit,
+  bandwidth or cost per token) before naming the card.
 
 ## Role lens
 - **Engineer:** Benchmarks the candidate card at the real batch size and context, confirms fp8 or
@@ -185,6 +285,43 @@ KV check: ~7 GB ÷ 300 GB/s ≈ 23 ms per step, under ~40 tokens/s per stream be
 so the remaining ~13 GB holds only a few long contexts. Recommendation: one A100 80 GB (two for redundancy), or an int4 L4 pair if
 the quality evaluation passes and budget dominates; revisit if traffic grows past the A100's ceiling
 or fp8 becomes necessary.
+
+## Interview questions
+### Why is memory bandwidth, not TFLOPs, the first spec to compare for an LLM serving card?
+- **Decode streams every weight byte per step,** so the step floor is bytes divided by bandwidth; at small
+  batches the arithmetic units mostly wait.
+- **Numbers:** 8B bf16 is ~53 ms per step on an L4 at ~300 GB/s, ~8 ms on an A100 at ~2.0 TB/s and ~5 ms
+  on an H100 at ~3.35 TB/s.
+- **TFLOPs matter** for prefill-heavy and training workloads, which is why the answer depends on the workload.
+
+### A team wants to standardise every workload on H100s. When would you push back?
+- **Sparse traffic:** an 8B internal tool at 0.3 requests/s keeps an H100 under 2% busy, so its hourly
+  price buys idle throughput while an L4 suffices.
+- **Small models with real concurrency:** an A100 often gives the best value under 30B, at 60% of the H100's
+  bandwidth for a typically lower price.
+- **Availability:** H100 quota or region limits can block launch where the data must stay.
+
+### How do you find the traffic level at which an H100 becomes cheaper than a fleet of L4s?
+- **Compute each card's ceiling** at the batch its memory allows (about 120 versus 4,800 tokens/s for 8B
+  bf16 in the worked example).
+- **Equal-cost comparison:** one H100 costs as much as five L4s, which top out near 600 tokens/s, so the
+  crossover is roughly 500–600 tokens/s sustained.
+- **Then correct it:** two-replica redundancy pushes it toward ~1,200 tokens/s; a per-user tokens/s SLO
+  above what an L4 delivers removes the L4 at any demand.
+
+### You validated fp8 serving on H100 but the production region only has A100s. What is your plan?
+- **Recognise the gap:** the A100 has no fp8 tensor cores, so the fp8 results do not transfer.
+- **Options:** int8 or int4 schemes, or fp8 weight-only kernels that dequantise to bf16 where the engine
+  offers them, which save memory and bandwidth but not compute.
+- **Re-evaluate** quality and speed on the A100 with the new kernels before committing, and recheck fit
+  and KV headroom at the new precision.
+
+### Which card would you pick for a 70B model serving a public product, and why?
+- **Fit:** 70B needs two or four 80 GB cards in fp8 or bf16, or one 80 GB card in int4 with a quality cost.
+- **Interconnect:** tensor parallelism across cards needs NVLink, so SXM H100 or A100 nodes, not PCIe-only
+  cards.
+- **Load:** a public product with sustained demand keeps H100s busy, where they are cheapest per token,
+  and fp8 on H100 gives KV room with less quality loss than int4.
 
 ## Quiz
 ### Q: Which card property most directly determines single-stream decode tokens per second for a given model and precision?

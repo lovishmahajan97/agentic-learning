@@ -5,7 +5,7 @@ name: Speculative decoding
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - model-internals/kv-cache
   - model-internals/sampling-strategies
@@ -23,28 +23,25 @@ sources:
 ---
 
 ## TL;DR
-Decoding is memory-bandwidth bound: each step reads all the weights to produce one token while the
-GPU's arithmetic units sit mostly idle. Speculative decoding uses that idle compute: a cheap draft model
-guesses several tokens ahead and the large model verifies all of them in one forward pass. A
-rejection-sampling rule keeps the output distribution exactly the large model's, so it is a pure
-latency optimization whose gain depends on how often the draft is right.
+Speculative decoding spends decode's idle GPU compute: a cheap draft guesses several tokens and the large
+model verifies them in one pass. A rejection-sampling rule keeps outputs exactly the large model's, so
+the gain is pure latency, set by draft acceptance.
 
 ## Why it exists
-During decode the large model produces one token per forward pass, and that pass is dominated by moving
-weights (and the KV cache) from GPU memory into the compute units, not by arithmetic. Processing two
-tokens in the same pass costs almost the same as processing one, because the weights are read once
-either way; the compute to multiply a second row is nearly free until the batch grows large enough to
-become compute-bound. Single-request latency therefore has a floor set by bandwidth, and buying a GPU
-with more FLOPs does little.
-
-The obstacle to using that slack is the autoregressive dependency: token *t+1* is unknown until token *t*
-is chosen, so you cannot simply ask for two tokens at once. The naive workaround, "use a smaller model",
-trades quality for speed, which is usually unacceptable. The insight behind speculative decoding is that
-you do not need to *know* the next tokens, only to *guess* them. If something cheap proposes a
-continuation, the large model can score every proposed position in one pass, because given a candidate
-prefix the model's distributions at all positions are computed in parallel, exactly as in prefill. Guess
-right and you advanced several tokens for the price of one pass; guess wrong and you lost only the cheap
-draft work.
+- **Decode is bandwidth-bound.** The large model produces one token per forward pass, and that pass is
+  dominated by moving weights (and the KV cache) from GPU memory into the compute units, not by
+  arithmetic.
+- **A second token in the same pass is nearly free.** The weights are read once either way, so the
+  compute for another row costs little until the batch grows large enough to become compute-bound.
+  Single-request latency has a bandwidth floor, and a GPU with more FLOPs does little.
+- **The autoregressive dependency blocks the obvious use.** Token *t+1* is unknown until token *t* is
+  chosen, so you cannot simply ask for two tokens at once. "Use a smaller model" trades quality for speed,
+  which is usually unacceptable.
+- **You only need to guess, not know.** If something cheap proposes a continuation, the large model scores
+  every proposed position in one pass, because given a candidate prefix its distributions at all positions
+  are computed in parallel, exactly as in prefill.
+- **Asymmetric payoff.** Guess right and you advance several tokens for the price of one pass; guess wrong
+  and you lose only the cheap draft work.
 
 ## How it works
 ### The loop
@@ -52,86 +49,133 @@ draft work.
    the current prefix, recording its probability `q(x)` for each. γ is typically a handful.
 2. **Verify.** The target model runs one forward pass over `prefix + γ candidates`. Because a causal
    model computes a distribution at every position in parallel, this yields the target's `p(·)` at all
-   γ draft positions plus one more position after the last candidate, with the same per-pass cost
-   profile as a short prefill.
-3. **Accept or reject, left to right.** For each candidate token *x* in turn, accept it with probability
-   `min(1, p(x) / q(x))`. On the first rejection, sample a replacement from the residual distribution
-   `normalize(max(0, p − q))` and stop. If all γ are accepted, sample one bonus token from the target's
-   distribution at the extra position.
+   γ draft positions plus one more after the last candidate, with the cost profile of a short prefill.
+3. **Accept or reject, left to right.** Accept each candidate *x* with probability `min(1, p(x) / q(x))`.
+   On the first rejection, sample a replacement from the residual distribution `normalize(max(0, p − q))`
+   and stop. If all γ are accepted, sample one bonus token from the target at the extra position.
 4. **Roll back.** KV-cache entries for rejected positions, in both models, are discarded; the accepted
    tokens are appended and the loop repeats.
 
 ### Why the output is exactly the target's
-The accept rule is a form of rejection sampling. Where the draft puts too little mass on a token
-(`q < p`), it is always accepted when drafted and the shortfall is made up by the residual on
-rejections; where the draft puts too much (`q > p`), it is accepted only a fraction `p/q` of the time.
-Summed over cases, the probability of emitting each token equals `p(x)` exactly, which is what makes the
-method lossless rather than an approximation. The one-line proof: the chance a drafted token is accepted
-is `α = Σ_x q(x)·min(1, p(x)/q(x)) = Σ_x min(p(x), q(x))`, and the residual's normalizer is
-`Σ_x max(0, p(x) − q(x)) = 1 − α`, the rejection probability. So
+- **It is rejection sampling.** Where the draft puts too little mass on a token (`q < p`), it is always
+  accepted when drafted and the shortfall is made up by the residual on rejections. Where it puts too much
+  (`q > p`), it is accepted only a fraction `p/q` of the time.
+- **Summed over cases,** the probability of emitting each token equals `p(x)` exactly, which makes the
+  method lossless rather than an approximation.
+- **The one-line proof.** The chance a drafted token is accepted is
+  `α = Σ_x q(x)·min(1, p(x)/q(x)) = Σ_x min(p(x), q(x))`, and the residual's normalizer is
+  `Σ_x max(0, p(x) − q(x)) = 1 − α`, the rejection probability. So
 
 ```
 P(emit x) = q(x)·min(1, p(x)/q(x)) + (1 − α) · max(0, p(x) − q(x)) / (1 − α)
           = min(p(x), q(x)) + max(0, p(x) − q(x)) = p(x)
 ```
 
-The same algebra tells you what acceptance rate to expect: `α = Σ min(p, q) = 1 − TV(p, q)`, one minus
-the total-variation distance between the two distributions. Acceptance is a direct measure of how much
-the drafter's distribution overlaps the target's, not of whether its single top guess is right. Under greedy decoding the rule collapses to "accept while
-the draft matches the target's argmax", which is the easiest version to reason about.
+- **Expected acceptance falls out of the same algebra:** `α = Σ min(p, q) = 1 − TV(p, q)`, one minus the
+  total-variation distance. Acceptance measures how much the drafter's distribution overlaps the
+  target's, not whether its single top guess is right.
+- **Under greedy decoding** the rule collapses to "accept while the draft matches the target's argmax",
+  the easiest version to reason about.
 
 ### What the speedup depends on
-Let α be the probability a draft token is accepted (a measure of draft–target agreement). Treating each
-position as an independent trial, the expected number of tokens produced per target pass is
-`(1 − α^(γ+1)) / (1 − α)`. With α = 0.8 and γ = 5 that is
-about 3.7 tokens per pass; with α = 0.5 it is about 2. The wall-clock gain is that figure divided by the
-relative cost of the cycle (γ draft steps plus one slightly longer target pass). Writing *c* for the
-cost of one draft step relative to one target pass, and treating verification as one target pass:
+Let α be the probability a draft token is accepted. Treating each position as an independent trial, the
+expected tokens per target pass is `(1 − α^(γ+1)) / (1 − α)`:
+
+| α | γ | Tokens per target pass |
+|---|---|---|
+| α = 0.8 | 5 | about 3.7 |
+| α = 0.5 | 5 | about 2 |
+
+The wall-clock gain divides that by the cycle's relative cost (γ draft steps plus one slightly longer
+target pass). With *c* the cost of one draft step relative to one target pass, treating verification as
+one target pass:
 
 ```
 speedup ≈ (1 − α^(γ+1)) / ((1 − α) · (γ·c + 1))
 ```
 
-So the draft must be much cheaper than the target *and* agree with it often; either alone is not
-enough. Agreement is highest on predictable text, such
-as code, boilerplate, structured output and anything that copies from the prompt, and lowest on creative
-text at high temperature. Increasing γ raises the ceiling but lowers the average acceptance of later
-positions, and past a point the extra verification compute costs more than it saves.
+- **Both conditions are needed.** The draft must be much cheaper than the target *and* agree with it
+  often; either alone is not enough.
+- **Agreement depends on the text.** Highest on predictable text such as code, boilerplate, structured
+  output and anything that copies from the prompt; lowest on creative text at high temperature.
+- **γ has an optimum.** Raising γ lifts the ceiling but lowers average acceptance of later positions, and
+  past a point the extra verification compute costs more than it saves.
 
 ### Where the draft comes from
-- **A separate small model** with the same tokenizer (needed so draft token ids are meaningful to the
-  target). A model from the same family, an order of magnitude or more smaller, is the usual choice.
-- **N-gram or prompt lookup**: propose the continuation that followed the same recent tokens earlier in
-  the context. No second model, near-zero cost, strong on RAG answers that quote sources and on code
-  edits that reproduce input, weak elsewhere.
-- **Extra heads on the target** (Medusa): small heads attached to the last hidden state predict tokens
-  at offsets +2, +3, ..., so drafting costs one target pass's worth of extra heads rather than a second
-  model. Candidates are verified as a tree in one pass. Note that Medusa also offers a relaxed "typical
-  acceptance" rule that trades exactness for higher acceptance; only the rejection-sampling rule above is
-  lossless, so check which mode a deployment uses before claiming identical outputs.
-- **A feature-level draft head** (EAGLE): a light autoregressive module that predicts the next hidden
-  state rather than the next token, reusing the target's own representations for higher acceptance.
+| Drafter | How it works | Strengths and costs |
+|---|---|---|
+| **Separate small model** | same tokenizer (so draft ids mean the same to the target), usually same family, an order of magnitude or more smaller | flexible, reusable across a family; extra weights and cache |
+| **N-gram or prompt lookup** | propose the continuation that followed the same recent tokens earlier in the context | no second model, near-zero cost; strong on RAG answers that quote sources and code edits that reproduce input, weak elsewhere |
+| **Extra heads (Medusa)** | heads on the last hidden state predict offsets +2, +3, ...; candidates verified as a tree in one pass | drafting costs one target pass's worth of extra heads, not a second model; heads trained per target |
+| **Feature-level head (EAGLE)** | a light autoregressive module predicts the next hidden state, not the next token | reuses the target's representations for higher acceptance |
+
+- **Check the acceptance mode.** Medusa also offers a relaxed "typical acceptance" rule that trades
+  exactness for higher acceptance; only the rejection-sampling rule above is lossless, so check which mode
+  a deployment uses before claiming identical outputs.
 
 ### Why it stops helping
-At high concurrency the server is already feeding the GPU many tokens per pass, and the arithmetic units
-are busy; verifying γ extra tokens per request then costs real compute and can lower total throughput.
-Speculative decoding is a latency tool for workloads with few concurrent requests, or a throughput tool
-only while the batch is still bandwidth-bound. Engines such as vLLM expose draft-model and n-gram modes
-with a configurable number of speculative tokens, and the right setting is found by measuring
-tokens/second per request and per GPU at the real batch size.
+- **High concurrency removes the idle compute.** The server already feeds the GPU many tokens per pass, so
+  verifying γ extra tokens per request costs real compute and can lower total throughput.
+- **So it is a latency tool** for workloads with few concurrent requests, or a throughput tool only while
+  the batch is still bandwidth-bound.
+- **Tune it by measurement.** Engines such as vLLM expose draft-model and n-gram modes with a configurable
+  number of speculative tokens; find the setting by measuring tokens/second per request and per GPU at the
+  real batch size.
 
-## Example
-First an illustrative cost model (every number here is invented for the arithmetic, not a benchmark),
-then a runnable verification step on toy distributions that exercises the accept, reject and bonus
-paths.
+## Diagram
+One speculation cycle: a cheap draft proposes γ tokens, one target pass scores them all, and the accept
+rule decides how many survive.
 
-Suppose a target pass takes 25 ms and a draft pass 2 ms, with γ = 5 and a verification pass that is
-slightly longer than a single-token pass, say 27 ms. A cycle costs 5 × 2 + 27 = 37 ms. At α = 0.8 it
-yields `(1 − 0.8⁶) / 0.2 ≈ 3.69` tokens, so about 10 ms per token against 25 ms baseline: a 2.5× gain.
-At α = 0.5 it yields about 1.97 tokens, 18.8 ms per token, a 1.3× gain. At α = 0.3 it yields about
-1.43 tokens, 25.9 ms per token: *slower* than not speculating. The same arithmetic with a draft that
-costs 8 ms instead of 2 turns the α = 0.8 case into 67 / 3.69 ≈ 18 ms per token. Acceptance rate and
-draft cost are the two numbers to measure before enabling it.
+```mermaid
+sequenceDiagram
+    participant D as Draft model
+    participant T as Target model
+    participant A as Accept rule
+    D->>D: Generate gamma tokens, record q
+    D->>T: Prefix plus gamma candidates
+    T->>T: One pass, p at gamma plus 1 positions
+    T->>A: p and q per position
+    A->>A: Accept x with prob min of 1 and p over q
+    Note over A: First rejection: sample from max of 0 and p minus q, stop
+    Note over A: All accepted: sample bonus token from target
+    A->>D: Accepted tokens, roll back rejected KV
+    A->>T: Accepted tokens, roll back rejected KV
+```
+
+## Examples
+### Illustrative cost model: when speculation pays
+Every number here is invented for the arithmetic, not a benchmark. A target pass takes 25 ms, a draft
+pass 2 ms, γ = 5, and verification is slightly longer than a single-token pass, say 27 ms. A cycle costs
+5 × 2 + 27 = 37 ms.
+
+| Acceptance | Tokens per cycle | ms per token | vs 25 ms baseline |
+|---|---|---|---|
+| α = 0.8 | `(1 − 0.8⁶) / 0.2 ≈ 3.69` | about 10 | a 2.5× gain |
+| α = 0.5 | about 1.97 | 18.8 | a 1.3× gain |
+| α = 0.3 | about 1.43 | 25.9 | *slower* than not speculating |
+| α = 0.8, draft costs 8 ms instead of 2 | 3.69 | 67 / 3.69 ≈ 18 | gain mostly gone |
+
+Acceptance rate and draft cost are the two numbers to measure before enabling it. The same model as a
+pure-Python calculator:
+
+```python
+def ms_per_token(alpha, gamma, draft_ms, verify_ms):
+    tokens = (1 - alpha ** (gamma + 1)) / (1 - alpha)   # expected tokens per cycle
+    return (gamma * draft_ms + verify_ms) / tokens
+
+BASE = 25.0                                             # target ms per token, no speculation
+for alpha, draft_ms in [(0.8, 2), (0.5, 2), (0.3, 2), (0.8, 8)]:
+    t = ms_per_token(alpha, 5, draft_ms, 27)
+    print(f"alpha={alpha} draft={draft_ms}ms: {t:5.1f} ms/token, speedup {BASE / t:.2f}x")
+# alpha=0.8 draft=2ms:  10.0 ms/token, speedup 2.49x
+# alpha=0.5 draft=2ms:  18.8 ms/token, speedup 1.33x
+# alpha=0.3 draft=2ms:  25.9 ms/token, speedup 0.96x
+# alpha=0.8 draft=8ms:  18.2 ms/token, speedup 1.38x
+```
+
+### A runnable verification step
+Toy distributions that exercise the accept, reject and bonus paths, checking measured tokens per pass
+against the formula.
 
 ```python
 import torch
@@ -166,41 +210,60 @@ print(f"alpha={alpha:.2f} predicted={(1 - alpha**(gamma + 1)) / (1 - alpha):.2f}
 # A stationary toy: real positions have different distributions, but the accept/reject logic is identical.
 ```
 
+## Production patterns
+- **Try prompt lookup first on copy-heavy routes.** For RAG answers that quote sources or code edits, use
+  n-gram drafting: no second model to host. In Hugging Face Transformers, `generate(...,
+  prompt_lookup_num_tokens=10)`; in vLLM, its n-gram speculative method. Monitor acceptance rate and time
+  per output token.
+- **Use assisted generation with a same-family drafter.** In Hugging Face, `model.generate(...,
+  assistant_model=draft)` with a much smaller model sharing the tokenizer; in vLLM, its draft-model
+  speculative mode with a set number of speculative tokens. Monitor acceptance, draft memory and p95 time
+  per output token.
+- **Split latency and throughput pools.** Enable speculation on low-concurrency interactive pools (chat,
+  coding, sequential agents) and leave high-batch pools without it. Monitor per-GPU tokens/second in each
+  pool, since that is what speculation can lower.
+- **Tune γ at production concurrency.** Sweep the number of speculative tokens (for example 2 to 6)
+  under replayed real traffic and pick the best p50/p95 time per output token that does not cut per-GPU
+  throughput. Re-tune when the batch size or model changes.
+- **Gate on output equivalence.** With greedy decoding and the lossless rule, outputs should match the
+  non-speculative path; diff a sample of responses after enabling it, and confirm the acceptance mode
+  (strict vs typical) before promising identical outputs.
+
 ## Trade-offs
-- Fewer target passes per token cut single-request latency, but the draft model's weights and KV cache
-  take GPU memory and its passes take time; the gain flips negative when acceptance is low or the draft
-  is not much cheaper than the target.
-- Lossless by construction with the rejection rule, whereas simply trusting the draft would be faster
-  still but changes outputs; the guarantee costs the residual-sampling bookkeeping and cache rollback.
-- A separate draft model is flexible and reusable across targets in a family, while attached heads
-  (Medusa, EAGLE) avoid a second model and achieve higher acceptance, at the cost of training heads per
-  target model.
-- Larger γ raises the best-case tokens per pass but spends more verification compute on positions that
-  are increasingly likely to be rejected; the optimum shifts lower as batch size grows.
+- **Fewer target passes vs draft overhead.** Single-request latency drops, but the draft's weights and KV
+  cache take GPU memory and its passes take time. The gain flips negative when acceptance is low or the
+  draft is not much cheaper than the target.
+- **Lossless vs fastest.** The rejection rule is lossless by construction; simply trusting the draft would
+  be faster but changes outputs. The guarantee costs residual-sampling bookkeeping and cache rollback.
+- **Separate drafter vs attached heads.** A separate draft model is flexible and reusable across a family;
+  attached heads (Medusa, EAGLE) avoid a second model and achieve higher acceptance, at the cost of
+  training heads per target model.
+- **Larger γ vs wasted verification.** It raises best-case tokens per pass but spends more verification on
+  positions increasingly likely to be rejected; the optimum shifts lower as batch size grows.
 
 ## Pitfalls
-- Enabling speculation on a heavily batched server and watching throughput fall; verification tokens
-  compete for compute that was no longer idle, so per-GPU tokens/second drops even as a lone request
-  speeds up.
-- Pairing a draft model with a different tokenizer; the symptom is near-zero acceptance or outright
-  errors because draft token ids do not mean the same thing to the target.
-- Measuring the speedup on greedy code completion and assuming it holds for creative writing at
+- **Enabling it on a heavily batched server.** Throughput falls: verification tokens compete for compute
+  that was no longer idle, so per-GPU tokens/second drops even as a lone request speeds up.
+- **A draft model with a different tokenizer.** Symptom: near-zero acceptance or outright errors, because
+  draft token ids do not mean the same thing to the target.
+- **Benchmarking on greedy code completion only.** Assuming the speedup holds for creative writing at
   temperature 1; acceptance falls with entropy and the gain shrinks or inverts.
-- Forgetting to roll back KV-cache entries for rejected draft tokens; the symptom is corrupted
-  continuations that reference text the model never emitted.
-- Treating a reported speedup as a property of the method rather than of the draft–target pair and the
+- **Forgetting to roll back rejected KV entries.** Symptom: corrupted continuations that reference text
+  the model never emitted.
+- **Treating a reported speedup as a property of the method.** It belongs to the draft–target pair and the
   workload; the same engine setting can help one customer and hurt another.
 
 ## When to use
-Reach for it when per-request latency (time per output token) matters more than aggregate throughput:
-interactive assistants, coding tools, agents making many sequential calls, or any deployment with few
-concurrent requests per GPU. Expect the most from predictable outputs: code, structured data, RAG
-answers that quote context, and templated text; n-gram drafting is nearly free to try there. Skip it or
-measure carefully when the server runs large batches or outputs are high-entropy. Measure acceptance
-rate, tokens per target pass, p50/p95 time per output token and per-GPU throughput before and after,
-at production concurrency. In interviews, the expected depth is the memory-bandwidth argument, the
-accept/reject rule and why it is lossless, the expected-tokens formula, and the conditions under which
-the technique backfires.
+- **Use when** per-request latency (time per output token) matters more than aggregate throughput:
+  interactive assistants, coding tools, agents making many sequential calls, or any deployment with few
+  concurrent requests per GPU.
+- **Expect the most** from predictable outputs: code, structured data, RAG answers that quote context, and
+  templated text; n-gram drafting is nearly free to try there.
+- **Avoid or measure carefully** when the server runs large batches or outputs are high-entropy.
+- **Measure** acceptance rate, tokens per target pass, p50/p95 time per output token and per-GPU
+  throughput before and after, at production concurrency.
+- **Interviews:** the memory-bandwidth argument, the accept/reject rule and why it is lossless, the
+  expected-tokens formula, and the conditions under which the technique backfires.
 
 ## Role lens
 - **Engineer:** Enables draft-model or n-gram speculation in the serving engine, tunes γ, and reads
@@ -223,6 +286,39 @@ aggregate tokens per second drops even though a lone request would still be fast
 acceptance rate and per-GPU throughput at production concurrency, lower γ or switch to a cheaper
 drafter such as n-gram lookup, and most likely restrict speculation to a latency-sensitive pool with
 low concurrency while leaving the high-throughput pool without it.
+
+## Interview questions
+### Why is speculative decoding lossless, unlike just using a smaller model?
+- **Rejection sampling.** Each draft token is accepted with probability `min(1, p/q)`, and on rejection a
+  replacement comes from the residual `max(0, p − q)`; together the emitted token is distributed exactly
+  as `p(x)`.
+- **So the draft only affects speed.** A bad drafter lowers acceptance and wastes work, but never changes
+  what the target would have produced.
+
+### With α = 0.8 and γ = 5, how many tokens per target pass do you expect, and what speedup?
+- **Tokens:** `(1 − 0.8⁶) / 0.2 ≈ 3.69` per cycle.
+- **Speedup depends on draft cost.** With 2 ms draft steps and a 27 ms verify pass against a 25 ms
+  baseline, about 10 ms per token, roughly 2.5×; with 8 ms draft steps it falls to about 1.4×.
+
+### Acceptance is only 20% after you enable a draft model. What do you check?
+- **Tokenizer and prompt format.** The drafter must share the tokenizer and see the same chat template, or
+  its token ids and context differ from the target's.
+- **Workload and settings.** High temperature or creative routes lower overlap; compare acceptance by route,
+  try a closer same-family drafter, n-gram lookup on copy-heavy routes, or a smaller γ.
+
+### How do you choose between a draft model, n-gram lookup and Medusa or EAGLE heads?
+- **N-gram lookup** costs almost nothing and shines when outputs copy the prompt, but helps little on novel
+  text.
+- **A draft model** works across tasks without training, at the cost of extra memory and a shared-tokenizer
+  constraint.
+- **Medusa or EAGLE heads** usually reach higher acceptance with no second model, but must be trained per
+  target, and some Medusa modes are not lossless.
+
+### How would you pick γ for a production deployment?
+- **Sweep it under real load.** Replay production traffic at real concurrency for several values and
+  measure p50/p95 time per output token and per-GPU throughput.
+- **Expect a moving optimum.** Later positions are accepted less often, and verification compute is less
+  idle as batches grow, so the best γ falls with concurrency and must be re-tuned.
 
 ## Quiz
 ### Q: Why can the target model verify several draft tokens for roughly the cost of generating one?

@@ -5,7 +5,7 @@ name: Exactly-once processing limitations
 kind: concept
 difficulty: advanced
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - system-design/outbox-inbox-patterns
   - system-design/event-driven-architecture
@@ -23,103 +23,127 @@ sources:
 ---
 
 ## TL;DR
-Exactly-once *delivery* over an unreliable network is impossible: a sender without an acknowledgement
-cannot tell whether the message or the ack was lost, so it must risk a duplicate or a loss. What you can
-build is exactly-once *effect*: at-least-once delivery plus deduplication or idempotent processing, with
-the dedupe state committed together with the effect. Every "exactly-once" feature, Kafka transactions
-included, stops at that boundary; external API calls and LLM invocations beyond it are not covered.
+Exactly-once *delivery* over a lossy network is impossible; exactly-once *effect* is buildable from
+at-least-once delivery plus deduplication committed with the effect. Every "exactly-once" feature, Kafka
+transactions included, stops at that boundary; external APIs and LLM calls are not covered.
 
 ## Why it exists
-Every retry policy, every queue and every agent framework eventually meets the same question from a
-product owner: "can you guarantee this runs exactly once?" The honest answer needs the reasoning, because
-the marketing answer ("our broker supports exactly-once") hides where the guarantee ends.
+- **Everyone eventually asks "can you guarantee this runs exactly once?"** The honest answer needs the
+  reasoning, *because* the marketing answer ("our broker supports exactly-once") hides where the guarantee
+  ends.
+- **A consumer has three failure points.** It reads, applies the effect, then acks:
 
-Picture a consumer that reads a message, applies its effect and acknowledges. Three failure points exist:
-before the effect (safe to redeliver), after the effect but before the ack (redelivery duplicates the
-effect), and after the ack (fine). The middle case is unavoidable because "apply effect" and "send ack"
-are two operations on two systems. If the consumer acks *before* applying the effect, a crash in between
-loses the message instead. Those are the only two choices a protocol can make: **at-most-once** (ack
-first, may lose) or **at-least-once** (ack last, may duplicate). Jim Gray's framing of the two generals
-problem makes it exact: two parties exchanging messages over a channel that can drop them can never reach
-certainty that both know the outcome, no matter how many confirmations they send, because the last
-confirmation could always be the one that was lost.
+| Crash point | Result on redelivery |
+|---|---|
+| Before the effect | safe to redeliver |
+| After the effect, before the ack | redelivery duplicates the effect |
+| After the ack | fine |
 
-The naive escape is "make the network reliable" with TCP, retries and timeouts. TCP gives exactly-once
-*within a connection*; the moment a connection breaks and the client opens a new one and retries, the
-server sees the request twice. Timeouts make it worse: a request that timed out may have been processed,
-and the client simply does not know. This is the state an LLM-calling service is in several times an
-hour.
-
-So the problem is reframed. Nobody needs the *message* exactly once; they need the *effect* exactly once.
-That is achievable, with conditions, and the conditions are the content of this lesson.
+- **The middle case is unavoidable** because "apply effect" and "send ack" are two operations on two
+  systems. Acking *before* the effect just moves the crash window and loses the message instead. A
+  protocol can only choose **at-most-once** (ack first, may lose) or **at-least-once** (ack last, may
+  duplicate).
+- **The two generals problem makes it exact.** Jim Gray's framing: two parties exchanging messages over a
+  channel that can drop them can never be certain both know the outcome, no matter how many confirmations
+  they send, *because* the last confirmation could always be the one that was lost. A sender without an
+  ack cannot tell whether the message or the ack was lost.
+- **"Make the network reliable" does not escape it.** TCP gives exactly-once *within a connection*; once a
+  connection breaks and the client retries on a new one, the server sees the request twice. A request
+  that timed out may have been processed, and the client does not know. An LLM-calling service is in this
+  state several times an hour.
+- **So reframe:** nobody needs the *message* exactly once; they need the *effect* exactly once. That is
+  achievable with conditions, and the conditions are this lesson.
 
 ## How it works
 ### Effectively-once: the recipe
-Take at-least-once delivery and make processing idempotent. Two mechanisms do this:
-
+Take at-least-once delivery and make processing idempotent:
 1. **Deduplication.** The receiver records each processed message id (an inbox table, a Redis set with
    TTL; on the broker side, Kafka dedupes producer retries by per-partition sequence number) and skips
-   repeats. It works for any effect, but only if the
-   record and the effect commit atomically, which is why the inbox row lives in the same database
-   transaction as the business write.
-2. **Natural idempotency.** The effect is defined so that applying it twice equals applying it once:
-   `SET status='paid'`, an upsert keyed by order id, `PUT` rather than `POST`. No dedupe state is needed,
-   but the effect must be formulated as an absolute state rather than a delta (`balance += 10` is not
-   idempotent; `balance = 110 WHERE version = 7` is).
-3. **Store the input position with the effect.** A consumer that writes to a database can save the
-   source offset (topic, partition, offset) in the same transaction as its output, and on restart seek
-   to the stored offset instead of trusting the broker's committed one. The offset *is* the dedupe
-   record: a message is either reflected in both the output and the stored offset or in neither. This
-   works only when one consumer owns each partition's offset row, and it is the usual way to get
-   exactly-once from a log into a relational sink.
+   repeats.
+   - Works for any effect, but only if the record and the effect commit atomically, which is why the inbox
+     row lives in the same database transaction as the business write.
+2. **Natural idempotency.** The effect is defined so applying it twice equals applying it once:
+   `SET status='paid'`, an upsert keyed by order id, `PUT` rather than `POST`.
+   - No dedupe state is needed, but the effect must be an absolute state rather than a delta:
+     `balance += 10` is not idempotent; `balance = 110 WHERE version = 7` is.
+3. **Store the input position with the effect.** A consumer writing to a database saves the source offset
+   (topic, partition, offset) in the same transaction as its output, and on restart seeks to the stored
+   offset instead of trusting the broker's committed one.
+   - The offset *is* the dedupe record: a message is reflected in both the output and the stored offset, or
+     in neither.
+   - Works only when one consumer owns each partition's offset row; it is the usual way to get exactly-once
+     from a log into a relational sink.
 
 ### What Kafka's "exactly-once semantics" actually covers
-The **idempotent producer** attaches a producer id and a per-partition sequence number to every batch;
-the broker rejects a batch whose sequence it has already appended, so a producer retry after a lost ack
-does not create a duplicate record. **Transactions** extend this to read-process-write loops entirely
-inside Kafka: a consumer reads from topic A, produces to topic B, and commits its input offsets as part
-of the same transaction, so either both the output records and the offset advance or neither does.
-Consumers configured with `read_committed` never see records from aborted transactions. This is genuine
-exactly-once for stream processing whose input and output are both Kafka topics. The limitation is the
-boundary: if the processing step calls a payment API or writes to Postgres, those effects are outside the
-transaction and the standard at-least-once reasoning returns. Flink's checkpoint-based exactly-once has
-the same shape: operator state is restored consistently from the last checkpoint, and sinks are
-exactly-once only when they are idempotent or support a two-phase-commit protocol.
+- **Idempotent producer.** Attaches a producer id and a per-partition sequence number to every batch; the
+  broker rejects a batch whose sequence it already appended, so a producer retry after a lost ack does not
+  create a duplicate record.
+- **Transactions.** Extend this to read-process-write loops entirely inside Kafka: read from topic A,
+  produce to topic B, and commit input offsets in the same transaction, so output records and the offset
+  advance together or not at all.
+- **`read_committed` consumers** never see records from aborted transactions.
+- **Genuine exactly-once,** but only for stream processing whose input and output are both Kafka topics.
+- **The boundary:** if the processing step calls a payment API or writes to Postgres, those effects are
+  outside the transaction and at-least-once reasoning returns.
+- **Flink has the same shape.** Checkpoint-based exactly-once restores operator state consistently from the
+  last checkpoint; sinks are exactly-once only when idempotent or supporting a two-phase-commit protocol.
 
 ### Where it breaks: the limitations
-- **External side effects.** Any effect in a system that does not share the transaction (HTTP APIs, email,
-  file storage, a model call) is at-least-once unless that system accepts an idempotency key and
-  deduplicates for you. Payment providers do; most internal services and most LLM endpoints do not.
+- **External side effects.** Any effect in a system outside the transaction (HTTP APIs, email, file storage,
+  a model call) is at-least-once unless that system accepts an idempotency key and deduplicates for you.
+  Payment providers do; most internal services and most LLM endpoints do not.
 - **Finite dedupe windows.** Ids are kept for a window (a table retention, a TTL, Kafka's producer-session
-  state). A replay or redelivery that arrives after the window is treated as new. The window must exceed
-  the longest possible redelivery delay, including the dead-letter queue's replay time.
-- **Key stability.** Deduplication needs the same key on every attempt. A client that generates a fresh
-  UUID per retry defeats it. The key must be created once, before the first attempt, and persisted by the
-  caller; for agent steps it is derived from `(run_id, step_id)`, never from the attempt number or the
-  current time.
-- **Non-deterministic processing.** Replaying a step that calls a model yields a different output and
-  possibly different downstream tool arguments. Idempotency then means *memoisation*: store the output
-  under the key on first success and return the stored output on every later attempt. Durable-execution
-  engines do exactly this.
-- **Unknown outcomes.** When a call times out, dedupe alone does not tell you whether the effect happened.
-  The only resolution is to query the receiver by key (reconciliation) before retrying or compensating.
-- **Ordering across keys.** Dedupe is per key; two different messages that must be applied in order are a
+  state); a redelivery after the window is treated as new. The window must exceed the longest possible
+  redelivery delay, including the dead-letter queue's replay time.
+- **Key stability.** Dedupe needs the same key on every attempt; a fresh UUID per retry defeats it. Create the
+  key once, before the first attempt, and persist it; for agent steps derive it from `(run_id, step_id)`,
+  never from the attempt number or the current time.
+- **Non-deterministic processing.** Replaying a model call yields a different output and possibly different
+  tool arguments. Idempotency then means *memoisation*: store the output under the key on first success and
+  return it on every later attempt. Durable-execution engines do exactly this.
+- **Unknown outcomes.** After a timeout, dedupe alone does not tell you whether the effect happened. The
+  only resolution is to query the receiver by key (reconciliation) before retrying or compensating.
+- **Ordering across keys.** Dedupe is per key; two different messages that must apply in order are a
   separate problem, solved by partitioning, not by idempotency.
 - **Cost.** Transactional producers add coordinator round trips and reduce throughput; inbox tables add a
-  write and an index per message. Exactly-once is paid for per message, which argues for applying it only
-  where duplicates actually hurt.
+  write and an index per message. Exactly-once is paid per message, so apply it only where duplicates hurt.
 - **Human-visible effects.** A duplicate notification cannot be deduplicated after the fact; the dedupe has
-  to sit before the send, and the send itself must be the last thing before the commit, not the first.
+  to sit before the send, and the send must be the last thing before the commit, not the first.
 
 ### A boundary test
-For each effect a handler produces, ask: does the dedupe record commit atomically with this effect? If
-yes, the effect is exactly-once within the dedupe window. If no, it is at-least-once and needs either an
-idempotency key honoured by the receiver, a memoised result, or acceptance of duplicates.
+For each effect a handler produces, ask: **does the dedupe record commit atomically with this effect?**
 
-## Example
-An agent step must email a customer a model-written draft at most once per `(run_id, step_id)`, even
-though the worker can be killed at any instruction and the model is non-deterministic. The step is split
-into phases, each idempotent on its own, with the state persisted between them.
+| Answer | Guarantee | What else it needs |
+|---|---|---|
+| Yes | exactly-once within the dedupe window | a window longer than any redelivery delay |
+| No | at-least-once | an idempotency key honoured by the receiver, a memoised result, or acceptance of duplicates |
+
+## Diagram
+Why the ack cannot be trusted: the effect lands, the ack is lost, the broker redelivers, and only a dedupe
+record committed with the effect turns the second delivery into a no-op.
+
+```mermaid
+sequenceDiagram
+    participant B as Broker
+    participant C as Consumer
+    participant D as Consumer DB
+    participant X as External API
+    B->>C: deliver event e1
+    C->>D: one transaction: effect + inbox row e1
+    C--xB: ack lost, consumer crashes
+    B->>C: redeliver e1
+    C->>D: insert inbox row e1
+    D-->>C: conflict, already processed
+    C->>B: ack, no second effect
+    Note over C,X: a call to X before the commit is outside the transaction
+    C->>X: send with idempotency key run:step
+```
+
+## Examples
+### Agent step: email a model-written draft at most once
+An agent step must email a customer a model-written draft at most once per `(run_id, step_id)`, even though
+the worker can be killed at any instruction and the model is non-deterministic. The step is split into
+phases, each idempotent on its own, with the state persisted between them.
 
 ```python
 import psycopg   # conn opened with autocommit=True: each statement commits on its own
@@ -149,57 +173,124 @@ def email_draft_once(conn, run_id, step_id, llm, mailer, prompt, to):
     return draft
 ```
 
-Walk the kill points. Killed during the model call or before the insert: the retry calls the model again,
-which wastes tokens but has no visible effect, because nothing was sent. Killed after the insert, before
-the send: the retry finds `drafted`, skips the model and sends the *stored* draft, so what is sent is the
-same text whichever attempt sends it. Killed after the send, before the update: the retry sends again
-with the same key and the provider suppresses the duplicate, as long as its key retention outlasts the
-retry delay. Killed after the update: the retry returns immediately. Two workers racing on the same key
-both may call the model, but `ON CONFLICT DO NOTHING` keeps the first draft and both send that one with
-one key. The single residual duplicate is the third kill point with a provider that ignores idempotency
-keys; no ordering of our code can remove it, which is the two-generals result showing up in practice.
+Walk the kill points:
+
+| Killed | What the retry does | Visible effect |
+|---|---|---|
+| During the model call or before the insert | calls the model again | none; wasted tokens, nothing was sent |
+| After the insert, before the send | finds `drafted`, skips the model, sends the *stored* draft | the same text whichever attempt sends it |
+| After the send, before the update | sends again with the same key; the provider suppresses the duplicate | none, as long as the provider's key retention outlasts the retry delay |
+| After the update | returns immediately | none |
+| Two workers racing on one key | both may call the model; `ON CONFLICT DO NOTHING` keeps the first draft | both send that draft with one key |
+
+- **The single residual duplicate** is the third kill point with a provider that ignores idempotency keys.
+  No ordering of our code can remove it; that is the two-generals result showing up in practice.
+
+### Runnable: at-most-once vs at-least-once vs dedupe
+A broker redelivers until it sees an ack, and the consumer crashes between effect and ack 1% of the time.
+Only the dedupe record committed with the effect gives zero losses and zero duplicates.
+
+```python
+import random
+
+def run(mode, n=10_000, p_crash=0.01, seed=7):
+    rng = random.Random(seed)
+    applied = {}                     # message id -> times its effect was applied
+    processed = set()                # dedupe record, committed together with the effect
+    for mid in range(n):
+        while True:                  # the broker redelivers until it sees an ack
+            crash = rng.random() < p_crash
+            if mode == "at-most-once":           # ack first, then apply
+                if not crash:
+                    applied[mid] = applied.get(mid, 0) + 1
+                break                            # acked either way: a crash loses it
+            if mode == "dedupe" and mid in processed:
+                break                            # duplicate: ack without re-applying
+            applied[mid] = applied.get(mid, 0) + 1
+            if mode == "dedupe":
+                processed.add(mid)               # same transaction as the effect
+            if not crash:
+                break                            # ack sent; a crash here means redelivery
+    return n - len(applied), sum(c - 1 for c in applied.values())
+
+for mode in ("at-most-once", "at-least-once", "dedupe"):
+    lost, dupes = run(mode)
+    print(f"{mode:14} lost={lost:4} duplicates={dupes:4}")
+# at-most-once   lost= 106 duplicates=   0
+# at-least-once  lost=   0 duplicates= 106
+# dedupe         lost=   0 duplicates=   0
+```
+
+The simulation's dedupe record is in memory; in a real system it survives only if it commits in the same
+transaction as the effect.
+
+## Production patterns
+- **Kafka-to-Kafka with transactions.** For pipelines whose input and output are both topics, set
+  `processing.guarantee=exactly_once_v2` in Kafka Streams (or, with a plain client, a `transactional.id`
+  on the producer and `isolation.level=read_committed` on consumers). Monitor transaction abort rate and
+  end-to-end latency, which rises with commit interval.
+- **Offsets stored in the sink.** For a log-to-Postgres consumer, write the output rows and the
+  `(topic, partition, offset)` row in one transaction, and on startup seek each assigned partition to the
+  stored offset. Monitor the gap between stored offsets and the broker's committed offsets.
+- **Provider idempotency keys from stable ids.** Pass `{run_id}:{step_id}` as the idempotency key to
+  payment and messaging providers that honour one (Stripe accepts an `Idempotency-Key` header), and check
+  the provider's documented key retention against your longest retry delay. Track keys per logical
+  operation; more than one means keys are being generated per attempt.
+- **Memoised step results.** Persist every model output and tool result in a `step_results` table (or use a
+  durable-execution engine that records them) before acting on it. Monitor replays served from memo versus
+  fresh model calls.
+- **Reconciliation for unknown outcomes.** A scheduled job finds steps left in an in-between state (for
+  example `drafted` older than a threshold), queries the receiver by key, and repairs. Track the count of
+  unknown-outcome timeouts and how many reconciliation actually changed.
+- **Dedupe window sized to the DLQ.** Set inbox retention or dedupe TTL longer than the maximum time a
+  message can sit in a dead-letter queue before replay. Plot the age distribution of redeliveries against
+  the window.
 
 ## Trade-offs
-- At-least-once with idempotent consumers is cheap, broker-agnostic and robust, but it pushes dedupe
-  state and key discipline into every consumer; broker-level transactions remove that burden only for
-  broker-to-broker pipelines.
-- Kafka transactions give true exactly-once inside Kafka at the cost of throughput and latency from
-  coordinator round trips; for pipelines whose sink is a database or an API they add cost without
-  extending the guarantee.
-- Long dedupe windows catch late redeliveries but grow storage and slow the lookup; short windows are
-  cheap but let a replayed dead-letter message through as a fresh event.
-- Memoising non-deterministic outputs makes agent replays reproducible and avoids repeated model spend,
-  yet it freezes a possibly poor output; a deliberate "regenerate" must use a new key, which is a
-  product decision, not a retry.
-- Accepting duplicates is sometimes the right trade: for an idempotent upsert into a search index, the
-  cost of a duplicate is a wasted write, which is cheaper than any dedupe machinery.
+- **Idempotent consumers vs broker transactions.** At-least-once with idempotent consumers is cheap,
+  broker-agnostic and robust, but pushes dedupe state and key discipline into every consumer; broker-level
+  transactions remove that burden only for broker-to-broker pipelines.
+- **Kafka transactions vs throughput.** True exactly-once inside Kafka costs throughput and latency from
+  coordinator round trips; for pipelines whose sink is a database or an API they add cost without extending
+  the guarantee.
+- **Long vs short dedupe windows.** Long windows catch late redeliveries but grow storage and slow the
+  lookup; short windows are cheap but let a replayed dead-letter message through as a fresh event.
+- **Memoisation vs fresh outputs.** Memoising non-deterministic outputs makes agent replays reproducible and
+  avoids repeated model spend, yet freezes a possibly poor output; a deliberate "regenerate" must use a new
+  key, which is a product decision, not a retry.
+- **Accepting duplicates vs dedupe machinery.** Sometimes duplicates are the right trade: for an idempotent
+  upsert into a search index, a duplicate costs a wasted write, cheaper than any dedupe machinery.
 
 ## Pitfalls
-- Believing the broker's "exactly-once" flag covers the HTTP call inside the handler; the symptom is
-  duplicate charges or double-posted messages that appear only during broker rebalances or deploys.
-- Generating the idempotency key per attempt (`uuid4()` inside the retry loop); duplicates persist despite
-  "having idempotency keys", visible as several keys for one logical operation in the provider's logs.
-- A dedupe TTL shorter than the dead-letter replay delay; messages replayed from the DLQ a day later are
+- **Believing the broker's "exactly-once" flag covers the HTTP call inside the handler.** Symptom: duplicate
+  charges or double-posted messages that appear only during broker rebalances or deploys.
+- **Generating the idempotency key per attempt** (`uuid4()` inside the retry loop). Duplicates persist
+  despite "having idempotency keys", visible as several keys for one logical operation in the provider's
+  logs.
+- **A dedupe TTL shorter than the dead-letter replay delay.** Messages replayed from the DLQ a day later are
   processed again because their ids have expired.
-- Recording the processed id in a different store (Redis) from the effect (Postgres); a crash between the
-  two writes either loses the effect or lets the duplicate through, and the inconsistency is rare enough
-  to be blamed on "flakiness" for months.
-- Retrying a timed-out model or tool call without memoisation; each retry produces a different answer and
-  the downstream saga compensations no longer match what was actually done.
-- Treating delta updates as idempotent; `credits -= 1` applied twice is wrong, discovered when customer
+- **Recording the processed id in a different store (Redis) from the effect (Postgres).** A crash between
+  the two writes loses the effect or lets the duplicate through, and the inconsistency is rare enough to be
+  blamed on "flakiness" for months.
+- **Retrying a timed-out model or tool call without memoisation.** Each retry produces a different answer
+  and the downstream saga compensations no longer match what was actually done.
+- **Treating delta updates as idempotent.** `credits -= 1` applied twice is wrong, discovered when customer
   balances drift from the ledger.
 
 ## When to use
-Decide per effect, not per system. For each side effect a handler or agent step produces, classify it:
-naturally idempotent (upserts, absolute state), deduplicable in the same transaction (inbox or result
-table), idempotent at the receiver (payment and messaging providers that honour keys), or
-duplicate-tolerant. Only effects in none of those classes need the heavyweight options: broker
-transactions for Kafka-to-Kafka flows, or a reconciliation job that detects and repairs duplicates after
-the fact. Measure duplicate rate at each dedupe point, the age distribution of redeliveries against your
-window, and the number of unknown-outcome timeouts needing reconciliation. In day-to-day work this is the
-`idempotency_key` parameter on every tool adapter and the `step_results` table in the agent runtime. In
-interviews, the strong answer explains why delivery cannot be exactly-once, defines effectively-once via
-atomic dedupe plus effect, and names the boundary where the guarantee ends.
+Decide per effect, not per system. Classify each side effect a handler or agent step produces:
+- **Naturally idempotent:** upserts, absolute state.
+- **Deduplicable in the same transaction:** inbox or result table.
+- **Idempotent at the receiver:** payment and messaging providers that honour keys.
+- **Duplicate-tolerant:** a duplicate costs only a wasted write.
+- **None of those:** only these need the heavyweight options, broker transactions for Kafka-to-Kafka flows
+  or a reconciliation job that detects and repairs duplicates after the fact.
+- **Measure:** duplicate rate at each dedupe point, the age distribution of redeliveries against your
+  window, and the number of unknown-outcome timeouts needing reconciliation.
+- **Day to day:** the `idempotency_key` parameter on every tool adapter and the `step_results` table in the
+  agent runtime.
+- **Interviews:** explain why delivery cannot be exactly-once, define effectively-once via atomic dedupe
+  plus effect, and name the boundary where the guarantee ends.
 
 ## Role lens
 - **Engineer:** Derives stable idempotency keys from run and step ids, memoises model outputs per step,
@@ -223,6 +314,45 @@ reconciliation that searches the channel for the summary's correlation id before
 residual risk explicitly: with a provider that lacks idempotency keys, the duplicate probability equals
 the probability of a crash between Slack accepting the post and our marker committing, a window of one
 response round trip plus one write, which is small but not zero.
+
+## Interview questions
+### What is the difference between exactly-once delivery and exactly-once processing?
+- **Delivery** is about the message crossing the network once; it is impossible over a lossy channel
+  because a sender without an ack cannot tell a lost message from a lost ack.
+- **Processing (effect)** is about the outcome being applied once; it is achievable with at-least-once
+  delivery plus dedupe or idempotent effects.
+- **The condition:** the dedupe record must commit atomically with the effect, and only within the dedupe
+  window.
+
+### Your team enabled Kafka exactly-once, yet customers were charged twice during a rebalance. Explain.
+- **The guarantee stops at Kafka.** Transactions make input offsets and output records atomic; the payment
+  API call inside the handler is outside that transaction.
+- **During a rebalance** the partition moves to another consumer before the offset commit, so the new owner
+  reprocesses the message and calls the API again.
+- **Fix:** send a stable idempotency key derived from the event or `(run_id, step_id)` to the payment
+  provider, and reconcile by key on timeouts.
+
+### When would you deliberately accept duplicates instead of building dedupe?
+- **When the effect is naturally idempotent,** such as an upsert into a search index or a vector store with
+  deterministic ids: a duplicate is a wasted write.
+- **When dedupe costs more than the duplicate,** for example a metrics counter where a rare double count is
+  within tolerance.
+- **Never for human-visible or financial effects;** a duplicate email or charge cannot be undone after the
+  fact.
+
+### How long should your dedupe window be, and what happens if it is too short?
+- **Longer than the longest redelivery delay,** including how long a message can sit in a dead-letter queue
+  before someone replays it.
+- **Too short:** a DLQ replay a day later finds its id expired and is processed as new, a duplicate that
+  looks like a fresh event.
+- **Measure** the age distribution of redeliveries and compare its tail with the window.
+
+### How do you make a retried LLM step produce the same downstream behaviour?
+- **Memoise, do not regenerate.** Persist the model output under a stable `(run_id, step_id)` key on first
+  success and return it on every later attempt.
+- **Temperature zero is not enough;** it is not guaranteed deterministic across runs, and different output
+  means different tool arguments and mismatched compensations.
+- **A deliberate regenerate** is a new key and a product decision, not a retry.
 
 ## Quiz
 ### Q: Why can no protocol over a lossy network guarantee exactly-once delivery?

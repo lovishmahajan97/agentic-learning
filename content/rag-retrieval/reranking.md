@@ -121,6 +121,24 @@ large and latency and cost grow for no gain, because recall@n has plateaued.
   passage" threshold possible.
 - **Calibrate on labeled data;** it is not a probability unless the training made it one.
 
+## Diagram
+Follow the funnel: the cheap first stage narrows the corpus to n candidates, the cross-encoder scores
+each query–passage pair jointly in one batch, and only the top k (after dedup and an optional threshold)
+reach the prompt.
+
+```mermaid
+flowchart TD
+    C[("Corpus: millions of chunks")] --> R1["First stage: BM25, dense or hybrid"]
+    R1 -->|"top n, 30 to 100"| W["Window long candidates to fit max length"]
+    W --> CE["Cross-encoder: query and passage in one sequence"]
+    CE -->|"one batched call, one logit per pair"| S["Sort by reranker score"]
+    S --> DD["Dedup: cap per source or MMR"]
+    DD --> T{"Best score above calibrated threshold?"}
+    T -->|"yes"| K["Top k, 3 to 10, into the prompt"]
+    T -->|"no"| NF["No relevant context path"]
+    CE -.->|"timeout"| FB["Fall back to first-stage order"]
+```
+
 ## Examples
 ### Two-stage retrieval with public models
 A small bi-encoder retrieves five candidates by cosine; an MS MARCO cross-encoder rescores each pair
@@ -293,6 +311,39 @@ candidates exceed its maximum length so it scores truncated text, or that the do
 reranker's training data. Then check prompt assembly: if all 50 chunks still go into the prompt rather
 than the top 5, reranking only changed order inside a context the model cannot use well. Only after
 those checks would I try a different or fine-tuned reranker.
+
+## Interview questions
+### What is the difference between a bi-encoder and a cross-encoder, and why use both?
+- **Bi-encoder:** embeds query and passage independently, so passage vectors are precomputed and scoring
+  is one dot product, which scales to millions of passages.
+- **Cross-encoder:** runs attention over query and passage as one sequence, catching negation, wrong years
+  and missing answers, but needs a full forward pass per pair with nothing precomputable.
+- **So two stages:** the bi-encoder (or BM25, or hybrid) for recall, the cross-encoder for precision over
+  a few dozen candidates.
+
+### Long, relevant passages keep scoring low after reranking. What is going on?
+- **Silent truncation:** BERT-derived rerankers stop at 512 tokens, so a passage longer than the limit
+  minus the query is scored only on its beginning.
+- **Fix:** keep chunks within the limit, or split long candidates into overlapping windows, score each in
+  the same batch and take the maximum; monitor the share of candidates that would be truncated.
+
+### How do you budget reranker latency, and what is the cost of 50 candidates?
+- **Cost is per pair:** a 20-token query and 400-token passages give about 420 tokens per pass, so 50
+  candidates are 21,000 encoder tokens per query, linear in n.
+- **Latency is illustrative until measured:** tens of milliseconds for a small model with GPU batching.
+- **Protect the request:** one batched call, a hard timeout, and a fallback to first-stage order.
+
+### When would you not add a reranker, or reach for an LLM reranker instead?
+- **Skip it** when first-stage precision is already high on your labels, the budget is single-digit
+  milliseconds, or the corpus is small enough for the LLM to read everything.
+- **LLM rerankers** are strongest on nuanced relevance and instructions such as "prefer the newest policy",
+  but they are slowest, most expensive and sensitive to candidate order.
+
+### Your top 5 after reranking holds three copies of the same boilerplate. Why, and what do you do?
+- **Each pair is scored in isolation,** so near-duplicate chunks get near-identical high scores and each
+  takes a slot.
+- **Fix after reranking:** cap results per source document or apply maximal marginal relevance, then
+  monitor the duplicate-source rate in the final top k.
 
 ## Quiz
 ### Q: Why is a cross-encoder more accurate than a bi-encoder at judging whether a passage answers a query?

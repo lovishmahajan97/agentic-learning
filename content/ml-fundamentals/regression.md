@@ -5,7 +5,7 @@ name: Regression
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: reviewed
+status: crisp
 related:
   - ml-fundamentals/classification
   - ml-fundamentals/loss-functions
@@ -21,87 +21,112 @@ sources:
 ---
 
 ## TL;DR
-Regression predicts a continuous quantity: latency in milliseconds, cost in dollars, a quality score.
-The model outputs a number and the loss measures its distance from the truth; choosing squared versus
-absolute error is choosing whether you estimate the conditional mean or the median, and how much a few
-extreme points steer the fit. In AI systems regression appears as reward models, latency and cost
-predictors, judge scores and value heads, and it fails in the same ways least squares always has:
-extrapolation, leverage points and leakage.
+Regression predicts a continuous quantity (latency, cost, a quality score). Choosing squared versus
+absolute error chooses mean versus median and how much outliers steer the fit. It powers reward models,
+cost predictors and judge scores, and fails through extrapolation, leverage and leakage.
 
 ## Why it exists
-Some questions are "how much", not "which": how long will this request take, what will this month's
-token bill be, how good is this response on a scale. Two naive approaches fail.
-
-Bucketing the quantity into ranges and classifying throws away the ordering and the resolution: a
-prediction of "200–500 ms" cannot be summed into a capacity plan, and a value just over a bucket edge is
-treated as a different category from one just under it. Lookup tables of averages per group cannot
-interpolate to combinations they have not seen and explode combinatorially as features are added.
-
-What is needed is a function from features to a number together with a differentiable notion of error.
-Least squares was invented for astronomy to combine noisy observations into one estimate; machine
-learning kept the frame and replaced the linear function with anything differentiable. The crucial
-insight that survived is that the loss is a statement about the noise. Squared error is the
-maximum-likelihood choice if the noise is Gaussian, and its minimiser is the conditional mean. If the
-noise is heavy-tailed or you care about the typical case rather than the average, the loss should change,
-not just the model.
+- **Some questions are "how much", not "which".** How long will this request take, what will this month's
+  token bill be, how good is this response on a scale.
+- **Bucketing and classifying throws away order and resolution.** A prediction of "200–500 ms" cannot be
+  summed into a capacity plan, and a value just over a bucket edge is treated as a different category from
+  one just under it.
+- **Lookup tables of averages per group do not scale.** They cannot interpolate to combinations they have
+  not seen and explode combinatorially as features are added.
+- **What is needed:** a function from features to a number plus a differentiable notion of error. Least
+  squares was invented for astronomy to combine noisy observations into one estimate; machine learning
+  kept the frame and replaced the linear function with anything differentiable.
+- **The loss is a statement about the noise.** Squared error is the maximum-likelihood choice if the
+  noise is Gaussian, and its minimiser is the conditional mean. If the noise is heavy-tailed or you care
+  about the typical case, change the loss, not just the model.
 
 ## How it works
 ### The model
-ŷ = f_θ(x). The simplest form is linear, ŷ = wᵀx + b, and it is more powerful than it looks because x
-can contain transformed features: log(tokens), tokens², an embedding, an indicator for the model tier.
-A neural regressor is the same final linear layer applied to learned features. A reward model is an LLM
-whose output head produces a single scalar instead of vocabulary logits. Note that "logistic regression"
-is a classifier despite its name: it regresses the log-odds, then thresholds a probability.
+- **Form:** ŷ = f_θ(x). The simplest is linear, ŷ = wᵀx + b.
+- **Linear is more powerful than it looks,** because x can contain transformed features: log(tokens),
+  tokens², an embedding, an indicator for the model tier.
+- **Neural regressors** apply the same final linear layer to learned features. A **reward model** is an
+  LLM whose output head produces a single scalar instead of vocabulary logits.
+- **Naming trap:** "logistic regression" is a classifier despite its name: it regresses the log-odds,
+  then thresholds a probability.
 
 ### The loss decides what you estimate
-Why a loss picks a statistic: at a fixed x, choose the single prediction c that minimises the expected
-loss over the noisy y values seen there. For squared error, d/dc E[(c − y)²] = 2(c − E[y]) = 0 gives
-c = E[y], the mean. For absolute error, the derivative of E|c − y| is P(y < c) − P(y > c), zero when half
-the mass lies on each side: the median. On latencies of 100, 110, 120 and 2,000 ms, MSE wants about 583 ms and
-MAE anything between 110 and 120 ms; neither is wrong, they answer different questions.
+At a fixed x, choose the single prediction c that minimises the expected loss over the noisy y values
+seen there:
 
-- **Mean squared error**, mean (ŷ − y)². The minimiser is E[y | x], the conditional mean. The gradient
-  2(ŷ − y) grows with the error, so a point 10× further away pulls 10× harder; outliers dominate.
-- **Mean absolute error**, mean |ŷ − y|. The minimiser is the conditional median. The gradient is ±1
-  regardless of distance, so it is robust to outliers, but it is not smooth at zero and converges more
-  slowly near the optimum.
-- **Huber loss**: quadratic for |ŷ − y| ≤ δ, linear beyond. Smooth near the solution, robust far from it;
-  δ is where you decide "this residual is an outlier".
-- **Quantile (pinball) loss** estimates a chosen quantile instead of the centre. For a p95 latency
-  target you fit the 0.95 quantile directly rather than predicting the mean and guessing the tail.
-- **Log-transformed target**: when the quantity is positive and multiplicative (costs, latencies,
-  durations), fitting MSE on log y estimates the geometric mean and penalises relative rather than
-  absolute error. Remember to evaluate on the original scale.
+```
+squared error:  d/dc E[(c − y)²] = 2(c − E[y]) = 0      ->  c = E[y], the mean
+absolute error: d/dc E|c − y| = P(y < c) − P(y > c) = 0  ->  half the mass each side: the median
+```
+
+On latencies of 100, 110, 120 and 2,000 ms, MSE wants about 583 ms and MAE anything between 110 and
+120 ms; neither is wrong, they answer different questions.
+
+| Loss | Estimates | Behaviour |
+|---|---|---|
+| **Mean squared error**, mean (ŷ − y)² | E[y \| x], the conditional mean | gradient 2(ŷ − y) grows with the error, so a point 10× further away pulls 10× harder; outliers dominate |
+| **Mean absolute error**, mean \|ŷ − y\| | the conditional median | gradient ±1 regardless of distance, so robust to outliers, but not smooth at zero and slower near the optimum |
+| **Huber** | between mean and median | quadratic for \|ŷ − y\| ≤ δ, linear beyond: smooth near the solution, robust far from it; δ is where you decide "this residual is an outlier" |
+| **Quantile (pinball)** | a chosen quantile | for a p95 latency target, fit the 0.95 quantile directly rather than predicting the mean and guessing the tail |
+| **MSE on log y** | the geometric mean | for positive, multiplicative quantities (costs, latencies, durations); penalises relative rather than absolute error; evaluate on the original scale |
 
 ### Fitting
-For a linear model with MSE there is a closed form, the normal equation w = (XᵀX)⁻¹Xᵀy, costing roughly
-O(d³) in the number of features plus O(nd²) to build XᵀX. For non-linear models, huge n or huge d, you
-use gradient descent instead. Gradient descent on unscaled features is slow or unstable because the
-condition number of XᵀX governs convergence, which is why standardising features is the first step, not an
-afterthought (see the gradient-descent lesson).
+- **Closed form for linear + MSE:** the normal equation w = (XᵀX)⁻¹Xᵀy, costing roughly O(d³) in the
+  number of features plus O(nd²) to build XᵀX.
+- **Gradient descent** for non-linear models, huge n or huge d.
+- **Standardise first.** Gradient descent on unscaled features is slow or unstable because the condition
+  number of XᵀX governs convergence, so standardising features is the first step, not an afterthought
+  (see the gradient-descent lesson).
 
 ### Regularisation
-Ridge adds λ||w||² and shrinks coefficients, which stabilises the fit when features are collinear and
-still has a closed form, (XᵀX + λI)⁻¹Xᵀy. Lasso adds λ||w||₁ and drives some coefficients exactly to
-zero, which selects features. The reason to pay this bias is variance: as the number of features
-approaches the number of rows, least squares starts fitting noise and test error climbs while training
-error falls; λ, chosen by cross-validation, sets where you sit on that trade. Weight decay in deep
-networks is the same idea (for plain SGD it is exactly ridge; for Adam see the optimizers lesson).
+| Penalty | Effect | Note |
+|---|---|---|
+| Ridge, λ\|\|w\|\|² | shrinks coefficients, stabilises collinear fits | closed form (XᵀX + λI)⁻¹Xᵀy |
+| Lasso, λ\|\|w\|\|₁ | drives some coefficients exactly to zero | selects features |
+
+- **Why pay the bias: variance.** As the number of features approaches the number of rows, least squares
+  starts fitting noise and test error climbs while training error falls.
+- **λ is chosen by cross-validation** and sets where you sit on that trade.
+- **Weight decay** in deep networks is the same idea: for plain SGD it is exactly ridge; for Adam see the
+  optimizers lesson.
 
 ### Evaluation
-RMSE is in the units of the target and punishes large errors; MAE is easier to explain and robust; R²
-is the fraction of variance explained relative to predicting the mean, can be negative on test data, and
-is not comparable across datasets with different variance. MAPE breaks on targets near zero. Always
-compare against a trivial baseline (predict the training mean, or the last observed value) and look at
-the residuals: a fan shape means the noise grows with the prediction, a curve means the model is missing
-a non-linearity.
+- **RMSE** is in the units of the target and punishes large errors.
+- **MAE** is easier to explain and robust.
+- **R²** is the fraction of variance explained relative to predicting the mean; it can be negative on
+  test data and is not comparable across datasets with different variance.
+- **MAPE** breaks on targets near zero.
+- **Always compare against a trivial baseline** (predict the training mean, or the last observed value).
+- **Look at the residuals:** a fan shape means the noise grows with the prediction; a curve means the
+  model is missing a non-linearity.
 
 ### Where it meets AI engineering
-Reward models output a scalar trained from preference pairs; LLM judges emit 1–5 scores that are ordinal
-rather than truly continuous; latency and cost predictors drive routing between model tiers; value
-functions in reinforcement learning are regressors; token-usage forecasts feed capacity planning.
+- **Reward models** output a scalar trained from preference pairs.
+- **LLM judges** emit 1–5 scores that are ordinal rather than truly continuous.
+- **Latency and cost predictors** drive routing between model tiers.
+- **Value functions** in reinforcement learning are regressors.
+- **Token-usage forecasts** feed capacity planning.
 
-## Example
+## Diagram
+The loss you pick decides which statistic of y the model learns; follow the question you need answered.
+
+```mermaid
+flowchart TD
+    Q["What number do you need?"] --> S{"Summed into a total?"}
+    S -->|"yes, cost or load"| MSE["MSE: conditional mean"]
+    S -->|"no"| T{"Typical case or tail?"}
+    T -->|"typical, noisy outliers"| MAE["MAE or Huber: median-like"]
+    T -->|"tail, SLO"| QL["Pinball loss at 0.95"]
+    MSE --> L{"Positive, multiplicative?"}
+    L -->|"yes"| LOG["Fit on log y, correct bias"]
+    L -->|"no"| EV["Evaluate vs mean baseline"]
+    LOG --> EV
+    MAE --> EV
+    QL --> EV
+```
+
+## Examples
+### Latency model: closed form vs gradient descent
 A latency model from serving logs, fitted two ways. The closed form recovers the generating
 coefficients directly; gradient descent recovers them too, but only after the features are scaled,
 because prompt lengths in the thousands make the raw problem badly conditioned.
@@ -132,42 +157,87 @@ print("GD intercept (= mean latency in scaled space):", round(w[0], 1))
 print("GD slopes back in original units:", np.round(w[1:] / sd, 3))   # ≈ [0.05, 25]
 ```
 
+### Which statistic does each loss pick?
+Pure Python, no libraries: find the constant prediction that minimises each loss on the four latencies
+from How it works.
+
+```python
+y = [100, 110, 120, 2000]                       # latencies in ms
+
+def mse(c):  return sum((c - v) ** 2 for v in y) / len(y)
+def mae(c):  return sum(abs(c - v) for v in y) / len(y)
+def pinball(c, q):
+    return sum(max(q * (v - c), (q - 1) * (v - c)) for v in y) / len(y)
+
+grid = [i / 2 for i in range(0, 4201)]          # constant predictions 0..2100 ms
+best = lambda loss: min(grid, key=loss)
+print("MSE picks", best(mse))                    # 582.5, the mean
+flat = [c for c in grid if mae(c) == mae(best(mae))]
+print("MAE picks", flat[0], "to", flat[-1])      # 110.0 to 120.0, any median
+print("pinball q=0.95 picks", best(lambda c: pinball(c, 0.95)))  # 2000.0, the top of the tail
+```
+
+| Loss | Prediction | Answers |
+|---|---|---|
+| MSE | 582.5 ms | "what is the average, to sum into a budget?" |
+| MAE | 110 to 120 ms | "what does a typical request take?" |
+| Pinball, q = 0.95 | 2,000 ms | "what latency must the SLO tolerate?" (with four points the tail is a single request) |
+
+## Production patterns
+- **Ship a naive baseline first.** Before any model, log the error of "predict last week's mean" per
+  segment. Every candidate must beat it on MAE and RMSE; monitor the gap over time, because drift often
+  erases it.
+- **Quantile models for SLOs.** Fit the tail directly, for example scikit-learn
+  `GradientBoostingRegressor(loss="quantile", alpha=0.95)`, or `QuantileRegressor` for a linear model.
+  Monitor empirical coverage: about 95% of real latencies should fall under the predicted p95.
+- **Robust fits on noisy logs.** When a few pathological requests distort the fit, use scikit-learn
+  `HuberRegressor` or a Huber loss in your framework. Monitor coefficients across retrains for stability.
+- **Log-target with bias correction for cost.** Fit on log(cost), then compare summed predicted spend
+  with actual spend each week; apply a multiplicative correction if the back-transformed totals run low.
+- **Request-time feature contract.** Keep a list of features available before the request runs (prompt
+  length, tier, tool flags) and fail the training job if any other feature appears. Monitor the
+  offline-vs-online error gap, which is the signature of leakage.
+- **Per-segment error dashboards.** Report error by model tier, prompt-length bucket and customer, not
+  just overall, because routing and capacity decisions fail in specific segments.
+
 ## Trade-offs
-- MSE is smooth and estimates the mean, which is what you want when predictions will be summed into a
-  total such as monthly cost, but a handful of extreme points can drag the whole fit; switch to MAE or
-  Huber when the tail is noise rather than signal.
-- A linear model is interpretable, data-efficient and extrapolates predictably, while trees and neural
-  regressors capture interactions and curvature at the cost of overfitting and erratic extrapolation;
-  the balance tips toward flexible models when n is large and the relationship is clearly non-linear.
-- Predicting a single number is simple, but SLO and capacity decisions need a tail quantile or an
-  interval, which costs an extra model or a quantile loss.
-- Fitting on log(y) gives relative error and positive predictions, but the back-transformed mean is
-  biased low; correct for it or report medians when you use it.
+- **MSE vs robust losses.** MSE is smooth and estimates the mean, which is what you want when predictions
+  will be summed into a total such as monthly cost, but a handful of extreme points can drag the whole
+  fit. Switch to MAE or Huber when the tail is noise rather than signal.
+- **Linear vs flexible models.** A linear model is interpretable, data-efficient and extrapolates
+  predictably; trees and neural regressors capture interactions and curvature at the cost of overfitting
+  and erratic extrapolation. The balance tips toward flexible models when n is large and the relationship
+  is clearly non-linear.
+- **Point prediction vs tail or interval.** A single number is simple, but SLO and capacity decisions
+  need a tail quantile or an interval, which costs an extra model or a quantile loss.
+- **Log target vs bias.** Fitting on log(y) gives relative error and positive predictions, but the
+  back-transformed mean is biased low; correct for it or report medians when you use it.
 
 ## Pitfalls
-- Extrapolating beyond the training range; the symptom is confident predictions for 32k-token prompts
-  from a model that only ever saw up to 4k, and a sharp error jump at the boundary.
-- Leakage through features that are only known after the target, such as using output token count to
-  predict latency; the symptom is a near-perfect offline R² and a model that cannot be run at request
-  time because the feature does not exist yet.
-- Optimising MSE and then reporting MAPE or median error; the symptom is metrics that disagree and a
-  model tuned for a quantity nobody reads.
-- Averaging ordinal judge scores as if 1–5 were a ratio scale; the symptom is "quality went from 3.2 to
-  3.4" claims with no idea whether that gap means anything.
-- Ignoring heteroscedastic noise; the symptom is a residual plot that fans out and prediction intervals
-  that are far too narrow for large requests.
-- Collinear features; the symptom is coefficients that flip sign between retrains while predictions
-  barely change, which destroys any story told about feature importance.
+- **Extrapolating beyond the training range.** Symptom: confident predictions for 32k-token prompts from
+  a model that only ever saw up to 4k, and a sharp error jump at the boundary.
+- **Leakage through features known only after the target.** Using output token count to predict latency
+  gives a near-perfect offline R² and a model that cannot be run at request time because the feature does
+  not exist yet.
+- **Optimising MSE and then reporting MAPE or median error.** Symptom: metrics that disagree and a model
+  tuned for a quantity nobody reads.
+- **Averaging ordinal judge scores as if 1–5 were a ratio scale.** Symptom: "quality went from 3.2 to 3.4"
+  claims with no idea whether that gap means anything.
+- **Ignoring heteroscedastic noise.** Symptom: a residual plot that fans out and prediction intervals that
+  are far too narrow for large requests.
+- **Collinear features.** Symptom: coefficients that flip sign between retrains while predictions barely
+  change, which destroys any story told about feature importance.
 
 ## When to use
-Use regression when the output is a quantity and the size of the error matters. Do not use it when the
-quantity is a probability of an event in disguise (classify, then take an expected value) or when you
-need the whole distribution rather than a point (quantile regression or a probabilistic model). Measure
-RMSE and MAE against a naive baseline, inspect residuals, and report per-segment error, because an
-average hides the segments where routing or capacity decisions actually go wrong. Day to day it appears
-in latency and cost predictors for routing, in reward and judge heads, and in usage forecasting. In
-interviews, expect "why does MSE estimate the mean", "when would you use MAE or Huber", and the caveats
-around R².
+- **Use when** the output is a quantity and the size of the error matters. Day to day it appears in
+  latency and cost predictors for routing, in reward and judge heads, and in usage forecasting.
+- **Avoid when** the quantity is a probability of an event in disguise (classify, then take an expected
+  value), or when you need the whole distribution rather than a point (quantile regression or a
+  probabilistic model).
+- **Measure** RMSE and MAE against a naive baseline, inspect residuals, and report per-segment error,
+  because an average hides the segments where routing or capacity decisions actually go wrong.
+- **Interviews:** expect "why does MSE estimate the mean", "when would you use MAE or Huber", and the
+  caveats around R².
 
 ## Role lens
 - **Engineer:** Builds the scalar head or sklearn regressor, chooses the loss to match the noise, checks
@@ -190,6 +260,37 @@ spend (the back-transformed log mean is biased low and needs a correction), and 
 decision quality: what fraction of genuinely expensive requests were sent to the expensive model and how
 much cheap traffic was misrouted. Check error separately for the tail, because that is where routing
 pays off.
+
+## Interview questions
+### Why does minimising squared error give you the conditional mean?
+- **Derivation:** at fixed x, the derivative of E[(c − y)²] with respect to c is 2(c − E[y]), which is
+  zero at c = E[y].
+- **Contrast:** absolute error is minimised where half the mass lies on each side, the median.
+- **Why it matters:** pick MSE when predictions are summed into totals, because sums of means are
+  unbiased; pick median-like losses when you care about the typical case.
+
+### Your latency model has R² = 0.6 and residuals fan out for long prompts. What do you do?
+- **Diagnose:** a fan shape is heteroscedastic noise; the error grows with request size.
+- **Fixes:** fit on log(latency) so error becomes relative, or model quantiles directly for the tail.
+- **Re-evaluate** per prompt-length bucket and check interval coverage on the large requests.
+
+### When would you not use R² to compare models?
+- **Across datasets:** R² depends on the target's variance, so a model on a narrow-range dataset looks
+  worse for the same absolute error.
+- **On test data** it can be negative, meaning worse than predicting the mean.
+- **For decisions:** report RMSE or MAE in target units, plus the routing or capacity outcome.
+
+### The coefficients of your cost model flip sign between weekly retrains. Should you worry?
+- **Likely collinearity:** correlated features let the fit trade weight between them while predictions
+  barely change.
+- **Predictions may be fine,** but any feature-importance story is not.
+- **Fix:** ridge regularisation chosen by cross-validation, or drop or combine the correlated features.
+
+### How would you predict p95 latency per request for autoscaling?
+- **Quantile loss at 0.95,** for example gradient-boosted trees with a quantile objective, using only
+  request-time features.
+- **Do not** add 1.645 residual standard deviations to a mean model; latency residuals are skewed.
+- **Monitor coverage:** about 95% of observed latencies should fall below the prediction, per segment.
 
 ## Quiz
 ### Q: Which statement about MSE versus MAE is correct?

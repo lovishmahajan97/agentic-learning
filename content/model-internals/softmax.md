@@ -5,7 +5,7 @@ name: Softmax
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: reviewed
+status: crisp
 related:
   - model-internals/logits
   - model-internals/attention-mechanism
@@ -22,28 +22,22 @@ sources:
 ---
 
 ## TL;DR
-Softmax turns a vector of arbitrary real scores into a probability distribution:
-`p_i = exp(z_i / T) / Σ_j exp(z_j / T)`. It is differentiable, order-preserving, invariant to shifting
-all scores, and its sharpness is controlled by the temperature *T*. An LLM uses it twice: inside every
-attention head to weight positions, and at the output to turn logits into next-token probabilities.
-Its properties, including "never exactly zero" and "must sum to one", explain sampling behaviour,
-attention sinks and several numerical bugs.
+Softmax turns arbitrary real scores into a probability distribution, with sharpness set by temperature
+*T*. An LLM uses it inside every attention head and at the output; "never exactly zero" and "must sum to
+one" explain sampling tails, attention sinks and numerical bugs.
 
 ## Why it exists
-A network that scores *K* options needs a way to choose among them that it can learn through. Taking
-the argmax is the obvious choice, but it is piecewise constant: a tiny change in scores either does
-nothing or flips the answer, so the gradient is zero almost everywhere and nothing propagates back to
-the scores that were not chosen. Dividing each score by the sum of scores fails too: scores can be
-negative, the result is not a distribution, and the map does nothing to sharpen or soften preferences.
-
-Exponentiating first solves both problems. `exp` is positive, so the normalized values are a valid
-distribution for any real input; it is smooth, so every score receives a gradient; and it is monotone,
-so ranking is preserved. The result is the "soft" version of argmax: as the gap between the best score
-and the rest grows, the output approaches a one-hot, and as scores converge it approaches uniform. Paired
-with cross-entropy loss, the gradient with respect to the logits is simply `p − y`, prediction minus
-target, which is as clean a training signal as exists. Softmax also has a principled reading: among all distributions with a given expected score, it is
-the one with maximum entropy, the same form as the Boltzmann distribution in physics, which is where the
-word "temperature" comes from.
+- **Argmax cannot be learned through.** It is piecewise constant: a tiny change in scores does nothing or
+  flips the answer, so the gradient is zero almost everywhere and nothing reaches the scores not chosen.
+- **Dividing by the sum fails too.** Scores can be negative, the result is not a distribution, and the map
+  does nothing to sharpen or soften preferences.
+- **Exponentiating first fixes both.** `exp` is positive, so normalized values are a valid distribution
+  for any real input; smooth, so every score gets a gradient; monotone, so ranking is preserved. It is the
+  "soft" argmax: a growing gap approaches one-hot, converging scores approach uniform.
+- **The training signal is clean.** Paired with cross-entropy, the gradient with respect to the logits is
+  simply `p − y`, prediction minus target.
+- **It has a principled reading.** Among all distributions with a given expected score it has maximum
+  entropy, the same form as the Boltzmann distribution in physics, which is where "temperature" comes from.
 
 ## How it works
 ### The function and its properties
@@ -57,37 +51,39 @@ log p_i = z_i / T − logsumexp(z / T)
 - **Shift invariance.** `softmax(z + c) = softmax(z)` for any constant *c*, because `exp(c)` factors out
   of numerator and denominator. Implementations subtract `max(z)` before exponentiating *because* the
   result is identical and the largest exponent becomes `exp(0) = 1`, so nothing overflows.
-- **Temperature.** Dividing by `T < 1` widens gaps between scores and sharpens the distribution; `T > 1`
-  flattens it. As `T → 0` softmax becomes argmax; as `T → ∞` it becomes uniform.
-- **Strictly positive.** Every output is greater than zero for finite inputs. Only `−∞` produces an
-  exact zero, which is how masks and token bans work.
-- **Sums to one.** Mass removed from one entry must go somewhere. This is a constraint, not a feature,
-  and it has consequences in attention (below).
+- **Temperature.** Dividing by `T < 1` widens gaps and sharpens the distribution; `T > 1` flattens it. As
+  `T → 0` softmax becomes argmax; as `T → ∞` it becomes uniform.
+- **Strictly positive.** Every output is greater than zero for finite inputs. Only `−∞` produces an exact
+  zero, which is how masks and token bans work.
+- **Sums to one.** Mass removed from one entry must go somewhere. This is a constraint, not a feature, and
+  it has consequences in attention (below).
 - **Gradient.** `∂p_i/∂z_j = p_i(δ_ij − p_j)`. With cross-entropy against a one-hot target the combined
   gradient is `p − y`.
 - **Two classes.** With `K = 2`, softmax reduces to the sigmoid of the score difference; the logistic
   function is the special case.
 
 ### At the output layer
-The vocabulary softmax converts the last position's logits into the next-token distribution over tens
-of thousands of entries. Because every entry stays positive, the distribution has a long tail of
-individually tiny but collectively significant probabilities; sampling from the full distribution will
-eventually draw one of them, which is why top-k and top-p truncation exist. The output softmax also caps
-expressiveness: log-probabilities are a linear function of a `d_model`-dimensional hidden state (up to
-the normalizer), so the matrix of log-probabilities across many contexts has rank at most about
-`d_model`. Yang et al. (2018) named this the "softmax bottleneck"; in practice a large `d_model` keeps
-it from biting, but it is why the output layer is not a fully general distribution. Temperature here is a
-user-facing knob; temperature inside attention is not.
+- **Next-token distribution.** The vocabulary softmax converts the last position's logits into a
+  distribution over tens of thousands of entries.
+- **A long tail.** Every entry stays positive, so there are many individually tiny but collectively
+  significant probabilities. Sampling from the full distribution eventually draws one, which is why top-k
+  and top-p truncation exist.
+- **The softmax bottleneck.** Log-probabilities are a linear function of a `d_model`-dimensional hidden
+  state (up to the normalizer), so the matrix of log-probabilities across many contexts has rank at most
+  about `d_model`. Yang et al. (2018) named this; a large `d_model` keeps it from biting in practice, but
+  it is why the output layer is not a fully general distribution.
+- **Temperature here is a user-facing knob;** temperature inside attention is not.
 
 ### Inside attention
-Each head computes `softmax(q·Kᵀ / √d_k)` over positions, producing weights that sum to one across the
-positions the query may see. The `√d_k` scale is a fixed temperature: dot products of *d_k*-dimensional
-vectors grow in magnitude with *d_k*, and without the scale the softmax would saturate early in training,
-giving near-one-hot weights and vanishing gradients. Causal masking adds `−∞` to future positions before
-the softmax so they get exactly zero weight. Because the weights must sum to one even when no position is
-relevant, models learn to dump excess attention onto an uninformative position, usually the first token;
-these **attention sinks** are a direct consequence of the normalization constraint, and streaming methods
-that evict old tokens must keep the sink tokens or quality collapses.
+1. **Weights over positions.** Each head computes `softmax(q·Kᵀ / √d_k)`, weights that sum to one across
+   the positions the query may see.
+2. **`√d_k` is a fixed temperature.** Dot products of *d_k*-dimensional vectors grow in magnitude with
+   *d_k*; without the scale the softmax would saturate early in training, giving near-one-hot weights and
+   vanishing gradients.
+3. **Causal masking** adds `−∞` to future positions before the softmax, so they get exactly zero weight.
+4. **Attention sinks.** Weights must sum to one even when no position is relevant, so models learn to dump
+   excess attention onto an uninformative position, usually the first token. Streaming methods that evict
+   old tokens must keep these **sink tokens** or quality collapses.
 
 ### Computing it efficiently
 A naive softmax over a long row needs the whole row in memory to find the max and the sum. The online
@@ -100,16 +96,35 @@ for each score x:   m_new = max(m, x)
 softmax(x_i) = exp(x_i − m) / s
 ```
 
-When a larger maximum arrives, the rescaling factor `exp(m − m_new)` converts everything summed so far to
-the new reference point, so the result is exact, not approximate, and it can be accumulated in tiles
-that never leave fast on-chip memory. The same rescaling applies to a partial weighted sum of value
-vectors. That trick is the heart of
-FlashAttention: exact attention without materializing the full `n × n` score matrix.
+- **Exact, not approximate.** When a larger maximum arrives, the factor `exp(m − m_new)` converts
+  everything summed so far to the new reference point.
+- **Tile-friendly.** It can be accumulated in tiles that never leave fast on-chip memory, and the same
+  rescaling applies to a partial weighted sum of value vectors.
+- **That trick is the heart of FlashAttention:** exact attention without materializing the full `n × n`
+  score matrix.
 
-## Example
-The code shows a stable softmax with temperature on a three-way score vector and prints how entropy
-moves with *T*; the numbers are worked out below so you can check them by hand. The last two lines
-show the overflow the max-subtraction trick prevents.
+## Diagram
+Both uses share one recipe (scale, mask with minus infinity, subtract the max, exponentiate, normalize);
+only the scores and what consumes the probabilities differ.
+
+```mermaid
+flowchart TD
+    A["Attention scores q times K"] -->|"divide by sqrt d_k"| M["Add minus infinity to masked"]
+    L["Output logits"] -->|"divide by temperature T"| M
+    M --> X["Subtract row max"]
+    X --> E["Exponentiate in fp32"]
+    E --> N["Divide by row sum"]
+    N --> W["Attention weights over positions"]
+    N --> P["Next-token probabilities"]
+    W --> V["Weighted sum of values"]
+    P --> S["Truncate and sample"]
+```
+
+## Examples
+### Stable softmax and temperature
+The code shows a stable softmax with temperature on a three-way score vector and prints how entropy moves
+with *T*; the numbers are worked out below so you can check them by hand. The last two lines show the
+overflow the max-subtraction trick prevents.
 
 ```python
 import numpy as np
@@ -131,48 +146,104 @@ print(np.exp(big) / np.exp(big).sum())   # overflow: inf/inf -> nan in the first
 print(softmax(big))                      # [1. 0.]
 ```
 
-By hand at `T = 1`: `exp(2.0) = 7.389`, `exp(1.0) = 2.718`, `exp(0.1) = 1.105`, sum `11.213`, so
-`p ≈ [0.659, 0.242, 0.099]`. At `T = 0.5` the scores become `[4, 2, 0.2]`, exponentials
-`[54.598, 7.389, 1.221]`, sum `63.209`, `p ≈ [0.864, 0.117, 0.019]`: the leader gained and the tail
-shrank by a factor of five. At `T = 2` the scores are `[1, 0.5, 0.05]`, exponentials
-`[2.718, 1.649, 1.051]`, sum `5.418`, `p ≈ [0.502, 0.304, 0.194]`: close to uniform. Same ranking in
-all three cases; only the confidence changed.
+Worked by hand (entropy printed by the script, in nats; the uniform maximum for three options is 1.10):
+
+| T | Scaled scores | Exponentials | Sum | p | Entropy |
+|---|---|---|---|---|---|
+| `T = 1` | `[2.0, 1.0, 0.1]` | `exp(2.0) = 7.389`, `exp(1.0) = 2.718`, `exp(0.1) = 1.105` | `11.213` | `p ≈ [0.659, 0.242, 0.099]` | 0.85 |
+| `T = 0.5` | `[4, 2, 0.2]` | `[54.598, 7.389, 1.221]` | `63.209` | `p ≈ [0.864, 0.117, 0.019]` | 0.45 |
+| `T = 2` | `[1, 0.5, 0.05]` | `[2.718, 1.649, 1.051]` | `5.418` | `p ≈ [0.502, 0.304, 0.194]` | 1.03 |
+
+- **At `T = 0.5`** the leader gained and the tail shrank by a factor of five.
+- **At `T = 2`** the distribution is close to uniform.
+- **Same ranking in all three cases;** only the confidence changed.
+
+### Online softmax equals the two-pass version
+Pure Python, the one-pass running-max update from above checked against the ordinary max-then-sum
+version on 10,000 random scores.
+
+```python
+import math, random
+
+def two_pass(xs):
+    m = max(xs)
+    s = sum(math.exp(x - m) for x in xs)
+    return [math.exp(x - m) / s for x in xs]
+
+def online(xs):
+    m, s = float("-inf"), 0.0
+    for x in xs:                                  # one pass: running max and rescaled sum
+        m_new = max(m, x)
+        s = s * math.exp(m - m_new) + math.exp(x - m_new)
+        m = m_new
+    return [math.exp(x - m) / s for x in xs]
+
+random.seed(0)
+xs = [random.uniform(-20, 20) for _ in range(10_000)]
+err = max(abs(a - b) for a, b in zip(two_pass(xs), online(xs)))
+print(f"max abs difference: {err:.1e}")          # zero or float-rounding level
+print(online([1000.0, 0.0]))                     # [1.0, 0.0]: no overflow either
+```
+
+## Production patterns
+- **Normalize in fp32.** Cast before normalizing (`torch.softmax(x.float(), dim=-1)`) or compute losses on
+  fp32 logits, even when the model runs in bf16 or fp16. Monitor NaN and inf counters on losses and
+  sampled probabilities.
+- **Use fused attention kernels.** Call `torch.nn.functional.scaled_dot_product_attention` or a
+  FlashAttention build instead of hand-writing `softmax(q @ k.T / sqrt(d))`, so the online softmax, the
+  scale and masking are handled for you. Monitor peak memory and step time at long sequence lengths.
+- **Mask before, and guard empty rows.** Add `−∞` (or the dtype's most negative value, `torch.finfo(dtype).min`)
+  before the softmax, and zero the output of rows where every key is masked. Monitor NaNs specifically in
+  padded batches.
+- **Keep sink tokens when evicting KV.** Any streaming or sliding-cache scheme should pin the first few
+  tokens in the cache along with the recent window. Monitor quality on long sessions against a
+  full-cache baseline.
+- **Calibrate before exposing probabilities.** If a product shows or thresholds softmax confidence, fit a
+  single temperature on a held-out labelled set (temperature scaling) and track expected calibration error
+  over time.
+- **Use sigmoids for multi-label outputs.** When labels are not mutually exclusive, train independent
+  sigmoids (for example `torch.nn.BCEWithLogitsLoss`) instead of a softmax. Monitor per-label precision
+  and recall.
 
 ## Trade-offs
-- Smooth, differentiable normalization gives clean gradients everywhere, but it can never express a hard
-  zero, so sampling must be truncated externally and attention must park unused mass somewhere.
-- Lower temperature raises consistency and accuracy on tasks with one right answer, while higher
-  temperature raises diversity; the right value flips with whether the task rewards variety.
-- The exact softmax needs the whole row, which is memory-heavy for long attention rows; the online
-  version is exact and tile-friendly at the cost of extra rescaling work per tile.
-- Scaling by `√d_k` stabilizes attention at initialization, but it is a fixed temperature; heads that
-  need very sharp or very flat attention must learn to grow or shrink their query and key norms.
+- **Clean gradients vs no hard zero.** Smooth normalization gives gradients everywhere, but it can never
+  express a hard zero, so sampling must be truncated externally and attention must park unused mass
+  somewhere.
+- **Low vs high temperature.** Lower temperature raises consistency and accuracy on tasks with one right
+  answer; higher raises diversity. The right value flips with whether the task rewards variety.
+- **Exact row vs online tiles.** The plain softmax needs the whole row, which is memory-heavy for long
+  attention rows; the online version is exact and tile-friendly at the cost of extra rescaling work per
+  tile.
+- **Fixed `√d_k` vs learned sharpness.** Scaling by `√d_k` stabilizes attention at initialization, but it
+  is a fixed temperature; heads that need very sharp or very flat attention must learn to grow or shrink
+  their query and key norms.
 
 ## Pitfalls
-- Exponentiating in half precision or without subtracting the max; the symptom is NaN or inf
-  probabilities on long or confident rows, often only on some batches.
-- Masking after the softmax (multiplying probabilities by zero) instead of adding `−∞` before it; the
-  symptom is rows that no longer sum to one. The sibling bug, masking with a large finite negative such
-  as −1e4 that underflows to nothing in fp16, shows up as attention leaking to masked positions.
-- Treating "99% probability" as 99% correctness; softmax outputs are scores shaped by training, and
+- **Exponentiating in half precision or without subtracting the max.** Symptom: NaN or inf probabilities
+  on long or confident rows, often only on some batches.
+- **Masking after the softmax.** Multiplying probabilities by zero instead of adding `−∞` before leaves rows
+  that no longer sum to one. The sibling bug, masking with a large finite negative such as −1e4 that
+  underflows to nothing in fp16, shows up as attention leaking to masked positions.
+- **Treating "99% probability" as 99% correctness.** Softmax outputs are scores shaped by training;
   calibration must be measured rather than assumed.
-- Letting a row be masked entirely, for example a padding query whose every key is masked; the row is
-  all `−∞`, softmax computes `0/0`, and the symptom is NaNs that appear only in batches with padding.
-  Kernels guard this case explicitly, and hand-written attention must too.
-- Evicting the first tokens of a long context to save KV memory; attention weights that used to land on
-  the sink get redistributed and output quality degrades sharply.
-- Reusing an output-layer temperature inside attention or vice versa; they are separate knobs with
-  separate meanings.
+- **A fully masked row.** For example a padding query whose every key is masked: the row is all `−∞`,
+  softmax computes `0/0`, and NaNs appear only in batches with padding. Kernels guard this case
+  explicitly, and hand-written attention must too.
+- **Evicting the first tokens of a long context.** To save KV memory; attention that used to land on the
+  sink is redistributed and output quality degrades sharply.
+- **Mixing up the two temperatures.** Reusing an output-layer temperature inside attention or vice versa;
+  they are separate knobs with separate meanings.
 
 ## When to use
-You do not choose softmax; you inherit it at two places in every transformer and in nearly every
-classifier. What you choose is the temperature at the output, the truncation rules layered on top, the
-precision the normalization runs in, and whether a problem is better framed as multi-class (softmax) or
-multi-label (independent sigmoids, because labels are not mutually exclusive). Measure calibration if
-you intend to read probabilities as confidence. The function shows up daily when debugging NaNs, when
-tuning sampling, and when reasoning about why attention behaves as it does. In interviews, expect to
-derive the gradient with cross-entropy, explain the max-subtraction trick, and say why attention scores
-are scaled by `√d_k`.
+- **You inherit it, not choose it:** at two places in every transformer and in nearly every classifier.
+- **What you choose:** the temperature at the output, the truncation rules layered on top, the precision
+  the normalization runs in, and multi-class (softmax) versus multi-label (independent sigmoids, because
+  labels are not mutually exclusive).
+- **Measure** calibration if you intend to read probabilities as confidence.
+- **Day to day** it shows up when debugging NaNs, tuning sampling, and reasoning about why attention
+  behaves as it does.
+- **Interviews:** derive the gradient with cross-entropy, explain the max-subtraction trick, and say why
+  attention scores are scaled by `√d_k`.
 
 ## Role lens
 - **Engineer:** Sets temperature per endpoint, computes softmax and losses in fp32, and masks with `−∞`
@@ -193,6 +264,38 @@ learning signal. Dividing by `√d_k` restores unit variance, keeping the softma
 at initialization. Without it you would expect attention maps that collapse to single positions early,
 slow or stalled loss decrease, and sensitivity to initialization, which is exactly the instability the
 scale was introduced to prevent.
+
+## Interview questions
+### Why is softmax paired with cross-entropy, and what is the resulting gradient?
+- **The combined gradient is `p − y`,** prediction minus one-hot target, because the log in cross-entropy
+  cancels the exp in softmax.
+- **Why it matters:** the signal is proportional to the error and never saturates when the model is
+  confidently wrong, unlike squared error on probabilities. Frameworks fuse the two for numerical stability.
+
+### Your training run shows NaN losses, but only on batches that contain padding. What do you check?
+- **Fully masked rows.** A padding query whose every key is masked gives an all `−∞` row and `0/0` in the
+  softmax.
+- **Mask style and precision.** Check that masks are added before the softmax, that fp16 is not
+  underflowing a finite mask value, and that normalization runs in fp32. Guard empty rows or use a fused
+  kernel that does.
+
+### When would you use independent sigmoids instead of a softmax?
+- **When labels are not mutually exclusive.** A support ticket can be both "billing" and "urgent"; softmax
+  forces the probabilities to compete and sum to one.
+- **Softmax remains right** for exactly one class per input, such as next-token prediction, where the
+  sum-to-one constraint is the truth.
+
+### How does FlashAttention compute an exact softmax without the full score matrix?
+- **Online softmax.** It keeps a running max and running sum per row, rescaling the sum and the partial
+  weighted sum of values by `exp(m − m_new)` whenever a larger max arrives.
+- **So it can tile.** Blocks of keys and values are processed in on-chip memory and the result is exact,
+  never materializing the `n × n` matrix.
+
+### What happens numerically when you lower temperature from 1 to 0.5 on logits [2.0, 1.0, 0.1]?
+- **Gaps double.** The scaled scores become [4, 2, 0.2], so probabilities move from about
+  [0.659, 0.242, 0.099] to [0.864, 0.117, 0.019].
+- **Entropy roughly halves** (0.85 to 0.45 nats) and the tail shrinks by a factor of five, while the
+  ranking is unchanged.
 
 ## Quiz
 ### Q: Why do implementations subtract the maximum score before exponentiating?

@@ -149,6 +149,26 @@ With *r* = 8, *b* = 16: about 0.95 at *J* = 0.8 and 0.06 at *J* = 0.5, threshold
 - **Version** the dataset, pin it to the model it produced, and feed eval error analysis into the next
   version.
 
+## Diagram
+Cheap, high-precision filters run first and costly judgement last; every stage logs its rejects with a
+reason, and eval error analysis feeds the next dataset version.
+
+```mermaid
+flowchart TD
+    R[("Raw crawl, logs or exports")] --> P["1. Provenance, licence, hash, PII scrub"]
+    P --> X["2. Extract, language ID, one template"]
+    X --> H["3. Heuristic filters"]
+    H --> D["4. Dedup: exact hash, then MinHash and LSH"]
+    D --> C["5. Decontaminate vs every eval set"]
+    C --> M["6. Model-based quality scoring"]
+    M --> MX["7. Mix and balance per source"]
+    MX --> V[("8. Versioned dataset pinned to its model")]
+    H -.->|"rejects with reason"| J[("Reject store, sampled by hand")]
+    D -.->|"rejects with reason"| J
+    C -.->|"rejects with reason"| J
+    V -->|"eval error analysis"| P
+```
+
 ## Examples
 ### Compact curation pass
 Gopher-style heuristics, exact deduplication, MinHash/LSH near-deduplication via `datasketch`, and
@@ -309,6 +329,44 @@ an SME and label a sample for quality to check agreement. Balance ticket categor
 to the production distribution, then version the set. I would measure per-stage drop counts, duplicate
 rate, contamination hits, agreement on the quality sample, and finally the eval delta versus the base
 model, which decides whether the data is ready.
+
+## Interview questions
+### Why does deduplication make a model better, not just a dataset smaller?
+- **Repeats are not evidence:** a passage seen a thousand times is a thousand gradient steps toward
+  memorising it, and compute spent on repeats is compute not spent on new content.
+- **Measured effect:** deduplicating a web corpus gave better perplexity and an order-of-magnitude drop
+  in verbatim regurgitation.
+- **It also protects measurement:** near-duplicates straddling train and validation inflate validation
+  scores.
+
+### Validation loss looks excellent but production quality is poor. Where do you look in the data?
+- **Split order:** if you split before deduplicating, near-copies sit on both sides; deduplicate first,
+  then split by conversation, customer or cluster.
+- **Contamination:** check internal golden sets as well as public benchmarks, with n-gram and embedding
+  overlap, because evals sampled from the same export leak.
+- **Distribution mismatch:** compare template, task-type and response-length mix with production, since
+  the model learns all three.
+
+### How aggressively should you filter with a model-based quality classifier? When would you hold back?
+- **The gain:** it judges content, which heuristics cannot; keeping only high educational-value scores
+  gave FineWeb-Edu large knowledge-benchmark gains.
+- **The cost:** it imports the labeller's taste at scale, quietly down-weighting code, forums and dialects
+  and narrowing diversity.
+- **Hold back** when those domains matter to your product: score them separately or set per-source
+  thresholds, and compare downstream evals across filter levels.
+
+### You run MinHash with 128 permutations. How do you set bands and rows for a 0.7 similarity cut?
+- **The S-curve:** P(candidate) = 1 − (1 − Jʳ)ᵇ, with threshold ≈ (1/b)^(1/r).
+- **r = 8, b = 16** puts the threshold near 0.71: about 0.95 at J = 0.8 and 0.06 at J = 0.5.
+- **Tune per source:** r = 16, b = 8 (threshold about 0.88) keeps templated contracts and forms, while
+  r = 4, b = 32 (about 0.42) catches loose paraphrases but floods you with candidates to verify.
+
+### A customer leaves and asks that their data be removed from future models. What does your pipeline need?
+- **Provenance from stage one:** source, licence, collection date and content hash per document, so the
+  request becomes a filter and a rebuild, not a forensic search.
+- **Versioned datasets pinned to models:** you can say which models contained the data and rebuild the
+  dataset without it.
+- **Monitor coverage:** track rows lacking provenance, because those are the ones you cannot delete.
 
 ## Quiz
 ### Q: What problem do MinHash and locality-sensitive hashing solve together?

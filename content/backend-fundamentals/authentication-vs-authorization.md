@@ -5,7 +5,7 @@ name: Authentication vs authorization
 kind: concept
 difficulty: intro
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - backend-fundamentals/oauth-2-0-oidc
   - backend-fundamentals/rbac
@@ -23,117 +23,149 @@ sources:
 ---
 
 ## TL;DR
-Authentication turns a credential into a verified *principal*: who is making this request.
-Authorization decides whether that principal may perform *this action* on *this resource*. They are
-different questions, answered at different points in the request, with different failure codes: 401
-means "I do not know who you are", 403 means "I know, and no". Most serious access-control bugs come
-from doing the first and assuming it implies the second.
+Authentication verifies *who* is calling; authorization decides whether that principal may do *this
+action* on *this resource*. 401 means "I do not know who you are", 403 means "I know, and no". Most
+access-control bugs assume the first implies the second.
 
 ## Why it exists
-The forcing problem is the second user. With one user, "logged in" and "allowed" are the same thing.
-With two, a request for `/documents/42` from a logged-in user says nothing about whether document 42 is
-theirs, and the moment the server stops asking, user A reads user B's data by editing a number in the
-URL. That single mistake, a valid identity treated as sufficient permission, is what OWASP ranks as the
-top web application risk in its 2021 Top 10 (broken access control), and it is a staple finding of
-penetration tests.
-
-The naive alternative is to fold the two together: check at login, then trust everything after. It
-fails because the questions have different inputs and change at different rates. Identity is
-established once per session from a credential; permission depends on the specific resource, the
-action, the tenant, the user's current role and sometimes the time of day, and must be re-evaluated on
-every request because any of those can change between two calls. Folding them also pushes authorization
-into the user interface (hide the button), which any client that is not your UI simply ignores.
-
-Keeping them separate buys three things. Several authentication methods (password, single sign-on, API
-key, service identity) can feed one authorization model. Permission policy can change without touching
-login. And audit becomes possible: *who* did *what* is only answerable when the principal is explicit.
-For AI systems the separation is sharper still: an agent calling tools acts *on behalf of* a user, so
-authentication must say which user, and authorization must be evaluated per tool call against that
-user's permissions rather than the agent's own, broad service account.
+- **The second user forces it.** With one user, "logged in" and "allowed" are the same. With two, a request
+  for `/documents/42` from a logged-in user says nothing about whether document 42 is theirs; stop asking
+  and user A reads user B's data by editing a number in the URL.
+- **It is the top web risk.** A valid identity treated as sufficient permission is what OWASP ranks first in
+  its 2021 Top 10 (broken access control), and a staple finding of penetration tests.
+- **Folding them together fails.** "Check at login, trust everything after" ignores that the questions have
+  different inputs and change at different rates. Identity is established once per session; permission
+  depends on resource, action, tenant, current role and sometimes time of day, and must be re-evaluated on
+  every request. Folding also pushes authorization into the UI (hide the button), which non-UI clients ignore.
+- **Separation buys three things.** Several authentication methods (password, single sign-on, API key,
+  service identity) feed one authorization model; policy changes without touching login; and audit works,
+  because *who* did *what* needs an explicit principal.
+- **Agents sharpen it.** An agent calling tools acts *on behalf of* a user, so authentication must say which
+  user, and authorization must run per tool call against that user's permissions, not the agent's broad
+  service account.
 
 ## How it works
 ### Authentication: credential to principal
-A credential is evidence: something the caller knows (password), has (hardware key, phone, signed
-token), or is (biometric). The authentication layer verifies the evidence and produces a **principal**,
-a small object such as `{user_id, tenant_id, roles, auth_method, auth_time}`, attached to the request
-context. Everything downstream trusts that object and never re-examines the credential, which is why
-this layer must be a single, well-tested chokepoint (middleware or a dependency), not code repeated in
-each handler.
+- **A credential is evidence:** something the caller knows (password), has (hardware key, phone, signed
+  token), or is (biometric).
+- **The output is a principal,** a small object such as `{user_id, tenant_id, roles, auth_method,
+  auth_time}` attached to the request context.
+- **One chokepoint.** Everything downstream trusts that object and never re-examines the credential, so
+  this layer must be a single, well-tested chokepoint (middleware or a dependency), not code repeated per handler.
 
-The common mechanisms differ in what is verified and where state lives. Passwords are checked against a
-slow, salted hash (bcrypt, scrypt or Argon2) *because* a leaked database must not be crackable offline
-at GPU speed. After login the browser holds a **session** cookie: an opaque id looked up in a server-side
-store, which makes revocation instant but requires every server to reach the store. Because the browser
-attaches cookies automatically, the cookie needs `HttpOnly` (script cannot read it, so an XSS bug cannot
-exfiltrate it), `Secure` (never sent over plain HTTP) and `SameSite=Lax` or `Strict` (not sent on most
-cross-site requests), and state-changing endpoints still need CSRF protection where `SameSite` alone does
-not cover the case. Issue a fresh session id at login rather than upgrading the anonymous one, or an
-attacker who planted a known id before login inherits the authenticated session (session fixation). A
-second factor (TOTP, or a phishing-resistant WebAuthn key) raises the bar from "knows the password" to
-"also holds the device", which matters because reused and phished passwords are the common way in. API clients send a
-**bearer token**: either opaque (looked up like a session) or a self-contained **JWT**, which the server
-verifies locally with the issuer's public key. A JWT check must cover four things: signature, issuer,
-audience and expiry. Signature verification includes pinning the accepted algorithm rather than trusting
-the token's own `alg` header, which is how `none`-algorithm and key-confusion attacks get in. Audience is
-the one people skip, and skipping it means a token minted for another service is accepted by yours. Because a JWT cannot be revoked before it expires without server state,
-access tokens are short-lived and paired with a refresh token. **API keys** identify machines and are
-stored only as a hash. Unlike passwords they are long random strings, so a fast hash such as SHA-256 or
-an HMAC is enough (a slow password hash would add latency to every request for no gain); compare in
-constant time, and give keys a recognisable prefix so secret scanners can spot a leaked key and you can
-tell which key it is without exposing the secret. Service-to-service calls use mutual TLS or platform
-identities. Single sign-on delegates all of this to an identity provider through OIDC or SAML; the
-OAuth/OIDC lesson covers the flows.
+### The common mechanisms
+| Mechanism | What is verified | Where state lives |
+|---|---|---|
+| Password | a slow, salted hash (bcrypt, scrypt or Argon2), *because* a leaked database must not be crackable offline at GPU speed | user table |
+| Browser **session** cookie | an opaque id | server-side store: revocation is instant, but every server must reach the store |
+| **Bearer token**, opaque | looked up like a session | server-side store |
+| **Bearer token**, **JWT** | verified locally with the issuer's public key | none, so it cannot be revoked before expiry |
+| **API key** | a hash of a long random string | key table |
+| Service-to-service | mutual TLS or platform identities | platform |
+| Single sign-on | delegated to an identity provider through OIDC or SAML (the OAuth/OIDC lesson covers the flows) | identity provider |
+
+### Session cookies done right
+- **`HttpOnly`:** script cannot read it, so an XSS bug cannot exfiltrate it.
+- **`Secure`:** never sent over plain HTTP.
+- **`SameSite=Lax` or `Strict`:** not sent on most cross-site requests, *because* browsers attach cookies
+  automatically. State-changing endpoints still need CSRF protection where `SameSite` alone does not cover the case.
+- **Fresh id at login.** Issue a new session id rather than upgrading the anonymous one, or an attacker who
+  planted a known id before login inherits the authenticated session (session fixation).
+- **A second factor** (TOTP, or a phishing-resistant WebAuthn key) raises the bar from "knows the password"
+  to "also holds the device", which matters because reused and phished passwords are the common way in.
+
+### JWT verification: four checks
+1. **Signature,** with the accepted algorithm pinned rather than trusting the token's own `alg` header,
+   which is how `none`-algorithm and key-confusion attacks get in.
+2. **Issuer.**
+3. **Audience,** the one people skip; skipping it means a token minted for another service is accepted by yours.
+4. **Expiry.** Because a JWT cannot be revoked before it expires without server state, access tokens are
+   short-lived and paired with a refresh token.
+
+### API keys
+- **Store only a hash.** Unlike passwords they are long random strings, so a fast hash such as SHA-256 or an
+  HMAC is enough; a slow password hash would add latency to every request for no gain.
+- **Compare in constant time.**
+- **Give keys a recognisable prefix** so secret scanners can spot a leaked key and you can tell which key it
+  is without exposing the secret.
 
 ### Authorization: (principal, action, resource) to allow or deny
 Authorization is a function of three inputs plus context, evaluated with **default deny**. The simplest
 form is an ownership check, `resource.owner_id == principal.user_id`, and its absence is the bug above.
-Beyond ownership there are three families. **RBAC** maps principals to roles and roles to permissions,
-and is what most products start with. **ABAC** evaluates policies over attributes of the principal, the
-resource and the environment ("analysts may read documents whose classification is at most internal,
-from the corporate network"). **ReBAC** answers through relationships ("user is an editor of this
-document via membership of this group"), which is the Zanzibar model behind systems such as OpenFGA and
-suits deeply shared, hierarchical data.
 
-Collections need the same care as single resources. `GET /documents/42` is authorized by loading 42 and
-checking it; `GET /documents?q=refund` must put the permission into the query itself
-(`WHERE tenant_id = $1 AND (owner_id = $2 OR ...)`), because fetching a page and filtering afterwards
-returns short or empty pages, leaks totals through counts, and on a vector search lets disallowed chunks
-crowd out allowed ones in the top-k.
+| Family | Decides by | Fits |
+|---|---|---|
+| **RBAC** | principals map to roles, roles to permissions | what most products start with |
+| **ABAC** | policies over attributes of principal, resource and environment ("analysts may read documents whose classification is at most internal, from the corporate network") | attribute-driven rules |
+| **ReBAC** | relationships ("user is an editor of this document via membership of this group"), the Zanzibar model behind systems such as OpenFGA | deeply shared, hierarchical data |
 
-Two placement rules matter more than the model. First, enforce on the server, as close to the data as
-possible, on every request; the UI hiding a button is not authorization. In multi-tenant systems every
-row carries a `tenant_id`, every query filters by it, and database row-level security acts as a backstop
-for the query someone forgets. Second, separate the **enforcement point** (the handler or middleware that
-asks) from the **decision point** (the library or policy service that answers: Casbin, OPA, Cedar,
-OpenFGA, or your own module), so policy is written once and testable in isolation.
+### Collections need the same care
+- **Single resource:** `GET /documents/42` is authorized by loading 42 and checking it.
+- **Collection:** `GET /documents?q=refund` must put the permission into the query itself
+  (`WHERE tenant_id = $1 AND (owner_id = $2 OR ...)`).
+- **Because filtering afterwards** returns short or empty pages, leaks totals through counts, and on a
+  vector search lets disallowed chunks crowd out allowed ones in the top-k.
 
-OAuth **scopes** are often mistaken for permissions. A scope bounds what a *client application* was
-allowed to request on the user's behalf; a permission is what the *user* actually holds. The effective
-right is the intersection: a `documents:write` scope on a token for a user who can only read grants
-nothing.
+### Placement rules matter more than the model
+1. **Enforce on the server, close to the data, on every request.** The UI hiding a button is not
+   authorization. In multi-tenant systems every row carries a `tenant_id`, every query filters by it, and
+   database row-level security backstops the query someone forgets.
+2. **Separate enforcement from decision.** The **enforcement point** (handler or middleware) asks; the
+   **decision point** (Casbin, OPA, Cedar, OpenFGA, or your own module) answers, so policy is written once
+   and testable in isolation.
+
+### Scopes are not permissions
+- **A scope** bounds what a *client application* was allowed to request on the user's behalf.
+- **A permission** is what the *user* actually holds.
+- **Effective right = intersection:** a `documents:write` scope on a token for a user who can only read
+  grants nothing.
 
 ### Order inside a request
-Authenticate first, in middleware: invalid or missing credential, respond 401 with a `WWW-Authenticate`
-header saying how to authenticate. Then, in the handler, load the resource and authorize: denied,
-respond 403, or 404 when revealing that the resource exists would itself leak information (a document id
-belonging to another tenant). Never reverse the order; an authorization check cannot run without a
-principal, and an unauthenticated caller must not learn which ids exist.
+1. **Authenticate first, in middleware.** Invalid or missing credential: 401 with a `WWW-Authenticate`
+   header saying how to authenticate.
+2. **Then load the resource and authorize in the handler.** Denied: 403, or 404 when revealing existence
+   would itself leak (a document id belonging to another tenant).
+3. **Never reverse the order:** an authorization check cannot run without a principal, and an
+   unauthenticated caller must not learn which ids exist.
 
 ### Agents are principals too
-An agent runtime introduces a new principal (the agent, or the tool server) that acts for an existing one
-(the user). If the runtime calls tools with its own powerful credentials and relies on the prompt to stay
-within the user's permissions, it is a **confused deputy**: the model can be talked into fetching what
-the user may not see. The fix is to carry the user's identity into every tool call (token exchange, or
-passing the principal to the tool) and let the tool's authorization layer decide, which also makes
-retrieval permission-aware. Human approval gates for consequential actions are authorization decisions
-made at a different time, by a different decider.
+- **A new principal acts for an old one.** The agent (or the tool server) acts for the user.
+- **Confused deputy.** If the runtime calls tools with its own powerful credentials and relies on the prompt
+  to stay within the user's permissions, the model can be talked into fetching what the user may not see.
+- **Fix:** carry the user's identity into every tool call (token exchange, or passing the principal to the
+  tool) and let the tool's authorization layer decide, which also makes retrieval permission-aware.
+- **Approval gates** for consequential actions are authorization decisions made at a different time, by a
+  different decider.
 
-## Example
-A FastAPI endpoint with the two concerns in two places. `current_principal` is the authentication
-chokepoint: it verifies signature, issuer, audience and expiry of a JWT via the identity provider's
-published keys (PyJWT). PyJWT checks `exp` only if the claim is present, so `require` makes its absence
-an error too. `authorize` is the decision function: tenant match first (returning 404 so other
-tenants' ids are not discoverable), then ownership or an explicit permission.
+## Diagram
+One request, two separate gates: the middleware turns a token into a principal or returns 401, and only
+then does the handler load the resource and ask the policy for allow, 403 or 404.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant M as Auth middleware
+    participant H as Handler
+    participant P as Policy decision
+    C->>M: request with Bearer token
+    Note over M: verify signature, issuer, audience, expiry
+    M-->>C: 401 plus WWW-Authenticate if invalid
+    M->>H: principal with user and tenant
+    H->>H: load resource by id
+    H->>P: principal, action, resource
+    P-->>H: allow or deny, default deny
+    H-->>C: 404 if other tenant, 403 if denied
+    H-->>C: 200 with result if allowed
+```
+
+## Examples
+### A FastAPI endpoint with the two concerns in two places
+- **`current_principal` is the authentication chokepoint.** It verifies signature, issuer, audience and
+  expiry of a JWT via the identity provider's published keys (PyJWT).
+- **`require` closes a gap:** PyJWT checks `exp` only if the claim is present, so `require` makes its absence
+  an error too.
+- **`authorize` is the decision function:** tenant match first (returning 404 so other tenants' ids are not
+  discoverable), then ownership or an explicit permission.
 
 ```python
 import jwt                                   # PyJWT
@@ -179,49 +211,115 @@ def delete_document(doc_id: int, p: Principal = Depends(current_principal)):
     return {"deleted": doc_id}
 ```
 
-`db` is the application's data layer. Note what is *not* here: no permission logic in the token parsing,
-no identity logic in the handler, and the tenant check runs before any content-dependent decision.
+- **`db` is the application's data layer.**
+- **Note what is *not* here:** no permission logic in the token parsing, no identity logic in the handler,
+  and the tenant check runs before any content-dependent decision.
+
+### Runnable: issuing and checking API keys
+Standard library only. The key is shown once, stored as a SHA-256 hash with a public key id and the
+tenant it is bound to, and checked in constant time.
+
+```python
+import hashlib, hmac, secrets
+
+STORE = {}                                   # key_id -> record; in production, a database table
+
+def issue_api_key(tenant_id):
+    key_id = secrets.token_hex(4)            # public part: lets you find and name the key safely
+    plaintext = f"docs_{key_id}_{secrets.token_urlsafe(32)}"   # prefix helps secret scanners
+    STORE[key_id] = {"tenant_id": tenant_id,
+                     "sha256": hashlib.sha256(plaintext.encode()).hexdigest()}
+    return plaintext                         # shown to the customer once, never stored
+
+def authenticate_api_key(presented):
+    try:
+        prefix, key_id, _ = presented.split("_", 2)
+    except ValueError:
+        return None
+    record = STORE.get(key_id)
+    if prefix != "docs" or record is None:
+        return None
+    digest = hashlib.sha256(presented.encode()).hexdigest()
+    if not hmac.compare_digest(digest, record["sha256"]):   # constant-time comparison
+        return None
+    return {"tenant_id": record["tenant_id"], "auth_method": "api_key", "key_id": key_id}
+
+key = issue_api_key("tenant-a")
+print(authenticate_api_key(key))             # principal bound to tenant-a
+print(authenticate_api_key(key[:-1] + ("x" if key[-1] != "x" else "y")))   # None: tampered secret
+print(authenticate_api_key("garbage"))       # None: wrong format
+```
+
+### Worked scenario: which status for which request
+The `DELETE /documents/{doc_id}` endpoint above, called by different principals.
+
+| Request | Gate that decides | Response |
+|---|---|---|
+| No `Authorization` header | authentication | 401 with `WWW-Authenticate: Bearer` |
+| Valid signature, audience is another service | authentication | 401 |
+| Valid token, document belongs to another tenant | authorization (tenant check) | 404 |
+| Same tenant, not the owner, no `documents:delete` permission | authorization | 403 |
+| Same tenant, owner of the document | authorization | 200, audit log records the user as actor |
+
+## Production patterns
+- **Authenticate by default, opt out explicitly.** Attach the principal dependency to the whole app or
+  router (FastAPI supports app- and router-level `dependencies=[Depends(current_principal)]`) and mark the
+  few public routes deliberately. Monitor 401 rate per endpoint and alert on sudden changes.
+- **A cross-tenant test for every route.** Seed two tenants in integration tests and assert that every
+  endpoint returns 404 or 403 for the other tenant's ids, including list and search endpoints. Monitor 403
+  and 404 spikes per principal in production as an enumeration signal.
+- **Database backstop for tenancy.** Set the tenant per transaction (for example `SET LOCAL app.tenant_id`)
+  and enforce PostgreSQL row-level security policies on tenant tables, so a forgotten `WHERE` returns
+  nothing. Monitor policy-denied queries in tests and logs.
+- **Short tokens, fast deprovisioning.** Keep access tokens to minutes, rotate refresh tokens on use, and
+  revoke sessions when the identity provider deprovisions a user (for example via SCIM). Monitor active
+  sessions or tokens belonging to disabled users; the target is zero.
+- **User-scoped tool calls for agents.** Exchange the user's token for a narrowly scoped downstream token
+  (OAuth 2.0 Token Exchange, RFC 8693) or pass the principal to each tool, and log the user as actor.
+  Monitor tool calls whose actor is the agent's own service account.
 
 ## Trade-offs
-- Stateless JWTs avoid a store lookup per request, but cannot be revoked before expiry; the trade flips
-  toward server-side sessions when you must log a user out instantly, as in offboarding or compromise.
-- A central policy service gives one consistent, auditable model across services, but adds latency and a
-  dependency on every request; inline checks are fine until a second service needs the same rules.
-- Fine-grained permissions give precision and least privilege, but the policy surface grows and becomes
-  hard to review; coarse roles are enough until customers demand custom roles or per-resource sharing.
-- Returning 404 instead of 403 for cross-tenant resources hides existence from attackers, but confuses
-  your own debugging and support unless the server logs the real reason.
-- Long-lived API keys are simple for machine clients, but never expire on their own; the trade flips
-  toward short-lived, scoped tokens once keys are shared across customer systems or appear in logs.
+- **Stateless JWTs vs revocation.** No store lookup per request, but no revocation before expiry; flip to
+  server-side sessions when you must log a user out instantly, as in offboarding or compromise.
+- **Central policy service vs latency.** One consistent, auditable model across services, but added latency
+  and a dependency on every request; inline checks are fine until a second service needs the same rules.
+- **Fine-grained permissions vs reviewability.** Precision and least privilege, but the policy surface grows
+  and gets hard to review; coarse roles suffice until customers demand custom roles or per-resource sharing.
+- **404 vs 403 for cross-tenant resources.** Hides existence from attackers, but confuses your own debugging
+  and support unless the server logs the real reason.
+- **Long-lived API keys vs exposure.** Simple for machine clients but never expire on their own; flip to
+  short-lived, scoped tokens once keys are shared across customer systems or appear in logs.
 
 ## Pitfalls
-- Insecure direct object reference: authentication present, ownership check absent; the symptom is that
-  changing an id in a URL returns another user's record, and it is the first thing a pen tester tries.
-- Skipping the audience check on JWTs; the symptom is a token issued for one API being accepted by
-  another, so a compromise of a low-value service unlocks a high-value one.
-- Authorization only in the front end; the symptom is that `curl` with a valid token bypasses every
-  restriction the UI shows.
-- A single agent service account holding the union of all users' permissions; the symptom is a user
-  asking the agent for a document they cannot open in the app and receiving it.
-- Caching authorization decisions beyond revocation; the symptom is a removed employee or deleted share
-  still working minutes or hours later.
-- Treating "valid API key" as "known tenant" without binding keys to tenants and filtering every query;
-  the symptom is cross-tenant data appearing in search or RAG results.
-- Storing API keys or passwords in plaintext, or passwords under a fast unsalted hash; the symptom is
-  that one database dump exposes every customer's credentials.
-- Returning 403 for an unauthenticated request; the symptom is clients that never retry with
-  credentials because the status told them they were already identified.
+- **Insecure direct object reference.** Authentication present, ownership check absent; changing an id in a
+  URL returns another user's record, and it is the first thing a pen tester tries.
+- **Skipping the JWT audience check.** Symptom: a token issued for one API is accepted by another, so a
+  compromise of a low-value service unlocks a high-value one.
+- **Authorization only in the front end.** Symptom: `curl` with a valid token bypasses every restriction the
+  UI shows.
+- **One agent service account holding the union of all users' permissions.** Symptom: a user asks the agent
+  for a document they cannot open in the app and receives it.
+- **Caching authorization decisions beyond revocation.** Symptom: a removed employee or deleted share still
+  works minutes or hours later.
+- **Treating "valid API key" as "known tenant"** without binding keys to tenants and filtering every query.
+  Symptom: cross-tenant data in search or RAG results.
+- **Plaintext API keys or passwords, or passwords under a fast unsalted hash.** Symptom: one database dump
+  exposes every customer's credentials.
+- **Returning 403 for an unauthenticated request.** Symptom: clients never retry with credentials because the
+  status told them they were already identified.
 
 ## When to use
-Every multi-user system needs both, so the decisions are about shape. Use server-side sessions for
-browser logins where instant logout matters; use short-lived JWTs with refresh tokens for APIs and
-mobile clients; use hashed, prefixed, tenant-bound API keys for machine access; delegate login to an
-identity provider as soon as an enterprise customer appears. Start authorization with ownership plus
-RBAC, and introduce ABAC or ReBAC only when sharing rules or attribute policies outgrow roles. Measure
-401 and 403 rates per endpoint, failed-login rates per account, and authorization decision latency. In
-daily work this is the dependency that produces the principal and the check at the top of every
-mutating handler. In interviews, expect to explain 401 versus 403, design the checks for a multi-tenant
-endpoint, and describe how an agent should act on behalf of a user without a confused-deputy hole.
+Every multi-user system needs both, so the decisions are about shape:
+- **Browser logins where instant logout matters:** server-side sessions.
+- **APIs and mobile clients:** short-lived JWTs with refresh tokens.
+- **Machine access:** hashed, prefixed, tenant-bound API keys.
+- **Enterprise customers:** delegate login to an identity provider as soon as the first one appears.
+- **Authorization model:** start with ownership plus RBAC; add ABAC or ReBAC only when sharing rules or
+  attribute policies outgrow roles.
+- **Measure:** 401 and 403 rates per endpoint, failed-login rates per account, and authorization decision latency.
+- **Day to day:** the dependency that produces the principal and the check at the top of every mutating handler.
+- **Interviews:** explain 401 versus 403, design the checks for a multi-tenant endpoint, and describe how an
+  agent acts on behalf of a user without a confused-deputy hole.
 
 ## Role lens
 - **Engineer:** Builds the authentication dependency once, verifies all four JWT properties, writes a
@@ -244,6 +342,40 @@ or by passing the principal explicitly, and to have the document service authori
 that user's tenant and permissions with default deny. Retrieval should filter by the user's ACLs at
 query time, and the agent's own account should hold only the minimal rights it needs for itself. Audit
 logs then record the user, not the agent, as the actor.
+
+## Interview questions
+### What is the difference between authentication and authorization, and why keep them separate?
+- **Authentication** turns a credential into a principal (who); **authorization** decides whether that
+  principal may do an action on a resource (may they).
+- **Separate because they change at different rates:** identity once per session, permission per request,
+  resource and role. Separation lets many login methods feed one policy, and makes audit possible.
+
+### Which JWT checks are mandatory, and what attack does each stop?
+- **Signature with a pinned algorithm** stops forged tokens and `none` or key-confusion tricks.
+- **Issuer** stops tokens from an untrusted identity provider; **audience** stops a token minted for another
+  service being replayed against yours.
+- **Expiry** (required, not optional) bounds how long a stolen token works, since JWTs cannot be revoked
+  without server state.
+
+### Design authorization for a search endpoint over a multi-tenant document store with sharing.
+- **Filter in the query, not after it:** tenant and permission predicates in SQL, or ACL metadata filters
+  in the vector search, so pages are full and counts do not leak.
+- **Model sharing explicitly:** ownership plus RBAC to start, ReBAC (Zanzibar-style, for example OpenFGA)
+  once documents are shared through groups and folders.
+- **Backstop** with row-level security and a cross-tenant test suite.
+
+### When would you return 404 instead of 403?
+- **When existence itself is sensitive,** such as another tenant's document id: 404 stops enumeration of
+  valid ids across tenants.
+- **Cost:** support and debugging get harder, so log the true reason server-side; use 403 when the caller
+  can legitimately know the resource exists but lacks the right.
+
+### A security review finds that an employee removed yesterday can still call the API. What do you check?
+- **Token lifetime and revocation:** long-lived JWTs or API keys keep working until expiry, so shorten
+  access tokens and revoke refresh tokens and sessions on deprovisioning.
+- **Authorization caching:** cached decisions or role lookups outliving the change; bound cache TTLs to
+  your revocation promise.
+- **Machine credentials:** API keys the employee created must be bound to owners and rotated.
 
 ## Quiz
 ### Q: A request arrives with no credential at all. Which response is correct and why?

@@ -5,7 +5,7 @@ name: Multi-tenancy
 kind: concept
 difficulty: core
 est_minutes: 18
-status: reviewed
+status: crisp
 related:
   - system-design/tenant-isolation
   - reliability/tenant-level-quotas-and-noisy-neighbor-isolation
@@ -21,120 +21,144 @@ sources:
 ---
 
 ## TL;DR
-Multi-tenancy is one running system serving many customers (tenants) while keeping each one's data,
-configuration, quotas and bill separate. It exists because one deployment per customer does not scale in
-cost or operations. The mechanism is a tenant identity established at the edge and carried through every
-layer, plus a deliberate choice per resource of how much is shared (pool), partitioned (bridge) or
-dedicated (silo). In AI systems that identity must also reach the retrieval index, the prompt, the caches
-and the token meter.
+Multi-tenancy is one running system serving many customers while keeping each one's data, configuration,
+quotas and bill separate. A tenant identity set at the edge travels through every layer, including the
+retrieval index, prompt, caches and token meter.
 
 ## Why it exists
-The alternative is a deployment per customer. For three customers it is fine. For three hundred it means
-three hundred databases to migrate, three hundred model-version rollouts, three hundred sets of alerts,
-and GPUs sitting idle in most of them because no single customer's traffic fills a card. Cost scales with
-customer count rather than with usage, and every upgrade becomes a campaign. Single-tenant deployments
-remain the right answer for a few regulated or very large customers, but they cannot be the default
-shape of a product.
-
-The naive multi-tenant answer, "add a `customer_id` column and filter in the query", fails in two ways.
-First, the filter is a convention, and one forgotten `WHERE` clause returns another customer's records;
-in an LLM product that record then lands in a prompt and is paraphrased back to the wrong user. Second,
-a column solves data separation only. Tenants also need separate configuration (which model, which
-system prompt, which features), separate performance envelopes (one tenant's bulk ingestion must not
-starve another's chat), separate cost accounting (who used which tokens) and sometimes separate
-jurisdictions (EU data stays in the EU). Multi-tenancy is the discipline of answering all of those with
-one identity and a small number of explicit sharing decisions, rather than rediscovering each one in an
-incident.
+- **One deployment per customer does not scale.** Fine for three customers; for three hundred it means
+  three hundred databases to migrate, three hundred model-version rollouts and three hundred sets of
+  alerts. GPUs sit idle in most of them because no single customer's traffic fills a card.
+- **Cost should track usage, not customer count.** Per-customer stacks make cost scale with customers and
+  turn every upgrade into a campaign. Single-tenant deployments stay right for a few regulated or very
+  large customers, but cannot be the product's default shape.
+- **"Add a `customer_id` column" fails twice.** The filter is a convention, so one forgotten `WHERE`
+  clause returns another customer's records; in an LLM product that record lands in a prompt and is
+  paraphrased back to the wrong user.
+- **A column only separates data.** Tenants also need separate configuration (model, system prompt,
+  features), performance envelopes (one tenant's bulk ingestion must not starve another's chat), cost
+  accounting (who used which tokens) and sometimes jurisdictions (EU data stays in the EU).
+- **What the discipline buys.** All of those answered with one identity and a few explicit sharing
+  decisions, rather than rediscovered one by one in incidents.
 
 ## How it works
 ### Tenant identity, established once and carried everywhere
-Every request enters with a credential (a JWT from the identity provider, an API key, an SSO assertion).
-The system resolves the tenant from that credential *at the edge*, never from a request body or a query
-parameter, because anything the caller can type is something the caller can change. From then on the
-tenant ID travels with the work: in a request-scoped context variable inside the process, as a header or
-message attribute when work crosses into a queue, and as a field on every log line, trace span and
-metric. The rule is that no layer may need to re-derive it from data, because re-derivation is where
-mistakes hide.
+1. **Credential in.** Every request carries a JWT from the identity provider, an API key or an SSO
+   assertion.
+2. **Resolve at the edge.** The tenant comes from that credential, never from a request body or query
+   parameter, *because* anything the caller can type is something the caller can change.
+3. **Carry it with the work:**
+   - in a request-scoped context variable inside the process;
+   - as a header or message attribute when work crosses into a queue;
+   - as a field on every log line, trace span and metric.
+4. **Never re-derive it.** No layer may need to work out the tenant from data, *because* re-derivation is
+   where mistakes hide.
 
 ### Three sharing models, chosen per resource
-The AWS SaaS Lens vocabulary is useful because it names the options precisely:
+The AWS SaaS Lens vocabulary names the options precisely:
 
-- **Pool.** Tenants share the resource, separated by a tenant key: one PostgreSQL schema with a
-  `tenant_id` column on every table, one vector index with tenant metadata, one model-serving fleet.
-  Cheapest and simplest to operate; isolation depends entirely on correct filtering and quotas.
-- **Bridge.** Shared infrastructure, partitioned structure: a schema or namespace per tenant in a shared
-  database, a collection per tenant in the vector store. Stronger separation, per-tenant backup and
-  restore, and per-tenant migration timing become possible, at the cost of running every migration N
-  times, a catalog that grows with N × tables, and multiplied connection pools if each tenant gets its own
-  database credentials.
-- **Silo.** A dedicated resource per tenant: separate database, cluster or whole stack. Strongest
-  isolation, highest cost, and the operational model drifts back toward one-deployment-per-customer.
+| Model | What it looks like | Gains | Costs |
+|---|---|---|---|
+| **Pool** | Shared resource with a tenant key: one PostgreSQL schema with `tenant_id` on every table, one vector index with tenant metadata, one model-serving fleet | Cheapest, simplest to operate | Isolation rests entirely on correct filtering and quotas |
+| **Bridge** | Shared infrastructure, partitioned structure: a schema or namespace per tenant in a shared database, a collection per tenant in the vector store | Stronger separation; per-tenant backup, restore and migration timing | Every migration runs N times; catalog grows with N × tables; connection pools multiply if each tenant gets its own credentials |
+| **Silo** | Dedicated database, cluster or whole stack per tenant | Strongest isolation | Highest cost; operations drift back toward one deployment per customer |
 
-Most real systems mix them *per resource and per tier*: pooled compute and a pooled vector index for
-self-serve customers, bridge databases for mid-market, silo for the enterprise tier that pays for it.
-The architecture decision is not "which model" but "which model for which resource, and what moves a
-tenant between tiers".
+- **Mix them per resource and per tier.** Pooled compute and a pooled vector index for self-serve, bridge
+  databases for mid-market, silo for the enterprise tier that pays for it.
+- **The real decision** is not "which model" but "which model for which resource, and what moves a
+  tenant between tiers".
 
 ### The tenant directory: placement as data
-"Which model for which resource" only works if placement is data rather than code. A control-plane
-**tenant directory** maps each tenant to its tier, region, cell, database or schema, index namespace and
-encryption-key ID. The data plane looks the tenant up (and caches the answer) on every request, *because*
-that indirection is what lets you move a tenant without touching callers. Moving a tenant from pool to
-silo then has a fixed shape: provision the new placement, copy the data, dual-write or freeze writes for
-the cut-over window, verify row and vector counts, flip the directory entry, and only then delete from
-the old placement. Larger SaaS systems extend this into **cells**: several identical, independently
-deployed pooled stacks, each holding a subset of tenants, so a bad deploy or a runaway tenant hurts one
-cell rather than everyone. Cells cap blast radius at the price of a routing layer and N fleets to deploy.
+- **A control-plane tenant directory** maps each tenant to its tier, region, cell, database or schema,
+  index namespace and encryption-key ID.
+- **The data plane looks it up (and caches it) on every request**, *because* that indirection lets you
+  move a tenant without touching callers.
+- **Moving a tenant from pool to silo has a fixed shape:**
+  1. Provision the new placement.
+  2. Copy the data.
+  3. Dual-write, or freeze writes for the cut-over window.
+  4. Verify row and vector counts.
+  5. Flip the directory entry.
+  6. Only then delete from the old placement.
+- **Cells extend this at scale.** Several identical, independently deployed pooled stacks each hold a
+  subset of tenants, so a bad deploy or runaway tenant hurts one cell, not everyone. The price is a
+  routing layer and N fleets to deploy.
 
 ### Tenant is a boundary, not an authorisation model
-The tenant is the outer boundary of data ownership; inside it, users still have roles and documents
-still have ACLs. Scoping retrieval by tenant is necessary but not sufficient: an intern and the CFO of
-the same tenant must not retrieve the same board minutes. Decide early which level of the customer
-hierarchy (reseller, organisation, workspace) is the isolation boundary, because that is the key every
-store is partitioned by, and changing it later means re-keying everything.
+- **Outer boundary only.** Inside a tenant, users still have roles and documents still have ACLs.
+- **Necessary, not sufficient.** Scoping retrieval by tenant does not stop an intern and the CFO of the
+  same tenant retrieving the same board minutes.
+- **Pick the isolation level early** (reseller, organisation, workspace), *because* it is the key every
+  store is partitioned by, and changing it later means re-keying everything.
 
 ### Lifecycle: onboarding and offboarding
-Onboarding creates the directory entry, configuration, keys and any dedicated resources in one
-idempotent workflow, so a half-failed signup can simply be retried. Offboarding is harder and is where
-audits find gaps: deleting a tenant must reach the primary database, the vector index, object storage,
-caches, queues, logs and traces, evaluation samples, fine-tuned adapters and, on their retention
-schedule, backups. In a silo this is "drop the stack"; in a pool it is a delete keyed by tenant across
-every store, which only works if every store carries the key. Per-tenant encryption keys turn the backup
-problem into deleting one key (crypto-shredding).
+- **Onboarding is one idempotent workflow** that creates the directory entry, configuration, keys and any
+  dedicated resources, so a half-failed signup can simply be retried.
+- **Offboarding is where audits find gaps.** Deletion must reach the primary database, vector index,
+  object storage, caches, queues, logs and traces, evaluation samples, fine-tuned adapters and, on their
+  retention schedule, backups.
+- **Silo vs pool.** In a silo this is "drop the stack"; in a pool it is a delete keyed by tenant across
+  every store, which only works if every store carries the key.
+- **Crypto-shredding.** Per-tenant encryption keys turn the backup problem into deleting one key.
 
 ### Tenant-aware configuration
-Tenants differ in more than data. A tenant record carries the model (or model tier) it is allowed to use,
-its system prompt and prompt version, enabled features and tools, rate and token quotas, retention
-period, data-residency region and allowed connectors. Loading this once per request and passing it
-explicitly, rather than sprinkling `if tenant == "acme"` through the code, is what keeps a hundred
-tenants from becoming a hundred code paths.
+- **The tenant record carries:** allowed model (or model tier), system prompt and prompt version, enabled
+  features and tools, rate and token quotas, retention period, data-residency region, allowed connectors.
+- **Load once per request and pass explicitly**, rather than sprinkling `if tenant == "acme"` through the
+  code, *because* that is what keeps a hundred tenants from becoming a hundred code paths.
 
 ### Fairness and noisy neighbours
 Pooled resources need fair-share mechanisms *because* the model-serving queue and the database do not
-know tenants exist. Per-tenant rate limits and concurrency caps at the gateway, per-tenant queues or
-weighted scheduling for background work, and token budgets per billing period keep one tenant's batch
-job from turning into everyone's latency incident.
+know tenants exist:
+- **Per-tenant rate limits and concurrency caps** at the gateway.
+- **Per-tenant queues or weighted scheduling** for background work.
+- **Token budgets per billing period**, so one tenant's batch job does not become everyone's latency
+  incident.
 
 ### Metering and cost allocation
-Every LLM call records input tokens, output tokens, model and tenant. This exists because token spend is
-the dominant variable cost of an AI product and it is invisible without per-tenant attribution; it feeds
-billing, quota enforcement and the margin analysis that decides which tier a tenant belongs in.
+- **Record per LLM call:** input tokens, output tokens, model and tenant.
+- **Why:** token spend is the dominant variable cost of an AI product and is invisible without per-tenant
+  attribution.
+- **What it feeds:** billing, quota enforcement, and the margin analysis that decides which tier a
+  tenant belongs in.
 
 ### What is specific to AI systems
-Tenant identity has to reach places a classic SaaS never had: the retrieval filter (the vector query
-must carry the tenant key, and the index must enforce it rather than relying on a post-filter), the
-prompt assembly (tenant-specific instructions and no cross-tenant few-shot examples), the semantic and
-prompt caches (keys include the tenant, or a cache hit becomes a leak), agent memory and tool
-credentials (a tenant's connector token is used only for that tenant's runs), fine-tuned adapters (a
-LoRA trained on one tenant's data is that tenant's asset), and the evaluation sets (per-tenant golden
-sets, because quality differs by corpus).
+Tenant identity must reach places a classic SaaS never had:
 
-## Example
-A FastAPI slice that resolves the tenant from a verified token, stores it in a context variable so
-deeper layers and `asyncio` tasks inherit it, scopes retrieval and configuration by it, and meters
-token usage against it. Nothing downstream takes `tenant_id` from user input. One detail matters: the
-dependency is `async def`. FastAPI runs a plain `def` dependency in a worker thread with a *copy* of
-the context, so a `ContextVar.set` made there is silently discarded before the endpoint runs.
+| Place | Rule |
+|---|---|
+| Retrieval filter | The vector query carries the tenant key, and the index enforces it rather than relying on a post-filter |
+| Prompt assembly | Tenant-specific instructions; no cross-tenant few-shot examples |
+| Semantic and prompt caches | Keys include the tenant, or a cache hit becomes a leak |
+| Agent memory and tool credentials | A tenant's connector token is used only for that tenant's runs |
+| Fine-tuned adapters | A LoRA trained on one tenant's data is that tenant's asset |
+| Evaluation sets | Per-tenant golden sets, because quality differs by corpus |
+
+## Diagram
+Follow the tenant ID from the verified credential: it is resolved once, then every store, cache, meter and
+queue message receives it explicitly.
+
+```mermaid
+flowchart TD
+    R["Request with JWT or API key"] --> E["Edge: verify credential"]
+    E --> T["tenant_id from claims"]
+    T --> D[("Tenant directory: tier, region, cell")]
+    T --> C["Request context variable"]
+    C --> CF["Tenant config and quota check"]
+    CF --> V[("Vector search filtered by tenant")]
+    V --> L["LLM call, cache key has tenant"]
+    L --> M["Meter tokens per tenant"]
+    C -->|"explicit field"| Q["Queue message for background work"]
+```
+
+## Examples
+### FastAPI slice: tenant from the token, carried to every layer
+- **What it shows:** the tenant is resolved from a verified token and stored in a context variable, so
+  deeper layers and `asyncio` tasks inherit it. Retrieval, configuration and token metering are scoped by
+  it; nothing downstream takes `tenant_id` from user input.
+- **The detail that matters:** the dependency is `async def`. FastAPI runs a plain `def` dependency in a
+  worker thread with a *copy* of the context, so a `ContextVar.set` made there is silently discarded
+  before the endpoint runs.
 
 ```python
 from contextvars import ContextVar
@@ -172,44 +196,117 @@ async def enqueue_ingestion(doc_id: str):
     await queue.send({"tenant_id": tenant_ctx.get(), "doc_id": doc_id})
 ```
 
+### Runnable: a per-tenant fair queue for ingestion
+A FIFO queue puts a bulk upload in front of everyone. Round-robin across tenants means a small tenant
+waits at most one turn per active tenant, not behind 1,000 queued chunks.
+
+```python
+from collections import deque, defaultdict
+
+class FairQueue:
+    """Round-robin across tenants so one tenant's backlog cannot starve the rest."""
+    def __init__(self):
+        self.queues = defaultdict(deque)   # tenant_id -> pending jobs
+        self.turns = deque()               # tenants with pending work, in turn order
+
+    def put(self, tenant_id: str, job: str) -> None:
+        if not self.queues[tenant_id]:
+            self.turns.append(tenant_id)   # tenant joins the rotation
+        self.queues[tenant_id].append(job)
+
+    def get(self) -> tuple[str, str]:
+        tenant_id = self.turns.popleft()
+        job = self.queues[tenant_id].popleft()
+        if self.queues[tenant_id]:
+            self.turns.append(tenant_id)   # back of the line, not the front
+        return tenant_id, job
+
+q = FairQueue()
+for i in range(1000):                       # enterprise bulk upload arrives first
+    q.put("enterprise", f"chunk-{i}")
+for t in ("small-a", "small-b", "small-c"):
+    q.put(t, "chunk-0")
+print([q.get()[0] for _ in range(6)])
+# ['enterprise', 'small-a', 'small-b', 'small-c', 'enterprise', 'enterprise']
+```
+
+Weighted fair scheduling generalises this by giving paying tiers more turns per round.
+
+### Worked scenario: promoting a tenant from pool to silo
+An enterprise customer's contract now requires a dedicated database. The directory makes it a runbook,
+not a code change.
+
+| Step | Action | Check before moving on |
+|---|---|---|
+| 1 | Provision a dedicated database and index namespace | Directory still points at the pool |
+| 2 | Copy rows and vectors keyed by the tenant | Row and vector counts match |
+| 3 | Dual-write, or freeze writes for the cut-over window | No writes lost during copy |
+| 4 | Flip the directory entry | Cached directory lookups expire; traffic lands on the silo |
+| 5 | Delete the tenant's rows from the pool | Pool queries for that tenant return nothing |
+
+## Production patterns
+- **Row-level security as a backstop.** Use when pooled tables share a schema. Enable PostgreSQL row
+  security on each table with a policy comparing `tenant_id` to a per-transaction setting the app sets
+  with `SET LOCAL` from the verified tenant. Remember the table owner bypasses policies unless row
+  security is forced. Monitor queries that run without the setting.
+- **Tenant on every signal.** Use from day one. Add the tenant ID as a structured log field and a trace
+  span attribute on every request and job, and as a metric label while tenant count stays modest
+  (thousands of label values strain most metrics backends). Monitor per-tenant p95 latency, errors and
+  token spend.
+- **Gateway quotas per tenant.** Use for any pooled API. Keep a token-bucket or sliding-window counter
+  keyed by tenant (for example in Redis) for requests and for LLM tokens, returning 429 with a retry
+  hint. Monitor 429 rate per tenant and the share of tokens used by the top tenant.
+- **Two-tenant isolation tests in CI.** Use for every endpoint and background job. Seed two tenants with
+  look-alike data, run each flow as tenant A, and assert nothing from tenant B appears in responses,
+  caches or retrieved passages. Monitor coverage of endpoints by this suite.
+- **Per-tenant data keys for deletion.** Use when offboarding must reach backups. Encrypt each tenant's
+  data with its own key held in a KMS, record the key ID in the tenant directory, and delete the key at
+  offboarding. Monitor time from offboarding request to verified deletion across all stores.
+
 ## Trade-offs
-- Pooling maximises utilisation and minimises operations, but isolation rests on software correctness;
-  that flips to bridge or silo when a tenant's contract or regulator demands physical separation.
-- Siloing gives the strongest isolation and simplest per-tenant customisation, but cost grows with
-  tenant count and upgrades become fleets; it is sustainable only for a small, high-value tier.
-- Per-tenant configuration makes customisation cheap, but every knob multiplies the test matrix; it pays
-  off when tenants differ in policy (model, prompt, tools) rather than in code.
-- Carrying tenant identity through every layer costs discipline and a little plumbing, but it is far
-  cheaper than the forensic work of finding which code path lost it after a leak.
-- A shared model-serving fleet amortises GPUs across tenants, but one tenant's long-context traffic can
-  dominate the KV cache; dedicated capacity becomes worth it when a tenant's load is both large and
-  latency-sensitive.
+- **Pooling: utilisation vs software-only isolation.** It maximises utilisation and minimises operations,
+  but isolation rests on software correctness. It flips to bridge or silo when a tenant's contract or
+  regulator demands physical separation.
+- **Siloing: strongest isolation vs linear cost.** It gives the strongest isolation and simplest
+  per-tenant customisation, but cost grows with tenant count and upgrades become fleets. Sustainable only
+  for a small, high-value tier.
+- **Per-tenant configuration: cheap customisation vs test matrix.** Every knob multiplies the test matrix.
+  It pays off when tenants differ in policy (model, prompt, tools) rather than in code.
+- **Carrying tenant identity everywhere: plumbing vs forensics.** It costs discipline and a little
+  plumbing, but is far cheaper than the forensic work of finding which code path lost it after a leak.
+- **Shared model-serving fleet: amortised GPUs vs KV-cache contention.** One tenant's long-context
+  traffic can dominate the KV cache. Dedicated capacity becomes worth it when a tenant's load is both
+  large and latency-sensitive.
 
 ## Pitfalls
-- Accepting `tenant_id` from a request body or query string; the symptom is a penetration test, or a
-  curious customer, reading another tenant's conversations by editing one field.
-- Forgetting the tenant key on the vector search or on a semantic cache; the symptom is an answer that
-  cites a document the user's organisation never uploaded.
-- Letting tenant context evaporate at a process or thread boundary (queues, cron jobs, thread pools,
-  a sync FastAPI dependency that sets a `ContextVar` in a worker thread); the symptom is background jobs
-  or handlers that run as "no tenant" and either fail or write into the wrong partition.
-- Hard-coding exceptions for a big customer in the code; the symptom is a release that breaks only for
-  them, discovered in production because the test suite has no such tenant.
-- Offboarding by deleting database rows only; the symptom is a departed customer's document resurfacing
-  from the vector index or a cached answer, or a deletion audit finding it in traces and eval samples.
-- Measuring cost per model but not per tenant; the symptom is a tenant on a flat plan quietly consuming
-  most of the token budget with no alarm until the invoice.
+- **Accepting `tenant_id` from a request body or query string.** Symptom: a penetration test, or a
+  curious customer, reads another tenant's conversations by editing one field. Fix: derive it from the
+  verified credential at the edge.
+- **Forgetting the tenant key on the vector search or a semantic cache.** Symptom: an answer cites a
+  document the user's organisation never uploaded. Fix: enforce the filter in the index and put the
+  tenant in every cache key.
+- **Letting tenant context evaporate at a process or thread boundary.** Queues, cron jobs, thread pools,
+  or a sync FastAPI dependency that sets a `ContextVar` in a worker thread. Symptom: background jobs or
+  handlers run as "no tenant" and either fail or write into the wrong partition.
+- **Hard-coding exceptions for a big customer.** Symptom: a release breaks only for them, discovered in
+  production because the test suite has no such tenant. Fix: express the difference as tenant
+  configuration.
+- **Offboarding by deleting database rows only.** Symptom: a departed customer's document resurfaces
+  from the vector index or a cached answer, or a deletion audit finds it in traces and eval samples.
+- **Measuring cost per model but not per tenant.** Symptom: a tenant on a flat plan quietly consumes most
+  of the token budget with no alarm until the invoice.
 
 ## When to use
-Design for multi-tenancy from the first commit of any product that will serve more than a handful of
-customers, because retrofitting tenant identity into an existing schema, index and prompt pipeline is
-one of the most expensive migrations there is. Choose the sharing model per resource, starting pooled
-for compute and bridge or pooled for data, and write down what promotes a tenant to a dedicated tier.
-Keep single-tenant deployment as an explicit product option for regulated buyers rather than an
-accident. Measure per-tenant latency percentiles, error rates, token spend and quota hits; if you cannot
-break a dashboard down by tenant, you cannot run the product. In interviews, expect to be asked how the
-tenant ID reaches the vector store and the cache, and what happens when one tenant uploads a million
-documents at once.
+- **Design for it from the first commit** of any product that will serve more than a handful of
+  customers, *because* retrofitting tenant identity into an existing schema, index and prompt pipeline is
+  one of the most expensive migrations there is.
+- **Choose the sharing model per resource:** start pooled for compute and bridge or pooled for data, and
+  write down what promotes a tenant to a dedicated tier.
+- **Keep single-tenant deployment as an explicit product option** for regulated buyers, not an accident.
+- **Measure:** per-tenant latency percentiles, error rates, token spend and quota hits. If you cannot
+  break a dashboard down by tenant, you cannot run the product.
+- **Interviews:** expect to be asked how the tenant ID reaches the vector store and the cache, and what
+  happens when one tenant uploads a million documents at once.
 
 ## Role lens
 - **Engineer:** Threads the tenant through request context, queue messages, retrieval filters, cache
@@ -232,6 +329,42 @@ for interactive traffic over batch; an ingestion quota per hour in the tenant co
 back-pressure response rather than silent queuing; and, for a tenant of this size, a bridge or silo tier
 for the index so its compaction cannot affect others. The dashboard should show queue depth and p95
 latency per tenant so this is seen before the tickets.
+
+## Interview questions
+### What are pool, bridge and silo, and why choose per resource rather than per system?
+- **Definition:** pool shares a resource with a tenant key, bridge partitions structure (schema or
+  collection per tenant) on shared infrastructure, silo dedicates the resource to one tenant.
+- **Why per resource:** compute, data and indexes have different isolation and cost needs, so a typical
+  system pools compute, bridges or pools data, and silos only the tier that pays for it.
+
+### How does the tenant ID reach the vector store, the cache and a background job?
+- **Edge:** resolved from the verified token, then set in a request-scoped context variable.
+- **Stores and caches:** passed as an index-enforced filter on every vector query and included in every
+  semantic or prompt cache key.
+- **Jobs:** written as an explicit field on the queue message, because context variables do not cross
+  process boundaries.
+
+### A customer reports an answer citing a document they never uploaded. How do you debug it?
+- **Treat it as a leak first:** find the request's trace, the retrieved passage IDs and their owning
+  tenant.
+- **Check the usual paths:** a vector search without the tenant filter, a cache key without the tenant,
+  a background job that ran with no tenant context, or a few-shot example drawn from another tenant.
+- **Then close the class of bug:** add a two-tenant test for that path and a database or index-level
+  backstop.
+
+### When would you not use a pooled database for tenant data?
+- **When a contract or regulator demands physical separation**, or a tenant needs its own backup,
+  restore and migration timing.
+- **When one tenant is large enough to dominate** shared write paths or index compaction.
+- **The cost of leaving the pool:** migrations run N times, the catalog and connection pools grow, and a
+  silo tier drifts back toward per-customer operations.
+
+### How would you allocate LLM cost to tenants on a pooled serving fleet?
+- **Meter every call:** input tokens, output tokens, model and tenant, recorded at the call site.
+- **Price by model:** multiply token counts by each model's per-token price to get spend per tenant per
+  period.
+- **Act on it:** feed billing and quotas, and compare spend with plan revenue to decide tier moves before
+  a flat-plan tenant erodes margin.
 
 ## Quiz
 ### Q: Where should a multi-tenant API derive the tenant identity for a request?

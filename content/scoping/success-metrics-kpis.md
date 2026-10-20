@@ -5,7 +5,7 @@ name: Success metrics / KPIs
 kind: metric
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - scoping/baseline-measurement-before-deployment
   - scoping/roi-model
@@ -20,138 +20,215 @@ sources:
 ---
 
 ## TL;DR
-Success metrics are the numbers the customer will use to decide whether the AI project worked; KPIs
-are the business outcomes among them. Agree them before building, as a tree: one outcome KPI, a few
-operational drivers, system-quality metrics you can measure daily, and guardrails that must not get
-worse. You need the tree because model accuracy on its own proves no value, and any single metric gets gamed.
+Success metrics are how the customer judges the AI project; KPIs are the business outcomes among them.
+Agree them before building, as a tree of outcome, drivers, quality and guardrails, because accuracy
+alone proves no value and single metrics get gamed.
 
 ## Why it exists
-AI projects rarely fail in the middle. They fail at the review meeting. The demo impressed, the pilot
-ran for six weeks, and then the sponsor asks "so, did it work?" and nobody had agreed what "work" meant.
-Engineers bring the numbers they can measure: 94% answer correctness on a golden set, p95 latency of
-3 seconds. The sponsor needs a different kind of number: cost per resolved case, cycle time, revenue,
-regulatory exposure. Nothing in the room connects the first set to the second, so the project gets
-judged on anecdote. That might be the one embarrassing answer someone screenshotted.
-
-The naive alternatives each break in a predictable way. "We'll know it when we see it" leaves the
-verdict to recency bias, and the goalposts move: once accuracy is good, the question becomes adoption,
-and once adoption is good, it becomes cost. Picking one metric invites Goodhart's law (a measure that
-becomes a target stops being a good measure). A support bot's deflection rate climbs fastest when the
-bot makes it hard to reach a human. Reporting only model metrics leaves the project defenceless at
-budget time, because nobody can translate "faithfulness 0.91" into money. And metrics chosen *after*
-deployment cannot be falsified, because people pick whichever one looks good. Defining metrics up front
-is what makes the project a testable claim instead of a story.
+- **AI projects fail at the review meeting, not in the middle.** The demo impressed, the pilot ran six
+  weeks, then the sponsor asks "so, did it work?" and nobody had agreed what "work" meant. The project
+  gets judged on anecdote, perhaps the one embarrassing answer someone screenshotted.
+- **Engineers and sponsors bring different numbers.** Engineers bring 94% answer correctness on a golden
+  set and p95 latency of 3 seconds. Sponsors need cost per resolved case, cycle time, revenue or
+  regulatory exposure. Nothing connects the two sets unless you build the link.
+- **"We'll know it when we see it" moves the goalposts.** Recency bias decides the verdict: once accuracy
+  is good the question becomes adoption, then cost.
+- **One metric invites Goodhart's law** (a measure that becomes a target stops being a good measure). A
+  support bot's deflection rate climbs fastest when reaching a human gets hard. Model-only metrics leave
+  you defenceless at budget time, because nobody can translate "faithfulness 0.91" into money.
+- **Metrics chosen after deployment cannot be falsified,** because people pick whichever one looks good.
+  Defining them up front turns the project into a testable claim instead of a story.
 
 ## How it works
 ### Build a metric tree, not a list
 Arrange metrics in levels connected by a stated causal hypothesis:
 
-1. **Outcome KPI** (lagging, monthly or quarterly). This is what the sponsor reports upward: cost per
-   resolved ticket, claim cycle time, days sales outstanding, analyst hours per report. Keep it to one
-   or at most two. Several outcome KPIs dilute accountability.
-2. **Operational drivers** (leading, weekly). These are the behaviours that should move the outcome:
-   share of cases completed without a human, handle time on AI-assisted cases, adoption rate (share of
-   eligible work where the tool was actually used), edit rate on drafts.
-3. **System quality** (daily, from evals and logs). This is what the engineering team controls directly:
-   task completion rate, extraction field accuracy, retrieval recall, escalation precision, p95 latency,
-   cost per successful task.
-4. **Guardrails** (counter-metrics). These must not get worse while the others improve: customer
-   satisfaction, reopen rate, compliance errors, misrouted high-severity cases.
+| Level | Cadence | Examples |
+|---|---|---|
+| 1. **Outcome KPI** (lagging) | monthly or quarterly | cost per resolved ticket, claim cycle time, days sales outstanding, analyst hours per report |
+| 2. **Operational drivers** (leading) | weekly | share of cases completed without a human, handle time on AI-assisted cases, adoption rate, edit rate on drafts |
+| 3. **System quality** | daily, from evals and logs | task completion rate, extraction field accuracy, retrieval recall, escalation precision, p95 latency, cost per successful task |
+| 4. **Guardrails** (counter-metrics) | with every report | customer satisfaction, reopen rate, compliance errors, misrouted high-severity cases |
 
-The tree exists because outcome KPIs move slowly and are confounded by seasonality, staffing and pricing
-changes, so you cannot steer week to week by them. Leading indicators predict them. Writing the causal
-links down also makes failures diagnosable: if level 3 improves but level 1 does not, one specific link
-in the hypothesis is wrong, and you can see which one.
+- **Keep one outcome KPI, or at most two.** It is what the sponsor reports upward; several outcome KPIs
+  dilute accountability.
+- **Adoption rate means use on eligible work:** the share of eligible work where the tool was actually
+  used, not logins.
+- **Guardrails must not get worse** while the others improve.
+- **Why a tree:** outcome KPIs move slowly and are confounded by seasonality, staffing and pricing
+  changes, so you cannot steer week to week by them. Leading indicators predict them.
+- **Why write the links down:** failures become diagnosable. If level 3 improves but level 1 does not,
+  one specific link in the hypothesis is wrong, and you can see which one.
 
 ### Write a spec for every metric
-Each metric gets a spec: the name, the exact numerator and denominator, the population (which cases,
-with what exclusions), the data source and who owns that pipeline, the measurement window, the baseline
-value and how it was measured, the target, and a named owner. This is tedious *because* it is the part
-that gets disputed. In three departments "resolved" can mean three things: closed by an agent, no
-customer reply for 72 hours, or not reopened within 7 days. The denominator matters just as much. If
-you drop "out-of-scope" tickets after the fact, the automation rate inflates silently.
+Each metric gets:
+1. Name, plus the exact numerator and denominator.
+2. Population: which cases, with what exclusions.
+3. Data source and who owns that pipeline.
+4. Measurement window.
+5. Baseline value and how it was measured.
+6. Target and a named owner.
+
+- **This is tedious because it is the part that gets disputed.** In three departments "resolved" can mean
+  three things: closed by an agent, no customer reply for 72 hours, or not reopened within 7 days.
+- **The denominator matters just as much.** Drop "out-of-scope" tickets after the fact and the automation
+  rate inflates silently.
 
 ### Turn targets into decision rules
-A target needs a reference point, a horizon and a consequence. For example: "median cycle time falls
-from the measured baseline of X to at most Y within 90 days of pilot start. If it does, we expand to
-region B. If it improves by less than Z, we stop." Without a pre-agreed decision rule the target is
-decoration, and the review turns into a negotiation.
+- **A target needs a reference point, a horizon and a consequence.** For example: "median cycle time falls
+  from the measured baseline of X to at most Y within 90 days of pilot start. If it does, we expand to
+  region B. If it improves by less than Z, we stop."
+- **Without a pre-agreed decision rule the target is decoration,** and the review turns into a negotiation.
 
 ### Pair every target with its cheapest way to cheat
-For each metric you optimise, name the cheap way to game it and add a guardrail that would catch it.
-Deflection pairs with reopen rate and escalations within 24 hours. Handle time pairs with a QA score.
-Auto-approval rate pairs with the error rate on auto-approved items, audited by sampling. This does not
-assume bad faith. Optimisation pressure, including the team's own prompt iteration against the metric, finds the
-cheap path by default.
+For each optimised metric, name the cheap way to game it and add a guardrail that would catch it:
+
+| Optimised metric | Guardrail |
+|---|---|
+| Deflection | reopen rate and escalations within 24 hours |
+| Handle time | QA score |
+| Auto-approval rate | error rate on auto-approved items, audited by sampling |
+
+- **This does not assume bad faith.** Optimisation pressure, including the team's own prompt iteration
+  against the metric, finds the cheap path by default.
 
 ### Check the target is attributable and detectable
-A target is only useful if the pilot can tell whether it was hit, and that takes two more decisions
-made now, not at the review. **Attribution:** what would the KPI have done without the system?
-Outcome KPIs drift with seasonality, staffing and pricing, so agree the comparison up front: a
-concurrent holdout group, a staggered rollout, or at minimum a before/after read against a comparison
-queue (the baseline lesson covers these designs). **Detectability:** a rule of thumb from online
-experimentation is n ≈ 16σ²/δ² cases per group for about 80% power at a two-sided 5% significance
-level, where δ is the smallest change that matters and, for a rate, σ² = p(1−p). Guardrails are where
-this bites, because they are rare-event rates. Detecting a misrouting rise from 1.5% to 2.5% needs about
-16 × 0.015 × 0.985 / 0.01² ≈ 2,400 cases per group. If the pilot will not see that volume, lengthen the
-window, accept a wider tolerance, or back the guardrail with targeted audits instead of the raw rate.
+A target is only useful if the pilot can tell whether it was hit. That takes two decisions made now, not
+at the review.
+- **Attribution: what would the KPI have done without the system?** Outcome KPIs drift with seasonality,
+  staffing and pricing, so agree the comparison up front: a concurrent holdout group, a staggered rollout,
+  or at minimum a before/after read against a comparison queue (the baseline lesson covers these designs).
+- **Detectability: is the pilot big enough?** A rule of thumb from online experimentation, for about 80%
+  power at a two-sided 5% significance level:
 
-## Example
-Here is a worked scenario with illustrative numbers. An insurer wants an assistant that reads
-first-notice-of-loss (FNOL) emails, extracts policy number, loss date, loss type and description, and
-pre-fills the claim record for an adjuster to confirm.
+```
+n ≈ 16σ²/δ² cases per group
+δ  = smallest change that matters
+σ² = p(1−p) for a rate
+```
 
-- **Outcome KPI:** median hours from FNOL receipt to claim set up. The baseline over 8 weeks was
-  26 hours. The target is at most 8 hours, 90 days after the pilot starts.
-- **Driver:** the share of FNOLs where every mandatory field was pre-filled and the adjuster accepted
-  it without edits. The target is 70%.
-- **System quality:** field-level accuracy on a 400-email golden set. The target is at least 99% for
-  policy number and at least 90% for loss-type category, measured on every prompt or model change.
-- **Guardrails:** the misrouting rate (claim sent to the wrong line of business) stays at or below the
-  1.5% baseline, and no claim is set up against the wrong policy number, with weekly audits.
+- **Guardrails are where this bites,** because they are rare-event rates. Detecting a misrouting rise from
+  1.5% to 2.5% needs about 16 × 0.015 × 0.985 / 0.01² ≈ 2,400 cases per group.
+- **If the pilot will not see that volume,** lengthen the window, accept a wider tolerance, or back the
+  guardrail with targeted audits instead of the raw rate.
 
-In week 3 the driver reads 78%, ahead of target, and cycle time has fallen to 11 hours. The guardrail
-shows misrouting at 3.1%. Is that noise? With about 700 FNOLs that week (illustrative), 3.1% is roughly
-22 misroutes against about 10 expected at the 1.5% baseline, and a count of 10 varies by only about ±3
-week to week, so this is a real shift, not a bad draw. A drill-down finds that adjusters are accepting pre-filled loss types without
-reading them on the busiest queue, and that the extractor confuses "escape of water" with "flood" in
-one region's phrasing. Without the guardrail, the dashboard would have said "success" while claims
-went to the wrong handlers. The team disables auto-accept for the water categories, adds 40
-region-specific emails to the golden set, and re-runs the eval. The tree told them which link broke: the
-driver rose for the wrong reason.
+## Diagram
+Read bottom-up: system quality should move the drivers, which should move the outcome, while guardrails
+catch the metric being gamed. Each arrow is a causal hypothesis you can test.
+
+```mermaid
+flowchart TD
+    Q["System quality: daily evals and logs"] -->|"hypothesis: better quality"| D["Drivers: adoption, automation share"]
+    D -->|"hypothesis: more use"| O["Outcome KPI: cost or cycle time"]
+    G["Guardrails: CSAT, reopens, misroutes"] -.->|"must not worsen"| D
+    O --> R{"Decision rule at review"}
+    G --> R
+    R -->|"target met, guardrails hold"| E["Expand"]
+    R -->|"below threshold Z"| S["Stop or rescope"]
+```
+
+## Examples
+### Worked scenario: insurer FNOL extraction (illustrative numbers)
+An insurer wants an assistant that reads first-notice-of-loss (FNOL) emails, extracts policy number, loss
+date, loss type and description, and pre-fills the claim record for an adjuster to confirm.
+
+| Level | Metric | Baseline / target |
+|---|---|---|
+| Outcome KPI | median hours from FNOL receipt to claim set up | baseline over 8 weeks: 26 hours; target at most 8 hours, 90 days after pilot start |
+| Driver | share of FNOLs with every mandatory field pre-filled and accepted without edits | target 70% |
+| System quality | field-level accuracy on a 400-email golden set, measured on every prompt or model change | at least 99% for policy number, at least 90% for loss-type category |
+| Guardrails | misrouting rate (claim sent to the wrong line of business); claims set up against the wrong policy number | misrouting at or below the 1.5% baseline; zero wrong-policy claims, with weekly audits |
+
+What week 3 showed:
+1. **Driver reads 78%,** ahead of target; cycle time has fallen to 11 hours.
+2. **Guardrail shows misrouting at 3.1%.** Is that noise? With about 700 FNOLs that week (illustrative),
+   3.1% is roughly 22 misroutes against about 10 expected at the 1.5% baseline. A count of 10 varies by
+   only about ±3 week to week, so this is a real shift, not a bad draw.
+3. **Drill-down:** adjusters on the busiest queue accept pre-filled loss types without reading them, and
+   the extractor confuses "escape of water" with "flood" in one region's phrasing.
+4. **Fix:** disable auto-accept for the water categories, add 40 region-specific emails to the golden
+   set, re-run the eval.
+
+Without the guardrail the dashboard would have said "success" while claims went to the wrong handlers.
+The tree told them which link broke: the driver rose for the wrong reason.
+
+### Guardrail calculator: sample size and "is this shift real?"
+Pure Python; reproduces the numbers above.
+
+```python
+import math
+
+def n_per_group(p_base, p_alt):
+    """Rule of thumb n = 16 sigma^2 / delta^2: ~80% power, two-sided 5% level."""
+    sigma2 = p_base * (1 - p_base)
+    delta = abs(p_alt - p_base)
+    return math.ceil(16 * sigma2 / delta ** 2)
+
+def shift_z(observed, n, p_base):
+    """How many standard deviations a weekly count sits above its baseline."""
+    expected = n * p_base
+    sd = math.sqrt(n * p_base * (1 - p_base))
+    return expected, sd, (observed - expected) / sd
+
+print(n_per_group(0.015, 0.025))   # 2364 -> about 2,400 cases per group
+print(shift_z(22, 700, 0.015))     # (10.5, ~3.2, ~3.6): a real shift, not noise
+```
+
+- **Read the second line:** 22 observed against 10.5 expected is about 3.6 standard deviations, well past
+  the usual 2 to 3 used as an alert line.
+
+## Production patterns
+- **Metric spec as a reviewed file.** When the pilot starts, keep each metric's numerator, denominator,
+  population, source, window, baseline, target and owner in a version-controlled file that the sponsor
+  signs off. Monitor for unreviewed edits to definitions, because a changed denominator silently moves
+  the number.
+- **Join keys from day one.** Log a task ID on every model event that also appears on the business record
+  (ticket, claim), so drivers and outcomes are computed by a join, not by hand. Monitor the share of
+  business records with no matching task ID.
+- **Guardrail-paired dashboards.** Put each optimised metric next to its counter-metric on the same panel,
+  for example deflection beside 7-day reopen rate. Alert when the guardrail breaches its threshold over a
+  confidence interval rather than a single week's reading.
+- **Version-tagged quality metrics.** Tag every eval run and production log with the model and prompt
+  version, so a shift in level 3 can be attributed to a specific change. Monitor quality per version after
+  each deploy.
+- **Steering meeting from the tree.** Use the tree as the agenda: outcome, drivers, quality, guardrails,
+  then the decision rule. Track which causal link is under investigation and who owns it.
 
 ## Trade-offs
-- More metrics give better diagnosis but blur accountability. Keep one outcome KPI and three to five
-  drivers, and add more only if a review cannot locate a failure.
-- Outcome KPIs are what sponsors care about, but they lag by weeks and carry confounders. Lean on
-  leading drivers for steering unless the outcome moves fast, as in real-time conversion.
-- Tight metric specs prevent disputes but take days of negotiation with data owners. For a throwaway
-  proof of concept, a looser spec is acceptable if it is labelled as such.
-- Ambitious targets motivate, but they make a sound project look like a failure. Set targets from a
-  measured baseline and the realistic human error rate, not from vendor marketing.
-- Hard guardrails (a breach stops rollout) protect users but can halt a sound launch over noise. Define
-  the breach threshold with a confidence interval, not a single week's reading.
+- **Diagnosis vs accountability.** More metrics give better diagnosis but blur accountability. Keep one
+  outcome KPI and three to five drivers, and add more only if a review cannot locate a failure.
+- **Relevance vs speed.** Outcome KPIs are what sponsors care about, but they lag by weeks and carry
+  confounders. Lean on leading drivers for steering unless the outcome moves fast, as in real-time
+  conversion.
+- **Precision vs negotiation time.** Tight metric specs prevent disputes but take days of negotiation with
+  data owners. For a throwaway proof of concept, a looser spec is acceptable if it is labelled as such.
+- **Ambition vs fairness.** Ambitious targets motivate, but they make a sound project look like a failure.
+  Set targets from a measured baseline and the realistic human error rate, not from vendor marketing.
+- **Protection vs false alarms.** Hard guardrails (a breach stops rollout) protect users but can halt a
+  sound launch over noise. Define the breach threshold with a confidence interval, not a single week's
+  reading.
 
 ## Pitfalls
-- Choosing model metrics as the success criteria. The symptom is a project that hits 95% accuracy and
-  still gets cancelled because nobody could say what it saved.
-- Leaving the denominator undefined. The symptom is two teams reporting different automation rates from
-  the same data and the review turning into an argument about definitions.
-- Setting targets before measuring the baseline. The symptom is a demand for 99% accuracy on a task
-  where the human team, once audited, turns out to be 88% accurate.
-- No guardrail for the optimised metric. The symptom is the headline number improving while complaints,
-  reopens or downstream rework quietly rise.
-- Measuring adoption as logins rather than use on eligible work. The symptom is high "active users"
-  alongside no change in handle time.
+- **Choosing model metrics as the success criteria.** Symptom: a project that hits 95% accuracy and still
+  gets cancelled because nobody could say what it saved. Fix: an outcome KPI at the top of the tree.
+- **Leaving the denominator undefined.** Symptom: two teams report different automation rates from the
+  same data and the review becomes an argument about definitions. Fix: a written spec per metric.
+- **Setting targets before measuring the baseline.** Symptom: a demand for 99% accuracy on a task where the
+  human team, once audited, turns out to be 88% accurate. Fix: measure first.
+- **No guardrail for the optimised metric.** Symptom: the headline number improves while complaints,
+  reopens or downstream rework quietly rise. Fix: pair every target with its cheapest cheat.
+- **Measuring adoption as logins rather than use on eligible work.** Symptom: high "active users" alongside
+  no change in handle time. Fix: define adoption over eligible work items.
 
 ## When to use
-Define success metrics in the first two weeks of any customer-facing AI engagement, before
-architecture choices, because the metrics decide what you build: a cycle-time KPI favours automation,
-while a quality KPI favours assistive drafting with review. Skip the full tree only for internal
-spikes whose sole question is technical feasibility, and say so in writing. In day-to-day work the tree
-becomes the pilot dashboard and the agenda of every steering meeting. In interviews, expect "how would
-you measure success for X?" A strong answer names the outcome, the drivers, the guardrail that catches
-gaming, and how the baseline gets measured.
+- **Use when:** any customer-facing AI engagement, in the first two weeks and before architecture choices,
+  because the metrics decide what you build. A cycle-time KPI favours automation; a quality KPI favours
+  assistive drafting with review.
+- **Skip the full tree when:** an internal spike's sole question is technical feasibility, and say so in
+  writing.
+- **Day to day:** the tree becomes the pilot dashboard and the agenda of every steering meeting.
+- **Interviews:** expect "how would you measure success for X?" A strong answer names the outcome, the
+  drivers, the guardrail that catches gaming, and how the baseline gets measured.
 
 ## Role lens
 - **Engineer:** Instruments the system so every driver and quality metric can be computed from logs,
@@ -171,6 +248,39 @@ Bot resolution share would be one driver, defined as no human contact and no rep
 issue within 7 days. Guardrails would be CSAT on bot-resolved chats, the 7-day repeat-contact rate, and
 the share of high-severity intents escalated within one turn. I would measure all of these over a
 baseline window first, and agree in writing what result triggers expansion or a stop.
+
+## Interview questions
+### What is the difference between a success metric and a KPI, and why build a tree rather than a list?
+- **Definition:** success metrics are every number the customer uses to judge the project; KPIs are the
+  business outcomes among them, such as cost per case or cycle time.
+- **Why a tree:** outcomes lag and are confounded, so you steer by leading drivers and daily quality
+  metrics, and the stated causal links show which assumption failed when the outcome does not move.
+
+### Your system quality metrics all improved, but the outcome KPI is flat after two months. How do you debug it?
+- **Walk the tree link by link.** Check the drivers first: if adoption on eligible work is low, the quality
+  gain never reached the business process.
+- **If drivers moved but the outcome did not,** check attribution against the holdout or comparison queue
+  for seasonality or staffing changes, then question the hypothesis linking that driver to the outcome.
+- **Check definitions,** in case the outcome's denominator or population changed during the pilot.
+
+### When would you not insist on a hard guardrail that halts rollout on breach?
+- **When the guardrail is a rare-event rate and volume is low.** Detecting 1.5% to 2.5% needs about 2,400
+  cases per group, so a small pilot would halt on noise.
+- **Instead,** use a confidence-interval threshold, a longer window, or targeted audits of the risky
+  segment, and reserve hard stops for severe harms such as wrong-policy claims.
+
+### How would you set the target for an extraction assistant when the customer asks for 99% accuracy?
+- **Measure the baseline first.** Audit the human team on the same task; if they are 88% accurate, 99% is
+  a target that makes a sound project look like a failure.
+- **Set per-field targets by consequence,** for example 99% on policy number but 90% on loss-type
+  category, and tie the decision rule to the outcome KPI, not to accuracy alone.
+
+### How do you stop a deflection or containment metric from being gamed?
+- **Name the cheapest cheat:** making handoff harder or ending chats early raises containment.
+- **Pair it with guardrails** that catch exactly that: reopen rate, repeat contacts and escalations within
+  24 hours, shown on the same dashboard panel.
+- **Define the driver strictly,** as no human contact and no repeat contact on the same issue within a
+  window, so contained-but-unresolved chats do not count.
 
 ## Quiz
 ### Q: Why does a metric tree separate operational drivers from the outcome KPI?

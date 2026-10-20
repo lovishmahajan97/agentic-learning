@@ -116,6 +116,24 @@ LLMError(Exception)              one base per subsystem: "anything from the LLM 
 - **`ExceptionGroup` (3.11) bundles them,** and `except* Transient` selects the matching members while
   re-raising the rest, keeping the retry/no-retry split correct for parallel work.
 
+## Diagram
+The decision path for one failed provider call: the adapter classifies once with `raise ... from e`,
+and every layer above decides by class, never by status code or message text.
+
+```mermaid
+flowchart TD
+    V["Vendor error: httpx exception or status code"] --> AD["Adapter: translate once, raise from e"]
+    AD -->|"429"| RL["RateLimited, a Transient, with retry_after"]
+    AD -->|"timeout or 5xx"| TR["Transient"]
+    AD -->|"context_length_exceeded"| CT["ContextTooLong, a Recoverable, with tokens and limit"]
+    AD -->|"400, 401, 403 or unmapped"| PE["Permanent"]
+    RL --> RLOOP["Retry loop: sleep retry_after capped, try again"]
+    TR --> BACK["Retry loop: exponential backoff"]
+    CT --> SHRINK["Shrink prompt to fit limit, then retry"]
+    PE --> TOP["Top-level handler: log once, map to HTTP status"]
+    BUG["Own bug such as KeyError"] -.->|"not an LLMError, no retry"| TOP
+```
+
 ## Examples
 ### A hierarchy, an adapter and a policy-aware retry loop
 HTTP failures are translated once at the adapter; the loop retries only what is marked retryable. The
@@ -298,6 +316,37 @@ and 5xx with a `retry_after` attribute, `Permanent` for 4xx auth and policy erro
 `ContextTooLong` carrying the limit. Translate vendor exceptions into it once in the adapter with
 `raise ... from e`, retry only `Transient`, shrink on `ContextTooLong`, and let everything else
 propagate to a single top-level handler that logs once with the full chain and maps to a status.
+
+## Interview questions
+### Why build a custom exception hierarchy instead of catching the SDK's exceptions directly?
+- **Policy, not source:** branches such as `Transient`, `Permanent` and `Recoverable` let each layer
+  catch exactly what it can act on, because `except` matches a class and all its subclasses.
+- **Vendor neutrality:** translating once in the adapter means adding a fallback provider touches one
+  module, not every call site, and handlers never depend on vendor message wording.
+
+### Your provider bill tripled after a deploy, but error rates look flat. What would you check?
+- **A catch-all retry:** `except Exception` around a paid call retries permanent failures and your own
+  bugs, so a new `KeyError` in parsing costs three requests while eventual failure looks like one error.
+- **Evidence:** retries per exception class, and the same trace appearing several times per request.
+- **Fix:** retry only `Transient`, let bugs escape on the first attempt, and log once at the top.
+
+### When would you use an attribute such as `retryable` instead of a new subclass?
+- **When handling depends on data,** for example the same `ProviderHTTPError` is retryable for 503 but
+  not for 400, and splitting every status into a class would be sprawl.
+- **Prefer classes where you can,** because an `except` clause cannot forget to check a flag, while every
+  `if e.retryable` is a place to get it wrong.
+
+### Three parallel tool calls fail at once inside a `TaskGroup`. How do you retry only the retryable ones?
+- **The group raises an `ExceptionGroup`** (3.11) bundling all failures, since there is no single
+  exception to raise.
+- **Use `except* Transient`** to select the retryable members and `except* Permanent` for the rest;
+  anything unmatched is re-raised, so the retry or no-retry split stays correct for parallel work.
+
+### What is the difference between `raise Domain(...) from e` and `from None`, and when would you use each?
+- **`from e`** sets `__cause__`, so the traceback shows the vendor error as the direct cause: the default
+  for adapter translation, because on-call needs the vendor trace.
+- **`from None`** suppresses the context and shows only the new error, for when the original is
+  irrelevant noise, such as a `KeyError` from a lookup you are reporting more clearly.
 
 ## Quiz
 ### Q: Why does `except Exception:` not catch `KeyboardInterrupt` or `asyncio.CancelledError`?

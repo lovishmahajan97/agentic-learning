@@ -280,12 +280,13 @@ empirical. If the hot loop can be expressed as vectorised Polars string operatio
 - **Monitor** executor queue length and offloaded-call latency, and switch to an async client when one
   exists.
 
-### When would multiprocessing make a job slower, and how do you fix it?
-- **When per-task compute is small relative to pickling.** The parent pickles every argument and result
-  and tracks a future per task, so tiny tasks make the parent the bottleneck.
-- **Fix the grain:** batch with `chunksize=` or explicit batches, load heavy state once in
-  `initializer=`, and check the ratio with `len(pickle.dumps(arg))` and a quick timing.
-- **In the lesson's run**, tiny tasks took about 4.4 s at `chunksize=1` and under 0.1 s at 1000.
+### Would free-threaded CPython (PEP 703) change how you design CPU-bound work?
+- **Potentially, for CPU work.** Without the GIL, threads could run pure-Python code in parallel while
+  sharing memory and model weights, avoiding pickling and per-worker copies.
+- **Not yet by default:** it is an optional build, so check its status for your Python version and
+  whether every C extension you depend on supports it.
+- **Shared state then needs real locking**, because code that was accidentally safe under the GIL can
+  race; measure before replacing a working process pool.
 
 ### Why would you choose spawn or forkserver over fork for a worker pool?
 - **`fork` copies the parent's state**, including locks held by other threads and CUDA state, so

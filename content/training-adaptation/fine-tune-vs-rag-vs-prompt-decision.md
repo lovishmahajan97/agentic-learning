@@ -5,7 +5,7 @@ name: Fine-tune vs RAG vs prompt decision
 kind: decision
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - training-adaptation/supervised-fine-tuning
   - training-adaptation/peft
@@ -22,39 +22,28 @@ sources:
 ---
 
 ## TL;DR
-The three levers change different objects. A prompt changes the input of one request and costs nothing
-to try. RAG puts knowledge the model does not have into the input at request time, with freshness,
-access control and citations. Fine-tuning changes the weights, which is the right tool for behaviour,
-format, skill and per-request cost, and a poor tool for injecting facts. Decide by naming the gap
-(knowledge, behaviour or economics) and climb prompt → RAG → fine-tune only when evals show the cheaper
-rung is not enough.
+Prompts change one request's input, RAG adds missing knowledge at request time, and fine-tuning changes
+weights for behaviour, format, skill and cost, not facts. Name the gap, then climb prompt → RAG →
+fine-tune only when evals prove the cheaper rung insufficient.
 
 ## Why it exists
-"Make the model know our stuff", "make it sound like us", "make it stop doing X" arrive every week, and
-the reflex answer is "fine-tune it", because training feels like the real engineering. That reflex is
-expensive and usually wrong for the first request. Fine-tuning on a pile of documents does not reliably
-make a model recall their contents: the loss is next-token prediction over a handful of phrasings, which
-is nothing like the massive repetition and paraphrase that got facts into the model during pretraining.
-Ovadia et al. compared knowledge injection methods and found retrieval consistently beat unsupervised
-fine-tuning on new facts; fine-tuning improved when each fact was shown in many paraphrases, which
-supports the diagnosis that the problem is exposure and phrasing, not effort. Even when fine-tuned knowledge does stick, it is frozen at training time,
-cannot be scoped per tenant or deleted, carries no citation, and has to be redone when the base model is
-upgraded.
-
-The opposite reflex, "just prompt harder", has its own ceilings. Prompts grow to thousands of tokens of
-instructions and examples, which costs money and latency on every call; few-shot examples cannot pin
-down a precise output distribution; and some behaviours (strict schema compliance in a small model,
-a domain's tone, a tool-calling idiom) never stabilise by instruction alone.
-
-RAG sits between them and is often the answer, but only for one kind of gap: it helps when the model is
-*missing* information that exists in retrievable text. It does nothing when the model has the
-information and still does the wrong thing with it, and it introduces retrieval quality as a new failure
-mode.
-
-So the decision needs a framework that maps the symptom to the lever, and a measurement loop that proves
-the cheaper lever insufficient before paying for the next one. Without it, teams spend two weeks on a
-LoRA to fix what a 200-token system prompt edit would have fixed, or build a retrieval stack to fix a
-formatting problem.
+- **The same requests arrive every week.** "Make the model know our stuff", "make it sound like us",
+  "make it stop doing X". The reflex answer is "fine-tune it", because training feels like the real
+  engineering. That reflex is expensive and usually wrong for the first request.
+- **Fine-tuning on documents does not reliably inject them.** The loss is next-token prediction over a
+  handful of phrasings, nothing like the massive repetition and paraphrase of pretraining. Ovadia et al.
+  found retrieval consistently beat unsupervised fine-tuning on new facts; fine-tuning improved only when
+  each fact was shown in many paraphrases, so the problem is exposure and phrasing, not effort.
+- **Even knowledge that sticks is frozen.** It is fixed at training time, cannot be scoped per tenant or
+  deleted, carries no citation, and must be redone when the base model is upgraded.
+- **"Just prompt harder" has ceilings too.** Prompts grow to thousands of tokens, costing money and
+  latency on every call; few-shot examples cannot pin a precise output distribution; some behaviours
+  (strict schema compliance in a small model, a domain's tone, a tool-calling idiom) never stabilise by
+  instruction alone.
+- **RAG fixes only one gap, and adds a failure mode.** It helps when the model is *missing* information
+  that exists in retrievable text, not when it has the information and still does the wrong thing, and
+  retrieval quality becomes a new risk. Without a framework, teams spend two weeks on a LoRA that a
+  200-token system prompt edit would have fixed, or build retrieval to fix formatting.
 
 ## How it works
 ### Three levers, three different objects
@@ -65,31 +54,32 @@ formatting problem.
 | Fine-tune (SFT/DPO, usually LoRA) | The weights | Default style, format, task skill, tool idiom, compressing a long prompt, distilling into a smaller model | Facts that change, facts needing attribution, anything still being redesigned | Data, GPU time, evals, re-doing on base-model upgrades, forgetting risk |
 
 ### The decision procedure
-1. **Name the gap with failing examples.** Collect 50–200 real failures and sort them: the model lacked
-   information (knowledge gap); it had the information and still answered wrongly, in the wrong form or
-   tone (behaviour gap); it was right but too slow or expensive (economics gap). Most requests contain
-   two gaps tangled together, and the lever is different for each.
+1. **Name the gap with failing examples.** Collect 50–200 real failures and sort them:
+   - *knowledge gap:* the model lacked information;
+   - *behaviour gap:* it had the information and still answered wrongly, in the wrong form or tone;
+   - *economics gap:* it was right but too slow or expensive.
+   Most requests contain two gaps tangled together, and the lever differs for each.
 2. **Knowledge gap → RAG.** Or long context, if the corpus is small, static and the token cost is
    acceptable. Do not fine-tune to inject the content. If the model handles retrieved passages badly
    (ignores them, cannot say "not in the documents"), that is a behaviour gap: fine-tune it to *use*
    retrieved context (the RAFT idea), still keeping the facts in the index.
 3. **Behaviour gap → prompt first.** System prompt, a few curated examples, structured-output mode. Build
    the eval set from the failures and score it. If the score plateaus below target, or the prompt needed
-   to reach it is so long that it dominates per-request cost, move to a LoRA SFT on the same reviewed
-   examples; use DPO when the failures are preference-shaped (two answers, one better) rather than
-   right/wrong.
+   to reach it dominates per-request cost, move to a LoRA SFT on the same reviewed examples. Use DPO when
+   failures are preference-shaped (two answers, one better) rather than right/wrong.
 4. **Economics gap → fine-tune.** Distil the big model's outputs into a smaller model, or train the
    few-shot block into the weights so the prompt shrinks; verify on the same eval set that quality held.
-5. **Combine.** The usual end state of a production domain assistant is RAG for facts, a fine-tuned or
-   well-prompted model for behaviour, and a prompt for per-deployment configuration. The levers are not
-   exclusive; the mistake is using the wrong one for a given gap.
+5. **Combine.** The usual production end state is RAG for facts, a fine-tuned or well-prompted model for
+   behaviour, and a prompt for per-deployment configuration. The levers are not exclusive; the mistake is
+   using the wrong one for a given gap.
 
 ### Why fine-tuning is weak at facts
-SFT shifts probability mass toward the sequences it sees. A fact seen a few times in one phrasing does
-not become reliably retrievable under other phrasings, which is what question answering requires. RAG
-puts the fact in the context window, where attention can copy it directly, so the model needs no
-memorisation at all. This is also why fine-tuned "knowledge" fails silently: the model produces
-plausible details in the style of the training data rather than refusing.
+- **SFT shifts probability mass toward the sequences it sees.** A fact seen a few times in one phrasing
+  does not become reliably retrievable under other phrasings, which question answering requires.
+- **RAG puts the fact in the context window,** where attention can copy it directly, so no memorisation
+  is needed.
+- **Fine-tuned "knowledge" fails silently,** because the model produces plausible details in the style of
+  the training data rather than refusing.
 
 ### The economics, as arithmetic
 The cost case for fine-tuning is a break-even, not a feeling:
@@ -101,78 +91,172 @@ cost per cycle   = data review + training runs + eval runs, repeated at every ba
 fine-tune pays   when monthly saving × months between upgrades > cost per cycle
 ```
 
-The second term of the saving is the one people forget. Some hosted fine-tuning products price tuned
-models above the base model per token, and a self-hosted tuned model needs its own GPUs unless the serving
-stack can load many LoRA adapters onto one shared base (multi-adapter serving). Prompt caching shrinks the
-first term, because a cached prefix is already billed at a discount. Run the numbers with your vendor's
-current prices before arguing either way.
+- **The second term of the saving is the one people forget.** Some hosted fine-tuning products price
+  tuned models above the base model per token.
+- **Self-hosting has its own cost.** A tuned model needs its own GPUs unless the serving stack can load
+  many LoRA adapters onto one shared base (multi-adapter serving).
+- **Prompt caching shrinks the first term,** because a cached prefix is already billed at a discount.
+- **Run the numbers** with your vendor's current prices before arguing either way.
 
 ### Reversibility and the upgrade tax
-A prompt change is one deploy with instant rollback and transfers largely unchanged to a newer base
-model. A RAG index is updated incrementally and supports deletion, and it transfers to any model.
-A fine-tune is a new artifact that must be re-evaluated, rolled back by swapping adapters, and
-re-trained for every base-model release; with proprietary APIs it may also lock you to one vendor's
-fine-tuning product. That tax is why "prompt until proven insufficient" is the default ordering, not
-a statement that fine-tuning is bad.
+| Lever | Change and rollback | On a new base model |
+|---|---|---|
+| Prompt | One deploy, instant rollback | Transfers largely unchanged |
+| RAG index | Incremental updates, supports deletion | Transfers to any model |
+| Fine-tune | New artifact to re-evaluate; roll back by swapping adapters | Re-train for every release; with proprietary APIs, may lock you to one vendor's fine-tuning product |
 
-## Example
-A support assistant for a SaaS product (all numbers illustrative). Three complaints: it does not know
-the product docs, which change weekly; it should answer in brand voice as a fixed JSON object; and it
-runs 2 million requests a month with a 5,000-token prompt of instructions and twelve examples.
+That tax is why "prompt until proven insufficient" is the default ordering, not a statement that
+fine-tuning is bad.
 
-Sort the gaps. The docs are a knowledge gap: build RAG over the docs with weekly re-indexing, so new
-pages are answerable the day they ship and retired pages stop being cited. Voice and JSON are behaviour
-gaps: tighten the system prompt, enable structured-output mode, and measure on 200 reviewed cases.
-Structured output guarantees the JSON parses and matches the schema, but not that the right fields carry
-the right content, so the metric is field-level correctness (right `category` enum, `escalate` set when
-policy requires it). Suppose that reaches 97% field-level correctness and a tone score of 4.1/5 on a
-rubric, against targets of 99.5% and 4.5. The prompt has plateaued, so fine-tune: a LoRA SFT on 1,500 reviewed answers reaches 99.7% and 4.6,
-and the twelve examples can leave the prompt, which shrinks to 800 tokens.
+## Diagram
+Start from labelled failures, route each gap to its lever, and only climb to fine-tuning when the eval
+set plateaus on the cheaper rung.
 
-Now the economics. Input tokens drop from 5,000 × 2M = 10 billion to 800 × 2M = 1.6 billion per month,
-about 6× fewer; with prompt caching the cached share is discounted, so the realised saving is smaller
-but still material. Before celebrating, plug the tuned model's serving price or hosting cost into the
-break-even above: if the tuned model costs more per token, part of that 8.4-billion-token saving is
-handed straight back. The fine-tune costs a few GPU-hours per iteration plus the eval harness, repeated at
-each base-model upgrade. Knowledge stayed in the index; the weights only learned behaviour; the system
-prompt still carries per-customer configuration.
+```mermaid
+flowchart TD
+    F["50 to 200 real failures"] --> C{"Which gap?"}
+    C -->|"knowledge"| R["RAG or long context"]
+    R --> U{"Uses passages well?"}
+    U -->|"no"| RF["Fine-tune to use context"]
+    C -->|"behaviour"| P["Prompt plus eval set"]
+    P --> PL{"Plateau or prompt too costly?"}
+    PL -->|"yes"| L["LoRA SFT or DPO"]
+    C -->|"economics"| D["Distil or shrink prompt"]
+    D --> E["Same eval set, quality held?"]
+    L --> E
+    RF --> E
+    PL -->|"no"| S["Ship the prompt"]
+```
+
+## Examples
+### Support assistant: sorting the gaps
+A support assistant for a SaaS product (all numbers illustrative), running 2 million requests a month
+with a 5,000-token prompt of instructions and twelve examples.
+
+| Complaint | Gap | Lever |
+|---|---|---|
+| Does not know the product docs, which change weekly | Knowledge | RAG over the docs, weekly re-indexing, so new pages are answerable the day they ship and retired pages stop being cited |
+| Should answer in brand voice | Behaviour | Tighten the system prompt, then measure |
+| Must return a fixed JSON object | Behaviour | Structured-output mode, then measure on 200 reviewed cases |
+
+- **Pick the right metric.** Structured output guarantees the JSON parses and matches the schema, not
+  that the right fields carry the right content. So the metric is field-level correctness (right
+  `category` enum, `escalate` set when policy requires it).
+- **The prompt plateaus.** It reaches 97% field-level correctness and a tone score of 4.1/5 on a rubric,
+  against targets of 99.5% and 4.5.
+- **So fine-tune.** A LoRA SFT on 1,500 reviewed answers reaches 99.7% and 4.6, and the twelve examples
+  leave the prompt, which shrinks to 800 tokens.
+- **Division of labour.** Knowledge stayed in the index; the weights only learned behaviour; the system
+  prompt still carries per-customer configuration.
+
+### The economics of that fine-tune
+| Quantity | Before | After |
+|---|---|---|
+| Prompt tokens per request | 5,000 | 800 |
+| Input tokens per month (× 2M requests) | 10 billion | 1.6 billion |
+| Reduction | | about 6× fewer, an 8.4-billion-token saving |
+
+- **Caching discounts the win.** With prompt caching the cached share is already discounted, so the
+  realised saving is smaller but still material.
+- **Plug in the serving price.** If the tuned model costs more per token, part of that 8.4-billion-token
+  saving is handed straight back.
+- **Count the cycle cost.** A few GPU-hours per iteration plus the eval harness, repeated at each
+  base-model upgrade.
+
+### Break-even calculator
+The formula above as runnable Python. The prices are placeholders; replace them with your vendor's
+current list prices before deciding anything.
+
+```python
+def monthly_saving(tokens_removed, requests, price_per_mtok,
+                   cached_share=0.0, cached_price_ratio=1.0, extra_serving=0.0):
+    # Removed tokens that would have been cached were already billed at a discount,
+    # so they save less than full price.
+    blended = price_per_mtok * ((1 - cached_share) + cached_share * cached_price_ratio)
+    return tokens_removed * requests * blended / 1e6 - extra_serving
+
+def pays_off(saving, months_between_upgrades, cost_per_cycle):
+    return saving * months_between_upgrades > cost_per_cycle
+
+# Placeholder prices: replace with your vendor's current list prices.
+base = dict(tokens_removed=5000 - 800, requests=2_000_000, price_per_mtok=3.00)
+cycle, months = 15_000, 6          # review + training + evals per cycle; months per base model
+
+for label, kw in [
+    ("no caching, same price",         dict()),
+    ("80% cached at 10% price",        dict(cached_share=0.8, cached_price_ratio=0.1)),
+    ("cached + tuned model +$6k/month", dict(cached_share=0.8, cached_price_ratio=0.1, extra_serving=6000)),
+]:
+    s = monthly_saving(**base, **kw)
+    print(f"{label:34s} saving ${s:>9,.0f}/mo  pays off: {pays_off(s, months, cycle)}")
+# no caching, same price             saving $   25,200/mo  pays off: True
+# 80% cached at 10% price            saving $    7,056/mo  pays off: True
+# cached + tuned model +$6k/month    saving $    1,056/mo  pays off: False
+```
+
+The same 8.4 billion removed tokens go from an easy win to a loss once caching and a tuned-model
+serving premium are counted, which is why the second term matters.
+
+## Production patterns
+- **Eval-gated lever ladder.** When any "know / sound like / stop doing" request arrives, build one
+  golden set from the labelled failures and score every rung (prompt, RAG, LoRA) on it. Block promotion in
+  CI unless the new rung beats the previous one on the target metric. Monitor score per rung and
+  regressions on unrelated tasks.
+- **Facts in the index, behaviour in the weights.** Re-index on every document change (weekly at minimum
+  for the support case) and delete retired pages from the index, never from weights. Monitor retrieval
+  recall on the golden set, citation rate and "not in the documents" answers.
+- **Cache before you train.** Put stable instructions, tool definitions and few-shot examples first and
+  byte-identical so provider prompt caching applies (Anthropic's `cache_control` breakpoints, OpenAI's
+  automatic prefix caching). Monitor cached-token share in the usage fields, then redo the break-even.
+- **Multi-adapter serving for many tunes.** When several teams or tenants each need a LoRA, serve them on
+  one shared base, for example vLLM started with `--enable-lora` and `--max-loras`, choosing the adapter
+  per request. Monitor adapter load latency and per-adapter error rates.
+- **Budget the upgrade tax up front.** Version the training data, adapter and eval harness together. On
+  each base-model release, first rerun the prompt-only baseline: if the new base closes the gap, retire the
+  adapter. Track months between upgrades as an input to the break-even.
 
 ## Trade-offs
-- Prompting costs nothing to try and rolls back instantly, but every request pays for the prompt and
-  quality plateaus; it flips to fine-tuning when a multi-thousand-token prompt runs at high volume or
-  evals stall below target.
-- RAG gives freshness, citations, access control and deletion, but you now own a retrieval system whose
-  recall becomes the dominant failure mode; it flips to plain long context when the corpus is small and
-  rarely changes, and it never flips to fine-tuning for facts.
-- Fine-tuning gives behaviour you cannot prompt into existence and a cheaper per-request path, but costs
-  data, evals, forgetting risk and re-training at every base-model release; it flips back to prompting
-  when the task is still changing or the model is upgraded often.
-- Combining RAG with a fine-tuned model is the strongest configuration, but doubles the moving parts; it
-  only pays off when the team can run the same eval set across both layers after every change.
+- **Prompting: free to try vs paid on every request.** It rolls back instantly, but every request pays for
+  the prompt and quality plateaus. It flips to fine-tuning when a multi-thousand-token prompt runs at high
+  volume or evals stall below target.
+- **RAG: freshness vs owning retrieval.** It gives freshness, citations, access control and deletion, but
+  you now own a retrieval system whose recall becomes the dominant failure mode. It flips to plain long
+  context when the corpus is small and rarely changes, and it never flips to fine-tuning for facts.
+- **Fine-tuning: behaviour and cost vs upkeep.** It gives behaviour you cannot prompt into existence and a
+  cheaper per-request path, but costs data, evals, forgetting risk and re-training at every base-model
+  release. It flips back to prompting when the task is still changing or the model is upgraded often.
+- **RAG plus a fine-tuned model: strongest vs most moving parts.** It is the strongest configuration but
+  doubles the moving parts, so it only pays off when the team can run the same eval set across both layers
+  after every change.
 
 ## Pitfalls
-- Fine-tuning to inject facts; the symptom is confident, plausible details that match the training data's
-  style but not its content, and no way to answer questions about last week's changes.
-- Skipping the eval set; the symptom is "the fine-tuned model feels better" with no number attached, and
-  regressions on other tasks discovered by users rather than by the team.
-- Building RAG for a behaviour gap; the symptom is retrieval returning the right passage while the model
-  still answers in the wrong format or ignores the passage.
-- Fine-tuning before the prompt has been seriously tried; the symptom is a two-week training project that
-  a short system-prompt edit would have resolved.
-- Ignoring the upgrade tax; the symptom is a fine-tuned model blocking a migration to a stronger base
-  model for months because nobody budgeted to re-train and re-evaluate.
-- Treating long context as free RAG; the symptom is per-request cost blowing up and lost-in-the-middle
-  errors on the documents that matter most.
+- **Fine-tuning to inject facts.** Symptom: confident, plausible details that match the training data's
+  style but not its content, and no way to answer questions about last week's changes. Fix: move the
+  facts to retrieval.
+- **Skipping the eval set.** Symptom: "the fine-tuned model feels better" with no number attached, and
+  regressions on other tasks discovered by users rather than by the team. Fix: build the set from real
+  failures before the first change.
+- **Building RAG for a behaviour gap.** Symptom: retrieval returns the right passage while the model still
+  answers in the wrong format or ignores the passage. Fix: treat it as behaviour (prompt, then fine-tune
+  to use context).
+- **Fine-tuning before the prompt has been seriously tried.** Symptom: a two-week training project that a
+  short system-prompt edit would have resolved. Fix: prompt until the eval plateaus.
+- **Ignoring the upgrade tax.** Symptom: a fine-tuned model blocks a migration to a stronger base model for
+  months because nobody budgeted to re-train and re-evaluate. Fix: budget it in the break-even.
+- **Treating long context as free RAG.** Symptom: per-request cost blows up and lost-in-the-middle errors
+  appear on the documents that matter most. Fix: retrieve, or keep long context for small static corpora.
 
 ## When to use
-Use the procedure every time someone asks for a model to "know", "sound like" or "stop doing" something.
-Start by classifying failures, then prompt, then RAG for knowledge, then LoRA for behaviour or cost, and
-measure the same eval set at every rung. Reach for fine-tuning when the behaviour is stable and the prompt
-has plateaued or become the dominant per-request cost, when a smaller model must match a larger one on a
-narrow task, or when the output distribution must be precise. Avoid it while the task is still being
-designed, when facts must be fresh or attributable, or when you cannot afford to re-train at the next
-base-model release. In interviews, the expected answer is never "fine-tune" or "RAG" alone; it is the
-gap classification, the ordering, and the measurement loop that justifies each step.
+- **Use the procedure:** every time someone asks for a model to "know", "sound like" or "stop doing"
+  something. Classify failures, then prompt, then RAG for knowledge, then LoRA for behaviour or cost, and
+  measure the same eval set at every rung.
+- **Reach for fine-tuning when:** the behaviour is stable and the prompt has plateaued or become the
+  dominant per-request cost; a smaller model must match a larger one on a narrow task; or the output
+  distribution must be precise.
+- **Avoid fine-tuning when:** the task is still being designed, facts must be fresh or attributable, or
+  you cannot afford to re-train at the next base-model release.
+- **Interviews:** the expected answer is never "fine-tune" or "RAG" alone; it is the gap classification,
+  the ordering, and the measurement loop that justifies each step.
 
 ## Role lens
 - **Engineer:** Builds the eval set from real failures first, ships the prompt, then the retrieval
@@ -192,6 +276,46 @@ with a few curated examples first and score it on a rubric over 100–200 real c
 plateaus below target, train a LoRA on reviewed answers for tone only, keeping facts in the index. Later,
 if the model mishandles retrieved passages, fine-tune it to use context rather than to contain it.
 Propose the measurement plan up front so each step is justified by a number, not a feeling.
+
+## Interview questions
+### Why doesn't fine-tuning on a company's documents make the model know them?
+- **Next-token training sees few phrasings.** SFT shifts probability toward the exact sequences it saw,
+  which does not build the paraphrase-invariant recall that question answering needs.
+- **Evidence:** Ovadia et al. found retrieval consistently beat unsupervised fine-tuning for new facts,
+  and fine-tuning helped only with many paraphrases per fact.
+- **And it fails silently:** the model invents plausible details in the training data's style instead of
+  refusing, with no citation and no way to delete a retired fact.
+
+### The retriever returns the right passage but answers still ignore it. What do you do?
+- **Classify it correctly:** retrieval works, so this is a behaviour gap, not a knowledge gap. More
+  retrieval tuning will not help.
+- **Prompt first:** instruct the model to answer only from the passages and to say "not in the
+  documents" otherwise, then score faithfulness on the golden set.
+- **If that plateaus:** fine-tune the model to use retrieved context (the RAFT idea) while the facts stay
+  in the index.
+
+### The prompt has plateaued below target. When would you still not fine-tune?
+- **When the task is still changing,** because every redesign means new data, a new run and a new eval.
+- **When the base model upgrades often,** because the upgrade tax repeats each release and a newer base
+  may close the gap on its own.
+- **When you cannot evaluate,** because without a golden set you cannot tell a better adapter from a
+  regression on other tasks.
+
+### 2M requests a month carry a 5,000-token prompt. Is fine-tuning it down to 800 tokens worth it?
+- **Token arithmetic:** 4,200 tokens removed × 2M requests = 8.4 billion input tokens a month, from 10
+  billion to 1.6 billion.
+- **Then subtract:** the cached share was already discounted, and a tuned model may cost more per token
+  or need its own GPUs.
+- **Compare with the cycle cost:** review, training and evals, multiplied by how often you re-train. It
+  pays only if monthly saving × months between upgrades exceeds that.
+
+### A legal team wants answers from internal policies, scoped by department, with citations. Design it.
+- **RAG is the core,** because the requirements (freshness, per-department access control, citations,
+  deletion) are exactly what retrieval gives and weights cannot.
+- **Enforce scoping at retrieval time** with metadata filters per user's department, so restricted text
+  never reaches the prompt.
+- **Behaviour via prompt:** a system prompt requiring citations and refusals outside the documents, scored
+  on a golden set; fine-tune only if that set plateaus.
 
 ## Quiz
 ### Q: Which situation is RAG the right lever for?

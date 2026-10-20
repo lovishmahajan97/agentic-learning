@@ -5,7 +5,7 @@ name: Request-scoped vs application-scoped resources
 kind: decision
 difficulty: core
 est_minutes: 13
-status: reviewed
+status: crisp
 related:
   - fastapi-for-ai/lifespan
   - fastapi-for-ai/dependency-injection
@@ -21,108 +21,146 @@ sources:
 ---
 
 ## TL;DR
-Every object in a FastAPI process has a scope. Application-scoped things (model weights, tokenizer,
-provider client with its connection pool, DB engine, vector index, settings) are built once per worker
-in lifespan and shared by all requests; request-scoped things (DB session, transaction, auth principal,
-request ID, budget, trace span) are built by a dependency and die with the request. Wrong in one
-direction wastes seconds and sockets per request; wrong in the other leaks one user's state into
-another's.
+Application-scoped objects (model, tokenizer, provider client, DB engine, index, settings) are built once
+per worker in lifespan; request-scoped ones (session, principal, budget, span, request ID) die with the
+request. Wrong one way wastes sockets; the other leaks users' data.
 
 ## Why it exists
-Two kinds of mistake are common in AI services, and they are mirror images. The first is building
-expensive, shareable things per request: `httpx.AsyncClient()` inside the handler,
-`from_pretrained(...)` inside a dependency, a new engine per call. A fresh client means a new TCP and
-TLS handshake for every provider call (tens to hundreds of milliseconds, as an illustrative order of
-magnitude), no connection reuse, and file descriptors that pile up under load; a fresh model load
-means seconds of latency and a copy of the weights per concurrent request until memory runs out. The
-second mistake is sharing things that carry per-request state: a module-level `current_user`, a single
-DB session reused across requests, a global list used as a scratch buffer. Under concurrency, two
-requests interleave on the event loop and one reads the other's user, commits the other's half-finished
-transaction, or returns the other's documents. These bugs are intermittent, appear only under load,
-and look like data leaks because they are.
-
-The naive rule "make everything global for speed" produces the second class of bug; "make everything
-fresh for safety" produces the first. The decision has to be made per object, by asking two
-questions: is it expensive or stateful across requests (a pool, a cache, loaded weights), and is it
-safe to use from many concurrent requests at once? Expensive and concurrency-safe → application scope.
-Carries per-request identity or a transaction, or unsafe for concurrent use → request scope. FastAPI
-gives one mechanism for each: lifespan plus `app.state` for the former, `Depends` with `yield` for the
-latter, and a worker process as the boundary of "application".
+- **Mistake one: building shareable things per request.** `httpx.AsyncClient()` inside the handler,
+  `from_pretrained(...)` inside a dependency, a new engine per call. A fresh client means a new TCP and TLS
+  handshake per provider call (tens to hundreds of milliseconds, as an illustrative order of magnitude),
+  no connection reuse, and file descriptors piling up under load.
+- **A fresh model load is worse:** seconds of latency and a copy of the weights per concurrent request
+  until memory runs out.
+- **Mistake two, the mirror image: sharing per-request state.** A module-level `current_user`, one DB
+  session reused across requests, a global list as a scratch buffer. Requests interleave on the event
+  loop, so one reads another's user, commits another's half-finished transaction or returns another's
+  documents. Intermittent, load-only, and real data leaks.
+- **Blanket rules fail both ways.** "Make everything global for speed" produces mistake two; "make
+  everything fresh for safety" produces mistake one. The decision must be made per object.
+- **FastAPI gives one mechanism per scope:** lifespan plus `app.state` for application scope, `Depends`
+  with `yield` for request scope, and the worker process as the boundary of "application".
 
 ## How it works
+### The two questions per object
+| Question | If yes |
+|---|---|
+| Is it expensive, or stateful across requests (a pool, a cache, loaded weights)? | candidate for application scope |
+| Is it safe to use from many concurrent requests at once? | application scope is allowed |
+| Does it carry per-request identity or a transaction, or is it unsafe for concurrent use? | request scope |
+| Must it be shared across workers or survive a restart? | external store (Redis, the database) |
+
+Expensive and concurrency-safe → application scope. Carries identity or a transaction, or unsafe →
+request scope.
+
 ### Application scope: once per worker
-The lifespan context manager runs before the worker accepts traffic. Objects created there — the
-provider client, the engine, the loaded model, the tokenizer, parsed settings — are attached to
-`app.state` (or yielded as lifespan state and read from `request.state`). They live until shutdown,
-when the lifespan's exit code closes them. "Application" means the worker process: with four Uvicorn
-workers there are four clients, four engines and four copies of the model, each with its own memory.
-Nothing in this scope is shared across processes; cross-process state (rate counters, caches, session
-stores) belongs in Redis or the database.
+1. **Built before traffic.** The lifespan context manager runs before the worker accepts traffic.
+2. **Stored on `app.state`** (or yielded as lifespan state and read from `request.state`): the provider
+   client, the engine, the loaded model, the tokenizer, parsed settings.
+3. **Closed at shutdown** by the lifespan's exit code.
 
-Objects in this scope are used from many requests at once, so they must be safe for concurrent use.
-`httpx.AsyncClient`, SQLAlchemy's engine and async pool, and provider SDK clients are designed for it.
-A loaded PyTorch model in eval mode can serve concurrent forward passes, but the GPU serialises the
-work, so a concurrency limit belongs next to it. A raw SQLAlchemy `Session` is not safe to share and
-does not belong here.
+- **"Application" means the worker process.** With four Uvicorn workers there are four clients, four
+  engines and four copies of the model, each with its own memory.
+- **Nothing is shared across processes.** Cross-process state (rate counters, caches, session stores)
+  belongs in Redis or the database.
 
-"Safe for concurrent use" means two different things depending on how it is called. Coroutines on one
-loop interleave only at `await`, so a plain object used from `async def` code without awaits in the
-middle of a mutation is effectively single-threaded. The same object used from `def` endpoints or
-`run_in_threadpool` is touched by real threads at the same time. Some objects that are fine in the
-first case are not in the second: Hugging Face fast tokenizers, for example, have been reported to
-raise "Already borrowed" when one instance is called from several threads at once. Check which kind
-of concurrency each shared object will actually see.
+### What "safe for concurrent use" means
+- **Designed for it:** `httpx.AsyncClient`, SQLAlchemy's engine and async pool, provider SDK clients.
+- **Safe but serialised:** a loaded PyTorch model in eval mode can serve concurrent forward passes, but
+  the GPU serialises the work, so a concurrency limit belongs next to it.
+- **Not safe:** a raw SQLAlchemy `Session` is not safe to share and does not belong in application scope.
+
+| How the shared object is called | What concurrency it sees |
+|---|---|
+| from `async def` code, no `await` in the middle of a mutation | coroutines interleave only at `await`, so it is effectively single-threaded |
+| from `def` endpoints or `run_in_threadpool` | real threads touch it at the same time |
+
+- **Some objects are fine in the first row and not the second.** Hugging Face fast tokenizers, for
+  example, have been reported to raise "Already borrowed" when one instance is called from several threads
+  at once. Check which kind of concurrency each shared object will actually see.
 
 ### Request scope: once per request, torn down with it
-A dependency with `yield` builds the object, hands it to the handler and cleans up afterwards. This is
-the home for a DB session and its transaction (commit on success, roll back on exception), the
-authenticated principal, the tenant's resolved configuration, a per-request token budget, the trace
-span, the request ID. FastAPI's per-request dependency cache guarantees that one request sees one
-instance even when several dependencies ask for it, which is how a handler and its auth dependency
-share a single transaction.
+- **Mechanism:** a dependency with `yield` builds the object, hands it to the handler and cleans up
+  afterwards.
+- **What lives here:** a DB session and its transaction (commit on success, roll back on exception), the
+  authenticated principal, the tenant's resolved configuration, a per-request token budget, the trace
+  span, the request ID.
+- **One instance per request.** FastAPI's per-request dependency cache guarantees one request sees one
+  instance even when several dependencies ask for it, which is how a handler and its auth dependency
+  share a single transaction.
 
 ### Request scope is not the same as unit of work
-In a CRUD service a request lasts milliseconds, so "one session per request" and "one transaction per
-unit of work" coincide. In an AI service the request includes a 5–30 s model call, and a session that
-has run a query holds a pooled connection until its transaction ends. Hold it across the provider call
-and pool size, not the provider, sets your concurrency. With SQLAlchemy's defaults (`pool_size=5`,
-`max_overflow=10`) a worker has 15 connections; at 15 s per call that is 1 request/s per worker, and
-request 16 waits up to `pool_timeout` (30 s by default) before failing. Keep the session request-scoped
-but the transactions short: read, commit (returning the connection), call the model, then write in a
-second short transaction.
+- **CRUD requests last milliseconds**, so "one session per request" and "one transaction per unit of
+  work" coincide.
+- **AI requests include a 5–30 s model call**, and a session that has run a query holds a pooled
+  connection until its transaction ends.
+- **Hold it across the provider call and pool size, not the provider, sets your concurrency.**
+
+| SQLAlchemy default | Value | Consequence at 15 s per call |
+|---|---|---|
+| `pool_size=5` plus `max_overflow=10` | 15 connections per worker | 15 ÷ 15 s = 1 request/s per worker |
+| `pool_timeout` | 30 s by default | request 16 waits up to 30 s, then fails |
+
+- **Fix:** keep the session request-scoped but the transactions short: read, commit (returning the
+  connection), call the model, then write in a second short transaction.
 
 ### Scopes in between
-Some objects are neither global nor per request: a client per tenant (different API key or region),
-a per-model tokenizer, a compiled prompt template. Treat them as application scope keyed by tenant or
-model: a bounded dict built in lifespan or lazily behind an `asyncio.Lock`, so two first requests do not
-build the same client twice. Conversation memory spans many requests and many workers, so it is not
-in-process at all; it belongs in Redis or the database.
+- **Neither global nor per request:** a client per tenant (different API key or region), a per-model
+  tokenizer, a compiled prompt template.
+- **Treat them as application scope keyed by tenant or model:** a bounded dict built in lifespan, or
+  lazily behind an `asyncio.Lock`, so two first requests do not build the same client twice.
+- **Conversation memory is not in-process at all.** It spans many requests and many workers, so it
+  belongs in Redis or the database.
 
 ### The hand-off between scopes
-Request-scoped objects are typically *derived from* application-scoped ones: the session comes from the
-engine's pool, the per-request "view" of the client is the shared client plus per-request headers, the
-retrieval handle is the shared index plus the tenant's namespace. The dependency borrows from
-`app.state` and returns something cheap. Resources flow one way, application → request, never back; a
-request must not stash its session or its user on `app.state`.
+- **Request objects are derived from application objects:**
+  - the session comes from the engine's pool;
+  - the per-request "view" of the client is the shared client plus per-request headers;
+  - the retrieval handle is the shared index plus the tenant's namespace.
+- **The dependency borrows from `app.state` and returns something cheap.**
+- **Resources flow one way, application → request, never back.** A request must not stash its session or
+  its user on `app.state`.
 
 ### Why the process is the boundary
-Python's event loop interleaves requests within one process, so application scope means "shared by
-concurrent requests" and must be concurrency-safe. Across processes nothing is shared, so application
-scope also means "duplicated per worker" and must be affordable N times. Both facts come from the same
-architecture: Uvicorn workers are independent processes with independent loops.
+- **Within one process**, the event loop interleaves requests, so application scope means "shared by
+  concurrent requests" and must be concurrency-safe.
+- **Across processes** nothing is shared, so application scope also means "duplicated per worker" and must
+  be affordable N times.
+- **Both facts have one cause:** Uvicorn workers are independent processes with independent loops.
 
 ### Context variables
-For data that must follow a request through code that cannot take parameters (logging formatters, deep
-library calls), `contextvars` give request-scoped storage without globals: set the request ID in a
-middleware or dependency, read it anywhere in that task. Each request's task sees its own value, which
-is exactly the isolation a module global cannot give.
+- **For code that cannot take parameters** (logging formatters, deep library calls), `contextvars` give
+  request-scoped storage without globals.
+- **Set once, read anywhere in that task:** set the request ID in a middleware or dependency, read it
+  anywhere in that task.
+- **Each request's task sees its own value**, which is exactly the isolation a module global cannot give.
 
-## Example
+## Diagram
+Resources flow one way: lifespan builds the shared objects once per worker, dependencies derive cheap
+request-scoped handles from them, and anything that must span workers lives outside the process.
+
+```mermaid
+flowchart TD
+    LS["Lifespan, once per worker"] --> ST[("app.state: client, engine, model, settings")]
+    ST -->|"borrow pooled connection"| DB["db dependency: session per request"]
+    ST -->|"borrow shared client"| H["Handler"]
+    RQ["Incoming request headers"] --> PR["principal dependency"]
+    DB -->|"yield session"| H
+    PR --> H
+    H -->|"short transactions around the model call"| TD2["Teardown after yield: close session"]
+    H -.->|"never stash user or session back"| ST
+    H --> EXT[("Redis or database: counters, memory, caches")]
+```
+
+## Examples
+### Lifespan plus request-scoped dependencies
 Lifespan creates the application-scoped objects; dependencies derive request-scoped ones; the handler
-mixes them without ever creating a client or sharing a session, and commits before the model call so
-its pooled connection is not held for the 10–30 s the provider takes. `expire_on_commit=False` is what
-lets `doc.text` still be read after that commit. `Document` and `Summary` are ORM classes defined
-elsewhere.
+mixes them without ever creating a client or sharing a session.
+
+- **Commit before the model call** so its pooled connection is not held for the 10–30 s the provider
+  takes.
+- **`expire_on_commit=False`** is what lets `doc.text` still be read after that commit.
+- **`Document` and `Summary`** are ORM classes defined elsewhere.
 
 ```python
 from contextlib import asynccontextmanager
@@ -162,45 +200,117 @@ async def summarise(doc_id: int, request: Request,
     return {"ok": True}
 ```
 
+### Runnable: a module global leaks across requests, a context variable does not
+Pure asyncio, no server. Two "requests" for different tenants overlap on one loop; each awaits a fake
+provider call between setting and reading its tenant.
+
+```python
+import asyncio, contextvars
+
+current_tenant = None                                   # BAD: module global, shared by all requests
+tenant_var = contextvars.ContextVar("tenant")           # GOOD: one value per request task
+
+async def handle_global(tenant: str, delay: float) -> str:
+    global current_tenant
+    current_tenant = tenant                             # "middleware" sets it
+    await asyncio.sleep(delay)                          # provider call: the loop runs other requests
+    return f"{tenant} retrieved docs for {current_tenant}"
+
+async def handle_ctx(tenant: str, delay: float) -> str:
+    tenant_var.set(tenant)                              # set inside this request's task
+    await asyncio.sleep(delay)
+    return f"{tenant} retrieved docs for {tenant_var.get()}"
+
+async def main():
+    for handler in (handle_global, handle_ctx):
+        results = await asyncio.gather(handler("acme", 0.2), handler("globex", 0.1))
+        print(handler.__name__, results)
+
+asyncio.run(main())
+# handle_global ['acme retrieved docs for globex', 'globex retrieved docs for globex']
+# handle_ctx ['acme retrieved docs for acme', 'globex retrieved docs for globex']
+```
+
+- **Why it works:** `asyncio.gather` wraps each coroutine in its own task, and each task runs in a copy
+  of the context, so `tenant_var.set` in one request is invisible to the other.
+
+### Worked scenario: one transaction across the model call
+One worker, SQLAlchemy defaults (15 connections), a 15 s provider call, traffic rising to 3 requests/s.
+
+| Design | Connection held per request | Ceiling per worker | At 3 requests/s |
+|---|---|---|---|
+| one transaction from read to write | about 15 s | 15 ÷ 15 s = 1 request/s | queue grows; request 16 waits up to `pool_timeout` (30 s), then `TimeoutError` |
+| commit after read, second short write | milliseconds per transaction | set by the provider and HTTP pool, not the DB | DB pool barely used |
+
+- **What the dashboards show:** database idle, provider under quota, requests failing with
+  `QueuePool limit ... reached`.
+- **Trade-off of the fix:** read and write are no longer atomic, so add a version check on the write if
+  the document can change meanwhile.
+
+## Production patterns
+- **One shared client per upstream, with explicit limits.** Use for every provider and internal API:
+  build `httpx.AsyncClient(timeout=..., limits=httpx.Limits(max_connections=...))` in lifespan, close it
+  with `aclose()` at shutdown, and expose it through a one-line dependency. Monitor new connections per
+  second on the client; a steady stream means something builds clients per request.
+- **Short transactions around slow calls.** Use whenever a request awaits a model: commit after reads,
+  call the provider, write in a second transaction, with `expire_on_commit=False` on the session factory.
+  Size `pool_size` and `max_overflow` per worker and monitor checked-out connections and pool wait time.
+- **Request ID in a context variable.** Use for log correlation: a middleware sets a
+  `contextvars.ContextVar` per request and a `logging.Filter` copies it onto every record. Remember that
+  values set inside a thread-pool call or a separate task do not flow back to the caller.
+- **Bounded per-tenant client cache.** Use when tenants need different keys or regions: a dict keyed by
+  tenant, filled lazily under an `asyncio.Lock`, with a size cap and `aclose()` on evicted clients. Monitor
+  cache size and evictions.
+- **Concurrency limit beside a shared model.** Use when a loaded model serves concurrent requests: guard
+  calls with an `asyncio.Semaphore` or `anyio.CapacityLimiter` created in lifespan. Monitor queue wait
+  and memory per worker; past a couple of workers, move the model to a separate server.
+- **Cross-worker state in an external store.** Use for rate limits, caches and conversation memory: keep
+  counters in Redis (for example `INCR` with an expiry) rather than on `app.state`, so a limit of 100 does
+  not silently become 400 across four workers.
+
 ## Trade-offs
-- Application scope amortises expensive setup across all requests, but everything in it is duplicated
-  per worker; past a couple of workers the memory of a loaded model forces a separate model server.
-- Request scope guarantees isolation and clean teardown at the cost of per-request construction; it
-  flips to a problem only when the object is expensive, which is the signal to move construction to
-  lifespan and keep only a cheap handle per request.
-- Sharing a concurrency-safe client gives connection reuse and pool limits in one place, but one bad
-  setting (a tiny pool, a global timeout) now affects every endpoint at once.
-- Splitting a request into short transactions around the model call frees pool connections, but the
-  read and the write are no longer atomic; when the write must match what was read (a document edited
-  meanwhile), add a version check on the write rather than holding the transaction open.
-- `contextvars` remove the need to thread request context through signatures, but values set inside a
-  thread-pool call or a separate task do not flow back, so the mechanism is only as predictable as the
-  task structure around it.
+- **Amortised setup vs per-worker duplication.** Application scope spreads expensive setup across all
+  requests, but everything in it is duplicated per worker; past a couple of workers the memory of a
+  loaded model forces a separate model server.
+- **Isolation vs construction cost.** Request scope guarantees isolation and clean teardown at the cost of
+  per-request construction; it flips to a problem only when the object is expensive, which is the signal
+  to move construction to lifespan and keep only a cheap handle per request.
+- **One place for pool limits vs blast radius.** Sharing a concurrency-safe client gives connection reuse
+  and pool limits in one place, but one bad setting (a tiny pool, a global timeout) now affects every
+  endpoint at once.
+- **Free pool connections vs atomicity.** Splitting a request into short transactions around the model
+  call frees pool connections, but the read and the write are no longer atomic; when the write must match
+  what was read (a document edited meanwhile), add a version check on the write rather than holding the
+  transaction open.
+- **No context threading vs predictability.** `contextvars` remove the need to thread request context
+  through signatures, but values set inside a thread-pool call or a separate task do not flow back, so the
+  mechanism is only as predictable as the task structure around it.
 
 ## Pitfalls
-- Creating `httpx.AsyncClient()` or a provider SDK client per request; symptom: elevated provider
+- **Creating `httpx.AsyncClient()` or a provider SDK client per request.** Symptom: elevated provider
   latency from handshakes, "too many open files" under load, and no benefit from keep-alive.
-- Loading a model in a dependency or on first request; symptom: a multi-second first call per worker,
+- **Loading a model in a dependency or on first request.** Symptom: a multi-second first call per worker,
   memory growing with concurrency, and OOM kills once several workers run.
-- Storing the current user or request-specific data on `app.state` or a module global; symptom:
+- **Storing the current user or request-specific data on `app.state` or a module global.** Symptom:
   intermittent wrong-user responses that reproduce only under concurrent load.
-- Holding a DB transaction open across the model call; symptom: the database is idle and the provider
+- **Holding a DB transaction open across the model call.** Symptom: the database is idle and the provider
   is under quota, yet requests queue and fail with SQLAlchemy `QueuePool limit ... reached` /
   `TimeoutError` once concurrency passes the pool size.
-- Sharing one DB session across requests; symptom: "session already in a transaction" errors and
+- **Sharing one DB session across requests.** Symptom: "session already in a transaction" errors and
   commits that contain other requests' changes.
-- Expecting an in-process cache or counter on `app.state` to be global; symptom: rate limits enforced
+- **Expecting an in-process cache or counter on `app.state` to be global.** Symptom: rate limits enforced
   per worker, so a limit of 100 becomes 400 with four workers.
 
 ## When to use
-Decide scope for each object by writing it down: cost to create, whether it is safe for concurrent
-use, whether it carries per-request identity. Clients, engines, models, indexes and settings go to
-lifespan; sessions, principals, budgets, spans and IDs go to dependencies; anything that must be shared
-across workers or survive a restart goes to an external store. Measure connection reuse (new
-connections per second on the provider client), time-to-first-request per worker, and memory per
-worker; each points at a scoping mistake when it is wrong. This decision comes up in interviews as
-"where would you create the OpenAI client and why not in the endpoint?", and in code review every time
-a `Client()` call appears inside a function that runs per request.
+- **Write the decision down per object:** cost to create, whether it is safe for concurrent use, whether
+  it carries per-request identity.
+- **Lifespan:** clients, engines, models, indexes and settings.
+- **Dependencies:** sessions, principals, budgets, spans and IDs.
+- **External store:** anything that must be shared across workers or survive a restart.
+- **Measure:** connection reuse (new connections per second on the provider client), time-to-first-request
+  per worker, and memory per worker; each points at a scoping mistake when it is wrong.
+- **Interviews and review:** "where would you create the OpenAI client and why not in the endpoint?", and
+  in code review every time a `Client()` call appears inside a function that runs per request.
 
 ## Role lens
 - **Engineer:** Builds clients, engines and models in lifespan, derives sessions and principals in
@@ -223,6 +333,45 @@ middleware runs while request A awaits the provider, A's retrieval uses B's tena
 with a dependency that resolves the tenant from the request (or a `contextvar` set per request) and
 pass it into the retrieval call. Both are the same mistake in opposite directions: an expensive
 shareable thing was made per request, and a per-request thing was made shared.
+
+## Interview questions
+### How do you decide whether an object should be application-scoped or request-scoped?
+- **Ask two questions:** is it expensive or stateful across requests (a pool, a cache, loaded weights),
+  and is it safe to use from many concurrent requests at once?
+- **Expensive and concurrency-safe → lifespan and `app.state`**: clients, engines, models, settings.
+- **Carries identity or a transaction, or unsafe → a `yield` dependency**: sessions, principals, budgets,
+  spans. Anything shared across workers goes to Redis or the database.
+
+### The database is idle and the provider is under quota, yet requests time out with `QueuePool limit ... reached`. Debug it.
+- **Suspect a transaction held across the model call.** A session that has run a query keeps its pooled
+  connection until the transaction ends, so a 15 s provider call holds one of 15 default connections.
+- **Do the arithmetic:** 15 connections ÷ 15 s = 1 request/s per worker, and request 16 waits up to
+  `pool_timeout` (30 s) before failing.
+- **Fix:** commit after the read, call the model, write in a second short transaction, with
+  `expire_on_commit=False` so loaded attributes stay readable.
+
+### Each tenant needs its own provider API key. Where does that client live?
+- **Application scope, keyed by tenant:** a bounded dict of clients, not a new client per request, which
+  would pay a handshake every call.
+- **Build lazily behind an `asyncio.Lock`** so two first requests for the same tenant do not create two
+  clients, and close evicted clients with `aclose()`.
+- **The request-scoped part is only the lookup**: a dependency resolves the tenant and returns that
+  tenant's shared client.
+
+### A loaded model is concurrency-safe in your async code. Why might it still break, and what does sharing cost?
+- **Threads change the answer.** Coroutines interleave only at `await`, but from `def` endpoints or
+  `run_in_threadpool` real threads call it at once; Hugging Face fast tokenizers have been reported to
+  raise "Already borrowed" in that case.
+- **The GPU serialises forward passes**, so put a concurrency limit next to the shared model.
+- **Memory multiplies by workers:** four Uvicorn workers hold four copies, which is what pushes large
+  models to a dedicated server.
+
+### When would you use `contextvars` instead of passing request context as a parameter?
+- **When the code cannot take parameters**, such as logging formatters or deep library calls that need
+  the request ID.
+- **Isolation comes from tasks:** each request's task sees its own value, unlike a module global.
+- **Limit:** values set inside a thread-pool call or a separate task do not flow back, so for business
+  data (tenant, user) an explicit dependency is easier to reason about and test.
 
 ## Quiz
 ### Q: Which object belongs in request scope rather than application scope?

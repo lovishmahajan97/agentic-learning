@@ -5,7 +5,7 @@ name: Message queues (Kafka, SQS, RabbitMQ)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: reviewed
+status: crisp
 related:
   - backend-fundamentals/background-jobs-durable-workers
   - backend-fundamentals/redis
@@ -23,124 +23,166 @@ sources:
 ---
 
 ## TL;DR
-A message queue puts a durable buffer between the code that produces work and the code that does it, so
-the two no longer have to be up, fast, or scaled the same way at the same moment. Reliable delivery in
-every mainstream broker means at-least-once, so consumers must be idempotent. Kafka is a replayable partitioned log, SQS is a
-managed queue with no replay, and RabbitMQ is a flexible-routing broker; the choice follows from whether
-you need ordering, replay, routing or just a simple buffer.
+A message queue is a durable buffer between producers and consumers, so they need not be up or scaled
+together. Delivery is at-least-once, so consumers must be idempotent. Kafka is a replayable log, SQS a
+managed queue, RabbitMQ a routing broker.
 
 ## Why it exists
-A request that triggers five downstream actions (store the upload, extract text, embed chunks, update
-the index, notify the user) cannot do them inline: the HTTP call would take minutes, any one failure
-fails the whole request, and a burst of uploads would hit every downstream service at the burst rate.
-Calling the services synchronously couples their availability (if the embedder is down, uploads fail),
-their capacity (the slowest service sets the pace), and their deployment (a change in one means retries
-across all). The naive fix, "retry in a background thread", loses the work when the process restarts and
-still has no buffer when the downstream is slower than the upstream.
-
-A queue solves the three couplings at once. Producers write a message and return; the broker stores it
-durably; consumers pull at their own rate; if a consumer is down the messages wait. The same mechanism
-gives fan-out (several consumer groups read the same event), load levelling (a burst becomes a backlog
-that drains), and a natural place to put retries and dead-letter handling. In AI systems the pattern
-appears constantly: document ingestion pipelines, batch embedding, webhook buffering from providers,
-decoupling an agent's tool calls from the services that execute them, and emitting events (run started,
-tool failed, tokens consumed) that observability and billing consume independently.
-
-The price is that the system becomes asynchronous and eventually consistent, and that every consumer
-must tolerate seeing the same message twice.
+- **Inline fan-out fails.** A request triggering five actions (store the upload, extract text, embed
+  chunks, update the index, notify the user) would take minutes, fail entirely on any one failure, and hit
+  every downstream at the burst rate.
+- **Synchronous calls couple three things.** Availability (embedder down, uploads fail), capacity (the
+  slowest service sets the pace) and deployment (a change in one means retries across all).
+- **"Retry in a background thread" is not a fix.** It loses the work when the process restarts and still
+  has no buffer when the downstream is slower than the upstream.
+- **A queue removes all three couplings.** Producers write and return, the broker stores durably, consumers
+  pull at their own rate, and messages wait while a consumer is down. It also gives fan-out (several
+  consumer groups read one event), load levelling (a burst becomes a backlog that drains), and a home for
+  retries and dead-letter handling.
+- **AI systems use it constantly,** for ingestion pipelines, batch embedding, buffering provider webhooks,
+  decoupling an agent's tool calls from their executors, and events (run started, tool failed, tokens
+  consumed) for observability and billing. The price: the system becomes asynchronous and eventually
+  consistent, and every consumer must tolerate seeing the same message twice.
 
 ## How it works
 ### The core loop
-A producer publishes a message to a named destination (queue, topic, exchange). The broker persists it
-and makes it available. A consumer receives it, does the work, and **acknowledges** it; only then does the
-broker consider it done. If the consumer crashes before acknowledging, the broker redelivers to another
-consumer. This ack-after-work protocol is what makes delivery **at-least-once**: a consumer that finishes
-the work and dies before the ack causes a duplicate. Acknowledging *before* the work gives
-**at-most-once**: no duplicates, but a crash loses the message. "Exactly-once" across arbitrary side
-effects is not achievable; what systems offer is at-least-once delivery plus **idempotent** consumers
-(deduplicate by message id or business key), which is effectively-once from the outside. Kafka's
-"exactly-once semantics" is real but narrower than the name: idempotent producers plus transactions make
-a read-from-Kafka, write-to-Kafka pipeline commit its outputs and its consumer offsets atomically, so
-nothing inside Kafka is duplicated. The guarantee ends at Kafka's edge; a consumer that calls an email
-API or writes to a database is back to at-least-once plus idempotency.
+1. A producer publishes a message to a named destination (queue, topic, exchange).
+2. The broker persists it and makes it available.
+3. A consumer receives it and does the work.
+4. The consumer **acknowledges** it; only then does the broker consider it done.
+5. If the consumer crashes before acknowledging, the broker redelivers to another consumer.
+
+| Ack timing | Guarantee | Failure mode |
+|---|---|---|
+| After the work | **at-least-once** | finishing then dying before the ack causes a duplicate |
+| Before the work | **at-most-once** | no duplicates, but a crash loses the message |
+
+- **"Exactly-once" across arbitrary side effects is not achievable.** Systems offer at-least-once plus
+  **idempotent** consumers (deduplicate by message id or business key): effectively-once from the outside.
+- **Kafka's "exactly-once semantics" is real but narrower.** Idempotent producers plus transactions make a
+  read-from-Kafka, write-to-Kafka pipeline commit outputs and consumer offsets atomically, so nothing
+  inside Kafka is duplicated.
+- **The guarantee ends at Kafka's edge.** A consumer that calls an email API or writes to a database is
+  back to at-least-once plus idempotency.
 
 ### Publishing reliably
-The producer side has its own failure, the **dual write**. A handler that commits an order to the database
-and then publishes `order.created` can crash between the two: the order exists and no event ever does.
-Publishing first is worse: consumers act on an order the database then rolls back. Retrying the publish
-does not help when the process is gone. The standard fix is the **transactional outbox**: write the event
-into an `outbox` table in the same database transaction as the business change, and let a separate relay
-(a poller, or change-data capture reading the database log) publish outbox rows and mark them sent. The
-relay can itself crash after publishing and before marking, so it too is at-least-once, and consumers
-still deduplicate.
+- **The dual write.** A handler commits an order, then publishes `order.created`; a crash between the two
+  leaves an order with no event, ever.
+- **Publishing first is worse:** consumers act on an order the database then rolls back. Retrying the
+  publish does not help when the process is gone.
+- **The transactional outbox.** Write the event into an `outbox` table in the same database transaction as
+  the business change; a separate relay (a poller, or change-data capture reading the database log)
+  publishes outbox rows and marks them sent.
+- **The relay is at-least-once too.** It can crash after publishing and before marking, so consumers still
+  deduplicate.
 
 ### Ordering, partitions and parallelism
-A single queue consumed by one worker is ordered; the moment you add workers, messages complete out of
-order. Kafka's answer is **partitions**: a topic is split into N ordered logs, a message's key decides its
-partition (same key, same partition, strict order), and a **consumer group** assigns each partition to
-exactly one consumer in the group. Parallelism is therefore capped by partition count, and a skewed key
-(one huge tenant) makes one partition hot. SQS FIFO queues offer the same idea with message group ids.
-SQS standard queues give best-effort ordering only. A RabbitMQ queue is FIFO as stored, but competing
-consumers and requeued redeliveries mean messages are not *processed* in order once there is more than
-one consumer or any failure.
+- **More workers, no order.** One queue consumed by one worker is ordered; add workers and messages
+  complete out of order.
+- **Kafka partitions.** A topic is split into N ordered logs; a message's key picks its partition (same
+  key, same partition, strict order); a **consumer group** assigns each partition to exactly one consumer.
+- **So parallelism is capped by partition count,** and a skewed key (one huge tenant) makes one partition hot.
+
+| Broker | Ordering |
+|---|---|
+| Kafka | strict within a partition |
+| SQS FIFO | the same idea, per message group id |
+| SQS standard | best-effort only |
+| RabbitMQ | FIFO as stored, but competing consumers and requeued redeliveries mean messages are not *processed* in order once there is more than one consumer or any failure |
 
 ### Backpressure and retries
-A queue only levels load if someone watches the **lag** (messages waiting, or the age of the oldest
-message); an unbounded backlog is a silent outage. The arithmetic is simple and worth doing: if producers
-add λ messages per second and consumers finish μ, the backlog grows at λ − μ while λ > μ and drains at
-μ − λ afterwards. A burst that leaves 120,000 messages waiting, with consumers at 500/s against a steady
-400/s arrival, drains in 120,000 ÷ 100 = 1,200 s, twenty minutes during which every new message waits
-behind it. Doubling consumers to 1,000/s cuts that to 200 s, which is why consumer autoscaling keys off
-lag or oldest-message age rather than CPU. If λ exceeds the maximum μ for long, the queue is not levelling
-load, it is accumulating debt, and the producer must be slowed or work shed. Consumers limit in-flight messages (RabbitMQ
-`prefetch`, SQS `MaxNumberOfMessages`, Kafka `max.poll.records`). Failed messages are retried with
-backoff, and after N attempts go to a **dead-letter queue** (DLQ) so one poison message cannot block the
-rest. A message whose payload is large (a PDF, a transcript) should not travel through the broker:
-store it in object storage and send the reference (the claim-check pattern).
+- **Watch the lag.** A queue only levels load if someone watches **lag** (messages waiting, or the age of
+  the oldest message); an unbounded backlog is a silent outage.
+- **The arithmetic.** With arrivals λ per second and completions μ, the backlog grows at λ − μ while λ > μ
+  and drains at μ − λ afterwards.
+
+| Scenario | Drain time |
+|---|---|
+| 120,000 waiting, consumers 500/s, steady arrivals 400/s | 120,000 ÷ 100 = 1,200 s, twenty minutes in which every new message waits |
+| Consumers doubled to 1,000/s | 200 s |
+
+- **Autoscale on lag, not CPU.** That is why consumer autoscaling keys off lag or oldest-message age.
+- **λ above max μ is debt.** If arrivals exceed the maximum service rate for long, the queue is
+  accumulating debt, and the producer must be slowed or work shed.
+- **Bound in-flight messages:** RabbitMQ `prefetch`, SQS `MaxNumberOfMessages`, Kafka `max.poll.records`.
+- **Retry, then dead-letter.** Failed messages retry with backoff and after N attempts go to a
+  **dead-letter queue** (DLQ), so one poison message cannot block the rest.
+- **Claim-check large payloads.** A PDF or transcript should not travel through the broker: store it in
+  object storage and send the reference.
 
 ### Kafka: a distributed, replayable log
-Kafka keeps messages on disk for a configured retention (time or size), regardless of whether they were
-consumed. Consumers track their own **offset** per partition and commit it; replaying means resetting the
-offset. Durability comes from replicating each partition to several brokers and, for producers,
-`acks=all` plus the idempotent producer setting, which deduplicates retries within a session. Log
-compaction keeps the latest message per key, turning a topic into a changelog. Kafka is built for high
-throughput, many consumers of the same stream, and event sourcing; it costs an operations burden (or a
-managed service) and a rigid partition-based parallelism model. It is a poor fit for a small job queue
-where each job needs individual retry and priority. Recent Kafka releases add share groups (KIP-932),
-queue-style consumption with per-message acknowledgement beyond the partition count; check its maturity
-on your version before relying on it.
+- **Retention, not deletion.** Messages stay on disk for a configured retention (time or size), whether
+  consumed or not.
+- **Consumers own offsets.** Each tracks and commits its **offset** per partition; replay means resetting it.
+- **Durability:** each partition is replicated to several brokers; producers use `acks=all` plus the
+  idempotent producer setting, which deduplicates retries within a session.
+- **Log compaction** keeps the latest message per key, turning a topic into a changelog.
+- **Fit:** high throughput, many consumers of one stream, event sourcing. **Cost:** an operations burden
+  (or a managed service) and rigid partition-based parallelism; a poor fit for a small job queue needing
+  per-job retry and priority.
+- **Share groups (KIP-932)** add queue-style consumption with per-message acknowledgement beyond the
+  partition count in recent releases; check its maturity on your version before relying on it.
 
 ### SQS: a managed queue without replay
-SQS is a fully managed queue: no brokers to run, near-unlimited throughput on standard queues, and
-pay-per-request. A consumer receives messages with a **visibility timeout**; the message is hidden from
-others until the consumer deletes it or the timeout expires, at which point it reappears. Long polling
-waits up to 20 seconds for messages instead of returning empty. Retention is bounded (days, not forever),
-messages are deleted when acknowledged, so there is no replay; a redrive policy moves messages to a DLQ
-after `maxReceiveCount` attempts. Standard queues are at-least-once with best-effort ordering; FIFO
-queues add ordering per message group and a deduplication id honoured for a five-minute window. Message
-size is bounded (256 KiB for most of SQS's history, raised to 1 MiB in 2025; check current limits), so
-large payloads go to S3.
+- **Fully managed:** no brokers to run, near-unlimited throughput on standard queues, pay-per-request.
+- **Visibility timeout:** a received message is hidden from others until the consumer deletes it or the
+  timeout expires, when it reappears.
+- **Long polling** waits up to 20 seconds for messages instead of returning empty.
+- **No replay:** retention is bounded (days, not forever) and messages are deleted when acknowledged.
+- **Redrive policy** moves messages to a DLQ after `maxReceiveCount` attempts.
+- **Standard vs FIFO:** standard is at-least-once with best-effort ordering; FIFO adds ordering per message
+  group and a deduplication id honoured for a five-minute window.
+- **Size limits:** 256 KiB for most of SQS's history, raised to 1 MiB in 2025 (check current limits), so
+  large payloads go to S3.
 
 ### RabbitMQ: a routing broker
-RabbitMQ implements AMQP: producers publish to an **exchange**, bindings route messages to **queues** by
-routing key (direct), pattern (topic), to all bound queues (fanout), or by headers. This makes complex
-routing and per-consumer queues easy. Consumers ack or nack; `prefetch` bounds in-flight messages per
-consumer; dead-letter exchanges handle rejects and TTL expiry. Quorum queues replicate via Raft for
-durability; the newer streams feature adds a Kafka-like replayable log. It is a good fit for task
-distribution with rich routing and moderate throughput, and it needs operating like any stateful system.
+- **AMQP exchanges:** producers publish to an **exchange**; bindings route to **queues** by routing key
+  (direct), pattern (topic), to all bound queues (fanout), or by headers. Complex routing and
+  per-consumer queues are easy.
+- **Flow control:** consumers ack or nack; `prefetch` bounds in-flight messages per consumer; dead-letter
+  exchanges handle rejects and TTL expiry.
+- **Durability:** quorum queues replicate via Raft; the newer streams feature adds a Kafka-like replayable log.
+- **Fit:** task distribution with rich routing and moderate throughput; it needs operating like any
+  stateful system.
 
 ### Choosing
-Need replay, many independent consumers of the same events, or very high throughput: Kafka (or a managed
-equivalent). Need a simple durable buffer with minimal operations on AWS: SQS. Need routing rules,
-per-message priorities or AMQP interop: RabbitMQ. Need a small job queue and already run PostgreSQL: a
-table with `SKIP LOCKED` is often enough, and Redis-backed queues sit between that and a real broker.
+| Need | Choose |
+|---|---|
+| Replay, many independent consumers of the same events, very high throughput | Kafka (or a managed equivalent) |
+| Simple durable buffer, minimal operations, on AWS | SQS |
+| Routing rules, per-message priorities, AMQP interop | RabbitMQ |
+| Small job queue, already on PostgreSQL | a table with `SKIP LOCKED`; Redis-backed queues sit between that and a real broker |
 
-## Example
-An SQS consumer for an embedding job. It long-polls, processes each message idempotently (the job id is
-the dedup key stored with the result), extends the visibility timeout of every message in the batch while
-they wait and while the slow model call runs, so none is redelivered mid-flight, and deletes only after
-success. Failures are left to expire and
-retry; the queue's redrive policy sends repeat offenders to a DLQ.
+## Diagram
+The full at-least-once path: the outbox closes the producer's dual-write gap, and the ack after the work
+closes the consumer's, so the only remaining risk is a duplicate, which the idempotency check absorbs.
+
+```mermaid
+sequenceDiagram
+    participant A as API handler
+    participant DB as Database
+    participant R as Outbox relay
+    participant B as Broker
+    participant C as Consumer
+    A->>DB: COMMIT business row plus outbox row
+    R->>DB: read unsent outbox rows
+    R->>B: publish event
+    R->>DB: mark row sent
+    B->>C: deliver message
+    Note over C: skip if message id already processed
+    C->>C: do the work, store result by id
+    C->>B: ack or delete
+    B-->>C: redeliver if no ack before timeout
+```
+
+## Examples
+### An SQS consumer for an embedding job
+- **Long-polls** for up to five messages at a time.
+- **Processes idempotently:** the job id is the dedup key stored with the result.
+- **Heartbeats every message in the batch,** extending visibility while they wait and while the slow model
+  call runs, so none is redelivered mid-flight.
+- **Deletes only after success;** failures expire and retry, and the redrive policy sends repeat offenders
+  to a DLQ.
 
 ```python
 import json, threading, boto3
@@ -177,56 +219,131 @@ while True:
             stop.set()
 ```
 
-`results`, `embed`, `load_chunks` and `log` are the application's own; the shape of the loop is what
-matters. Without the batch-wide heartbeat, messages two to five would sit unprocessed while message one
-ran, their 60-second timeout would lapse, and another worker would receive them too. With Kafka the same
-loop would poll, process, then commit the offset; with RabbitMQ it would set `basic_qos(prefetch_count=5)`,
-`basic_consume`, and `basic_ack` after success.
+- **App-supplied names:** `results`, `embed`, `load_chunks` and `log` are the application's own; the shape
+  of the loop is what matters.
+- **Why the batch-wide heartbeat:** without it, messages two to five would sit unprocessed while message
+  one ran, their 60-second timeout would lapse, and another worker would receive them too.
+- **Same loop elsewhere:** with Kafka, poll, process, then commit the offset; with RabbitMQ, set
+  `basic_qos(prefetch_count=5)`, `basic_consume`, and `basic_ack` after success.
+
+### Runnable: backlog drain and consumer sizing
+Pure Python for the λ/μ arithmetic above; use it to set autoscaling targets.
+
+```python
+import math
+
+def drain_seconds(backlog, arrival_per_s, service_per_s):
+    """Time to clear a backlog while new messages keep arriving (λ = arrival, μ = service)."""
+    if service_per_s <= arrival_per_s:
+        return math.inf                      # λ ≥ μ: the queue is accumulating debt, not levelling load
+    return backlog / (service_per_s - arrival_per_s)
+
+def consumers_needed(backlog, arrival_per_s, per_consumer_per_s, target_s):
+    """Smallest consumer count that drains the backlog within target_s."""
+    return math.ceil((backlog / target_s + arrival_per_s) / per_consumer_per_s)
+
+print(drain_seconds(120_000, 400, 500))      # 1200.0 s, twenty minutes
+print(drain_seconds(120_000, 400, 1_000))    # 200.0 s after doubling consumers
+print(drain_seconds(120_000, 600, 500))      # inf: shed load or slow the producer
+print(consumers_needed(120_000, 400, per_consumer_per_s=50, target_s=300))   # 16
+```
+
+### Production SQL: the transactional outbox
+The business row and the event commit together; the relay publishes and marks rows, and several relays
+can run safely because of `SKIP LOCKED`.
+
+```sql
+CREATE TABLE outbox (
+  id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  topic      text NOT NULL,
+  key        text NOT NULL,                 -- partition key, e.g. document id
+  payload    jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  sent_at    timestamptz
+);
+
+-- In the request handler: one transaction for the change and its event.
+BEGIN;
+INSERT INTO documents (id, tenant_id, status) VALUES ($1, $2, 'uploaded');
+INSERT INTO outbox (topic, key, payload)
+VALUES ('document.uploaded', $1, jsonb_build_object('document_id', $1, 'tenant_id', $2));
+COMMIT;
+
+-- In the relay: lock a batch, publish each row to the broker, then mark them sent.
+BEGIN;
+SELECT id, topic, key, payload FROM outbox
+WHERE  sent_at IS NULL
+ORDER  BY created_at
+LIMIT  100
+FOR UPDATE SKIP LOCKED;
+-- ... publish every row; a crash here means they are published again later ...
+UPDATE outbox SET sent_at = now() WHERE id = ANY($1);   -- $1: ids of the rows just published
+COMMIT;
+```
+
+## Production patterns
+- **Autoscale consumers on age, not CPU.** On SQS scale from CloudWatch `ApproximateAgeOfOldestMessage`
+  and `ApproximateNumberOfMessagesVisible`; on Kafka from consumer-group lag (shown by
+  `kafka-consumer-groups.sh --describe`). KEDA has scalers for both on Kubernetes. Alert when oldest-message
+  age exceeds the product's freshness promise.
+- **DLQ with an owner and a redrive path.** Set `maxReceiveCount` to a small number (for example 5), alarm
+  on any DLQ depth above zero, and after fixing the bug move messages back to the source queue (SQS
+  supports DLQ redrive). Monitor DLQ inflow rate by error type.
+- **Durable Kafka producers.** Set `acks=all` and `enable.idempotence=true`, use replication factor 3 with
+  `min.insync.replicas=2`, so one broker loss neither loses nor blocks writes. Monitor under-replicated
+  partitions and producer error rate.
+- **Outbox via change-data capture.** Instead of polling, stream the `outbox` table from the database log
+  (for example Debezium's outbox event router) into the broker. Monitor relay lag and the age of the
+  oldest unsent outbox row.
+- **Timeouts sized to real model latency.** Set the visibility timeout or ack deadline above p99
+  processing time and heartbeat for long calls; key every result by message or job id. Monitor
+  redelivery rate (SQS `ApproximateReceiveCount` per message) as a timeout-too-short signal.
 
 ## Trade-offs
-- Decoupling producers from consumers gains availability and burst tolerance, but the caller no longer
-  knows when (or whether) the work finished, so every flow needs a status path or an event back.
-- At-least-once delivery never loses acknowledged work, but it forces idempotent consumers; at-most-once
-  is simpler and acceptable only for data you can afford to drop, such as metrics samples.
-- Kafka's retained log allows replay and many consumer groups, but operations cost, partition planning
-  and the lack of per-message retry make it heavy for a plain job queue.
-- SQS removes all broker operations and scales without planning, but no replay, bounded retention and a
-  small message size push payloads to S3 and audit history to a database.
-- RabbitMQ's exchanges give fine-grained routing and priorities, but a single very hot queue is harder
-  to scale than Kafka partitions, and the cluster must be run and upgraded.
-- Partition-keyed ordering preserves per-entity sequence, but parallelism is capped by partition count
-  and a skewed key concentrates load; the trade flips toward unordered queues when order does not matter.
+- **Decoupling vs visibility.** Producers gain availability and burst tolerance, but the caller no longer
+  knows when (or whether) work finished, so every flow needs a status path or an event back.
+- **At-least-once vs at-most-once.** At-least-once never loses acknowledged work but forces idempotent
+  consumers; at-most-once is simpler and acceptable only for data you can drop, such as metrics samples.
+- **Kafka replay vs weight.** The retained log allows replay and many consumer groups, but operations
+  cost, partition planning and no per-message retry make it heavy for a plain job queue.
+- **SQS simplicity vs history.** No broker operations and no capacity planning, but no replay, bounded
+  retention and a small message size push payloads to S3 and audit history to a database.
+- **RabbitMQ routing vs scale.** Exchanges give fine-grained routing and priorities, but one very hot queue
+  is harder to scale than Kafka partitions, and the cluster must be run and upgraded.
+- **Keyed ordering vs parallelism.** Partition keys preserve per-entity sequence, but parallelism is capped
+  by partition count and a skewed key concentrates load; flip to unordered queues when order does not matter.
 
 ## Pitfalls
-- Non-idempotent consumers; the symptom is duplicate emails, double charges or two embeddings per chunk
-  after any consumer restart or timeout.
-- A visibility timeout or ack deadline shorter than the work (a 90-second model call under a 30-second
-  timeout); the symptom is the same job running on two workers and redelivery counts climbing under load.
-- No dead-letter queue; the symptom is one malformed message redelivered forever, consuming a worker and
-  hiding behind it a growing backlog.
-- Committing the Kafka offset (or deleting the SQS message) before processing; the symptom is work that
-  silently disappears whenever a worker crashes.
-- Nobody alerting on queue lag or oldest-message age; the symptom is a backlog discovered hours later by
-  a user asking why their document never got indexed.
-- Choosing Kafka for a few messages per second of job traffic; the symptom is a team spending its time on
-  partition rebalances and consumer-group tuning instead of the product.
-- Committing to the database and then publishing the event as a second step; the symptom is rows that
-  exist with no downstream effect (never indexed, never notified) after a deploy or crash, with no error
-  anywhere because the publish was simply never attempted.
-- Assuming order on SQS standard queues or across Kafka partitions; the symptom is "updated" events
-  processed before "created" events and intermittent not-found errors.
-- Sending multi-megabyte payloads through the broker; the symptom is size errors, slow brokers and a
-  broker that has become an accidental blob store.
+- **Non-idempotent consumers.** Symptom: duplicate emails, double charges or two embeddings per chunk after
+  any consumer restart or timeout.
+- **A visibility timeout or ack deadline shorter than the work** (a 90-second model call under a 30-second
+  timeout). Symptom: the same job on two workers and redelivery counts climbing under load.
+- **No dead-letter queue.** Symptom: one malformed message redelivered forever, consuming a worker and
+  hiding a growing backlog behind it.
+- **Committing the Kafka offset (or deleting the SQS message) before processing.** Symptom: work silently
+  disappears whenever a worker crashes.
+- **Nobody alerting on lag or oldest-message age.** Symptom: a backlog discovered hours later by a user
+  asking why their document never got indexed.
+- **Kafka for a few messages per second of job traffic.** Symptom: the team spends its time on partition
+  rebalances and consumer-group tuning instead of the product.
+- **Commit to the database, then publish as a second step.** Symptom: rows with no downstream effect
+  (never indexed, never notified) after a deploy or crash, and no error anywhere because the publish was
+  never attempted.
+- **Assuming order on SQS standard or across Kafka partitions.** Symptom: "updated" events processed before
+  "created" events and intermittent not-found errors.
+- **Multi-megabyte payloads through the broker.** Symptom: size errors, slow brokers, and a broker that has
+  become an accidental blob store.
 
 ## When to use
-Introduce a queue when work must outlive the request, when a downstream is slower or less available than
-the caller, when several consumers need the same events, or when bursts must be smoothed. Do not
-introduce one for a synchronous read the user is waiting on, or when a database table with `SKIP LOCKED`
-would carry the load without a new system. Measure lag, oldest-message age, redelivery rate and DLQ
-depth from day one. Day to day this shows up as "should this endpoint enqueue or call directly", choosing
-a partition key, and tuning timeouts to the real duration of an LLM call. In interviews, expect to
-explain at-least-once, design a partition key for a tenant-skewed workload, and justify Kafka versus SQS
-for a given scenario.
+- **Use when:** work must outlive the request, a downstream is slower or less available than the caller,
+  several consumers need the same events, or bursts must be smoothed.
+- **Avoid when:** it is a synchronous read the user is waiting on, or a database table with `SKIP LOCKED`
+  would carry the load without a new system.
+- **Measure from day one:** lag, oldest-message age, redelivery rate and DLQ depth.
+- **Day to day:** "should this endpoint enqueue or call directly", choosing a partition key, and tuning
+  timeouts to the real duration of an LLM call.
+- **Interviews:** explain at-least-once, design a partition key for a tenant-skewed workload, and justify
+  Kafka versus SQS for a scenario.
 
 ## Role lens
 - **Engineer:** Writes idempotent consumers, sets visibility or ack timeouts to match model latency,
@@ -249,6 +366,38 @@ offering only best-effort order across many workers. Either move to a FIFO queue
 the message group id, so events for one document are serialized while different documents proceed in
 parallel, or make the consumer order-independent by storing a version per document and ignoring events
 older than the current state. Add a DLQ so poison messages do not block either path.
+
+## Interview questions
+### What does at-least-once delivery mean, and why can't a broker give you exactly-once?
+- **At-least-once:** the broker redelivers until it sees an ack after the work, so a crash between the work
+  and the ack produces a duplicate but never a loss.
+- **No exactly-once across side effects,** because the ack and an external call cannot be made atomic.
+  Kafka's transactions cover only Kafka-to-Kafka pipelines.
+- **So consumers are idempotent,** keyed by message id or business key.
+
+### Your service writes to the database and then publishes an event. Sometimes the event never appears. Why, and how do you fix it?
+- **Dual write:** the process crashed or was redeployed between commit and publish, so nothing ever tried
+  to publish again.
+- **Fix:** a transactional outbox, writing the event row in the same transaction, with a relay or CDC
+  publishing it; consumers deduplicate because the relay is at-least-once too.
+
+### Kafka or SQS for an LLM document-ingestion pipeline?
+- **SQS** if it is a job buffer: per-message retries, a DLQ, visibility timeouts and no brokers to run.
+- **Kafka** if several teams consume the same document events, need replay to rebuild an index, or the
+  throughput is very high.
+- **Neither** if volume is small and you already run PostgreSQL: a `SKIP LOCKED` jobs table is enough.
+
+### One enterprise tenant makes a Kafka partition hot and its consumer lag grows. What do you do?
+- **Diagnose:** the partition key is the tenant id, so all its traffic lands on one partition and one consumer.
+- **Fix:** key by a finer entity (document or conversation id) when per-tenant order is not needed, or add
+  a sub-key suffix for that tenant; raise partitions to allow more consumers.
+- **Trade-off:** order is then preserved only per finer key.
+
+### A backlog of 120,000 messages builds while arrivals are 400/s. How many consumers do you need?
+- **Arithmetic:** draining in 5 minutes needs 120,000 ÷ 300 = 400/s of extra capacity on top of the 400/s
+  arrivals, so 800/s total.
+- **At 50 messages per second per consumer** (an assumed figure), that is 16 consumers, and the
+  autoscaler should key on oldest-message age to get there automatically.
 
 ## Quiz
 ### Q: Why is "exactly-once delivery" not something a broker can promise for a consumer that calls an external API?

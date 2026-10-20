@@ -5,7 +5,7 @@ name: Background jobs / durable workers
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: reviewed
+status: crisp
 related:
   - backend-fundamentals/message-queues
   - backend-fundamentals/redis
@@ -23,123 +23,142 @@ sources:
 ---
 
 ## TL;DR
-A background job is work a request handler hands off so it can respond now. A *durable* worker is one
-where the job's existence, state and progress live in a store that outlives both the process that
-enqueued it and the process running it, so a deploy or crash never loses the work. Durability is bought
-with a lease-and-acknowledge protocol, which means a job can run twice, so every job body must be
-idempotent.
+A durable worker keeps each background job's state in a store that outlives both the enqueuing and the
+running process, so deploys and crashes never lose work. Its lease-and-acknowledge protocol means a job
+can run twice, so handlers must be idempotent.
 
 ## Why it exists
-The forcing problem is any request whose real work takes longer than a client will wait: embedding a
-300-page PDF, running a twenty-step agent, sending ten thousand notifications, re-indexing a tenant.
-Doing it inline fails three ways at once. Load balancers and browsers cut idle connections (commonly
-around a minute by default; check your own), so the client sees an error while the server keeps working.
-The web process's capacity is consumed by slow work, so fast requests queue behind it. And a failure at
-minute nine leaves partial side effects with no record of how far it got.
-
-The first naive fix is "fire and forget": start a thread, an `asyncio` task or a framework background
-task and return. This fails because the job now exists only in one process's memory. The next deploy,
-out-of-memory kill or autoscaler scale-in silently destroys every in-flight and waiting job, and nobody
-is told. There is no retry, no visibility, no backpressure (a burst of uploads becomes a burst of
-threads) and no way to scale the workers separately from the web tier. Teams discover this the day a
-customer asks why their document never got indexed.
-
-A durable worker fixes the root cause by making the job a *record* rather than a *call*. Once the record
-is committed, three invariants hold: the job is not lost; at most one worker runs it at a time; and if
-that worker dies, the job becomes runnable again. That is the same at-least-once contract a message
-queue gives, seen from the worker's side and extended with state the worker owns: attempts, next run
-time, progress, result. In AI systems nearly every expensive operation is such a job, and "durable" is
-what lets you ship five deploys a day without aborting the agent runs in progress.
+- **Some work outlasts any client's patience.** Embedding a 300-page PDF, running a twenty-step agent,
+  sending ten thousand notifications, re-indexing a tenant.
+- **Inline fails three ways.** Load balancers and browsers cut idle connections (commonly around a minute
+  by default; check your own), so the client errors while the server keeps working. Slow work eats the web
+  tier's capacity, queueing fast requests. A failure at minute nine leaves partial side effects with no
+  record of progress.
+- **"Fire and forget" loses work silently.** A thread, an `asyncio` task or a framework background task
+  lives only in one process's memory; the next deploy, out-of-memory kill or scale-in destroys every
+  in-flight and waiting job, and nobody is told.
+- **It also has no controls.** No retry, no visibility, no backpressure (a burst of uploads becomes a burst
+  of threads), and no way to scale workers separately from the web tier. Teams find out when a customer
+  asks why their document never got indexed.
+- **Make the job a record, not a call.** Once committed: the job is not lost; at most one worker runs it at
+  a time; if that worker dies, it becomes runnable again. That is a message queue's at-least-once contract
+  from the worker's side, plus state the worker owns (attempts, next run time, progress, result). It is
+  what lets you ship five deploys a day without aborting agent runs in progress.
 
 ## How it works
 ### The job is a row
-A job record carries an id, a type (which handler runs it), a payload (arguments, small; large inputs go
-to object storage by reference), a state (`queued`, `running`, `succeeded`, `failed`, `dead`), an attempt
-counter, a `run_at` time, a lease (`locked_by`, `lease_until`), and an error or result. Each field exists
-for a reason: `run_at` gives delayed and scheduled jobs for free; `attempts` makes retry policy a function
-of the row instead of worker memory; the lease is what makes crash recovery possible; and the row itself
-is the audit trail and the status endpoint for the caller.
+| Field | Why it exists |
+|---|---|
+| id, type | identity, and which handler runs it |
+| payload | arguments, kept small; large inputs go to object storage by reference |
+| state: `queued`, `running`, `succeeded`, `failed`, `dead` | lifecycle, and the caller's status endpoint |
+| attempt counter | makes retry policy a function of the row, not worker memory |
+| `run_at` | delayed and scheduled jobs for free |
+| lease: `locked_by`, `lease_until` | what makes crash recovery possible |
+| error or result | the row itself is the audit trail |
 
 ### Enqueue is a write, not a call
-Because the job is a row, enqueueing is an insert. If the job table lives in the same database as the
-business data, insert it in the *same transaction* as the change that caused it: the job exists if and
-only if the business change committed. If the queue is a separate system (Redis, SQS, a broker) you
-have a dual-write problem: "commit, then enqueue" loses the job if the process dies between the two;
-"enqueue, then commit" runs a job for data that may have been rolled back. The transactional outbox
-pattern is the general cure: write the job to a table in the business transaction and let a relay
-forward it to the external queue.
+- **Same database, same transaction.** If the job table lives with the business data, insert the job in
+  the *same transaction* as the change that caused it: the job exists if and only if the change committed.
+- **Separate queue, dual-write problem.** With Redis, SQS or a broker, "commit, then enqueue" loses the job
+  if the process dies between the two; "enqueue, then commit" runs a job for data that may have been rolled back.
+- **The general cure is the transactional outbox:** write the job to a table in the business transaction
+  and let a relay forward it to the external queue.
 
 ### Claim with a lease, not a lock
-A worker claims a job by atomically flipping `queued` to `running` and setting `lease_until = now + T`
-and `locked_by = me`. In PostgreSQL the idiom is a single `UPDATE ... WHERE id = (SELECT ... FOR UPDATE
-SKIP LOCKED LIMIT 1) RETURNING *`. `SKIP LOCKED` exists because without it N workers block on the same
-hot row and serialize; with it each worker skips rows another worker is examining and takes the next.
-The claim is a *lease* rather than a transaction-long row lock because a lock held by a dead process is
-held until the connection drops, and holding a transaction open for a ten-minute job pins a database
-connection. A lease simply expires: the claim query also matches `running` rows whose `lease_until` is
-in the past, which is exactly how an orphaned job from a crashed worker gets picked up. SQS calls the
-same thing a visibility timeout; Redis-based libraries call it a lock with a duration the worker renews.
+1. **Claim atomically.** Flip `queued` to `running`, set `lease_until = now + T` and `locked_by = me`. The
+   PostgreSQL idiom is one `UPDATE ... WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *`.
+2. **`SKIP LOCKED` prevents serialization.** Without it N workers block on the same hot row; with it each
+   skips rows another worker is examining and takes the next.
+3. **A lease, not a transaction-long lock,** because a dead process's lock is held until its connection
+   drops, and a transaction open for a ten-minute job pins a database connection.
+4. **Expiry is recovery.** The claim also matches `running` rows whose `lease_until` is past, which is
+   exactly how a crashed worker's orphaned job gets picked up.
+
+SQS calls the same thing a visibility timeout; Redis-based libraries call it a lock with a duration the
+worker renews.
 
 ### Heartbeats and the long-job dilemma
-If the lease is shorter than the job, a healthy worker loses its job to a colleague mid-run, and both
-run it. If the lease is very long, recovery from a real crash waits that long. The usual answer is a
-short lease plus a heartbeat that extends it while work is in progress, paired with a hard maximum
-duration so a worker that is alive but stuck cannot hold a job forever.
+| Lease length | Problem |
+|---|---|
+| Shorter than the job | a healthy worker loses its job to a colleague mid-run, and both run it |
+| Very long | recovery from a real crash waits that long |
+| **Short lease plus heartbeat** | the usual answer, paired with a hard maximum duration so an alive-but-stuck worker cannot hold a job forever |
 
 ### Finish, retry, dead-letter
-On success the worker sets `succeeded` and stores the result. On failure it classifies the error.
-Retryable errors (timeouts, 429s, 5xxs from a model provider) set `queued` again with `run_at = now +
-backoff(attempts)`, exponential with jitter because a dependency recovering from an outage would
-otherwise be hit by every retry at the same instant. Permanent errors (validation, 4xx, a missing
-document) go straight to `dead`: burning five retries on them only delays the moment a human sees the
-problem. After `max_attempts` the job is `dead` and stays inspectable, which is the dead-letter queue in
-table form. Nothing is ever deleted on failure.
+- **Success:** set `succeeded` and store the result.
+- **Retryable errors** (timeouts, 429s, 5xxs from a model provider): set `queued` again with `run_at = now +
+  backoff(attempts)`, exponential with jitter, because a dependency recovering from an outage would
+  otherwise be hit by every retry at the same instant.
+- **Permanent errors** (validation, 4xx, a missing document): straight to `dead`; burning five retries only
+  delays the moment a human sees the problem.
+- **After `max_attempts`** the job is `dead` and stays inspectable: the dead-letter queue in table form.
+  Nothing is ever deleted on failure.
 
 ### Idempotency is the price of durability
-The worker can finish the side effect, then die before marking the row done. The lease expires, the job
-runs again. There is no way to make "call the external API" and "update the row" atomic, so the handler
-must tolerate a second run: upsert keyed by job id, pass an idempotency key to payment and email
-providers, check the store before acting. For multi-step jobs, checkpoint progress (a step index, or a
-per-chunk `done` marker) so a retry *resumes* instead of restarting; a 40-minute job that fails at minute
-39 should cost one more minute, not forty. Taken to its conclusion, recording every step and replaying
-on failure is what durable execution engines such as Temporal do, and what agent runtimes need for long
-tool-calling loops; the lessons on durable workflow execution and checkpointing go deeper.
+- **The unavoidable race.** The worker finishes the side effect, then dies before marking the row done; the
+  lease expires and the job runs again. "Call the external API" and "update the row" cannot be atomic.
+- **Tolerate a second run:** upsert keyed by job id, pass an idempotency key to payment and email
+  providers, check the store before acting.
+- **Checkpoint multi-step jobs** (a step index, or a per-chunk `done` marker) so a retry *resumes*: a
+  40-minute job failing at minute 39 should cost one more minute, not forty.
+- **Taken to its conclusion,** recording every step and replaying on failure is what durable execution
+  engines such as Temporal do, and what agent runtimes need for long tool-calling loops; the lessons on
+  durable workflow execution and checkpointing go deeper.
 
 ### Where the store lives
-A PostgreSQL table with `SKIP LOCKED` needs no new infrastructure, gives transactional enqueue, and is
-trivially inspectable; it polls, so idle workers cost queries, and finished rows must be archived or the
-table bloats. Redis-backed libraries (Celery with Redis, RQ, BullMQ, Sidekiq) give blocking pops and low
-latency, but inherit Redis's weaker durability and the dual-write problem. Broker-backed workers (Celery
-with RabbitMQ, SQS consumers) are the message-queue lesson from the consumer's chair. Choose by what
-losing a job costs and by throughput; a few hundred jobs per second (illustrative) is well within a
-Postgres table on modest hardware.
+| Store | Gains | Costs |
+|---|---|---|
+| PostgreSQL table with `SKIP LOCKED` | no new infrastructure, transactional enqueue, trivially inspectable | polling (idle workers cost queries); finished rows must be archived or the table bloats |
+| Redis-backed (Celery with Redis, RQ, BullMQ, Sidekiq) | blocking pops, low latency | Redis's weaker durability and the dual-write problem |
+| Broker-backed (Celery with RabbitMQ, SQS consumers) | the message-queue lesson from the consumer's chair | another system to run |
+
+Choose by what losing a job costs and by throughput; a few hundred jobs per second (illustrative) is well
+within a Postgres table on modest hardware.
 
 ### Sizing, fairness and shutdown
-Worker count follows from Little's law: jobs in progress = arrival rate × average duration. If uploads
-arrive at 0.5 per second and an embedding job averages 4 minutes, 0.5 × 240 = 120 jobs are running at
-steady state, so fewer than 120 worker slots means the backlog grows without bound, however fast each
-worker is. Size for the peak arrival rate you must absorb within your latency target, and remember that
-the model provider's rate limit, not your worker count, may be the real ceiling.
-
-A single shared queue in run order is unfair: one tenant that enqueues 10,000 jobs puts every other
-tenant's job behind them. The usual fixes are a per-tenant concurrency cap enforced in the claim (skip
-tenants already at their limit), a claim that rotates across tenants rather than taking the globally
-oldest row, or separate queues per priority class so interactive work is never behind bulk backfills.
-
-Deploys are the most frequent "crash". A worker that receives SIGTERM should stop claiming, finish or
-checkpoint the current job within the platform's grace period, and exit; anything it cannot finish is
-recovered by lease expiry, which is why the lease, not the shutdown handler, is the correctness mechanism.
+- **Little's law sizes workers:** jobs in progress = arrival rate × average duration. Uploads at 0.5 per
+  second with 4-minute jobs give 0.5 × 240 = 120 jobs running at steady state; fewer than 120 worker slots
+  means the backlog grows without bound, however fast each worker is.
+- **Size for peak** arrivals you must absorb within the latency target; the model provider's rate limit,
+  not your worker count, may be the real ceiling.
+- **Run-order queues are unfair.** One tenant enqueuing 10,000 jobs puts every other tenant behind them.
+  Fixes: a per-tenant concurrency cap in the claim (skip tenants at their limit), a claim that rotates
+  across tenants, or separate queues per priority class so interactive work never waits behind backfills.
+- **Deploys are the most frequent "crash".** On SIGTERM a worker stops claiming, finishes or checkpoints the
+  current job within the grace period, and exits. Anything unfinished is recovered by lease expiry, which is
+  why the lease, not the shutdown handler, is the correctness mechanism.
 
 ### What to measure
-Queue depth, age of the oldest queued job, run duration per type, attempts histogram, and dead count.
-The first two detect a stalled worker fleet; the last two detect a failing dependency.
+- **Queue depth and age of the oldest queued job** detect a stalled worker fleet.
+- **Run duration per type, attempts histogram and dead count** detect a failing dependency.
 
-## Example
-A PostgreSQL-backed worker in Python using psycopg 3. The claim reclaims expired leases, the handler is
-required to be idempotent, retryable failures are rescheduled with jittered backoff, and permanent
-failures go to `dead` without burning attempts. Every finishing update is guarded by `locked_by`, so a
-worker whose lease expired and was taken over cannot overwrite the new holder's outcome. Heartbeating is
-omitted for brevity; for jobs longer than the five-minute lease, extend `lease_until` from a timer thread.
+## Diagram
+The job's lifecycle as stored in the row: every arrow is one guarded `UPDATE`, and lease expiry is the
+only way a crashed worker's job returns to the pool.
+
+```mermaid
+stateDiagram-v2
+    [*] --> queued: insert in business transaction
+    queued --> running: claim with SKIP LOCKED and lease
+    running --> running: heartbeat extends lease
+    running --> succeeded: handler done, fenced by locked_by
+    running --> queued: retryable error, run_at plus backoff
+    running --> dead: permanent error or max attempts
+    running --> queued: lease expired, worker presumed dead
+    succeeded --> [*]
+    dead --> [*]
+```
+
+## Examples
+### A PostgreSQL-backed worker (psycopg 3)
+- **The claim reclaims expired leases,** and the handler must be idempotent.
+- **Retryable failures** are rescheduled with jittered backoff; **permanent failures** go to `dead`
+  without burning attempts.
+- **Every finishing update is guarded by `locked_by`,** so a worker whose lease expired and was taken over
+  cannot overwrite the new holder's outcome.
+- **Heartbeating is omitted for brevity;** for jobs longer than the five-minute lease, extend
+  `lease_until` from a timer thread.
 
 ```python
 import random, time, uuid, psycopg
@@ -193,58 +212,124 @@ with psycopg.connect(DSN) as conn:
             time.sleep(1)                  # idle poll; LISTEN/NOTIFY can wake workers instead
 ```
 
-`load_chunks`, `embed`, `vectors`, `RetryableError` and `DSN` belong to the application. A partial index
-on `(run_at) WHERE state IN ('queued','running')` keeps the claim fast as the table grows. The
-`attempts < 5` guard on orphan reclaim matters because a job that kills its worker (an out-of-memory
-crash on one huge document) never reaches the `except` branches; without the guard it is reclaimed
-forever, and a small periodic sweeper should move such rows to `dead`.
+- **App-supplied names:** `load_chunks`, `embed`, `vectors`, `RetryableError` and `DSN` belong to the application.
+- **Keep the claim fast:** a partial index on `(run_at) WHERE state IN ('queued','running')` keeps it fast
+  as the table grows.
+- **Why the `attempts < 5` guard on orphan reclaim:** a job that kills its worker (an out-of-memory crash on
+  one huge document) never reaches the `except` branches. Without the guard it is reclaimed forever, and a
+  small periodic sweeper should move such rows to `dead`.
+
+### Runnable: lease expiry and the completion fence
+Pure Python, in memory. Worker A stalls past its lease, B reclaims the job, and A's late completion is
+rejected, exactly what `DONE` does in SQL.
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class Job:
+    id: str
+    state: str = "queued"
+    locked_by: str = ""
+    lease_until: float = 0.0
+    attempts: int = 0
+
+def claim(job, worker, now, lease_s=300):
+    orphaned = job.state == "running" and job.lease_until < now
+    if job.state == "queued" or orphaned:
+        job.state, job.locked_by, job.lease_until = "running", worker, now + lease_s
+        job.attempts += 1
+        return True
+    return False
+
+def finish(job, worker):
+    if job.locked_by != worker:            # the fence: WHERE id=%s AND locked_by=%s
+        return False
+    job.state = "succeeded"
+    return True
+
+job = Job("embed-42")
+print(claim(job, "A", now=0))              # True: A holds the lease until t=300
+print(claim(job, "B", now=100))            # False: lease still valid
+print(claim(job, "B", now=301))            # True: A looks dead (GC pause, slow call), B reclaims
+print(finish(job, "A"))                    # False: A's late completion is rejected
+print(finish(job, "B"), job.attempts)      # True 2
+```
+
+### Worked scenario: sizing workers and protecting small tenants
+Uploads average 0.5 per second with 4-minute embedding jobs; then one tenant bulk-imports 10,000 documents.
+
+| Question | Arithmetic | Answer |
+|---|---|---|
+| Worker slots at steady state | 0.5/s × 240 s | 120 jobs in progress; provision more than 120 slots |
+| Bulk import on a shared run-order queue, 120 slots | 10,000 × 240 s ÷ 120 | ~20,000 s (about 5.6 hours) before other tenants' jobs start |
+| Same import with a per-tenant cap of 20 slots | the tenant uses 20, others share 100 | other tenants keep near-normal latency; the import takes longer |
+
+The cap trades the bulk tenant's completion time for everyone else's latency, which is usually the right
+product call; make it explicit in the tier's terms.
+
+## Production patterns
+- **Partial index plus archival.** Create `CREATE INDEX jobs_claimable ON jobs (run_at) WHERE state IN
+  ('queued','running')` and move finished rows older than a retention window to an archive table nightly,
+  in batches. Monitor claim query latency and table size.
+- **Wake workers with LISTEN/NOTIFY.** Issue `NOTIFY` in the enqueue transaction (it is delivered only on
+  commit) and have idle workers `LISTEN`, keeping a slow poll as a fallback for missed notifications.
+  Monitor idle-poll query rate and pickup latency.
+- **Per-tenant concurrency cap in the claim.** Add a predicate that skips tenants whose `running` count is
+  at their limit, or rotate the claim across tenants. Monitor oldest-queued-job age per tenant, not just
+  globally.
+- **Late acks in Celery.** Set `acks_late=True` and `task_reject_on_worker_lost=True` so a crash redelivers
+  instead of losing the task, `worker_prefetch_multiplier=1` for long jobs, and with Redis a broker
+  `visibility_timeout` above the longest job. Monitor duplicate executions per task id.
+- **Graceful shutdown sized to the platform.** Handle SIGTERM by stopping claims and checkpointing, and set
+  the platform grace period (for example Kubernetes `terminationGracePeriodSeconds`) above the checkpoint
+  interval. Monitor jobs reclaimed by lease expiry after each deploy; it should be near zero.
 
 ## Trade-offs
-- A job table in the main database gains transactional enqueue and zero new infrastructure, but pays
-  polling and row churn; it flips toward Redis or a broker when throughput reaches (as an order of
-  magnitude) thousands of jobs per second, or when hundreds of idle workers poll.
-- Redis-backed queues gain blocking pops and millisecond pickup, but lose jobs if persistence is off or
-  lagging; acceptable for cache warming, unacceptable for billing or customer-visible work.
-- A long lease simplifies the worker, but delays recovery after a crash; a short lease with heartbeats
-  recovers fast but needs a maximum-duration guard so a stuck worker cannot renew forever.
-- Retrying every failure is easy to write, but hides permanent errors behind five slow attempts;
-  classifying errors costs code and flips to worthwhile the moment a model provider returns 4xx.
-- Restarting a failed multi-step job is simple, but repeats side effects and wasted minutes;
-  checkpointing adds state to manage and pays off once jobs exceed a few minutes or several steps.
-- A durable execution engine gains resume-from-step and full history, but costs a runtime to operate and
-  a programming model to learn; a table and a loop are enough until workflows become long and branching.
+- **Job table vs broker.** A table in the main database gains transactional enqueue and zero new
+  infrastructure but pays polling and row churn; flip to Redis or a broker at (as an order of magnitude)
+  thousands of jobs per second, or when hundreds of idle workers poll.
+- **Redis speed vs loss.** Redis-backed queues gain blocking pops and millisecond pickup but lose jobs if
+  persistence is off or lagging; fine for cache warming, unacceptable for billing or customer-visible work.
+- **Long lease vs fast recovery.** A long lease simplifies the worker but delays crash recovery; a short
+  lease with heartbeats recovers fast but needs a maximum-duration guard so a stuck worker cannot renew forever.
+- **Retry everything vs classify.** Retrying every failure is easy but hides permanent errors behind five
+  slow attempts; classifying costs code and is worthwhile the moment a model provider returns 4xx.
+- **Restart vs checkpoint.** Restarting a failed multi-step job is simple but repeats side effects and
+  wasted minutes; checkpointing adds state and pays off once jobs exceed a few minutes or several steps.
+- **Durable execution engine vs a loop.** An engine gains resume-from-step and full history but costs a
+  runtime to operate and a model to learn; a table and a loop suffice until workflows get long and branching.
 
 ## Pitfalls
-- Using in-process background tasks for work that matters; the symptom is jobs that vanish after every
-  deploy, discovered weeks later by a customer rather than by an alert.
-- A non-idempotent handler; the symptom is duplicate emails, double charges or two embeddings per chunk
-  after a worker is OOM-killed or a lease expires.
-- Enqueueing outside the business transaction; the symptom is jobs that fail on "row not found" because
-  the insert was rolled back, or committed changes with no job because the process died first.
-- A lease shorter than the job and no heartbeat; the symptom is the same job id running on two workers
-  and `attempts` climbing with no recorded failure.
-- No maximum attempts or dead state; the symptom is one poison job retried forever, a worker permanently
-  busy and a backlog growing behind it.
-- One shared run-order queue for all tenants; the symptom is a bulk import by one customer turning every
-  other customer's two-second job into a two-hour wait, with workers fully busy and no errors.
-- Storing large payloads in the job row; the symptom is a bloated table, slow claims and a database that
-  has become a blob store.
-- Never archiving finished rows and no partial index; the symptom is a claim query that gets slower every
-  week even though the backlog is small.
-- Assuming the library acknowledges after the work; some default to acknowledging before execution
-  (Celery's `acks_late` is off by default), and the symptom is lost jobs on worker crash despite a
-  "durable" broker.
+- **In-process background tasks for work that matters.** Symptom: jobs vanish after every deploy,
+  discovered weeks later by a customer rather than an alert.
+- **A non-idempotent handler.** Symptom: duplicate emails, double charges or two embeddings per chunk after
+  a worker is OOM-killed or a lease expires.
+- **Enqueueing outside the business transaction.** Symptom: jobs failing on "row not found" because the
+  insert rolled back, or committed changes with no job because the process died first.
+- **A lease shorter than the job, and no heartbeat.** Symptom: the same job id on two workers and
+  `attempts` climbing with no recorded failure.
+- **No maximum attempts or dead state.** Symptom: one poison job retried forever, a worker permanently busy
+  and a backlog growing behind it.
+- **One shared run-order queue for all tenants.** Symptom: one customer's bulk import turns every other
+  customer's two-second job into a two-hour wait, with workers fully busy and no errors.
+- **Large payloads in the job row.** Symptom: a bloated table, slow claims and a database that has become
+  a blob store.
+- **Never archiving finished rows, no partial index.** Symptom: a claim query that slows every week even
+  though the backlog is small.
+- **Assuming the library acks after the work.** Some default to acknowledging before execution (Celery's
+  `acks_late` is off by default); the symptom is lost jobs on worker crash despite a "durable" broker.
 
 ## When to use
-Reach for a durable worker whenever work must survive the request: anything longer than a few seconds,
-anything with an external side effect that must happen exactly once from the user's view, anything that
-needs retry, scheduling or a status the caller can poll. Stay inline for fast reads the user is waiting
-on, and use in-process tasks only for best-effort work you can afford to lose, such as a metrics sample.
-Start with a table in the database you already run and move to a broker or an execution engine when
-throughput, fan-out or workflow length demands it. Measure oldest-job age and dead count from day one.
-Day to day this shows up as "should this endpoint enqueue or call", choosing lease length against real
-LLM latency, and deciding what is retryable. In interviews, expect to design the job table, explain
-`SKIP LOCKED` and leases, and justify idempotency.
+- **Use when:** work must survive the request: anything longer than a few seconds, any external side effect
+  that must happen exactly once from the user's view, anything needing retry, scheduling or a pollable status.
+- **Avoid when:** it is a fast read the user is waiting on; use in-process tasks only for best-effort work
+  you can lose, such as a metrics sample.
+- **Start simple:** a table in the database you already run; move to a broker or execution engine when
+  throughput, fan-out or workflow length demands it.
+- **Measure from day one:** oldest-job age and dead count.
+- **Day to day:** "should this endpoint enqueue or call", lease length against real LLM latency, and what is retryable.
+- **Interviews:** design the job table, explain `SKIP LOCKED` and leases, and justify idempotency.
 
 ## Role lens
 - **Engineer:** Writes the claim query, idempotent handlers and error classification, sizes leases to
@@ -268,6 +353,37 @@ rather than repeats, and the twenty-minute job costs only the unfinished chunks.
 while embedding so a slow but healthy worker is not pre-empted, with a maximum duration as a guard.
 Classify provider errors: 429 and 5xx reschedule with jittered backoff, 4xx go to `dead`. Alert on the age
 of the oldest queued job and the dead count.
+
+## Interview questions
+### Why isn't FastAPI's BackgroundTasks (or a thread) enough for embedding uploads?
+- **The job lives only in process memory,** so a deploy, OOM kill or scale-in silently destroys it with no
+  record and no retry.
+- **No controls:** no backpressure, no status for the caller, and no way to scale workers apart from the
+  web tier. A durable job row fixes all of these.
+
+### Why does SKIP LOCKED matter in a database-backed queue?
+- **Without it, N workers contend for the same oldest row** and wait on each other's locks, so the queue
+  is effectively single-threaded.
+- **With it, each worker skips rows another holds** and takes the next, so a single `UPDATE ... RETURNING`
+  claims a distinct job per worker in one statement.
+
+### A job's `attempts` climbs to 5 with no errors logged. What happened?
+- **Lease expiry without failure:** the lease is shorter than the job, so other workers reclaim it while the
+  first is still healthy, or the job crashes its worker (OOM) and never reaches the error handler.
+- **Fix:** heartbeat the lease with a maximum duration, fence completions on `locked_by`, and have a sweeper
+  move crash-loopers to `dead` for inspection.
+
+### When would you move from a Postgres jobs table to a broker or Temporal?
+- **Broker:** at thousands of jobs per second, many idle pollers, or fan-out to several consumer services.
+- **Durable execution engine:** when workflows are long, branching and multi-step, and you need resume
+  from the last step with full history.
+- **Stay on the table** while transactional enqueue and inspectability matter more than throughput.
+
+### Uploads arrive at 0.5/s and each embedding takes 4 minutes. How many workers do you need?
+- **Little's law:** 0.5 × 240 s = 120 jobs in progress, so you need more than 120 concurrent slots or the
+  backlog grows forever.
+- **Then check the real ceiling:** the provider's rate limit may cap throughput below what the worker count
+  allows, and peak arrivals, not the average, set the target.
 
 ## Quiz
 ### Q: Why does a durable worker claim a job with an expiring lease instead of holding a row lock for the duration of the job?

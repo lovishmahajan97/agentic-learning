@@ -5,7 +5,7 @@ name: Tokens per second
 kind: metric
 difficulty: core
 est_minutes: 13
-status: reviewed
+status: crisp
 related:
   - serving-inference/tpot
   - serving-inference/throughput-vs-latency
@@ -21,28 +21,23 @@ sources:
 ---
 
 ## TL;DR
-"Tokens per second" names two different numbers: the decode speed of one stream (roughly `1 / TPOT`,
-what a user sees) and the aggregate output of a whole server (all concurrent streams summed, what you
-pay for). They move in opposite directions as concurrency rises. A quoted figure means nothing
-without which tokens (input, output or both), the concurrency, prompt and output lengths, hardware,
-precision and percentile. Use it for capacity and cost per token; never compare it across tokenizers.
+"Tokens per second" names two numbers that move in opposite directions with concurrency: one stream's
+decode speed (what a user sees) and a server's aggregate output (what you pay for). A figure means
+nothing without tokens counted, concurrency, lengths, hardware and percentile.
 
 ## Why it exists
-Serving an LLM is selling tokens produced per unit of GPU time, so the business, the capacity plan
-and the user experience all need a rate. The problem is that the obvious rate is overloaded. A
-vendor slide says "1,200 tokens/s"; a user complains the assistant "only does 30 tokens/s"; an
-engineer sizes a cluster from a benchmark at concurrency 1. All three are using the same words for
-different quantities, and the mistakes compound: sizing from single-stream speed can undershoot
-capacity by an order of magnitude, while judging user experience from aggregate throughput hides
-that each stream is crawling.
-
-The naive fix, "just report one tokens/s per deployment", fails because the number is not a property
-of the deployment. It depends on how many requests are in flight, how long their prompts and answers
-are, whether the measurement counts prompt tokens (which prefill chews through tens of times faster
-than decode produces output), and even which tokenizer defines a token. Two models given the same
-English text can differ in token count by double-digit percentages, and far more on code or
-non-Latin scripts. Without pinning those variables down, tokens/s is marketing, not measurement.
-Pinning them down is what this lesson is about.
+- **Serving is selling tokens per GPU-second.** The business, the capacity plan and the user experience
+  all need a rate, and the obvious one is overloaded.
+- **Three people, three quantities, same words.** A vendor slide says "1,200 tokens/s"; a user complains
+  the assistant "only does 30 tokens/s"; an engineer sizes a cluster from a benchmark at concurrency 1.
+- **The mistakes compound.** Sizing from single-stream speed can undershoot capacity by an order of
+  magnitude, while judging user experience from aggregate throughput hides that each stream is crawling.
+- **One number per deployment does not exist.** It depends on requests in flight, prompt and answer
+  lengths, whether prompt tokens count (prefill chews through them tens of times faster than decode
+  produces output), and which tokenizer defines a token.
+- **Tokenizers alone move it a lot.** Two models given the same English text can differ in token count
+  by double-digit percentages, and far more on code or non-Latin scripts. Without pinning these down,
+  tokens/s is marketing, not measurement.
 
 ## How it works
 ### The four numbers hiding in one phrase
@@ -54,67 +49,97 @@ Pinning them down is what this lesson is about.
 3. **Input (prefill) tokens/s.** Prompt tokens processed per second. Prefill is compute-bound and
    batched, so this is typically one to two orders of magnitude higher than output rate on the same
    hardware.
-4. **"Total" tokens/s.** Input plus output over wall time. It is dominated by the cheap input term, so
-   it makes any system look fast; treat a quote that does not say "output" as this number.
+4. **"Total" tokens/s.** Input plus output over wall time. It is dominated by the cheap input term, so it
+   makes any system look fast; treat a quote that does not say "output" as this number.
 
-Alongside these sit requests per second and *goodput*: the rate of requests (or tokens) served
-*within* the latency SLO. Goodput is the honest capacity figure because it refuses to count tokens
-that arrived too late to matter.
+Alongside these:
+- **Requests per second.**
+- **Goodput:** the rate of requests (or tokens) served *within* the latency SLO. It is the honest
+  capacity figure because it refuses to count tokens that arrived too late to matter.
 
 ### How they relate
-Per-stream rate falls slowly as concurrency rises, because each decode step streams the weights once
-for all sequences and only KV-cache reads grow with the batch. Aggregate rate therefore climbs almost
-linearly at first, then bends as KV reads dominate or the GPU becomes compute-bound, and finally
-stops when KV memory is full and new requests queue. The two curves cross whatever SLO you have at
-some concurrency; that crossing, not the plateau, is the capacity you can sell for interactive
-traffic.
+- **Per-stream rate falls slowly with concurrency**, because each decode step streams the weights once
+  for all sequences and only KV-cache reads grow with the batch.
+- **Aggregate rate climbs almost linearly at first**, then bends as KV reads dominate or the GPU becomes
+  compute-bound, and stops when KV memory is full and new requests queue.
+- **The sellable capacity is where the curves cross your SLO**, not the plateau, for interactive
+  traffic.
 
-"Aggregate ≈ concurrency × per-stream rate" is only the decode-phase view. Little's law makes it exact
-in steady state: requests per second = concurrency / mean request latency, so
+### Little's law makes it exact
+"Aggregate ≈ concurrency × per-stream rate" is only the decode-phase view. In steady state, requests per
+second = concurrency / mean request latency, so
 
 ```
 aggregate_output_tok/s ≈ concurrency × n_out / (TTFT + (n_out − 1) × TPOT)
 ```
 
-With 64 in flight, TPOT 25 ms and TTFT 500 ms, 1,000-token answers give about 64 × 1000 / 25.5 s ≈
-2,500 tokens/s, while 50-token answers give 64 × 50 / 1.7 s ≈ 1,900 tokens/s on the same engine,
-because each slot spends almost a third of its life in queue and prefill rather than decoding.
+| 64 in flight, TPOT 25 ms, TTFT 500 ms | Request time | Aggregate output |
+|---|---|---|
+| 1,000-token answers | about 25.5 s | 64 × 1000 / 25.5 s ≈ 2,500 tokens/s |
+| 50-token answers | about 1.7 s | 64 × 50 / 1.7 s ≈ 1,900 tokens/s |
+
+Same engine, fewer tokens per second for short answers, because each slot spends almost a third of its
+life in queue and prefill rather than decoding.
 
 ### What moves the numbers
-- **Bytes per step:** model size and weight precision set the floor of per-stream speed.
-- **Memory bandwidth:** the hardware term; FLOPs matter only once compute binds at high batch.
-- **Concurrency:** trades per-stream for aggregate, as above.
-- **Context length:** longer sequences mean more KV bytes per step and fewer sequences that fit, so
-  both per-stream and aggregate fall as conversations grow.
-- **Output length distribution:** many short answers mean more scheduling churn and a larger prefill
-  share; aggregate output rate falls even though the GPU is busy.
-- **Tokenizer:** changes the denominator. Comparing models by tokens/s rewards the one with the
-  coarser vocabulary; compare characters or words per second for user-facing speed.
+| Factor | Effect |
+|---|---|
+| **Bytes per step** | Model size and weight precision set the floor of per-stream speed |
+| **Memory bandwidth** | The hardware term; FLOPs matter only once compute binds at high batch |
+| **Concurrency** | Trades per-stream for aggregate, as above |
+| **Context length** | More KV bytes per step and fewer sequences that fit, so both per-stream and aggregate fall as conversations grow |
+| **Output length distribution** | Many short answers mean more scheduling churn and a larger prefill share; aggregate output falls even though the GPU is busy |
+| **Tokenizer** | Changes the denominator. Comparing models by tokens/s rewards the coarser vocabulary; compare characters or words per second for user-facing speed |
 
 ### Measuring it without fooling yourself
-Count tokens from the server's usage report, not from the number of streamed chunks. Warm up and
-measure in steady state, excluding model load and cache fill. Decide between a closed-loop test
-(fixed concurrency, each client sends the next request when the previous finishes) and an open-loop
-test (requests arrive at a set rate regardless of completion); closed-loop can never show queue
-build-up, so capacity numbers from it are optimistic. Use realistic prompt and output length
-distributions, report failures and timeouts as part of the run, and publish percentiles of TTFT and
-TPOT next to the throughput figure. vLLM ships a serving benchmark script and NVIDIA's GenAI-Perf
-exists for the same job; a 30-line asyncio harness is enough to start.
+- **Count tokens from the server's usage report**, not from the number of streamed chunks.
+- **Warm up and measure in steady state**, excluding model load and cache fill.
+- **Choose the loop deliberately.**
+  - *Closed-loop:* fixed concurrency; each client sends the next request when the previous finishes.
+    It can never show queue build-up, so its capacity numbers are optimistic.
+  - *Open-loop:* requests arrive at a set rate regardless of completion, which exposes queueing.
+- **Use realistic prompt and output length distributions**, report failures and timeouts as part of the
+  run, and publish TTFT and TPOT percentiles next to the throughput figure.
+- **Tools:** vLLM ships a serving benchmark script and NVIDIA's GenAI-Perf exists for the same job; a
+  30-line asyncio harness is enough to start.
 
 ### From tokens/s to money
 Cost per million output tokens on self-hosted hardware is
-`gpu_hourly_cost / (aggregate_output_tokens_per_second × 3600) × 1e6`. Illustrative: a replica
-sustaining 3,000 output tokens/s at an assumed $3 per GPU-hour produces 10.8 million tokens per hour,
-about $0.28 per million output tokens, before idle time, redundancy and prefill. Run the same replica
-at concurrency 1 for 200 tokens/s and the same GPU-hour yields $4.17 per million. That spread is the
-entire economics of batching, and it is why the concurrency you choose is a pricing decision.
+`gpu_hourly_cost / (aggregate_output_tokens_per_second × 3600) × 1e6`. Illustrative:
 
-## Example
+| Replica setting | Output tokens/s | Tokens per hour at $3 per GPU-hour (assumed) | Cost per million output tokens |
+|---|---|---|---|
+| Batched, high concurrency | 3,000 | 10.8 million | about $0.28 |
+| Concurrency 1 | 200 | 0.72 million | $4.17 |
+
+- **Before idle time, redundancy and prefill.** Real costs are higher than both rows.
+- **That spread is the entire economics of batching**, and why the concurrency you choose is a pricing
+  decision.
+
+## Diagram
+Before trusting any tokens/s figure, walk it down this path; each question changes the number, and only
+the last two predict capacity and cost.
+
+```mermaid
+flowchart TD
+    Q["Quoted tokens per second"] --> T{"Which tokens?"}
+    T -->|"input plus output"| F["Flattering total, prefill dominated"]
+    T -->|"output only"| S{"One stream or whole server?"}
+    S -->|"one stream"| P["Per-stream, about 1 over TPOT"]
+    S -->|"whole server"| A["Aggregate at stated concurrency"]
+    A --> L["Pin lengths, hardware, tokenizer"]
+    L --> G["Goodput within SLO"]
+    G --> C["Cost per million output tokens"]
+```
+
+## Examples
+### Closed-loop load generator for the concurrency curve
 A small closed-loop load generator against any OpenAI-compatible streaming server: *c* workers each
 send a request, wait for it to finish, and send the next, so concurrency stays near *c* for the
-whole run. It reports aggregate output tokens/s (total tokens over wall time, not an average of
-per-request rates), median per-stream rate and TTFT percentiles at several concurrency levels, which
-is the curve you need before setting a per-replica concurrency limit.
+whole run.
+- **It reports** aggregate output tokens/s (total tokens over wall time, not an average of
+  per-request rates), median per-stream rate and TTFT percentiles at several concurrency levels.
+- **That is the curve** you need before setting a per-replica concurrency limit.
 
 ```python
 import asyncio, statistics, time
@@ -159,41 +184,82 @@ asyncio.run(main())
 # A closed loop never offers more than c requests, so rerun open-loop before trusting the limit.
 ```
 
+### From a benchmark result to replicas and price
+Runnable arithmetic: Little's law for aggregate output, then replicas and cost per million. Inputs are
+illustrative; replace them with your measured TTFT, TPOT and traffic.
+
+```python
+import math
+
+def aggregate_tok_s(concurrency, n_out, ttft_s, tpot_s):
+    return concurrency * n_out / (ttft_s + (n_out - 1) * tpot_s)
+
+def cost_per_million(gpu_hourly, agg_tok_s):
+    return gpu_hourly / (agg_tok_s * 3600) * 1e6
+
+agg = aggregate_tok_s(64, 1000, 0.5, 0.025)        # ~2,512 output tok/s per replica
+peak_demand = 20_000                                # output tok/s needed at peak (assumed)
+print(f"aggregate {agg:,.0f} tok/s, replicas {math.ceil(peak_demand / agg)}")
+print(f"${cost_per_million(3.0, agg):.2f} per million at c=64")
+print(f"${cost_per_million(3.0, 200):.2f} per million at c=1 (200 tok/s)")
+# aggregate 2,512 tok/s, replicas 8
+# $0.33 per million at c=64
+# $4.17 per million at c=1 (200 tok/s)
+```
+
+## Production patterns
+- **Benchmark with your length mix, open-loop.** Run the engine's serving benchmark (vLLM's ships with
+  it; `vllm bench serve` in recent versions) with your real prompt and output length distribution and
+  a fixed request rate, not only fixed concurrency. Record TTFT and TPOT percentiles next to tokens/s.
+- **Publish goodput, not peak.** Report capacity as output tokens/s (or requests/s) served within the
+  TTFT and TPOT SLO at the concurrency limit you will deploy. Monitor goodput per replica in production
+  against that number.
+- **Count from usage fields.** Read `usage.completion_tokens` (with the include-usage stream option on
+  OpenAI-style APIs) rather than chunk counts. Monitor drift between your token counts and the
+  provider's billing.
+- **Price from the chosen operating point.** Compute cost per million output tokens from aggregate
+  tokens/s at the deployed concurrency, plus idle and redundancy overhead. Monitor GPU-hours per million
+  output tokens weekly.
+- **Compare models by task time, not tokens/s.** For model selection, measure characters per second or
+  seconds to complete a fixed task set, because tokenizers differ. Monitor end-to-end task latency.
+
 ## Trade-offs
-- Raising concurrency raises aggregate tokens/s and lowers cost per token, but lowers per-stream
-  speed; the right point flips from "maximise aggregate" to "cap concurrency" the moment a per-stream
-  or TTFT SLO exists.
-- Quoting total (input + output) tokens/s gives a bigger, more flattering number that is fair for
-  prefill-heavy jobs like summarisation, and misleading for chat where output dominates the cost.
-- Comparing engines on peak throughput is cheap to run but rewards configurations that queue
-  aggressively; goodput at your SLO is harder to measure and the only figure that predicts capacity.
-- Speculative decoding raises per-stream tokens/s at low concurrency but can lower aggregate at high
-  concurrency, so a benchmark at one setting can reverse at the other.
-- Long-context workloads cut both numbers because KV reads grow and fewer sequences fit; a model that
-  wins at 1k context can lose at 32k.
+- **Aggregate vs per-stream.** Raising concurrency raises aggregate tokens/s and lowers cost per token,
+  but lowers per-stream speed. The right point flips from "maximise aggregate" to "cap concurrency" the
+  moment a per-stream or TTFT SLO exists.
+- **Total vs output tokens/s.** Quoting total (input + output) gives a bigger, more flattering number
+  that is fair for prefill-heavy jobs like summarisation, and misleading for chat where output
+  dominates the cost.
+- **Peak vs goodput.** Comparing engines on peak throughput is cheap to run but rewards configurations
+  that queue aggressively; goodput at your SLO is harder to measure and the only figure that predicts
+  capacity.
+- **Speculative decoding by concurrency.** It raises per-stream tokens/s at low concurrency but can lower
+  aggregate at high concurrency, so a benchmark at one setting can reverse at the other.
+- **Short vs long context.** Long-context workloads cut both numbers because KV reads grow and fewer
+  sequences fit; a model that wins at 1k context can lose at 32k.
 
 ## Pitfalls
-- Comparing providers or models by tokens/s across different tokenizers; the symptom is the "faster"
-  model taking longer to finish the same paragraph.
-- Benchmarking at concurrency 1 and dividing a fleet by that; the symptom is capacity that is wildly
-  under- or over-provisioned depending on which number was used.
-- Counting streamed chunks as tokens; the symptom is tokens/s that disagrees with usage and with the
-  bill, since servers coalesce or split tokens per event.
-- Closed-loop load tests only; the symptom is a capacity estimate that collapses in production when
+- **Comparing tokens/s across different tokenizers.** Symptom: the "faster" model takes longer to finish
+  the same paragraph.
+- **Benchmarking at concurrency 1 and dividing a fleet by that.** Symptom: capacity wildly under- or
+  over-provisioned depending on which number was used.
+- **Counting streamed chunks as tokens.** Symptom: tokens/s that disagrees with usage and with the bill,
+  since servers coalesce or split tokens per event.
+- **Closed-loop load tests only.** Symptom: a capacity estimate that collapses in production when
   arrivals burst and queues form.
-- Ignoring prompt tokens in capacity math; the symptom is a RAG workload saturating prefill compute
-  while the output tokens/s dashboard says the GPU has headroom.
-- Averaging per-request tokens/s instead of dividing total tokens by wall time; the symptom is an
-  aggregate figure that short requests inflate and that no capacity model can reproduce.
+- **Ignoring prompt tokens in capacity math.** Symptom: a RAG workload saturating prefill compute while
+  the output tokens/s dashboard says the GPU has headroom.
+- **Averaging per-request tokens/s.** Divide total tokens by wall time instead; the average is inflated
+  by short requests and no capacity model can reproduce it.
 
 ## When to use
-Reach for tokens/s whenever the question is capacity or cost: how many replicas for a launch, what a
-GPU-hour yields, whether a quantised model pays for itself, whether a vendor's claim covers your
-workload. Always state which of the four numbers you mean and the conditions behind it. Reach for
-TPOT and TTFT instead when the question is how one request feels. Day to day it appears in capacity
-reviews, vendor comparisons and pricing models; in interviews the strong move is to refuse to answer
-"how many tokens/s does it do" until concurrency, lengths, hardware and which tokens are specified,
-then to connect the number to cost per million tokens.
+- **Use for capacity or cost questions:** how many replicas for a launch, what a GPU-hour yields,
+  whether a quantised model pays for itself, whether a vendor's claim covers your workload.
+- **Always state which of the four numbers** you mean and the conditions behind it.
+- **Use TPOT and TTFT instead** when the question is how one request feels.
+- **Day to day** it appears in capacity reviews, vendor comparisons and pricing models.
+- **Interviews:** refuse to answer "how many tokens/s does it do" until concurrency, lengths, hardware
+  and which tokens are specified, then connect the number to cost per million tokens.
 
 ## Role lens
 - **Engineer:** Builds the load harness, reads usage rather than chunk counts, and produces the
@@ -214,6 +280,41 @@ floor? Closed- or open-loop, and what were TTFT and TPOT percentiles at that rat
 without an SLO is not capacity? Which tokenizer, since I will compare to my current model by words
 or characters, not tokens? Finally, is it sustained or peak, and does it include failures? The answers
 turn a slogan into a point on a curve I can place my workload on.
+
+## Interview questions
+### What is the difference between per-stream and aggregate tokens per second?
+- **Per-stream** is one request's decode rate after its first token, about 1 / TPOT; it is what a user
+  perceives.
+- **Aggregate** is all output tokens a replica produces per second across concurrent requests, roughly
+  concurrency × per-stream rate; it sets cost per token.
+- **They diverge with concurrency** because the weight read is shared: aggregate rises while each
+  stream slows.
+
+### Why can a replica produce fewer tokens per second on short answers than on long ones?
+- **Little's law:** aggregate ≈ concurrency × output length / (TTFT + (n − 1) × TPOT).
+- **Short answers** spend a larger share of each slot's life in queue and prefill: with 64 in flight,
+  TTFT 500 ms and TPOT 25 ms, 50-token answers give about 1,900 tokens/s versus about 2,500 for
+  1,000-token answers.
+- **So** output length distribution belongs in every capacity estimate.
+
+### You need to size a fleet for launch. How do you benchmark?
+- **Open-loop at realistic lengths:** fixed arrival rates with the production prompt and output mix,
+  after warm-up, counting tokens from usage.
+- **Find goodput:** the highest rate where TTFT and TPOT percentiles meet the SLO, including failures
+  and timeouts.
+- **Divide peak demand by goodput per replica**, then add headroom for redundancy and bursts.
+
+### What does batching do to cost per token? Give numbers.
+- **Formula:** GPU hourly cost / (aggregate output tokens/s × 3600) × 1e6.
+- **Illustrative:** at an assumed $3 per GPU-hour, 3,000 tokens/s is about $0.28 per million; the same
+  GPU at concurrency 1 and 200 tokens/s is $4.17 per million.
+- **So** the concurrency limit is a pricing decision, constrained by the latency SLO.
+
+### When is a tokens-per-second comparison between two models misleading?
+- **Different tokenizers:** a coarser vocabulary emits fewer tokens for the same text, so the slower
+  model can post the higher figure.
+- **Different conditions:** concurrency, lengths, precision or input-plus-output counting.
+- **Use instead** characters or words per second, or task completion time and cost at the SLO.
 
 ## Quiz
 ### Q: A replica produces 4,000 output tokens/s in aggregate at a steady concurrency of 64. Roughly what does each user see?

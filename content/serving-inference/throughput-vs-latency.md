@@ -5,7 +5,7 @@ name: Throughput vs latency
 kind: decision
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - serving-inference/continuous-batching
   - serving-inference/batching-and-concurrency-limits
@@ -22,145 +22,224 @@ sources:
 ---
 
 ## TL;DR
-A decode step costs about the same whether it advances one sequence or thirty-two, because its time
-is dominated by reading the weights once. Packing more requests into each step therefore multiplies
-throughput almost for free, until compute or KV memory saturates, but every added request lengthens
-each step and the queue in front of it, so per-request latency rises. No setting maximises both. You
-pick an operating point on that curve per workload and enforce it with concurrency limits, admission
-control and SLOs.
+A decode step costs about the same for one sequence or thirty-two, so batching multiplies throughput
+almost for free, but each added request lengthens every step and the queue. Pick an operating point per
+workload and enforce it with limits and SLOs.
 
 ## Why it exists
-A GPU serving an LLM at concurrency 1 is mostly idle: it streams 16 GB of weights through its memory
-system to produce a single token, then does it again. Letting it produce 32 tokens per pass instead
-costs almost nothing extra, which is why continuous batching exists and why self-hosting is
-affordable at all. But the same arithmetic means the server is now making 32 users share one
-pipeline. Each step is a little slower, new arrivals wait for a slot, and under bursty traffic the
-wait, not the step, becomes the latency.
-
-Teams that never choose get the worst of both. Run at high utilisation to keep cost per token low and
-the p99 latency explodes, because queueing delay grows without bound as utilisation approaches 100 %.
-Run at low concurrency to keep latency tight and you pay for GPUs that are 80 % idle. The naive
-"autoscale on GPU utilisation" does not resolve it either. The usual utilisation metric (what
-`nvidia-smi` reports) is the fraction of time any kernel is running, not the fraction of compute in
-use, so a decode loop at batch 4 and one at batch 200 can both read near 100 %. It tells you the GPU
-is busy, not how much headroom is left, and it says nothing about the queue that users feel.
-
-Providers make the trade-off explicit in their pricing. Interactive endpoints are tuned for latency
-and cost more; batch endpoints run at the throughput end of the curve with multi-hour completion
-windows at roughly half the interactive price at the time of writing. If you run your own engine,
-you are the one who has to make that choice, per workload, with numbers.
+- **A GPU at concurrency 1 is mostly idle.** It streams 16 GB of weights through its memory system to
+  produce a single token, then does it again. Producing 32 tokens per pass instead costs almost nothing
+  extra, which is why continuous batching exists and why self-hosting is affordable at all.
+- **The same arithmetic makes 32 users share one pipeline.** Each step is a little slower, new arrivals
+  wait for a slot, and under bursty traffic the wait, not the step, becomes the latency.
+- **Not choosing gets the worst of both.**
+  - Run at high utilisation for low cost per token and p99 explodes, because queueing delay grows
+    without bound as utilisation approaches 100 %.
+  - Run at low concurrency for tight latency and you pay for GPUs that are 80 % idle.
+- **"Autoscale on GPU utilisation" does not resolve it.** The usual metric (what `nvidia-smi` reports)
+  is the fraction of time any kernel is running, not compute in use, so a decode loop at batch 4 and one
+  at batch 200 can both read near 100 %. It says the GPU is busy, not how much headroom remains or how
+  long the queue is.
+- **Providers price the trade-off explicitly.** Interactive endpoints are tuned for latency and cost
+  more; batch endpoints run at the throughput end with multi-hour completion windows at roughly half
+  the interactive price at the time of writing. Self-hosting, you make that choice per workload.
 
 ## How it works
 ### The shape of the curve
-Plot concurrency on the x-axis. Throughput (aggregate output tokens/s) rises almost linearly, bends,
-and plateaus. Per-request latency (TPOT, and TTFT once queueing starts) stays nearly flat, then turns
-upward at a knee, then climbs steeply. The mechanism for the decode phase is a single line:
+- **Throughput** (aggregate output tokens/s) against concurrency rises almost linearly, bends, and
+  plateaus.
+- **Per-request latency** (TPOT, and TTFT once queueing starts) stays nearly flat, turns upward at a
+  knee, then climbs steeply.
+- **The decode-phase mechanism** is a single line:
 
 ```
 step_time ≈ (weight_bytes + B × kv_bytes_per_seq) / bandwidth        (bandwidth-bound regime)
 throughput ≈ B / step_time          per-request TPOT ≈ step_time
 ```
 
-While `weight_bytes` dominates, *B* can grow with little effect on step time, so throughput scales
-with *B*. As `B × kv_bytes` catches up (long contexts do this quickly) each new sequence costs every
-other one real latency. Eventually arithmetic overtakes bandwidth and the step becomes compute-bound,
-or KV memory fills and the engine can admit no one; from there additional load only lengthens the
-queue.
+1. **While `weight_bytes` dominates**, *B* can grow with little effect on step time, so throughput
+   scales with *B*.
+2. **As `B × kv_bytes` catches up** (long contexts do this quickly), each new sequence costs every other
+   one real latency.
+3. **Eventually** arithmetic overtakes bandwidth and the step becomes compute-bound, or KV memory fills
+   and the engine can admit no one. From there additional load only lengthens the queue.
 
 ### Queueing sits on top
-Even below the knee, arrivals are random. Little's law says the average number of requests in the
-system equals arrival rate times average time in system (`L = λW`), and for a simple single-server
-queue the time in system grows like `service_time / (1 − ρ)`, where ρ is utilisation. At ρ = 0.5 a
-request spends twice its service time in the system; at ρ = 0.9, ten times. LLM services have
-long, highly variable service times (output length is unknown in advance), which makes the tail
-worse than the simple model predicts. That is why interactive services target moderate utilisation
-and why TTFT p99 is the first thing to break under load.
+- **Arrivals are random even below the knee.** Little's law: average requests in the system equal
+  arrival rate times average time in system (`L = λW`).
+- **Time in system grows like `service_time / (1 − ρ)`** for a simple single-server queue, where ρ is
+  utilisation.
+
+| Utilisation ρ | Time in system vs service time |
+|---|---|
+| 0.5 | 2× |
+| 0.9 | 10× |
+
+- **LLM service times are long and highly variable** (output length is unknown in advance), which makes
+  the tail worse than the simple model predicts.
+- **So** interactive services target moderate utilisation, and TTFT p99 is the first thing to break
+  under load.
 
 ### Choosing the operating point
-1. Write the SLO as percentiles: for example TTFT p95 ≤ 1 s and TPOT p95 ≤ 50 ms for chat.
-2. Run a load curve at realistic prompt and output lengths and find the largest concurrency at
-   which both hold. That is the replica's *goodput* capacity.
-3. Set the engine's per-replica concurrency limit (`max_num_seqs` in vLLM) and token budget there,
+1. **Write the SLO as percentiles**, for example TTFT p95 ≤ 1 s and TPOT p95 ≤ 50 ms for chat.
+2. **Run a load curve** at realistic prompt and output lengths and find the largest concurrency at which
+   both hold. That is the replica's *goodput* capacity.
+3. **Set the engine's per-replica concurrency limit** (`max_num_seqs` in vLLM) and token budget there,
    with headroom for bursts.
-4. Shed or queue beyond it visibly: a fast 429 with `Retry-After`, or a queue position, instead of a
+4. **Shed or queue beyond it visibly:** a fast 429 with `Retry-After`, or a queue position, instead of a
    silent 10-second TTFT.
-5. Autoscale on queue depth or TTFT, not on GPU utilisation.
-6. Separate pools: interactive traffic at the knee, batch and background jobs at the plateau where
+5. **Autoscale on queue depth or TTFT**, not on GPU utilisation.
+6. **Separate pools:** interactive traffic at the knee, batch and background jobs at the plateau where
    each token is cheapest and nobody is waiting.
 
 ### Techniques move the curve; they do not remove it
-Continuous batching lets sequences join and leave every step instead of waiting for the slowest.
-PagedAttention stops KV fragmentation so more sequences fit before memory binds. Chunked prefill
-bounds the prefill work per step so new arrivals do not stall running streams. Disaggregated
-prefill and decode put the two phases on different GPUs so one workload's TTFT stops competing with
-another's TPOT. Quantisation shrinks bytes per step and KV footprint. Speculative decoding lowers
-latency at low concurrency but spends compute that the plateau needs, so it can reduce peak
-throughput. Each of these shifts the knee rightward or the floor downward; none lets you run at
-100 % utilisation with flat latency.
+| Technique | What it shifts |
+|---|---|
+| Continuous batching | Sequences join and leave every step instead of waiting for the slowest |
+| PagedAttention | Stops KV fragmentation, so more sequences fit before memory binds |
+| Chunked prefill | Bounds prefill work per step, so new arrivals do not stall running streams |
+| Disaggregated prefill and decode | Puts the phases on different GPUs, so one workload's TTFT stops competing with another's TPOT |
+| Quantisation | Shrinks bytes per step and KV footprint |
+| Speculative decoding | Lowers latency at low concurrency but spends compute the plateau needs, so it can reduce peak throughput |
+
+Each shifts the knee rightward or the floor downward; none lets you run at 100 % utilisation with flat
+latency.
 
 ### If you do not run the engine
-With a hosted API you do not set the batch size, but the trade-off is still yours: you choose between
-the interactive and batch tiers, how many requests you keep in flight per key, which timeouts you
-accept, and whether to pay for provisioned or dedicated capacity when tail latency matters. The
-provider's rate limits are, in effect, the operating point they chose for you.
+- **You still own the trade-off.** You do not set the batch size, but you choose between interactive
+  and batch tiers, how many requests to keep in flight per key, which timeouts to accept, and whether
+  to pay for provisioned or dedicated capacity when tail latency matters.
+- **The provider's rate limits are**, in effect, the operating point they chose for you.
 
-## Example
-A worked scenario on one replica, using the illustrative bandwidth model from the TPOT lesson: an
-8B fp16 model (16 GB of weights, 128 KB of KV cache per token) on an 80 GB GPU with about 3.35 TB/s
-of memory bandwidth, every request at 4k tokens of context, so each sequence holds about 0.5 GB of
-KV cache.
+## Diagram
+How an operating point is chosen and enforced: the SLO picks the concurrency, and everything above that
+limit is shed, queued visibly or sent to a cheaper pool.
 
-Memory capacity caps concurrency first: after weights and a few GB of working space, roughly 60 GB
-remain, so at most about 120 sequences can be resident. Bytes per step at *B* sequences are
-`16 GB + B × 0.5 GB`, so TPOT ≈ `(16 + 0.5B) / 3350` seconds and throughput ≈ `B / TPOT`.
+```mermaid
+flowchart TD
+    S["SLO as percentiles"] --> L["Load curve at real lengths"]
+    L --> K["Largest concurrency meeting SLO"]
+    K --> C["Set per-replica limit"]
+    C --> R{"Request arrives"}
+    R -->|"under limit"| A["Admit to batch"]
+    R -->|"over limit"| X["Fast 429 or visible queue"]
+    R -->|"batch traffic"| B["Throughput pool at plateau"]
+    X -.->|"queue depth"| H["Autoscale replicas"]
+```
 
-Now apply an SLO. If chat needs TPOT ≤ 50 ms, the bandwidth model allows `16 + 0.5B ≤ 167 GB`,
-i.e. *B* up to about 300. The memory cap of ~120 binds first, so latency is not the limit: at
-*B* = 120 the step is `(16 + 60) / 3350 ≈ 23 ms`, comfortably inside the SLO, and throughput is
-about 120 / 0.023 ≈ 5,300 tokens/s. Run the replica full.
+## Examples
+### Worked scenario: what a latency target costs in throughput
+One replica, using the illustrative bandwidth model from the TPOT lesson: an 8B fp16 model (16 GB of
+weights, 128 KB of KV cache per token) on an 80 GB GPU with about 3.35 TB/s of memory bandwidth. Every
+request has 4k tokens of context, so each sequence holds about 0.5 GB of KV cache.
+- **Memory caps concurrency first.** After weights and a few GB of working space, roughly 60 GB remain,
+  so at most about 120 sequences can be resident.
+- **The model.** Bytes per step at *B* sequences are `16 GB + B × 0.5 GB`, so TPOT ≈ `(16 + 0.5B) / 3350`
+  seconds and throughput ≈ `B / TPOT`.
 
-Tighten the SLO to TPOT ≤ 15 ms, as a code-completion product might. Now `16 + 0.5B ≤ 50 GB`, so
-*B* ≤ 68 and latency binds before memory does; throughput falls to about 68 / 0.015 ≈ 4,500
-tokens/s. Tighten again to 10 ms and *B* ≤ 35, throughput ≈ 3,500 tokens/s. The same hardware
-delivers about a third fewer tokens per hour, hence roughly 50 % higher cost per token, purely
-because of the latency target. That is the trade-off turned into a budget line, before any
-queueing delay is added on top; real measurements will sit below every figure here.
+| TPOT SLO | Bandwidth limit on *B* | Binding limit | Step time | Throughput |
+|---|---|---|---|---|
+| ≤ 50 ms (chat) | `16 + 0.5B ≤ 167 GB`, *B* up to about 300 | Memory, ~120 | `(16 + 60) / 3350 ≈ 23 ms` | about 120 / 0.023 ≈ 5,300 tokens/s |
+| ≤ 15 ms (code completion) | `16 + 0.5B ≤ 50 GB`, *B* ≤ 68 | Latency | 15 ms | about 68 / 0.015 ≈ 4,500 tokens/s |
+| ≤ 10 ms | *B* ≤ 35 | Latency | 10 ms | about 3,500 tokens/s |
+
+- **At 50 ms, latency is not the limit**: the step is comfortably inside the SLO, so run the replica full.
+- **At 10 ms, the same hardware delivers about a third fewer tokens per hour**, hence roughly 50 % higher
+  cost per token, purely because of the latency target.
+- **That is the trade-off as a budget line**, before any queueing delay is added; real measurements will
+  sit below every figure here.
+
+```python
+BW_GBPS, WEIGHTS_GB, KV_GB_PER_SEQ, MEM_CAP = 3350, 16, 0.5, 120
+
+def best_batch(tpot_slo_s: float) -> int:
+    by_latency = int((tpot_slo_s * BW_GBPS - WEIGHTS_GB) / KV_GB_PER_SEQ)
+    return min(by_latency, MEM_CAP)
+
+for slo in (0.050, 0.015, 0.010):
+    b = best_batch(slo)
+    step = (WEIGHTS_GB + KV_GB_PER_SEQ * b) / BW_GBPS
+    print(f"SLO {slo*1e3:4.0f} ms  B={b:3d}  step {step*1e3:4.1f} ms  {b/step:5.0f} tok/s")
+# SLO   50 ms  B=120  step 22.7 ms   5289 tok/s
+# SLO   15 ms  B= 68  step 14.9 ms   4556 tok/s
+# SLO   10 ms  B= 35  step 10.0 ms   3500 tok/s
+```
+
+### Why the tail explodes near saturation
+Runnable: a single-server FIFO queue with random arrivals and service times (Lindley's recursion),
+compared with the `service_time / (1 − ρ)` formula.
+
+```python
+import random
+
+def mean_time_in_system(rho, service=1.0, n=200_000, seed=0):
+    rnd = random.Random(seed)
+    wait = total = 0.0
+    for _ in range(n):
+        s = rnd.expovariate(1 / service)          # this request's service time
+        total += wait + s
+        gap = rnd.expovariate(rho / service)      # time until the next arrival
+        wait = max(0.0, wait + s - gap)           # next request's queueing delay
+    return total / n
+
+for rho in (0.5, 0.7, 0.9, 0.95):
+    print(f"rho={rho:.2f}  simulated {mean_time_in_system(rho):5.1f}x  formula {1/(1-rho):5.1f}x")
+# rho=0.50 ~2x, 0.70 ~3.3x, 0.90 ~10x, 0.95 ~20x the service time
+```
+
+## Production patterns
+- **Concurrency cap from the load curve.** Set vLLM `--max-num-seqs` (and the per-step token budget
+  `--max-num-batched-tokens`) at the largest concurrency that met the SLO, minus burst headroom. Monitor
+  TTFT p95 and TPOT p95 against running sequences.
+- **Shed at the edge with `Retry-After`.** When a replica's queue exceeds what fits in the first-token
+  budget, return 429 with `Retry-After` from the gateway instead of queueing silently. Monitor shed rate
+  per tenant and the share of admitted requests inside the SLO.
+- **Autoscale on queue depth.** Feed the engine's waiting-request gauge (vLLM `vllm:num_requests_waiting`)
+  into the autoscaler, for example a Kubernetes HPA on a custom metric or a KEDA Prometheus trigger.
+  Monitor queue depth and scale-out lag.
+- **Separate interactive and batch pools.** Run interactive traffic on replicas held at the knee and
+  send offline work to a pool run at the plateau, or to a provider batch API (OpenAI Batch, Anthropic
+  Message Batches). Monitor interactive TTFT during batch job start times.
+- **Measure goodput per replica.** Track tokens or requests served within SLO per GPU-hour as the
+  capacity KPI. Monitor it next to cost per token in capacity reviews.
 
 ## Trade-offs
-- Higher concurrency lowers cost per token and raises per-request latency; the balance flips from
-  "fill the GPU" to "cap the batch" the moment a per-request SLO exists for that traffic.
-- Running at low utilisation buys flat tail latency and wastes hardware; it is the right call for
-  interactive tiers and the wrong one for offline jobs that can wait hours.
-- Speculative decoding improves latency when the GPU has spare compute (low concurrency) and can cut
-  peak throughput when it does not, so it belongs on the interactive pool, not the batch pool.
-- Sharing one pool between interactive and batch traffic maximises utilisation but lets batch
-  arrivals push interactive TTFT past the knee; separate pools cost headroom and buy predictability.
-- Shedding load with fast 429s protects the latency of admitted requests at the cost of failed ones;
-  queueing admits everyone and lets latency drift, which is better only when callers can wait.
+- **Cost per token vs per-request latency.** Higher concurrency lowers cost per token and raises
+  per-request latency; the balance flips from "fill the GPU" to "cap the batch" the moment a
+  per-request SLO exists for that traffic.
+- **Flat tails vs wasted hardware.** Low utilisation buys flat tail latency and wastes hardware; right
+  for interactive tiers, wrong for offline jobs that can wait hours.
+- **Speculative decoding by pool.** It improves latency when the GPU has spare compute (low concurrency)
+  and can cut peak throughput when it does not, so it belongs on the interactive pool, not the batch pool.
+- **Shared vs separate pools.** Sharing one pool maximises utilisation but lets batch arrivals push
+  interactive TTFT past the knee; separate pools cost headroom and buy predictability.
+- **Shedding vs queueing.** Fast 429s protect the latency of admitted requests at the cost of failed
+  ones; queueing admits everyone and lets latency drift, which is better only when callers can wait.
 
 ## Pitfalls
-- Autoscaling on GPU utilisation; the symptom is a metric pinned near 100 % at both light and heavy
-  load, so replicas scale out late or never while users wait through a queue.
-- Benchmarking throughput with a closed loop and no SLO; the symptom is a "capacity" figure that
-  production never reaches without blowing p99.
-- Sizing from mean latency; the symptom is on-call pages for p99 while the dashboard average looks
-  fine, since queueing lives entirely in the tail.
-- Letting one batch job share the interactive pool; the symptom is TTFT spikes at the exact minute a
-  cron job starts.
-- Raising `max_num_seqs` to fix throughput without checking KV memory; the symptom is preemptions and
-  recompute stalls that lower throughput and latency at once.
-- Treating speculative decoding as free throughput; the symptom is lower aggregate tokens/s at peak
-  than without it.
+- **Autoscaling on GPU utilisation.** Symptom: a metric pinned near 100 % at both light and heavy load,
+  so replicas scale out late or never while users wait through a queue.
+- **Closed-loop throughput benchmarks with no SLO.** Symptom: a "capacity" figure production never
+  reaches without blowing p99.
+- **Sizing from mean latency.** Symptom: on-call pages for p99 while the dashboard average looks fine,
+  since queueing lives entirely in the tail.
+- **One batch job on the interactive pool.** Symptom: TTFT spikes at the exact minute a cron job starts.
+- **Raising `max_num_seqs` without checking KV memory.** Symptom: preemptions and recompute stalls that
+  lower throughput and latency at once.
+- **Treating speculative decoding as free throughput.** Symptom: lower aggregate tokens/s at peak than
+  without it.
 
 ## When to use
-This is the decision you make every time you configure a replica, choose a provider tier, or set a
-rate limit. Reach for the latency end whenever a person or a latency-sensitive agent is waiting:
-chat, completions, voice, interactive tools. Reach for the throughput end for evaluation runs, bulk
-extraction, embeddings backfills, nightly summaries and anything with a deadline measured in hours.
-Measure the curve (throughput, TTFT p95, TPOT p95 against concurrency) for each model and hardware
-pairing, pick the point, and enforce it with limits and alerts on queue depth. In interviews the
-strong answer draws the curve, explains why it bends (weights shared per step, then KV and compute
-binding), adds the queueing tail, and names the concurrency limit as the control.
+- **Every time** you configure a replica, choose a provider tier, or set a rate limit, you are making
+  this decision.
+- **Latency end** whenever a person or latency-sensitive agent is waiting: chat, completions, voice,
+  interactive tools.
+- **Throughput end** for evaluation runs, bulk extraction, embeddings backfills, nightly summaries and
+  anything with a deadline measured in hours.
+- **Measure** throughput, TTFT p95 and TPOT p95 against concurrency for each model and hardware pairing,
+  pick the point, and enforce it with limits and alerts on queue depth.
+- **Interviews:** draw the curve, explain why it bends (weights shared per step, then KV and compute
+  binding), add the queueing tail, and name the concurrency limit as the control.
 
 ## Role lens
 - **Engineer:** Produces the load curve, sets per-replica concurrency and token budgets, and wires
@@ -182,6 +261,37 @@ chunked prefill so long prompts stop stalling admission, cap `max_model_len` to 
 needs so more sequences fit, and evaluate weight or KV quantisation. Move any batch or background
 traffic to off-peak hours or a separate cheap pool. Finally measure goodput at the SLO and present
 finance with cost per token at the required latency, which is the real request.
+
+## Interview questions
+### Why does batching raise throughput almost for free, and where does that stop?
+- **Decode is bandwidth-bound:** each step reads the weights once whatever the batch size, so more
+  sequences per step means more tokens for nearly the same step time.
+- **It stops** when per-sequence KV reads dominate the bytes moved, when arithmetic catches up with
+  bandwidth, or when KV memory is full and new requests must queue.
+
+### How would you choose the concurrency limit for a new chat deployment?
+- **Start from the SLO** as percentiles, such as TTFT p95 ≤ 1 s and TPOT p95 ≤ 50 ms.
+- **Run an open-loop load curve** at production prompt and output lengths, and take the largest
+  concurrency at which both percentiles hold, minus burst headroom.
+- **Enforce it** with the engine's max-sequences setting, shed the excess with 429s, and autoscale on
+  queue depth.
+
+### When would you deliberately run a replica at low utilisation?
+- **Interactive tiers with strict tails:** at ρ = 0.9 time in system is about ten times service time, so
+  a voice or completion product needs headroom.
+- **Not for offline work:** evaluation runs and backfills should run at the plateau, ideally on a
+  separate pool or a provider batch tier at roughly half price.
+
+### What does tightening TPOT from 50 ms to 10 ms cost on one replica?
+- **In the illustrative 8B example**, memory caps the batch at about 120 at 50 ms, for about 5,300 tokens/s.
+- **At 10 ms** latency binds at a batch of about 35, about 3,500 tokens/s: a third fewer tokens and
+  roughly 50 % higher cost per token.
+- **So** a latency target is a line in the infrastructure budget, and should be negotiated as one.
+
+### GPU utilisation reads 100 % at both light and heavy load. Why, and what do you scale on instead?
+- **The metric is time-busy**, the fraction of time any kernel runs, not the fraction of compute used,
+  so batch 4 and batch 200 decode loops both look saturated.
+- **Scale on** engine queue depth or TTFT percentiles, which directly measure the wait users feel.
 
 ## Quiz
 ### Q: Why does raising the batch size increase throughput almost linearly at first?

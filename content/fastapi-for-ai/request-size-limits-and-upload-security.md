@@ -106,6 +106,25 @@ Uvicorn doesn't limit body size, and FastAPI parses JSON bodies fully into memor
 - **Isolate and defend:** keep per-tenant indexes and apply prompt-injection defences at retrieval time.
 - **Run PII detection** if documents may contain regulated data.
 
+## Diagram
+An upload's path through the five layers: each one rejects what only it can see, and the risky parsing
+happens in an isolated worker after the API has already answered 202.
+
+```mermaid
+flowchart TD
+    U["Client upload"] --> E{"Edge: per-route body cap and body timeout"}
+    E -->|"too big or too slow"| X1["413 or timeout at the proxy"]
+    E -->|"ok"| M{"App middleware: Content-Length check, then byte counter"}
+    M -->|"over cap"| X2["413 Content Too Large"]
+    M -->|"ok"| T{"Magic bytes in allowlist?"}
+    T -->|"no"| X3["415 unsupported type"]
+    T -->|"yes"| S[("Private tenant-scoped storage, UUID name")]
+    S --> J["202 with job ID"]
+    S --> W["Sandboxed parse worker: CPU, memory, time limits, no network"]
+    W -->|"archive, pixel, page caps"| C["Extracted text"]
+    C --> I["Index as untrusted data: strip hidden text, injection and PII checks"]
+```
+
 ## Examples
 ### Byte-counting ASGI middleware plus a magic-byte check
 A pure-ASGI size-limit middleware, plus a type check on the first bytes.
@@ -298,6 +317,41 @@ pod's memory and kills all its requests. Fixes: enforce limits on uncompressed s
 compression ratio while extracting. Move extraction and parsing to a separate worker with memory and
 time limits, so the API only stores the file and returns 202 with a job ID. Cap pages per document.
 Check magic bytes per entry. Keep the app-level byte counter in case the app is reached around nginx.
+
+## Interview questions
+### nginx already caps request bodies. Why add a size limit in the FastAPI app too?
+- **Defence in depth:** if the app is ever reached another way (a new ingress, an internal caller), the
+  proxy cap is bypassed, and uvicorn and FastAPI put no cap on JSON body size.
+- **Only the app sees per-route meaning and decompressed bytes**, for example a gzip request body
+  inflated in middleware.
+- **Monitor both:** 413s raised in the app rather than at the edge mean traffic is bypassing the proxy.
+
+### How do you enforce a size cap on a chunked request that sends no Content-Length?
+- **Wrap `receive` in ASGI middleware** and count `body` bytes in each `http.request` message, aborting
+  with 413 once the running total passes the route's cap.
+- **Keep the `Content-Length` check as a fast path**, because it rejects an honest 3 GB upload before
+  reading anything.
+- **Why counting is required:** the header is a client claim and is absent under chunked transfer, so
+  only bytes actually received are a measurement.
+
+### Workers are exhausted while bandwidth and CPU stay low, and many requests sit in "reading body". What is happening?
+- **A slow-body attack (the slowloris variant):** clients trickle bodies at a few kilobytes per second,
+  staying under every byte cap while holding connections and worker slots.
+- **Fix at the proxy:** a body read timeout such as nginx `client_body_timeout`, an overall limit or
+  minimum rate for large uploads, and full request buffering so slow clients never occupy Python workers.
+
+### Would you accept large documents through the API or with presigned direct uploads?
+- **Through the API** is simpler and keeps one auth path, but every byte crosses your workers.
+- **Presigned direct-to-storage uploads** suit files larger than tens of megabytes: the storage service
+  enforces the size condition and the API receives only the object key.
+- **Either way**, type checks, quarantine and sandboxed parsing still run on the stored object.
+
+### Which checks catch a 20 KB zip that expands to gigabytes, and where should they run?
+- **No byte cap sees it**, because the compressed upload is tiny.
+- **Bound the extraction:** entry count, compression ratio and uncompressed total counted as bytes
+  actually decompress, because archive headers can lie.
+- **Run it in the parse worker** with memory and time limits, so a bomb that slips past kills one job,
+  not the API pod.
 
 ## Quiz
 ### Q: Why is checking `Content-Length` insufficient to enforce an upload size limit?

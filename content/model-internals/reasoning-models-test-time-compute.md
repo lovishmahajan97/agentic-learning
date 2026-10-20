@@ -5,7 +5,7 @@ name: Reasoning models / test-time compute
 kind: concept
 difficulty: core
 est_minutes: 18
-status: reviewed
+status: crisp
 related:
   - prompting/chain-of-thought
   - model-internals/sampling-strategies
@@ -23,118 +23,134 @@ sources:
 ---
 
 ## TL;DR
-Test-time compute means spending more inference computation on a query to get a better answer: a longer
-chain of thought, several sampled attempts with a vote or verifier, or search over partial solutions.
-Reasoning models are LLMs trained, mostly with reinforcement learning on verifiable tasks, to do this
-internally in a long thinking trace before answering. A transformer does fixed computation per token, so
-hard problems need more tokens, and extra inference compute often buys more accuracy per dollar than a
-bigger model.
+Test-time compute spends more inference per query: longer chains of thought, several attempts with a vote
+or verifier, or search. Reasoning models are RL-trained to do this in a thinking trace, often buying more
+accuracy per dollar than a bigger model.
 
 ## Why it exists
-A decoder-only transformer spends the same compute on every token: L layers, one pass. Whether the next
-token completes "2 + 2 =" or "the smallest prime factor of 8,633 is", the depth of computation is
-identical. Problems that need many sequential steps therefore cannot be solved in one forward pass once
-they exceed what the layer stack can compose; the model guesses. Chain-of-thought prompting (Wei et al.,
-2022) was the first clear evidence: asking the model to write intermediate steps lets it use its own output
-as working memory, turning one hard prediction into many easy ones. Each emitted token is another forward
-pass, so a longer trace is literally more compute spent on the problem.
-
-Two further observations turned a prompting trick into a scaling axis. Self-consistency (Wang et al., 2022)
-samples several chains and majority-votes the final answer; accuracy rises with samples because wrong paths
-tend to disagree with each other while correct paths converge. And coverage keeps growing: the chance that
-at least one of N samples is correct rises roughly log-linearly in N over a wide range, so anything that
-can recognise a correct answer, from a unit test to a reward model, can harvest it. Snell et al. then
-showed in 2024 that for a fixed compute budget, spending it at inference time can beat spending it on a
-larger model, with the best allocation depending on how hard the question is.
-
-Why not just prompt for chain of thought? Prompted reasoning is shallow: the model imitates what reasoning
-looks like in its pre-training data, rarely backtracks, and does not know when to stop. Reasoning models
-(OpenAI's o-series, DeepSeek-R1, and the extended-thinking modes of Anthropic and Google models) train
-the behaviour with reinforcement learning on tasks whose answers can be checked, such as maths, code and
-logic. Rewarding the correct final answer is enough for the policy to learn to explore alternatives, verify
-its own steps and self-correct inside the trace; the DeepSeek-R1 report describes these behaviours emerging
-without being demonstrated. The naive alternative, a bigger base model, is expensive to pre-train and still
-does fixed compute per token, so it does not remove the underlying constraint.
+- **Compute per token is fixed.** A decoder-only transformer spends L layers, one pass, on every token.
+  Whether it completes "2 + 2 =" or "the smallest prime factor of 8,633 is", the depth is identical, so
+  problems needing more sequential steps than the layer stack can compose get a guess.
+- **Chain of thought adds passes.** Wei et al. (2022) showed that writing intermediate steps lets the model
+  use its own output as working memory, turning one hard prediction into many easy ones. Each emitted token
+  is another forward pass, so a longer trace is literally more compute spent on the problem.
+- **It became a scaling axis.** Self-consistency (Wang et al., 2022) majority-votes several chains;
+  accuracy rises because wrong paths disagree while correct ones converge. Coverage, the chance at least one
+  of N samples is correct, rises roughly log-linearly in N over a wide range, so anything that recognises a
+  correct answer, from a unit test to a reward model, can harvest it.
+- **It can beat a bigger model.** Snell et al. showed in 2024 that for a fixed compute budget, spending it
+  at inference can beat a larger model, with the best allocation depending on question difficulty. A bigger
+  base model is expensive to pre-train and still does fixed compute per token, so it does not remove the
+  constraint.
+- **Prompted reasoning is shallow, so it is trained.** Prompted chains imitate reasoning from pre-training
+  data, rarely backtrack and do not know when to stop. Reasoning models (OpenAI's o-series, DeepSeek-R1, the
+  extended-thinking modes of Anthropic and Google models) use RL on checkable maths, code and logic.
+  Rewarding the correct final answer is enough to learn exploring, self-verification and self-correction;
+  the DeepSeek-R1 report describes these emerging without demonstration.
 
 ## How it works
 ### Tokens as computation
-Each generated token costs a forward pass, about 2N FLOPs plus attention over the growing context, and its
-result is written into the context where later steps can read it through attention. A 2,000-token thinking
-trace is therefore 2,000 sequential passes of extra computation with an explicit scratchpad. The serial
-depth comes from the token dimension, not the layer dimension, which is why chain of thought provably
-extends what a fixed-depth transformer can compute. The exchange rate is explicit: cost and latency grow
-linearly with trace length, and the trace occupies context and KV-cache memory.
+- **Each generated token costs a forward pass,** about 2N FLOPs plus attention over the growing context, and
+  its result is written into the context where later steps read it through attention.
+- **A 2,000-token thinking trace** is therefore 2,000 sequential passes of extra computation with an
+  explicit scratchpad.
+- **Serial depth comes from the token dimension, not the layer dimension,** which is why chain of thought
+  provably extends what a fixed-depth transformer can compute.
+- **The exchange rate is explicit:** cost and latency grow linearly with trace length, and the trace
+  occupies context and KV-cache memory.
 
 ### Four strategies for spending inference compute
-1. **Sequential.** One path, more steps: longer chain of thought, self-critique, revision loops.
-2. **Parallel.** N independent samples at temperature above zero, aggregated by majority vote on the final
-   answer (which needs a canonical answer) or by a verifier or reward model choosing the best (best-of-N).
-3. **Search.** Expand solutions step by step, score partial solutions with a process reward model, and
-   keep the best candidates (beam search or tree search over steps). Most useful on hard problems where whole
-   samples rarely contain a fully correct path.
-4. **Trained reasoning.** The model internalises the first three in a single long trace through RL, and
-   at inference you control a budget rather than orchestrating samples yourself.
+| Strategy | How | Best when |
+|---|---|---|
+| 1. Sequential | one path, more steps: longer chain of thought, self-critique, revision loops | easy questions where the first attempt is nearly right |
+| 2. Parallel | N independent samples at temperature above zero, aggregated by majority vote on the final answer (needs a canonical answer) or by a verifier or reward model choosing the best (best-of-N) | hard questions needing diverse attempts |
+| 3. Search | expand solutions step by step, score partial solutions with a process reward model, keep the best (beam or tree search over steps) | hard problems where whole samples rarely contain a fully correct path |
+| 4. Trained reasoning | the model internalises the first three in one long trace through RL | you control a budget rather than orchestrating samples |
 
-Snell et al. found the best strategy depends on difficulty: sequential revision wins on easy questions where
-the first attempt is nearly right, parallel sampling and search win on hard ones where diverse attempts are
-needed, and a difficulty-aware policy that picks per question is reported to be several times more
-compute-efficient than any fixed strategy.
+- **Difficulty decides.** Snell et al. found sequential revision wins on easy questions and parallel
+  sampling and search on hard ones; a difficulty-aware policy that picks per question is reported to be
+  several times more compute-efficient than any fixed strategy.
 
 ### Verifiers
-Outcome reward models score only the final answer; process reward models score each step, and Lightman et
-al. found step-level supervision more reliable for maths. Wherever a ground-truth checker exists, such as
-unit tests, a calculator or a symbolic solver, use it: it is exact and free. That is also why maths and code
-are where reasoning models improved most; the reward signal there is verifiable, so RL has something clean
-to optimise. Majority voting needs discrete answers; for free-form outputs you fall back to an LLM judge or
-pairwise comparison, which brings its own error rate.
+- **Outcome vs process reward models.** Outcome reward models score only the final answer; process reward
+  models score each step, and Lightman et al. found step-level supervision more reliable for maths.
+- **Use a ground-truth checker wherever one exists,** such as unit tests, a calculator or a symbolic solver:
+  it is exact and free.
+- **That is why maths and code improved most.** The reward there is verifiable, so RL has something clean to
+  optimise.
+- **Voting needs discrete answers.** For free-form outputs you fall back to an LLM judge or pairwise
+  comparison, which brings its own error rate.
 
 ### How a reasoning model is trained, in outline
-Start from a strong pre-trained model and run RL on problems with checkable answers. DeepSeek-R1 used
-GRPO: sample a group of responses per prompt (say 16), score each with rule-based rewards for a correct
-final answer and the required format, and give each response an advantage equal to its reward minus the
-group mean, divided by the group's standard deviation. The policy is pushed toward above-average responses
-and away from below-average ones. The group baseline is the design choice that matters: PPO needs a learned
-value network as large as the policy to estimate "how good was this state", and GRPO replaces it with the
-other samples for the same prompt, which halves the models in memory and avoids training a critic on long,
-sparse-reward traces. Rule-based rewards are chosen over a learned reward model because a learned scorer
-can be gamed over long RL runs, while "does the answer equal 42" or "do the tests pass" cannot.
+1. **Start from a strong pre-trained model** and run RL on problems with checkable answers.
+2. **GRPO (DeepSeek-R1).** Sample a group of responses per prompt (say 16), score each with rule-based
+   rewards for a correct final answer and the required format, and give each an advantage equal to its
+   reward minus the group mean, divided by the group's standard deviation.
+3. **The policy is pushed** toward above-average responses and away from below-average ones.
 
-DeepSeek-R1-Zero applied this directly to the base model, and trace length grew over training as the
-policy found that checking its work raised reward; but its traces mixed languages and were hard to read.
-R1 therefore added a small supervised "cold start" on curated long-reasoning examples before RL, then a
-round of supervised fine-tuning on rejection-sampled traces plus general data, then a final RL stage
-covering general helpfulness as well as reasoning. Distillation then transfers much of the capability:
-fine-tuning smaller models on traces from the big reasoner gives small models that reason far better than
-their size suggests, with the gains concentrated on the distilled domains.
+- **Why the group baseline matters.** PPO needs a learned value network as large as the policy to estimate
+  "how good was this state". GRPO replaces it with the other samples for the same prompt, which halves the
+  models in memory and avoids training a critic on long, sparse-reward traces.
+- **Why rule-based rewards.** A learned scorer can be gamed over long RL runs, while "does the answer equal
+  42" or "do the tests pass" cannot.
+
+| Stage | What happened |
+|---|---|
+| R1-Zero | RL directly on the base model; trace length grew as the policy found checking its work raised reward, but traces mixed languages and were hard to read |
+| R1 cold start | a small supervised stage on curated long-reasoning examples before RL |
+| R1 later stages | supervised fine-tuning on rejection-sampled traces plus general data, then a final RL stage covering general helpfulness as well as reasoning |
+| Distillation | fine-tuning smaller models on the big reasoner's traces gives small models that reason far better than their size suggests, with gains concentrated on the distilled domains |
 
 ### What you control at inference
-A thinking budget or effort level, under vendor-specific names; whether the trace is returned, hidden or
-summarised; temperature and N for your own parallel sampling; and stopping rules such as an agreement
-threshold. Open-weight setups can also force the budget directly: cap thinking by inserting the
-end-of-thinking marker, or extend it by suppressing that marker and appending a word such as "Wait" (the
-"budget forcing" used in the s1 work), which is a crude but direct way to trace an accuracy-versus-tokens
-curve. Thinking tokens are billed as output tokens, the whole trace precedes the first answer token, and
-the trace competes with your prompt for context.
+- **A thinking budget or effort level,** under vendor-specific names.
+- **Trace visibility:** whether it is returned, hidden or summarised.
+- **Your own parallel sampling:** temperature and N, plus stopping rules such as an agreement threshold.
+- **Budget forcing (open weights).** Cap thinking by inserting the end-of-thinking marker, or extend it by
+  suppressing that marker and appending a word such as "Wait" (the s1 work). Crude but direct for tracing
+  an accuracy-versus-tokens curve.
+- **Costs to remember:** thinking tokens are billed as output tokens, the whole trace precedes the first
+  answer token, and the trace competes with your prompt for context.
 
 ### Limits
 - **Overthinking.** On easy questions long traces add cost without accuracy and can even hurt; some models
   loop in very long traces.
 - **Faithfulness.** The visible trace is not guaranteed to reflect the factors that actually drove the
   answer (Turpin et al., 2023); it is not an audit log.
-- **Domain.** Gains concentrate where answers are verifiable; on open-ended writing or on questions
+- **Domain.** Gains concentrate where answers are verifiable; on open-ended writing or questions
   bottlenecked by knowledge rather than reasoning, retrieval helps more than thinking.
-- **Variance.** Results fluctuate between runs more than single-shot answers do, so evaluate with several
-  runs and report pass@k or pass^k, not one number. pass@k is the probability that at least one of k
-  attempts succeeds, the right metric when a verifier will pick the winner; pass^k is the probability that
-  all k succeed, the right metric when a user or agent gets one shot each time and must be reliable.
+- **Variance.** Results fluctuate between runs more than single-shot answers, so evaluate with several runs
+  and report pass@k or pass^k, not one number.
 
-## Example
-Self-consistency with early stopping and an escalation signal. If a single chain is right 70% of the time
-and wrong chains scatter across different values, a majority of five is right well above 70% (with
-independent samples and a binary outcome the figure is about 84%, and scattered wrong answers make it
-better). Agreement doubles as a confidence signal: high agreement stops spending early, low agreement
-routes the question to a stronger model or a human, which is a practical version of difficulty-aware
-allocation.
+| Metric | Meaning | Right when |
+|---|---|---|
+| pass@k | probability at least one of k attempts succeeds | a verifier will pick the winner |
+| pass^k | probability all k attempts succeed | a user or agent gets one shot each time and must be reliable |
+
+## Diagram
+Difficulty-aware allocation in practice: sample cheaply, stop when paths agree or a verifier passes, and
+escalate only the questions that stay contested.
+
+```mermaid
+flowchart TD
+    Q["Question"] --> S["Sample n_min chains"]
+    S --> V{"Verifier available?"}
+    V -->|"yes"| T["Run tests on each sample"]
+    T -->|"one passes"| OUT["Return answer"]
+    T -->|"none pass"| ESC["Escalate: reasoning model or human"]
+    V -->|"no"| A{"Agreement at or above threshold?"}
+    A -->|"yes"| OUT
+    A -->|"no, budget left"| MORE["Sample one more"]
+    MORE --> A
+    A -->|"no, n_max reached"| ESC
+```
+
+## Examples
+### Self-consistency with early stopping and an escalation signal
+- **Why voting helps.** If a single chain is right 70% of the time and wrong chains scatter across
+  different values, a majority of five is right well above 70%. With independent samples and a binary
+  outcome the figure is about 84%, and scattered wrong answers make it better.
+- **Agreement doubles as confidence.** High agreement stops spending early; low agreement routes the
+  question to a stronger model or a human, a practical version of difficulty-aware allocation.
 
 ```python
 import collections, re
@@ -166,47 +182,103 @@ print(solve("A train leaves at 09:40 and arrives at 13:05. How many minutes is t
 # a 2-vs-1 split (0.67) keeps sampling, which is where the extra compute goes.
 ```
 
-Swap the vote for a verifier when one exists: run the unit tests on each sampled patch and return the first
-that passes, which turns coverage directly into accuracy.
+- **Prefer a verifier when one exists.** Run the unit tests on each sampled patch and return the first that
+  passes, which turns coverage directly into accuracy.
+
+### pass@k, pass^k and the GRPO advantage, in numbers
+Runnable, pure Python. The pass@k form is the standard unbiased estimator from n runs with c successes;
+pass^k is computed the same way for "all k succeed".
+
+```python
+from math import comb
+from statistics import mean, pstdev
+
+def pass_at_k(n, c, k):      # at least one of k succeeds
+    return 1 - comb(n - c, k) / comb(n, k)
+
+def pass_hat_k(n, c, k):     # all k succeed
+    return comb(c, k) / comb(n, k)
+
+n, c = 10, 7                 # 10 runs of one task, 7 succeeded
+for k in (1, 3, 5):
+    print(f"k={k}: pass@k={pass_at_k(n, c, k):.2f}  pass^k={pass_hat_k(n, c, k):.2f}")
+
+rewards = [1] * 4 + [0] * 12                   # group of 16 samples, 4 correct
+mu, sd = mean(rewards), pstdev(rewards)
+print([round((r - mu) / sd, 2) for r in (1, 0)])   # advantage of a correct and a wrong sample
+```
+
+| k | pass@k | pass^k | Reading |
+|---|---|---|---|
+| 1 | 0.70 | 0.70 | identical for one attempt |
+| 3 | 0.99 | 0.29 | a verifier almost always finds a winner; three clean runs in a row are unlikely |
+| 5 | 1.00 | 0.08 | great for best-of-5 with tests, poor for an agent that must succeed every time |
+
+- **GRPO advantages for that group:** a correct sample gets about +1.73 and a wrong one about −0.58, so the
+  rare correct answers are pushed up hard. Implementations differ in details such as the standard
+  deviation estimator.
+
+## Production patterns
+- **Difficulty-aware routing.** Send traffic to a fast model first and escalate on low agreement, a failed
+  verifier or a failed schema check, as in `solve` above. Monitor escalation rate, cost per solved task and
+  p95 latency per tier.
+- **Set the thinking budget per route, not globally.** Use the vendor's knob, for example `budget_tokens`
+  in Anthropic extended thinking or `reasoning_effort` on OpenAI reasoning models, and pick the knee of the
+  accuracy-versus-tokens curve measured on each route's eval set. Leave `max_tokens` room for both the
+  trace and the answer.
+- **Verifier-gated best-of-N for code.** Sample N patches in parallel, run the test suite on each, and
+  return the first that passes. Monitor pass@1 against pass@N and track flaky or missing tests, because
+  weak tests let wrong patches through.
+- **Account for thinking tokens explicitly.** Log thinking and answer tokens separately in cost dashboards,
+  and keep earlier traces out of agent history unless the next step needs them, so they do not fill the
+  context window.
+- **Evaluate with repeated runs.** Run each eval item several times and report pass@k for verifier-backed
+  flows and pass^k for one-shot user-facing flows, with means over seeds rather than a single run.
+- **Keep prompts plain for reasoning models.** Drop chain-of-thought instructions and reasoning few-shots
+  that several vendors advise against, and A/B the plain prompt against the old one on the eval set.
 
 ## Trade-offs
-- Accuracy on verifiable multi-step tasks rises with inference budget, but cost and latency rise linearly
-  with tokens; the trade flips when the task is easy, high-volume or latency-bound, where a fine-tuned small
-  model wins.
-- Parallel sampling parallelises well, so latency stays near one sample, but cost multiplies by N; sequential
-  long traces can need fewer total tokens for the same gain on some problems, but the latency is the bill.
-- Verifier-based selection extracts far more from N samples than majority vote, but needs a verifier; with
-  tests or solvers it is nearly free, with an LLM judge you have added error and cost.
-- Reasoning models give large out-of-the-box gains on maths, code and planning, but their traces are billed
-  and consume context, and on extraction or classification they add cost with little gain.
-- Distilled small reasoners deliver much of the capability cheaply, but inherit the teacher's trace style
-  and tendency to overthink, and the gains are strongest on the domains they were distilled on.
+- **Accuracy vs cost and latency.** Accuracy on verifiable multi-step tasks rises with inference budget, but
+  cost and latency rise linearly with tokens; the trade flips when the task is easy, high-volume or
+  latency-bound, where a fine-tuned small model wins.
+- **Parallel vs sequential.** Parallel sampling keeps latency near one sample but multiplies cost by N;
+  sequential long traces can need fewer total tokens for the same gain on some problems, but the latency is
+  the bill.
+- **Verifier selection vs majority vote.** A verifier extracts far more from N samples than a vote, but
+  needs a verifier: with tests or solvers it is nearly free, with an LLM judge you have added error and cost.
+- **Reasoning models vs plain tasks.** Large out-of-the-box gains on maths, code and planning, but traces
+  are billed and consume context, and on extraction or classification they add cost with little gain.
+- **Distilled small reasoners vs teacher quirks.** Much of the capability cheaply, but they inherit the
+  teacher's trace style and tendency to overthink, and gains are strongest on the distilled domains.
 
 ## Pitfalls
-- Turning reasoning on for every request; the symptom is cost per request rising several-fold and p95
-  latency exploding with no measurable quality change on the simple tasks that dominate traffic.
-- Treating the thinking trace as an explanation; the symptom is a trace that reads soundly while the answer
+- **Turning reasoning on for every request.** Symptom: cost per request rises several-fold and p95 latency
+  explodes with no measurable quality change on the simple tasks that dominate traffic.
+- **Treating the thinking trace as an explanation.** Symptom: a trace that reads soundly while the answer
   was driven by a bias the trace never mentions.
-- Majority-voting free-text answers; the symptom is near-zero agreement because no two strings match;
+- **Majority-voting free-text answers.** Symptom: near-zero agreement because no two strings match. Fix:
   normalise the answer or use a judge.
-- Evaluating with a single run; the symptom is swings of several points between runs of the "same" eval;
-  report means over several seeds or pass^k.
-- Forgetting the trace in context budgeting; the symptom is truncated answers or length errors deep in agent
+- **Evaluating with a single run.** Symptom: swings of several points between runs of the "same" eval.
+  Fix: report means over several seeds or pass^k.
+- **Forgetting the trace in context budgeting.** Symptom: truncated answers or length errors deep in agent
   loops as thinking tokens fill the window.
-- Loading a reasoning model's prompt with chain-of-thought instructions and reasoning few-shots; several
-  vendors advise against it because it can degrade results; keep the prompt plain and let the model think.
-- Assuming the budget knob is linear in quality; the symptom is paying for 4× the tokens and getting the
+- **Loading a reasoning model's prompt with chain-of-thought instructions and reasoning few-shots.**
+  Several vendors advise against it because it can degrade results; keep the prompt plain and let the model
+  think.
+- **Assuming the budget knob is linear in quality.** Symptom: paying for 4× the tokens and getting the
   accuracy of 2× because nobody measured the accuracy-versus-tokens curve on the real task.
 
 ## When to use
-Reach for test-time compute when the task has multi-step structure and a checkable, or at least judgeable,
-answer: maths, code generation and debugging, planning inside agents, complex data transformations, and
-hard classifications where a rationale changes the verdict. Measure the accuracy-versus-tokens curve on
-your own eval at several budgets and sample counts, pick the knee, and add difficulty-aware routing: a cheap
-model first, escalation on low agreement or a failed verifier. Do not use it for latency-bound chat, simple
-extraction, or questions bottlenecked by knowledge, where retrieval wins. In interviews, explain why extra
-tokens are extra compute, contrast parallel and sequential strategies and when each wins, sketch how
-R1-style RL works, and raise the faithfulness caveat unprompted.
+- **Use when** the task has multi-step structure and a checkable, or at least judgeable, answer: maths, code
+  generation and debugging, planning inside agents, complex data transformations, and hard classifications
+  where a rationale changes the verdict.
+- **Measure** the accuracy-versus-tokens curve on your own eval at several budgets and sample counts, pick
+  the knee, and add difficulty-aware routing: a cheap model first, escalation on low agreement or a failed
+  verifier.
+- **Avoid for** latency-bound chat, simple extraction, or questions bottlenecked by knowledge, where
+  retrieval wins.
+- **Interviews:** explain why extra tokens are extra compute, contrast parallel and sequential strategies and
+  when each wins, sketch how R1-style RL works, and raise the faithfulness caveat unprompted.
 
 ## Role lens
 - **Engineer:** Implements thinking budgets, sampling with early stopping and verifier gates, tracks thinking
@@ -228,6 +300,43 @@ planning, where sampling rarely finds a complete solution, and where tests are w
 to combine them: standard model first with test-based selection, escalation to the reasoning model on
 tasks that fail. Fine-tuning helps only if failures are stylistic or convention-related and there is data.
 Decide on pass@1, pass@5 and cost per solved task measured on their task set.
+
+## Interview questions
+### What is test-time compute, and what are the main ways to spend it?
+- **Definition:** extra inference computation per query to get a better answer, which works because each
+  generated token is another forward pass with a scratchpad.
+- **Ways:** sequential (longer chains, revision), parallel (N samples with a vote or verifier), search over
+  partial solutions scored by a process reward model, or a trained reasoning model with a budget knob.
+- **Which wins:** sequential revision on easy questions, parallel and search on hard ones, per Snell et al.
+
+### When would you report pass@k and when pass^k?
+- **pass@k** when a verifier picks the winner, such as tests choosing among k patches; it measures whether
+  any attempt succeeds.
+- **pass^k** when a user or agent gets one shot each time and must be reliable; it measures whether all k
+  attempts succeed.
+- **They diverge fast:** 7 successes in 10 runs gives pass@5 of 1.00 but pass^5 of about 0.08.
+
+### How does GRPO differ from PPO, and why did DeepSeek-R1 use rule-based rewards?
+- **Baseline:** PPO trains a value network as large as the policy; GRPO scores each response against the
+  mean and standard deviation of a group of samples for the same prompt, which halves the models in memory.
+- **No critic on sparse traces:** long reasoning traces with one final reward are hard for a critic to
+  learn.
+- **Rule-based rewards** such as "the answer equals 42" or "the tests pass" cannot be gamed the way a learned
+  reward model can over long RL runs.
+
+### After enabling a reasoning mode for all traffic, cost rose fivefold with no quality gain. How do you fix it?
+- **Segment the traffic:** most requests are probably simple extraction or chat, where long traces add cost
+  and latency without accuracy.
+- **Route by difficulty:** fast model first, reasoning tier only on low agreement, failed verifiers or
+  task types that showed gains on the eval.
+- **Tune the budget:** measure accuracy against thinking tokens per route and set the budget at the knee,
+  since quality is not linear in budget.
+
+### Can you use a reasoning model's thinking trace as an audit log for its decisions?
+- **No.** The visible trace is not guaranteed to reflect the factors that drove the answer (Turpin et al.,
+  2023), so it can read soundly while a bias it never mentions drove the verdict.
+- **Instead** log inputs, outputs, tool calls and verifier results, and evaluate decisions for bias
+  directly.
 
 ## Quiz
 ### Q: Why does writing out intermediate steps let a transformer solve problems it fails on when asked for the answer directly?

@@ -114,6 +114,25 @@ p_k = exp(z_k) / Σ_j exp(z_j)        (multiclass softmax; predict returns the a
   saved it, and loading untrusted pickles executes code.
 - **`skops`** exists to load models without arbitrary code execution when artifacts cross a trust boundary.
 
+## Diagram
+Honest evaluation with a pipeline: preprocessing is refit on the training folds only, every fold is scored
+against a dummy baseline, and the test set is touched once at the end.
+
+```mermaid
+flowchart TD
+    D[("Labelled tickets")] --> S["train_test_split with stratify=y"]
+    S -->|"20 percent"| TE["Test set, held back"]
+    S -->|"80 percent"| CV["StratifiedKFold or GroupKFold"]
+    CV --> TR["Training folds"]
+    CV --> VA["Validation fold"]
+    TR --> FIT["Pipeline.fit: vectorizer learns vocabulary and idf, model learns coef_"]
+    FIT --> PR["Pipeline.predict: transform only, then predict"]
+    VA --> PR
+    PR --> M["Macro-F1 per fold vs DummyClassifier"]
+    M --> FF["Final fit on all training data"]
+    FF -->|"score once"| TE
+```
+
 ## Examples
 ### Intent classifier baseline for support tickets
 An intent classifier for support tickets, the kind of baseline you build before deciding an LLM router
@@ -264,6 +283,45 @@ fold. Worse, random row splits place a customer's near-duplicate tickets on both
 partly memorizing. Use `GroupKFold` or a group-aware split keyed on customer ID, and ideally a
 time-based holdout of the most recent tickets. Report macro-F1 against a `DummyClassifier` baseline. A
 real score will be lower but will predict production.
+
+## Interview questions
+### What is the scikit-learn estimator contract, and why does it matter?
+- **Constructor holds hyperparameters only:** `LogisticRegression(C=1.0)` touches no data, so tools can
+  clone an estimator and refit it on each fold.
+- **`fit(X, y)` learns state** and returns `self`; learned attributes end with an underscore, such as
+  `coef_`, `classes_` and `vocabulary_`.
+- **Why it matters:** pipelines, cross-validators and grid searches treat any estimator uniformly, so
+  swapping logistic regression for a random forest is a one-line change.
+
+### Would you build a classical baseline before an LLM router for ticket intents? Why?
+- **Yes, first:** a TF-IDF plus logistic regression pipeline trains in seconds, runs on CPU and costs
+  nothing per request, and it is the number any LLM solution must beat on cost and accuracy.
+- **Know its ceiling:** the model is linear in word evidence, so negation and word order beyond the given
+  n-grams are out of reach; that is where embeddings or an LLM earn their cost.
+- **Decide on one test set:** if macro-F1 is close to the LLM prompt's, the classifier is the cheaper,
+  faster router.
+
+### Your classifier reports 90% accuracy on imbalanced intents. Is that good?
+- **Not by itself:** with `billing` at 40% of 4,000 tickets, a `DummyClassifier` that always predicts it
+  already scores 40% accuracy, so accuracy hides classes never predicted.
+- **Use macro-F1:** that dummy gets about 0.57 F1 on `billing` and 0 on the other 5 classes, a macro-F1
+  near 0.1, which exposes the failure.
+- **Report per-class F1** from `classification_report` against the dummy baseline, not just the mean.
+
+### How do you ship a scikit-learn model to production safely?
+- **One artifact:** persist the fitted `Pipeline`, vectorizer and model together, with `joblib.dump`, so
+  serving applies exactly the training preprocessing.
+- **Pin the version:** pickles are tied to the scikit-learn version that saved them, so record
+  `sklearn.__version__` beside the artifact and watch for `InconsistentVersionWarning` at load.
+- **Mind trust boundaries:** loading an untrusted pickle executes code; use `skops` when artifacts come
+  from elsewhere.
+
+### You route low-confidence tickets to an LLM using `predict_proba`. What can go wrong?
+- **Shifted probabilities:** `class_weight="balanced"` raises recall on rare intents but distorts
+  predicted probabilities, so a fixed threshold no longer means what you think.
+- **Calibrate first:** wrap the model in `CalibratedClassifierCV` before choosing the threshold.
+- **Monitor:** fallback rate, per-class precision above the threshold, cost per ticket, and the daily
+  mix of predicted intents against the training distribution.
 
 ## Quiz
 ### Q: Why does scikit-learn require that constructors only store hyperparameters and never touch data?

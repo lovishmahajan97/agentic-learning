@@ -119,6 +119,27 @@ most AI work goes asynchronous, with streaming in between.
   threshold, and expose that wait estimate to clients.
 - An unbounded queue turns an outage into a multi-hour backlog that keeps failing after the cause is fixed.
 
+## Diagram
+The asynchronous shape: the request only has to persist a job, a worker does the work under a lease, and
+the client learns the outcome by polling (or a webhook or push stream) instead of holding a connection.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as API
+    participant J as Job store
+    participant W as Worker
+    C->>A: POST /analyses with idempotency key
+    A->>J: insert job, status queued
+    A-->>C: 202 Accepted, Location /analyses/k1
+    W->>J: claim job with lease, status running
+    C->>A: GET /analyses/k1
+    A-->>C: status running
+    W->>J: write result, status succeeded
+    C->>A: GET /analyses/k1
+    A-->>C: status succeeded with result
+```
+
 ## Examples
 ### FastAPI job service: submit, worker, status
 Submit returns `202` and a job id, a worker drains a queue, a status endpoint reports progress. The
@@ -312,6 +333,43 @@ creation idempotent by deriving its key from the run id and the step, so even a 
 create two tickets. Workers need leases so a crash reclaims the run, the queue should be bounded with a
 clear `503` on overload, and run results need a retention window. If the customer wants progress, offer
 an SSE stream keyed by run id rather than lengthening the gateway timeout.
+
+## Interview questions
+### What does "asynchronous" mean in API design, and how is it different from async I/O?
+- **Interaction model, not runtime.** An asynchronous API accepts work, returns a job id (`202 Accepted`)
+  and delivers the result later; the caller does not hold a connection while the work runs.
+- **Async I/O is inside one process.** `asyncio` or Node's event loop lets one thread wait on many sockets,
+  which raises connection capacity but still keeps the caller waiting on each request.
+- **Why it matters:** async I/O does not survive a restart or a proxy timeout; a durable job record does.
+
+### Your fleet serves 10 requests per second of agent runs averaging 30 seconds. How many connections are open, and what changes if runs double?
+- **Little's law:** in-flight ≈ arrival rate × time in system = 10 × 30 = 300 open connections.
+- **Doubling run time doubles it to 600** with no extra useful work, and a deploy that restarts an instance
+  drops every run that instance held.
+- **The async shape breaks the link.** Submits finish in milliseconds, so connections track request rate,
+  and in-flight work lives in the job store where a restart cannot erase it.
+
+### Users see spinners that never resolve on a job-based endpoint. What do you look for?
+- **Jobs stuck in `running`.** A worker that crashed without a lease or heartbeat leaves its job claimed
+  forever; query the age of the oldest `running` job.
+- **Fix with leases.** Set `lease_until` on claim, extend it while working, and let other workers reclaim
+  expired leases, capping `attempt` before dead-lettering.
+- **Also check delivery.** A webhook that failed without retries, or a client that stopped polling, looks
+  identical from the user's side; compare job status in the store with what the client last saw.
+
+### When would you keep an endpoint synchronous even though you have a job system available?
+- **When p99 is comfortably inside every timeout.** Sub-second or few-second work gains nothing from a job
+  store, worker fleet and polling logic except latency and moving parts.
+- **When the caller needs the answer to continue.** A classifier gating the next step of a request is
+  simpler as a synchronous call with an idempotency key and a tight timeout.
+- **Hybrid when in doubt.** Offer a `wait` budget so fast cases return inline and slow ones return a job id.
+
+### How do you make a streaming chat response survive a dropped connection?
+- **Number the events.** Give each SSE event an `id:`; a reconnecting browser sends `Last-Event-ID`.
+- **Keep the generation server-side.** The server buffers the run's events by sequence so it can replay
+  everything after the last id instead of starting a new, paid generation.
+- **Measure** reconnect rate and duplicate-generation count; a rising duplicate count means resume is not
+  working.
 
 ## Quiz
 ### Q: Why does raising the load balancer timeout from 60 s to 600 s not fix an endpoint whose agent runs take up to five minutes?

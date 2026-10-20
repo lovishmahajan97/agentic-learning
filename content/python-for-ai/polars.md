@@ -86,6 +86,24 @@ Before executing, the optimizer applies rules such as:
 - **`to_pandas()`** exists for libraries that only accept pandas. Many plotting and ML libraries accept
   Polars frames directly now, but not all.
 
+## Diagram
+A lazy query is only a plan until `.collect()`; the optimizer pushes columns and filters into the scan
+before the parallel engine runs, and group order is not guaranteed unless you ask for it.
+
+```mermaid
+flowchart TD
+    S["scan_parquet returns a LazyFrame, nothing read"] --> P["filter, with_columns, group_by add plan nodes"]
+    P --> O["collect: optimizer rewrites the plan"]
+    O --> PP["Projection pushdown: read only referenced columns"]
+    O --> PR["Predicate pushdown: skip row groups using statistics"]
+    PP --> X["Multi-threaded Rust: partial aggregates per thread, then merged"]
+    PR --> X
+    X --> Q{"Does output order matter?"}
+    Q -->|"yes"| SO["sort or maintain_order=True"]
+    Q -->|"no"| R["DataFrame, or sink_parquet straight to disk"]
+    SO --> R
+```
+
 ## Examples
 ### Daily token usage from trace files, read lazily
 Daily token usage per model from a directory of trace files, read lazily.
@@ -219,6 +237,44 @@ row groups for other customers can be skipped using Parquet statistics. The aggr
 parallel. I would verify with `explain()` that the filter and projection are in the scan, measure peak
 memory, and if data is not sorted or partitioned by customer, expect less skipping and consider the
 streaming engine.
+
+## Interview questions
+### What is a Polars expression, and why is it faster than a pandas `apply` with a lambda?
+- **Definition:** an expression such as `pl.col("latency_ms").quantile(0.95)` describes a column
+  computation; contexts like `select`, `with_columns`, `filter` and `group_by(...).agg(...)` apply it.
+- **Why faster:** because it is declarative, Polars can optimize it and run independent expressions in
+  parallel in Rust, outside the GIL, while a lambda runs once per row in the interpreter.
+- **The escape hatch costs the same:** `map_elements` with a Python function drops back to interpreter
+  speed and one core.
+
+### A daily report diff fails intermittently on identical input. What is the likely cause?
+- **Group order:** a parallel `group_by` hashes rows into partitions per thread and merges partial
+  aggregates, so groups come back in a different order from run to run.
+- **Fix:** end the pipeline with an explicit `.sort(...)`, or pass `maintain_order=True` where order
+  matters, accepting some speed cost.
+- **Same idea for dedupe:** `unique(..., maintain_order=True)` keeps reruns diffable.
+
+### After migrating to Polars, `drop_nulls()` leaves bad rows and an average comes out NaN. Why?
+- **Two kinds of missing:** Polars uses an Arrow validity bitmap, so `null` is distinct from a float
+  `NaN`; `drop_nulls()` removes only nulls.
+- **Where NaN comes from:** upstream float maths or a pandas source that used `NaN` for missing values.
+- **Fix:** handle both explicitly, and settle at ingestion which one the dataset uses for missing.
+
+### How would you lay out Parquet files so Polars filters skip most of the data?
+- **Sort or partition by the common filter key,** such as date or customer, before `write_parquet`, so
+  each row group has tight min and max statistics.
+- **Then predicate pushdown can skip row groups** whose statistics rule them out; unsorted data gives wide
+  ranges and little skipping.
+- **Verify:** check `lf.explain()` for the filter inside the scan, and compare bytes read and peak memory
+  before and after the layout change.
+
+### When would you stay with pandas or pick DuckDB instead of Polars?
+- **Stay with pandas:** small notebook data, code that depends on pandas-only libraries, or a team whose
+  skills make pandas cheaper; conversion with `to_pandas()` at each boundary also costs time.
+- **Pick DuckDB:** when the team prefers SQL for the same in-process analytical work.
+- **Move to a warehouse:** when many users share data and need concurrency control, durability or
+  access management.
+- **Decide with numbers:** measure wall time and peak memory on real data before migrating.
 
 ## Quiz
 ### Q: What does projection pushdown do in a Polars lazy query over Parquet?

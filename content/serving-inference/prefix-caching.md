@@ -5,7 +5,7 @@ name: Prefix caching
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - prompting/prompt-caching
   - serving-inference/kv-cache-paging-and-eviction
@@ -22,98 +22,119 @@ sources:
 ---
 
 ## TL;DR
-Prefix caching keeps the KV cache of a prompt prefix alive after the request that computed it finishes, so
-the next request starting with the same tokens skips prefill for that part. It is exact because K and V
-at a position depend only on the tokens before it. A shared system prompt, few-shot block or chat history
-becomes a one-time cost instead of a per-request one, cutting time-to-first-token and compute, but only
-when prompts share a byte-identical beginning.
+Prefix caching keeps a prompt prefix's KV cache alive so the next request with the same leading tokens
+skips that prefill. It is exact under causal attention, and cuts TTFT and compute, but only for
+byte-identical beginnings.
 
 ## Why it exists
-Real prompts are mostly repetition. A product's system prompt is the same thousands of tokens on every
-call; a few-shot block is the same examples every time; turn *n* of a conversation begins with all of turns
-1 to *n−1*; an agent loop re-sends the whole trajectory on every tool step. Prefill is compute-bound and
-linear in prompt length, so a 3,000-token boilerplate prefix costs 3,000 tokens of matmul on every single
-request, and that work produces exactly the same K and V vectors every time. Paying for it repeatedly is
-pure waste.
-
-The naive alternative, "shorten the prompt", helps but has a floor: the instructions, schema and examples
-are there because quality needs them. The other naive alternative, "cache the response", only works for
-identical full prompts, which almost never recur beyond FAQs. What recurs is the *beginning*. Causal
-attention makes that exploitable: because position *i* attends only to positions ≤ *i*, the cache for a
-prefix is a pure function of the prefix tokens and the weights. Nothing after it can change it. So the
-cache computed for one request's first 3,000 tokens is bit-for-bit what the next request with the same
-first 3,000 tokens would compute. The only engineering needed is to keep those blocks around, find them
-again quickly, and reclaim them when memory is scarce. Paged KV memory made this cheap: blocks are
-already the unit of allocation, so sharing them between requests is a reference count, not a copy.
+- **Real prompts are mostly repetition.** A system prompt is the same thousands of tokens on every call; a
+  few-shot block is the same examples; turn *n* of a chat begins with turns 1 to *n−1*; an agent loop
+  re-sends the whole trajectory every tool step.
+- **Repeating it is pure waste.** Prefill is compute-bound and linear in prompt length, so a 3,000-token
+  boilerplate prefix costs 3,000 tokens of matmul on every request, producing exactly the same K and V
+  vectors every time.
+- **The naive fixes fall short.** "Shorten the prompt" has a floor, because instructions, schema and
+  examples are there for quality. "Cache the response" only works for identical full prompts, which almost
+  never recur beyond FAQs. What recurs is the *beginning*.
+- **Causal attention makes the beginning exploitable.** Position *i* attends only to positions ≤ *i*, so a
+  prefix's cache is a pure function of the prefix tokens and the weights. One request's first 3,000 tokens
+  give bit-for-bit what the next request with the same 3,000 tokens would compute.
+- **Paging made it cheap.** The work left is keeping blocks, finding them fast and reclaiming them under
+  pressure. Blocks are already the allocation unit, so sharing is a reference count, not a copy.
 
 ## How it works
 ### Content-addressed blocks
-With paging, a prefix is a sequence of full blocks. The engine hashes each block's content, typically the
-hash of the previous block combined with the token ids in this block, so a block's key encodes everything
-before it, not just its own 16 tokens. That matters: the same 16 tokens at a different position, or after
-a different prefix, have different K and V (positions and preceding context both feed into them), so the
-hash must be of the whole prefix up to and including the block.
+- **A prefix is a sequence of full blocks.** The engine hashes each block's content, typically the hash of
+  the previous block combined with this block's token ids.
+- **So a key encodes everything before the block,** not just its own 16 tokens. That matters because the
+  same 16 tokens at a different position, or after a different prefix, have different K and V (position
+  and preceding context both feed in).
 
 ### Lookup on arrival
-When a request is admitted, the scheduler walks its prompt block by block, computing hashes and looking
-each up in the cache table. The longest chain of hits from the start is the cached prefix; those physical
-blocks are attached to the new request's block table with their reference counts incremented, and prefill
-runs only over the remaining tokens (and, in some engines, a partial last block is always recomputed
-because only full blocks are cached). TTFT drops in proportion to the fraction of the prompt that hit.
+1. **Walk the prompt** block by block at admission, computing hashes and looking each up.
+2. **Take the longest chain of hits from the start** as the cached prefix.
+3. **Attach those physical blocks** to the new request's block table and increment their reference counts.
+4. **Prefill only the remaining tokens.** In some engines a partial last block is always recomputed,
+   because only full blocks are cached.
+- **TTFT drops** in proportion to the fraction of the prompt that hit.
 
 ### Two payoffs: compute and memory
-The obvious saving is prefill compute. For an 8B model, a 3,000-token prefix is about
-2 × 8e9 × 3,000 ≈ 48 TFLOPs, on the order of 50 ms on one GPU at illustrative peak rates, against a
-millisecond or two for a 50-token question; with a hit, TTFT is dominated by the question and the queue.
-The less obvious saving is capacity. Requests that share a prefix point their block tables at the same
-physical blocks, so 100 concurrent requests with that 3,000-token prefix (at 128 KB per token, ~390 MB
-each) hold one copy instead of 100: roughly 39 GB of pool returned to live sequences. On workloads with
-long shared prefixes, that is often worth more than the TTFT gain, because it raises the batch size.
+| Payoff | Arithmetic (8B model, illustrative peak rates) |
+|---|---|
+| **Prefill compute** | A 3,000-token prefix is 2 × 8e9 × 3,000 ≈ 48 TFLOPs, on the order of 50 ms on one GPU, against a millisecond or two for a 50-token question. With a hit, TTFT is dominated by the question and the queue |
+| **Capacity** | Requests sharing a prefix point at the same physical blocks. 100 concurrent requests with that prefix (at 128 KB per token, ~390 MB each) hold one copy instead of 100: roughly 39 GB returned to live sequences |
+
+- **On long shared prefixes the capacity win is often worth more than the TTFT gain,** because it raises
+  the batch size.
 
 ### Lifetime and eviction
-When a request finishes, its blocks' reference counts drop. Blocks with zero references are not returned
-to the free list immediately; they stay in the cache table, reclaimable in LRU order when live sequences
-need memory. Under light load, a system prompt stays resident indefinitely; under heavy load, it is
-evicted and recomputed, and the hit-rate metric tells you which regime you are in. SGLang represents
-cached prefixes as a radix tree so that requests sharing a long ancestor and diverging late reuse the
-ancestor and evict the leaves first; vLLM's hash table reaches the same behaviour with per-block LRU.
+- **Zero-reference blocks stay cached.** When a request finishes, its blocks are not returned to the free
+  list; they stay in the cache table, reclaimable in LRU order when live sequences need memory.
+- **Load decides residency.** Under light load a system prompt stays resident indefinitely; under heavy
+  load it is evicted and recomputed. The hit-rate metric tells you which regime you are in.
+- **Two data structures, same behaviour.** SGLang uses a radix tree, so requests sharing a long ancestor
+  and diverging late reuse the ancestor and evict leaves first. vLLM's hash table reaches the same
+  behaviour with per-block LRU.
 
 ### What counts as "the same prefix"
-Token identity, not semantic similarity. A single different token invalidates every block from that point
-on. The classic mistakes are placing a timestamp, request id, user name or randomly ordered retrieval
-results near the top of the prompt. The rule for prompt layout is: stable content first (system prompt,
-tool definitions, few-shot examples), then slowly changing content (conversation history, document), then
-the volatile part (the current question). Chat templates must also be stable: a template that emits the
-date, or that formats the system prompt differently depending on the presence of tools, silently breaks
-sharing. The key must also cover everything else that changes K and V for the same tokens: a different
-LoRA adapter, or different image inputs in a multimodal prompt, produce different caches, so engines mix
-those identities into the block hash, and two tenants on different adapters never share.
+- **Token identity, not semantic similarity.** A single different token invalidates every block from that
+  point on.
+- **Classic mistakes:** a timestamp, request id, user name or randomly ordered retrieval results near the
+  top of the prompt.
+- **Layout rule:**
+  1. Stable content first: system prompt, tool definitions, few-shot examples.
+  2. Slowly changing content next: conversation history, document.
+  3. The volatile part last: the current question.
+- **Chat templates must be stable too.** A template that emits the date, or formats the system prompt
+  differently when tools are present, silently breaks sharing.
+- **The key covers everything that changes K and V.** A different LoRA adapter or different image inputs
+  produce different caches, so engines mix those identities into the block hash, and two tenants on
+  different adapters never share.
 
 ### Multi-replica serving
-A cache lives on one GPU. With several replicas behind a load balancer, the second request for a tenant
-lands on a replica that has never seen its prefix unless routing is cache-aware. Options are sticky
-routing by tenant or conversation, consistent hashing on a prefix hash computed at the router, or a
-router that queries replicas' cache state. Without one of these, measured hit rate on a fleet is far
-below what a single replica shows, and the problem is routing, not the engine.
+- **A cache lives on one GPU.** Behind a plain load balancer, a tenant's second request lands on a replica
+  that has never seen its prefix.
+- **Options:** sticky routing by tenant or conversation, consistent hashing on a prefix hash computed at
+  the router, or a router that queries replicas' cache state.
+- **Without one,** fleet hit rate is far below a single replica's, and the problem is routing, not the
+  engine.
 
 ### Managed APIs
-Providers expose the same mechanism with different control surfaces: some cache automatically for prompts
-above a minimum length, others require explicit cache breakpoints in the request, and most price cached
-input tokens at a fraction of normal input price while charging a premium to write a cache entry. Cache
-lifetime is short (minutes) unless refreshed, and the rules differ per provider and change over time, so
-treat the exact numbers as something to look up, not memorize. The engineering discipline is identical:
-stable prefix first, measure hit rate, do not let volatile content leak upward.
+- **Same mechanism, different controls.** Some providers cache automatically above a minimum prompt
+  length; others need explicit cache breakpoints in the request.
+- **Pricing shape:** most price cached input tokens at a fraction of normal input and charge a premium to
+  write an entry. Lifetime is short (minutes) unless refreshed.
+- **Look the numbers up, do not memorize them,** because rules differ per provider and change over time.
+  The discipline is identical: stable prefix first, measure hit rate, keep volatile content out of the top.
 
 ### Sampling independence and correctness
-The cache stores K and V, not outputs, so it is independent of temperature, seed and sampling settings;
-reusing it never changes the distribution the model samples from. The one subtlety is numerical: with
-batched kernels, a cached prefix computed in one batch shape may differ in the last bits from a fresh
-prefill in another, which is why cached and uncached runs are not always bit-identical even at
-temperature 0.
+- **The cache stores K and V, not outputs,** so it is independent of temperature, seed and sampling
+  settings; reuse never changes the sampled distribution.
+- **One numerical subtlety:** with batched kernels, a prefix cached in one batch shape may differ in the
+  last bits from a fresh prefill in another, so cached and uncached runs are not always bit-identical even
+  at temperature 0.
 
-## Example
-Enable prefix caching in vLLM's offline engine and measure the effect of prompt layout. The two prompt
-styles contain identical content; only the position of the volatile part changes.
+## Diagram
+On arrival the engine walks the prompt's chained block hashes; the first miss ends reuse, and only the
+remaining tokens are prefilled.
+
+```mermaid
+flowchart TD
+    R["Request arrives"] --> H["Hash next full block, chained to previous"]
+    H --> L{"Hash in cache table?"}
+    L -->|"hit"| A["Attach block, ref count plus 1"]
+    A --> H
+    L -->|"miss or no full block left"| P["Prefill only remaining tokens"]
+    P --> D["Decode as usual"]
+    D --> F["Request finishes, ref count minus 1"]
+    F --> C[("Zero-ref blocks stay cached")]
+    C -->|"memory pressure"| E["LRU eviction"]
+    C -.->|"next matching request"| L
+```
+
+## Examples
+### Measure prompt layout in vLLM's offline engine
+The two prompt styles contain identical content; only the position of the volatile part changes.
 
 ```python
 import time
@@ -142,41 +163,109 @@ print(f"volatile-first: {run(bad)*1000:.0f} ms/request")
 # llm.llm_engine metrics (or the server's /metrics endpoint) expose the prefix hit rate.
 ```
 
+### Why one early token kills every later hit: a block-hash simulator
+Pure Python, no GPU. Each block's key chains the previous key, exactly as described above.
+
+```python
+import hashlib
+
+BLOCK = 16
+
+def block_hashes(token_ids):
+    """Chained hash per full block: each key covers the whole prefix up to that block."""
+    hashes, prev = [], b""
+    for i in range(0, len(token_ids) - len(token_ids) % BLOCK, BLOCK):
+        h = hashlib.sha256(prev + str(token_ids[i:i + BLOCK]).encode()).digest()
+        hashes.append(h); prev = h
+    return hashes
+
+def cached_tokens(cache, token_ids):
+    hit = 0
+    for h in block_hashes(token_ids):
+        if h not in cache: break          # longest chain of hits from the start
+        hit += BLOCK
+    cache.update(block_hashes(token_ids))
+    return hit
+
+system = list(range(1000, 4000))          # 3,000 stable "system prompt" tokens
+cache = set()
+for turn, q in enumerate([[1, 2, 3] * 10, [4, 5, 6] * 10]):
+    print("stable-first  turn", turn, cached_tokens(cache, system + q))   # 0, then 2992
+cache = set()
+for req_id in (7, 8):
+    print("id-first   request", req_id, cached_tokens(cache, [req_id] + system))  # 0, 0
+```
+
+- **2992, not 3,000:** the block holding the system prompt's last 8 tokens also holds question tokens, so
+  it differs and is recomputed.
+- **The id-first layout never hits,** because the first block differs and every chained key after it does
+  too.
+
+### Worked scenario: an agent loop on a four-replica fleet
+A 4k-token system prompt plus a growing trajectory, 10 tool steps per task, illustrative.
+
+| Setup | What prefills each step | Fleet effect |
+|---|---|---|
+| Timestamp at the top, round-robin routing | the whole prompt, every step | TTFT grows with trajectory length; hit rate near zero |
+| Timestamp moved to the end, still round-robin | everything on ~3 of 4 steps (a step returns to a replica that has its prefix only about 1 time in 4) | single-replica hit rate looks fine, fleet rate poor |
+| Stable prefix and routing by conversation id | only the newest tool result | step latency stops growing, except the decode-side cache-read term |
+
+## Production patterns
+- **Lint prompt templates for cache stability.** In CI, render each template twice with different
+  volatile inputs (time, user, request id) and assert that the token ids of the stable section are
+  identical. Monitor prefix hit rate per route after every template change.
+- **Route for locality.** Use consistent hashing on conversation or tenant id at the gateway, or a
+  cache-aware router (SGLang's router offers one), so repeat traffic hits a warm replica. Monitor fleet hit
+  rate against single-replica hit rate.
+- **Track hit rate and TTFT as a pair, with preemptions.** Enable caching (`--enable-prefix-caching` in
+  vLLM, on by default in recent versions) and chart prefix hit rate, TTFT p50/p95 and the preemption
+  counter together; a falling hit rate with rising preemptions means the pool is too small.
+- **Read cache usage from managed-API responses.** Place stable content first and add breakpoints where the
+  provider needs them (for example `cache_control` blocks on Anthropic's Messages API). Log the cached
+  token counts the response reports (`usage.cache_read_input_tokens` on Anthropic,
+  `usage.prompt_tokens_details.cached_tokens` on OpenAI) per request.
+- **Isolate untrusted tenants.** Where cross-tenant timing probes matter, give tenants separate replicas or
+  a per-tenant salt in the block hash (vLLM accepts a per-request `cache_salt`). Monitor per-tenant hit
+  rate to confirm sharing only happens within a tenant.
+
 ## Trade-offs
-- Skips prefill for shared prefixes, cutting TTFT and GPU time, but holds cached blocks in VRAM that live
-  sequences could use; the gain reverses when the pool is tight and cached blocks keep getting evicted.
-- Forces a prompt layout discipline (stable first, volatile last) that improves hit rate, but constrains
-  prompt design; it flips to irrelevant when prompts share nothing beyond a short system line.
-- Cache-aware routing raises fleet-wide hit rate, but concentrates a tenant's traffic on one replica,
-  reducing load balancing; worth it when prefixes are long and tenants are many.
-- On managed APIs, cache writes cost more than plain input and reads cost less; it pays once a prefix is
-  reused a few times within the cache lifetime, and loses money on one-off prompts.
+- **Skipped prefill vs held VRAM.** It cuts TTFT and GPU time for shared prefixes, but holds cached blocks
+  live sequences could use. The gain reverses when the pool is tight and cached blocks keep getting evicted.
+- **Layout discipline vs prompt freedom.** Stable-first, volatile-last improves hit rate but constrains
+  prompt design. It becomes irrelevant when prompts share nothing beyond a short system line.
+- **Cache-aware routing vs load balance.** It raises fleet-wide hit rate but concentrates a tenant's
+  traffic on one replica. Worth it when prefixes are long and tenants are many.
+- **Managed-API write premium vs read discount.** Cache writes cost more than plain input and reads cost
+  less. It pays once a prefix is reused a few times within the cache lifetime, and loses money on one-off
+  prompts.
 
 ## Pitfalls
-- A timestamp, request id or user name at the top of the prompt; symptom is a prefix hit rate near zero
-  despite a long identical system prompt.
-- Retrieval results inserted before the question in a non-deterministic order; symptom is hits only on
-  the system prompt and never on the document block, with TTFT still scaling with retrieved length.
-- Round-robin load balancing across replicas; symptom is hit rate on a single replica far higher than
-  the fleet's, and TTFT that depends on which replica the request landed on.
-- Measuring hit rate only on a benchmark that replays the same prompt; symptom is a dashboard showing 95%
-  hits and production showing 20%, because real conversations diverge after the system prompt.
-- Assuming the cache stores responses; symptom is confusion when the same prompt yields different text
-  at non-zero temperature, which is expected because only K and V are reused.
-- Sharing one prefix cache across mutually untrusted tenants; the symptom is invisible in metrics, but a
-  hit is measurably faster than a miss, so a tenant can probe whether someone else recently sent a given
-  prefix (a timing side channel). Where that matters, isolate tenants by replica or mix a per-tenant salt
-  into the block hash, which some engines support, at the cost of cross-tenant hits.
+- **A timestamp, request id or user name at the top of the prompt.** Symptom: hit rate near zero despite a
+  long identical system prompt.
+- **Retrieval results before the question in a non-deterministic order.** Symptom: hits only on the system
+  prompt, never on the document block, with TTFT still scaling with retrieved length.
+- **Round-robin load balancing across replicas.** Symptom: single-replica hit rate far higher than the
+  fleet's, and TTFT that depends on which replica the request landed on.
+- **Measuring hit rate on a benchmark that replays one prompt.** Symptom: 95% hits on the dashboard and 20%
+  in production, because real conversations diverge after the system prompt.
+- **Assuming the cache stores responses.** Symptom: confusion when the same prompt yields different text at
+  non-zero temperature, which is expected because only K and V are reused.
+- **One prefix cache across mutually untrusted tenants.** Invisible in metrics, but a hit is measurably
+  faster than a miss, so a tenant can probe whether someone recently sent a given prefix (a timing side
+  channel). Isolate tenants by replica or mix a per-tenant salt into the block hash, which some engines
+  support, at the cost of cross-tenant hits.
 
 ## When to use
-Turn it on whenever prompts share a long common beginning: product system prompts, few-shot blocks, tool
-schemas, multi-turn chat, and agent loops that re-send the trajectory each step; those are the majority
-of production workloads. Measure prefix hit rate and TTFT before and after, and check the preemption
-counter to confirm cached blocks are not starving live sequences. Skip it, or expect little, for
-single-shot workloads with unique prompts such as bulk document summarization. On managed APIs, restructure
-prompts so the stable part is first and add explicit cache breakpoints where the provider requires them.
-In interviews, the depth expected is to explain why causal attention makes prefix reuse exact, why a
-single changed token invalidates everything after it, and how routing affects hit rate on a fleet.
+- **Use when** prompts share a long common beginning: product system prompts, few-shot blocks, tool
+  schemas, multi-turn chat, and agent loops that re-send the trajectory each step. That is the majority of
+  production workloads.
+- **Measure** prefix hit rate and TTFT before and after, and check the preemption counter to confirm cached
+  blocks are not starving live sequences.
+- **Expect little** for single-shot workloads with unique prompts, such as bulk document summarization.
+- **On managed APIs,** put the stable part first and add explicit cache breakpoints where the provider
+  requires them.
+- **Interviews:** explain why causal attention makes reuse exact, why one changed token invalidates
+  everything after it, and how routing affects fleet hit rate.
 
 ## Role lens
 - **Engineer:** Restructures prompts so stable content comes first, enables the flag or cache
@@ -201,6 +290,38 @@ savings. Finally check the preemption and eviction metrics; if the pool is satur
 being evicted between steps, and the fix is memory or admission limits, not the cache flag. With those in
 place, each step should prefill only the newest tool result, and step latency should stop growing with
 trajectory length except for the decode-side cache-read term.
+
+## Interview questions
+### Why is prefix caching exact rather than an approximation?
+- **Causality:** K and V at position *i* depend only on tokens ≤ *i* and the weights, so a byte-identical
+  prefix yields bit-for-bit the same cache (up to batch-shape floating-point differences).
+- **It stores K and V, not outputs,** so sampling settings are untouched and reuse never changes the
+  distribution the model samples from.
+
+### How does an engine find a cached prefix, and why are block hashes chained?
+- **Lookup:** hash each full block in order and take the longest run of hits from the start; attach those
+  blocks and prefill the rest.
+- **Chaining:** each key combines the previous block's hash with this block's tokens, because the same 16
+  tokens after a different prefix have different K and V. One early difference therefore misses every
+  later block.
+
+### Hit rate is 70% on one replica but 20% fleet-wide. What do you change?
+- **Diagnosis:** routing, not the engine. Round-robin sends repeat traffic to replicas that never
+  prefilled the prefix.
+- **Fix:** consistent hashing on conversation or tenant id, or a cache-aware router; then watch for hot
+  replicas, since locality concentrates load.
+
+### When would you turn prefix caching off or isolate it?
+- **Mutually untrusted tenants:** hit latency leaks whether someone else sent a prefix, so isolate by
+  replica or salt the hash per tenant.
+- **Unique-prompt bulk jobs:** little to gain while cached blocks compete with live sequences.
+- **A saturated pool:** evictions make hits rare, and the fix is memory or admission limits.
+
+### Estimate what a 3,000-token shared system prompt saves on an 8B model at 100 concurrent requests.
+- **Compute:** about 48 TFLOPs per request, roughly 50 ms of prefill at illustrative peak rates, skipped on
+  every hit.
+- **Memory:** ~390 MB of cache per request at 128 KB per token; one shared copy instead of 100 returns about
+  39 GB to live sequences, which raises batch size.
 
 ## Quiz
 ### Q: Why can the KV cache of a prompt prefix be reused exactly by a different request?

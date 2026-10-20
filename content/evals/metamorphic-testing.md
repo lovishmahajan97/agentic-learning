@@ -5,7 +5,7 @@ name: Metamorphic testing
 kind: concept
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - evals/property-based-testing
   - evals/regression-tests
@@ -20,91 +20,116 @@ sources:
 ---
 
 ## TL;DR
-Metamorphic testing checks a system without knowing the right answer. Instead of asserting that an output
-equals an expected value, you transform the input in a way whose effect is predictable (paraphrase: same
-answer; add an irrelevant paragraph: same answer; swap two options: the choice swaps) and assert that
-relation between the two outputs. It exists because most LLM inputs have no label, and relation
-violations are cheap to generate and expose brittleness a golden set, which sees each item once in one
-form, cannot.
+Metamorphic testing checks a system without knowing the right answer: transform the input predictably
+(paraphrase, add an irrelevant document, swap options) and assert the relation between the two outputs.
+It needs no labels and exposes brittleness a golden set cannot see.
 
 ## Why it exists
-Testing needs an oracle, something that says what the correct output is. For an LLM system the oracle
-is a human label, and labels are expensive, so a golden set has a few hundred items while the input
-space is every sentence a user might type. Worse, each golden item is tested in one surface form. A
-system can pass all of them and still fail the user who asks the same question with a typo, in a
-different order, or with a longer preamble, because models are sensitive to surface form in ways that
-have nothing to do with the task. "It worked in the demo" is usually an invariance failure.
-
-Metamorphic testing, proposed in software testing before machine learning needed it, sidesteps the
-oracle. You may not know the correct answer to "what is our refund window for annual plans", but you
-know that the answer must not change when the question is rephrased, when an unrelated newsletter is
-added to the retrieved context, or when the documents are reordered. Each such *metamorphic relation*
-turns one input into a family of checks with no labelling cost, and it tests a property, stability,
-that accuracy on a fixed set cannot measure at all.
-
-The naive alternatives are weaker. "Label more data" scales linearly in cost and still tests one form
-per item. "Have an LLM judge every output" needs a rubric or a reference, so it has the same oracle
-problem, and the judge is itself sensitive to surface form. Metamorphic relations need neither labels
-nor a trustworthy judge of correctness: they need only a reliable way to say whether two outputs agree.
+- **Testing needs an oracle, and labels are expensive.** For an LLM system the oracle is a human label,
+  so a golden set has a few hundred items while the input space is every sentence a user might type.
+- **Each golden item is tested in one surface form.** A system can pass them all and still fail the user
+  who adds a typo, reorders the question or writes a longer preamble, because models are sensitive to
+  surface form in ways unrelated to the task. "It worked in the demo" is usually an invariance failure.
+- **Relations sidestep the oracle.** Metamorphic testing came from software testing before ML needed it.
+  You may not know the refund window for annual plans, but the answer must not change when the question
+  is rephrased, a newsletter is added to the context, or the documents are reordered.
+- **Each relation is a free family of checks.** One input becomes many tests with no labelling cost, and
+  they test stability, a property accuracy on a fixed set cannot measure at all.
+- **The naive alternatives are weaker.** "Label more data" scales linearly in cost and still tests one
+  form per item. "LLM-judge every output" needs a rubric or reference, the same oracle problem, and the
+  judge is itself sensitive to surface form. Relations need only a reliable way to say two outputs agree.
 
 ## How it works
 ### A relation, not an expected value
-A metamorphic test has three parts: a source input *x*, a transformation *T* that produces a follow-up
-input *T(x)*, and a relation *R* that must hold between the outputs *f(x)* and *f(T(x))*. The test
-passes if *R* holds. Nothing says whether *f(x)* was correct, which is the point: provided the relation
-genuinely holds for that input (the paraphrase really kept the meaning), a violation proves at least one
-of the two outputs is wrong without saying which, and that is still a bug report.
+| Part | Symbol | Example |
+|---|---|---|
+| Source input | *x* | "What is the refund window?" plus retrieved docs |
+| Transformation | *T*, giving *T(x)* | Reverse the document order |
+| Relation | *R* between *f(x)* and *f(T(x))* | The two answers say the same thing |
 
-CheckList (Ribeiro et al.) organised the same idea for NLP into invariance tests (INV: the output should
-not change), directional expectation tests (DIR: the output should move in a known direction), and
-minimum functionality tests (MFT), which are ordinary labelled unit tests and the complement, not a
-metamorphic relation.
+- **The test passes if *R* holds.** Nothing says whether *f(x)* was correct, which is the point.
+- **A violation is still a bug report.** Provided the relation genuinely holds for that input (the
+  paraphrase really kept the meaning), a violation proves at least one output is wrong, without saying which.
+
+CheckList (Ribeiro et al.) organised the idea for NLP:
+- **INV, invariance tests:** the output should not change.
+- **DIR, directional expectation tests:** the output should move in a known direction.
+- **MFT, minimum functionality tests:** ordinary labelled unit tests, the complement, not a metamorphic
+  relation.
 
 ### A catalogue of relations for LLM systems
 - **Invariance.** Paraphrase; casing, whitespace and punctuation; bounded typos; the language of the
-  instruction (not of the content); reordering independent list items or retrieved documents; adding an
-  irrelevant document or an irrelevant earlier turn; changing a date format. Each is chosen *because*
-  the task is defined independently of that surface feature, so sensitivity to it is a defect.
-- **Mapping.** Rename an entity consistently in the input and the same rename must appear in the
-  output; translate the question and the answer must translate back to the same content. The relation
-  is an equivalence up to a known substitution.
-- **Directional.** Add a constraint and the set of valid answers must shrink or the constraint must be
-  acknowledged; add stronger supporting evidence and the stated confidence must not fall; raise a
-  length budget and the summary must keep every fact it kept before; insert a strongly negative sentence
-  and a sentiment score must not rise.
-- **Symmetry and consistency.** In a pairwise judge, swapping A and B must swap the verdict (this is the
-  standard position-bias check); asking a question and its negation must give consistent answers;
-  asking the model to verify its own answer must not contradict that answer.
-- **Composition.** Extracting facts from a summary of a document must yield a subset of the facts
-  extracted from the document itself.
+  instruction (not of the content); reordering independent list items or retrieved documents; an added
+  irrelevant document or earlier turn; a changed date format. Each holds *because* the task is defined
+  independently of that surface feature, so sensitivity to it is a defect.
+- **Mapping.** Rename an entity consistently in the input and the same rename must appear in the output;
+  translate the question and the answer must translate back to the same content. The relation is an
+  equivalence up to a known substitution.
+- **Directional.** Add a constraint and the valid answers must shrink or the constraint be acknowledged;
+  stronger supporting evidence must not lower stated confidence; a larger length budget must keep every
+  fact kept before; a strongly negative sentence must not raise a sentiment score.
+- **Symmetry and consistency.** In a pairwise judge, swapping A and B must swap the verdict (the standard
+  position-bias check); a question and its negation must get consistent answers; asking the model to
+  verify its own answer must not contradict that answer.
+- **Composition.** Facts extracted from a summary of a document must be a subset of the facts extracted
+  from the document itself.
 
 ### Deciding whether two text outputs agree
-Outputs are text, so "equal" has to be defined per task, in increasing order of leniency: exact equality
-for structured fields (a label, a number, a JSON field, a tool name), normalised comparison for short
-answers, embedding similarity above a threshold, or an LLM judge asked the narrow question "do these two
-answers say the same thing" (a far easier and more reliable judgment than "is this answer correct").
+Outputs are text, so "equal" is defined per task, in increasing order of leniency:
+1. **Exact equality** for structured fields: a label, a number, a JSON field, a tool name.
+2. **Normalised comparison** for short answers.
+3. **Embedding similarity** above a threshold.
+4. **A narrow LLM judge:** "do these two answers say the same thing", a far easier and more reliable
+   judgment than "is this answer correct".
+
 Choose the strictest definition the task allows, because a lenient comparator hides real violations.
 
 ### The noise floor
-Models are nondeterministic, so first run the identity transformation: the same input twice. Its
-violation rate is the noise floor. A relation reveals a real sensitivity only when its violation rate
-sits clearly above that floor; a 4% paraphrase violation rate against a 3% identity rate is noise, a
-25% document-order violation rate against 3% is a finding. "Clearly above" is a statistical claim, so
-size it: on 200 questions, 3% versus 6% is 6 violations against 12, a gap a two-proportion test does not
-distinguish from chance (z ≈ 1.5), while 3% versus 25% is unmistakable. Because both relations run on
-the same questions, the sharper check is paired: count the items that violate under the transform but
-agreed under identity. Reporting per relation and per slice shows *which* sensitivity you have, which is
-more actionable than one robustness number.
+- **Run the identity transformation first:** the same input twice. Models are nondeterministic, so its
+  violation rate is the noise floor.
+- **Only the excess is a finding.** 4% paraphrase violations against a 3% identity rate is noise; 25%
+  document-order violations against 3% is a finding.
+- **"Clearly above" is a statistical claim, so size it.**
+
+| On 200 questions | Counts | Two-proportion test |
+|---|---|---|
+| 3% vs 6% | 6 violations vs 12 | z ≈ 1.5, not distinguishable from chance |
+| 3% vs 25% | 6 vs 50 | Unmistakable |
+
+- **Pair it.** Both relations run on the same questions, so the sharper check counts items that violate
+  under the transform but agreed under identity.
+- **Report per relation and per slice.** It shows *which* sensitivity you have, more actionable than one
+  robustness number.
 
 ### From violations to action
-A violated pair goes to a human or a correctness judge to decide which side is wrong, and the losing
-side becomes a labelled regression case. Over time the relation suite also doubles as the generator for
-adversarial evaluation: the transforms that violate most often are the ones worth hardening against.
+1. A violated pair goes to a human or a correctness judge to decide which side is wrong.
+2. The losing side becomes a labelled regression case.
+3. Over time the relation suite doubles as the generator for adversarial evaluation: the transforms that
+   violate most often are the ones worth hardening against.
 
-## Example
-Five relations against a RAG question-answering function. `same_meaning` is a narrow agreement
-comparator (normalised equality for short answers, a "do these say the same thing" judge otherwise).
-The identity relation measures the noise floor; the others are compared against it.
+## Diagram
+One source input fans out into transformed variants; each pair of outputs is compared, and only rates
+above the identity floor go to triage.
+
+```mermaid
+flowchart TD
+    X["Source input: question plus docs"] --> F1["System output f of x"]
+    X --> T["Transform T: identity, paraphrase, noise doc, reorder"]
+    T --> F2["System output f of T of x"]
+    F1 --> C["Agreement comparator, strictest allowed"]
+    F2 --> C
+    C --> VR["Violation rate per relation and slice"]
+    VR --> FL{"Clearly above identity floor?"}
+    FL -->|"no"| N["Noise, no action"]
+    FL -->|"yes"| TR["Human or correctness judge picks wrong side"]
+    TR --> RG["Labelled regression case"]
+```
+
+## Examples
+### Five relations against a RAG question-answering function
+`same_meaning` is a narrow agreement comparator (normalised equality for short answers, a "do these say
+the same thing" judge otherwise). The identity relation measures the noise floor; the others are
+compared against it.
 
 ```python
 import re
@@ -143,50 +168,93 @@ def violation_rates(cases: list[tuple[str, list[str]]]) -> dict[str, float]:
 # A high doc_order rate in RAG usually points at position effects in the context window.
 ```
 
-An illustrative run on 300 support questions (made-up numbers, chosen to show how to read the table):
-identity 0.03, whitespace 0.03, paraphrase 0.06, noise_doc 0.11, doc_order 0.21. Whitespace is at the
-floor, so the system is not reacting to formatting. Paraphrase is above it but only modestly; pull the
-18 violating pairs before concluding anything, because a few may be paraphrases that changed the
-question. Noise_doc at roughly four times the floor says one irrelevant newsletter changes about one
-answer in ten, which is weak grounding: the model is using whatever is in the context. Doc_order at
-seven times the floor is the headline: the answer depends on which document comes first, so either the
-retriever's top hit dominates or the model under-reads the middle of the context. Each of those
-diagnoses suggests a different fix (reranking, context ordering, a "cite the passage" instruction), and
-none of them needed a single label.
+### Reading an illustrative run on 300 support questions
+Made-up numbers, chosen to show how to read the table.
+
+| Relation | Violation rate | vs identity floor | Reading |
+|---|---|---|---|
+| identity | 0.03 | floor | Run-to-run noise |
+| whitespace | 0.03 | at floor | Not reacting to formatting |
+| paraphrase | 0.06 | modestly above | Pull the 18 violating pairs first: a few may be paraphrases that changed the question |
+| noise_doc | 0.11 | roughly four times | One irrelevant newsletter changes about one answer in ten: weak grounding, the model uses whatever is in context |
+| doc_order | 0.21 | seven times | The headline: the answer depends on which document comes first |
+
+- **Doc_order has two candidate causes:** the retriever's top hit dominates, or the model under-reads
+  the middle of the context.
+- **Each diagnosis suggests a different fix:** reranking, context ordering, or a "cite the passage"
+  instruction. None of them needed a single label.
+
+### Symmetry relation for a pairwise judge
+Pure Python, runnable with toy judges. Swapping A and B must swap the verdict; a position-biased judge
+violates it every time.
+
+```python
+SWAP = {"A": "B", "B": "A", "tie": "tie"}
+
+def swap_violation_rate(judge, pairs) -> float:
+    bad = 0
+    for q, a, b in pairs:
+        bad += judge(q, b, a) != SWAP[judge(q, a, b)]
+    return bad / len(pairs)
+
+first_wins = lambda q, a, b: "A"                                   # pure position bias
+longer_wins = lambda q, a, b: "A" if len(a) > len(b) else "B" if len(b) > len(a) else "tie"
+
+pairs = [("q1", "short", "a longer answer"), ("q2", "same", "same"), ("q3", "detailed reply", "ok")]
+print(swap_violation_rate(first_wins, pairs))    # 1.0: verdict ignores content
+print(swap_violation_rate(longer_wins, pairs))   # 0.0: symmetric (verbosity bias is a separate test)
+```
+
+## Production patterns
+- **Relation table on every prompt change.** Run identity plus a fixed set of relations on a few hundred
+  unlabelled production questions in CI and fail when a relation's paired excess over identity exceeds
+  its threshold. Monitor the per-relation rate per version.
+- **Context perturbations for RAG.** Always include "append one distractor document" and "reverse
+  document order" relations, rerun them when the retriever, reranker or chunker changes. Monitor
+  noise_doc and doc_order rates per index version.
+- **Order-swapped pairwise judging.** Run every pairwise judgment in both orders and count a verdict that
+  does not swap as a tie. Monitor the swap-violation rate as the judge's position-bias metric.
+- **Compute the base output once.** Cache *f(x)* per question and reuse it across relations, paying one
+  extra call per relation plus one for identity. Monitor total calls per run against the budget.
+- **Triage queue into regressions.** Send violated pairs to a reviewer or correctness judge; promote the
+  wrong side to a labelled regression case. Monitor the queue size and promotion rate.
+- **Customer-sourced transforms.** Build paraphrase and template transforms from real phrasing variants
+  in logs, so measured robustness matches what users do. Monitor violation rate per customer slice.
 
 ## Trade-offs
-- Relations need no labels, so coverage scales with compute instead of annotation budget, but a
-  violation tells you something is wrong without telling you which output or how; triage is still human.
-- Invariance relations are easy to write and interpret, but some sensitivity is legitimate (a casing
-  change inside a code snippet changes meaning), so each relation must be scoped to where it truly holds.
-- A strict comparator catches more violations but flags harmless rewording; a lenient one misses real
-  drift; the right choice flips with how structured the output is.
-- Automated transforms are cheap but can produce invalid follow-ups (a paraphrase that changes the
-  question); using a model to transform adds cost and its own errors, so validate transforms on a sample.
-- Measuring the noise floor adds one more relation's worth of model calls to every run, yet without it
-  any violation rate is uninterpretable, so it can be skipped only when outputs are fully deterministic.
+- **No labels vs no diagnosis.** Coverage scales with compute instead of annotation budget, but a
+  violation says something is wrong without saying which output or how; triage is still human.
+- **Easy invariances vs legitimate sensitivity.** Easy to write and interpret, but a casing change inside
+  a code snippet changes meaning, so each relation must be scoped to where it truly holds.
+- **Strict vs lenient comparator.** Strict catches more violations but flags harmless rewording; lenient
+  misses real drift; the right choice flips with how structured the output is.
+- **Automated vs model transforms.** Automated transforms are cheap but can produce invalid follow-ups (a
+  paraphrase that changes the question); model transforms add cost and errors, so validate on a sample.
+- **Noise-floor cost vs interpretability.** One more relation's worth of calls every run, yet without it
+  any rate is uninterpretable; skip it only when outputs are fully deterministic.
 
 ## Pitfalls
-- Skipping the identity baseline; the symptom is a "12% paraphrase sensitivity" that turns out to be
-  the model's own run-to-run variance.
-- Using a correctness judge as the comparator; the symptom is violations that depend on the judge's
-  opinion of the answer rather than on whether the two answers agree.
-- Treating every violation as a bug in the transformed output; the symptom is "fixes" that make the
-  original, actually-wrong answer the standard.
-- Applying an invariance relation where the feature is meaningful; the symptom is a flood of violations
-  on code, IDs or case-sensitive names that nobody acts on.
-- Writing relations only for the question and never for the context; the symptom is a RAG system that
-  passes paraphrase tests and still answers differently when one extra document is retrieved.
+- **Skipping the identity baseline.** Symptom: a "12% paraphrase sensitivity" that is the model's own
+  run-to-run variance. Fix: always report against identity.
+- **A correctness judge as comparator.** Symptom: violations that depend on the judge's opinion of the
+  answer, not on whether the two answers agree. Fix: ask only "same meaning?".
+- **Blaming the transformed output.** Symptom: "fixes" that make the original, actually-wrong answer the
+  standard. Fix: triage which side is wrong.
+- **Invariance where the feature matters.** Symptom: a flood of violations on code, IDs or case-sensitive
+  names that nobody acts on. Fix: scope the relation.
+- **Relations only on the question.** Symptom: a RAG system that passes paraphrase tests and still
+  answers differently when one extra document is retrieved. Fix: perturb the context too.
 
 ## When to use
-Reach for metamorphic relations whenever you have many unlabelled inputs and a system whose stability
-matters: RAG answers, classifiers, extractors, pairwise judges, agents reading tool output. They are the
-cheapest way to measure robustness to surface form and to find position and context-length effects. Do
-not use them as the only eval: they say nothing about correctness, so pair them with a golden set.
-Measure violation rate per relation against the identity floor, track it per version like any other
-metric, and feed violated pairs into the regression suite. In day-to-day work the relation suite is what
-you run when a prompt change "feels" less stable. In interviews, the expected depth is to explain the
-oracle problem, give three relations for a concrete system, and explain the noise-floor measurement.
+- **Use when:** you have many unlabelled inputs and stability matters: RAG answers, classifiers,
+  extractors, pairwise judges, agents reading tool output. It is the cheapest way to measure robustness
+  to surface form and to find position and context-length effects.
+- **Avoid when:** it would be the only eval. It says nothing about correctness, so pair it with a golden set.
+- **Measure:** violation rate per relation against the identity floor, tracked per version; feed violated
+  pairs into the regression suite.
+- **Day to day:** the relation suite is what you run when a prompt change "feels" less stable.
+- **Interviews:** explain the oracle problem, give three relations for a concrete system, and explain the
+  noise-floor measurement.
 
 ## Role lens
 - **Engineer:** Writes the transform functions and the agreement comparator, runs the relation table on
@@ -208,6 +276,40 @@ relation's violation rate against it, per slice. A relation well above the floor
 document-order violations point at position effects, noise-document violations at weak grounding.
 Violated pairs are then triaged by a human to decide which side is wrong and become labelled regression
 cases. Correctness still needs a golden set; this measures stability, which the golden set cannot.
+
+## Interview questions
+### What is the oracle problem, and how does metamorphic testing get around it?
+- **Oracle problem:** testing needs something that says what the correct output is; for LLMs that is a
+  human label, which is expensive and covers each item in one surface form only.
+- **Workaround:** assert a relation between outputs of related inputs, such as "a paraphrase gives the
+  same answer", which needs no expected value.
+- **Limit:** it measures stability, not correctness, so it complements a golden set.
+
+### Give three metamorphic relations for a contract-clause extractor.
+- **Invariance:** reformatting whitespace or reordering independent sections must not change the
+  extracted clauses.
+- **Mapping:** renaming a party consistently in the contract must rename it in the extraction.
+- **Composition:** clauses extracted from a summary must be a subset of those extracted from the full
+  contract.
+
+### Paraphrase violations are 8%. Is that bad?
+- **Compare with the identity floor first:** if the same input twice disagrees 7% of the time, 8% is noise.
+- **Size the gap:** on 200 questions even 3% versus 6% gives z ≈ 1.5, not significant; use the paired
+  count of items that violate only under the transform.
+- **Then read the pairs:** some violations are paraphrases that changed the question, a transform bug.
+
+### Why use a "same meaning" comparator rather than a correctness judge?
+- **It is an easier question:** comparing two answers needs no reference and is more reliable than
+  deciding which is right.
+- **It keeps the test clean:** a correctness judge mixes its opinion of the answer into the violation
+  rate.
+- **Strictness matters:** use exact equality for structured fields and the judge only for prose.
+
+### Your RAG system shows doc_order violations seven times the noise floor. What do you do?
+- **Diagnose:** either the top retrieved document dominates or the model under-reads the middle of the
+  context.
+- **Try targeted fixes:** reranking, deliberate context ordering, or an instruction to cite the passage.
+- **Verify:** rerun the relation table and promote triaged violated pairs into the regression suite.
 
 ## Quiz
 ### Q: What does a metamorphic test require that a golden-set test does not, and what does it do without?

@@ -130,6 +130,23 @@ domain events (event storming), then look for seams. Four signals mark one:
   a saga with compensation, not one transaction.
 - **Evals are per context,** written in that context's language by that context's experts.
 
+## Diagram
+A context map for the support agent in the examples. The agent only speaks its own published language;
+each upstream model is translated in an adapter, and contexts change each other only through events.
+
+```mermaid
+flowchart LR
+    AG["Support agent"] -->|"lookup_customer tool"| SC["Support context: SupportCustomer"]
+    SC --> ACL1["Billing adapter: anticorruption layer"]
+    ACL1 -->|"plan, past_due_since"| BC["Billing context: BillingAccount"]
+    SC --> ACL2["CRM adapter: anticorruption layer"]
+    ACL2 --> CRM["Sales context: account and stage"]
+    BC --> DB1[("Billing schema")]
+    SC --> DB2[("Support schema")]
+    BC -.->|"domain event InvoicePaid"| SC
+    ACL1 -.->|"unmapped plan raises an alert"| AL["On-call owner"]
+```
+
 ## Examples
 ### Two contexts, one anticorruption layer, one published tool
 Each context has its own Customer; the support agent sees only its own concept. The translation from
@@ -321,6 +338,52 @@ prompt would make the model re-derive the business rules on every request, from 
 only partly understands, with no tests and no owner; a mapping change would be a prompt edit with
 unpredictable effects. In adapters the rules are code, owned by the team that owns each boundary,
 unit-tested, and versioned independently of the model.
+
+## Interview questions
+### What is a bounded context, and why not agree on one canonical customer schema?
+
+- **Definition:** the boundary inside which one model and its language are consistent; it owns its
+  data, invariants and storage, and nothing outside writes to that storage directly.
+- **Why not canonical:** meaning is local, so a single schema becomes a lowest common denominator with
+  dozens of optional fields, owned by a committee that becomes the bottleneck for every change.
+
+### How would you find the context boundaries in a business you do not know yet?
+
+- **Event storming:** map the process with domain experts as a timeline of domain events, then look for
+  seams.
+- **Seam signals:** a term changes meaning, a different person decides changes, the rate of change
+  differs; rules that must hold together at the same instant belong inside one context.
+- **Wrong seam test:** if two candidate contexts must constantly ask each other questions to decide
+  anything, move the boundary.
+
+### How big should an aggregate be, and what crosses aggregate boundaries?
+
+- **As small as the true invariants allow,** because the aggregate is the unit of locking; an `Order`
+  with its lines and a credit-limit invariant is one aggregate, the customer is another, referenced by id.
+- **One aggregate per transaction:** other aggregates and other contexts catch up through domain events
+  such as "OrderPlaced", published reliably with a transactional outbox.
+
+### After billing launched a new plan, the agent started treating some customers as free tier. What went wrong?
+
+- **A catch-all default in the translation map:** `.get(plan, "free")` turned an unknown upstream value
+  into a wrong meaning with no error anywhere.
+- **Fix:** an explicit map that raises on unmapped values, contract tests against the upstream sandbox in
+  CI, and an alert on unmapped-value errors so the change surfaces on day one.
+
+### When would you conform to an upstream model instead of building an anticorruption layer?
+
+- **Conform** when the upstream is tiny and stable or you have no leverage, as with many vendor APIs,
+  because translation code changes whenever either side changes.
+- **Build the ACL** when the foreign model would leak into your prompts, UI and tests, or when its
+  churn would otherwise become your churn.
+- **Skip DDD's ceremony** for a small product with one team and one language; one context is correct.
+
+### An agent step must update records in two contexts. How do you make it safe?
+
+- **Not one transaction:** spanning contexts couples their storage and uptime, and leads to distributed
+  locks, timeouts under load and partial updates.
+- **Use a saga with compensation:** each context commits its own change and emits an event; if a later
+  step fails, a compensating action undoes the earlier one, and the agent sees eventual consistency.
 
 ## Quiz
 ### Q: Billing, Support and Sales each define "customer" differently. What does domain-driven design recommend?

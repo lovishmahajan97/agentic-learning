@@ -124,6 +124,25 @@ Ranking data beyond postings:
   to match this.
 - **IVF is an inverted index** whose "terms" are cluster ids, which is why the name carries over.
 
+## Diagram
+Read the top row as the write path (documents become immutable segments on refresh, merges drop deletes)
+and the bottom row as the read path (the same analyzer, a dictionary lookup, then pruned traversal of
+sorted posting lists across every segment).
+
+```mermaid
+flowchart LR
+    D["New or updated document"] --> A1["Analyzer"]
+    A1 --> B["In-memory buffer"]
+    B -->|"refresh interval"| S[("Immutable segments, live-docs bitset")]
+    S -->|"background merge drops deletes"| S
+    Q["Query"] --> A2["Same analyzer"]
+    A2 --> DI["Term dictionary, FST in memory"]
+    DI --> PL["Sorted, compressed posting lists per segment"]
+    S --> PL
+    PL -->|"skips, WAND or MaxScore"| H["Top k heap per segment"]
+    H --> R["Merged top k"]
+```
+
 ## Examples
 ### A tiny index by hand
 Build postings with positions, intersect sorted lists with two cursors, and answer a phrase query from
@@ -271,6 +290,37 @@ bounds let WAND or MaxScore skip whole blocks of the "case" list whose best poss
 cannot lift a document into the current top ten. Compression keeps the common list cache-friendly, and
 the term dictionary lookups are two trie traversals. If the query were OR rather than AND, the same upper
 bounds still prune most of the common list for a top-10 result.
+
+## Interview questions
+### What is an inverted index and why is it faster than scanning documents?
+- **Definition:** a map from each analyzed term to a posting list of the documents containing it, sorted
+  by document id, with term frequency and optionally positions per entry.
+- **Why it is fast:** a five-term query reads five lists, so cost tracks how many documents contain the
+  query terms rather than how many documents exist; a forward-index scan is O(total tokens) per query.
+
+### Integration tests that index a document and immediately search for it are flaky. Why, and what is the fix?
+- **Cause:** new documents sit in an in-memory buffer and become searchable only when a refresh flushes
+  them into a segment, after the refresh interval (`1s` in the snippet above).
+- **Fix:** index test documents with `refresh=wait_for` or call `_refresh`, instead of adding sleeps that
+  pass on a fast laptop and fail on a busy CI runner.
+
+### How does a top-10 query avoid reading a posting list of four million entries?
+- **Per-term upper bounds:** with BM25 each term's maximum contribution is known, so once the top-10 heap
+  threshold θ exceeds the common term's bound, documents containing only that term cannot qualify.
+- **MaxScore or WAND** then iterate the rare list and probe the common list through skip data, and
+  block-max impacts skip low-scoring blocks; the result is exact, not approximate.
+- **Exact total hit counts defeat this,** because every match must be counted.
+
+### When would you turn off positions on a field, and what do you lose?
+- **Turn them off** on fields only ever filtered or scored as a bag of words, because positions
+  substantially enlarge the index (`"index_options": "freqs"` keeps BM25 frequencies).
+- **You lose** phrase and proximity queries on that field; changing it later needs a full re-index.
+
+### Index size keeps growing on a high-churn index even though the document count is flat. What is happening?
+- **Deletes are only marked:** updates are a delete plus re-add, and deleted postings stay in segments
+  until a background merge rewrites them, also skewing document frequency meanwhile.
+- **Check** the deleted-docs count in `_cat/indices`; if merges lag, run a force merge with
+  `only_expunge_deletes` in a quiet window and watch p99 latency.
 
 ## Quiz
 ### Q: Why are posting lists kept sorted by document id?

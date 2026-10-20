@@ -5,7 +5,7 @@ name: Prompt versioning
 kind: practice
 difficulty: core
 est_minutes: 12
-status: reviewed
+status: crisp
 related:
   - prompting/prompt-templates
   - prompting/prompt-caching
@@ -22,99 +22,122 @@ sources:
 ---
 
 ## TL;DR
-A prompt is behaviour-defining code that happens to be prose, so it needs what code already has:
-immutable versions, an identifier recorded on every call, review, an eval before promotion and a
-one-step rollback. Without that, a quality regression cannot be tied to a change, a user complaint
-cannot be reproduced, and "the prompt in production" is whatever someone last pasted from a playground.
+A prompt is behaviour-defining code written as prose, so it needs immutable versions, an id on every
+call, review, an eval before promotion and one-step rollback. Without that, regressions cannot be dated
+and complaints cannot be reproduced.
 
 ## Why it exists
-The behaviour of an LLM feature is the product of model × prompt × parameters × tools × retrieval. Of
-those, the prompt changes most often and is handled with the least discipline: it is a string literal
-somewhere in the codebase, edited by a product manager in a vendor console, hot-patched on a Friday to
-fix one complaint. Three failures follow directly.
-
-First, irreproducibility. A user reports a wrong answer on Tuesday; the prompt was edited on Wednesday;
-nobody can say which wording produced the complaint, so nobody can test the fix. Second, silent
-regression. A sentence added "to handle one edge case" shifts behaviour on a few percent of unrelated
-traffic, and because no eval ran before the change, the shift is discovered by customers. Third, coupled
-rollout. If prompts live only in code, a bad prompt needs a code rollback; if they live only in a
-database, the code may expect a template variable the new prompt dropped, and the failure appears at
-runtime rather than at review.
-
-The naive answer, "it is in git, so it is versioned", is half right. Git versions the file. It does
-not record which commit produced which response, does not capture the variables rendered at runtime,
-and hides that the model id and the tool descriptions changed in the same pull request. Sculley et al.
-called this configuration debt: in mature ML systems the configuration is large, rarely reviewed
-with the rigour applied to code, and a common source of costly mistakes. Prompt versioning is the practice of turning the *effective prompt* into an
-identifiable, testable, revertible artifact.
+- **The prompt changes most and is guarded least.** Behaviour is model × prompt × parameters × tools ×
+  retrieval. The prompt is often a string literal edited by a product manager in a vendor console, or
+  hot-patched on a Friday to fix one complaint. "The prompt in production" becomes whatever someone last
+  pasted from a playground.
+- **Irreproducibility.** A user reports a wrong answer on Tuesday; the prompt was edited on Wednesday;
+  nobody can say which wording produced the complaint, so nobody can test the fix.
+- **Silent regression and coupled rollout.** A sentence added "to handle one edge case" shifts behaviour
+  on a few percent of unrelated traffic, found by customers because no eval ran. Prompts only in code
+  need a code rollback; prompts only in a database can drop a variable the code expects, failing at
+  runtime rather than at review.
+- **"It is in git" is half right.** Git versions the file. It does not record which commit produced which
+  response, does not capture runtime variables, and hides that the model id and tool descriptions changed
+  in the same pull request.
+- **This is configuration debt.** Sculley et al. note that mature ML configuration is large, rarely
+  reviewed with code's rigour, and a common source of costly mistakes. Versioning turns the *effective
+  prompt* into an identifiable, testable, revertible artifact.
 
 ## How it works
-### What the versioned unit is
-The thing that determines behaviour is not the system prompt alone. It is the bundle: template text
-(system prompt, user-turn scaffolding, few-shot examples), tool names, descriptions and schemas, the
-output schema, the model id, sampling and output parameters, and the rendering code that fills
-variables. Version the bundle, *because* a change to any part changes behaviour, and a bundle that
-records only the template will report "no change" after someone edits a tool description.
+### The versioned unit is the bundle
+Version all of it, *because* a change to any part changes behaviour:
+- template text: system prompt, user-turn scaffolding, few-shot examples;
+- tool names, descriptions and schemas, and the output schema;
+- the model id, sampling and output parameters;
+- the rendering code that fills variables.
+
+A bundle that records only the template reports "no change" after someone edits a tool description.
 
 ### Two identities: hash and label
-A content hash (SHA-256 of a canonical serialization of the bundle) is exact, automatic and changes
-when any byte changes; it is the identity you trust. A human label (`v14`, or a semver-style
-`2.1.0` where a major bump means "behaviour changed, re-evaluate") is the identity you talk about.
-Use both: the hash goes in every trace, the label goes in the changelog and the alias file.
+| Identity | Example | Property | Where it goes |
+|---|---|---|---|
+| Content hash | SHA-256 of a canonical serialization of the bundle | exact, automatic, changes when any byte changes; the one you trust | every trace |
+| Human label | `v14`, or semver-style `2.1.0` (major bump = behaviour changed, re-evaluate) | the one you talk about | changelog and alias file |
+
+Use both.
 
 ### Immutable versions, mutable aliases
-Versions never change once created. Deployment is a pointer: an alias such as `production` or
-`canary` resolves to a version, and release means moving the pointer. This mirrors container tags and
-exists *because* it decouples prompt rollout from code deploys and makes rollback a one-line change
-with no rebuild. The cost is that code and prompt now evolve separately, so each version declares its
-variable contract (which placeholders it expects) and the loader checks that contract at startup rather
-than discovering a missing variable in a 3 a.m. request.
+1. **Versions never change once created.**
+2. **Deployment is a pointer.** An alias such as `production` or `canary` resolves to a version; release
+   means moving the pointer. This mirrors container tags.
+3. **Why:** it decouples prompt rollout from code deploys and makes rollback a one-line change with no
+   rebuild.
+4. **The cost:** code and prompt evolve separately. So each version declares its variable contract (the
+   placeholders it expects) and the loader checks it at startup, rather than discovering a missing
+   variable in a 3 a.m. request.
 
 ### Where versions live
-Three workable layouts. In the repository as files (`prompts/<name>/v14.md` with a metadata header):
-reviewed in pull requests, promoted by CI, tied to a commit; best when engineers own prompts. In a
-registry (Langfuse, LangSmith, PromptLayer or a table you own): fetched by alias at runtime, editable
-through a UI by non-engineers, hot-swappable without a deploy; best when domain experts iterate daily.
-Or both: files are the source of truth and CI pushes them to the registry, which gives review *and*
-runtime decoupling.
+| Layout | How | Best when |
+|---|---|---|
+| Repository files | `prompts/<name>/v14.md` with a metadata header; reviewed in pull requests, promoted by CI, tied to a commit | engineers own prompts |
+| Registry | Langfuse, LangSmith, PromptLayer or a table you own; fetched by alias at runtime, editable in a UI, hot-swappable without a deploy | domain experts iterate daily |
+| Both | files are the source of truth; CI pushes them to the registry | you want review *and* runtime decoupling |
 
 ### Record the version on every call
-This is the step that makes everything else pay off. Each trace of an LLM call carries the prompt
-name, version label, content hash, model id and the rendered variables (or their hash when they are
-sensitive). With that, "show every response from v13 next to v14 on the same inputs" and "replay the
-exact prompt behind this complaint" become queries instead of archaeology.
+- **This step makes the rest pay off.** Each trace carries prompt name, version label, content hash,
+  model id and the rendered variables (or their hash when sensitive).
+- **Then questions become queries.** "Show every response from v13 next to v14 on the same inputs" and
+  "replay the exact prompt behind this complaint" stop being archaeology.
 
 ### Promotion through evals
-A new version is a candidate until it has run against the golden dataset and the regression suite,
-been compared case by case against the current production version, and survived a canary slice of
-live traffic. The eval exists *because* prompt changes have non-local effects that reading the diff
-cannot predict; the canary exists because the golden set never covers the real distribution.
+A new version is a candidate until it has:
+1. run against the golden dataset and the regression suite;
+2. been compared case by case against the current production version;
+3. survived a canary slice of live traffic.
+
+The eval exists *because* prompt changes have non-local effects that reading the diff cannot predict; the
+canary exists because the golden set never covers the real distribution.
 
 ### Two interactions worth knowing
-A prompt release changes bytes near the front of the request, so every request on the new version
-misses the prompt cache until the new prefix has been written once: expect a short cost and
-time-to-first-token blip, larger at high concurrency where many requests miss before the first write
-lands. A gradual alias move keeps most traffic on the still-warm old prefix while the new one warms.
-And a model upgrade is a prompt version too, because prompts are tuned to a model; pin the model in
-the bundle and re-evaluate when it changes. Pin a dated snapshot id rather than a floating alias
-(many providers offer both), *because* a floating alias can move to a new model underneath an
-unchanged bundle hash, which is exactly the silent change versioning is meant to rule out.
+- **Prompt cache.** A release changes bytes near the front of the request, so every request on the new
+  version misses the cache until the new prefix is written once. Expect a short cost and
+  time-to-first-token blip, larger at high concurrency where many requests miss before the first write
+  lands. A gradual alias move keeps most traffic on the still-warm old prefix while the new one warms.
+- **Model upgrades are prompt versions.** Prompts are tuned to a model, so pin it in the bundle and
+  re-evaluate when it changes. Pin a dated snapshot id, not a floating alias (many providers offer both),
+  *because* a floating alias can move underneath an unchanged bundle hash: exactly the silent change
+  versioning is meant to rule out.
 
 ### Replay reproduces the input, not the output
-Recording the version lets you rebuild the exact request, but sampling makes the response
-non-deterministic, and even at temperature 0 providers do not promise bit-identical output across
-runs. So "replay the complaint" means re-sending the identical request several times and looking at
-the distribution of answers: if most samples are wrong, the version is at fault; if one in ten is
-wrong, the problem is variance, and the fix is a tighter prompt, an output schema or a check rather
-than a revert. Version comparisons work the same way: score each version on several samples per case,
-or a one-sample difference between v13 and v14 may be noise.
+- **Sampling is non-deterministic.** Even at temperature 0, providers do not promise bit-identical output
+  across runs.
+- **So replay means a distribution.** Re-send the identical request several times. Most samples wrong:
+  the version is at fault. One in ten wrong: it is variance, and the fix is a tighter prompt, an output
+  schema or a check rather than a revert.
+- **Compare versions the same way.** Score each version on several samples per case, or a one-sample
+  difference between v13 and v14 may be noise.
 
-## Example
-A minimal file-based registry: immutable version files, an alias file for promotion, a content hash
-over the whole bundle (template plus model, parameters and tool schemas), a variable-contract check at
-load time, and the trace line that records which version answered. Swapping the directory for a
-registry client changes `load`, nothing else. Promotion is then a CI job that runs the golden set
-against `canary` and `production`, diffs results per case, and only then edits `aliases.yaml`.
+## Diagram
+A version moves through gates by pointer moves only; every call logs which version answered, so rollback
+and replay are both cheap.
+
+```mermaid
+flowchart TD
+    E["Edit prompt bundle"] --> V["New immutable version + hash"]
+    V --> G["Golden set + regression suite"]
+    G -->|"per-case diff vs production"| C["Move canary alias"]
+    G -->|"regression"| X["Reject candidate"]
+    C -->|"metrics hold"| P["Move production alias"]
+    C -->|"metrics drop"| R["Rollback: move pointer back"]
+    P --> T[("Traces: name, version, hash, model")]
+    C --> T
+    T -.->|"replay and compare"| G
+```
+
+## Examples
+### A minimal file-based registry
+Immutable version files, an alias file for promotion, a content hash over the whole bundle (template plus
+model, parameters and tool schemas), a variable-contract check at load time, and the trace line that
+records which version answered.
+- Swapping the directory for a registry client changes `load`, nothing else.
+- Promotion is a CI job that runs the golden set against `canary` and `production`, diffs results per
+  case, and only then edits `aliases.yaml`.
 
 ```python
 import hashlib, json, pathlib, re
@@ -150,42 +173,94 @@ def triage(client, ticket: str, tracer) -> str:
     return r.content[0].text
 ```
 
+### A per-category promotion gate (runnable)
+The aggregate can rise while one category collapses. Weight by case count, then block on any category
+drop beyond a tolerance. Numbers are illustrative.
+
+```python
+cases = {"billing": 400, "refunds": 100, "outage": 100}
+base  = {"billing": 0.85, "refunds": 0.95, "outage": 0.80}   # production version
+cand  = {"billing": 0.93, "refunds": 0.70, "outage": 0.82}   # candidate version
+
+def mean(scores):
+    return sum(scores[c] * n for c, n in cases.items()) / sum(cases.values())
+
+def gate(base, cand, max_drop=0.02):
+    drops = {c: (base[c], cand[c]) for c in base if cand[c] < base[c] - max_drop}
+    return not drops, drops
+
+print(f"mean {mean(base):.3f} -> {mean(cand):.3f}")   # mean 0.858 -> 0.873
+ok, drops = gate(base, cand)
+print("promote" if ok else f"blocked: {drops}")       # blocked: {'refunds': (0.95, 0.7)}
+```
+
+| Category | Cases | v13 (production) | v14 (candidate) |
+|---|---|---|---|
+| billing | 400 | 85% | 93% |
+| refunds | 100 | 95% | 70% |
+| outage | 100 | 80% | 82% |
+| **weighted mean** | 600 | 85.8% | 87.3% |
+
+A mean-only gate would have shipped v14; the per-category gate catches the refunds regression.
+
+## Production patterns
+- **Version and hash as trace attributes.** On every LLM span, set prompt name, version label, content
+  hash and model id as attributes (for example in your OpenTelemetry or Langfuse traces). Monitor the
+  share of calls carrying a version; it should be 100%.
+- **CI eval gate on prompt paths.** Trigger the golden-set and regression run whenever files under
+  `prompts/` change (a path filter in your CI), post the per-case diff on the pull request, and block
+  merge on any category drop. Monitor eval delta between consecutive versions.
+- **Canary by stable hash.** Route a fixed slice (for example 5%) to the `canary` alias by hashing the
+  user or conversation id, so a user stays on one version. Compare escalation rate, refusals and cost
+  per version before moving `production`.
+- **Cached alias resolution with fallback.** Resolve the alias through a short-TTL in-process cache and
+  keep the last known version if the registry is unreachable, so the registry is not a hard dependency
+  of every request. Monitor registry errors and alias staleness.
+- **Pin dated model snapshots in the bundle.** Store a dated model id (such as `gpt-4o-2024-08-06`
+  rather than `gpt-4o`) in the version metadata, so a provider alias moving cannot change behaviour
+  under an unchanged hash.
+- **Read-only production in the console.** Let people edit drafts in the registry UI, but allow only CI
+  (or a reviewed action) to move the `production` label. Monitor label moves as audit events.
+
 ## Trade-offs
-- Prompts as files in git give pull-request review and atomic code-plus-prompt changes, but couple
-  rollout to deploys and lock out non-engineers; it flips to a registry once domain experts edit
+- **Files in git vs a registry.** Files give pull-request review and atomic code-plus-prompt changes, but
+  couple rollout to deploys and lock out non-engineers. It flips to a registry once domain experts edit
   prompts weekly or a fix must ship without a release.
-- A registry allows hot swaps and UI editing but invites drift between what the code expects and what
-  the prompt provides; a declared variable contract checked at load time is the price of that freedom.
-- Content hashes are exact but meaningless to humans, while labels communicate intent but depend on
-  discipline; using both costs nothing and avoids arguing about which one is "real".
-- Resolving the alias at request time makes rollback instant but puts the registry in the request
-  path; cache the resolution with a short TTL and fall back to the last known version on failure.
-- Running the full eval on every version is slow; it is mandatory for a major bump and overkill for a
-  typo fix, which is exactly the distinction the version label exists to express.
+- **Hot swaps vs contract drift.** A registry allows hot swaps and UI editing but invites drift between
+  what the code expects and what the prompt provides; a declared variable contract checked at load time
+  is the price of that freedom.
+- **Hashes vs labels.** Content hashes are exact but meaningless to humans; labels communicate intent but
+  depend on discipline. Using both costs nothing and avoids arguing about which one is "real".
+- **Request-time resolution vs dependency.** Resolving the alias per request makes rollback instant but
+  puts the registry in the request path; cache the resolution with a short TTL and fall back to the last
+  known version on failure.
+- **Full eval vs speed.** Running the full eval on every version is slow. It is mandatory for a major
+  bump and overkill for a typo fix, which is exactly the distinction the version label exists to express.
 
 ## Pitfalls
-- Editing in the vendor console and pasting into production; the symptom is a live prompt that matches
-  no commit and a regression nobody can date.
-- Changing the model and the prompt in the same version; the symptom is an eval drop that cannot be
-  attributed to either, so both get reverted.
-- Not recording the version on each call; the symptom is a user complaint you cannot reproduce because
-  you do not know which prompt that user received.
-- Versioning the template but not tool descriptions, few-shot examples or the output schema; the
-  symptom is "the prompt did not change" while behaviour did after someone reworded a tool.
-- Promoting on the aggregate score alone; the symptom is a mean that rose one point while one critical
-  category fell from 95% to 70%, visible only in per-case diffs.
-- Releasing to 100% of traffic at once; the symptom is a regression that reaches every user before any
-  metric can flag it, plus a brief cost and latency spike as all traffic misses the prompt cache together.
+- **Editing in the vendor console and pasting into production.** Symptom: a live prompt that matches no
+  commit and a regression nobody can date. Fix: console is read-only for production.
+- **Changing model and prompt in the same version.** Symptom: an eval drop attributable to neither, so
+  both get reverted. Fix: one change per version.
+- **Not recording the version on each call.** Symptom: a complaint you cannot reproduce because you do
+  not know which prompt that user received.
+- **Versioning the template but not tool descriptions, few-shot examples or the output schema.** Symptom:
+  "the prompt did not change" while behaviour did after someone reworded a tool.
+- **Promoting on the aggregate score alone.** Symptom: a mean up one point while one critical category
+  fell from 95% to 70%, visible only in per-case diffs.
+- **Releasing to 100% of traffic at once.** Symptom: a regression reaching every user before any metric
+  flags it, plus a brief cost and latency spike as all traffic misses the prompt cache together.
 
 ## When to use
-From the first prompt that reaches a user. The minimum that pays for itself in a week is: prompt in a
-file with a metadata header, a content hash logged on every call, and the golden set run in CI before
-merge. Add aliases when you need rollback without a deploy, a registry when non-engineers edit, and
-canary routing when traffic is large enough that a 5% slice is informative. Measure three things: the
-fraction of calls whose trace carries a prompt version (should be 100%), time from "bad release
-noticed" to "rolled back", and the eval delta between consecutive versions. In interviews, "how do you
-ship a prompt change safely" expects exactly this sequence: version, evaluate, canary, promote,
-roll back, with the trace link that makes each step auditable.
+- **Start:** from the first prompt that reaches a user.
+- **Minimum that pays for itself in a week:** prompt in a file with a metadata header, a content hash
+  logged on every call, and the golden set run in CI before merge.
+- **Add later:** aliases when you need rollback without a deploy, a registry when non-engineers edit,
+  canary routing when traffic is large enough that a 5% slice is informative.
+- **Measure:** fraction of calls whose trace carries a prompt version (should be 100%), time from "bad
+  release noticed" to "rolled back", and the eval delta between consecutive versions.
+- **Interviews:** "how do you ship a prompt change safely" expects version, evaluate, canary, promote,
+  roll back, with the trace link that makes each step auditable.
 
 ## Role lens
 - **Engineer:** Keeps prompts as versioned files or registry entries, logs the version and hash on
@@ -208,6 +283,43 @@ pointer move back to the previous version, which is possible only if versions ar
 aliased. To make it stick: prompts live in files or a registry with aliases, the console is read-only
 for production, every call logs prompt name, version and hash so Monday's escalations can be joined
 to the version that caused them, and CI blocks promotion of any version without an eval run.
+
+## Interview questions
+### Why isn't keeping prompts in git enough to call them versioned?
+- **Git versions the file, not the call.** It does not record which commit produced which response, so a
+  complaint cannot be tied to a version without a per-call record.
+- **The effective prompt is a bundle.** Model id, tool descriptions, output schema and rendered
+  variables also shape behaviour, and they can change in the same pull request unnoticed.
+- **So add a hash per call.** Hash the whole bundle and log it on every trace, alongside name, label and
+  model id.
+
+### A complaint arrives about an answer from last week. How do you reproduce it?
+- **Find the trace.** Look up prompt name, version, hash, model id and rendered variables for that call.
+- **Rebuild and resend the exact request several times.** Output is not bit-identical even at
+  temperature 0, so look at the distribution of answers.
+- **Decide by rate.** If most samples are wrong, fix or revert the version; if roughly one in ten is
+  wrong, treat it as variance and tighten the prompt, add a schema or add a check.
+
+### When would you choose a prompt registry over files in the repository?
+- **Registry when non-engineers iterate.** Domain experts editing weekly, or fixes that must ship
+  without a release, favour runtime fetch by alias.
+- **Files when engineers own prompts.** You get pull-request review and atomic code-plus-prompt changes.
+- **Often both.** Files stay the source of truth and CI pushes them to the registry, with a variable
+  contract checked at load time to stop drift.
+
+### You release a new prompt version and cost and TTFT spike for a few minutes. Why?
+- **Prompt cache misses.** The new version changes bytes near the front of the request, so every request
+  misses until the new prefix has been written once.
+- **Worse at high concurrency.** Many requests miss before the first write lands.
+- **Mitigate with a gradual alias move.** Most traffic stays on the warm old prefix while the new one
+  warms; watch cache-read tokens per version.
+
+### How do you stop a provider model update from silently changing your prompt's behaviour?
+- **Pin a dated snapshot id in the bundle**, not a floating alias, because the alias can move to a new
+  model while your bundle hash stays the same.
+- **Treat a model change as a new prompt version.** Run the golden set and regression suite, compare per
+  case, and canary it like any other change.
+- **Never combine it with a prompt edit**, or an eval drop cannot be attributed to either.
 
 ## Quiz
 ### Q: Which single piece of data makes prompt versioning pay off most once it is in place?

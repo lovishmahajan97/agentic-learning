@@ -125,6 +125,26 @@ RRF(d) = Σ_arms 1 / (k + rank_arm(d))        k = 60 in the original paper
 - **Watch small k:** adding BM25 noise to a strong dense arm can lower precision at small k while raising
   recall at large k; the reranker usually recovers it, but you need to see it.
 
+## Diagram
+Watch the request lifecycle: the same query and the same filter go to both arms in parallel, each returns
+a deep top-n, fusion uses only ranks, and the reranker turns the fused pool into the final top k.
+
+```mermaid
+sequenceDiagram
+    participant A as App
+    participant L as BM25 arm
+    participant D as Dense arm
+    participant F as RRF fusion
+    participant R as Reranker
+    A->>L: query plus tenant filter
+    A->>D: embedding plus same tenant filter
+    L-->>F: top 50 ids with ranks
+    D-->>F: top 50 ids with ranks
+    Note over F: sum of 1 over 60 plus rank per arm
+    F->>R: fused top 20 to 50
+    R-->>A: final top k for the prompt
+```
+
 ## Examples
 ### Reciprocal rank fusion in a dozen lines
 Document 3 is the BM25 arm's top hit but absent from the dense top 10; it falls to fifth behind four
@@ -283,6 +303,38 @@ the GIN index accelerates only the match; `ts_rank` is computed for every matchi
 prove it helped, run the labeled query set through dense-only and hybrid, compare recall@10 overall and
 per query type, inspect queries that regressed, and check p95 latency, since the second subquery adds
 time.
+
+## Interview questions
+### What is hybrid search and why does it usually beat either retriever alone?
+- **Definition:** run BM25 and a dense retriever on the same query and fuse their ranked lists.
+- **Why it helps:** their failures overlap only partly (BM25 misses paraphrase, dense misses identifiers
+  and jargon), so the union raises first-stage recall, which bounds everything the generator can answer.
+
+### How does reciprocal rank fusion work, and what does the constant k do?
+- **Formula:** each arm contributes 1 / (k + rank), summed across arms; k = 60 in the original paper.
+- **Effect:** agreement wins, since rank 10 in both arms (≈ 0.0286) beats rank 1 in one (1/61 ≈ 0.0164).
+- **k as a knob:** smaller k steepens the curve so top ranks count more; larger k flattens it toward
+  counting agreement.
+
+### After adding hybrid, a user sees a document from another tenant. How do you debug and prevent it?
+- **Likely cause:** the tenant or ACL filter is applied in only one arm, so that arm returns forbidden
+  chunks and a strong match carries one through fusion.
+- **Prevent it:** build one filter object and pass it to both arms, and add a CI canary that runs a
+  cross-tenant query and fails if any foreign chunk appears.
+
+### When would you choose weighted score fusion over RRF, or skip hybrid altogether?
+- **Weighted fusion** only when one arm clearly dominates and you have labels to tune α, re-tuned after
+  every model or corpus change, because min–max normalization inflates weak top hits.
+- **Skip hybrid** when a labeled evaluation shows one arm already captures the relevant chunk in nearly
+  every case, since the second arm doubles query-time work and index storage.
+
+### How deep should each arm retrieve, and how do you know when to stop adding depth?
+- **Typical sizing:** 50 to 200 candidates per arm for a final 5 to 10, with the top 20 to 50 fused results
+  passed to a cross-encoder reranker, because fusion needs overlap and the reranker needs a wide pool.
+- **Stop when recall@depth is flat** on your labeled set; beyond that, latency and reranker cost grow with
+  no gain.
+- **Check engine caps match,** for example pgvector's `hnsw.ef_search` at least the arm's `LIMIT`, and
+  monitor rows returned per arm versus requested.
 
 ## Quiz
 ### Q: Why can BM25 scores and cosine similarities not simply be added together?

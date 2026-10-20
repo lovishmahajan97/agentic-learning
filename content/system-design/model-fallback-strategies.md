@@ -123,6 +123,24 @@ your traffic.
 - **Larger fallback models** are a cost spike.
 - **Both belong in the runbook** before the first outage.
 
+## Diagram
+One request walking the ladder: the breaker and the remaining deadline decide whether a rung is tried, the
+error class decides between failing over and stopping, and the bottom of the ladder hands off to
+degradation.
+
+```mermaid
+flowchart TD
+    R["Request with one user-facing deadline"] --> N{"Next rung: budget left and breaker allows?"}
+    N -->|"no, skip rung"| MORE{"More rungs?"}
+    N -->|"yes"| C["Call target, timeout = min of rung timeout and remaining"]
+    C -->|"success"| OK["Return, tagged with served_by and fallback_depth"]
+    C -->|"400, 401, policy refusal, context too long"| STOP["Raise: same error on every rung, breaker not tripped"]
+    C -->|"408, 429, 5xx, timeout"| F["Record failure on this breaker, jitter"]
+    F --> MORE
+    MORE -->|"yes, next rung is further in behaviour"| N
+    MORE -->|"no"| D["ServiceDegraded: hand off to graceful degradation"]
+```
+
 ## Examples
 ### Fallback ladder with breakers and a shared deadline
 Per-target circuit breakers (closed, open, half-open with a single probe), error classification and one
@@ -322,6 +340,39 @@ target. Second, the agent retried or failed over after a tool had already execut
 send-email step. Fix with idempotency keys on tool calls, a rule that non-idempotent steps are never
 retried blindly, and checkpointed agent state so the fallback resumes after the completed action. Add an
 alert on fallback share so someone is watching during the outage, not the morning after.
+
+## Interview questions
+### What is the difference between a retry, a fallback and graceful degradation?
+- **Retry** repeats the call on the same target after jittered backoff; it only covers transient blips.
+- **Fallback** changes the target while keeping the function: another region, provider or model.
+- **Degradation** changes the function itself: a cache, a non-AI path or honest unavailability. Confusing them
+  produces a fallback chain slower than the outage it was meant to hide.
+
+### Two providers each succeed 99.5% of the time. What availability do you get with both?
+- **If failures are independent:** 1 − 0.005² = 99.9975%.
+- **They rarely are:** two resellers of the same upstream model, one cloud region or one organisation quota
+  fail together; with half the failures shared, availability falls to about 99.75%.
+- **So design for independence** of rungs, not just their count.
+
+### Design the fallback ladder for an agent that sends emails and writes records.
+- **Order by behavioural distance:** same model in another region, same weights via another provider, then a
+  re-validated model from another vendor, then degradation.
+- **One deadline:** each attempt's timeout fits inside the user-facing budget, passed down the ladder.
+- **Protect side effects:** idempotency keys on tool calls and checkpointed agent state, so a failover resumes
+  after the email instead of sending it twice.
+
+### When is hedging a bad idea?
+- **When the primary is overloaded,** because a hedge doubles load exactly when the provider is struggling;
+  disable it when the breaker indicates overload.
+- **For non-idempotent calls,** where two concurrent attempts duplicate side effects.
+- **Once a stream is committed** to the user, since models do not reliably continue each other's text.
+
+### During an outage, latency rose to primary timeout plus fallback time for every request. What was missing?
+- **A per-target circuit breaker:** without one, each request waits the full primary timeout before falling
+  back, for the whole incident.
+- **With a breaker** (5 failures, 60 s cooldown in the example), the dead primary receives about 5 requests
+  to open it and then one probe per cooldown, instead of 120,000 over 40 minutes at 50 requests per second.
+- **Also check** that client errors are not counted, so one buggy caller cannot open the breaker.
 
 ## Quiz
 ### Q: Which error should not trigger failover to another provider?

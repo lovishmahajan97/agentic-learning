@@ -5,7 +5,7 @@ name: Outbox / inbox patterns
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - system-design/event-driven-architecture
   - system-design/exactly-once-processing-limitations
@@ -22,102 +22,117 @@ sources:
 ---
 
 ## TL;DR
-A service cannot atomically commit a database row and publish a message. The **outbox** pattern writes
-the message into a table inside the same transaction as the business change and lets a relay publish it,
-so a message exists if and only if the change committed. The **inbox** pattern records each processed
-message id inside the consumer's transaction, so redeliveries become no-ops. Together they turn an
-at-least-once broker into effectively-once processing between two databases.
+The **outbox** writes a message in the same transaction as the business change and a relay publishes it;
+the **inbox** records each processed message id in the consumer's transaction. Together: effectively-once
+processing between two databases over an at-least-once broker.
 
 ## Why it exists
-The producer side of every event-driven system has to do two things when an order is placed: commit the
-order row and tell the rest of the world. There are three naive orderings and each is wrong.
-
-**Commit, then publish.** The process crashes, is OOM-killed or loses its broker connection after the
-commit and before the publish. The row exists; the event never happens. Downstream, the search index,
-the billing meter and the audit log never hear about the order. This is a silent failure: nothing errors,
-data is simply missing.
-
-**Publish, then commit.** The event is out; the commit fails on a constraint violation or a deadlock and
-rolls back. Consumers now act on an order that does not exist.
-
-**Publish inside the transaction, before commit.** The consumer receives the event, queries the producer
-for details, and finds nothing, because the transaction has not committed yet. Or the transaction later
-rolls back and the event is again a phantom.
-
-The frequency is not academic. Suppose the crash window between the two operations is a millisecond and
-the service processes 1,000 transactions per second; at an illustrative one restart per day you lose on
-average about one event per day, and at scale that becomes "the index is missing a few hundred documents
-and nobody knows which". Retrying the publish in application code does not help when the process itself
-is gone. Wrapping both in a distributed transaction would require the broker to participate in two-phase
-commit, which most brokers do not support and which blocks under coordinator failure.
-
-The way out is to use the one atomic primitive you already have, the local database transaction, and to
-make publishing a separate, retryable, idempotent step that reads from committed state.
+A service cannot atomically commit a database row and publish a message, yet every producer must commit
+the order row *and* tell the world. All three naive orderings are wrong:
+- **Commit, then publish.** The process crashes, is OOM-killed or loses its broker connection after the
+  commit and before the publish. The row exists; the event never happens, so the search index, billing
+  meter and audit log never hear about the order. A silent failure: nothing errors, data is just missing.
+- **Publish, then commit.** The event is out; the commit fails on a constraint violation or a deadlock and
+  rolls back. Consumers now act on an order that does not exist.
+- **Publish inside the transaction, before commit.** The consumer queries the producer for details and
+  finds nothing, because the transaction has not committed yet; or it later rolls back and the event is a
+  phantom.
+- **The frequency is not academic.** With a millisecond crash window, 1,000 transactions per second and an
+  illustrative one restart per day, you lose about one event per day. At scale that is "the index is missing
+  a few hundred documents and nobody knows which". Retrying in application code fails when the process
+  itself is gone, and two-phase commit needs a broker that supports it (most do not) and blocks on
+  coordinator failure.
+- **The way out:** use the one atomic primitive you already have, the local database transaction, and make
+  publishing a separate, retryable, idempotent step that reads from committed state.
 
 ## How it works
 ### The outbox table
-Alongside the business tables lives an `outbox` table: `id` (monotonic), `aggregate_type`,
-`aggregate_id`, `event_type`, `payload`, `created_at`, `published_at`. When the application commits a
-business change it inserts the corresponding event row *in the same transaction*. Atomicity is now
-guaranteed by the database: either both the order and its event row are durable or neither is. The event
-is modelled as data, not as a side effect, *because* data is the only thing the transaction can protect.
+- **Columns:** `id` (monotonic), `aggregate_type`, `aggregate_id`, `event_type`, `payload`, `created_at`,
+  `published_at`, alongside the business tables.
+- **Same transaction:** when the application commits a business change it inserts the event row *in the
+  same transaction*, so the database guarantees both the order and its event row are durable, or neither.
+- **Event as data:** the event is modelled as data, not as a side effect, *because* data is the only thing
+  the transaction can protect.
 
 ### The relay
-A separate process moves rows from the outbox to the broker. Two implementations exist.
+A separate process moves rows from the outbox to the broker.
 
-**Polling publisher.** A loop runs `SELECT ... FROM outbox WHERE published_at IS NULL ORDER BY id LIMIT n
-FOR UPDATE SKIP LOCKED`, publishes each row, then marks it published (or deletes it). `SKIP LOCKED` lets
-several relay instances run without double-claiming rows. It is simple and database-agnostic; its cost is
-polling latency and load on the table. Selecting by `published_at IS NULL` rather than "rows with `id` above
-the last one I published" is deliberate: ids come from a sequence assigned at insert time, but
-transactions commit in a different order, so row 101 can be visible while row 100's transaction is still
-open. A relay that advances a high-water mark past 101 never returns for 100, and that event is lost
-without any error.
+| | Polling publisher | Log tailing (CDC) |
+|---|---|---|
+| Mechanism | loop runs `SELECT ... FROM outbox WHERE published_at IS NULL ORDER BY id LIMIT n FOR UPDATE SKIP LOCKED`, publishes, marks published (or deletes) | a connector such as Debezium reads the write-ahead log and forwards committed outbox inserts |
+| Ordering | `id` order per relay | commit order |
+| Latency | polling interval | milliseconds, no polling |
+| Cost | polling latency and load on the table | operating a CDC pipeline and granting it replication access |
+| Strength | simple, database-agnostic; `SKIP LOCKED` lets several relays run without double-claiming rows | single commit-ordered log |
 
-**Log tailing (CDC).** A connector such as Debezium reads the database's write-ahead log, sees committed
-inserts into the outbox table in commit order, and forwards them to the broker. There is no polling, the
-latency is milliseconds, and ordering follows commit order. The cost is operating a CDC pipeline and
-granting it replication access.
-
-Either way the relay can crash after publishing and before marking the row, so it will publish that row
-again on restart. The outbox therefore gives **at-least-once** publication, never exactly-once. That is
-acceptable precisely because the inbox exists on the other side.
+- **The polling loop** claims a batch with `FOR UPDATE SKIP LOCKED`, publishes each row, then marks it
+  published (or deletes it).
+- **Query unpublished rows, never a high-water mark.** Ids come from a sequence assigned at insert time,
+  but transactions commit in a different order, so row 101 can be visible while row 100's transaction is
+  still open. A relay that advances "last id published" past 101 never returns for 100, and that event is
+  lost without any error. Selecting by `published_at IS NULL` is deliberate.
+- **At-least-once, never exactly-once.** The relay can crash after publishing and before marking the row,
+  so it publishes that row again on restart. That is acceptable precisely *because* the inbox exists on the
+  other side.
 
 ### Ordering
-Consumers typically need per-aggregate order. Publish with `aggregate_id` as the partition key, and have
-the relay process rows in `id` order. With several polling relays, order across relays is not guaranteed
-unless rows are partitioned among relays by aggregate as well; CDC avoids the problem by reading a single
-commit-ordered log.
+- **Per-aggregate order:** publish with `aggregate_id` as the partition key, and have the relay process rows
+  in `id` order.
+- **Several polling relays:** order across relays is not guaranteed unless rows are partitioned among
+  relays by aggregate as well. CDC avoids the problem by reading a single commit-ordered log.
 
 ### Housekeeping
-The outbox grows by one row per event forever unless pruned. Delete or archive rows after publication
-with a lag that covers your debugging needs; a table with hundreds of millions of published rows makes the
-`WHERE published_at IS NULL` scan slow unless a partial index exists.
+- **The outbox grows by one row per event forever** unless pruned. Delete or archive rows after publication
+  with a lag that covers your debugging needs.
+- **Index it:** a table with hundreds of millions of published rows makes the `WHERE published_at IS NULL`
+  scan slow unless a partial index exists.
 
 ### The inbox table
-On the consumer, every message handler runs inside a database transaction that does two things: performs
-the business effect and inserts the message's id into an `inbox` table with a unique constraint
-(`INSERT ... ON CONFLICT DO NOTHING`). If the insert affects zero rows the message was already handled,
-and the handler commits nothing. Doing the inbox insert *first*, before the effect, also handles two
-copies arriving concurrently on different consumer instances: in Postgres the second insert waits on the
-unique index until the first transaction commits, then finds the conflict and does nothing, so the
-unique constraint, not application logic, serialises the duplicates. Because the dedupe record and the effect commit together, a crash
-between them cannot leave the effect applied but unrecorded, or recorded but unapplied. The dedupe key
-must be the producer's `event_id`, not the broker's delivery id, *because* a redelivery carries the same
-event with a new delivery id.
+Every message handler runs inside one database transaction that:
+1. **Inserts the message's id first** into an `inbox` table with a unique constraint
+   (`INSERT ... ON CONFLICT DO NOTHING`).
+2. **Checks the result.** If the insert affects zero rows, the message was already handled and the handler
+   commits nothing.
+3. **Performs the business effect** and commits both together.
 
-A variant stores the full message in the inbox first, acknowledges to the broker, and processes from the
-inbox asynchronously. This decouples receipt from processing and gives the consumer its own durable
-queue, at the cost of another relay-like loop.
+Why each choice:
+- **Inbox insert first** also handles two copies arriving concurrently on different consumer instances: in
+  Postgres the second insert waits on the unique index until the first transaction commits, then finds the
+  conflict and does nothing. The unique constraint, not application logic, serialises the duplicates.
+- **Same transaction** means a crash cannot leave the effect applied but unrecorded, or recorded but
+  unapplied.
+- **Key on the producer's `event_id`,** not the broker's delivery id, *because* a redelivery carries the
+  same event with a new delivery id.
+- **Variant:** store the full message in the inbox first, acknowledge to the broker, and process from the
+  inbox asynchronously. This decouples receipt from processing and gives the consumer its own durable
+  queue, at the cost of another relay-like loop.
 
 ### What the pair does and does not guarantee
-Outbox plus inbox plus an at-least-once broker gives effectively-once effects from the producer's
-database to the consumer's database. It does not make effects outside the consumer's database idempotent:
-if the handler calls an external API, sends an email or invokes a model, a duplicate that slips in
-between the effect and the commit still repeats that call. Those effects need their own idempotency key at
-the external boundary.
+- **Does:** outbox plus inbox plus an at-least-once broker gives effectively-once effects from the
+  producer's database to the consumer's database.
+- **Does not:** make effects outside the consumer's database idempotent. If the handler calls an external
+  API, sends an email or invokes a model, a duplicate that slips in between the effect and the commit
+  still repeats that call. Those effects need their own idempotency key at the external boundary.
 
-## Example
+## Diagram
+The producer writes the order and its event in one transaction; the relay may publish twice, and the
+consumer's inbox, committed with the effect, turns the duplicate into a no-op.
+
+```mermaid
+flowchart TD
+    A["place_order"] -->|"one transaction"| DB[("orders + outbox")]
+    DB -->|"published_at IS NULL"| R["Relay: poll or CDC"]
+    R -->|"key = aggregate_id"| K[("Broker, at-least-once")]
+    R -->|"mark published"| DB
+    K --> H["Consumer handler"]
+    H -->|"INSERT inbox ON CONFLICT DO NOTHING"| I{"Inserted a row?"}
+    I -->|"yes"| E[("Effect + inbox row, one commit")]
+    I -->|"no"| D["Duplicate: commit nothing"]
+    H -.->|"external call needs own key"| X["Email, API, model"]
+```
+
+## Examples
+### Postgres outbox, relay and inbox
 Tables and the three code paths: the producer writes order and outbox row in one transaction, a polling
 relay publishes with `SKIP LOCKED`, and a consumer deduplicates through the inbox. Uses psycopg 3; the
 `broker.publish` call stands in for a Kafka or SQS client.
@@ -161,58 +176,140 @@ def handle_order_placed(conn, msg):                 # consumer: effect + inbox i
     return "handled"
 ```
 
-Kill the relay between `broker.publish` and the `UPDATE` and the row is published twice; the consumer's
-second `INSERT INTO inbox` conflicts, `rowcount` is zero, and the ledger is written exactly once. Two
-production details the sketch glosses: the relay publishes while holding row locks, so a slow broker
-stretches the transaction, which is why real relays use small batches and a short publish timeout; and
-with several relays running, two events for the same order can be claimed by different relays and
-published in the wrong order, so either run one relay per partition of aggregates or use CDC.
+- **Relay crash:** kill the relay between `broker.publish` and the `UPDATE` and the row is published twice;
+  the consumer's second `INSERT INTO inbox` conflicts, `rowcount` is zero, and the ledger is written
+  exactly once.
+- **Glossed detail 1, locks during publish:** the relay publishes while holding row locks, so a slow broker
+  stretches the transaction, which is why real relays use small batches and a short publish timeout.
+- **Glossed detail 2, ordering:** with several relays running, two events for the same order can be claimed
+  by different relays and published in the wrong order, so either run one relay per partition of
+  aggregates or use CDC.
+
+### Runnable: relay crash and inbox dedupe with SQLite
+The same three paths with the standard library only (SQLite 3.24+ for `ON CONFLICT DO NOTHING`). The relay
+"crashes" after publishing, the restart republishes, and the ledger still has one row.
+
+```python
+import sqlite3, json, uuid
+
+db = sqlite3.connect(":memory:", isolation_level=None)
+db.executescript("""
+CREATE TABLE orders (id TEXT PRIMARY KEY, total INT);
+CREATE TABLE outbox (id INTEGER PRIMARY KEY, aggregate_id TEXT, payload TEXT, published_at TEXT);
+CREATE TABLE inbox (event_id TEXT PRIMARY KEY);
+CREATE TABLE ledger (order_id TEXT, amount INT);
+""")
+
+def place_order(oid, total):                        # both rows or neither
+    with db:
+        db.execute("BEGIN")
+        db.execute("INSERT INTO orders VALUES (?, ?)", (oid, total))
+        ev = {"event_id": str(uuid.uuid4()), "id": oid, "total": total}
+        db.execute("INSERT INTO outbox (aggregate_id, payload) VALUES (?, ?)", (oid, json.dumps(ev)))
+
+def relay(broker, crash_before_mark=False):         # at-least-once publication
+    for id_, payload in db.execute("SELECT id, payload FROM outbox WHERE published_at IS NULL ORDER BY id").fetchall():
+        broker.append(payload)
+        if crash_before_mark:
+            return                                  # simulated crash: row stays unpublished
+        db.execute("UPDATE outbox SET published_at = datetime('now') WHERE id = ?", (id_,))
+
+def handle(payload):                                # inbox insert first, then effect, one transaction
+    msg = json.loads(payload)
+    with db:
+        db.execute("BEGIN")
+        cur = db.execute("INSERT INTO inbox VALUES (?) ON CONFLICT DO NOTHING", (msg["event_id"],))
+        if cur.rowcount == 0:
+            return "duplicate"
+        db.execute("INSERT INTO ledger VALUES (?, ?)", (msg["id"], msg["total"]))
+        return "handled"
+
+broker = []
+place_order("o1", 30)
+relay(broker, crash_before_mark=True)              # published, then "crashed"
+relay(broker)                                      # restart republishes the same row
+print([handle(m) for m in broker])                 # ['handled', 'duplicate']
+print(db.execute("SELECT count(*), sum(amount) FROM ledger").fetchone())   # (1, 30)
+```
+
+### Worked scenario: the high-water-mark relay that loses one event forever
+Two transactions take ids 100 and 101 but commit in the opposite order.
+
+| Time | Transaction A (id 100) | Transaction B (id 101) | High-water-mark relay | `published_at IS NULL` relay |
+|---|---|---|---|---|
+| t1 | inserted, still open | inserted and committed | sees 101, publishes, mark = 101 | sees 101, publishes it |
+| t2 | commits | | queries `id > 101`: never sees 100 | sees 100 unpublished, publishes it |
+| Result | | | event 100 lost, no error | both published |
+
+## Production patterns
+- **CDC with Debezium's outbox event router.** When polling latency or table load becomes a problem, tail
+  the WAL with Debezium and apply its outbox event router transform
+  (`io.debezium.transforms.outbox.EventRouter`) so outbox rows are routed to topics by aggregate type and
+  keyed by aggregate id. Monitor connector lag and replication slot growth, because a stopped connector
+  makes Postgres retain WAL.
+- **Outbox-lag alert from one query.** Export `SELECT now() - min(created_at) FROM outbox WHERE
+  published_at IS NULL` as a metric and alert when it exceeds the freshness budget; it catches a dead relay
+  long before consumers notice.
+- **Small batches, short publish timeout.** Keep the relay's `LIMIT` small and set a short broker publish
+  timeout so a slow broker does not hold row locks for long. Watch relay transaction duration and rows
+  published per second.
+- **Wake the poller with LISTEN/NOTIFY.** In Postgres, issue `NOTIFY` in the producing transaction (it is
+  delivered on commit) and have the relay `LISTEN`, keeping a slow poll as the safety net. This cuts
+  polling latency without hammering the table.
+- **Batched retention jobs.** Delete published outbox rows and old inbox rows in small batches on a
+  schedule, keeping inbox rows longer than the broker's maximum redelivery delay. Monitor table size and
+  dead tuples.
+- **Idempotency keys at external boundaries.** Where a handler calls an email or payment API, pass the
+  `event_id` as the provider's idempotency key, or move the call after commit with its own retry loop.
+  Track duplicate-send complaints and provider-side dedupe hits.
 
 ## Trade-offs
-- You gain a hard guarantee that events match committed state, but every event now costs a database
-  write and a relay hop, adding latency of tens of milliseconds with polling (less with CDC) compared with
-  publishing directly.
-- A polling relay is trivial to run anywhere, whereas CDC gives lower latency and commit ordering but
-  requires replication privileges and a connector to operate; polling flips to CDC once event volume or
-  latency sensitivity makes table scans costly.
-- The inbox makes any handler idempotent regardless of its logic, yet it adds a write and a growing
-  table per consumer; when the effect is naturally idempotent (an upsert keyed by aggregate id) the
-  inbox is redundant and can be skipped.
-- Keeping outbox and inbox rows longer eases debugging and widens the dedupe window, but table size and
-  index bloat grow linearly; the retention must at least exceed the broker's maximum redelivery delay.
-- The pattern couples publishing to the service's database schema and transaction, which is the point,
-  but it means services without a relational store (or using a database per request) need a different
-  mechanism, such as a broker with transactional producers.
+- **Guarantee vs per-event cost.** You gain a hard guarantee that events match committed state, but every
+  event costs a database write and a relay hop, adding tens of milliseconds with polling (less with CDC)
+  compared with publishing directly.
+- **Polling vs CDC.** A polling relay is trivial to run anywhere; CDC gives lower latency and commit
+  ordering but requires replication privileges and a connector to operate. Polling flips to CDC once event
+  volume or latency sensitivity makes table scans costly.
+- **Inbox vs naturally idempotent effects.** The inbox makes any handler idempotent regardless of its
+  logic, yet adds a write and a growing table per consumer. When the effect is naturally idempotent (an
+  upsert keyed by aggregate id) the inbox is redundant and can be skipped.
+- **Retention vs bloat.** Keeping outbox and inbox rows longer eases debugging and widens the dedupe window,
+  but table size and index bloat grow linearly; retention must at least exceed the broker's maximum
+  redelivery delay.
+- **Coupling to the database vs reach.** The pattern couples publishing to the service's database schema
+  and transaction, which is the point, but services without a relational store (or using a database per
+  request) need a different mechanism, such as a broker with transactional producers.
 
 ## Pitfalls
-- Publishing from a database trigger or an ORM "after commit" hook that calls the broker directly; this is
-  still a dual write and shows up as occasional missing events after deploys and failovers.
-- Running multiple polling relays without `SKIP LOCKED` or partitioning; the same event is published
-  several times in a burst and per-aggregate order breaks, seen as out-of-order status transitions
-  downstream.
-- Deduplicating on the broker's message or receipt id instead of the producer's `event_id`; redeliveries
-  carry new ids and sail past the inbox, so duplicates reappear exactly when the broker retries.
-- A relay that tracks "last published id" instead of querying unpublished rows; events from
-  transactions that committed out of sequence order are skipped forever, showing up as rare, permanent
-  gaps that no retry ever fills.
-- Letting the outbox grow unbounded with no partial index; relay latency creeps from milliseconds to
-  seconds as the unpublished scan degrades.
-- Treating the inbox as protection for external calls; the handler emails the customer, then crashes
-  before commit, the redelivery emails again, and support hears about duplicate messages.
-- Writing a huge payload per event; outbox rows bloat the primary database and the WAL, slowing every
-  unrelated transaction, which argues for thin events with an id to fetch.
+- **Publishing from a trigger or ORM "after commit" hook that calls the broker directly.** Still a dual
+  write; shows up as occasional missing events after deploys and failovers.
+- **Multiple polling relays without `SKIP LOCKED` or partitioning.** The same event is published several
+  times in a burst and per-aggregate order breaks, seen as out-of-order status transitions downstream.
+- **Deduplicating on the broker's message or receipt id.** Redeliveries carry new ids and sail past the
+  inbox, so duplicates reappear exactly when the broker retries. Use the producer's `event_id`.
+- **A relay that tracks "last published id".** Events from transactions that committed out of sequence
+  order are skipped forever, showing up as rare, permanent gaps that no retry ever fills.
+- **An unbounded outbox with no partial index.** Relay latency creeps from milliseconds to seconds as the
+  unpublished scan degrades.
+- **Treating the inbox as protection for external calls.** The handler emails the customer, crashes before
+  commit, the redelivery emails again, and support hears about duplicate messages.
+- **Huge payloads per event.** Outbox rows bloat the primary database and the WAL, slowing every unrelated
+  transaction, which argues for thin events with an id to fetch.
 
 ## When to use
-Use the outbox whenever a service both persists state in a transactional database and must publish
-messages about that state, which describes nearly every service in an event-driven system: order
-services, document-ingestion services recording upload rows, agent runtimes persisting step results
-while emitting telemetry. Use the inbox in any consumer whose effect is not naturally idempotent (ledgers,
-counters, "send once" notifications, calls that append rather than upsert). Skip both when there is no
-database in the loop, when the broker itself is the system of record, or when a lost message is
-genuinely harmless. Measure outbox lag (oldest unpublished row age), relay throughput, duplicate rate at
-the inbox and table sizes. In interviews, the expected move is to raise the dual-write problem yourself,
-sketch the outbox with `SKIP LOCKED` or CDC, and state plainly that the result is at-least-once plus
-consumer-side deduplication rather than exactly-once delivery.
+- **Use the outbox when:** a service persists state in a transactional database and must publish messages
+  about that state, which is nearly every service in an event-driven system: order services,
+  document-ingestion services recording upload rows, agent runtimes persisting step results while emitting
+  telemetry.
+- **Use the inbox when:** the consumer's effect is not naturally idempotent (ledgers, counters, "send once"
+  notifications, calls that append rather than upsert).
+- **Skip both when:** there is no database in the loop, the broker itself is the system of record, or a lost
+  message is genuinely harmless.
+- **Measure:** outbox lag (oldest unpublished row age), relay throughput, duplicate rate at the inbox and
+  table sizes.
+- **Interviews:** raise the dual-write problem yourself, sketch the outbox with `SKIP LOCKED` or CDC, and
+  state plainly that the result is at-least-once plus consumer-side deduplication rather than exactly-once
+  delivery.
 
 ## Role lens
 - **Engineer:** Adds the outbox insert to the same transaction as the business write, runs the relay as a
@@ -238,6 +335,45 @@ idempotence has to come from the effect: deterministic chunk ids such as `doc_id
 so a republished event overwrites instead of duplicating. Backfilling the 37 missing
 documents is now a one-off insert of outbox rows for them. Add an alert on the age of the oldest
 unpublished outbox row and on inbox duplicate rate.
+
+## Interview questions
+### What is the dual-write problem and why can't you fix it with retries?
+- **Definition:** a service writes its database and publishes to a broker as two separate operations, and
+  no ordering of the two is safe; a crash between them loses the event or emits one for a rolled-back
+  change.
+- **Retries do not help** because the failure that matters is the process dying; there is nothing left to
+  run the retry.
+- **The fix** moves the event into the database transaction (the outbox) and makes publishing a separate,
+  retryable step reading committed rows.
+
+### Your relay uses "select rows with id greater than the last published id". Events go missing rarely and permanently. Why?
+- **Sequence order is not commit order.** A long transaction can hold id 100 while id 101 commits; the relay
+  publishes 101, advances its mark, and never looks at 100 again.
+- **Symptom:** rare gaps that no retry fills, with no error anywhere.
+- **Fix:** select `WHERE published_at IS NULL` with a partial index, or switch to CDC, which reads the log in
+  commit order.
+
+### When would you skip the inbox table?
+- **When the effect is naturally idempotent,** such as an upsert keyed by aggregate id or a vector upsert
+  with deterministic chunk ids; a redelivery overwrites identical data.
+- **When the effect is outside your database,** the inbox does not protect it anyway; put an idempotency
+  key on the external call instead.
+- **Keep it** for ledgers, counters and "send once" effects, where a duplicate changes the result.
+
+### Polling relay or CDC: how do you choose, and what do you monitor?
+- **Polling** is database-agnostic and easy to run; it costs polling latency and table load, and several
+  relays need `SKIP LOCKED` plus partitioning by aggregate to keep order.
+- **CDC** (for example Debezium on the WAL) gives millisecond latency and commit ordering, but needs
+  replication access and a connector to operate.
+- **Monitor** the age of the oldest unpublished outbox row for either; for CDC also watch replication slot
+  lag, because a stalled connector makes the database retain WAL.
+
+### Two copies of the same message arrive at two consumer instances at the same moment. What stops a double effect?
+- **The unique constraint on `event_id`.** Both handlers insert into the inbox first; in Postgres the second
+  insert blocks on the unique index until the first transaction commits.
+- **Then it conflicts** and `ON CONFLICT DO NOTHING` affects zero rows, so the second handler commits nothing.
+- **Why insert first:** checking with a `SELECT` before the effect would let both pass the check; the
+  database index serialises the duplicates, not application logic.
 
 ## Quiz
 ### Q: What exactly does the transactional outbox guarantee?

@@ -5,7 +5,7 @@ name: Max-step budgets
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - agent-reliability/stopping-conditions-termination
   - agent-reliability/loop-detection
@@ -17,109 +17,135 @@ related:
 ---
 
 ## TL;DR
-A max-step budget caps how many model calls (and, more usefully, how many tokens, seconds and
-dollars) one run may spend before the harness stops it. It is a backstop against runs that never
-terminate, not a target: set it from the step distribution of successful runs so it rarely fires,
-warn the model before it fires so it can hand back a labelled partial result, and treat every
-exhaustion as a stuck-agent signal worth investigating.
+A max-step budget caps the model calls, tokens, seconds and dollars one run may spend. It is a backstop,
+not a target: set it from successful runs, warn before it fires, return a labelled partial, and treat
+every exhaustion as a stuck-agent signal.
 
 ## Why it exists
-A model that is stuck will keep calling tools until something external stops it, and each additional
-step costs more than the last because the accumulated context is re-sent on every call. Without a
-cap, a single stuck run can burn hours of wall-clock and a surprising amount of money before anyone
-notices, and a burst of stuck runs (a tool outage that makes every call fail) multiplies that across
-every concurrent user. The cap is the one guard that needs no intelligence to work: it cannot be
-fooled by a confident model, a mislabelled tool result or a failure mode nobody anticipated.
-
-The obvious implementation, `for step in range(20)`, is where most teams start and where many
-problems hide. Twenty of what? A model call that emits five parallel tool calls is one step or five.
-A step at the start costs a few thousand input tokens; step forty, with the whole history attached,
-may cost tens of thousands. So a step count is a loose proxy for what you actually want to bound,
-which is cost and time. And hitting the limit by raising an exception loses the work in flight: the
-model never gets to say "here is what I have so far and what is blocking me", which is often the
-most useful output of a failed run.
-
-Budgets therefore need several dimensions, a soft threshold before the hard one, and an exhaustion
-path that preserves state instead of discarding it.
+- **Stuck models never stop themselves.** A stuck model keeps calling tools until something external
+  stops it, and each step costs more than the last because the accumulated context is re-sent on every
+  call. One stuck run can burn hours of wall-clock and a surprising amount of money before anyone notices.
+- **Failures arrive in bursts.** A tool outage that makes every call fail multiplies stuck runs across
+  every concurrent user.
+- **The cap needs no intelligence.** It cannot be fooled by a confident model, a mislabelled tool result
+  or a failure mode nobody anticipated.
+- **The naive cap hides problems.** `for step in range(20)` is where most teams start. Twenty of what? A
+  call emitting five parallel tool calls is one step or five; an early step costs a few thousand input
+  tokens, step forty may cost tens of thousands. Steps are a loose proxy for what you want to bound: cost
+  and time.
+- **Raising on the limit loses the work.** The model never gets to say "here is what I have and what is
+  blocking me", often the most useful output of a failed run. So budgets need several dimensions, a soft
+  threshold before the hard one, and an exhaustion path that preserves state.
 
 ## How it works
 ### Dimensions
-- **Steps**: model invocations, one per loop iteration. Cheap to count, coarse in meaning.
-- **Tool calls**: finer-grained, and per-tool caps ("no more than five web searches") encode task
-  knowledge the model lacks.
-- **Tokens**: cumulative input plus output. Because the input is re-sent each turn, cumulative input
-  grows roughly quadratically with steps when context is not compacted. Illustrative arithmetic: if
-  each step adds about 2k tokens of context, twenty steps re-send about 2k × (1 + 2 + … + 20) ≈ 420k
-  input tokens. This is why token budgets, not step budgets, are what protect cost. Prompt caching,
-  where the provider offers it, discounts the re-sent prefix but does not shrink the token count or
-  the context-window limit, so the budget should still count tokens and price them separately.
-- **Wall-clock**: bounds user-facing latency and protects against tools that hang. It must be paired
-  with per-call timeouts; a ten-minute budget does nothing if a single tool call blocks for thirty.
-- **Money**: tokens × price plus tool costs (paid APIs, compute). The dimension finance cares about.
-- **Depth and fan-out**: for sub-agent trees, how deep delegation may recurse and how many children
-  a parent may spawn.
+| Dimension | What it counts | Why it matters |
+|---|---|---|
+| **Steps** | Model invocations, one per loop iteration | Cheap to count, coarse in meaning |
+| **Tool calls** | Each tool invocation; per-tool caps ("no more than five web searches") | Encode task knowledge the model lacks |
+| **Tokens** | Cumulative input plus output | What actually protects cost (see below) |
+| **Wall-clock** | Seconds since the run started | Bounds user-facing latency and hanging tools |
+| **Money** | Tokens × price plus tool costs (paid APIs, compute) | The dimension finance cares about |
+| **Depth and fan-out** | How deep delegation recurses, how many children a parent spawns | Bounds sub-agent trees |
+
+- **Tokens grow roughly quadratically.** Input is re-sent each turn, so without compaction cumulative
+  input grows with the square of steps. Illustrative: each step adds about 2k tokens, so twenty steps
+  re-send about 2k × (1 + 2 + … + 20) ≈ 420k input tokens.
+- **Prompt caching does not remove the need.** Where offered, it discounts the re-sent prefix but does not
+  shrink the token count or the context-window limit, so the budget still counts tokens and prices them
+  separately.
+- **Wall-clock needs per-call timeouts.** A ten-minute budget does nothing if a single tool call blocks
+  for thirty.
 
 ### Setting the number
-Measure the step and token distribution of *successful* runs per task class. Set the hard limit
-above a high percentile of that distribution (p95 to p99 plus margin), not at the mean: at the mean
-you cut off the hard-but-solvable tail, which is exactly where agents earn their keep. Then watch the
-exhaustion rate; a backstop that fires on more than a few percent of runs is not a budget problem but
-a termination or loop problem. Different task classes get different budgets: "fix a typo" and
-"migrate a module" should not share one.
+1. **Measure successful runs.** Collect the step and token distribution of *successful* runs per task
+   class.
+2. **Set the hard limit high.** Put it above a high percentile (p95 to p99 plus margin), not at the mean,
+   because at the mean you cut off the hard-but-solvable tail, exactly where agents earn their keep.
+3. **Watch the exhaustion rate.** A backstop that fires on more than a few percent of runs is a
+   termination or loop problem, not a budget problem.
+4. **Separate task classes.** "Fix a typo" and "migrate a module" should not share one budget.
 
 ### Soft threshold
-At some fraction of the budget (around 75–80% is a common starting point) inject a message: "You have
-used 16 of 20 steps. Finish up: submit your best result and list what remains." Because a model can
-usually produce a coherent partial answer when told to, this converts a hard failure into a labelled
-partial result. Below the soft line the model should not need to know the budget exists, or it may
-ration effort unnecessarily; whether to disclose it at all is a judgement call worth measuring.
+- **Warn at a fraction of the budget.** Around 75–80% is a common starting point: "You have used 16 of 20
+  steps. Finish up: submit your best result and list what remains."
+- **Why it works.** A model can usually produce a coherent partial answer when told to, so a hard failure
+  becomes a labelled partial result.
+- **Stay quiet below the line.** The model should not need to know the budget exists, or it may ration
+  effort unnecessarily; whether to disclose it at all is a judgement call worth measuring.
 
 ### Hard threshold
-When any dimension is exceeded: stop issuing model calls, persist the state (checkpoint) so a human
-or a retry with a larger budget can resume, and return status `partial` or `exhausted` with the last
-draft, never `succeeded`. Do not raise and lose the transcript.
+When any dimension is exceeded:
+1. Stop issuing model calls.
+2. Persist the state (checkpoint) so a human or a retry with a larger budget can resume.
+3. Return status `partial` or `exhausted` with the last draft, never `succeeded`.
+- **Do not raise and lose the transcript.**
 
 ### Hierarchy
-A parent agent delegating to sub-agents gives each a sub-budget, and the sum of the children's
-allowances must not exceed the parent's remaining budget. Children charge against their own budget
-and report usage upward; the parent debits on return. Without this a single sub-agent can spend the
-parent's whole allowance. Above the run, enforce tenant-level and platform-level caps (a tenant's
-daily token quota, a global concurrency cap), because a thousand runs each within budget can still be
-an incident.
+- **Sub-budgets for children.** A parent gives each sub-agent a sub-budget; the sum of the children's
+  allowances must not exceed the parent's remaining budget.
+- **Charge and report upward.** Children charge their own budget and report usage; the parent debits on
+  return. Without this a single sub-agent can spend the parent's whole allowance.
+- **Caps above the run.** Enforce tenant-level and platform-level caps (a tenant's daily token quota, a
+  global concurrency cap), because a thousand runs each within budget can still be an incident.
 
 ### Accounting
-Charge after each model response using the usage fields the API returns (input and output tokens),
-not estimates; charge tool costs as they occur; and store the counters in the checkpoint so a resumed
-run does not start from zero.
-
-Post-hoc charging has a gap: the check runs *before* a call, but the cost is only known *after* it.
-At 390k of a 400k-token budget, a check that asks "are we over?" says no, and the next call re-sends
-a 60k-token context and lands at 450k. Close the gap by projecting: the next call's input is the
-current context size (known, or counted with the provider's token counter) and its output is bounded
-by `max_tokens`, so refuse the call if `used + context + max_tokens` would exceed the limit. The same
-projection tells you when to fire the wrap-up turn instead of another working step.
+- **Use real usage, not estimates.** Charge after each model response from the usage fields the API
+  returns (input and output tokens); charge tool costs as they occur.
+- **Persist counters.** Store them in the checkpoint so a resumed run does not start from zero.
+- **Close the post-hoc gap by projecting.** The check runs *before* a call but cost is known only *after*.
+  At 390k of a 400k-token budget, "are we over?" says no, and the next call re-sends a 60k-token context
+  and lands at 450k.
+  - The next call's input is the current context size (known, or counted with the provider's token
+    counter), and its output is bounded by `max_tokens`.
+  - Refuse the call if `used + context + max_tokens` would exceed the limit. The same projection tells you
+    when to fire the wrap-up turn instead of another working step.
 
 ### Reserve for the wrap-up
-The partial result that makes exhaustion useful costs a model call of its own. If the hard limit is
-the whole allowance, that call cannot be afforded at exactly the moment it is needed. Hold back a
-reserve (one context-sized call is the natural unit) that only the wrap-up may spend, and send that
-call with tools withheld so the model summarises instead of acting.
+- **The partial result costs a call.** If the hard limit is the whole allowance, the wrap-up cannot be
+  afforded at exactly the moment it is needed.
+- **Hold back a reserve.** One context-sized call is the natural unit, spendable only by the wrap-up.
+- **Withhold tools on that call** so the model summarises instead of acting.
 
-## Example
-The budget tracks three dimensions at once, fires a single soft warning at 80% of whichever is
-closest to its limit, refuses a call whose *projected* cost would breach the token limit, and returns
-a labelled partial rather than raising. `child()` hands a sub-agent a slice of what remains and
-`absorb()` debits the parent when the child returns, so delegation cannot spend more than the parent
-had.
+## Diagram
+Before every call the harness projects the cost; the soft warning and the hard stop both come from that
+projection, not only from the fraction used.
 
-Why the warning also fires on `last`: trace a run whose context grows by about 15k tokens per
-step, so step *n* sends roughly 15k × n and cumulative spend after *n* steps is 15k × n(n+1)/2.
-After five steps it has used 225k (56%). Step six would send 90k, which fits (225k + 90k + 4k ≤ 400k),
-but six and seven together would not, so the warning goes out with step six. After it the run has
-used 315k, still under the 80% line, and step seven would project to 424k, so the loop stops with a
-partial. A purely fractional soft line would never have fired: with quadratic growth the jump from
-"under 80%" to "cannot afford another call" happens in one step, which is why the warning must be
-driven by the projection, not only by the fraction.
+```mermaid
+flowchart TD
+    S["Next loop iteration"] --> P{"used + context + max_tokens within limit?"}
+    P -->|"no"| W["Wrap-up call from reserve, no tools"]
+    W --> X["Checkpoint, return partial"]
+    P -->|"yes"| L{"Room for only one more call, or over 80%?"}
+    L -->|"yes, not yet warned"| N["Inject finish-up warning"]
+    L -->|"no"| M["Call model"]
+    N --> M
+    M --> C["Charge usage from API response"]
+    C --> D{"Submit accepted?"}
+    D -->|"yes"| OK["Return succeeded"]
+    D -->|"no"| S
+```
+
+## Examples
+### A multi-dimension budget with projection and sub-budgets
+- **Three dimensions at once:** steps, tokens and seconds, with a single soft warning at 80% of whichever
+  is closest to its limit.
+- **Projection:** it refuses a call whose *projected* cost would breach the token limit, and returns a
+  labelled partial rather than raising.
+- **Delegation:** `child()` hands a sub-agent a slice of what remains and `absorb()` debits the parent
+  when the child returns, so delegation cannot spend more than the parent had.
+
+Why the warning also fires on `last`, traced for a run whose context grows by about 15k tokens per step
+(step *n* sends roughly 15k × n; cumulative spend after *n* steps is 15k × n(n+1)/2):
+
+| After step | Cumulative | Next call | Decision |
+|---|---|---|---|
+| 5 | 225k (56%) | step six sends 90k: 225k + 90k + 4k ≤ 400k fits | but six and seven together would not, so warn with step six |
+| 6 | 315k (still under the 80% line) | step seven would project to 424k | stop with a partial |
+
+- **Lesson:** a purely fractional soft line would never have fired. With quadratic growth the jump from
+  "under 80%" to "cannot afford another call" happens in one step, so the warning must be driven by the
+  projection, not only by the fraction.
 
 ```python
 import time
@@ -170,42 +196,92 @@ def run(state, model, budget: Budget, max_out=4_000):
             return {"status": "succeeded", "result": state.result}
 ```
 
+### Runnable: simulate quadratic token growth
+Pure Python, no API. It reproduces the trace above and shows why step counts understate cost.
+
+```python
+def simulate(per_step=15_000, budget=400_000, max_out=4_000, soft=0.8):
+    used, n = 0, 0
+    while True:
+        ctx = per_step * (n + 1)                  # context sent on the next call
+        if used + ctx + max_out > budget:
+            return n, used, "stop: next call would breach"
+        last = used + 2 * (ctx + max_out) > budget
+        warn = last or used / budget >= soft
+        n += 1
+        used += ctx                               # input only, for simplicity
+        print(f"step {n}: sent {ctx//1000}k, used {used//1000}k ({used/budget:.0%})"
+              + ("  <- warn" if warn else ""))
+
+print(simulate())             # warns on step 6 at 79%, stops before step 7
+for steps in (8, 10, 20):     # re-sent context units: 36, 55, 210
+    print(steps, "steps ->", sum(range(1, steps + 1)), "units of re-sent context")
+```
+
+- **Read the output:** 8 to 10 steps is a 25% rise in steps but about 1.5x in re-sent context; 20 steps
+  re-send 210 units, nearly six times the 8-step run.
+
+## Production patterns
+- **Use the framework's turn cap as the outer backstop.** In the OpenAI Agents SDK pass `max_turns` to
+  `Runner.run` and handle `MaxTurnsExceeded`; in LangGraph set `recursion_limit` in the run config and
+  catch `GraphRecursionError`. Convert either exception into a labelled `partial` with the checkpointed
+  state rather than letting it surface as a crash. Monitor how often each fires per task class.
+- **Token budget from usage fields, projected before the call.** Read input and output tokens from every
+  response, count the next context with the provider's token-counting endpoint where available, and
+  refuse calls where `used + context + max_tokens` breaches the limit. Monitor the gap between projected
+  and actual spend.
+- **Per-task-class budgets from p95 to p99 of successes.** Recompute budgets from a weekly job over
+  successful-run traces and store them in config keyed by task class. Monitor exhaustion rate per class;
+  alert when it exceeds a few percent.
+- **Tenant and platform caps above runs.** Keep a daily token quota per tenant in a shared counter (for
+  example a Redis key with a TTL) and a global concurrency cap, and also set provider-side spend limits
+  where the provider offers them. Monitor quota burn rate and how many runs are refused at admission.
+- **Per-call timeouts under the wall-clock budget.** Wrap every tool call in a timeout (for example
+  `asyncio.wait_for`) and set the SDK client's request timeout, so the wall-clock budget can actually
+  interrupt. Monitor p99 tool latency and timeout counts per tool.
+
 ## Trade-offs
-- A tight budget bounds cost and latency precisely, but truncates the long-tail tasks that justify
-  using an agent; it flips when the exhaustion rate on solvable tasks costs more than the spend saved.
-- Warning the model about remaining budget yields usable partials, but warning too early makes it
-  rush or skip verification; keep the soft line late and measure quality on runs that got the warning.
-- Step counts are trivial to implement and explain, yet poorly correlated with cost once contexts
-  grow; token and money budgets track the real constraint at the price of accurate usage accounting.
-- Hierarchical sub-budgets keep a delegation tree bounded, but starve deep sub-tasks when the parent
-  has already spent most of its allowance; dynamic reallocation helps but complicates accounting.
-- Projecting cost before each call never overshoots the limit, but stops runs a step early whenever
-  `max_tokens` is set far above typical output; size `max_tokens` from observed output lengths, or
-  the projection becomes the binding constraint instead of real spend.
+- **Tight budget vs long-tail tasks.** It bounds cost and latency precisely but truncates the long-tail
+  tasks that justify an agent; it flips when the exhaustion rate on solvable tasks costs more than the
+  spend saved.
+- **Warning the model vs rushing.** Remaining-budget warnings yield usable partials, but warning too early
+  makes the model rush or skip verification; keep the soft line late and measure quality on runs that got
+  the warning.
+- **Step counts vs token and money budgets.** Steps are trivial to implement and explain, yet poorly
+  correlated with cost once contexts grow; token and money budgets track the real constraint at the price
+  of accurate usage accounting.
+- **Hierarchical sub-budgets vs starved sub-tasks.** They keep a delegation tree bounded, but starve deep
+  sub-tasks when the parent has already spent most of its allowance; dynamic reallocation helps but
+  complicates accounting.
+- **Projection vs early stops.** Projecting cost before each call never overshoots, but stops runs a step
+  early whenever `max_tokens` is set far above typical output; size `max_tokens` from observed output
+  lengths, or the projection becomes the binding constraint instead of real spend.
 
 ## Pitfalls
-- Counting steps but not tokens, then being surprised by the bill; the symptom is cost per run
-  growing far faster than steps per run as tasks lengthen.
-- Raising an exception on exhaustion and discarding the transcript; the symptom is support unable to
-  see what the agent did, and users receiving a bare "failed" with no partial output.
-- Resetting the budget to zero on resume from a checkpoint; the symptom is a stuck run that is
-  retried automatically consuming several budgets instead of one.
-- Sharing one budget constant across every task type; the symptom is trivial tasks with absurd
-  headroom while complex ones are cut off at a fixed step count regardless of progress.
-- A wall-clock budget without per-call timeouts; the symptom is a run that "times out" long after
-  its budget because one tool call hung and nothing interrupted it.
-- Checking the budget only after charging; the symptom is runs that end 10–20% over their token
-  limit, because the final call's cost was unknown until it had already been paid.
+- **Counting steps but not tokens.** The symptom is cost per run growing far faster than steps per run as
+  tasks lengthen, and a surprising bill. Fix: add a token or money budget.
+- **Raising an exception on exhaustion and discarding the transcript.** The symptom is support unable to
+  see what the agent did, and users receiving a bare "failed" with no partial output. Fix: checkpoint and
+  return `partial`.
+- **Resetting the budget to zero on resume.** The symptom is a stuck run that is retried automatically
+  consuming several budgets instead of one. Fix: persist counters in the checkpoint.
+- **One budget constant for every task type.** The symptom is trivial tasks with absurd headroom while
+  complex ones are cut off at a fixed step count regardless of progress. Fix: per-class budgets.
+- **Wall-clock budget without per-call timeouts.** The symptom is a run that "times out" long after its
+  budget because one tool call hung and nothing interrupted it. Fix: timeouts on every call.
+- **Checking the budget only after charging.** The symptom is runs ending 10–20% over their token limit,
+  because the final call's cost was unknown until it had been paid. Fix: project before the call.
 
 ## When to use
-Always on, from the first prototype: the prototype without a cap is the one that runs overnight.
-Choose dimensions by what you are protecting: tokens or money for cost, wall-clock for interactive
-latency, depth and fan-out for multi-agent systems, per-tool caps for expensive or rate-limited
-tools. Measure the exhaustion rate per task class, the median and p95 steps and tokens of successful
-runs, and the quality of partial results produced after the soft warning. Day to day this is the
-parameter you revisit after every "why did this run cost that much" conversation. In interviews,
-explain why steps are a proxy, how you would pick the number from data, and what happens to the state
-when the limit fires.
+- **Always on, from the first prototype:** the prototype without a cap is the one that runs overnight.
+- **Choose dimensions by what you protect:** tokens or money for cost, wall-clock for interactive latency,
+  depth and fan-out for multi-agent systems, per-tool caps for expensive or rate-limited tools.
+- **Measure:** exhaustion rate per task class, median and p95 steps and tokens of successful runs, and
+  the quality of partial results produced after the soft warning.
+- **Day to day:** this is the parameter you revisit after every "why did this run cost that much"
+  conversation.
+- **Interviews:** explain why steps are a proxy, how you would pick the number from data, and what happens
+  to the state when the limit fires.
 
 ## Role lens
 - **Engineer:** Implements the Budget object, wires usage accounting from API responses, persists the
@@ -229,6 +305,39 @@ percentile.
 Then add a token budget alongside the step cap, with a soft warning, and attack the cause: truncate
 or compact tool outputs, summarize older context, and check whether a tool started returning much
 larger payloads. Report the exhaustion rate by task class rather than lowering the step cap blindly.
+
+## Interview questions
+### Why is a step count a weak proxy for what an agent budget should bound?
+- **Steps are not uniform.** One model call may emit five parallel tool calls, and a late step re-sends
+  the whole history, so it can cost many times an early one.
+- **Cost grows roughly quadratically.** With a constant amount added per step, cumulative input scales
+  with n(n+1)/2, so token and money budgets are what actually bound spend; steps stay as a cheap backstop.
+
+### How would you pick the budget number for a new task class?
+- **From data, not intuition:** collect step and token usage of successful runs, then set the hard limit
+  above p95 to p99 plus margin.
+- **Not at the mean,** because that cuts off the hard-but-solvable tail where agents add most value.
+- **Then monitor exhaustion rate.** If it fires on more than a few percent of runs, investigate
+  termination or loops instead of raising the cap.
+
+### A run ended 12.5% over its token budget. How did that happen and how do you prevent it?
+- **Post-hoc charging gap:** the check ran before the call, but cost was only known after. At 390k of
+  400k, a 60k-context call lands at 450k.
+- **Fix by projecting:** refuse the call when `used + context + max_tokens` exceeds the limit, and keep a
+  reserve so the no-tools wrap-up call can still be afforded.
+
+### When would a tight budget be the wrong choice?
+- **When the long tail is the product.** Migrations and multi-file fixes legitimately need many steps;
+  a tight cap turns them into partials and the lost value exceeds the saved spend.
+- **When warnings make the model rush.** An early soft line can make it skip verification, so keep it
+  late (around 75–80%) and compare quality on warned versus unwarned runs.
+
+### How do you budget a parent agent that spawns sub-agents?
+- **Give each child a slice of what remains** so the sum of allowances never exceeds the parent's
+  remaining budget.
+- **Children report usage upward and the parent debits on return.**
+- **Add tenant and platform caps above the run,** because a thousand in-budget runs can still be an
+  incident.
 
 ## Quiz
 ### Q: Why is a token or cost budget a better primary guard than a step count?

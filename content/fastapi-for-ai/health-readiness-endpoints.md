@@ -92,6 +92,27 @@ dependency checks belong in readiness, never liveness.
 - Keep a separate, authenticated `/health/details` reporting each dependency's status and latency for
   dashboards and on-call, wired to no automated restart or routing decision.
 
+## Diagram
+Each probe moves a pod along a different edge: startup gates the others, readiness only toggles traffic,
+and only liveness (or an exhausted startup probe) restarts the container.
+
+```mermaid
+stateDiagram-v2
+    state "Starting, model loading, probes held" as S
+    state "Ready, in rotation" as R
+    state "Not ready, out of rotation, still running" as N
+    state "Container restarted" as X
+    [*] --> S
+    S --> R : startup probe passes and readyz 200
+    S --> X : startup failureThreshold x periodSeconds exceeded
+    R --> N : readyz 503, pool lost or draining
+    N --> R : readyz 200 again
+    R --> X : livez fails 3 times in a row
+    N --> X : livez fails 3 times in a row
+    X --> S
+    N --> [*] : SIGTERM, drained, exited
+```
+
 ## Examples
 ### Liveness, readiness and a draining flag
 A service that loads an embedding model in lifespan.
@@ -274,6 +295,42 @@ event-loop check; readiness reads local lifespan state plus this instance's own 
 timeout; the provider is not probed at all but handled in the request path with timeouts, a fallback model
 or a clear 503, plus an alert. A startup probe covers model load, and a separate authenticated details
 endpoint serves dashboards.
+
+## Interview questions
+### What is the difference between liveness, readiness and startup probes?
+- **Liveness** asks whether the process can make progress, and failure restarts the container, so it
+  should check only what a restart fixes, such as a wedged event loop.
+- **Readiness** asks whether this instance should get traffic now, and failure only removes it from
+  rotation while it recovers or drains.
+- **Startup** holds the other two until initialisation finishes, so a slow model load is not mistaken for
+  a hang.
+
+### A new model version puts pods into CrashLoopBackOff, each killed at the same age. How do you debug it?
+- **The same age is the clue:** the container is killed by a probe on a fixed schedule before it ever logs
+  "model loaded", typically liveness at about 30 seconds with defaults.
+- **Check** whether a startup probe exists and whether `failureThreshold × periodSeconds` covers the new,
+  slower load on the slowest node type.
+- **Fix:** size the startup probe from the measured worst case plus margin, and load the model off the
+  event loop with `asyncio.to_thread`.
+
+### Should readiness fail when the LLM provider is down?
+- **Usually not:** the outage hits every replica at once, so gating readiness removes every pod and with
+  them cached answers, fallback models and clear error messages.
+- **Handle it in the request path instead:** timeouts, a fallback model or a fast 503, plus an alert.
+- **Flip to gating** only when the instance truly has nothing useful to return without the provider.
+
+### Your readiness probe checks the database. How do you keep it from becoming a problem?
+- **Check only this instance's own pool**, the thing it can lose alone, not the shared database as a whole.
+- **Bound and cache it:** a 0.3 s budget inside the default 1 s `timeoutSeconds`, and a cached result for
+  5 seconds, so probes are not load on the database.
+- **Watch for many pods flapping together**, which means a shared dependency has leaked into the probe.
+
+### Why should liveness be an async def that does almost nothing?
+- **Because a blocked event loop cannot answer it,** which is exactly the condition liveness should
+  detect.
+- **A plain `def` runs in the thread pool** (40 threads by default in AnyIO), so it can fail when the pool
+  is exhausted while the loop is healthy, restarting a pod that only needed to shed load.
+- **Anything heavier** couples restarts to dependencies a restart cannot fix.
 
 ## Quiz
 ### Q: Why should a liveness probe usually not check the database?

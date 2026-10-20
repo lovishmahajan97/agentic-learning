@@ -125,6 +125,25 @@ and explicit `cache_control`. Learn them and most integration bugs become obviou
 - **Batches.** `client.messages.batches` submits many requests for asynchronous processing at a discount,
   results keyed by your `custom_id`.
 
+## Diagram
+The agent loop is driven by `stop_reason`: on a tool call, echo every content block back, then answer
+all calls in one user message; the cached prefix (tools, then system) stays fixed across iterations.
+
+```mermaid
+flowchart TD
+    P["Prefix: tools, then system, cache_control breakpoint"] --> CALL["messages.create with max_tokens and history"]
+    H[("History: append-only messages")] --> CALL
+    CALL --> SR{"stop_reason?"}
+    SR -->|"tool_use"| EC["Append full response.content as assistant turn"]
+    EC --> RUN["Run each tool_use block, validate input"]
+    RUN --> TR["One user message: tool_result per tool_use_id"]
+    TR --> H
+    SR -->|"end_turn"| DONE["Read text blocks, log usage and cache reads"]
+    SR -->|"max_tokens"| TRUNC["Truncated: retry larger or stream"]
+    SR -->|"refusal"| REF["Declined: handle before reading content"]
+    SR -->|"pause_turn"| CALL
+```
+
 ## Examples
 ### Minimal tool-use loop with a cached system prompt
 Model IDs change; take them from configuration.
@@ -280,6 +299,44 @@ their order changes, or JSON serialised without sorted keys. I would check the b
 the stable content and that the prefix exceeds the model's minimum cacheable length. I would confirm
 requests arrive within the cache lifetime and use the same model, since caches are model-scoped. Then I
 would move volatile data after the last breakpoint and watch the read counter rise.
+
+## Interview questions
+### How does the Messages API shape differ from OpenAI's Chat Completions, and why does it matter?
+- **`system` is top-level**, not a message, because it is operator configuration and a stable, cacheable
+  prefix.
+- **`max_tokens` is required** and responses are typed content blocks (`text`, `thinking`, `tool_use`)
+  rather than one string, so code must branch on `block.type`.
+- **Tool results go back as user `tool_result` blocks** keyed by `tool_use_id`; porting OpenAI code
+  without these changes is the source of most integration bugs.
+
+### The second request in your tool loop fails validation. What went wrong?
+- **Likely cause:** the code appended only the assistant's text instead of the full `response.content`, so
+  the `tool_result` blocks reference `tool_use` ids no longer in history.
+- **Other suspects:** results split across several user messages, a missing result for one of several
+  parallel calls, or thinking blocks dropped or edited, since their `signature` is verified.
+- **Fix:** treat history as append-only and return every result, including failures with `is_error: True`.
+
+### When would you not use the native Anthropic SDK?
+- **When several providers are genuinely in production** and you need routing, fallbacks or central spend
+  tracking, a router or gateway may fit better.
+- **But check feature survival:** generic wrappers often lag or flatten cache breakpoints, citations,
+  batches or reasoning controls.
+- **For Bedrock or Vertex contracts** you usually still use this SDK's platform client classes, keeping
+  calling code the same.
+
+### How much does caching save on a 6,000-token prefix resent on 10 calls?
+- **Without caching:** 10 × 6,000 = 60,000 input-token equivalents.
+- **With caching, using illustrative multipliers:** one write at ~1.25× is 7,500, nine reads at ~0.1× are
+  5,400, total 12,900, about 78% less; check current pricing per model.
+- **It only works** if the prefix is byte-identical and above the model's minimum cacheable length;
+  confirm with `cache_read_input_tokens`.
+
+### A long generation fails with a timeout or the SDK refuses the request. What do you change?
+- **Stream it:** the Python SDK refuses a non-streaming request whose `max_tokens` implies a duration
+  beyond its timeout, and long non-streaming calls can hit HTTP timeouts.
+- **Use the helper:** `client.messages.stream(...)` with `s.text_stream` for deltas and
+  `get_final_message()` for the assembled message and usage.
+- **Remember retries:** timeouts are retried, so worst-case wall clock is the timeout times attempts.
 
 ## Quiz
 ### Q: After a response with `stop_reason == "tool_use"`, what must the next request contain?

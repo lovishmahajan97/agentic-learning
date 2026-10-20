@@ -5,7 +5,7 @@ name: Regression tests
 kind: practice
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - evals/golden-dataset
   - evals/eval-harness
@@ -20,96 +20,122 @@ sources:
 ---
 
 ## TL;DR
-A regression test for an AI system re-runs a pinned set of inputs with known expected behaviour every
-time the prompt, model, retriever or tools change, and fails the change if cases that used to pass now
-fail. It exists because LLM changes are non-local: a prompt edit that fixes one case silently breaks
-others, and the provider can change the model behind the same name. The engineering problem is telling
-a real regression from sampling noise, which is why comparisons are per item and paired, not aggregate.
+An AI regression test re-runs pinned inputs whenever prompt, model, retriever or tools change, and fails
+the change if passing cases now fail. LLM changes are non-local, so the hard part is separating real
+regressions from noise with paired, per-item comparisons.
 
 ## Why it exists
-In ordinary code a change to function A does not alter function B, so a test suite can be organised
-around units. A prompt is one shared artifact that shapes every output at once: adding "always use ISO
-dates" changes the tone of refunds answers; switching to a newer model version changes how strictly it
-follows a JSON schema; raising the retriever's top-k changes which answers get cited. Fixing bug #1
-reintroduces bug #3 that was fixed last month, and nobody notices until the customer does. Without a
-pinned suite the team is playing whack-a-mole with no memory.
-
-The second force is that the system changes without anyone committing anything. Hosted models are
-updated, deprecated and re-routed; a dependency bumps the tokenizer; the retrieval index is rebuilt with
-a different chunker. A suite that runs only on diffs never sees these.
-
-The naive alternatives fail in predictable ways. "The engineer re-checks the five examples they
-remember" is biased toward the cases that were just fixed and ignores everything else. "Run the full
-eval before each release" finds regressions weeks after they were introduced, across dozens of commits,
-with no cheap way to bisect. "Snapshot the exact output string" fails on every harmless rephrasing, so
-within a month someone adds a flag to skip it. Regression tests for AI systems borrow the shape of unit
-tests (fast, automatic, per change) but replace string equality with behavioural assertions and judges,
-and replace "all tests pass" with a comparison against a baseline that respects the noise.
+- **A prompt is one shared artifact.** In ordinary code a change to function A does not alter B. A
+  prompt shapes every output at once: "always use ISO dates" changes the tone of refund answers; a newer
+  model version follows a JSON schema more or less strictly; a higher retriever top-k changes citations.
+- **Fixes reintroduce old bugs.** Fixing bug #1 brings back bug #3 fixed last month, and nobody notices
+  until the customer does. Without a pinned suite the team plays whack-a-mole with no memory.
+- **The system changes with no commit.** Hosted models are updated, deprecated and re-routed; a
+  dependency bumps the tokenizer; the index is rebuilt with a different chunker. A diff-only suite never
+  sees these.
+- **The naive alternatives fail.** Re-checking the five remembered examples is biased toward the cases
+  just fixed. "Full eval before release" finds regressions weeks late across dozens of commits, with no
+  cheap bisect. Exact-string snapshots fail on every harmless rephrasing, so someone adds a skip flag.
+- **What this borrows from unit tests.** Fast, automatic, per change, but with behavioural assertions
+  and judges instead of string equality, and a noise-aware baseline comparison instead of "all pass".
 
 ## How it works
 ### The suite is a golden set with a contract
-Each case holds an input (and any context, tool stubs or conversation history), one or more graders,
-the expected behaviour, and tags: slice, criticality, the incident it came from. Two tiers keep it
-runnable. A **smoke tier** of a few dozen cases with deterministic graders (JSON schema valid, must
-contain or must not contain, tool-call sequence matches, refuses or does not refuse) runs on every pull
-request in minutes. A **full tier** of hundreds of cases including judge-graded ones runs nightly and
-before release. A third **scheduled run with no diff** at all catches provider-side drift: if the
-Tuesday run differs from Monday's and nothing was committed, the model changed under you.
+Each case holds:
+- an input, plus any context, tool stubs or conversation history;
+- one or more graders and the expected behaviour;
+- tags: slice, criticality, the incident it came from.
+
+| Tier | Size and graders | When it runs | Catches |
+|---|---|---|---|
+| **Smoke** | A few dozen cases, deterministic graders (schema valid, must or must not contain, tool-call sequence, refuses or not) | Every pull request, in minutes | Obvious breakage |
+| **Full** | Hundreds of cases, including judge-graded ones | Nightly and before release | Smaller and quality regressions |
+| **Scheduled, no diff** | The full tier | On a schedule regardless of commits | Provider-side drift: if Tuesday differs from Monday with nothing committed, the model changed under you |
 
 ### Graders ordered by determinism
-Prefer code graders (schema, regex, numeric tolerance, set equality on extracted entities, tool-trace
-match), then reference-based judges, then rubric judges. The order matters because a flaky grader
-makes a flaky suite, and a flaky suite is ignored within weeks. A judge-graded case should carry a
-reference answer and a narrow question ("does the answer state the 30-day window?") rather than
-"is this good".
+1. **Code graders first:** schema, regex, numeric tolerance, set equality on extracted entities,
+   tool-trace match.
+2. **Then reference-based judges**, then rubric judges.
+- **Why the order matters:** a flaky grader makes a flaky suite, and a flaky suite is ignored within weeks.
+- **Narrow judge questions.** A judge-graded case carries a reference answer and asks "does the answer
+  state the 30-day window?", not "is this good".
 
 ### Handle nondeterminism explicitly
-Temperature 0 reduces variance but does not remove it: batched inference, floating-point ordering and
-provider changes all move outputs. So each case runs *k* times and records a pass rate, and "pass" for
-a critical case means all *k* passed (pass^k, the reliability reading of pass@k). A case that passed
-3 of 5 before and 3 of 5 after has not regressed; a case that went 5/5 to 2/5 has. Pin everything that
-can be pinned: model identifier with version or snapshot, prompt hash, index version, seed where the API
-supports it, and recorded responses for external tools so the test exercises the model, not the weather
-API.
+- **Temperature 0 is not deterministic.** Batched inference, floating-point ordering and provider
+  changes all move outputs.
+- **Run each case *k* times** and record a pass rate. For a critical case "pass" means all *k* passed
+  (pass^k, the reliability reading of pass@k).
+- **Read flips against noise.** 3 of 5 before and 3 of 5 after is no regression; 5/5 to 2/5 is.
+- **Pin everything pinnable:** model identifier with version or snapshot, prompt hash, index version,
+  seed where the API supports it, and recorded external tool responses, so the test exercises the model,
+  not the weather API.
 
 ### Compare per item, paired, not by aggregate
-Aggregate pass rate 82% versus 80% says almost nothing: it could be two items, or ten items flipping
-each way. The regression list is the set of items that went pass to fail; the improvement list is the
-reverse. Both are reviewed by a human, because an item that "regressed" may have a stale expectation.
-For a significance check on paired pass/fail outcomes use McNemar's test on the discordant pairs. With
-300 items where 20 flipped fail-to-pass and 14 flipped pass-to-fail, the statistic is
-(20 − 14)² / (20 + 14) ≈ 1.06, below the 3.84 threshold for p < 0.05 with one degree of freedom, so the
-suite cannot claim the change is a net improvement; it can still hand you the 14 regressed items to
-inspect. Inverting the formula gives the suite's resolution: with 34 discordant pairs the net difference
-must be at least 12 (23 against 11) to clear 3.84. When discordant pairs are few (under about 25), use
-the exact binomial version of the test instead of the chi-squared approximation. Publish this minimum
-detectable effect next to the suite so nobody reads a two-item difference as a result.
+- **Aggregates say little.** 82% versus 80% could be two items, or ten flipping each way.
+- **Two lists.** Regressions are items that went pass to fail; improvements the reverse. A human reviews
+  both, because a "regressed" item may have a stale expectation.
+- **McNemar's test on discordant pairs** checks paired pass/fail significance:
+
+```
+statistic = (b − c)² / (b + c)      b = fail→pass flips, c = pass→fail flips
+significant at p < 0.05 (one degree of freedom) when statistic > 3.84
+```
+
+| Scenario | Value |
+|---|---|
+| 300 items, 20 fail→pass, 14 pass→fail | (20 − 14)² / (20 + 14) ≈ 1.06 < 3.84: no claim of net improvement |
+| What it still gives you | The 14 regressed items to inspect |
+| Resolution with 34 discordant pairs | Net difference must be at least 12 (23 against 11) to clear 3.84 |
+| Few discordant pairs (under about 25) | Use the exact binomial version, not the chi-squared approximation |
+
+- **Publish the minimum detectable effect** next to the suite, so nobody reads a two-item difference as
+  a result.
 
 ### Run the baseline in the same job
-Pair in time as well as by item. A baseline recorded last month and a candidate run today differ by the
-change *and* by whatever drifted in between (a provider snapshot, a rebuilt index), so the flip list
-mixes both. Re-run the current production configuration on the same cases in the same job, or at least
-the same night, and diff against that; the stored baseline then serves only for the no-diff drift run,
-where drift is exactly what you want to see.
+- **Pair in time as well as by item.** A baseline from last month differs from today's candidate by the
+  change *and* by drift (a provider snapshot, a rebuilt index), so the flip list mixes both.
+- **Re-run production config** on the same cases in the same job, or at least the same night, and diff
+  against that.
+- **The stored baseline** then serves only the no-diff drift run, where drift is what you want to see.
 
 ### Gate policy
-Block the change on any smoke failure, on any flip of a case tagged critical (cases born from
-production incidents or contractual requirements), and on a net regression beyond a tolerance on the
-full tier, per slice as well as overall. Warn, do not block, on judge-graded single-item flips, because
-judge noise would otherwise block every PR. The asymmetry is deliberate: deterministic critical cases
-are cheap to run and expensive to break; judge-graded ones are noisy and should drive review, not
-blocks.
+| Condition | Action | Because |
+|---|---|---|
+| Any smoke failure | Block | Cheap, deterministic |
+| Any flip of a case tagged critical (from production incidents or contractual requirements) | Block | Cheap to run, expensive to break |
+| Net regression beyond a tolerance on the full tier, per slice and overall | Block | A real aggregate loss |
+| Judge-graded single-item flip | Warn, do not block | Judge noise would otherwise block every PR; it should drive review |
 
 ### The growth loop
-Every production incident becomes a case tagged with its ticket. Every disagreement in a review ("should
-it have refused?") becomes a case once resolved. When expected behaviour legitimately changes, the
-case's expectation is updated in the same commit as the prompt, and the suite is versioned alongside
-the prompt so a baseline is always comparable with its own expectations.
+1. **Every production incident** becomes a case tagged with its ticket.
+2. **Every resolved review disagreement** ("should it have refused?") becomes a case.
+3. **Intended behaviour changes** update the case's expectation in the same commit as the prompt.
+4. **Version the suite with the prompt**, so a baseline is always comparable with its own expectations.
 
-## Example
-A pytest suite over a JSONL case file. Each case is run *k* times, critical cases must pass every time,
-other cases fail only if they clearly got worse than the recorded baseline, and the fixture writes the
-candidate pass rates so a separate step can diff them against the baseline per slice.
+## Diagram
+A pull request runs the smoke tier, then candidate and production baseline run together on the same
+cases; the flip list, not the average, drives the gate.
+
+```mermaid
+flowchart TD
+    PR["Prompt, model, retriever or tool change"] --> SM["Smoke tier: deterministic graders"]
+    SM -->|"any failure"| BL["Block"]
+    SM -->|"green"| RUN["Candidate and production baseline, same job, k samples"]
+    RUN --> FL["Per-item flip lists"]
+    FL --> CR{"Critical case flipped?"}
+    CR -->|"yes"| BL
+    CR -->|"no"| MC["McNemar and per-slice tolerance"]
+    MC -->|"net regression"| BL
+    MC -->|"within tolerance"| RV["Human reviews both flip lists"]
+    RV --> MG["Merge"]
+    CRON["Scheduled run, no diff"] -.->|"drift vs stored baseline"| FL
+```
+
+## Examples
+### pytest suite over a JSONL case file
+Each case runs *k* times, critical cases must pass every time, other cases fail only if they clearly
+got worse than the recorded baseline, and the fixture writes candidate pass rates so a separate step can
+diff them against the baseline per slice.
 
 ```python
 # tests/test_regression.py  ->  pytest -q tests/test_regression.py
@@ -148,44 +174,98 @@ def test_no_regression(case, results):
         assert n >= base - 1, f"{case['id']} regressed: {base}/{K} -> {n}/{K}"
 ```
 
+### The diff step: flip lists and McNemar
+Pure Python, runnable. It treats a case as passing when its pass rate is 1.0, builds both flip lists
+and reports the chi-squared statistic plus the exact binomial p-value for small counts.
+
+```python
+from math import comb
+
+def flips(base: dict, cand: dict) -> tuple[list, list]:
+    ok = lambda r: r >= 1.0
+    up = [c for c in cand if c in base and not ok(base[c]) and ok(cand[c])]
+    down = [c for c in cand if c in base and ok(base[c]) and not ok(cand[c])]
+    return up, down
+
+def mcnemar(b: int, c: int) -> tuple[float, float]:
+    n = b + c
+    chi2 = (b - c) ** 2 / n if n else 0.0
+    exact_p = min(1.0, 2 * sum(comb(n, i) for i in range(min(b, c) + 1)) / 2 ** n)
+    return round(chi2, 2), round(exact_p, 3)
+
+print(mcnemar(20, 14))   # (1.06, 0.392)  not significant: review the 14 regressions anyway
+print(mcnemar(23, 11))   # (4.24, 0.058)  clears 3.84, but borderline on the exact test
+print(mcnemar(6, 0))     # (6.0, 0.031)   few pairs: trust the exact p-value
+```
+
+### Worked scenario: a "neutral" model upgrade
+Illustrative numbers. The provider's new snapshot is swapped in; the full tier has 400 items.
+
+| Step | Observation |
+|---|---|
+| Aggregate | 80% → 80%, looks harmless |
+| Flip lists | 9 fail→pass, 9 pass→fail |
+| Critical tags | 2 of the 9 regressions are incident cases (refund window, PII redaction) |
+| Gate | Blocked on critical flips, regardless of the flat average |
+| Fix | Prompt clarification, re-run in the same job: critical cases 3/3 again |
+
+## Production patterns
+- **Three cadences in CI.** Smoke tier on every pull request, full tier nightly, and the same full tier
+  on a scheduled trigger with no diff (for example a cron `schedule` in GitHub Actions). Monitor
+  no-diff flip counts as the provider-drift signal.
+- **Incident-to-case as part of the postmortem.** The postmortem is not closed until the triggering
+  input is a case tagged `critical` with the ticket ID and an owner. Monitor the share of incidents with
+  a linked case.
+- **Same-job baseline.** The CI job first runs the production config, writes the baseline file, then
+  runs the candidate, as in the example. Monitor flips on cases the change could not plausibly affect.
+- **Record and replay external tools.** Store tool and HTTP responses as fixtures (for example with
+  vcrpy cassettes) so cases are hermetic, plus a small live suite for integration. Monitor fixture age.
+- **Flakiness budget.** Periodically run the suite twice on an identical config and count items whose
+  pass rate differs; fix graders before adding cases when it exceeds the tolerance. Monitor the
+  flakiness rate per grader type.
+- **Published resolution.** Print the minimum detectable effect (from McNemar on the expected number of
+  discordant pairs) at the top of each report. Monitor reviewers citing differences below it.
+
 ## Trade-offs
-- Running each case *k* times multiplies cost and time by *k*, but without it a single unlucky sample
-  blocks a PR; drop to *k* = 1 only for deterministic graders on temperature-0 structured outputs.
-- Deterministic graders are stable and fast but blind to quality; judge graders see quality but add
-  noise, so the mix shifts toward judges as the suite moves from the smoke tier to the nightly tier.
-- Blocking on any critical flip is right when the cases come from incidents, but it becomes a tax if
-  "critical" is applied loosely; the tag needs an owner and a justification per case.
-- Recording external tool responses makes tests hermetic and cheap but hides integration breakage,
-  which then needs its own smaller live suite.
-- A large suite detects small regressions but takes longer to run and costs more per PR; a small
-  smoke tier plus nightly full tier is the usual compromise, and it flips when the model is cheap or
+- **k samples vs cost.** Running each case *k* times multiplies cost and time by *k*, but without it one
+  unlucky sample blocks a PR; drop to *k* = 1 only for deterministic graders on temperature-0
+  structured outputs.
+- **Deterministic vs judge graders.** Deterministic graders are stable and fast but blind to quality;
+  judges see quality but add noise, so the mix shifts toward judges from smoke tier to nightly tier.
+- **Blocking on critical flips vs tax.** Right when cases come from incidents, a tax if "critical" is
+  applied loosely; the tag needs an owner and a justification per case.
+- **Recorded tool responses vs integration coverage.** Hermetic and cheap, but they hide integration
+  breakage, which then needs its own smaller live suite.
+- **Suite size vs speed.** A large suite detects small regressions but runs longer and costs more per
+  PR; small smoke plus nightly full is the usual compromise, and it flips when the model is cheap or
   self-hosted.
 
 ## Pitfalls
-- Comparing aggregate pass rates between runs; the symptom is "82% vs 81%, looks fine" while ten items
-  silently flipped each way and a customer-facing case is among the losses.
-- Asserting exact output strings; the symptom is a suite that fails on every harmless rephrasing until
-  someone disables it.
-- Running only on diffs; the symptom is a regression that appears on a day with no commits, traced
-  weeks later to a provider model update.
-- Letting the suite's expectations go stale after an intended behaviour change; the symptom is a
-  permanent red test that everyone has learned to ignore, which hides the next real failure.
-- Diffing against a baseline recorded weeks ago; the symptom is flips on cases the change could not
-  plausibly affect, because provider or index drift is being attributed to the pull request.
-- Letting cases leak into the prompt as few-shot examples; the symptom is a perfect suite score and
-  unchanged production quality.
-- Grading with a judge whose prompt was tuned on the same cases; the symptom is a suite that passes
-  outputs the customer rejects.
+- **Comparing aggregate pass rates.** Symptom: "82% vs 81%, looks fine" while ten items flipped each
+  way and a customer-facing case is among the losses. Fix: review the flip lists.
+- **Asserting exact output strings.** Symptom: failures on every harmless rephrasing until someone
+  disables the suite. Fix: behavioural assertions and narrow judges.
+- **Running only on diffs.** Symptom: a regression on a day with no commits, traced weeks later to a
+  provider model update. Fix: the scheduled no-diff run.
+- **Stale expectations after an intended change.** Symptom: a permanent red test everyone ignores, which
+  hides the next real failure. Fix: update expectations in the same commit.
+- **Diffing against a weeks-old baseline.** Symptom: flips on cases the change could not plausibly
+  affect, because provider or index drift is attributed to the PR. Fix: same-job baseline.
+- **Cases leaking into the prompt as few-shot examples.** Symptom: a perfect suite score and unchanged
+  production quality. Fix: keep cases out of prompts.
+- **A judge tuned on the same cases.** Symptom: the suite passes outputs the customer rejects. Fix: tune
+  judges on a separate split.
 
 ## When to use
-Start the suite the day the first production bug is found, with that bug as case one, and run the smoke
-tier on every change to a prompt, model setting, retriever or tool schema. Reach for the full tier
-before any release and on a schedule regardless of commits. Measure per-item flips, per-slice pass
-rates and the suite's own flakiness (rate of items whose pass rate differs between two identical runs);
-if flakiness exceeds the tolerance you set, fix graders before adding cases. Do not use the regression
-suite to measure capability: it is a safety net of known behaviour, and a golden set with held-out items
-answers "is the new version better". In interviews, the expected depth is to explain why comparisons
-are paired and per item, how you handle nondeterminism, and how the suite grows from incidents.
+- **Start:** the day the first production bug is found, with that bug as case one.
+- **Run:** the smoke tier on every change to a prompt, model setting, retriever or tool schema; the
+  full tier before any release and on a schedule regardless of commits.
+- **Measure:** per-item flips, per-slice pass rates and the suite's own flakiness (items whose pass rate
+  differs between two identical runs); if flakiness exceeds your tolerance, fix graders first.
+- **Avoid when:** measuring capability. The suite is a safety net of known behaviour; a golden set with
+  held-out items answers "is the new version better".
+- **Interviews:** explain why comparisons are paired and per item, how you handle nondeterminism, and how
+  the suite grows from incidents.
 
 ## Role lens
 - **Engineer:** Owns the case file and graders, wires the smoke tier into CI, pins model and index
@@ -205,6 +285,41 @@ per-slice view, because a gain concentrated in one intent can mask a loss in ano
 to the customer. Then noise: with *k* samples per item, how many flips are within one sample of
 baseline, and does McNemar on the discordant pairs even reach significance at this suite size. Finally
 whether any expectations were edited in the same change, which would be a prompt tuned to the test.
+
+## Interview questions
+### How is a regression test for an LLM system different from a unit test?
+- **Same shape:** fast, automatic, run on every change, blocking on failure.
+- **Different assertions:** behavioural checks and narrow reference-based judges replace string
+  equality, because harmless rephrasings would break snapshots.
+- **Different pass rule:** each case runs *k* times and the comparison is against a noise-aware baseline,
+  because outputs are not deterministic even at temperature 0.
+
+### A regression appears on a Tuesday when nothing was merged. How do you find the cause?
+- **Confirm with the no-diff run:** flips against Monday's stored baseline with no commit point at drift.
+- **Check pinned versions:** model snapshot, index version, tokenizer and dependency versions; an
+  unpinned model alias is the usual culprit.
+- **Bisect the environment,** not the code: re-run with yesterday's index or model snapshot to isolate
+  which component moved.
+
+### Why not just block any PR whose aggregate pass rate drops?
+- **Aggregates hide flips:** 80% to 80% can contain several regressions, including critical ones.
+- **Aggregates also cry wolf:** a one-item drop is usually noise; with 34 discordant pairs you need a
+  net difference of 12 to clear McNemar's 3.84.
+- **Better gate:** block on smoke failures and critical flips, apply a per-slice tolerance, and only warn
+  on judge-graded single flips.
+
+### How do you keep a regression suite from becoming flaky and ignored?
+- **Order graders by determinism**, using judges only with a reference and a narrow question.
+- **Pin and record:** model snapshot, prompt hash, index version, seeds where supported, recorded tool
+  responses.
+- **Measure flakiness** by running an identical config twice, and fix graders before adding cases when
+  it exceeds the tolerance.
+
+### What goes into the suite, and what does not?
+- **In:** every production incident, every resolved review disagreement, contractual requirements, tagged
+  with slice and criticality.
+- **Not in the prompt:** cases must never double as few-shot examples, or the score becomes meaningless.
+- **Not a capability benchmark:** "is the new version better" belongs to a held-out golden set.
 
 ## Quiz
 ### Q: Why are regression results compared per item as paired pass/fail flips rather than as two aggregate pass rates?

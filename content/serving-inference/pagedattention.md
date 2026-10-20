@@ -5,7 +5,7 @@ name: PagedAttention
 kind: concept
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - model-internals/kv-cache
   - serving-inference/kv-cache-memory-estimation
@@ -20,109 +20,138 @@ sources:
 ---
 
 ## TL;DR
-PagedAttention stores each request's KV cache in fixed-size blocks (16 tokens is the usual size)
-addressed through a per-request block table, instead of one contiguous buffer reserved for the maximum
-length. Output lengths are unknown when a request arrives, so contiguous allocation must over-reserve
-and wastes most of the memory; paging allocates blocks on demand, removes external fragmentation, and
-lets requests share blocks. Decode is memory-bound, so the memory you recover becomes more concurrent
-requests, which is where vLLM's throughput gains come from.
+PagedAttention stores each request's KV cache in fixed-size blocks (usually 16 tokens) behind a
+per-request block table, so memory is allocated on demand and shared. The recovered memory becomes more
+concurrent requests, which is where vLLM's throughput gains come from.
 
 ## Why it exists
-Every token in flight costs KV-cache memory: about 0.5 MB per token for a Llama-2-7B-style model in
-fp16 (see the KV-cache lesson for the derivation). The awkward fact is that when a request arrives, the
-server has no idea how many tokens it will produce. Attention kernels before PagedAttention expected the
-K and V tensors of a sequence to be contiguous in memory, so the only safe thing to do was to reserve a
-contiguous slab for the maximum possible length at admission time. For a 2,048-token limit that is about
-1 GB per request on the model above, whether the request ends up generating 20 tokens or 2,000.
-
-That reservation strategy wastes memory in three ways. *Reserved* slots are held for tokens that have
-not been generated yet, so nothing else can use them. *Internal fragmentation* is the part of the
-reservation the request never reaches because it stops early. *External fragmentation* appears between
-slabs of different sizes once requests with different limits come and go, leaving holes too small for the
-next arrival. The vLLM paper measured that in prior systems only a minority of KV-cache memory, roughly
-20–40%, actually held token state; the rest was waste.
-
-The naive fixes do not work. Allocating the exact length is impossible because the length is unknown.
-Growing a contiguous buffer by reallocate-and-copy means copying hundreds of megabytes every few tokens
-and still fragments. Lowering the length limit refuses legitimate long requests. What was needed was the
-same move operating systems made decades ago for RAM: stop requiring physical contiguity and translate
-logical addresses through a table.
+- **Every token in flight costs memory.** About 0.5 MB per token for a Llama-2-7B-style model in fp16
+  (see the KV-cache lesson for the derivation).
+- **Output length is unknown at admission.** Kernels before PagedAttention expected each sequence's K and
+  V to be contiguous, so the only safe move was a contiguous slab for the maximum length. For a
+  2,048-token limit that is about 1 GB per request, whether it generates 20 tokens or 2,000.
+- **Reservation wastes memory three ways.** *Reserved* slots hold tokens not generated yet; *internal
+  fragmentation* is the part a request never reaches because it stops early; *external fragmentation* is
+  holes between slabs of different sizes, too small for the next arrival.
+- **Most memory was waste.** The vLLM paper measured that in prior systems only roughly 20–40% of
+  KV-cache memory actually held token state.
+- **The naive fixes fail.** Exact-length allocation is impossible (length unknown). Reallocate-and-copy
+  copies hundreds of megabytes every few tokens and still fragments. A lower length limit refuses
+  legitimate long requests. The answer was the OS move for RAM: drop physical contiguity and translate
+  addresses through a table.
 
 ## How it works
 ### Blocks and block tables
-The KV cache is carved into *physical blocks* of a fixed number of tokens, call it B. For one layer, a
-block holds K and V for B tokens across all KV heads, so its size is `2 × n_kv_heads × head_dim × B ×
-bytes_per_element`. For Llama-2-7B in fp16 with B = 16 that is 2 × 32 × 128 × 16 × 2 = 262,144 bytes, 256
-KB per layer, or 8 MB per block summed over 32 layers, which is exactly 16 tokens × 0.5 MB.
-
-Each request owns a sequence of *logical blocks* (block 0 holds tokens 0–15, block 1 holds 16–31, and
-so on) and a *block table* mapping each logical block to the physical block that currently holds it.
-Logical blocks are contiguous; physical blocks can be anywhere in the pool. This is a page table, and the
-block table lookup is the address translation.
+- **Physical blocks.** The cache is carved into blocks of a fixed number of tokens, B. For one layer a
+  block holds K and V for B tokens across all KV heads: `2 × n_kv_heads × head_dim × B ×
+  bytes_per_element`.
+- **Worked size.** Llama-2-7B, fp16, B = 16: 2 × 32 × 128 × 16 × 2 = 262,144 bytes, 256 KB per layer, or
+  8 MB per block summed over 32 layers. That is exactly 16 tokens × 0.5 MB.
+- **Logical blocks.** Each request owns a sequence of logical blocks (block 0 holds tokens 0–15, block 1
+  holds 16–31, and so on).
+- **Block table.** Maps each logical block to the physical block holding it. Logical blocks are
+  contiguous; physical blocks can be anywhere in the pool. This is a page table, and the lookup is the
+  address translation.
 
 ### Allocation on demand
-A request is admitted with only the blocks its prompt needs. When the last block fills during decode,
-the scheduler hands out one more. The only waste is the unused tail of a request's final block, which is
-strictly less than B tokens per sequence, and because every block has the same size there is no external
-fragmentation at all: any free block fits any request. This is *because* fixed-size units are the one
-allocation scheme where freed space is always reusable, which is why the kernel's memory manager and the
-OS page allocator work the same way.
+1. **Admit** a request with only the blocks its prompt needs.
+2. **Grow** by one block when the last block fills during decode.
+3. **Waste** is only the unused tail of the final block, strictly less than B tokens per sequence.
+4. **No external fragmentation**, because every block has the same size, so any free block fits any
+   request. Fixed-size units are the one scheme where freed space is always reusable, which is why the
+   OS page allocator works the same way.
 
 ### The attention kernel
-The engine hands the kernel a block-table tensor of shape [num_seqs, max_blocks_per_seq] plus each
-sequence's current length. For each sequence the kernel takes the new token's query, walks that row of
-the table, loads K and V from each physical block, and accumulates attention block by block. Softmax
-needs the maximum and the sum over *all* scores, which are unknown until the last block, so the kernel
-keeps a running maximum *m*, a running denominator *l* and a running weighted sum of V, and rescales what
-it has accumulated by `exp(m_old − m_new)` whenever a later block raises the maximum (the same
-online-softmax trick FlashAttention uses). The output is exact; only the memory layout changed.
-
-The indirection costs something: memory accesses are less coalesced than for a single contiguous
-tensor, so the kernel itself is somewhat slower than a contiguous one. The design accepts that *because*
-decode throughput is limited by how many sequences fit, not by per-sequence kernel speed; a slightly
-slower kernel over far more sequences wins. The idea has outlived the original kernel: current engines
-often run FlashAttention- or FlashInfer-family kernels that accept a block table directly, so
-"PagedAttention" now names the memory-management scheme more than one specific kernel.
+- **Inputs.** A block-table tensor of shape [num_seqs, max_blocks_per_seq] plus each sequence's current
+  length.
+- **Per sequence.** Take the new token's query, walk that row of the table, load K and V from each
+  physical block, and accumulate attention block by block.
+- **Online softmax.** Softmax needs the maximum and sum over *all* scores, unknown until the last block.
+  The kernel keeps a running maximum *m*, a running denominator *l* and a running weighted sum of V, and
+  rescales by `exp(m_old − m_new)` whenever a later block raises the maximum (the FlashAttention trick).
+  The output is exact; only the layout changed.
+- **The indirection costs something.** Accesses are less coalesced than for one contiguous tensor, so the
+  kernel is somewhat slower. The design accepts that *because* decode throughput is limited by how many
+  sequences fit, not per-sequence kernel speed.
+- **The name outlived the kernel.** Current engines often run FlashAttention- or FlashInfer-family kernels
+  that accept a block table directly, so "PagedAttention" now names the memory-management scheme.
 
 ### Sizing the pool
-At startup the engine measures what the weights take, runs a dummy forward pass at the maximum batch to
-find peak activation memory, and gives the remainder of its configured budget (vLLM's
-`gpu_memory_utilization`, historically defaulting to 0.9) to the block pool. Capacity in tokens is simply
-`num_blocks × B`, and the scheduler admits a request only when enough free blocks exist for its prompt.
+1. Measure what the weights take.
+2. Run a dummy forward pass at the maximum batch to find peak activation memory.
+3. Give the rest of the configured budget (vLLM's `gpu_memory_utilization`, historically defaulting to
+   0.9) to the block pool.
+4. Capacity in tokens is `num_blocks × B`; the scheduler admits a request only when enough free blocks
+   exist for its prompt.
 
 ### Sharing and copy-on-write
-Because requests reference blocks indirectly, two requests can map the same physical block, tracked with
-a reference count. Parallel sampling (`n > 1`) and beam search share the prompt's blocks instead of
-copying them. Prefix caching extends this across requests: full blocks are hashed by their content (and
-the prefix before them), so a new request whose system prompt matches an earlier one reuses the resident
-blocks and skips that part of prefill. When a sequence needs to write into a shared block, the engine
-copies it first, the same copy-on-write rule as `fork()`.
+- **Reference counts.** Requests reference blocks indirectly, so two can map the same physical block.
+- **Within a request.** Parallel sampling (`n > 1`) and beam search share the prompt's blocks instead of
+  copying them.
+- **Across requests (prefix caching).** Full blocks are hashed by their content and the prefix before
+  them, so a matching system prompt reuses resident blocks and skips that part of prefill.
+- **Copy-on-write.** Before writing into a shared block the engine copies it, the same rule as `fork()`.
 
 ### Running out of blocks
-On-demand allocation means the pool can run dry mid-generation. The scheduler then preempts a sequence,
-either by swapping its blocks to CPU memory or by freeing them and recomputing the prefix later (which of
-the two an engine offers varies by version: vLLM's V1 engine recomputes only). Swap cost grows with the
-sequence's cache bytes over PCIe, recompute cost with the prefill FLOPs to rebuild it; the rough
-intuition is that recompute suits short sequences and swap long ones, but the crossover depends on the
-hardware and on how busy the GPU already is, so neither wins universally. Either way, preemption counters rising in the metrics is the sign the pool
-is too small for the traffic.
+- **Preemption.** On-demand allocation can run the pool dry mid-generation. The scheduler then swaps a
+  sequence's blocks to CPU memory or frees them and recomputes the prefix later. Which an engine offers
+  varies by version: vLLM's V1 engine recomputes only.
+
+| Option | Cost grows with | Rough fit |
+|---|---|---|
+| Swap | cache bytes over PCIe | long sequences |
+| Recompute | prefill FLOPs to rebuild | short sequences |
+
+- **Neither wins universally.** The crossover depends on hardware and how busy the GPU already is.
+- **The signal.** Preemption counters rising in the metrics mean the pool is too small for the traffic.
 
 ### Choosing the block size
-Larger blocks mean fewer table entries and better memory coalescing in the kernel, but more waste in each
-sequence's last block and coarser prefix-cache sharing (only complete blocks are shared). Smaller blocks
-reverse the trade. Sixteen tokens is the common compromise.
+| Block size | Gains | Costs |
+|---|---|---|
+| Larger | fewer table entries, better coalescing | more waste in the last block, coarser prefix sharing (only complete blocks are shared) |
+| Smaller | less tail waste, finer sharing | more table entries, worse coalescing |
 
-## Example
-Capacity for a Llama-3-8B-class model (32 layers, 8 KV heads, head_dim 128, fp16) on an 80 GB GPU.
-KV per token is 2 × 32 × 8 × 128 × 2 = 131,072 bytes = 128 KB, so a 16-token block is 2 MB across all
-layers. With weights at ~16 GB, a 0.9 memory budget (72 GB) and an illustrative 2 GB activation peak,
-about 54 GB goes to the pool: 27,648 blocks, roughly 442,000 tokens of KV capacity.
+Sixteen tokens is the common compromise.
 
-Compare two allocators serving chats whose actual length averages 1,500 tokens under an 8,192-token
-limit. Contiguous reservation holds 8,192 × 128 KB = 1 GB per request no matter what, so 54 requests fit.
-Paged allocation holds about 1,500 tokens plus a partial block per request, roughly 188 MB, so around 290
-requests fit in the same pool, about 5× more, and the kernel never has to copy anything when a chat runs
-long. The script below reproduces the arithmetic so you can plug in your own model.
+## Diagram
+A request's logical blocks map through its block table to scattered physical blocks; a full last block
+triggers one more allocation, and an empty pool triggers preemption.
+
+```mermaid
+flowchart TD
+    R["Request admitted with prompt"] --> T["Block table: logical to physical"]
+    T --> P[("Physical block pool")]
+    D["Decode: append K, V"] --> F{"Last block full?"}
+    F -->|"no"| W["Write into tail block"]
+    F -->|"yes"| A{"Free block available?"}
+    A -->|"yes"| N["Allocate one block"]
+    N --> T
+    A -->|"no"| X["Preempt: swap or recompute"]
+    X -.->|"frees blocks"| P
+    K["Attention kernel"] -->|"walks table row"| P
+```
+
+## Examples
+### Capacity: contiguous vs paged on an 80 GB GPU
+A Llama-3-8B-class model (32 layers, 8 KV heads, head_dim 128, fp16).
+
+| Quantity | Value |
+|---|---|
+| KV per token | 2 × 32 × 8 × 128 × 2 = 131,072 bytes = 128 KB |
+| One 16-token block, all layers | 2 MB |
+| Weights | ~16 GB |
+| Budget at 0.9 | 72 GB |
+| Activation peak (illustrative) | 2 GB |
+| Block pool | about 54 GB = 27,648 blocks ≈ 442,000 tokens |
+
+Chats averaging 1,500 actual tokens under an 8,192-token limit:
+
+| Allocator | Memory per request | Requests that fit |
+|---|---|---|
+| Contiguous | 8,192 × 128 KB = 1 GB, always | 54 |
+| Paged | ~1,500 tokens + a partial block ≈ 188 MB | around 290 (about 5× more) |
+
+The paged kernel also never copies anything when a chat runs long. The script reproduces the arithmetic:
 
 ```python
 def kv_capacity(gpu_gb, weights_gb, util=0.9, act_gb=2.0,
@@ -140,36 +169,109 @@ for avg_len, max_len in [(1500, 8192), (6000, 8192)]:
     print(f"avg {avg_len}: contiguous fits {contiguous}, paged fits {paged}")
 ```
 
+### A toy block allocator with sharing and copy-on-write
+Pure Python, runnable as is. It shows on-demand growth, `fork()`-style sharing for parallel sampling and
+copy-on-write of a shared tail block.
+
+```python
+class BlockPool:
+    def __init__(self, num_blocks, block=16):
+        self.block, self.free = block, list(range(num_blocks))
+        self.ref = [0] * num_blocks
+
+    def alloc(self):
+        if not self.free:
+            raise MemoryError("out of blocks: preempt a sequence")
+        b = self.free.pop()
+        self.ref[b] = 1
+        return b
+
+    def release(self, b):
+        self.ref[b] -= 1
+        if self.ref[b] == 0:
+            self.free.append(b)
+
+class Sequence:
+    def __init__(self, pool, n_prompt=0):
+        self.pool, self.len, self.table = pool, 0, []
+        for _ in range(n_prompt):
+            self.append()
+
+    def append(self):                              # store one new token's K and V
+        p = self.pool
+        if self.len % p.block == 0:                # last block full, or no block yet
+            self.table.append(p.alloc())
+        elif p.ref[self.table[-1]] > 1:            # copy-on-write a shared partial block
+            p.release(self.table[-1])
+            self.table[-1] = p.alloc()             # (a real engine also copies its K/V)
+        self.len += 1
+
+    def fork(self):                                # parallel sampling: share, do not copy
+        child = Sequence(self.pool)
+        child.len, child.table = self.len, list(self.table)
+        for b in self.table:
+            self.pool.ref[b] += 1
+        return child
+
+pool = BlockPool(num_blocks=8)
+a = Sequence(pool, n_prompt=40)                    # 40 tokens -> 3 blocks (16 + 16 + 8)
+b = a.fork()                                       # n=2 sampling shares all 3
+print(a.table, b.table, "free:", len(pool.free))   # [7, 6, 5] [7, 6, 5] free: 5
+a.append(); b.append()                             # both write into the shared tail block
+print(a.table, b.table, "free:", len(pool.free))   # [7, 6, 4] [7, 6, 5] free: 4
+```
+
+## Production patterns
+- **Profile, then set the memory fraction.** When deploying a new model or GPU, start vLLM at the
+  default `gpu_memory_utilization` (0.9) and raise it only after re-profiling activation peaks with your
+  real `max_model_len` and batch size. Monitor KV-cache usage and OOMs.
+- **Alert on preemptions, not OOMs.** Under lazy allocation a small pool shows up as preemptions and
+  latency jitter. Scrape the engine's Prometheus metrics endpoint and alert when the preemption counter
+  rises steadily while KV-cache usage sits near 100%.
+- **Cap context per route.** When long-document chats share a deployment with short Q&A, lower
+  `max_model_len` (or route long requests to their own deployment) so a few long chats cannot drain the
+  pool. Monitor block usage per route and p95 prompt length.
+- **Design prompts for block sharing.** Turn on prefix caching (`--enable-prefix-caching` in vLLM) and
+  keep the system prompt and tool definitions byte-identical and first, with dates and user IDs after
+  them. Monitor the prefix-cache hit rate and time to first token.
+- **Stretch the pool with an FP8 cache.** When block usage is the bottleneck, set the KV-cache dtype to
+  fp8 (`--kv-cache-dtype fp8` in vLLM) and run your eval set before rollout. It roughly doubles tokens
+  of capacity per GPU.
+
 ## Trade-offs
-- You recover most of the memory lost to reservation and fragmentation, but the attention kernel pays an
-  indirection and coalescing cost per block, a net loss only when the batch is too small for the extra
-  sequences to matter, such as one long request alone on a GPU.
-- On-demand allocation admits many more requests, but it can run out of blocks mid-generation, so the
-  system needs a preemption policy (swap or recompute) that contiguous reservation never needed.
-- Block sharing makes beam search, parallel sampling and prefix caching nearly free in memory, at the cost
-  of reference counting and copy-on-write logic that makes the memory manager harder to reason about.
-- Larger blocks give faster kernels and fewer table entries; smaller blocks waste less in partial blocks
-  and share prefixes at finer granularity. The best size flips as average request length shrinks.
+- **Recovered memory vs kernel speed.** You recover most memory lost to reservation and fragmentation,
+  but the kernel pays an indirection and coalescing cost per block. It is a net loss only when the batch
+  is too small for extra sequences to matter, such as one long request alone on a GPU.
+- **More admissions vs mid-generation exhaustion.** On-demand allocation admits many more requests, but
+  can run out of blocks mid-generation, so the system needs a preemption policy (swap or recompute) that
+  contiguous reservation never needed.
+- **Free sharing vs memory-manager complexity.** Block sharing makes beam search, parallel sampling and
+  prefix caching nearly free in memory, at the cost of reference counting and copy-on-write logic that
+  is harder to reason about.
+- **Large vs small blocks.** Larger blocks give faster kernels and fewer table entries; smaller ones
+  waste less in partial blocks and share prefixes at finer granularity. The best size flips as average
+  request length shrinks.
 
 ## Pitfalls
-- Reading the paper's throughput gain as "a faster attention kernel". The kernel is slightly slower; the
-  2–4× comes from batching more sequences. If your batch is already small, you will not see it.
-- Ignoring preemption metrics. A pool that is slightly too small shows up as a throughput cliff and
-  jittery latency under load, not as an OOM, because sequences are silently swapped or recomputed.
-- Expecting prefix caching to share partially identical prompts. Only whole blocks with identical content
-  and prefix are shared, so a timestamp in the first line of the system prompt defeats it entirely;
-  the symptom is a prefix-cache hit rate near zero for prompts that look identical.
-- Setting `gpu_memory_utilization` to 0.98 to get more blocks and then OOMing when another process, a
-  CUDA graph or a larger-than-profiled activation peak needs the headroom.
+- **Reading the gain as "a faster attention kernel".** The kernel is slightly slower; the 2–4× comes from
+  batching more sequences. If your batch is already small, you will not see it.
+- **Ignoring preemption metrics.** A pool slightly too small shows up as a throughput cliff and jittery
+  latency under load, not as an OOM, because sequences are silently swapped or recomputed.
+- **Expecting prefix caching to share partially identical prompts.** Only whole blocks with identical
+  content and prefix are shared, so a timestamp in the first line of the system prompt defeats it. The
+  symptom is a prefix-cache hit rate near zero for prompts that look identical.
+- **Setting `gpu_memory_utilization` to 0.98 for more blocks.** It then OOMs when another process, a CUDA
+  graph or a larger-than-profiled activation peak needs the headroom.
 
 ## When to use
-You do not switch PagedAttention on; every mainstream open engine (vLLM, SGLang, TensorRT-LLM and
-others) uses block-based KV management, so the decision is how to configure and observe it. Reach for the
-block arithmetic when sizing a deployment: tokens of capacity, expected tokens per request, and therefore
-concurrency. Watch block utilization and preemption counts in production; they tell you whether to lower
-`max_model_len`, raise the memory fraction, add prefix caching, or add GPUs. In interviews, the expected
-depth is to explain the three kinds of waste, why fixed-size blocks remove two of them, and why the win is
-measured in concurrent sequences rather than kernel speed.
+You do not switch PagedAttention on: every mainstream open engine (vLLM, SGLang, TensorRT-LLM and others)
+uses block-based KV management. The decision is how to configure and observe it.
+- **Sizing a deployment:** use the block arithmetic for tokens of capacity, expected tokens per request,
+  and therefore concurrency.
+- **In production:** watch block utilization and preemption counts. They tell you whether to lower
+  `max_model_len`, raise the memory fraction, add prefix caching, or add GPUs.
+- **Interviews:** explain the three kinds of waste, why fixed-size blocks remove two of them, and why the
+  win is measured in concurrent sequences rather than kernel speed.
 
 ## Role lens
 - **Engineer:** Tunes block pool size, `max_model_len` and prefix caching in the engine config, and reads
@@ -191,6 +293,38 @@ either shrink demand per sequence (lower `max_model_len`, shorter retrieved cont
 increase supply (higher memory fraction after re-profiling activation peaks, a GQA model, more GPUs with
 tensor parallelism), or cap concurrency so admitted requests finish instead of thrashing. If the chats
 share a long system prompt, enabling prefix caching recovers blocks too.
+
+## Interview questions
+### What problem does PagedAttention solve, and why is the analogy to virtual memory apt?
+- **Problem:** output length is unknown at admission, so contiguous KV buffers must reserve the maximum
+  length, wasting memory to reservation, internal and external fragmentation.
+- **Analogy:** like OS paging, logical blocks map through a per-request table to physical blocks anywhere
+  in the pool, so contiguity is no longer needed and any free block fits any request.
+
+### Your vLLM deployment shows latency spikes under load but no OOMs. How do you debug it?
+- **Check KV-cache usage and preemption counters first.** Usage pinned near 100% with rising preemptions
+  means the pool is too small for the traffic mix.
+- **Then look at demand.** Compare prompt-length and output-length distributions before and after the
+  spikes; a shift to long documents drains blocks.
+- **Fix by shrinking demand or growing supply:** lower `max_model_len`, cap concurrent sequences, enable
+  an fp8 cache or prefix caching, or add GPUs.
+
+### When would PagedAttention give you little or no benefit?
+- **Small batches.** The win comes from fitting more sequences; one long request alone on a GPU only pays
+  the indirection cost of the slower kernel.
+- **Requests that always use their full length.** If actual length is close to the limit, contiguous
+  reservation wastes little, so paging recovers little.
+
+### How would you pick a block size, and what does it change?
+- **Larger blocks:** fewer table entries and better memory coalescing, but more tail waste per sequence
+  and coarser prefix sharing because only complete blocks are shared.
+- **Smaller blocks:** less waste and finer sharing, at more table overhead. Sixteen tokens is the common
+  default; deviate only after measuring with your length distribution.
+
+### Estimate how many 1,500-token chats fit on an 80 GB GPU for an 8B GQA model.
+- **Per token:** 2 × 32 layers × 8 KV heads × 128 × 2 bytes = 128 KB.
+- **Pool:** 80 × 0.9 − 16 GB weights − ~2 GB activations ≈ 54 GB, about 442,000 tokens.
+- **Answer:** around 290 chats paged versus 54 with contiguous 8,192-token reservations, roughly 5× more.
 
 ## Quiz
 ### Q: Where does most of PagedAttention's throughput improvement come from?

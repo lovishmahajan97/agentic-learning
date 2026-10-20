@@ -107,6 +107,24 @@ exact solution.
 | OS libraries (glibc, CUDA drivers), base container image | an image digest |
 | model weights | model revisions or checksums |
 
+## Diagram
+The lock is the only input to every install, hash checks guard the bytes, and changes reach the lock only
+through a reviewed upgrade pull request that CI and evals must pass.
+
+```mermaid
+flowchart TD
+    D["pyproject.toml: PEP 440 ranges"] --> R["Resolver: uv, Poetry, pip-compile"]
+    R --> L[("Lockfile: exact versions, hashes, markers, sources")]
+    L --> I["Install: uv sync --locked or pip install --require-hashes"]
+    I --> H{"File hash matches the lock?"}
+    H -->|"no"| F["Install fails: tampered or substituted artifact"]
+    H -->|"yes"| E["Same bytes on laptop, CI and container"]
+    B["Weekly bot: uv lock --upgrade"] --> P["Upgrade PR with lock diff"]
+    P --> T{"CI and eval suite pass?"}
+    T -->|"yes, merge"| L
+    T -->|"no"| X["Hold back, or add a temporary bound with a ticket"]
+```
+
 ## Examples
 ### Worked failure: an unlocked rebuild breaks every request
 A RAG service declares `openai>=1.0` and `httpx` with no lockfile.
@@ -234,6 +252,39 @@ dependencies, so it declares ranges covering versions it is tested against, perh
 and locks only its own CI environment. If the library pinned exact versions, every consuming service would
 be forced onto those versions, and any service needing a different version of a shared package (an SDK,
 pydantic, httpx) would hit an unresolvable conflict.
+
+## Interview questions
+### Why do you need a lockfile if `pyproject.toml` already lists your dependencies?
+- **`pyproject.toml` holds ranges for direct dependencies only,** while a typical AI service installs well
+  over a hundred packages, each with its own ranges and new releases daily.
+- **Without a lock,** two installs of the same source tree days apart can differ, and the breakage arrives in
+  a package nobody chose directly.
+- **The lock records the exact resolved set with hashes,** so every environment installs the same bytes and
+  an incident is bisectable to a lock diff.
+
+### A deploy broke with a `TypeError` about an unexpected keyword, but nobody changed code. How do you investigate?
+- **Compare environments:** diff the installed versions (or the lock) between the last good image and the
+  broken one; an unlocked rebuild often pulled a new transitive minor.
+- **Known shape:** older OpenAI Python SDK releases broke when httpx 0.28 removed its `proxies` argument.
+- **Fix and prevent:** upgrade the SDK or add `httpx<0.28` with a ticket, then lock and install only from the
+  lock, with an integration test that constructs the real clients.
+
+### What does `~=1.4` allow, and why does that trip people up?
+- **It means `>=1.4, ==1.*`,** so 1.9 is allowed; the number of components decides how much floats.
+- **For patch releases only,** write `~=1.4.0` or `>=1.4,<1.5`.
+- **And remember** PEP 440 defines ordering, not compatibility, and many AI-stack packages are still `0.x`.
+
+### When does hash checking cause more friction than it is worth, and what do you do then?
+- **Missing hashes:** the lock lacks a hash for another platform's wheel.
+- **Rebuilt artifacts:** an internal mirror re-packages files, producing new bytes and new hashes.
+- **Unhashable sources:** direct URL and VCS dependencies pip cannot hash-check; verify at the mirror or pin by
+  commit instead of dropping verification everywhere.
+
+### Your eval scores shifted between two runs with the same commit and the same lock. What else would you pin?
+- **The interpreter:** a `requires-python` range plus a `.python-version`.
+- **System layers:** the base image by digest, which also fixes OS libraries and the CUDA runtime.
+- **Model weights:** a revision or checksum, for example a commit hash as the Hugging Face `revision=`, and
+  record all of these alongside the eval results.
 
 ## Quiz
 ### Q: What does hash checking in a lockfile protect against that exact version pins alone do not?

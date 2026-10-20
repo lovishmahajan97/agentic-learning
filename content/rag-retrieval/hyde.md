@@ -83,6 +83,24 @@ facts; it costs one generation per query.
 - **The honest position is model- and corpus-dependent:** measure recall@k on your golden set with and
   without it.
 
+## Diagram
+Note where the hypothetical stops: it shapes the search vector, but only real passages reach the
+reranker and the generator, both of which see the original question.
+
+```mermaid
+flowchart TD
+    Q["User question"] --> G["LLM writes n hypothetical answer passages"]
+    G --> E["Embed each with the corpus encoder, passage mode"]
+    Q --> EQ["Embed the question, query mode"]
+    E --> AV["Average vectors and normalise"]
+    EQ --> AV
+    AV --> S["Nearest-neighbour search"]
+    I[("Corpus index, same encoder")] --> S
+    S -->|"real passages"| RR["Rerank against the original question"]
+    RR --> A["Generator answers from real passages only"]
+    G -.->|"logged, never sent to the generator"| L[("Debug log")]
+```
+
 ## Examples
 ### HyDE with multiple samples and a query anchor
 `llm`, `embed` and `index.search` are stubs for any provider, encoder and vector store.
@@ -228,6 +246,46 @@ encoder and hybrid search, which may close the gap for free. Risks: the wiki cov
 model cannot write about, giving generic hypotheticals; identifier-heavy queries regress if the original
 query is dropped; latency rises by one generation; and if the hypothetical ever leaks into the answer
 prompt, invented details get cited. Keep it as a search key only.
+
+## Interview questions
+### What is HyDE and why does a partly hallucinated passage retrieve the right documents?
+- **Definition:** an LLM writes a plausible answer passage, you embed it with the corpus encoder instead of
+  (or with) the question, and retrieve the real passages nearest to it.
+- **Why it works:** questions and passages are different shapes; an answer-shaped text lands among real
+  answers, while a bare question's nearest neighbours are other questions.
+- **Why wrong facts mostly do not matter:** the encoder is a lossy compressor that keeps topic, entities and
+  structure and gives little weight to a specific number such as "48 hours" versus 24.
+
+### You added HyDE and recall@10 dropped below the plain-query baseline. What do you check?
+- **Encoder mismatch:** the hypothetical must be embedded with the same model and mode as the corpus;
+  a different encoder puts it in an unrelated space.
+- **Dropped query:** identifier-heavy queries regress when the original is not averaged in or not sent to
+  BM25 and the reranker.
+- **Entity confusion and truncation:** on private domains the model writes about the wrong product, and a
+  long hypothetical may be silently truncated past the encoder's input limit.
+
+### When would you not use HyDE?
+- **When the embedder already closes the gap:** an instruction-tuned model trained on query-passage pairs
+  of your query type leaves little gain while the generation cost stays.
+- **For identifier lookups and time-sensitive facts,** where invented or stale details pull the vector
+  toward the wrong or outdated passages.
+- **At high query volume over a stable corpus,** index-time question generation pays the generation cost
+  once per chunk instead of once per query.
+
+### How do you keep HyDE's latency acceptable in production?
+- **Use it as a fallback:** run plain retrieval first and only generate when first-pass scores fall below a
+  cut-off tuned on the golden set.
+- **Keep hypotheticals short** with a capped output length, and generate the n samples concurrently,
+  because one decoded passage (several hundred milliseconds to a few seconds) precedes the search.
+- **Monitor** the fallback rate, p95 generation latency and recall@k on the fallback slice.
+
+### How does HyDE relate to Query2doc and doc2query?
+- **Query2doc** concatenates the original query with the generated pseudo-document, and helps sparse BM25
+  as well as dense retrieval.
+- **Doc2query-style expansion** is the mirror image at index time: generate the questions each chunk
+  answers, so the corpus becomes question-shaped.
+- **Choose by where you can pay:** HyDE for a corpus you cannot re-index or low query volume, doc2query for
+  high volume and a stable corpus.
 
 ## Quiz
 ### Q: Why does a hypothetical answer with a wrong number still retrieve the right passage?

@@ -90,6 +90,24 @@ Either way the unit is a fact like `(Service:payments)-[:DEPENDS_ON]->(Database:
 - **Text-extracted edges carry extraction confidence and run id**, so a bad prompt version can be rolled
   back by deleting its edges.
 
+## Diagram
+Construction on the left keeps the graph true; retrieval on the right turns a relational question into a
+bounded traversal whose per-hop provenance becomes the citation trail.
+
+```mermaid
+flowchart LR
+    SR["Systems of record: CMDB, HR, CRM"] -->|"deterministic mapping"| ER["Entity resolution: IDs, names, review"]
+    TX["Documents"] -->|"LLM extraction into schema"| ER
+    ER --> KG[("Knowledge graph: typed nodes, temporal edges, provenance")]
+    CF["Change feeds and reconcile"] -.->|"update or delete edges"| KG
+    Q["Relational question"] --> T{"Known question type?"}
+    T -->|"yes"| PT["Parametrised tool: bounded hops, LIMIT, read-only"]
+    T -->|"no"| TC["Text-to-Cypher behind a validator"]
+    PT --> KG
+    TC --> KG
+    KG --> A["Rows plus sources into the prompt"]
+```
+
 ## Examples
 ### A join beats similarity (runnable, in memory)
 A miniature graph. In production the same logic is one Cypher query, shown in the comment.
@@ -235,6 +253,38 @@ two different Priyas may have merged by name alone, which explains wrong project
 the HR system and attribute-based matching. Second, schema looseness: if extraction produced varied relation
 names (LEADS, MANAGES, WORKS_ON), the query misses synonyms or includes non-lead roles. Constrain relation
 types in the extraction schema, and better still, load ownership from the project system directly.
+
+## Interview questions
+### When does a knowledge graph beat vector search for RAG?
+- **When the answer is a path or a count, not a passage:** "which customers use a product affected by
+  CVE-123" needs product to deployment to customer, facts that share an entity but not wording.
+- **Why vectors fail there:** similarity finds passages about the CVE but cannot follow typed edges or
+  count reliably, while a traversal is exact and carries provenance for every hop.
+
+### How would you build a knowledge graph from a customer's messy documents and systems?
+- **Start from questions** and design a schema with specific relationship types, never a generic
+  `RELATED_TO`.
+- **Load structured sources first** (CMDB, HR, CRM) by stable IDs, because it is cheap and precise; then
+  extract from text with constrained structured outputs and provenance on every edge.
+- **Resolve entities** with identifiers, normalised names, attributes and human review for hard cases.
+
+### "Who owns service X?" returns two people. What is wrong and how do you fix it?
+- **Missing time on edges.** The owner changed, and re-extraction left both relationships asserted, or
+  history was overwritten.
+- **Fix:** put `valid_from` and `valid_to` on the relationship, close the old edge instead of deleting it,
+  default queries to currently valid, and alert on entities with more than one current owner.
+
+### Would you use a graph database or Postgres for this?
+- **Postgres** when joins are shallow and fixed, such as a three-hop query, or variable length is bounded:
+  recursive CTEs with cycle handling cover reporting chains and similar cases without a new system.
+- **A graph database** when deep variable-length traversal is the core workload, such as
+  `[:USES|DEPENDS_ON*1..6]` over transitive dependencies, enough to justify operating another store.
+
+### How do you let an agent query the graph safely?
+- **Prefer parametrised tools:** fixed query text, parameters only, bounded hops, `LIMIT`, read routing and
+  a query timeout, because the model will occasionally invent labels or write unbounded traversals.
+- **Allow text-to-Cypher only behind a validator** (read-only, allowed labels, row limits) and monitor
+  error rate, empty-result rate and p95 query time.
 
 ## Quiz
 ### Q: Which question is a knowledge graph best placed to answer that top-k vector search handles poorly?

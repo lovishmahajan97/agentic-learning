@@ -5,7 +5,7 @@ name: Tool calling
 kind: concept
 difficulty: core
 est_minutes: 13
-status: reviewed
+status: crisp
 related:
   - agents/agent-loop
   - agents/tool-schemas-and-argument-validation
@@ -21,91 +21,122 @@ sources:
 ---
 
 ## TL;DR
-Tool calling lets a model request an action instead of describing one. Given declared tools (a name, a
-description and a JSON Schema for the arguments), the model emits a structured call, your code executes
-it and returns the result, and the model continues with that result in context. It exists because models
-cannot reach live data or cause effects, and because parsing actions out of free text is unreliable; a
-trained structured format turns "text that looks like a command" into a typed request.
+Tool calling lets a model request an action instead of describing one: it emits a structured, typed call
+against a declared schema, your code executes it, and the result returns to context. Models cannot reach
+live data, and parsing actions from free text is unreliable.
 
 ## Why it exists
-A model's knowledge stops at its training cutoff and its reach stops at its output text. Ask it for
-today's exchange rate or to create a ticket and it can only guess or describe. The first workaround was
-to prompt it to write commands in text ("respond with ACTION: search(query)") and parse them with regular
-expressions. That failed in three ways: the model drifted from the format in long contexts, the parser
-could not tell a quoted example from a real command, and arguments were free text, so a date arrived as
-"next Tuesday" when the API needed ISO 8601.
-
-Tool calling (OpenAI's term "function calling" names the same idea) moves the format into the model's
-training and into the API contract. The model is trained to emit a dedicated content block containing a
-tool name and arguments that conform to the declared schema, and the API parses that block before you
-see it. Your code receives a dictionary, not a string to scrape. Crucially, the model still does
-nothing: it issues a request, and whether that request is honoured, modified, rejected or routed to a
-human is decided by the code that receives it. That separation is what makes tool calling safe enough
-to connect to real systems, and it is why "the model can call tools" really means "the model can ask".
+- **Models stop at their training cutoff and their output text.** Ask for today's exchange rate or to
+  create a ticket and the model can only guess or describe.
+- **Text-command parsing failed three ways.** Prompting for "respond with ACTION: search(query)" plus
+  regular expressions broke because the model drifted from the format in long contexts, the parser could
+  not tell a quoted example from a real command, and free-text arguments sent "next Tuesday" where the
+  API needed ISO 8601.
+- **Tool calling moves the format into training and the API contract.** OpenAI's term "function calling"
+  names the same idea. The model emits a dedicated block with a tool name and schema-conforming
+  arguments, the API parses it, and your code receives a dictionary, not a string to scrape.
+- **The model still does nothing; it only asks.** Whether a request is honoured, modified, rejected or
+  routed to a human is decided by the receiving code. That separation is what makes tool calling safe
+  enough to connect to real systems.
 
 ## How it works
 ### Declaration
-Each tool is declared with a `name`, a `description`, and an `input_schema` (JSON Schema, normally an
-object with typed properties, a `required` list and `enum` where the values are fixed). The declarations
-are rendered into the prompt on every request (on the Claude API they sit at the very front: the cache
-order is tools, then system, then messages), so they consume input tokens every time and form part of
-the cacheable prefix; changing one tool invalidates the cache for everything after it. The description is the single most important field:
-it is all the model has to decide *whether* and *when* to call the tool, so it should state trigger
-conditions ("call this when the user asks about an order's status") and not only what the tool does.
+- **Three fields:** a `name`, a `description`, and an `input_schema` (JSON Schema, normally an object with
+  typed properties, a `required` list and `enum` where values are fixed).
+- **Declarations are rendered into the prompt on every request,** so they cost input tokens every time and
+  form part of the cacheable prefix.
+- **On the Claude API they sit at the very front:** cache order is tools, then system, then messages, so
+  changing one tool invalidates the cache for everything after it.
+- **The description is the most important field,** because it is all the model has to decide *whether* and
+  *when* to call. State trigger conditions ("call this when the user asks about an order's status"), not
+  only what the tool does.
 
 ### The model's side
-Given the prompt, the model chooses among plain text, one or more tool calls, or text followed by calls.
-A call arrives as a `tool_use` content block with a unique `id`, the `name`, and `input` already parsed
-into JSON, and the response's `stop_reason` is `tool_use`, which is the harness's signal that work is
-expected. A `tool_choice` parameter steers the decision: `auto` (the default), `none` (never call), and
-`any` or a named tool to force a call (OpenAI spells these `auto`, `none`, `required` and a named
-function). Forcing is not always available: on the Claude API, requests with extended thinking enabled
-accept only `auto` and `none`, so there the instruction has to go in the prompt. Treat forcing as
-model- and mode-dependent and always check that a `tool_use` block actually came back. With `strict: true` on the declaration (and
-`additionalProperties: false` in the schema) the API guarantees the arguments validate against the
-schema, which removes a class of parsing failures but says nothing about whether the values make sense.
+1. **It chooses** plain text, one or more tool calls, or text followed by calls.
+2. **A call arrives as a `tool_use` block** with a unique `id`, the `name`, and `input` already parsed into
+   JSON.
+3. **The response's `stop_reason` is `tool_use`,** the harness's signal that work is expected.
+
+| `tool_choice` | Claude API | OpenAI |
+|---|---|---|
+| Model decides (default) | `auto` | `auto` |
+| Never call | `none` | `none` |
+| Must call something | `any` | `required` |
+| Must call this tool | a named tool | a named function |
+
+- **Forcing is not always available.** On the Claude API, requests with extended thinking enabled accept
+  only `auto` and `none`, so the instruction must go in the prompt. Treat forcing as model- and
+  mode-dependent and always check a `tool_use` block came back.
+- **`strict: true` guarantees shape, not sense.** With it on the declaration (and
+  `additionalProperties: false` in the schema) the API guarantees arguments validate against the schema.
+  That removes a class of parsing failures but says nothing about whether the values make sense.
 
 ### Under the hood
-Nothing about tool calling is outside next-token prediction. The provider serializes your declarations
-into the prompt in a format the model was fine-tuned on, and the model emits the call as ordinary tokens
-wrapped in special delimiter tokens; the API recognises the delimiters, stops generation, parses the
-arguments into JSON and hands you a `tool_use` block. Two consequences follow. First, without `strict`,
-argument validity is a *trained tendency*, not a guarantee: the model usually produces schema-shaped JSON
-*because* it was trained on millions of such calls, but it can still omit a required field or invent an
-enum value, so your handler must validate. Second, `strict` mode works by constrained decoding: the
-schema is compiled into a grammar and, at each step, tokens that would break it are masked out before
-sampling. That is why it can *guarantee* shape, why it supports only a subset of JSON Schema (the grammar
-has to be compilable), and why it cannot help with meaning; a grammar can force `"date"` to be a string
-matching a pattern, not to be the date the user meant.
+- **It is still next-token prediction.** The provider serializes declarations into a prompt format the
+  model was fine-tuned on; the model emits the call as ordinary tokens wrapped in special delimiters; the
+  API recognises them, stops generation, parses the arguments and hands you a `tool_use` block.
+- **Without `strict`, validity is a trained tendency, not a guarantee.** The model usually produces
+  schema-shaped JSON *because* it was trained on millions of such calls, but it can omit a required field
+  or invent an enum value, so your handler must validate.
+- **`strict` works by constrained decoding.** The schema is compiled into a grammar and tokens that would
+  break it are masked before sampling. That is why it can *guarantee* shape, why it supports only a
+  subset of JSON Schema (the grammar must compile), and why it cannot help with meaning.
+- **A grammar can force `"date"` to be a pattern-matching string,** not to be the date the user meant.
 
 ### Your side
-For each `tool_use` block you execute the matching function with `input` as its arguments and send back
-a user message containing a `tool_result` block with the same `tool_use_id` and a `content` (a string,
-or a list of text and image blocks). If the tool failed, set `is_error: true` and put a readable message
-in `content`; models are trained to treat such results as recoverable and will retry, adjust arguments
-or explain. Several calls in one turn get several `tool_result` blocks in a single message, and on the
-Claude API the `tool_result` blocks must come first in that message's content, before any text you add.
-(OpenAI's Chat Completions API differs: one `role: "tool"` message per call, keyed by `tool_call_id`.) The model is
-then called again with the extended history, which is one iteration of the agent loop.
+1. **Execute** the matching function for each `tool_use` block, with `input` as its arguments.
+2. **Send back a user message** containing a `tool_result` block with the same `tool_use_id` and a
+   `content` (a string, or a list of text and image blocks).
+3. **On failure** set `is_error: true` with a readable message in `content`; models are trained to treat
+   such results as recoverable and will retry, adjust arguments or explain.
+4. **Several calls in one turn** get several `tool_result` blocks in a single message. On the Claude API
+   those blocks must come first in the message's content, before any text you add.
+5. **Call the model again** with the extended history: one iteration of the agent loop.
+
+- **OpenAI's Chat Completions differs:** one `role: "tool"` message per call, keyed by `tool_call_id`.
 
 ### Client-side versus server-side tools
-Tools you execute are client-side: the API returns the request and waits for your result. Providers also
-offer server-side tools (web search, code execution, hosted MCP connections) where the provider executes
-the call inside the same request and the result appears directly in the response. Server-side tools
-remove the round trip and the hosting burden; client-side tools keep execution, secrets and policy in
-your process. Both kinds can be declared in one request.
+| | Client-side | Server-side |
+|---|---|---|
+| Who executes | You; the API returns the request and waits for your result | The provider, inside the same request |
+| Examples | Your APIs, databases, internal systems | Web search, code execution, hosted MCP connections |
+| Gain | Execution, secrets and policy stay in your process | No round trip, no hosting burden |
+
+- **Both kinds can be declared in one request.**
 
 ### Token and latency accounting
-Every declared tool costs tokens on every call, so a catalogue of fifty tools can be several thousand
-tokens of fixed overhead, and selection accuracy degrades as the catalogue grows. Each round trip is a
-full model call plus your tool's latency. Those two facts drive most of the engineering around tool
-calling: small focused tool sets, deferred loading or tool search for large catalogues, parallel calls
-for independent reads, and compact results.
+- **Every declared tool costs tokens on every call;** a catalogue of fifty tools can be several thousand
+  tokens of fixed overhead, and selection accuracy degrades as the catalogue grows.
+- **Each round trip is a full model call plus your tool's latency.**
+- **These two facts drive most tool engineering:** small focused tool sets, deferred loading or tool search
+  for large catalogues, parallel calls for independent reads, and compact results.
 
-## Example
-One tool, one call, one result, one answer. The point is the exact shape of each message: the assistant
-turn carries the `tool_use` block, the following user turn carries the `tool_result` with the matching
-id, and only then does the model produce the final text. The rate itself is stubbed.
+## Diagram
+One tool call is two model requests: the first returns a `tool_use` request, your code runs it, and the
+second request carries the matching `tool_result` back.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant H as Harness
+    participant M as Model API
+    participant T as Tool
+    U->>H: question
+    H->>M: tools + messages
+    M-->>H: tool_use id, name, input
+    Note over H: validate, apply policy
+    H->>T: execute with input
+    T-->>H: result or error
+    H->>M: history + tool_result with tool_use_id
+    M-->>H: final text, end_turn
+    H-->>U: answer
+```
+
+## Examples
+### One tool, one call, one result, one answer
+The point is the exact shape of each message: the assistant turn carries the `tool_use` block, the next
+user turn carries the `tool_result` with the matching id, and only then does the model produce final
+text. The rate itself is stubbed.
 
 ```python
 import json, anthropic
@@ -147,42 +178,99 @@ final = client.messages.create(model="claude-opus-5-5", max_tokens=8192,
 print(next(b.text for b in final.content if b.type == "text"))   # "250 EUR is about 271.05 USD ..."
 ```
 
+### A dispatcher that never crashes the loop
+Production harnesses route every `tool_use` block through one function: unknown tools and handler
+exceptions become `is_error` results, and results are compact JSON. Runnable without an API key.
+
+```python
+import json
+
+HANDLERS = {"get_fx_rate": lambda base, quote: {"rate": 1.0842, "base": base, "quote": quote}}
+
+def dispatch(name: str, tool_use_id: str, args: dict) -> dict:
+    handler = HANDLERS.get(name)
+    try:
+        if handler is None:
+            raise LookupError(f"unknown tool {name!r}; available: {sorted(HANDLERS)}")
+        content, is_error = json.dumps(handler(**args), separators=(",", ":")), False
+    except Exception as e:
+        content, is_error = f"error: {e}", True
+    return {"type": "tool_result", "tool_use_id": tool_use_id,
+            "content": content, "is_error": is_error}
+
+print(dispatch("get_fx_rate", "toolu_1", {"base": "EUR", "quote": "USD"}))
+print(dispatch("get_fx_rate", "toolu_2", {"base": "EUR"}))     # missing arg -> is_error True
+print(dispatch("get_weather", "toolu_3", {}))                  # unknown tool -> is_error True
+```
+
+### Worked numbers: what a large catalogue costs
+Illustrative assumption: about 100 tokens per tool declaration. Measure your own with a token-count call.
+
+| Catalogue | Fixed tokens per call | Over a 20-step run |
+|---|---|---|
+| 5 focused tools | ~500 | ~10,000 |
+| 50 tools | ~5,000 | ~100,000 |
+
+- **Caching softens the bill** because declarations are the stable front of the prefix, but it does not
+  fix selection: the model still has to choose among fifty descriptions on every turn.
+
+## Production patterns
+- **Measure declaration overhead before shipping.** When a catalogue grows past a handful of tools; call
+  the Claude API's token-count endpoint (`client.messages.count_tokens`) with and without `tools` and
+  record the difference. Monitor fixed tokens per request per route.
+- **Defer rarely used tools.** For large catalogues; keep a small core set always loaded and expose the
+  rest through a tool-search step or deferred loading so only relevant declarations enter context. Monitor
+  selection accuracy and how often the search step is used.
+- **Central dispatcher with errors as results.** In every harness; one `dispatch` function as above, with
+  the tool name, latency and `is_error` logged per call. Monitor error rate per tool; a spike usually means
+  an upstream API or schema change.
+- **Strict schemas plus semantic validation.** For tools with fixed shapes; set `strict: true` and
+  `additionalProperties: false`, then check meaning (dates in range, ids that exist) in the handler.
+  Monitor validation-failure rate by field.
+- **Selection eval in CI.** Before changing descriptions or adding tools; replay a labelled set of real
+  queries (expected tool or "none") and fail the build on regressions. Monitor should-call recall and
+  wrong-tool rate.
+
 ## Trade-offs
-- Structured calls are reliable to parse but cost declaration tokens on every request; when only one or
-  two tools are ever relevant, a large catalogue is pure overhead and should be trimmed or loaded on demand.
-- Letting the model decide (`auto`) handles mixed conversations, but for a step that must always produce
-  a call, a forced choice or an explicit prompt instruction plus a check for a `tool_use` block is more
-  predictable; which of these is available depends on the model.
-- Server-side tools cut latency and hosting work but move execution, data and credentials to the
-  provider; when the tool touches internal systems or needs approval gates, client-side execution is the
-  only option.
-- `strict` schemas guarantee argument shape at the cost of a restricted, provider-specific schema
-  vocabulary (support for recursion and numeric or length constraints varies); when you need rich validation, keep the schema simple and validate the meaning
-  of the values in your handler.
+- **Reliable parsing vs declaration tokens.** Structured calls are reliable to parse but cost declaration
+  tokens on every request. When only one or two tools are ever relevant, a large catalogue is pure
+  overhead; trim it or load on demand.
+- **`auto` vs forced choice.** Letting the model decide handles mixed conversations. For a step that must
+  always produce a call, a forced choice or an explicit prompt instruction plus a check for a `tool_use`
+  block is more predictable; which is available depends on the model.
+- **Server-side vs client-side.** Server-side tools cut latency and hosting work but move execution, data
+  and credentials to the provider. When the tool touches internal systems or needs approval gates,
+  client-side execution is the only option.
+- **`strict` vs schema richness.** Strict schemas guarantee argument shape at the cost of a restricted,
+  provider-specific vocabulary (support for recursion and numeric or length constraints varies). When you
+  need rich validation, keep the schema simple and validate the meaning in your handler.
 
 ## Pitfalls
-- Descriptions that say what the tool does but not when to use it; the symptom is a model that answers
-  from memory when it should have called, or picks the wrong one of two similar tools.
-- Returning raw API payloads of thousands of tokens as the result; the symptom is context exhaustion
-  after a handful of steps and answers that miss the one field buried in the dump.
-- Raising on tool failure instead of returning `is_error: true`; the symptom is a crashed loop where a
-  retry with corrected arguments would have succeeded.
-- Matching on the serialized `input` string (in tests or caches) rather than the parsed object; the
-  symptom is spurious mismatches when the model escapes Unicode or slashes differently between runs.
-- On the Claude API, sending results for several calls as separate user messages, or putting text
-  before the `tool_result` blocks; the symptom is a validation error about unanswered `tool_use` ids,
-  or a model that quietly stops batching independent calls.
+- **Descriptions that say what, not when.** Symptom: the model answers from memory when it should have
+  called, or picks the wrong one of two similar tools. Fix: add trigger conditions and negative guidance.
+- **Returning raw API payloads of thousands of tokens.** Symptom: context exhaustion after a handful of
+  steps and answers that miss the one field buried in the dump. Fix: return only the fields that matter.
+- **Raising on tool failure instead of returning `is_error: true`.** Symptom: a crashed loop where a retry
+  with corrected arguments would have succeeded. Fix: route through a dispatcher that catches.
+- **Matching on the serialized `input` string (in tests or caches) instead of the parsed object.** Symptom:
+  spurious mismatches when the model escapes Unicode or slashes differently between runs. Fix: compare
+  parsed, canonicalized objects.
+- **On the Claude API, separate user messages per result, or text before the `tool_result` blocks.**
+  Symptom: a validation error about unanswered `tool_use` ids, or a model that quietly stops batching
+  independent calls. Fix: one message, results first.
 
 ## When to use
-Use tool calling whenever the answer depends on data the model does not have or on an effect it cannot
-cause: lookups, calculations that must be exact, writes to systems, anything time-sensitive. Do not use
-it merely to get structured output from a model that is not acting; a JSON schema on the response
-(structured outputs) is the right tool there where the provider supports it, and forcing a "function"
-just to extract JSON is a leftover habit from before that existed. Measure three things: how often the model calls when it should and refrains when it
-should not, how often arguments validate, and tokens per completed task. Day to day the work is writing
-descriptions, keeping schemas small, shaping results and handling `is_error`. In interviews, be able to
-draw the request and response shapes from memory and explain why the model never executes anything
-itself.
+- **Use when** the answer depends on data the model lacks or an effect it cannot cause: lookups, exact
+  calculations, writes to systems, anything time-sensitive.
+- **Avoid when** you only want structured output from a model that is not acting. A JSON schema on the
+  response (structured outputs) is the right tool where supported; forcing a "function" to extract JSON is
+  a leftover habit from before that existed.
+- **Measure** how often the model calls when it should and refrains when it should not, how often
+  arguments validate, and tokens per completed task.
+- **Day to day** the work is writing descriptions, keeping schemas small, shaping results and handling
+  `is_error`.
+- **Interviews:** draw the request and response shapes from memory and explain why the model never
+  executes anything itself.
 
 ## Role lens
 - **Engineer:** Declares tools with trigger-condition descriptions, dispatches `tool_use` blocks to
@@ -203,6 +291,42 @@ ones sit in context. Third, a system prompt that rewards answering directly. Dia
 eval: a few hundred real queries labelled with the expected tool or "none", scored for should-call
 recall, tool-name accuracy and argument validity, changing one lever at a time. Confirm in production by
 logging the ratio of calls to answerable queries.
+
+## Interview questions
+### What actually happens when a model calls a tool?
+- **Definition:** the model emits a `tool_use` block (id, name, parsed JSON input) and stops with
+  `stop_reason` `tool_use`; it executes nothing.
+- **Why it matters:** your harness decides whether to run, modify, refuse or escalate the request, which
+  is where policy, secrets and audit live.
+- **Then** you return a `tool_result` with the matching `tool_use_id` and call the model again.
+
+### The API guarantees strict schemas. Why do you still validate arguments?
+- **`strict` guarantees shape through constrained decoding,** not meaning: a valid string can still be the
+  wrong date or a nonexistent id.
+- **Without `strict`** validity is only a trained tendency, so required fields can be missing.
+- **So** the handler checks ranges, existence and permissions, and returns `is_error` with a clear message
+  when they fail.
+
+### When would you use a server-side tool instead of a client-side one?
+- **Server-side** (web search, code execution, hosted MCP) when the capability is generic and you want no
+  round trip or hosting.
+- **Client-side** whenever the tool touches internal systems, needs your credentials, or needs an approval
+  gate, because execution and policy then stay in your process.
+- **Both can be declared in one request,** so mix them per capability.
+
+### A tools catalogue grew from 8 to 60 and costs and errors rose. What do you do?
+- **Quantify:** measure declaration tokens per request with a token-count call and run a selection eval
+  for wrong-tool and should-call rates.
+- **Shrink:** consolidate near-duplicates into one tool with an enum, and defer rarely used tools behind a
+  search step.
+- **Protect the cache** by keeping declarations stable and first, since one changed tool invalidates
+  everything after it.
+
+### How do the Claude and OpenAI result message shapes differ?
+- **Claude API:** one user message containing every `tool_result` block for the turn, results before any
+  text, each keyed by `tool_use_id`.
+- **OpenAI Chat Completions:** one `role: "tool"` message per call, keyed by `tool_call_id`.
+- **Same invariant:** every call is answered before the next model turn, or the request is rejected.
 
 ## Quiz
 ### Q: What does the model actually do when it "calls" a tool?

@@ -5,7 +5,7 @@ name: Optimizers (Adam, AdamW)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - ml-fundamentals/gradient-descent
   - ml-fundamentals/backpropagation
@@ -23,33 +23,27 @@ sources:
 ---
 
 ## TL;DR
-An optimizer turns gradients into parameter updates. Plain SGD applies one learning rate to every
-parameter, which fails when gradient scales differ by orders of magnitude across a network. Adam keeps a
-running mean (momentum) and a running mean square of each parameter's gradient and divides one by the
-root of the other, so every parameter moves by roughly the learning rate whatever its gradient scale.
-AdamW applies weight decay directly to the weights instead of through the gradient, and is the default
-for transformers.
+An optimizer turns gradients into updates. Adam divides a running mean of each parameter's gradient by
+the root of its running mean square, so every parameter moves about one learning rate. AdamW decays
+weights directly, not through the gradient, and is the transformer default.
 
 ## Why it exists
-Inside a transformer the gradients of different parameters live on different scales. The embedding row
-of a rare token receives a gradient only when that token appears, and a small one; layer-norm gains,
-attention projections and output heads each see their own typical magnitude. With a single learning
-rate, either it is right for the large-gradient parameters and the small-gradient ones barely move, or it
-is right for the small ones and the large ones diverge. On top of that, plain gradient descent crawls
-along low-curvature directions for the condition-number reasons covered in the gradient-descent lesson.
-
-The answer is per-parameter adaptation. AdaGrad divided each gradient by the square root of the sum of
-its past squares, so rarely updated parameters got larger steps, but the sum grows forever and the
-effective learning rate decays to zero. RMSProp replaced the sum with an exponential moving average.
-Adam combined that moving average of squared gradients with a moving average of the gradients themselves
-(momentum) and added a correction for the fact that both averages start at zero. It became the default
-because it made the learning rate far less sensitive to the problem.
-
-Then weight decay went wrong. The standard regulariser, an L2 penalty on the weights added to the loss,
-enters Adam through the gradient and is therefore divided by the same per-parameter scale, which
-quietly turns a uniform shrinkage into one that depends on gradient history. Loshchilov and Hutter
-showed that decoupling the decay from the gradient restores the intended behaviour and improves
-generalisation; that variant is AdamW, and it is what every modern transformer recipe uses.
+- **Gradient scales differ by orders of magnitude.** The embedding row of a rare token receives a gradient
+  only when that token appears, and a small one; layer-norm gains, attention projections and output heads
+  each see their own typical magnitude.
+- **One learning rate cannot fit all.** Either it suits the large-gradient parameters and the
+  small-gradient ones barely move, or it suits the small ones and the large ones diverge. Plain gradient
+  descent also crawls along low-curvature directions (see the gradient-descent lesson).
+- **Per-parameter adaptation, step by step.** AdaGrad divided each gradient by the root of the sum of its
+  past squares, so rare parameters got larger steps, but the sum grows forever and the effective learning
+  rate decays to zero. RMSProp replaced the sum with an exponential moving average.
+- **Adam combined** that moving average of squared gradients with momentum and a correction for both
+  averages starting at zero. It became the default because it made the learning rate far less sensitive
+  to the problem.
+- **Then weight decay went wrong.** An L2 penalty enters Adam through the gradient and is divided by the
+  same per-parameter scale, turning uniform shrinkage into one that depends on gradient history.
+  Loshchilov and Hutter showed decoupling restores the intended behaviour and improves generalisation:
+  AdamW, which every modern transformer recipe uses.
 
 ## How it works
 ### The Adam update
@@ -62,63 +56,101 @@ m̂ = m_t / (1 − β1^t);  v̂ = v_t / (1 − β2^t)     # bias correction
 θ_{t+1} = θ_t − η · m̂ / (√v̂ + ε)
 ```
 
-Each piece has a reason. The first moment is momentum: it averages out mini-batch noise and
-accumulates in consistent directions. The division by √v̂ normalises the step by the parameter's typical
-gradient magnitude, so the update is about η · E[g]/√E[g²], whose magnitude is at most about 1·η. For a
-gradient with a consistent sign the ratio is near 1 and the parameter moves by roughly η per step
-whatever the gradient's scale, which is why Adam behaves like sign descent early on, why its learning
-rates sit around 1e-4 to 1e-3 rather than SGD's 0.1, and why the choice is so much more forgiving.
+Each piece has a reason:
+- **First moment = momentum.** It averages out mini-batch noise and accumulates in consistent directions.
+- **Dividing by √v̂ normalises the step** by the parameter's typical gradient magnitude, so the update is
+  about η · E[g]/√E[g²], whose magnitude is at most about 1·η.
+- **Consequences of that ratio.** For a consistent-sign gradient it is near 1, so the parameter moves by
+  roughly η per step whatever its gradient scale. That is why Adam behaves like sign descent early on, why
+  its learning rates sit around 1e-4 to 1e-3 rather than SGD's 0.1, and why it is so forgiving.
 
-Bias correction exists because m and v start at zero. After one step m₁ = 0.1·g₁ and v₁ = 0.001·g₁², so
-the uncorrected ratio m/√v would be 0.1/0.0316 ≈ 3.2 times too large; dividing each by (1 − βᵗ) removes
-the shrinkage. Even corrected, v is estimated from a handful of samples early in training and is noisy,
-which is the reason learning-rate warmup is standard with Adam. The ε term prevents division by zero and
-acts as a floor: parameters whose gradient RMS is far below ε behave as if trained by SGD with rate η/ε.
-The default is 1e-8; some low-precision recipes raise it for stability.
+### Bias correction, warmup and ε
+- **Why correct.** m and v start at zero. After one step m₁ = 0.1·g₁ and v₁ = 0.001·g₁², so the
+  uncorrected ratio m/√v would be 0.1/0.0316 ≈ 3.2 times too large; dividing each by (1 − βᵗ) removes the
+  shrinkage.
+- **Why warmup.** Even corrected, v is estimated from a handful of samples early in training and is noisy,
+  which is the reason learning-rate warmup is standard with Adam.
+- **ε is a floor.** It prevents division by zero; parameters whose gradient RMS is far below ε behave as
+  if trained by SGD with rate η/ε. The default is 1e-8; some low-precision recipes raise it for stability.
 
 ### Weight decay: coupled L2 versus decoupled
-With an L2 penalty the loss becomes L + (λ/2)‖θ‖², so the gradient becomes g + λθ. Under SGD this is
-θ ← θ − ηg − ηλθ, a uniform shrink of every weight by the factor (1 − ηλ) per step, which is the intended
-regulariser. Under Adam the term λθ enters m and v and is divided by √v̂. A weight with a large gradient
-history has a large √v̂, so its decay is scaled down almost to nothing; a weight with tiny gradients has
-λθ dominating both numerator and denominator, so the ratio is about sign(θ) and it decays at the full
-rate regardless of λ. The regularisation strength has become a function of gradient statistics rather
-than of λ.
+1. **L2 penalty.** The loss becomes L + (λ/2)‖θ‖², so the gradient becomes g + λθ.
+2. **Under SGD it works.** θ ← θ − ηg − ηλθ, a uniform shrink of every weight by the factor (1 − ηλ) per
+   step: the intended regulariser.
+3. **Under Adam it breaks.** λθ enters m and v and is divided by √v̂.
+   - A weight with a large gradient history has a large √v̂, so its decay is scaled down almost to nothing.
+   - A weight with tiny gradients has λθ dominating numerator and denominator, so the ratio is about
+     sign(θ) and it decays at the full rate regardless of λ.
+   - The regularisation strength has become a function of gradient statistics rather than of λ.
 
-A rough quantitative picture: near convergence a weight's loss gradient is mostly noise with RMS σ,
-so m̂ ≈ λθ while √v̂ ≈ σ (when λθ ≪ σ), and the coupled update shrinks the weight by about ηλθ/σ per
-step. The effective decay coefficient is λ/σ, not λ. With λ = 0.01, a weight whose gradient RMS is 1 is
-decayed at 0.01 and one whose gradient RMS is 0.1 at 0.1, ten times harder, for no reason anyone chose.
-Under AdamW both decay at exactly ηλ per step.
+**A rough quantitative picture.** Near convergence a weight's loss gradient is mostly noise with RMS σ, so
+m̂ ≈ λθ while √v̂ ≈ σ (when λθ ≪ σ). The coupled update shrinks the weight by about ηλθ/σ per step: the
+effective decay coefficient is λ/σ, not λ.
 
-AdamW removes λθ from the gradient entirely and applies decay as its own step: θ ← θ − η(m̂/(√v̂ + ε) +
-λθ), implemented in PyTorch as θ ← θ·(1 − ηλ) followed by the ordinary Adam step. Every weight now
-shrinks by the same fraction per step, independent of its gradient history, and λ can be tuned without
-re-tuning η. Two practical notes: `torch.optim.Adam(weight_decay=...)` is the coupled L2 form while
-`torch.optim.AdamW` is decoupled, a frequent source of confusion; and by convention decay is not applied
-to biases or normalisation gains, because shrinking a layer-norm scale toward zero has no regularising
-meaning.
+| λ = 0.01, gradient RMS σ | Coupled L2 in Adam: effective decay | AdamW: decay per step |
+|---|---|---|
+| 1 | 0.01 | ηλ |
+| 0.1 | 0.1, ten times harder, for no reason anyone chose | ηλ |
+
+**What AdamW does.** It removes λθ from the gradient and applies decay as its own step:
+θ ← θ − η(m̂/(√v̂ + ε) + λθ), implemented in PyTorch as θ ← θ·(1 − ηλ) followed by the ordinary Adam step.
+- **Every weight shrinks by the same fraction per step,** independent of its gradient history, and λ can be
+  tuned without re-tuning η.
+- **API trap:** `torch.optim.Adam(weight_decay=...)` is the coupled L2 form while `torch.optim.AdamW` is
+  decoupled, a frequent source of confusion.
+- **Convention:** decay is not applied to biases or normalisation gains, because shrinking a layer-norm
+  scale toward zero has no regularising meaning.
 
 ### Memory and compute
-Adam keeps m and v, two fp32 values per parameter, so 8 bytes per parameter of optimizer state on top of
-the weights. In mixed-precision training the usual accounting is 16 bytes per parameter: 2 for fp16
-weights, 2 for fp16 gradients, 4 for an fp32 master copy, 4 for m and 4 for v. A 7-billion-parameter
-model therefore needs about 112 GB before a single activation is stored, more than one 80 GB GPU. That
-number drives the alternatives: 8-bit Adam quantises m and v; Adafactor stores a factored second moment
-and drops the first; ZeRO and FSDP shard the optimizer state across GPUs; parameter-efficient fine-tuning
-keeps state only for the adapter weights.
+- **Optimizer state:** m and v, two fp32 values per parameter, so 8 bytes per parameter on top of the
+  weights.
+- **Mixed-precision accounting: 16 bytes per parameter.** 2 for fp16 weights, 2 for fp16 gradients, 4 for
+  an fp32 master copy, 4 for m and 4 for v.
+- **A 7-billion-parameter model** therefore needs about 112 GB before a single activation is stored, more
+  than one 80 GB GPU.
+
+That number drives the alternatives:
+
+| Alternative | What it changes |
+|---|---|
+| 8-bit Adam | quantises m and v |
+| Adafactor | stores a factored second moment and drops the first |
+| ZeRO / FSDP | shards the optimizer state across GPUs |
+| Parameter-efficient fine-tuning | keeps state only for the adapter weights |
 
 ### Hyperparameters in practice
-β1 = 0.9 almost everywhere. β2 = 0.999 is the default, but many LLM pre-training recipes use 0.95,
-because a long memory in v reacts slowly when the gradient distribution shifts and that lag produces loss
-spikes in long runs. Weight decay of 0.01 (the PyTorch default) to 0.1 (common in LLM recipes) on
-matrices only. Peak learning rates for full fine-tuning are typically in the 1e-5 to 5e-5 range and for
-LoRA adapters in the 1e-4 to 3e-4 range (illustrative, recipe-dependent), always with warmup, a decay
-schedule and gradient clipping around 1.0. SGD with momentum still matches or beats Adam on some
-convolutional benchmarks with a tuned schedule; newer optimizers such as Lion, Sophia and Muon trade
-memory or steps against Adam and should be compared under equal compute before adoption.
+| Setting | Typical value | Why |
+|---|---|---|
+| β1 | 0.9 almost everywhere | |
+| β2 | 0.999 default; 0.95 in many LLM pre-training recipes | a long memory in v reacts slowly when the gradient distribution shifts, and that lag produces loss spikes in long runs |
+| Weight decay | 0.01 (the PyTorch default) to 0.1 (common in LLM recipes) | on matrices only |
+| Peak LR, full fine-tuning | 1e-5 to 5e-5 (illustrative, recipe-dependent) | always with warmup, decay schedule and clipping around 1.0 |
+| Peak LR, LoRA adapters | 1e-4 to 3e-4 (illustrative, recipe-dependent) | same |
 
-## Example
+- **SGD with momentum** still matches or beats Adam on some convolutional benchmarks with a tuned schedule.
+- **Newer optimizers** such as Lion, Sophia and Muon trade memory or steps against Adam and should be
+  compared under equal compute before adoption.
+
+## Diagram
+One AdamW step per parameter: decay is applied to the weight directly, while the gradient flows through
+the two moment estimates.
+
+```mermaid
+flowchart TD
+    G["Gradient g"] --> M["m: EMA of g, beta1"]
+    G --> V["v: EMA of g squared, beta2"]
+    M --> BC["Bias-correct m and v"]
+    V --> BC
+    BC --> R["Ratio m hat over root v hat plus eps"]
+    W["Weight theta"] --> D["Decay: theta times 1 minus eta lambda"]
+    D --> U["Subtract eta times ratio"]
+    R --> U
+    U --> W2["Updated theta"]
+    L2["Adam plus L2: lambda theta into g"] -.->|"coupled, avoid"| G
+```
+
+## Examples
+### Hand-written AdamW matches torch.optim.AdamW
 A hand-written AdamW step compared against `torch.optim.AdamW` on the same parameters. The two must
 agree exactly, which confirms the update rule above is the whole algorithm; the final print shows the
 per-parameter step sizes settling near one learning rate each, whatever the gradient magnitudes.
@@ -151,45 +183,102 @@ print(step.abs() / lr)                                    # step sizes in units 
 print(g.abs())                                            # ... even though the raw gradients differ a lot
 ```
 
+### Production setup: parameter groups without decay on biases and norms
+The common convention: matrices (2-D and above) get weight decay; biases and normalisation gains (1-D) do
+not. β2 = 0.95 as in many LLM recipes.
+
+```python
+import torch
+
+def build_adamw(model, lr=3e-4, weight_decay=0.1, betas=(0.9, 0.95)):
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue                                  # frozen weights: no optimizer state at all
+        (decay if p.ndim >= 2 else no_decay).append(p)
+    groups = [{"params": decay, "weight_decay": weight_decay},
+              {"params": no_decay, "weight_decay": 0.0}]
+    return torch.optim.AdamW(groups, lr=lr, betas=betas, eps=1e-8)
+
+# Checkpoint optimizer state too, or m and v restart from zero on resume:
+# torch.save({"model": model.state_dict(), "optim": opt.state_dict(), "step": step}, path)
+```
+
+### Worked numbers: memory for full fine-tuning a 7B model
+Mixed precision with AdamW, before activations (7 × 10⁹ parameters).
+
+| Component | Bytes per parameter | Total |
+|---|---|---|
+| fp16 weights | 2 | 14 GB |
+| fp16 gradients | 2 | 14 GB |
+| fp32 master weights | 4 | 28 GB |
+| m (fp32) | 4 | 28 GB |
+| v (fp32) | 4 | 28 GB |
+| **Total** | **16** | **112 GB** |
+
+- **On one 80 GB GPU it does not fit,** so the options are sharding (ZeRO or FSDP across GPUs), quantised
+  optimizer state, or PEFT.
+- **With 8-bit m and v** (1 byte each, ignoring small quantisation constants) the two states drop from
+  56 GB to about 14 GB, for roughly 70 GB in total: still tight before activations.
+
+## Production patterns
+- **Use `torch.optim.AdamW`, never Adam plus `weight_decay`, for decay.** Build parameter groups so 1-D
+  parameters (biases, norm gains) get `weight_decay=0.0`. Monitor the weight-norm trend per layer.
+- **Save and restore optimizer state.** Include `optimizer.state_dict()` and the scheduler state in every
+  checkpoint. Monitor the loss at each resume point; a spike means m and v were lost.
+- **Lower β2 when long runs spike.** If loss spikes appear in long pre-training runs, set `betas=(0.9,
+  0.95)`. Monitor spike frequency and the gradient-norm curve.
+- **Warmup, decay and clipping together.** Pair AdamW with a warmup-then-cosine or linear schedule and
+  gradient-norm clipping around 1.0. Monitor the logged learning rate, the clipped fraction and the loss.
+- **Shrink optimizer memory before buying GPUs.** Shard state with FSDP or DeepSpeed ZeRO, use 8-bit
+  optimizer states (for example the bitsandbytes 8-bit AdamW), or switch to LoRA so state exists only for
+  adapters. Monitor peak memory at the first `optimizer.step()`.
+- **Watch the update-to-weight ratio.** Every N steps log ‖Δθ‖/‖θ‖ per layer; it should be small but not
+  negligible. Monitor for layers whose ratio is orders of magnitude off from the rest.
+
 ## Trade-offs
-- Adam and AdamW are robust to gradient-scale differences and to the learning-rate choice and make fast
-  early progress, but cost two extra states per parameter and, on some vision tasks, generalise slightly
-  worse than tuned SGD; when memory binds, 8-bit states or Adafactor recover most of the benefit.
-- Decoupled decay makes regularisation strength independent of gradient statistics, but the effective
-  decay per step is η·λ, so schedules that change η change the decay too, and λ must be chosen with that in mind.
-- A high β2 (0.999) gives a smooth, stable scale estimate but adapts slowly to shifts in gradient
-  magnitude, which shows up as loss spikes in long runs; 0.95 adapts faster at the cost of a noisier
-  denominator, and the balance tips toward 0.95 as runs get longer.
-- A larger ε stabilises parameters with tiny gradients, especially in low precision, but damps the very
-  adaptivity Adam exists for; it is a knob to move deliberately, not a default to leave untouched in bf16.
+- **Adam/AdamW robustness vs memory and generalisation.** Robust to gradient-scale differences and to the
+  learning-rate choice, with fast early progress, but two extra states per parameter and, on some vision
+  tasks, slightly worse generalisation than tuned SGD. When memory binds, 8-bit states or Adafactor
+  recover most of the benefit.
+- **Decoupled decay vs schedule coupling.** Regularisation strength becomes independent of gradient
+  statistics, but the effective decay per step is η·λ, so schedules that change η change the decay too,
+  and λ must be chosen with that in mind.
+- **β2 = 0.999 vs 0.95.** A high β2 gives a smooth, stable scale estimate but adapts slowly to shifts in
+  gradient magnitude, showing up as loss spikes in long runs. 0.95 adapts faster at the cost of a noisier
+  denominator; the balance tips toward 0.95 as runs get longer.
+- **Larger ε: stability vs adaptivity.** It stabilises parameters with tiny gradients, especially in low
+  precision, but damps the very adaptivity Adam exists for; move it deliberately, do not leave the default
+  untouched in bf16.
 
 ## Pitfalls
-- Using `torch.optim.Adam` with `weight_decay` and believing it is AdamW; the symptom is regularisation
-  that seems to do nothing, because the decay on large-gradient weights has been divided away.
-- Applying weight decay to biases and normalisation gains; the symptom is a small but consistent loss
-  penalty, fixed with parameter groups that exclude them.
-- Carrying an SGD learning rate such as 0.1 into Adam; the symptom is immediate divergence, since Adam's
-  step is about η per parameter per step.
-- Skipping warmup; the symptom is a loss spike in the first few hundred steps, sometimes unrecoverable,
+- **`torch.optim.Adam` with `weight_decay`, believed to be AdamW.** Symptom: regularisation that seems to
+  do nothing, because the decay on large-gradient weights has been divided away.
+- **Weight decay on biases and normalisation gains.** Symptom: a small but consistent loss penalty; fix
+  with parameter groups that exclude them.
+- **Carrying an SGD learning rate such as 0.1 into Adam.** Symptom: immediate divergence, since Adam's step
+  is about η per parameter per step.
+- **Skipping warmup.** Symptom: a loss spike in the first few hundred steps, sometimes unrecoverable,
   caused by updates computed from a second-moment estimate built on a handful of samples.
-- Resuming from a checkpoint that saved weights but not optimizer state; the symptom is a loss spike at
-  the resume point as m and v restart from zero.
-- Forgetting optimizer state in capacity planning; the symptom is an out-of-memory error at the first
+- **Resuming without optimizer state.** Symptom: a loss spike at the resume point as m and v restart from
+  zero.
+- **Forgetting optimizer state in capacity planning.** Symptom: an out-of-memory error at the first
   `optimizer.step()` even though the bf16 weights fitted comfortably.
-- Keeping m and v in plain bf16 to save memory; bf16 resolves only about 0.4% relative changes, so the
-  per-step increment (1 − β2)·g² = 0.001·g² to v is rounded away and the scale estimate stops tracking.
-  The symptom is training that stalls or drifts compared with an fp32-state run, which is why states stay
-  in fp32 or use block-wise 8-bit quantisation designed for this.
+- **Keeping m and v in plain bf16.** bf16 resolves only about 0.4% relative changes, so the per-step
+  increment (1 − β2)·g² = 0.001·g² to v is rounded away and the scale estimate stops tracking. Symptom:
+  training that stalls or drifts versus an fp32-state run; states stay in fp32 or use block-wise 8-bit
+  quantisation designed for this.
 
 ## When to use
-Default to AdamW for transformers and for most new architectures: learning rate from a short sweep,
-weight decay in the 0.01 to 0.1 range on matrices only, β2 of 0.95 for long pre-training runs if spikes
-appear, paired with warmup, a cosine or linear decay and gradient clipping. Move to 8-bit Adam, Adafactor
-or parameter-efficient fine-tuning when optimizer memory is the binding constraint, and keep SGD with
-momentum for convolutional recipes that are known to work with it. Measure the loss and gradient-norm
-curves and the ratio of update size to weight size per layer, a useful sanity check that updates are
-neither negligible nor wild. In interviews, expect to write the Adam update, explain bias correction,
-contrast coupled L2 with decoupled decay, and count the bytes of optimizer state per parameter.
+- **Default to AdamW** for transformers and most new architectures: learning rate from a short sweep,
+  weight decay in the 0.01 to 0.1 range on matrices only, β2 of 0.95 for long pre-training runs if spikes
+  appear, paired with warmup, a cosine or linear decay and gradient clipping.
+- **Switch** to 8-bit Adam, Adafactor or parameter-efficient fine-tuning when optimizer memory is the
+  binding constraint; keep SGD with momentum for convolutional recipes known to work with it.
+- **Measure** the loss and gradient-norm curves and the ratio of update size to weight size per layer, a
+  useful sanity check that updates are neither negligible nor wild.
+- **Interviews:** write the Adam update, explain bias correction, contrast coupled L2 with decoupled decay,
+  and count the bytes of optimizer state per parameter.
 
 ## Role lens
 - **Engineer:** Configures AdamW with parameter groups that exclude norms and biases from decay, sets
@@ -211,6 +300,40 @@ therefore set by gradient statistics rather than by λ. AdamW takes λθ out of 
 θ ← θ(1 − ηλ) as a separate step before the Adam update, so every weight shrinks by the same fraction,
 λ and η become separately tunable, and generalisation improves at the same learning rate. One caveat:
 the shrink per step is ηλ, so a learning-rate schedule scales the decay along with it.
+
+## Interview questions
+### Write the Adam update and explain what each term is for.
+- **m:** an EMA of gradients (β1 = 0.9), i.e. momentum that averages out mini-batch noise.
+- **v:** an EMA of squared gradients (β2 = 0.999 or 0.95), the per-parameter scale; dividing by √v̂ makes
+  each step about η regardless of gradient size.
+- **Bias correction and ε:** dividing by (1 − βᵗ) undoes the zero start; ε prevents division by zero and
+  sets a floor.
+
+### Your fine-tune diverges in the first 200 steps with Adam at lr = 0.1. What happened and what do you change?
+- **Wrong scale:** Adam moves each parameter by about η per step, so 0.1 is enormous; SGD-style rates do
+  not transfer.
+- **Fix:** sweep in the 1e-5 to 5e-5 range for full fine-tuning (higher for LoRA), add warmup so v is not
+  estimated from a handful of samples, and clip gradients.
+- **Verify** with the loss and gradient-norm curves over the first few hundred steps.
+
+### Why is the weight_decay argument of torch.optim.Adam not the same as AdamW?
+- **Adam's argument is coupled L2:** λθ is added to the gradient and divided by √v̂, so large-gradient
+  weights are barely decayed and tiny-gradient ones decay at about the full rate.
+- **AdamW is decoupled:** θ ← θ(1 − ηλ) separately, so every weight shrinks by the same fraction.
+- **Practical effect:** λ becomes tunable independently of η, and generalisation improves.
+
+### How much GPU memory does full AdamW fine-tuning of a 7B model need, and what are your options if you have one 80 GB GPU?
+- **16 bytes per parameter:** fp16 weights 2, gradients 2, fp32 master 4, m 4, v 4, so about 112 GB before
+  activations.
+- **Options:** shard state across GPUs with ZeRO or FSDP, quantise m and v to 8-bit, or use LoRA so state
+  exists only for adapters.
+- **Remember activations** come on top, so sequence length and batch still need checking.
+
+### When would you not use AdamW?
+- **Known-good SGD recipes:** some convolutional benchmarks match or beat Adam with SGD plus momentum and a
+  tuned schedule, with less optimizer memory.
+- **Memory-bound training:** Adafactor or 8-bit states trade some fidelity for much smaller state.
+- **New optimizers** (Lion, Sophia, Muon) only after comparing under equal compute on your own task.
 
 ## Quiz
 ### Q: What does dividing by √v̂ achieve in Adam's update?

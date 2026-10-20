@@ -5,7 +5,7 @@ name: Class imbalance
 kind: concept
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - ml-fundamentals/confusion-matrix
   - ml-fundamentals/precision-recall-f1
@@ -23,127 +23,147 @@ sources:
 ---
 
 ## TL;DR
-When one class is rare, the default recipe of accuracy as the metric, an unweighted loss and a 0.5
-threshold quietly optimises for "say the common class". Imbalance is less a data problem than a cost
-problem that the defaults get wrong. Fix the evaluation first (confusion matrix, precision–recall,
-stratified splits), then the decision threshold, and only then reach for class weights, resampling or
-focal loss, remembering that each of those distorts the probabilities you may need later.
+With a rare class, accuracy, an unweighted loss and a 0.5 threshold quietly optimise for "say the common
+class". It is a cost problem: fix evaluation, then the threshold, and only then weights, resampling or
+focal loss, which distort probabilities.
 
 ## Why it exists
-Rare positives are the normal case in valuable problems: fraud, abuse, prompt injection, hallucinated
-answers, churn, defects, thumbs-down feedback. Three things go wrong at once when the positive class is
-1% of the data.
-
-The **metric** lies: accuracy for the constant "never positive" classifier is 99%, so the number cannot
-distinguish a useless model from a good one. The **optimisation** is lopsided: the loss is a sum over
-examples, 99% of which are negatives, so the gradient mostly says "get the negatives right" and the
-boundary drifts to wherever majority errors are cheapest; with few minority examples the model also
-cannot learn the minority region well, whatever the weighting. The **decision rule** is wrong: argmax,
-or a 0.5 threshold, is the Bayes-optimal rule only when both errors cost the same, and in every
-problem listed above they do not. Elkan's result makes this concrete: with calibrated probabilities,
-the cost-minimising rule is to predict positive when p ≥ C_FP / (C_FP + C_FN), which for a miss that
-costs fifty times a false alarm is a threshold near 0.02, nowhere near 0.5.
-
-The naive responses fail in their own ways. "Collect more data" keeps the same ratio, and the minority
-is usually the expensive class to label. "Oversample until balanced and carry on" works only if you
-keep the duplicates out of the validation folds and repair the probabilities afterwards; done
-carelessly it produces leakage and a model whose "0.5" means 0.05. The enemy is not the imbalance; it
-is the mismatch between the cost structure and the defaults.
+- **Rare positives are the valuable case.** Fraud, abuse, prompt injection, hallucinated answers, churn,
+  defects, thumbs-down feedback. When positives are 1% of the data, three things go wrong at once.
+- **The metric lies.** Accuracy for the constant "never positive" classifier is 99%, so the number cannot
+  distinguish a useless model from a good one.
+- **The optimisation is lopsided.** The loss sums over examples, 99% of them negatives, so the gradient
+  mostly says "get the negatives right" and the boundary drifts to wherever majority errors are cheapest.
+  With few minority examples the model also cannot learn the minority region well, whatever the weighting.
+- **The decision rule is wrong.** Argmax, or a 0.5 threshold, is Bayes-optimal only when both errors cost the
+  same. Elkan: with calibrated probabilities, predict positive when p ≥ C_FP / (C_FP + C_FN); a miss costing
+  fifty times a false alarm gives a threshold near 0.02.
+- **Naive responses fail.** "Collect more data" keeps the same ratio, and the minority is usually expensive to
+  label. "Oversample until balanced" works only if duplicates stay out of validation folds and probabilities
+  are repaired; carelessly done, it leaks and its "0.5" means 0.05. The enemy is the cost-default mismatch.
 
 ## How it works
 ### Step 0: measure with the right instruments
-Report the prevalence. Split with stratification so every fold keeps the ratio; otherwise a small test
-fold can contain zero positives and recall is undefined. Read the confusion matrix with raw counts.
-Prefer the precision–recall curve and average precision to ROC-AUC when positives are rare, because
-ROC's false-positive axis is normalised by the huge negative count and hides the alert volume.
-Specify the operating point as a constraint ("recall ≥ 0.8 at the best precision", or "at most N
-false alarms per day") and pick the threshold on a validation split, never on the test split.
+1. **Report the prevalence.**
+2. **Split with stratification** so every fold keeps the ratio; otherwise a small test fold can contain zero
+   positives and recall is undefined.
+3. **Read the confusion matrix with raw counts.**
+4. **Prefer the precision–recall curve and average precision to ROC-AUC** when positives are rare, because
+   ROC's false-positive axis is normalised by the huge negative count and hides the alert volume.
+5. **State the operating point as a constraint** ("recall ≥ 0.8 at the best precision", or "at most N false
+   alarms per day") and pick the threshold on a validation split, never the test split.
 
-Then check that the evaluation set can measure what you claim. Recall is estimated from the positives
-alone, so its standard error is about √(r(1 − r) / n_pos): with 50 positives a measured recall of 0.80
-has a standard error near 0.057, a 95% interval of roughly ±0.11, which is too wide to tell 0.75 from
-0.85. With 400 positives the interval narrows to about ±0.04. The size of the dataset is irrelevant;
-the number of positives is what buys precision on recall, which is why evaluation sets for rare
-classes are deliberately enriched (and why that enrichment must be undone for precision, below).
+**Check the evaluation set can measure what you claim.** Recall is estimated from the positives alone, so
+its standard error is about √(r(1 − r) / n_pos):
+
+| Positives | Measured recall | Standard error | 95% interval |
+|---|---|---|---|
+| 50 | 0.80 | near 0.057 | roughly ±0.11: cannot tell 0.75 from 0.85 |
+| 400 | 0.80 | about 0.02 | about ±0.04 |
+
+- **Dataset size is irrelevant; the number of positives buys precision on recall.** That is why evaluation
+  sets for rare classes are deliberately enriched, and why that enrichment must be undone for precision (below).
 
 ### Lever 1: move the threshold
-For a model that already ranks reasonably, most of the "imbalance problem" is the 0.5 default. Choose
-τ on validation to meet the cost-optimal rule above or the product constraint. No retraining, no
-distortion of probabilities. Try this first *because* reweighting and resampling are, for a
-well-specified model, roughly equivalent to shifting the threshold, and the threshold is the cheaper
-knob.
+- **Most of the "imbalance problem" is the 0.5 default** for a model that already ranks reasonably.
+- **Choose τ on validation** to meet the cost-optimal rule above or the product constraint. No retraining, no
+  distortion of probabilities.
+- **Try this first** *because* reweighting and resampling are, for a well-specified model, roughly equivalent
+  to shifting the threshold, and the threshold is the cheaper knob.
 
 ### Lever 2: reweight the loss
-Multiply each example's loss by a class weight; the common "balanced" heuristic is w_c = N / (k · n_c),
-so with 2% positives the minority weight is about 25 and the majority about 0.51 (scikit-learn's
-`class_weight="balanced"`). This is oversampling in expectation without duplicating rows. It moves the
-boundary toward recall, but it changes the whole fitted solution, not only the intercept, so verify
-the ranking with average precision rather than assuming it improved; and the probabilities now reflect
-an artificial 50/50 prior and must be recalibrated or corrected before anything consumes them. When
-does reweighting genuinely help rather than merely relocate the threshold? When the model cannot fit
-everything and must choose where to spend capacity (a misspecified or heavily regularized model), the
-weights tell it to fit the minority's boundary at the expense of the bulk of the negatives, which can
-improve ranking in the high-recall region you will actually operate in; and when training by
-minibatch SGD, where a 1%-positive class appears about once per hundred examples and oversampling makes
-its gradient signal less noisy. Both are empirical claims about your data, so measure AP with and
-without. For deep networks the same idea is weighted cross-entropy, or **focal loss**:
+- **Balanced heuristic:** w_c = N / (k · n_c). With 2% positives the minority weight is about 25 and the
+  majority about 0.51 (scikit-learn's `class_weight="balanced"`). This is oversampling in expectation without
+  duplicating rows.
+- **It changes the whole fitted solution, not only the intercept.** It moves the boundary toward recall, so
+  verify the ranking with average precision rather than assuming it improved.
+- **Probabilities now reflect an artificial 50/50 prior** and must be recalibrated or corrected before
+  anything consumes them.
+
+When does reweighting genuinely help rather than merely relocate the threshold?
+- **Limited capacity:** a misspecified or heavily regularized model must choose where to spend capacity; the
+  weights tell it to fit the minority's boundary at the expense of the bulk of the negatives, which can
+  improve ranking in the high-recall region you will actually operate in.
+- **Minibatch SGD:** a 1%-positive class appears about once per hundred examples, and oversampling makes its
+  gradient signal less noisy.
+- **Both are empirical claims about your data,** so measure AP with and without.
+
+For deep networks the same idea is weighted cross-entropy, or **focal loss**:
 
 ```
 FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
 ```
 
-where p_t is the probability assigned to the true class. The (1 − p_t)^γ factor shrinks the loss of
-examples the model already gets right, so the thousands of easy negatives stop dominating the
-gradient; γ = 2 is the value the original detection paper settled on. It was invented *because* in
-dense object detection the problem was not only the class ratio but that almost all negatives were
-trivially easy.
+- **p_t** is the probability assigned to the true class.
+- **The (1 − p_t)^γ factor** shrinks the loss of examples the model already gets right, so the thousands of
+  easy negatives stop dominating the gradient; γ = 2 is the value the original detection paper settled on.
+- **Why it was invented:** in dense object detection the problem was not only the class ratio but that almost
+  all negatives were trivially easy.
 
 ### Lever 3: resample
-- **Random undersampling** of the majority: fast, loses information; right when negatives are
-  abundant and redundant. Training several models on different undersamples and averaging them
-  recovers much of the lost signal.
-- **Random oversampling** of the minority: duplicates rows, so trees and high-capacity models overfit
-  to them. It must happen *after* the split, or inside each cross-validation fold; otherwise copies of
-  the same row land in train and validation and scores inflate.
-- **SMOTE**: for each minority point, pick one of its k nearest minority neighbours and create a
-  synthetic point on the segment between them. This widens the minority region instead of just making
-  it denser. It assumes a continuous feature space, so it produces nonsense on one-hot or embedding
-  features, and it can plant points inside majority territory when the classes overlap; borderline and
-  adaptive variants exist for that. For text, the modern analogue is LLM-generated minority examples,
-  with the same two risks (distribution mismatch, label noise) and the same rule: validate only on real
-  minority data.
+| Method | What it does | Right when | Risk |
+|---|---|---|---|
+| Random undersampling | drops majority rows; fast, loses information | negatives are abundant and redundant | lost signal; averaging models trained on different undersamples recovers much of it |
+| Random oversampling | duplicates minority rows | cheap first try | trees and high-capacity models overfit to the copies |
+| SMOTE | synthetic point on the segment to one of k nearest minority neighbours; widens the region | continuous feature spaces | nonsense on one-hot or embedding features; plants points in majority territory when classes overlap |
+
+- **Resample *after* the split, or inside each cross-validation fold,** otherwise copies of the same row land in
+  train and validation and scores inflate.
+- **Borderline and adaptive SMOTE variants** exist for overlapping classes.
+- **For text, the modern analogue is LLM-generated minority examples,** with the same two risks (distribution
+  mismatch, label noise) and the same rule: validate only on real minority data.
 
 ### Lever 4: change the problem
-When positives are below roughly one in a thousand, or unlabelled, reframe: anomaly or one-class
-detection, active learning to find positives worth labelling, or a two-stage cascade where a cheap
-high-recall filter hands a small enriched set to an expensive precise model, which is how most
-LLM-based moderation and injection pipelines are actually built. Rare classes in a multi-class problem
-can be merged into a parent class or handled hierarchically.
+When positives are below roughly one in a thousand, or unlabelled, reframe:
+- **Anomaly or one-class detection.**
+- **Active learning** to find positives worth labelling.
+- **A two-stage cascade:** a cheap high-recall filter hands a small enriched set to an expensive precise model.
+  This is how most LLM-based moderation and injection pipelines are actually built.
+- **Multi-class:** merge rare classes into a parent class or handle them hierarchically.
 
 ### Translating between enriched evaluation and production
-Evaluation sets are often enriched with positives to make recall estimates stable. Recall and FPR
-transfer; precision does not. Convert with the production prevalence π:
+Recall and FPR transfer from an enriched set; precision does not. Convert with the production prevalence π:
 
 ```
 precision_at_prod = TPR * pi / (TPR * pi + FPR * (1 - pi))
 ```
 
-A detector with TPR 0.95 and FPR 0.001 has precision of about 0.49 when injections are 0.1% of traffic,
-and about 0.09 if its FPR is 0.01.
+| Detector | Production prevalence | Precision |
+|---|---|---|
+| TPR 0.95, FPR 0.001 | injections 0.1% of traffic | about 0.49 |
+| TPR 0.95, FPR 0.01 | injections 0.1% of traffic | about 0.09 |
 
 ### Imbalance in LLM systems
-Few-shot classification inherits the label distribution of the demonstrations: if nine of ten examples
-in the prompt are "benign", the model leans benign regardless of input (majority-label bias), so
-balance the demonstrations or calibrate the outputs. A judge evaluated on a set where 3% of outputs
-are failures can "agree with humans 97%" by passing everything; score it on recall of the failure
-class. Production feedback is imbalanced by construction (thumbs-down is rare), so a feedback
-classifier's headline should be recall on bad outputs at a fixed review budget.
+- **Few-shot majority-label bias.** If nine of ten demonstrations are "benign", the model leans benign
+  regardless of input; balance the demonstrations or calibrate the outputs.
+- **Judges.** On a set where 3% of outputs are failures, a judge can "agree with humans 97%" by passing
+  everything; score it on recall of the failure class.
+- **Feedback classifiers.** Production feedback is imbalanced by construction (thumbs-down is rare), so the
+  headline should be recall on bad outputs at a fixed review budget.
 
-## Example
-A 2%-positive problem, split three ways with stratification. Two logistic regressions, one unweighted
-and one with balanced class weights, are compared on ranking (average precision), on behaviour at the
-default threshold, and after choosing the threshold on validation for "recall ≥ 0.80"; the last column
-shows what the weights did to the probabilities.
+## Diagram
+Work down the levers in order of cost; stop at the first one that meets the operating constraint.
+
+```mermaid
+flowchart TD
+    A["Prevalence under 10 percent"] --> B["Stratified split, PR curve, raw counts"]
+    B --> C["Tune threshold on validation"]
+    C --> D{"Constraint met?"}
+    D -->|"yes"| Z["Ship, monitor flag volume"]
+    D -->|"no, ranking poor"| E["Class weights or resampling inside folds"]
+    E --> F{"AP improved?"}
+    F -->|"yes"| R["Recalibrate probabilities"]
+    F -->|"no"| G["Cascade, anomaly detection or more positives"]
+    R --> Z
+    G --> Z
+```
+
+## Examples
+### Unweighted vs balanced logistic regression on 2% positives
+A 2%-positive problem, split three ways with stratification. Two logistic regressions, one unweighted and
+one with balanced class weights, are compared on ranking (average precision), on behaviour at the default
+threshold, and after choosing the threshold on validation for "recall ≥ 0.80". The last column shows what
+the weights did to the probabilities.
 
 ```python
 import numpy as np
@@ -176,57 +196,111 @@ for cw in (None, "balanced"):
 # the 2% base rate; and its average precision is not better (in this run it is clearly worse, ~0.74 vs ~0.82).
 ```
 
-The output is the one people miss. In one run: unweighted, AP 0.82, recall 0.67 at τ = 0.5, and
-recall 0.80 at precision 0.61 once τ is tuned to about 0.13. Balanced, AP 0.74, recall 0.89 at τ = 0.5
-but precision 0.16, and at the tuned τ about 0.73 recall 0.83 at precision 0.31, with a mean predicted
-probability of 0.17 on 2% data. The weights did not teach the model anything new about the minority:
-they moved its operating point, inflated its probabilities and, because a linear model on this data
-is misspecified, changed which errors it traded off, here for the worse. The unweighted model reached
-the recall target by moving τ alone, at twice the precision.
+The output is the one people miss. In one run:
+
+| Model | AP | At τ = 0.5 | At tuned τ | Mean predicted p |
+|---|---|---|---|---|
+| Unweighted | 0.82 | recall 0.67 | τ about 0.13: recall 0.80 at precision 0.61 | near the 2% base rate |
+| Balanced | 0.74 | recall 0.89, precision 0.16 | τ about 0.73: recall 0.83 at precision 0.31 | 0.17 on 2% data |
+
+- **The weights taught the model nothing new about the minority.** They moved its operating point and
+  inflated its probabilities.
+- **They also changed which errors it traded off,** here for the worse, because a linear model on this data
+  is misspecified.
+- **The unweighted model reached the recall target by moving τ alone,** at twice the precision.
+
+### Imbalance arithmetic you will need in a design review
+Pure Python: the cost threshold, recall's interval, enriched-to-production precision, and prior correction.
+
+```python
+import math
+
+def cost_threshold(c_fp, c_fn):                  # Elkan: predict positive when p >= this
+    return c_fp / (c_fp + c_fn)
+
+def recall_ci(r, n_pos):                         # normal-approximation 95% interval half-width
+    return 1.96 * math.sqrt(r * (1 - r) / n_pos)
+
+def prod_precision(tpr, fpr, pi):                # enriched eval -> production precision
+    return tpr * pi / (tpr * pi + fpr * (1 - pi))
+
+def prior_correct(p, pi_train, pi_prod):         # undo a shifted training prior
+    r = (pi_prod / (1 - pi_prod)) / (pi_train / (1 - pi_train))
+    return p * r / (p * r + (1 - p))
+
+print(f"threshold for 50:1 costs  = {cost_threshold(1, 50):.3f}")
+for n in (50, 400):
+    print(f"recall 0.80 with {n:>3} positives: +/- {recall_ci(0.80, n):.3f}")
+for fpr in (0.001, 0.01):
+    print(f"TPR 0.95, FPR {fpr}: precision at 0.1% prevalence = {prod_precision(0.95, fpr, 0.001):.2f}")
+for p in (0.5, 0.9):                             # balanced weights act like a 50/50 prior
+    print(f"balanced-model p={p} -> {prior_correct(p, 0.5, 0.02):.3f} at 2% prevalence")
+# threshold 0.020; +/- 0.111 and 0.039; precision 0.49 and 0.09; p 0.5 -> 0.020, 0.9 -> 0.155
+```
+
+The prior correction is exact only for a well-specified model; for anything else, recalibrate on a sample at
+production prevalence and compare.
+
+## Production patterns
+- **Threshold from a cost model or alert budget.** Pick τ on validation with `precision_recall_curve`
+  against a written constraint (recall floor, or N alerts per day), version τ with the model, and never
+  hard-code 0.5. Monitor daily flag volume and precision on a reviewed sample.
+- **Stratify every split.** Use `train_test_split(..., stratify=y)` and `StratifiedKFold` (or
+  `StratifiedGroupKFold` with entities) so no fold lacks positives. Monitor positives per fold and the spread
+  of recall across seeds.
+- **Resample inside the fold only.** Put samplers in an imbalanced-learn `Pipeline` (for example
+  `make_pipeline(SMOTE(), LogisticRegression())` from `imblearn.pipeline`), which applies sampling during
+  `fit` only. Monitor the gap between cross-validation and a fresh holdout.
+- **Recalibrate after reweighting.** Fit `CalibratedClassifierCV(..., method="isotonic")` or apply the prior
+  correction on unweighted data at production prevalence. Monitor mean predicted probability versus the
+  observed positive rate per day.
+- **Cascade for very rare positives.** A cheap high-recall classifier routes a small enriched slice to an LLM
+  judge or human review. Monitor stage-one recall on a labelled audit sample and stage-two queue volume.
 
 ## Trade-offs
-- Threshold moving costs nothing and keeps probabilities honest, but it cannot help a model that never
-  learned the minority structure; if the precision–recall curve hugs the prevalence line, you need data
-  or a different model, not a different τ.
-- Class weights and oversampling push the boundary toward recall and are cheap to try, but they change
-  the fitted solution and inflate probabilities; the flip is any consumer that needs p, where you must
-  recalibrate or prior-correct afterwards.
-- Undersampling trains faster and often loses little when negatives are redundant, but it throws away
-  data; with millions of negatives undersample, with thousands weight instead.
-- SMOTE widens the minority region in continuous feature spaces and can lift recall, but it produces
-  implausible points on categorical, one-hot or embedding features and across overlapping classes;
-  prefer real or human-validated synthetic examples there.
-- Focal loss rescues deep detectors drowning in easy negatives, but adds two hyperparameters and
-  changes the probability scale, so calibration must be re-checked after switching.
-- Enriched evaluation sets stabilise recall estimates but make precision unrepresentative; convert
-  through TPR, FPR and the production prior before promising a number.
+- **Free threshold moving vs a ceiling.** It costs nothing and keeps probabilities honest, but cannot help a
+  model that never learned the minority structure; if the precision–recall curve hugs the prevalence line,
+  you need data or a different model, not a different τ.
+- **Cheap recall from weights and oversampling vs inflated probabilities.** They push the boundary toward
+  recall but change the fitted solution; the flip is any consumer that needs p, where you must recalibrate
+  or prior-correct afterwards.
+- **Fast undersampling vs lost data.** It often loses little when negatives are redundant; with millions of
+  negatives undersample, with thousands weight instead.
+- **SMOTE recall vs implausible points.** It widens the minority region in continuous spaces and can lift
+  recall, but produces implausible points on categorical, one-hot or embedding features and across
+  overlapping classes; prefer real or human-validated synthetic examples there.
+- **Focal loss vs tuning and calibration.** It rescues deep detectors drowning in easy negatives, but adds two
+  hyperparameters and changes the probability scale, so re-check calibration after switching.
+- **Enriched eval sets: stable recall vs unrepresentative precision.** Convert through TPR, FPR and the
+  production prior before promising a number.
 
 ## Pitfalls
-- Resampling or SMOTE before the split; the symptom is near-perfect cross-validation followed by a
-  collapse in production, because neighbours of the same minority point sat in both folds.
-- Non-stratified splits with rare positives; the symptom is folds with zero positives, undefined recall
-  and wildly varying scores between random seeds.
-- Reporting accuracy or ROC-AUC alone; the symptom is 0.99 accuracy with no positives caught, or 0.95
-  AUC with a review queue that is 90% false alarms.
-- Shipping raw probabilities from a reweighted model; the symptom is that everything looks "likely
-  positive" and every downstream threshold breaks.
-- Measuring precision on the enriched evaluation set; the symptom is 0.8 offline and 0.1 in production
-  with no change in the model.
-- Few-shot prompts whose demonstrations are all one class; the symptom is predictions skewing to that
-  class whatever the input says.
-- Adding LLM-generated minority examples and validating on them; the symptom is excellent numbers on
-  synthetic positives and no improvement on real ones.
+- **Resampling or SMOTE before the split.** Symptom: near-perfect cross-validation then a production collapse,
+  because neighbours of the same minority point sat in both folds.
+- **Non-stratified splits with rare positives.** Symptom: folds with zero positives, undefined recall and
+  wildly varying scores between random seeds.
+- **Reporting accuracy or ROC-AUC alone.** Symptom: 0.99 accuracy with no positives caught, or 0.95 AUC with a
+  review queue that is 90% false alarms.
+- **Shipping raw probabilities from a reweighted model.** Symptom: everything looks "likely positive" and
+  every downstream threshold breaks.
+- **Measuring precision on the enriched evaluation set.** Symptom: 0.8 offline and 0.1 in production with no
+  change in the model.
+- **Few-shot prompts whose demonstrations are all one class.** Symptom: predictions skew to that class
+  whatever the input says.
+- **Validating on LLM-generated minority examples.** Symptom: excellent numbers on synthetic positives and no
+  improvement on real ones.
 
 ## When to use
-Treat any problem with prevalence under roughly 10% as imbalanced and start with the measurement
-discipline: prevalence, stratified splits, confusion matrix, precision–recall, a threshold chosen on
-validation against a stated constraint. Add class weights or resampling only when the ranking itself
-is poor and you have verified with average precision that they help; use focal loss for deep detectors
-swamped by easy negatives; use undersampling when negatives are enormous and redundant; use anomaly
-detection or a cascade when positives are below one in a thousand. Whatever you do to the training
-distribution, recalibrate before anyone consumes the probabilities. In interviews, the expected depth
-is: why accuracy fails, the cost-optimal threshold formula, how resampling causes leakage, and how
-enriched-set precision converts to production precision.
+- **Treat prevalence under roughly 10% as imbalanced** and start with measurement discipline: prevalence,
+  stratified splits, confusion matrix, precision–recall, a threshold chosen on validation against a stated
+  constraint.
+- **Use class weights or resampling** only when the ranking itself is poor and average precision shows they
+  help; **focal loss** for deep detectors swamped by easy negatives; **undersampling** when negatives are
+  enormous and redundant.
+- **Use anomaly detection or a cascade** when positives are below one in a thousand.
+- **Always recalibrate** before anyone consumes the probabilities, whatever you did to the training distribution.
+- **Interviews:** why accuracy fails, the cost-optimal threshold formula, how resampling causes leakage, and
+  how enriched-set precision converts to production precision.
 
 ## Role lens
 - **Engineer:** Builds the stratified split, the threshold sweep and the prior correction into the
@@ -251,6 +325,37 @@ from the enriched set. Set the threshold from the cost model: a false block cost
 injection risks exfiltration, so fix the FPR budget security will accept and read recall there on
 validation. If the score feeds a second-stage LLM check, calibrate it. Monitor daily flag volume and
 review a sample so drift in either class is noticed.
+
+## Interview questions
+### Why is accuracy a bad metric at 1% prevalence, and what do you report instead?
+- **Definition-plus-why:** the constant "never positive" classifier scores 99%, so accuracy cannot separate a
+  useless model from a good one.
+- **Report instead:** prevalence, the confusion matrix in raw counts, the precision–recall curve with average
+  precision, and recall and precision at the chosen operating point.
+
+### A teammate added `class_weight="balanced"` and now every downstream threshold fires constantly. What happened?
+- **Diagnosis:** balanced weights make the model behave as if the classes were 50/50, so its probabilities are
+  inflated; mean predicted p far above the base rate confirms it.
+- **Fix:** recalibrate on unweighted data at production prevalence or apply the prior correction, then re-pick
+  thresholds on validation.
+- **Also check** whether the weights improved average precision at all; often moving τ alone was enough.
+
+### When would you undersample instead of reweighting?
+- **Undersample** when negatives number in the millions and are redundant: training is faster and little is
+  lost, and averaging models over several undersamples recovers more.
+- **Reweight** when negatives number in the thousands and every one carries information.
+- **Either way** the probabilities shift and need correcting before use.
+
+### Your injection detector has TPR 0.95 and FPR 0.01 on a balanced test set. What precision will production see?
+- **Convert with the prior:** at 0.1% prevalence, precision is 0.95·0.001 / (0.95·0.001 + 0.01·0.999), about 0.09.
+- **So** roughly ten false alarms per true catch; driving FPR to 0.001 lifts precision to about 0.49.
+- **Design response:** a cascade with a precise second stage, or a stricter threshold traded against recall.
+
+### How many positives does your evaluation set need?
+- **Recall's standard error is about √(r(1 − r) / n_pos):** 50 positives at recall 0.80 give a 95% interval near
+  ±0.11; 400 give about ±0.04.
+- **So size by positives, not rows,** and enrich the evaluation set, then convert precision back to
+  production prevalence.
 
 ## Quiz
 ### Q: Missing a fraud costs about fifty times as much as a false alarm. With calibrated probabilities, which decision threshold minimises expected cost?

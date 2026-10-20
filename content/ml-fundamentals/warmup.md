@@ -5,7 +5,7 @@ name: Warmup
 kind: practice
 difficulty: core
 est_minutes: 11
-status: reviewed
+status: crisp
 related:
   - ml-fundamentals/learning-rate-schedulers
   - ml-fundamentals/optimizers
@@ -21,92 +21,103 @@ sources:
 
 ## TL;DR
 Warmup ramps the learning rate from near zero to its peak over the first few hundred or thousand
-optimizer steps. It exists because the first steps are the most dangerous: weights are random, gradients
-are large and poorly conditioned, and Adam's running variance estimates are built from almost no data,
-so a full-size step can throw the model into a region it never recovers from. A short ramp costs almost
-nothing and removes most early-training divergence.
+optimizer steps, because early steps are the most dangerous. A short ramp costs almost nothing and removes
+most early-training divergence.
 
 ## Why it exists
-At initialization nothing about the network is calibrated. Activations have whatever scale the init gave
-them, the loss is at its maximum, and the gradient is large in magnitude and dominated by a few
-directions (fix the output bias, shrink everything) rather than by anything useful. Taking a full
-learning-rate step here moves the weights a long way along a direction computed from a landscape that
-will look completely different one step later. The visible result is a loss that drops for a few steps,
-then spikes, then either recovers slowly or produces NaNs.
-
-Adaptive optimizers make this worse in a specific way. Adam divides each parameter's update by the square
-root of a running average of squared gradients, `√v̂`. After one step, `v` is an estimate from a single
-sample; after ten, from ten. The variance of that estimate is enormous early, and a parameter whose few
-observed gradients happened to be small gets an update that is far too large. The RAdam analysis made this
-precise: the effective per-parameter step size has divergent variance in the first iterations, and a
-learning-rate warmup is a cheap way to keep updates small until `v` has enough samples to be trusted.
-
-Architecture adds a third reason. In the original Post-LN transformer, the expected gradient norm at the
-layers nearest the output is large at initialization and does not shrink with depth, while in Pre-LN it
-scales down roughly as `1/√L`; in a deep Post-LN model the first updates are therefore disproportionately
-large near the output, and the paper that analysed this showed Post-LN is unstable without warmup, while
-Pre-LN tolerates its absence.
-Large-batch training is a fourth: a bigger batch justifies a bigger learning rate, but only once the
-model has left the chaotic initial region, so the ImageNet-in-one-hour recipe ramped the rate linearly
-over the first five epochs rather than starting at the scaled peak.
-
-The naive alternative is simply a lower peak learning rate. It avoids the early blow-up, but the whole run
-then trains too slowly and the final loss is worse. Warmup separates the two concerns: a conservative
-start and an aggressive middle.
+- **Nothing is calibrated at init.** Activations have whatever scale the init gave them, the loss is at
+  its maximum, and the gradient is large and dominated by a few directions (fix the output bias, shrink
+  everything). A full step moves far along a direction computed from a landscape that looks completely
+  different one step later. Result: loss drops, spikes, then recovers slowly or produces NaNs.
+- **Adam's early statistics are noise.** It divides each update by `√v̂`, a running average of squared
+  gradients built from one sample after one step, ten after ten. A parameter whose few observed gradients
+  happened to be small gets an update far too large. RAdam showed the effective step size has divergent
+  variance in the first iterations; warmup keeps updates small until `v` can be trusted.
+- **Post-LN amplifies it.** In the original Post-LN transformer the expected gradient norm nearest the
+  output is large at init and does not shrink with depth, while Pre-LN scales roughly as `1/√L`. The paper
+  that analysed this showed Post-LN is unstable without warmup, while Pre-LN tolerates its absence.
+- **Large batches need it.** A bigger batch justifies a bigger rate only once the model has left the
+  chaotic initial region, so the ImageNet-in-one-hour recipe ramped linearly over the first five epochs
+  instead of starting at the scaled peak.
+- **A lower peak is the wrong fix.** It avoids the early blow-up, but the whole run trains too slowly and
+  ends at a worse loss. Warmup separates the concerns: a conservative start and an aggressive middle.
 
 ## How it works
-Warmup is a multiplier on the learning rate for the first `W` optimizer steps, after which the main
-schedule takes over:
+Warmup is a multiplier on the learning rate for the first `W` optimizer steps, then the main schedule
+takes over:
 
 ```
 η(t) = η_max × t / W           for t < W      (linear warmup)
 η(t) = main_schedule(t)        for t ≥ W
 ```
 
-Linear is standard; some recipes start from a small non-zero fraction instead of exactly zero so the
-very first step still does something. The ramp is in *optimizer steps*, which matters with gradient
-accumulation: 500 warmup steps with accumulation 8 means 4,000 micro-batches.
+- **Linear is standard.** Some recipes start from a small non-zero fraction instead of exactly zero, so
+  the very first step still does something.
+- **Counted in optimizer steps.** With gradient accumulation this matters: 500 warmup steps with
+  accumulation 8 means 4,000 micro-batches.
 
 ### What it protects against, step by step
 1. **Steps 1–10.** Adam's `m` and `v` are nearly empty. Bias correction fixes their *mean* but not their
-   *variance*; the per-parameter step `m̂/√v̂` can be wildly off for individual weights. The extreme case is
-   step one: after bias correction `m̂ = g` and `v̂ = g²`, so the update is `η · g/|g| = η · sign(g)`.
-   Every parameter, including those whose gradient is pure noise, moves by the full learning rate in the
-   direction of a single batch. At η = 1e-4 that is every one of billions of weights shifted by 1e-4 at
-   once. A tiny η keeps those mis-scaled updates harmless while `v` fills.
-2. **Steps 10–W.** Gradients are still large and the loss surface is sharp. Weight norms, LayerNorm
-   statistics and attention logit scales are settling. A rising η lets the model take progressively larger
-   steps as the curvature along the trajectory decreases.
-3. **After W.** The model is in a smoother basin, moment estimates are reliable, and the main schedule
+   *variance*, so the per-parameter step `m̂/√v̂` can be wildly off for individual weights.
+2. **Step one is the extreme.** After bias correction `m̂ = g` and `v̂ = g²`, so the update is
+   `η · g/|g| = η · sign(g)`. Every parameter, including pure-noise ones, moves by the full rate in one
+   batch's direction. At η = 1e-4 that is billions of weights shifted by 1e-4 at once; a tiny η keeps
+   those mis-scaled updates harmless while `v` fills.
+3. **Steps 10–W.** Gradients are still large and the surface is sharp. Weight norms, LayerNorm statistics
+   and attention logit scales are settling; a rising η takes progressively larger steps as the curvature
+   along the trajectory decreases.
+4. **After W.** The model is in a smoother basin, moment estimates are reliable, and the main schedule
    (cosine, linear, WSD) governs.
 
 ### How long
-There is no closed form. Practical ranges: for fine-tuning, a few percent of total steps or a fixed 50–200
-steps; for pre-training, on the order of a thousand to a few thousand steps (Llama 2, for example,
-reports 2,000). Larger peak learning rates, larger batches and Post-LN architectures want longer warmup;
-small fine-tuning runs with a low peak often work with very little. The tell for "too short" is a loss
-spike or a sudden rise in gradient norm within the first few hundred steps; the tell for "too long" is
-a flat early loss curve that only starts dropping when the ramp ends.
+There is no closed form. Practical ranges:
+
+| Run | Typical warmup |
+|---|---|
+| Fine-tuning | a few percent of total steps, or a fixed 50–200 steps |
+| Pre-training | on the order of a thousand to a few thousand steps (Llama 2 reports 2,000) |
+| Small fine-tune, low peak | often very little |
+
+- **Want longer:** larger peak learning rates, larger batches and Post-LN architectures.
+- **Too short:** a loss spike or a sudden rise in gradient norm within the first few hundred steps.
+- **Too long:** a flat early loss curve that only starts dropping when the ramp ends.
 
 ### Interaction with other stabilizers
-Warmup, gradient clipping and Pre-LN normalization all attack the same early instability from different
-sides, which is why modern recipes use all three. Clipping bounds the damage of any single bad step;
-Pre-LN keeps gradient magnitudes roughly uniform across depth; warmup shrinks the step itself. Removing
-one usually means asking more of the others. RAdam builds the variance correction into the optimizer
-itself (it damps the adaptive step until `v` has enough samples), which is why some recipes run it without
-an explicit ramp; most LLM recipes still pair AdamW with a plain linear warmup because it is simpler to
-reason about and tune.
+Warmup, gradient clipping and Pre-LN attack the same early instability from different sides, which is why
+modern recipes use all three. Removing one usually means asking more of the others.
+- **Clipping** bounds the damage of any single bad step.
+- **Pre-LN** keeps gradient magnitudes roughly uniform across depth.
+- **Warmup** shrinks the step itself.
+- **RAdam** builds the variance correction into the optimizer (it damps the adaptive step until `v` has
+  enough samples), so some recipes run it with no explicit ramp. Most LLM recipes still pair AdamW with a
+  plain linear warmup, because it is simpler to reason about and tune.
 
 ### Resuming and re-warming
-When resuming a run from a checkpoint with intact optimizer state, warmup should *not* repeat, because
-`v` is already populated; the scheduler state must be restored so the learning rate continues where it
-left off. When starting a new phase (continued pre-training on new data, or fine-tuning from a base model)
-the optimizer state is fresh, so a new warmup is needed even though the weights are trained.
+- **Resume with intact optimizer state:** do *not* repeat warmup, because `v` is already populated.
+  Restore the scheduler state so the learning rate continues where it left off.
+- **New phase** (continued pre-training on new data, or fine-tuning from a base model): the optimizer
+  state is fresh, so a new warmup is needed even though the weights are trained.
 
-## Example
-A fine-tuning configuration where the warmup length is derived from the real number of optimizer steps,
-then checked by printing the learning rate at the ends of the ramp. The scheduler comes from
-`transformers`; the arithmetic that most people get wrong is the step count.
+## Diagram
+Follow one run from initialization: the ramp covers the window where Adam's statistics are unreliable,
+and a resume skips it only when optimizer state comes back with the weights.
+
+```mermaid
+flowchart TD
+    A["Random init, empty m and v"] --> B["Step 1: update is eta times sign g"]
+    B --> C["Steps 1 to 10: v from few samples"]
+    C --> D["Steps 10 to W: eta rises, curvature falls"]
+    D --> E["After W: main schedule"]
+    E --> F{"Restart?"}
+    F -->|"resume with optimizer state"| E
+    F -->|"fresh optimizer or new phase"| A
+```
+
+## Examples
+### Sizing warmup from the real optimizer step count
+A fine-tuning configuration where warmup is derived from the real number of optimizer steps, then checked
+by printing the learning rate at the ends of the ramp. The scheduler comes from `transformers`; the
+arithmetic most people get wrong is the step count.
 
 ```python
 import torch
@@ -133,46 +144,97 @@ print(f"{seen[0]:.2e} {seen[warmup // 2]:.2e} {seen[warmup - 1]:.2e} {seen[opt_s
 # ~4.3e-07  ~1.0e-05  2.0e-05  ~0  -> ramp reaches the peak at step 45, then cosine decays
 ```
 
-If `opt_steps` had been computed from micro-batches (`epochs * n_examples // micro_batch` = 7,500), the
-same 5% rule would give 375 warmup steps: 40% of the 936 optimizer steps that actually run. Worse, the
-cosine is planned for 7,500 steps, so when the data runs out the decay is only (936 − 375)/(7,500 − 375),
-about 8%, of the way through, the learning rate is still near its peak, and the final weights never get
-an anneal.
+What goes wrong if `opt_steps` is computed from micro-batches (`epochs * n_examples // micro_batch` =
+7,500):
+
+| Quantity | Correct | From micro-batches |
+|---|---|---|
+| Planned schedule length | 936 | 7,500 |
+| 5% warmup | 46 steps | 375 steps: 40% of the 936 steps that actually run |
+| Decay progress when data runs out | 100% | (936 − 375)/(7,500 − 375), about 8% |
+| Final learning rate | ~0 | still near peak, so the weights never get an anneal |
+
+### Why clipping cannot replace warmup: Adam's first step by hand
+Pure Python, no dependencies. It applies Adam's bias-corrected first update to a gradient with one huge,
+one tiny (noise) and one large component, with and without clipping to norm 1.0.
+
+```python
+import math
+
+def adam_first_step(g, lr=1e-4, b1=0.9, b2=0.999, eps=1e-8):
+    m = [(1 - b1) * x for x in g]                 # m after one step
+    v = [(1 - b2) * x * x for x in g]             # v after one step
+    m_hat = [x / (1 - b1) for x in m]             # bias correction: m_hat = g
+    v_hat = [x / (1 - b2) for x in v]             # v_hat = g^2
+    return [-lr * mh / (math.sqrt(vh) + eps) for mh, vh in zip(m_hat, v_hat)]
+
+def clip(g, max_norm=1.0):
+    norm = math.sqrt(sum(x * x for x in g))
+    return [x * min(1.0, max_norm / norm) for x in g], norm
+
+grad = [3.0, -0.001, 9.0]                         # one large, one tiny (noise), one huge
+clipped, norm = clip(grad)
+print(f"grad norm {norm:.2f}, clipped to {math.sqrt(sum(x*x for x in clipped)):.2f}")
+print("unclipped:", [f"{u:+.2e}" for u in adam_first_step(grad)])
+print("clipped:  ", [f"{u:+.2e}" for u in adam_first_step(clipped)])
+# grad norm 9.49, clipped to 1.00
+# Both lines print -1.00e-04 +1.00e-04 -1.00e-04: step one is lr * sign(g),
+# the tiny noisy gradient moves as far as the huge one, and clipping changes nothing.
+```
+
+Only a smaller `lr` on that first step shrinks the move, which is exactly what the warmup ramp does.
+
+## Production patterns
+- **Derive warmup from optimizer steps.** Compute steps as examples ÷ (micro-batch × accumulation ×
+  GPUs) × epochs, then set `warmup_steps`, or a ratio of that count (the Trainer's `warmup_ratio`).
+  Before launch, print the rate at step 0, `W` and the end; it should hit the peak exactly at `W`.
+- **Log grad norm from step zero.** `torch.nn.utils.clip_grad_norm_` returns the pre-clip total norm, so
+  log it every step. A healthy run shows the norm falling as the rate rises; a spike in the first few
+  hundred steps means the ramp is too short.
+- **Re-warm on every fresh optimizer.** Continued pre-training on new data or fine-tuning from a base
+  model starts with empty `m` and `v`, so give it its own ramp. A true resume restores optimizer and
+  scheduler state and skips it; alert if the logged rate drops at a resume step.
+- **Short ramp for LoRA.** LoRA's `B` starts at zero and LoRA uses higher peak rates, so a 20–50 step ramp
+  removes the first-steps loss jump. Watch grad norm over the first tens of steps.
+- **Scale warmup with peak rate and batch.** When raising the peak learning rate or batch size, lengthen
+  warmup as Goyal et al. did (a linear ramp over the first five epochs at large batch). Monitor early
+  gradient-norm spikes after each change.
 
 ## Trade-offs
-- A longer warmup is safer against early divergence but spends more of a short fine-tuning run below the
-  productive learning rate; once the early gradient-norm spike is gone, extra ramp buys nothing, so the
-  trade flips as soon as a shorter warmup shows a clean norm trace.
-- Warmup lets you use a higher peak learning rate (and therefore reach a given loss in fewer steps),
-  but the higher peak then needs a proper decay phase or the run ends noisy.
-- Pre-LN architectures and gradient clipping reduce the *need* for warmup, so very short ramps work, but
-  removing warmup entirely still risks polluting Adam's moment estimates with the first erratic gradients.
-- Skipping warmup on resume is correct when optimizer state is restored, and wrong when it is not;
-  the convenience of "just reload the weights" trades for a second unstable start.
+- **Safety vs productive steps.** A longer warmup is safer against early divergence but spends more of a
+  short fine-tuning run below the productive rate; once the early gradient-norm spike is gone, extra ramp
+  buys nothing, so the trade flips as soon as a shorter warmup shows a clean norm trace.
+- **Higher peak vs noisy end.** Warmup lets you use a higher peak learning rate, reaching a given loss in
+  fewer steps, but the higher peak then needs a proper decay phase or the run ends noisy.
+- **Pre-LN and clipping vs zero warmup.** They reduce the *need* for warmup, so very short ramps work, but
+  removing it entirely still risks polluting Adam's moment estimates with the first erratic gradients.
+- **Skipping warmup on resume.** Correct when optimizer state is restored, wrong when it is not; the
+  convenience of "just reload the weights" trades for a second unstable start.
 
 ## Pitfalls
-- Setting `warmup_steps` as if steps were micro-batches or epochs; the symptom is either a ramp that
-  never finishes before the run ends or one that is over after a single logging interval.
-- Resuming a crashed run without the scheduler state, so warmup restarts from zero at step 10,000;
-  the loss curve shows a visible dip in progress for the next few hundred steps.
-- Treating a loss spike at step 50 as a data problem when it is a warmup problem; check the gradient norm
-  trace first, which jumps before the loss does.
-- Reusing a pre-training warmup length (thousands of steps) for a fine-tuning run of 500 steps, so the
+- **Counting warmup in the wrong unit.** Setting `warmup_steps` as if steps were micro-batches or epochs.
+  Symptom: a ramp that never finishes before the run ends, or one over after a single logging interval.
+- **Resuming without scheduler state.** Warmup restarts from zero at step 10,000; the loss curve shows a
+  visible dip in progress for the next few hundred steps.
+- **Blaming data for a step-50 spike.** It is usually a warmup problem. Check the gradient norm trace
+  first, because it jumps before the loss does.
+- **Reusing a pre-training warmup for fine-tuning.** Thousands of steps of ramp in a 500-step run means the
   model never reaches its intended learning rate.
-- Starting LoRA fine-tuning at its usual higher peak rate with no warmup: `B` is zero-initialized, so on
-  step one only `B` receives a gradient, and Adam's sign-like first step moves every element of `B` by the
-  full rate in one batch's direction. The symptom is a loss jump or grad-norm spike in the first tens of
-  steps that a 20–50 step ramp removes.
+- **LoRA at a high peak with no warmup.** `B` is zero-initialized, so on step one only `B` gets a gradient,
+  and Adam's sign-like first step moves every element of `B` by the full rate in one batch's direction.
+  Symptom: a loss jump or grad-norm spike in the first tens of steps; a 20–50 step ramp removes it.
 
 ## When to use
-Use warmup in essentially every run that uses Adam-family optimizers, which is every run in modern
-AI engineering. For fine-tuning, default to a few percent of total optimizer steps and verify the
-step count. For pre-training or large-batch training, size it in the thousands of steps and increase it
-when raising the peak learning rate or batch size. Skip it only in tiny experiments where divergence is
-cheap to notice and restart. Measure it by logging the learning rate and gradient norm from step zero:
-a healthy run shows the norm falling as the rate rises. In interviews, the question is rarely "what is
-warmup" but "why does Adam need it", and the answer is the variance of early second-moment estimates
-plus large, poorly conditioned initial gradients.
+- **Use warmup** in essentially every run with an Adam-family optimizer, which is every run in modern AI
+  engineering.
+- **Fine-tuning:** default to a few percent of total optimizer steps and verify the step count.
+- **Pre-training or large-batch training:** size it in the thousands of steps, and increase it when
+  raising the peak learning rate or batch size.
+- **Skip it** only in tiny experiments where divergence is cheap to notice and restart.
+- **Measure:** log learning rate and gradient norm from step zero; a healthy run shows the norm falling as
+  the rate rises.
+- **Interviews:** the question is rarely "what is warmup" but "why does Adam need it". The answer is the
+  variance of early second-moment estimates plus large, poorly conditioned initial gradients.
 
 ## Role lens
 - **Engineer:** Computes warmup from the real optimizer step count, logs learning rate and grad norm from
@@ -194,6 +256,40 @@ norm 10 to norm 1 produces the same first step as the unclipped one. Expect a lo
 or a run that converges but to a worse final loss than the same recipe with a 50-step ramp. The cost of
 warmup is a few percent of a short run, and the fix for any observed spike is cheaper up front than after
 a wasted run.
+
+## Interview questions
+### Why do Adam-family optimizers need warmup when plain SGD often gets by without it?
+- **Normalized steps:** Adam divides by `√v̂`, and early `v̂` comes from one or a few gradients, so
+  per-parameter step sizes have huge variance until enough samples arrive.
+- **Step one is sign descent:** after bias correction the first update is `η · sign(g)`, so every weight
+  moves by the full rate regardless of how small or noisy its gradient was.
+- **Warmup keeps η tiny** for exactly that window, then hands over to the main schedule.
+
+### A fine-tune's loss spikes around step 50 and then recovers slowly. Walk me through the diagnosis.
+- **Check the grad-norm trace first:** it jumps before the loss does, which points at optimization
+  stability rather than a bad data shard.
+- **Check step accounting:** confirm warmup was counted in optimizer steps and actually ran, and that the
+  peak was reached when intended.
+- **Fix:** lengthen the ramp (for example 50–200 steps for fine-tuning) or lower the peak, then rerun and
+  compare the norm trace.
+
+### When is it correct to skip warmup?
+- **On a true resume:** if the checkpoint restores optimizer state, `v` is populated and the scheduler
+  should continue from its saved step; repeating the ramp only slows the next few hundred steps.
+- **Tiny experiments:** where divergence is cheap to notice and restart.
+- **Not when only weights are reloaded:** a fresh optimizer needs a fresh ramp, even on trained weights.
+
+### How long should warmup be for pre-training versus fine-tuning, and what tells you it is wrong?
+- **Pre-training:** on the order of a thousand to a few thousand steps; Llama 2 reports 2,000.
+- **Fine-tuning:** a few percent of total steps or a fixed 50–200 steps.
+- **Too short:** loss or grad-norm spike in the first few hundred steps. **Too long:** a flat early loss
+  curve that only starts falling when the ramp ends.
+
+### Does RAdam make explicit warmup unnecessary?
+- **It addresses the same cause:** RAdam damps the adaptive step until `v` has enough samples, so some
+  recipes run it with no explicit ramp.
+- **Why most LLM recipes still use AdamW plus linear warmup:** it is simpler to reason about and tune,
+  and it also covers the large, poorly conditioned initial gradients.
 
 ## Quiz
 ### Q: Why does Adam specifically benefit from learning-rate warmup?

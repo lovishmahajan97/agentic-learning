@@ -5,7 +5,7 @@ name: Structured / constrained generation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - prompting/structured-outputs-json-mode
   - prompting/function-tool-calling
@@ -23,116 +23,142 @@ sources:
 ---
 
 ## TL;DR
-Structured generation makes a model's output conform to a schema, regex, grammar or fixed set of
-choices. The reliable way is constrained decoding: at every step the engine masks the logits of tokens
-that would violate the grammar, so the sampler can only pick valid continuations and the output parses
-by construction. That removes the parse-and-retry loop, but it guarantees shape, not truth, costs a
-grammar compile step, and can subtly change what the model says, so schema design still matters.
+Constrained decoding masks the logits of grammar-violating tokens at every step, so output matches a
+schema, regex, grammar or choice set by construction. It removes retry loops but guarantees
+shape, not truth, costs a grammar compile, and can shift what the model says.
 
 ## Why it exists
-Code downstream of a model needs something it can parse: a JSON object with known fields, a function
-call with typed arguments, one of five labels. Asked nicely, models mostly comply, and "mostly" is the
-problem. They wrap JSON in Markdown fences, add a trailing comma, rename a field, emit a comment, or
-start with "Sure, here is the JSON". At a 2% failure rate, a pipeline running a million calls a day
-breaks twenty thousand times, and the failures cluster on the hardest inputs.
-
-The naive fix is validate-and-retry: parse the output, and if it fails, send it back with the error
-message. That works at low volume and is still worth having for semantic checks, but each retry doubles
-latency and cost on exactly the requests that were already slow, the failure rate is never zero, and
-small or heavily quantized models can loop without converging. Post-processing with regex repair is
-brittle in the other direction: it silently accepts malformed intent.
-
-Constrained decoding attacks the root. The model proposes a distribution over next tokens; the engine
-knows, from the grammar and what has been emitted so far, which tokens are legal; it zeroes the rest
-before sampling. Invalid output becomes impossible rather than unlikely. The mechanism exists in open
-engines (vLLM, SGLang, llama.cpp, TensorRT-LLM) and behind hosted "structured outputs" and strict
-tool-calling modes, so the pattern is now the default way to get machine-readable output.
+- **Code needs parseable output.** A JSON object with known fields, a function call with typed arguments,
+  one of five labels.
+- **"Mostly complies" is the problem.** Models wrap JSON in Markdown fences, add a trailing comma, rename a
+  field, emit a comment, or start with "Sure, here is the JSON". At a 2% failure rate, a million calls a
+  day break twenty thousand times, clustered on the hardest inputs.
+- **Validate-and-retry is not enough.** Still worth having for semantic checks, but each retry doubles
+  latency and cost on requests that were already slow, the failure rate never reaches zero, and small or
+  heavily quantized models can loop without converging.
+- **Regex repair is brittle the other way:** it silently accepts malformed intent.
+- **Constrained decoding attacks the root.** The engine knows from the grammar and the output so far which
+  tokens are legal and zeroes the rest before sampling, so invalid output becomes impossible, not
+  unlikely. Open engines (vLLM, SGLang, llama.cpp, TensorRT-LLM) and hosted "structured outputs" and
+  strict tool-calling modes all use it; it is now the default.
 
 ## How it works
 ### Where the constraint sits
-Each decode step produces a logits vector over the vocabulary. A constraint is a *logits processor*: it
-computes the set of allowed token ids for the current state and adds −∞ to every other entry. Softmax
-then assigns those tokens zero probability, and temperature, top-p and the rest apply only among the
-allowed ones. The model is never asked to do anything; it is simply not permitted to make certain moves.
+1. Each decode step produces a logits vector over the vocabulary.
+2. A *logits processor* computes the allowed token ids for the current state and adds −∞ to every other
+   entry.
+3. Softmax assigns those tokens zero probability; temperature, top-p and the rest apply only among the
+   allowed ones.
+
+The model is never asked to do anything; it is simply not permitted to make certain moves.
 
 ### The token-versus-character problem
-Grammars are defined over characters, but the model emits tokens, and a vocabulary of 100k+ entries
-contains many tokens that straddle grammar boundaries: `"na`, `me":`, ` {"`. The brute-force check,
-"for each of 128k tokens, would appending its characters keep the output valid?", costs a full grammar
-walk per token per step, which is far too slow for a decode step budgeted in milliseconds.
+- **Grammars are over characters; models emit tokens.** A vocabulary of 100k+ entries has many tokens that
+  straddle grammar boundaries: `"na`, `me":`, ` {"`.
+- **Brute force is too slow.** "For each of 128k tokens, would appending its characters keep the output
+  valid?" costs a full grammar walk per token per step, far too slow for a decode step budgeted in
+  milliseconds.
 
-Outlines' insight was to do that work once. Compile the regex (or the regex derived from a JSON schema)
-into a deterministic finite automaton, then, for every automaton state, walk every vocabulary token
-through the automaton and record which tokens are legal from that state and which state each leads to.
-At generation time the engine tracks the current state and the allowed set is a table lookup; the
-expensive vocabulary scan happened at compile time *because* it depends only on the grammar and the
-tokenizer, not on the request.
+### Outlines' insight: precompute the index
+1. **Compile** the regex (or the regex derived from a JSON schema) into a deterministic finite automaton.
+2. **For every automaton state,** walk every vocabulary token through it and record which tokens are legal
+   and which state each leads to.
+3. **At generation time** track the current state; the allowed set is a table lookup.
 
-A tiny case shows what the index holds. Take the pattern "exactly three digits, then stop" and a toy
-vocabulary containing `7`, `42`, `123`, `1234`, `a` and ` 5`. From the start state (no digits yet), `7`
-leads to the one-digit state, `42` to the two-digit state, `123` straight to the accepting state, and
-`1234`, `a` and ` 5` are illegal. From the two-digit state only single-digit tokens are legal; from the
-accepting state only end-of-sequence is. Note that multi-character tokens jump several automaton steps
-at once, which is exactly what a character-level grammar check cannot see without walking each token.
+The expensive scan happens at compile time *because* it depends only on the grammar and the tokenizer,
+not on the request.
 
-Non-recursive JSON schemas compile to regexes; recursive or deeply nested grammars need a pushdown automaton (a context-free grammar), which is what llama.cpp's GBNF grammars and
-XGrammar implement, the latter caching the tokens whose legality does not depend on the stack so that
-most steps are still a lookup.
+### A tiny index
+Pattern: "exactly three digits, then stop". Toy vocabulary: `7`, `42`, `123`, `1234`, `a`, ` 5`.
+
+| State | Legal tokens → next state | Illegal |
+|---|---|---|
+| start (no digits) | `7` → one digit, `42` → two digits, `123` → accepting | `1234`, `a`, ` 5` |
+| two digits | single-digit tokens only | everything longer |
+| accepting | end-of-sequence only | all others |
+
+Multi-character tokens jump several automaton steps at once, which a character-level check cannot see
+without walking each token.
+
+### Regular vs context-free grammars
+- **Non-recursive JSON schemas** compile to regexes.
+- **Recursive or deeply nested grammars** need a pushdown automaton (a context-free grammar): llama.cpp's
+  GBNF grammars and XGrammar implement this.
+- **XGrammar caches** the tokens whose legality does not depend on the stack, so most steps are still a
+  lookup.
 
 ### What the automaton controls
-Three things fall out of the state machine. End-of-sequence is allowed only in an accepting state, so the
-model cannot stop halfway through an object. When exactly one token is legal (a closing brace, a fixed
-key name), some engines skip sampling and append it directly, which saves decode steps on boilerplate.
-And enums, numeric ranges and string patterns become hard constraints: a `"status"` field declared as
-`enum: ["open", "closed"]` cannot come back as `"Closed"`.
+- **No stopping halfway.** End-of-sequence is allowed only in an accepting state.
+- **Forced tokens.** When exactly one token is legal (a closing brace, a fixed key name), some engines skip
+  sampling and append it directly, saving decode steps on boilerplate.
+- **Hard enums, ranges and patterns.** A `"status"` field declared as `enum: ["open", "closed"]` cannot
+  come back as `"Closed"`.
 
 ### The cost at serving time
-Masking has to fit inside a decode step that takes milliseconds for a whole batch, so engines treat it as
-a pipeline problem. The grammar state advance and mask computation run on the CPU while the GPU computes
-the forward pass for the same step, and the result is applied as a compact per-sequence bitmask over the
-vocabulary just before sampling; when mask computation is slower than the forward pass, it shows up
-directly as higher time per output token. Appending runs of forced tokens without sampling, mentioned
-above, is what SGLang calls jump-forward decoding. Every sequence in a batch can carry a different
-grammar, so the CPU-side work (compiling grammars and computing each sequence's mask) is the part that
-has to scale with concurrency; applying the finished mask on the GPU is cheap.
+- **Overlap with the forward pass.** Grammar state advance and mask computation run on the CPU while the
+  GPU computes the same step's forward pass.
+- **Compact application.** The result is a per-sequence bitmask over the vocabulary applied just before
+  sampling. When mask computation is slower than the forward pass, it shows up directly as higher time
+  per output token.
+- **Jump-forward.** Appending runs of forced tokens without sampling is what SGLang calls jump-forward
+  decoding.
+- **Scaling.** Every sequence in a batch can carry a different grammar, so CPU-side work (compiling
+  grammars, computing each mask) must scale with concurrency; applying the mask on the GPU is cheap.
 
 ### What it does not control
-A valid schema says nothing about whether the values are true. A hallucinated invoice number passes a
-regex for invoice numbers. Semantic validation (Pydantic validators, cross-field rules, database
-lookups) still belongs after generation, and retry-with-feedback remains the right tool for *those*
-failures. Constrained decoding also changes the distribution: at a point where the model wanted to write
-prose, it must choose among whitespace or a quote, and may take a low-probability path. Masking and
-renormalising at each step is also not the same as sampling from the model's distribution conditioned
-on producing valid output: the mask is greedy and local, so the model can be steered into a prefix whose
-only legal continuations it considers unlikely, and it is never allowed to back up. Tokenization
-artefacts matter too; forcing output to begin with `{` rather than ` {` can land the model in a token
-sequence it rarely saw in training. One 2024 study (Tam et al.) reported that strict format restrictions
-can degrade reasoning performance in some settings, which is why the mitigations below exist.
+- **Truth.** A valid schema says nothing about whether values are true; a hallucinated invoice number
+  passes a regex for invoice numbers. Semantic validation (Pydantic validators, cross-field rules,
+  database lookups) still belongs after generation, with retry-with-feedback for *those* failures.
+- **The distribution.** Where the model wanted to write prose, it must choose whitespace or a quote, and
+  may take a low-probability path.
+- **Not true conditional sampling.** Masking and renormalising each step is not sampling from the model's
+  distribution conditioned on valid output. The mask is greedy and local, so the model can be steered into
+  a prefix whose only legal continuations it finds unlikely, and it can never back up.
+- **Tokenization artefacts.** Forcing output to begin with `{` rather than ` {` can land the model in a
+  token sequence it rarely saw in training.
+- **Reasoning can suffer.** One 2024 study (Tam et al.) reported that strict format restrictions can
+  degrade reasoning performance in some settings, which is why the rules below exist.
 
 ### Design rules that follow
-- Put a free-text `reasoning` or `analysis` field *before* the answer fields, or run a two-stage
-  pipeline: think freely, then extract under constraint. The model reasons in prose; the schema captures
-  the result.
-- Keep schemas flat and small; prefer enums to open strings; make field order match the order evidence
-  appears.
-- Compile and cache grammars by schema hash. Compilation ranges from milliseconds to seconds for large
-  schemas, and a per-request dynamic schema throws that away every call.
-- Do not confuse "JSON mode" with schema enforcement: JSON mode guarantees syntactically valid JSON of
-  any shape, while structured-output modes enforce your schema's fields, types and enums.
-- Check backend coverage: hosted strict modes and open-engine backends support a *subset* of JSON Schema
-  (for example requiring every field and forbidding additional properties), so validate the schema
+- **Reason before answering.** Put a free-text `reasoning` or `analysis` field *before* the answer fields,
+  or run a two-stage pipeline: think freely, then extract under constraint.
+- **Keep schemas flat and small.** Prefer enums to open strings; order fields the way evidence appears.
+- **Cache grammars by schema hash.** Compilation ranges from milliseconds to seconds for large schemas, and
+  a per-request dynamic schema throws that away every call.
+- **JSON mode is not schema enforcement.** JSON mode guarantees syntactically valid JSON of any shape;
+  structured-output modes enforce your schema's fields, types and enums.
+- **Check backend coverage.** Hosted strict modes and open-engine backends support a *subset* of JSON
+  Schema (for example requiring every field and forbidding additional properties), so validate the schema
   against the backend before relying on a feature.
 
 ### Tool calling is the same mechanism
-Function-calling APIs are structured generation with a schema per tool plus a choice over which tool to
-call. Hosted "strict" tool modes and open engines' tool parsers run the same automaton idea over the
-argument schema, which is why argument validity is high while argument *correctness* still needs checks.
+- **Schema per tool plus a choice of tool.** Function-calling APIs are structured generation.
+- **Same automaton idea** over the argument schema in hosted "strict" tool modes and open engines' tool
+  parsers, which is why argument validity is high while argument *correctness* still needs checks.
 
-## Example
-A from-scratch constrained decoder for the simplest grammar: the output must be exactly one of a fixed
-set of choices, then stop. The allowed-token table is a trie built once from the tokenizer, so each step
-is a lookup rather than a vocabulary scan, which is the same structure Outlines and XGrammar generalise
-to regexes and grammars.
+## Diagram
+One constrained decode step: the CPU computes the grammar mask while the GPU runs the forward pass, the
+mask is applied to the logits, and the sampled token advances the automaton.
+
+```mermaid
+flowchart TD
+    G["Schema, regex or grammar"] --> C["Compile once: state to token table"]
+    C --> K[("Grammar cache by schema hash")]
+    K --> M["CPU: allowed-token mask for state"]
+    F["GPU: forward pass, logits"] --> A["Add minus infinity to illegal tokens"]
+    M --> A
+    A --> S["Sample among legal tokens"]
+    S --> N["Advance automaton state"]
+    N --> E{"Accepting state and EOS?"}
+    E -->|"no"| M
+    E -->|"yes"| V["Parse, then semantic validation"]
+```
+
+## Examples
+### A choice constraint from scratch
+The output must be exactly one of a fixed set of choices, then stop. The allowed-token table is a trie
+built once from the tokenizer, so each step is a lookup rather than a vocabulary scan: the structure
+Outlines and XGrammar generalise to regexes and grammars.
 
 ```python
 import torch
@@ -168,38 +194,133 @@ out = model.generate(ids, max_new_tokens=5, do_sample=False, logits_processor=pr
 print(repr(tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)))   # -> 'no'
 ```
 
+### The token index for "exactly three digits", in pure Python
+Runnable as is. It builds the state-to-token table from the tiny index above at compile time, then
+decodes greedily with a fake model that prefers illegal tokens.
+
+```python
+VOCAB = ["7", "42", "123", "1234", "a", " 5", "<eos>"]
+ACCEPT = 3                                      # DFA for "exactly three digits": state = digits seen
+
+def step(state, ch):
+    return state + 1 if ch.isdigit() and state < ACCEPT else None   # None = dead state
+
+def build_index(vocab):
+    """Compile time: for every DFA state, which tokens are legal and where they lead."""
+    index = {}
+    for s in range(ACCEPT + 1):
+        index[s] = {}
+        for tok in vocab:
+            if tok == "<eos>":
+                if s == ACCEPT:
+                    index[s][tok] = "done"      # EOS only in the accepting state
+                continue
+            cur = s
+            for ch in tok:                      # walk every character of the token
+                cur = step(cur, ch)
+                if cur is None:
+                    break
+            if cur is not None:
+                index[s][tok] = cur
+    return index
+
+def constrained_greedy(scores, index):
+    """Run time: a lookup per step, then argmax among allowed tokens only."""
+    state, out = 0, []
+    while state != "done":
+        allowed = index[state]
+        tok = max(allowed, key=lambda t: scores.get(t, float("-inf")))
+        out.append(tok)
+        state = allowed[tok]
+    return "".join(t for t in out if t != "<eos>")
+
+index = build_index(VOCAB)
+for s, allowed in index.items():
+    print(s, allowed)       # 0 {'7': 1, '42': 2, '123': 3} ... 3 {'<eos>': 'done'}
+# The "model" prefers 1234 and a, both illegal from the start state.
+fake_logits = {"1234": 5.0, "a": 4.0, "<eos>": 3.0, "42": 1.0, "7": 0.5}
+print(constrained_greedy(fake_logits, index))   # -> 427
+```
+
+### Production call: schema-constrained output plus semantic validation
+Against vLLM's OpenAI-compatible server (hosted providers accept the same `response_format` shape). The
+reasoning field comes first, and Pydantic re-validates after generation because some backends ignore
+numeric bounds.
+
+```python
+from typing import Literal
+from openai import OpenAI
+from pydantic import BaseModel, Field
+
+class Ticket(BaseModel):
+    analysis: str                                         # free-text reasoning FIRST
+    category: Literal["billing", "bug", "account", "other"]
+    priority: int = Field(ge=1, le=4)                     # bounds may be ignored by the backend
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
+resp = client.chat.completions.create(
+    model="Qwen/Qwen2.5-7B-Instruct",
+    messages=[{"role": "user", "content": "Classify this ticket: 'I was charged twice this month.'"}],
+    response_format={"type": "json_schema",
+                     "json_schema": {"name": "ticket", "schema": Ticket.model_json_schema()}},
+    temperature=0,
+)
+ticket = Ticket.model_validate_json(resp.choices[0].message.content)   # shape AND bounds checked
+print(ticket.category, ticket.priority)
+```
+
+## Production patterns
+- **Native structured outputs, not hand-rolled processors.** When output feeds code, pass a JSON Schema
+  via `response_format` (or the engine's grammar or choice mode) and let the engine's backend, such as
+  XGrammar in vLLM, do the masking. Monitor validity rate; it should sit at 100%.
+- **Static schemas, cached grammars.** Keep schemas versioned in code and identical across requests, with
+  no request ids or dates inside enums, so compiled grammars are reused. Monitor TTFT for first-seen
+  schemas versus cached ones.
+- **Think, then extract.** For reasoning-heavy tasks, put an `analysis` field first or split into a free
+  call plus a constrained extraction call. Monitor task accuracy against an unconstrained baseline, not
+  just validity.
+- **Validate semantics with bounded retries.** Parse with Pydantic `model_validate_json`, enforce
+  cross-field rules and lookups, and retry at most once or twice with the error message. Monitor retry
+  rate and the share of requests that exhaust retries.
+- **Schema compatibility test in CI.** Run every schema through the target backend with a few fixture
+  prompts, asserting that unsupported keywords (`format: date`, `minimum`, `pattern`) are either
+  enforced or re-checked after generation.
+
 ## Trade-offs
-- Syntactic validity becomes guaranteed and retries vanish, but the constraint can push the model down
-  low-probability paths; the cost is small for flat schemas and grows with rigid, deeply nested ones.
-- Compile-once tables make per-step masking nearly free, but a new schema per request pays compilation
-  each time; the win flips to a loss without a grammar cache.
-- Hosted strict modes are zero-effort, yet they support a schema subset and hide the mechanism; open
-  engines expose regex, grammar and choice modes but you own backend selection and version drift.
-- Validate-and-retry handles semantic errors that no grammar can express, but it costs a full extra call
-  per failure; combining both gives shape for free and spends retries only on meaning.
+- **Guaranteed validity vs distribution shift.** Retries vanish, but the constraint can push the model
+  down low-probability paths; the cost is small for flat schemas and grows with rigid, deeply nested ones.
+- **Compile-once tables vs dynamic schemas.** Per-step masking becomes nearly free, but a new schema per
+  request pays compilation each time; the win flips to a loss without a grammar cache.
+- **Hosted strict modes vs open engines.** Hosted modes are zero-effort, yet support a schema subset and
+  hide the mechanism; open engines expose regex, grammar and choice modes but you own backend selection
+  and version drift.
+- **Constraints vs validate-and-retry.** Retry handles semantic errors no grammar can express, at a full
+  extra call per failure; combining both gives shape for free and spends retries only on meaning.
 
 ## Pitfalls
-- Trusting a schema-valid output as correct. The symptom is clean JSON with invented identifiers or
-  wrong numbers that no parser will ever flag.
-- Placing the answer field first and a `reasoning` field last, so the model commits to an answer before
-  it has "thought"; accuracy on reasoning tasks drops compared with unconstrained prompting.
-- Sending a fresh, slightly different schema on every request (a timestamp or request id baked into an
-  enum), visible as high time to first token from grammar compilation on each call.
-- Using JSON Schema features the backend ignores (`format: date`, `minimum`, `pattern` in some modes)
-  and discovering in production that values outside the range come through.
-- Forgetting that whitespace is part of the grammar. A schema-derived regex that allows unbounded
-  whitespace between tokens lets a model loop on spaces or newlines until `max_tokens`; one that forbids it
-  forces minified JSON the model rarely saw in training. Set the whitespace pattern deliberately.
+- **Trusting schema-valid output as correct.** Symptom: clean JSON with invented identifiers or wrong
+  numbers that no parser will ever flag.
+- **Answer field first, `reasoning` last.** The model commits to an answer before it has "thought";
+  accuracy on reasoning tasks drops compared with unconstrained prompting.
+- **A fresh, slightly different schema per request** (a timestamp or request id baked into an enum).
+  Symptom: high time to first token from grammar compilation on each call.
+- **JSON Schema features the backend ignores** (`format: date`, `minimum`, `pattern` in some modes),
+  discovered in production when out-of-range values come through.
+- **Forgetting whitespace is part of the grammar.** Unbounded whitespace between tokens lets a model loop
+  on spaces or newlines until `max_tokens`; forbidding it forces minified JSON the model rarely saw in
+  training. Set the whitespace pattern deliberately.
 
 ## When to use
-Use constrained decoding whenever output is consumed by code: extraction, classification into a fixed
-label set, tool arguments, routing decisions, batch data transformation. Prefer the engine's or
-provider's native structured-output mode over hand-rolled logits processors, and keep Pydantic (or
-equivalent) validation plus bounded retries for semantics. Skip it for free-form writing, and be careful
-with reasoning-heavy tasks, where a two-stage design keeps accuracy. Measure validity rate, retry rate,
-time to first token with and without the grammar, and task accuracy against an unconstrained baseline.
-In interviews, the test is explaining why masking happens at the logits, how the token-boundary problem
-is solved by compile-time precomputation, and what the guarantee does not cover.
+- **Use when** output is consumed by code: extraction, classification into a fixed label set, tool
+  arguments, routing decisions, batch data transformation.
+- **Prefer** the engine's or provider's native structured-output mode over hand-rolled logits processors,
+  and keep Pydantic (or equivalent) validation plus bounded retries for semantics.
+- **Avoid** for free-form writing; be careful with reasoning-heavy tasks, where a two-stage design keeps
+  accuracy.
+- **Measure** validity rate, retry rate, time to first token with and without the grammar, and task
+  accuracy against an unconstrained baseline.
+- **Interviews:** explain why masking happens at the logits, how compile-time precomputation solves the
+  token-boundary problem, and what the guarantee does not cover.
 
 ## Role lens
 - **Engineer:** Defines Pydantic models, passes the schema to the engine's structured-output mode, caches
@@ -221,6 +342,36 @@ grammar forces unusual tokenizations (no leading space, escaped newlines) that d
 saw JSON in training, and whether the schema is stricter than necessary, with enums that exclude valid
 answers. Then I would compare accuracy on the same prompts under unconstrained decoding plus parsing to
 quantify the gap, and keep semantic validators and bounded retries for the residual errors.
+
+## Interview questions
+### How does constrained decoding guarantee valid JSON, and why at the logits?
+- **Mechanism:** a logits processor adds −∞ to every token the grammar forbids from the current state, so
+  softmax gives them zero probability and the sampler cannot pick them.
+- **Why the logits:** it is the last point before sampling where the engine can remove choices, so
+  validity holds by construction instead of being checked and retried afterwards.
+
+### Why can't you just check each vocabulary token against the grammar at every step?
+- **Cost:** 100k+ tokens, each needing a grammar walk, per step per sequence, far beyond a millisecond
+  decode budget.
+- **Fix:** precompute, per automaton state, the legal tokens and their next states once per grammar and
+  tokenizer; runtime is a lookup, and XGrammar extends this to context-free grammars.
+
+### TTFT jumped after you added structured outputs. What do you look at?
+- **Grammar compilation:** is each request sending a slightly different schema, defeating the cache?
+- **Schema size and nesting:** large or recursive schemas compile slowly; flatten or version them.
+- **CPU saturation:** mask computation runs on the CPU per sequence, so check CPU utilisation under
+  concurrency and TPOT as well as TTFT.
+
+### When would you not use constrained decoding?
+- **Free-form writing,** where no consumer parses the output.
+- **Reasoning-heavy answers** unless the schema lets the model reason first or you extract in a second
+  call, because strict formats can degrade reasoning.
+- **When only semantics matter:** the grammar cannot catch wrong values, so validation is still needed.
+
+### What is the difference between JSON mode and schema-enforced structured outputs?
+- **JSON mode** guarantees syntactically valid JSON of any shape: fields can be missing or renamed.
+- **Structured outputs** enforce your fields, types and enums, but backends support a subset of JSON
+  Schema, so check which keywords are actually enforced.
 
 ## Quiz
 ### Q: Why do libraries like Outlines precompute a table from automaton states to allowed tokens?

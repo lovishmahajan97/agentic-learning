@@ -109,6 +109,23 @@ retrieval steps give one cross-service trace per request, for any backend.
 - **Official guidance stands:** with Gunicorn `--preload` or any pre-fork server, initialise the tracer
   provider in each worker (a `post_fork` hook or lifespan), not in the master.
 
+## Diagram
+Follow one trace id: the `traceparent` header stitches services into one tree, spans leave each process
+in batches, and the collector scrubs and tail-samples before any backend sees them.
+
+```mermaid
+flowchart LR
+    C["Client"] --> G["Chat API: FastAPI server span"]
+    G --> L["Manual span: chat model-a with gen_ai attributes"]
+    L -->|"httpx client span, injects traceparent"| P["LLM provider"]
+    G -->|"traceparent header"| R["Retrieval service: child server span"]
+    G -.->|"BatchSpanProcessor, OTLP 4317"| CO["Collector: scrub, tail_sampling, batch"]
+    R -.->|"OTLP"| CO
+    G -.->|"MeterProvider, every request counted"| CO
+    CO --> B1[("Tracing backend")]
+    CO --> B2[("Metrics backend")]
+```
+
 ## Examples
 ### Per-worker init, auto-instrumentation and a manual LLM span
 ```python
@@ -272,6 +289,42 @@ I would add manual spans around each agent step and tool call and instrument mis
 with no code there, it points to event-loop blocking: the loop could not resume awaiting tasks, so check loop
 lag and look for synchronous calls in async handlers. I would also check the stream case: if the response
 streams, part of that time is token streaming that a manual span closed early.
+
+## Interview questions
+### What is OpenTelemetry and why use it instead of a vendor APM agent?
+- **Definition:** a vendor-neutral API, SDK and wire protocol (OTLP) for traces, metrics and logs; code and
+  libraries call the stable API, the SDK samples and batches, an exporter ships the data.
+- **Why:** the backend becomes a deployment choice, not a code change, so switching vendors means changing
+  an exporter endpoint or collector config instead of re-instrumenting every service.
+
+### Your Gunicorn service with --preload exports no spans from its workers. What is wrong?
+- **The provider was created in the master before fork.** Threads do not survive `fork`, and the OTLP gRPC
+  exporter's channel is not fork-safe, so workers inherit broken exporter state.
+- **Fix:** build the tracer and meter providers per worker, in lifespan or Gunicorn's
+  `post_fork(server, worker)` hook, never at import.
+- **Verify** with exported spans per worker; one exporting zero is the fork problem.
+
+### Head sampling or tail sampling for an LLM API?
+- **Head sampling** with `ParentBased(TraceIdRatioBased(0.1))` is cheap and keeps traces whole across
+  services, but drops about 90% of rare errors.
+- **Tail sampling in the collector** keeps every error and slow trace because it decides after the trace
+  ends, but the app must export everything (or a high ratio) and all spans of a trace must reach the same
+  collector instance.
+- **Common mix:** keep errors, slow traces and a probabilistic baseline in the collector.
+
+### Finance wants daily token spend. Why not compute it from traces?
+- **Traces are sampled:** at 10% head sampling, spend from traces comes out at roughly a tenth of the bill,
+  and drifts whenever someone changes the ratio; tail sampling biases it toward failures.
+- **Use metrics:** a `gen_ai.client.token.usage` histogram through a `MeterProvider` counts every call
+  regardless of trace sampling.
+- **Then reconcile** metric totals daily against the provider's billing.
+
+### Why are manual spans still needed when auto-instrumentation is on?
+- **Auto-instrumentation sees transport, not meaning:** an HTTP POST to the provider, not a chat call on a
+  specific model with 812 input tokens.
+- **Manual spans add AI semantics:** wrap model calls, retrieval, reranking and tool execution, and set
+  GenAI attributes such as `gen_ai.request.model` and `gen_ai.usage.input_tokens`.
+- **For streams,** start the span inside the generator so it covers the whole stream.
 
 ## Quiz
 ### Q: How does a downstream service's span become a child of the caller's span?

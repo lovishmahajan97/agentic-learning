@@ -120,6 +120,23 @@ The sweep for a self-hosted engine:
 - **Uvicorn's `--limit-concurrency`** returns 503 once a worker holds too many connections or tasks; it is
   a coarse safety net, not a per-dependency limit.
 
+## Diagram
+A request either gets a slot within the bounded wait or a fast 503; a streaming request keeps its slot
+until the generator's `finally`, not until the endpoint returns.
+
+```mermaid
+flowchart TD
+    A["Request arrives at one worker"] --> B{"Free slot in this dependency's semaphore?"}
+    B -->|"yes"| C["acquire: counter minus 1"]
+    B -->|"no"| W["Wait, bounded by asyncio.timeout"]
+    W -->|"slot freed in time"| C
+    W -->|"timeout"| R["503 with Retry-After"]
+    C --> S["Return StreamingResponse, call the provider while streaming"]
+    S --> F["Generator finally: release, counter plus 1"]
+    F -->|"wakes one waiter"| W
+    N["Fleet cap = workers x n, keep under the provider quota"] -.-> B
+```
+
 ## Examples
 ### Per-worker cap for a streaming LLM endpoint
 A per-worker cap on calls to an LLM provider whose quota is 64 concurrent requests across 4 workers, with
@@ -282,6 +299,45 @@ see 429s; set per-worker caps to about 16. With 96 slots and 5-second calls, Lit
 waiters accumulate; with a bounded wait the excess gets fast 503s with `Retry-After` rather than
 timing out. To serve 30 per second you need more provider concurrency, shorter generations (lower
 max tokens), caching, or routing some traffic to another model.
+
+## Interview questions
+### Why does an async FastAPI service need an explicit concurrency limit when a sync one often does not?
+- **Async removes the natural brake.** A sync worker runs out of threads; an async one turns a burst of
+  2,000 requests into 2,000 concurrent provider calls within milliseconds, because each request is a cheap coroutine.
+- **Downstream cannot push back cleanly:** the provider returns 429s, a self-hosted engine queues
+  internally, and every in-flight call holds memory and a connection.
+- **A semaphore per scarce dependency** caps calls in flight before the work starts.
+
+### After scaling from 4 to 8 workers, provider 429s come back even though the code did not change. Why?
+- **The semaphore is per process,** so the fleet limit is `workers × n`. With 16 per worker, 8 workers allow
+  128 in flight against a quota of 64.
+- **Fix the sizing:** compute `floor(quota / (workers × replicas))` from settings at startup, which gives 8
+  per worker here, minus headroom for retries.
+- **For autoscaled replicas,** a fixed number drifts, so move to leases with expiry in Redis or a gateway.
+
+### When is a plain async with sem the wrong choice?
+- **When the wait is unbounded:** under sustained overload waiters pile up, p99 climbs to the client
+  timeout and memory grows, so wrap the acquire in a timeout and return 503 with `Retry-After`.
+- **For streaming responses:** `async with` around `return StreamingResponse(...)` frees the slot before
+  any tokens are generated, so release in the generator's `finally`.
+- **For calls of very different cost:** a 50k-token prompt is not one slot's worth, so weight the limit or
+  cap request size.
+
+### How would you pick n for a self-hosted inference server that has no quota?
+- **Run a concurrency sweep:** step concurrency up in a load test and record throughput, time to first
+  token and time per output token at each step.
+- **Find the knee:** throughput rises then flattens while latency stays flat then climbs; set *n* just
+  before it, because past it extra concurrency only queues inside the engine.
+- **Check the ceiling with Little's law:** `max throughput ≈ n / mean latency`, and re-run the sweep when
+  prompts or the model change.
+
+### Why not just acquire the semaphore k times to weight large requests?
+- **Acquisition of k units on `asyncio.Semaphore` is not atomic,** so two large requests can each hold half of
+  what they need and wait on each other forever: a deadlock.
+- **Use a limiter that takes k units in one step,** or cap request size separately so one slot is a
+  bounded cost.
+- **Remember quotas often count tokens per minute too,** so a request-count cap alone may still breach
+  the provider's token limit.
 
 ## Quiz
 ### Q: Why does a requests-per-second rate limit not bound the number of concurrent LLM calls?

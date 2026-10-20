@@ -142,6 +142,23 @@ from another's OOM.
 - **Automated cordon-on-XID** (or the GPU Operator's health checks) is part of the stack, not an optional
   extra.
 
+## Diagram
+Follow one GPU pod from `kubectl apply` to its first token; each box is a layer that can fail on its own,
+and the dotted edge is the health loop that keeps bad cards out of the pool.
+
+```mermaid
+flowchart TD
+    A["kubectl apply: pod asks for nvidia.com/gpu: 1"] --> B["Scheduler: taints, labels, free GPU count"]
+    B --> C["Node with card and NVIDIA driver"]
+    C --> D["Container Toolkit mounts driver libs and /dev/nvidia*"]
+    D --> E{"Image CUDA runtime supported by driver?"}
+    E -->|"no"| F["Crash: driver version is insufficient"]
+    E -->|"yes"| G["Load weights from storage"]
+    G --> H["Engine serves first token"]
+    H --> I["DCGM exporter: SM activity, XID errors"]
+    I -.->|"XID fault: cordon node"| B
+```
+
 ## Examples
 ### Deployment that fails fast on a bad node
 Asks for one GPU on a node labelled with a card model and tolerates the GPU taint.
@@ -292,6 +309,45 @@ the GPU Operator or node-pool images so every node runs one known version, label
 version, roll driver upgrades fleet-wide before base-image upgrades, and add an init container that
 runs `nvidia-smi` so a mismatch fails fast and visibly instead of after a long weight load. Capacity
 also matters: if half the fleet is unusable, the autoscaler should be told, not left to discover it.
+
+## Interview questions
+### Walk me through what happens between kubectl apply and the first token on a GPU pod.
+- **Scheduling:** the device plugin advertises `nvidia.com/gpu` as an integer resource; the scheduler
+  picks a node with a free card that the pod's tolerations and label selectors allow.
+- **Runtime:** the NVIDIA Container Toolkit mounts the node's driver libraries and `/dev/nvidia*` into the
+  container, so the image's CUDA runtime must be one that driver supports.
+- **Start-up:** the server reads weights from storage into host RAM and then GPU memory, so storage
+  throughput sets ready-time; only then does it serve the first token.
+
+### Why does Kubernetes hand out whole GPUs, and how would you share one card between small models?
+- **No enforcement primitive:** there is no cgroup-style controller for a GPU share or device memory cap,
+  so the kubelet treats GPUs as an opaque count with requests equal to limits.
+- **Sharing options:** MIG for hardware-isolated slices on A100 or H100; time-slicing or MPS for higher
+  packing without memory or fault isolation.
+- **Rule of thumb:** use MIG when tenants must not OOM each other; time-slice only workloads whose summed
+  memory footprint you have checked.
+
+### A dashboard shows the fleet at 95% GPU utilisation but throughput is poor. How do you debug it?
+- **Question the metric:** `nvidia-smi` GPU-Util only says a kernel was running in the sample window, not
+  how much of the chip it used.
+- **Look at SM activity:** DCGM's SM activity profiling field next to tokens per second shows real
+  occupancy; a low value means the card is mostly idle.
+- **Then find the feeder:** small batches, CPU-bound tokenisation or request handling, or slow data
+  loading are the usual causes, fixed by batching more or adding host CPU.
+
+### When would you run inference on PCIe cards instead of SXM nodes with NVLink?
+- **PCIe wins** when each model fits on one card: cards are cheaper, available singly and fit ordinary
+  servers, and only prompts and tokens cross the network.
+- **SXM wins** once a model must be tensor-parallel across cards, because NVLink gives hundreds of GB/s
+  per GPU versus roughly 32 GB/s per direction for PCIe Gen4 x16.
+- **The cost of SXM** is fixed eight-card blocks and higher power, so small models waste much of the node.
+
+### Your 140 GB checkpoint takes 23 minutes to become Ready. What do you change, and what does it buy?
+- **Diagnose:** 140 GB at 100 MB/s is about 23 minutes, so the network volume is the bottleneck, not the GPU.
+- **Fix:** move weights to local NVMe or pre-stage them on the node; at a few GB/s the load drops under a
+  minute.
+- **Why it matters:** autoscaling is only useful if new replicas are ready before the queue grows, so
+  ready-time is a capacity number, not a convenience.
 
 ## Quiz
 ### Q: Why can `nvidia.com/gpu` not be overcommitted on Kubernetes the way CPU can?

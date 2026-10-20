@@ -107,6 +107,26 @@ TCO_buy   = licence over 3 years (at projected seats or usage) + integration
 - **For FDEs the roles reverse.** The customer is making this decision about *your* product; your job is
   to make "buy" credible by showing the integration path, the exit path and a transparent quality loop.
 
+## Diagram
+Run this path once per stack layer, not once per project: compliance can force the answer before cost
+is compared, and every outcome ends behind a seam you own.
+
+```mermaid
+flowchart TD
+    L["One stack layer"] --> D{"Does it differentiate?"}
+    D -->|"no"| B["Buy or adopt open source"]
+    D -->|"yes"| M{"Is the layer moving fast?"}
+    M -->|"yes"| TB["Build thin and switchable"]
+    M -->|"no"| BU["Build"]
+    B --> C{"Can the data go to the vendor under compliance rules?"}
+    C -->|"no"| BU
+    C -->|"yes"| T["Compare three-year TCO including exit"]
+    TB --> T
+    BU --> T
+    T --> S["Own the seam: adapter plus contract test"]
+    S -.->|"renewal or layer commoditises"| L
+```
+
 ## Examples
 ### Worked scenario: an internal knowledge assistant
 2,000 employees over wikis, tickets and documents; one source is restricted and cannot be sent to third
@@ -260,6 +280,46 @@ product. A vertical banking-chatbot SaaS fails three tests at once: transaction 
 vendor, fee explanations are the product, and compliance cannot review a black box. So buy the
 platform layers, build the data, workflow and evaluation layers, keep seams at the model and the
 vector store, and revisit at renewal.
+
+## Interview questions
+### Why is build versus buy in AI a per-layer decision rather than one decision for the project?
+- **Each default is wrong at specific layers.** Building everything conflates strategic importance with
+  differentiation; buying end-to-end treats the application layer as commodity when your domain
+  knowledge and data live there.
+- **Layers differ in differentiation, rate of change and data sensitivity,** so models, serving and
+  gateways usually lean buy while evaluation sets, workflows and context assembly lean build.
+- **Decomposing first** makes the four questions answerable for each layer.
+
+### Walk me through a three-year TCO comparison. Which terms do people usually drop?
+- **Build:** effort plus about three years of maintenance, infrastructure, usage and opportunity cost.
+  Maintenance and opportunity cost are the ones left out.
+- **Buy:** licence at projected seats or usage, integration, and the probability of switching times
+  exit cost. Integration and exit are the ones left out.
+- **Look for the flip point,** because licence grows with adoption while most build cost is fixed; in
+  the scenario it was about 360 seats.
+
+### A vendor's assistant scores well in the demo. What would make you reject it anyway?
+- **The data cannot go to the vendor.** A restricted source that cannot leave your environment overrides
+  the cost question.
+- **The quality loop is opaque:** you cannot run your own golden set against it or explain a wrong
+  answer.
+- **No exit path:** prompts, analytics and labels live only inside their platform, with no export clause
+  or scheduled export.
+
+### When would you deliberately buy first and plan to build later?
+- **When requirement uncertainty is high,** because you cannot know what differentiates before users use
+  it.
+- **The cost is paying twice plus a migration,** so it is worth it only if the vendor's exit path is
+  clean.
+- **Keep your golden set and an adapter seam from day one,** so the later build is measured against the
+  vendor rather than started from zero.
+
+### How do you make "time to swap a vendor" a measured number rather than a guess?
+- **Wrap the component in an interface you own,** such as a retriever protocol, and keep one contract
+  test suite every implementation must pass.
+- **Run the suite against a candidate replacement in staging,** checking both quality (for example
+  recall at 5 on the golden set) and safety properties such as no ACL leaks.
+- **Rehearse a trial swap about once a year** and record the time in the layer map.
 
 ## Quiz
 ### Q: Which layer should an organisation build regardless of what else it buys?

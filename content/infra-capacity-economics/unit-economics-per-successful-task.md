@@ -5,7 +5,7 @@ name: Unit economics per successful task
 kind: metric
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - infra-capacity-economics/cost-modeling
   - infra-capacity-economics/cost-optimization
@@ -17,77 +17,93 @@ related:
 ---
 
 ## TL;DR
-Cost per successful task divides everything a unit of work really costs (failed attempts, retries,
-verification, human fallback and the damage from errors that slip through) by the number of tasks that
-met an agreed acceptance bar. It replaces cost per call because a cheap model that fails often is
-expensive once its failures are paid for, and it is the number you compare with the value of the task
-to know whether the product makes money.
+Cost per successful task divides everything a unit of work costs (failed attempts, retries,
+verification, human fallback, damage from missed errors) by tasks meeting an agreed acceptance bar.
+Compare it with task value to know whether the product makes money.
 
 ## Why it exists
-Model providers bill per token, so dashboards naturally show cost per call or per request. That number
-answers the wrong question. The business does not buy calls; it buys resolved tickets, extracted
-invoices, merged pull requests, qualified leads. Between a call and a resolved task sit retries, tool
-errors, verification passes, escalations to a human and, worst, wrong outputs that nobody caught and
-that cost a refund, a compliance incident or a customer.
-
-Optimizing cost per call therefore rewards the wrong design. Swapping to a smaller model halves the per-
-call cost and can triple the cost per resolved task once escalations are counted. Agents make the gap
-wider: a run that loops for 40 steps and then fails has consumed real money and produced nothing. A
-second failure is definitional: "success" that is not measured against explicit acceptance criteria
-becomes whatever makes the metric look good, such as "the model returned something". Unit economics per
-successful task exists to put cost and outcome in one ratio, measured the same way every time, so that
-model choices, retry policies and human-in-the-loop design can be compared on the only basis the
-business cares about: what does one good outcome cost, and is it less than it is worth?
+- **Dashboards show cost per call because providers bill per token.** That answers the wrong question.
+- **The business buys outcomes, not calls:** resolved tickets, extracted invoices, merged pull requests,
+  qualified leads.
+- **Between a call and an outcome sit hidden costs:** retries, tool errors, verification passes,
+  escalations to a human and, worst, wrong outputs nobody caught that cost a refund, a compliance
+  incident or a customer.
+- **Cost per call rewards the wrong design.** A smaller model halves per-call cost and can triple cost
+  per resolved task once escalations are counted. Agents widen the gap: a run that loops for 40 steps
+  and then fails consumed real money and produced nothing.
+- **Undefined success drifts.** Without explicit acceptance criteria, "success" becomes whatever flatters
+  the metric, such as "the model returned something". One fixed ratio of cost to outcome lets model
+  choices, retry policies and human-in-the-loop designs be compared on what the business cares about.
 
 ## How it works
-### Define success first
-Write down what counts as a successful task in terms the customer would accept: ticket resolved and
-not reopened within a set window, extraction matching the source on all required fields, code change
-passing tests and merged. Decide how success is measured: automated checks, sampled human review, or
-a downstream signal. A metric without a fixed definition drifts toward whatever is easy to count.
-Downstream signals arrive late (a ticket counts as resolved only once the reopen window has passed), so
-compute the metric on cohorts of tasks whose window has closed, or this week's number will look better
-than it is.
+### 1. Define success first
+- **In terms the customer would accept:** ticket resolved and not reopened within a set window;
+  extraction matching the source on all required fields; code change passing tests and merged.
+- **Decide how it is measured:** automated checks, sampled human review, or a downstream signal. A metric
+  without a fixed definition drifts toward whatever is easy to count.
+- **Use closed cohorts.** Downstream signals arrive late (a ticket counts as resolved only once the reopen
+  window has passed), so compute on cohorts whose window has closed, or this week's number looks better
+  than it is.
 
-### Count all the cost
+### 2. Count all the cost
 For a period or a cohort of tasks, sum:
-- model tokens for every attempt, including failed and abandoned ones, and reasoning tokens;
-- non-model calls (retrieval, tools, guardrails, verifier or judge models);
-- human time for review, escalation and correction, at a loaded hourly rate;
-- the expected cost of undetected errors (rate of silent failure × cost per incident);
-- amortized fixed costs if the comparison is about the whole product rather than a design change.
+- **Model tokens for every attempt,** including failed and abandoned ones, and reasoning tokens.
+- **Non-model calls:** retrieval, tools, guardrails, verifier or judge models.
+- **Human time** for review, escalation and correction, at a loaded hourly rate.
+- **Expected cost of undetected errors:** rate of silent failure × cost per incident.
+- **Amortized fixed costs,** if the comparison is about the whole product rather than a design change.
 
-### Divide by successes
+### 3. Divide by successes
 ```
 cost_per_successful_task = total_cost / tasks_meeting_acceptance
 ```
-For reasoning about designs, a simple expected-value model helps. If each attempt costs c and succeeds
-with probability p, and every failure is reliably detected and retried, the expected AI cost per success
-is c/p. That ratio already shows why a model at 4× the price with 1.5× the success rate is not 4× worse.
-Real systems add two terms that usually dominate: the share of failures handed to humans, and the share
-of failures *not detected* at all.
+- **Expected-value shortcut:** if each attempt costs c and succeeds with probability p, and every failure
+  is reliably detected and retried, expected AI cost per success is c/p.
+- **So a model at 4× the price with 1.5× the success rate is not 4× worse.**
+- **Two terms usually dominate in real systems:** the share of failures handed to humans, and the share
+  of failures *not detected* at all.
 
-### Compare with value
-Value per task is what the business gains: the human handling cost avoided, revenue per conversion, or
-time saved. Margin per task = value − fully loaded cost. Break-even success rate is the p at which that
-margin reaches zero; it tells you how good the system must be before automation pays. For the common
-case of a human fallback, the baseline is the all-human cost h. With one attempt at cost c, a detector
-that catches a fraction d of failures, and a cost e per silent error, automation is cheaper when
+### 4. Compare with value
+- **Value per task:** human handling cost avoided, revenue per conversion, or time saved.
+- **Margin per task** = value − fully loaded cost.
+- **Break-even success rate** is the p at which margin reaches zero: how good the system must be before
+  automation pays.
+- **With a human fallback,** the baseline is the all-human cost h. With one attempt at cost c, a detector
+  catching a fraction d of failures, and a cost e per silent error, automation is cheaper when:
 
 ```
 c + (1 − p)·(d·h + (1 − d)·e)  <  h     →     p  >  1 − (h − c) / (d·h + (1 − d)·e)
 ```
 
-With perfect detection (d = 1) this reduces to p > c/h, which is why cheap models clear the bar
-easily when failures are always caught; as e grows and d falls, the required p climbs fast.
+- **With perfect detection (d = 1)** this reduces to p > c/h, which is why cheap models clear the bar
+  easily when failures are always caught. As e grows and d falls, the required p climbs fast.
 
 ### Caveats that change the answer
-Attempts are not independent: if a model fails on a hard input, retrying the same model often fails
-again, so the c/p retry math is optimistic. Detection is not free or perfect: a verifier adds cost and
-misses some failures. And the mix of tasks shifts over time, so recompute per task category, not one
-global number.
+- **Attempts are not independent.** A model that fails on a hard input often fails again on retry, so the
+  c/p retry math is optimistic.
+- **Detection is neither free nor perfect.** A verifier adds cost and misses some failures.
+- **The task mix shifts over time,** so recompute per task category, not one global number.
 
-## Example
+## Diagram
+One task's paths: only caught failures can be retried; missed failures skip straight to the error cost,
+which is why detection rate matters so much.
+
+```mermaid
+flowchart TD
+    T["Task arrives"] --> A["AI attempt: cost c"]
+    A --> V{"Verifier passes?"}
+    V -->|"yes, correct"| S["Success"]
+    V -->|"yes, but wrong"| E["Silent error: cost e"]
+    V -->|"no, caught"| K{"Attempts left?"}
+    K -->|"yes"| A
+    K -->|"no"| H["Human handles: cost h"]
+    H --> S
+    S --> R["Cost per success = total cost / successes"]
+    E --> R
+```
+
+## Examples
+### Fully loaded cost per task for two models
 A ticket-triage agent where a human handles anything the agent cannot (all figures illustrative): human
 cost $4.00 per ticket, a verifier costing $0.005 catches 80% of agent failures, and a failure that slips
 through costs $20 in rework and goodwill.
@@ -115,46 +131,104 @@ for name, c, p in (("small", 0.02, 0.60), ("large", 0.08, 0.90)):
 # large k=3: $0.529/task automated 97.8% AI spend/success $0.094
 ```
 
-On AI spend per success the small model looks more than twice as good. Fully loaded, it costs about
-3.6× more per task (k=1), because its silent failures and escalations dominate. Retries help only with
-*detected* failures, and every extra attempt is another chance for a failure to slip past the verifier:
-for the small model, going from k=1 to k=3 cuts human escalation from $1.28 to about $0.13 per task but
-*raises* the silent-error term from $1.60 to about $2.28, which now dominates its bill. That is why
-improving detection is often worth more than adding retries, or even than improving the model.
+- **AI spend per success flatters the small model** by more than 2×. Fully loaded, it costs about 3.6×
+  more per task (k=1), because its silent failures and escalations dominate.
+- **Retries help only with *detected* failures,** and every extra attempt is another chance to slip past
+  the verifier. For the small model, k=1 to k=3 cuts human escalation from $1.28 to about $0.13 per task
+  but *raises* the silent-error term from $1.60 to about $2.28, which now dominates its bill.
+- **So improving detection is often worth more than adding retries,** or even than improving the model.
+- **Cost per task ≈ cost per success here,** because a human finishes every caught failure; silent
+  failures are the exception, charged through the error term.
+- **Break-even:** against the all-human $4.00, the formula gives p > 1 − 3.975 / 7.2 ≈ 0.45 for the small
+  model. At 60% it beats doing everything by hand, but by a thin margin a small rise in silent-error cost
+  would erase.
 
-Because a human finishes every caught failure, nearly every task ends in a good outcome here, so cost
-per task is close to cost per successful task; the silent failures are the exception, charged through
-the error term. Against the all-human baseline of $4.00, the break-even formula above gives
-p > 1 − 3.975 / 7.2 ≈ 0.45 for the small model, so at 60% it does beat doing everything by hand, but
-by a thin margin that a small rise in silent-error cost would erase.
+### How detection moves the break-even bar
+The same formula as a function, for the small model (c = $0.02 + $0.005 verifier).
+
+```python
+def break_even_p(c, h, d, e):
+    """Minimum success rate for one AI attempt plus fallback to beat the all-human cost h."""
+    return 1 - (h - c) / (d * h + (1 - d) * e)
+
+for d in (1.0, 0.8, 0.6):
+    print(d, f"{break_even_p(0.025, 4.00, d, 20.00):.2f}")
+# 1.0 0.01   (reduces to c/h)
+# 0.8 0.45
+# 0.6 0.62
+```
+
+| Detection rate d | Required success rate p |
+|---|---|
+| 1.0 | ~0.01 (c/h) |
+| 0.8 | ~0.45 |
+| 0.6 | ~0.62 |
+
+Losing 20 points of detection raises the bar by about 17 points of model accuracy.
+
+### Worked cohort: from invoice lines to one number
+An illustrative month of 10,000 tickets whose 7-day reopen window has closed.
+
+| Line | Amount |
+|---|---|
+| Model tokens, all attempts including failed and abandoned | $420 |
+| Retrieval, tools and verifier calls | $90 |
+| Human escalations: 1,200 tickets × $4.00 | $4,800 |
+| Silent errors: 150 reopened tickets × $20 | $3,000 |
+| **Total** | **$8,310** |
+| Successful tasks (resolved, not reopened) | 9,850 |
+| **Cost per successful task** | **~$0.84** |
+
+- **The model line is 5% of the total;** escalations and silent errors are 94%.
+- **Against the $4.00 human baseline** the margin is about $3.16 per success, a number a per-call
+  dashboard could never show.
+
+## Production patterns
+- **One task ID across every attempt.** Generate an ID when the task starts and attach it to every model
+  call, tool call, verifier result and escalation (for example as a trace attribute). Monitor the share
+  of spend not attributable to any task; it should be near zero.
+- **Cohort metrics after the window closes.** Compute cost per successful task weekly on cohorts whose
+  reopen or acceptance window has passed, per task category and per tenant. Monitor it next to success
+  rate and escalation rate.
+- **Calibrate detection with sampled review.** Have humans review a random sample of verifier-passed
+  outputs to estimate the silent-failure rate (1 − d). Monitor that rate per category; it feeds the
+  error term directly.
+- **Retry budget tied to detection.** Allow retries only after a verifier rejects an output, cap them at a
+  small k, then route to a human. Monitor success on the second attempt; if it is far below the first,
+  failures are correlated and retries are wasted.
+- **Break-even check before rollout.** For each new model or prompt, compute required p from c, h, d and e
+  and compare with the eval success rate per category. Ship only where the margin is comfortably
+  positive.
 
 ## Trade-offs
-- A stricter success definition makes the metric trustworthy, but lowers the headline number and costs
-  review effort; a looser one flips into self-deception once customers start reopening tasks.
-- Adding a verifier costs money on every task, but pays back whenever the cost of a silent failure is
-  much larger than the verification cost; for low-stakes tasks it can be pure overhead.
-- More retries raise automation rate, but each retry costs tokens and latency and helps only when
-  failures are detected and not strongly correlated across attempts.
-- Including amortized fixed costs gives the true product margin, but blurs comparisons between design
-  options; use marginal cost to choose designs and fully loaded cost to price.
+- **Stricter success definition vs headline number.** It makes the metric trustworthy but lowers the
+  number and costs review effort; a looser one flips into self-deception once customers start reopening
+  tasks.
+- **Verifier cost vs silent-failure cost.** A verifier costs money on every task but pays back whenever a
+  silent failure costs much more than verification; for low-stakes tasks it can be pure overhead.
+- **More retries vs tokens and latency.** Retries raise automation rate, but each costs tokens and
+  latency and helps only when failures are detected and not strongly correlated across attempts.
+- **Fully loaded vs marginal cost.** Including amortized fixed costs gives the true product margin but
+  blurs comparisons between designs; use marginal cost to choose designs and fully loaded cost to price.
 
 ## Pitfalls
-- Reporting cost per call as unit cost; the symptom is a "cheaper" model rollout followed by more
-  escalations and a higher total support bill.
-- Counting only successful runs' tokens; visible as unit cost that ignores agent runs that looped and
-  failed, so finance totals never reconcile with the metric.
-- Defining success as "completed without error"; the metric looks excellent while customer reopen rates
-  or downstream correction volume quietly climb.
-- Treating the retry math as independent; real success after retries stays well below the predicted
-  rate because the same hard inputs keep failing.
+- **Reporting cost per call as unit cost.** Symptom: a "cheaper" model rollout followed by more
+  escalations and a higher total support bill. Fix: divide fully loaded cost by successes.
+- **Counting only successful runs' tokens.** Symptom: unit cost that ignores agent runs that looped and
+  failed, so finance totals never reconcile with the metric. Fix: attribute every attempt to its task.
+- **Defining success as "completed without error".** Symptom: the metric looks excellent while customer
+  reopen rates or downstream correction volume quietly climb. Fix: customer-accepted criteria.
+- **Treating the retry math as independent.** Symptom: real success after retries stays well below the
+  predicted rate because the same hard inputs keep failing. Fix: measure second-attempt success.
 
 ## When to use
-Use this metric whenever you compare models, prompts, retry policies or human-in-the-loop designs, and
-whenever you price an AI feature or argue for its ROI. Compute it per task category and per tenant
-rather than globally, track it weekly next to success rate and escalation rate, and validate the
-success definition with sampled human review. It is less useful during early prototyping, before there
-is a stable task definition. In interviews, asking "per successful what?" when someone quotes a cost
-number is the mark of someone who has run an AI product.
+- **Use when** comparing models, prompts, retry policies or human-in-the-loop designs, and when pricing an
+  AI feature or arguing for its ROI.
+- **Measure** per task category and per tenant rather than globally; track weekly next to success rate
+  and escalation rate, and validate the success definition with sampled human review.
+- **Avoid** during early prototyping, before there is a stable task definition.
+- **Interviews:** asking "per successful what?" when someone quotes a cost number is the mark of someone
+  who has run an AI product.
 
 ## Role lens
 - **Engineer:** Instruments each task end to end with an ID so every attempt, tool call, verifier
@@ -173,6 +247,39 @@ dominates. I would challenge perfect detection: if some failures are not caught,
 error must be added, and that term usually favors the more accurate model further. I would also check
 whether retrying X helps or whether its failures correlate on hard inputs, and compute the numbers per
 ticket category.
+
+## Interview questions
+### What is cost per successful task, and why not just report cost per call?
+- **Definition:** fully loaded cost (all attempts, tools, verifiers, human time, expected silent-error
+  cost) divided by tasks meeting an agreed acceptance bar.
+- **Why:** the business buys outcomes; a cheaper call that fails more moves cost into retries,
+  escalations and errors.
+- **Comparable to value:** only this number can be set against value per task to get a margin.
+
+### Your team adds two retries and the automation rate rises, but total cost per task barely moves. Why?
+- **Retries act only on caught failures,** so they shift cost from human escalation to automation.
+- **Each attempt is another chance for a silent miss,** so the silent-error term grows; in the
+  illustrative example it rises from $1.60 to about $2.28 per task.
+- **Fix detection first:** a better verifier lowers both escalation and silent-error terms.
+
+### When would you not add a verifier step?
+- **When silent failures are cheap:** for low-stakes tasks the verifier is pure overhead on every task.
+- **When it misses the failures that matter:** a verifier with low detection on the costly error class
+  adds spend without cutting e.
+- **Decide with the break-even formula,** comparing verifier cost per task with the expected silent-error
+  cost it removes.
+
+### How do you set the minimum accuracy a model needs before you automate a workflow?
+- **Compute break-even p** from attempt cost c, human cost h, detection rate d and silent-error cost e:
+  p > 1 − (h − c) / (d·h + (1 − d)·e).
+- **Detection dominates:** in the illustrative example the bar moves from about 0.45 at d = 0.8 to about
+  0.62 at d = 0.6.
+- **Require a margin** above break-even per task category, measured on a closed cohort.
+
+### This week's cost per successful ticket looks 30% better than last month's. What do you check?
+- **Cohort maturity:** tickets still inside the reopen window count as successes until they reopen.
+- **Definition drift:** whether "success" quietly loosened, or the task mix shifted to easier categories.
+- **Attribution gaps:** failed or abandoned runs missing a task ID drop out of the cost numerator.
 
 ## Quiz
 ### Q: Why is cost per API call a misleading unit cost for an AI feature?

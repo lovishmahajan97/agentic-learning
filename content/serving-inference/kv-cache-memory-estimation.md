@@ -5,7 +5,7 @@ name: KV-cache memory estimation
 kind: practice
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - model-internals/kv-cache
   - model-internals/grouped-query-attention
@@ -21,53 +21,57 @@ sources:
 ---
 
 ## TL;DR
-KV-cache memory is the number that turns "we have an 80 GB GPU" into "we can serve N concurrent requests
-of length L". It is a short multiplication you can do from a model's config file: bytes per token equals
-2 × layers × KV heads × head dimension × bytes per element, times tokens, times concurrent sequences.
-Learning to do it quickly, and knowing what the formula leaves out, is how you avoid both out-of-memory
-surprises and paying for GPUs that sit half empty.
+KV-cache estimation turns "we have an 80 GB GPU" into "we can serve N requests of length L": 2 × layers ×
+KV heads × head dim × bytes per element, times tokens, times sequences. It prevents OOM surprises and
+half-empty GPUs.
 
 ## Why it exists
-Weights are the visible cost of a model; the cache is the invisible one. A team that budgets 16 GB for an
-8B fp16 model and assumes the remaining 64 GB is "headroom" has not budgeted at all, because every
-running request pins a cache that grows with its context, and the engine refuses or preempts requests
-once that pool is exhausted. The failure is silent until load arrives: nothing crashes at low traffic, and
-then under real concurrency the server either OOMs, stalls admissions, or evicts half-finished generations
-and recomputes them, which shows up as latency collapse.
-
-The naive alternative, "try it and see", fails because the right answer depends on things you do not
-observe until production: the distribution of prompt lengths, output lengths and concurrency, and how they
-move together. Load tests with synthetic 500-token prompts say nothing about the day a customer pastes a
-40-page contract. The other naive alternative, "pick the biggest GPU", fails on cost and often still does
-not fit: a 70B model's cache at 128k context on a modest batch exceeds any single card. The estimate exists
-so you can reason forward from a config file and a traffic model to a GPU count before buying anything,
-and backward from an OOM to the parameter that caused it.
+- **The cache is the invisible cost.** A team that budgets 16 GB for an 8B fp16 model and calls the
+  remaining 64 GB "headroom" has not budgeted at all, because every running request pins a cache that
+  grows with its context, and the engine refuses or preempts requests once that pool is exhausted.
+- **The failure is silent until load arrives.** Nothing crashes at low traffic. Under real concurrency the
+  server OOMs, stalls admissions, or evicts half-finished generations and recomputes them, which shows up
+  as latency collapse.
+- **"Try it and see" fails.** The answer depends on what you do not observe until production: the
+  distribution of prompt lengths, output lengths and concurrency, and how they move together. Synthetic
+  500-token load tests say nothing about the day a customer pastes a 40-page contract.
+- **"Pick the biggest GPU" fails** on cost, and often still does not fit: a 70B model's cache at 128k
+  context on a modest batch exceeds any single card.
+- **What the estimate buys:** reason forward from a config file and a traffic model to a GPU count before
+  buying anything, and backward from an OOM to the parameter that caused it.
 
 ## How it works
 ### Bytes per token
-Each transformer layer stores one key vector and one value vector per KV head per token. So:
+Each layer stores one key vector and one value vector per KV head per token:
 
 ```
 bytes_per_token = 2 × n_layers × n_kv_heads × head_dim × bytes_per_element
 ```
 
-The factor 2 is K and V. `n_kv_heads` is the number of key/value heads, not attention heads: with
-multi-head attention they are equal, with grouped-query attention (GQA) KV heads are fewer (8 is common),
-and with multi-query attention it is 1. `head_dim` is usually `hidden_size / n_attention_heads`.
-`bytes_per_element` is 2 for fp16/bf16, 1 for fp8 or int8 cache. All of these come from the model's
-config file (`num_hidden_layers`, `num_key_value_heads`, `hidden_size`, `num_attention_heads`).
+| Term | Meaning | Config field |
+|---|---|---|
+| 2 | K and V | — |
+| `n_layers` | transformer layers | `num_hidden_layers` |
+| `n_kv_heads` | key/value heads, **not** attention heads: equal under multi-head attention, fewer under GQA (8 is common), 1 under multi-query attention | `num_key_value_heads` |
+| `head_dim` | usually `hidden_size / n_attention_heads` | `hidden_size`, `num_attention_heads` |
+| `bytes_per_element` | 2 for fp16/bf16, 1 for fp8 or int8 cache | engine setting |
 
-Multi-head latent attention (DeepSeek-V2/V3 and derivatives) replaces per-head K and V with one compressed
-latent vector per layer per token plus a small decoupled RoPE key, so the formula becomes
-1 × layers × (latent_dim + rope_dim) × bytes (for DeepSeek-V3: 61 × (512 + 64) × 2 ≈ 70 KB in bf16, versus
-several MB for an equivalent MHA layout); read the architecture before applying the standard formula.
+### Two architectures that break the formula
+- **Multi-head latent attention** (DeepSeek-V2/V3 and derivatives) replaces per-head K and V with one
+  compressed latent vector per layer per token plus a small decoupled RoPE key:
 
-Sliding-window attention is the other common exception. A layer that only attends to the last *W*
-positions needs at most *W* tokens of cache no matter how long the sequence gets, and several recent
-model families interleave sliding-window layers with full-attention layers. Then the estimate is a sum:
-full-attention layers scale with sequence length, windowed layers are capped at *W*, and the average
-bytes per token falls as sequences grow past the window. Whether an engine actually frees the
-out-of-window blocks depends on the engine and version, so confirm with its startup log.
+```
+bytes_per_token = 1 × layers × (latent_dim + rope_dim) × bytes
+DeepSeek-V3: 61 × (512 + 64) × 2 ≈ 70 KB in bf16   (an equivalent MHA layout: several MB)
+```
+
+  Read the architecture before applying the standard formula.
+- **Sliding-window attention.** A layer attending only to the last *W* positions needs at most *W* tokens of
+  cache however long the sequence grows. Several recent model families interleave windowed and
+  full-attention layers, so the estimate becomes a sum: full layers scale with sequence length, windowed
+  layers cap at *W*, and average bytes per token falls past the window.
+- **Caveat:** whether an engine actually frees out-of-window blocks depends on engine and version, so
+  confirm with its startup log.
 
 ### From per-token to per-GPU
 ```
@@ -76,43 +80,60 @@ pool_bytes        = gpu_memory × utilization_fraction − weight_bytes − acti
 max_concurrency   ≈ pool_bytes / cache_per_request
 ```
 
-Four refinements matter in practice:
+Four refinements matter in practice (the fifth item is a constraint on the fourth):
 
 1. **Weights.** Parameters × bytes per parameter: 8B × 2 = 16 GB in fp16, 8 GB at int8, ~4.5 GB at 4-bit
-   (plus a little for scales). Quantizing weights frees cache space; that is often its biggest payoff.
-2. **Activation and workspace.** Engines profile a worst-case forward pass at startup (the largest
-   prefill batch they will allow) and reserve that memory before sizing the pool. CUDA graphs, sampling
-   buffers and the framework's own allocator overhead also take a few GB. vLLM exposes the knob as
-   `gpu_memory_utilization` (default 0.9) and prints the number of cache blocks it managed to allocate;
-   that printed number, times block size, is the real pool in tokens.
-3. **Sequence length is a distribution.** Use the p95 or p99 of (prompt + output), not the mean, to decide
-   what fits without preemption, and use the mean to estimate steady-state concurrency. Paged allocation
-   means a request only consumes what it has actually generated so far, so admission can be optimistic
-   about the mean while the max context length bounds the worst case.
-4. **Tensor parallelism splits the cache, up to a point.** With tensor parallelism of degree *T*, each GPU
-   holds the K/V of `n_kv_heads / T` heads, so per-GPU cache per token is divided by *T* along with the
-   weights, and the pool is the sum over GPUs. Once *T* exceeds `n_kv_heads` (say *T* = 16 on a model
-   with 8 KV heads) heads must be replicated, and the per-GPU cache stops shrinking. *T* must also divide
-   the head counts, which is why real deployments use TP degrees of 2, 4 or 8, not 3 or 6.
+   (plus a little for scales). Quantizing weights frees cache space, often its biggest payoff.
+2. **Activation and workspace.** Engines profile a worst-case forward pass at startup (the largest prefill
+   batch they allow) and reserve that memory before sizing the pool. CUDA graphs, sampling buffers and
+   allocator overhead take a few GB more. vLLM's knob is `gpu_memory_utilization` (default 0.9), and it
+   prints the cache blocks it allocated; that number times block size is the real pool in tokens.
+3. **Sequence length is a distribution.** Use p95 or p99 of (prompt + output) to decide what fits without
+   preemption, and the mean for steady-state concurrency. Paged allocation means a request only consumes
+   what it has generated so far, so admission can be optimistic about the mean while max context bounds
+   the worst case.
+4. **Tensor parallelism splits the cache, up to a point.** At degree *T* each GPU holds the K/V of
+   `n_kv_heads / T` heads, so per-GPU cache per token divides by *T* along with weights, and the pool is the
+   sum over GPUs. Once *T* exceeds `n_kv_heads` (say *T* = 16 with 8 KV heads) heads are replicated and
+   per-GPU cache stops shrinking.
+5. **TP degree must divide the head counts,** which is why deployments use TP 2, 4 or 8, not 3 or 6.
 
 ### Running the numbers for common shapes
 Illustrative, computed from public config values:
-- 32 layers, 32 KV heads, head_dim 128, fp16 (a Llama-2-7B-class MHA model): 2 × 32 × 32 × 128 × 2 =
-  524,288 B ≈ 512 KB per token. 8k context ≈ 4 GB per request.
-- 32 layers, 8 KV heads, head_dim 128, fp16 (a Llama-3-8B-class GQA model): 2 × 32 × 8 × 128 × 2 =
-  131,072 B = 128 KB per token. 8k context ≈ 1 GB per request. Same size class, 4× less cache: this is why
-  GQA exists.
-- 80 layers, 8 KV heads, head_dim 128, fp16 (a 70B-class GQA model): 2 × 80 × 8 × 128 × 2 = 327,680 B =
-  320 KB per token. 8k context ≈ 2.5 GB per request; 128k context ≈ 40 GB for one request.
+
+| Shape (fp16) | Bytes per token | 8k context | Note |
+|---|---|---|---|
+| 32 layers, 32 KV heads, head_dim 128 (Llama-2-7B-class MHA) | 2 × 32 × 32 × 128 × 2 = 524,288 B ≈ 512 KB | ≈ 4 GB per request | |
+| 32 layers, 8 KV heads, head_dim 128 (Llama-3-8B-class GQA) | 2 × 32 × 8 × 128 × 2 = 131,072 B = 128 KB | ≈ 1 GB per request | Same size class, 4× less cache: this is why GQA exists |
+| 80 layers, 8 KV heads, head_dim 128 (70B-class GQA) | 2 × 80 × 8 × 128 × 2 = 327,680 B = 320 KB | ≈ 2.5 GB per request | 128k context ≈ 40 GB for one request |
 
 ### Reading it backwards
-If the engine reports N cache blocks of 16 tokens, the pool holds 16N tokens. Divide by your p50 sequence
-length for expected concurrency, by your `max_model_len` for guaranteed concurrency. If the gap between
-those two is large, the scheduler will run many requests at once and preempt when the tail arrives; that
-is a policy choice, not an error, but you should make it consciously.
+1. **Engine reports N cache blocks of 16 tokens:** the pool holds 16N tokens.
+2. **Divide by p50 sequence length** for expected concurrency, and by `max_model_len` for guaranteed
+   concurrency.
+3. **A large gap between the two** means the scheduler will run many requests at once and preempt when the
+   tail arrives. That is a policy choice, not an error, but make it consciously.
 
-## Example
-A helper you can run against any Hugging Face config to answer "how many fit" before touching a GPU.
+## Diagram
+Work from the config down to a concurrency number, then check it against what the engine actually
+allocated.
+
+```mermaid
+flowchart TD
+    CFG["Model config.json"] --> BPT["Bytes per token: 2 x L x KV heads x dim x bytes"]
+    GPU["GPU memory x utilization"] --> POOL["Cache pool bytes"]
+    W["Weights: params x bytes"] -->|"subtract"| POOL
+    WS["Activation workspace, CUDA graphs"] -->|"subtract"| POOL
+    BPT --> TOK["Pool in tokens"]
+    POOL --> TOK
+    TOK -->|"divide by p50 length"| EXP["Expected concurrency"]
+    TOK -->|"divide by max_model_len"| GUA["Guaranteed concurrency"]
+    TOK -.->|"compare"| LOG["Engine startup log block count"]
+```
+
+## Examples
+### A capacity helper for any Hugging Face config
+Answers "how many fit" before touching a GPU.
 
 ```python
 import json
@@ -144,42 +165,88 @@ print(capacity(llama3_8b_like, 8, cache_bytes=1)["concurrency_at_p50"])   # fp8 
 print(capacity(llama3_8b_like, 8, weight_bytes=0.5)["pool_gb"])           # 4-bit weights: +12 GB pool
 ```
 
-The last two lines are the two cheapest levers when the answer is "not enough": quantize the cache to
-double token capacity, or quantize the weights to enlarge the pool. Compare the printed `pool_tokens`
-with the block count the engine logs at startup; if they disagree by more than ~10%, the workspace
-estimate is wrong for that engine and model and you should trust the log.
+- **The last two lines are the two cheapest levers** when the answer is "not enough": quantize the cache to
+  double token capacity (264 requests at the p50), or quantize the weights to enlarge the pool (64 GB).
+- **Compare the printed `pool_tokens`** with the block count the engine logs at startup. If they disagree
+  by more than ~10%, the workspace estimate is wrong for that engine and model; trust the log.
+
+### Worked scenario: how far tensor parallelism shrinks a 70B cache
+The 70B-class GQA shape above (80 layers, 8 KV heads, head_dim 128, fp16), per-GPU cache per token as TP
+grows:
+
+| TP degree *T* | KV heads per GPU | Per-GPU bytes per token | 12k-token session per GPU |
+|---|---|---|---|
+| 1 | 8 | 320 KB | ~3.9 GB |
+| 2 | 4 | 160 KB | ~2 GB |
+| 4 | 2 | 80 KB | ~1 GB |
+| 8 | 1 | 40 KB | ~0.5 GB |
+| 16 | 1 (replicated) | 40 KB | ~0.5 GB, no further saving |
+
+- **Read it as:** past *T* = 8 you add GPUs for weights and bandwidth, not for cache per token.
+
+### Worked scenario: a model with interleaved sliding-window layers
+A hypothetical shape for illustration: 32 layers, of which 8 are full attention and 24 use a 4,096-token
+window, 8 KV heads, head_dim 128, fp16 (32 KB per layer per token).
+
+| Sequence length | Cache per request | Average bytes per token |
+|---|---|---|
+| 4,096 | 0.5 GiB | 128 KB (same as all-full) |
+| 32,768 | ~1.4 GiB | 44 KB |
+| 131,072 | ~4.4 GiB | 35 KB |
+
+- **The naive formula** would say 16 GiB at 131,072 tokens, about 3.7× too high, but only if the engine
+  really frees out-of-window blocks.
+
+## Production patterns
+- **Keep a bytes-per-token table for every served model.** Compute it from `config.json` in CI and store it
+  next to the deployment config, so capacity questions take seconds. Recompute on every model change.
+- **Gate deploys on the engine's own number.** After startup, parse the logged cache size (blocks, or
+  tokens and maximum concurrency at `max_model_len` in recent vLLM versions) and fail the rollout if it is
+  more than ~10% below plan. Monitor it per model and GPU type.
+- **Set flags from the distribution.** Derive `max_model_len` from the p99 of prompt + output and
+  `max_num_seqs` from pool tokens divided by the mean, then load-test the tail. Monitor KV-cache
+  utilization and preemption counts per replica.
+- **Quantize the cache before adding GPUs.** Try `--kv-cache-dtype fp8` (vLLM) with a quality eval; it
+  roughly doubles token capacity. Monitor eval scores on long-range recall tasks specifically.
+- **Review context-limit requests against the model.** Treat "raise the context window" as a capacity
+  change: rerun the estimate at the new p99 and the new guaranteed concurrency before approving. Monitor
+  context-length p95 per route after the change.
 
 ## Trade-offs
-- Sizing to the maximum context guarantees no preemption but leaves most of the pool idle on typical
-  traffic; sizing to the median packs more users but accepts preemption on the tail.
-- Quantizing the cache to 8-bit doubles token capacity at a small, task-dependent quality cost; the trade
+- **Size to the max vs size to the median.** Sizing to the maximum context guarantees no preemption but
+  leaves most of the pool idle on typical traffic; sizing to the median packs more users but accepts
+  preemption on the tail.
+- **8-bit cache vs recall.** It doubles token capacity at a small, task-dependent quality cost. The trade
   flips against it for workloads where exact long-range recall is the product.
-- Choosing a GQA model shrinks the cache several-fold and raises concurrency, but constrains model choice;
-  a stronger MHA model may still win when quality per request matters more than requests per GPU.
-- Raising `gpu_memory_utilization` toward 1.0 enlarges the pool but removes headroom for activation
-  spikes and other processes; it flips to dangerous when the GPU is shared or prompts are bursty.
+- **GQA model vs model choice.** A GQA model shrinks the cache several-fold and raises concurrency, but
+  constrains model choice; a stronger MHA model may still win when quality per request matters more than
+  requests per GPU.
+- **`gpu_memory_utilization` toward 1.0 vs headroom.** It enlarges the pool but removes headroom for
+  activation spikes and other processes. Dangerous when the GPU is shared or prompts are bursty.
 
 ## Pitfalls
-- Using the attention-head count instead of the KV-head count; symptom is a capacity estimate four or
+- **Using the attention-head count instead of the KV-head count.** Symptom: a capacity estimate four or
   eight times too pessimistic for GQA models, and a purchase of GPUs you did not need.
-- Forgetting that output tokens also need cache; symptom is OOM or preemption on long generations even
+- **Forgetting that output tokens also need cache.** Symptom: OOM or preemption on long generations even
   though every prompt fit comfortably in the estimate.
-- Trusting the formula over the engine's startup log; symptom is a pool 10–20% smaller than planned
+- **Trusting the formula over the engine's startup log.** Symptom: a pool 10–20% smaller than planned,
   because activation workspace and allocator overhead were not budgeted.
-- Estimating with mean sequence length and promising that concurrency; symptom is latency collapse the
+- **Estimating with mean sequence length and promising that concurrency.** Symptom: latency collapse the
   first time a batch of long-context requests arrives together.
-- Applying the standard formula to a model with latent or sliding-window attention; symptom is an estimate
-  off by a large factor in either direction, because the cache layout is different.
+- **The standard formula on latent or sliding-window attention.** Symptom: an estimate off by a large
+  factor in either direction, because the cache layout is different.
 
 ## When to use
-Do this arithmetic at four moments: when choosing a model and GPU before any code exists; when setting
-`max_model_len`, `max_num_seqs` and utilization flags for a deployment; when an OOM or preemption storm
-appears in production; and when someone asks for a longer context window or a bigger model on the same
-hardware. Keep the per-token number for every model you serve in your head or in a table, because it
-answers most capacity questions in seconds. Measure actual cache utilization and preemption counts in
-production to validate the estimate against real traffic. In interviews, deriving bytes per token from a
-config, then turning it into a concurrency number with the weights subtracted, is the canonical serving
-question, and the follow-up is always "what would you change if it does not fit".
+- **Do the arithmetic at four moments:** choosing a model and GPU before any code exists; setting
+  `max_model_len`, `max_num_seqs` and utilization flags; an OOM or preemption storm in production; and a
+  request for a longer context window or a bigger model on the same hardware.
+- **Keep the per-token number** for every model you serve in your head or a table; it answers most capacity
+  questions in seconds.
+- **Measure** actual cache utilization and preemption counts in production to validate the estimate
+  against real traffic.
+- **Interviews:** deriving bytes per token from a config, then a concurrency number with weights
+  subtracted, is the canonical serving question; the follow-up is always "what would you change if it does
+  not fit".
 
 ## Role lens
 - **Engineer:** Computes the pool before deployment, sets context and concurrency flags from it, and
@@ -206,6 +273,37 @@ fits roughly 30–33 sessions at the average. Then cap context per session at 16
 paging and prefix caching, and run a quality eval on the quantized configuration before promising
 anything. A strong answer notes that decode at 40 sessions
 will have higher TPOT because every step reads all 40 caches.
+
+## Interview questions
+### Walk me through estimating how many concurrent requests an 8B GQA model serves on one 80 GB GPU.
+- **Bytes per token:** 2 × 32 layers × 8 KV heads × 128 × 2 bytes = 128 KB.
+- **Pool:** 0.9 × 80 GB minus 16 GB of weights minus ~4 GB of workspace ≈ 52 GB, about 400k tokens.
+- **Concurrency:** ~132 at a 3k p50, ~48 guaranteed at an 8k max; then confirm against the engine's
+  startup log.
+
+### Why does the KV-head count matter more than the attention-head count?
+- **Only KV heads are cached.** Under GQA several query heads share one K/V head, so a 32-query-head model
+  with 8 KV heads stores a quarter of the cache of its MHA twin.
+- **Getting it wrong** makes estimates four or eight times too pessimistic and leads to buying GPUs you do
+  not need.
+
+### Production shows preemption storms at only 60% average cache utilization. What is going on?
+- **Averages hide the tail.** Admission was sized on mean length, and bursts of long-context requests
+  arrive together and exhaust the pool.
+- **Check** p95/p99 of prompt + output and the preemption counter over time, not the mean.
+- **Fix:** cap context per route, lower the concurrency cap, quantize the cache, or split long-context
+  traffic onto its own replicas.
+
+### When does adding tensor parallelism stop helping cache capacity?
+- **When *T* exceeds the KV-head count.** With 8 KV heads, TP 16 replicates heads, so per-GPU cache per
+  token stays at the TP 8 value.
+- **And *T* must divide the head counts,** so 3 or 6 GPUs are not valid degrees; real steps are 2, 4, 8.
+
+### When would you not trust the standard formula?
+- **Latent attention** caches one compressed vector per layer (DeepSeek-V3 is ~70 KB per token in bf16), so
+  the MHA formula is far too high.
+- **Sliding-window layers** cap at *W* tokens, so the cost per token falls with length, but only if the
+  engine frees out-of-window blocks. In both cases read the architecture and the startup log.
 
 ## Quiz
 ### Q: Which model-config fields do you need to compute KV-cache bytes per token?

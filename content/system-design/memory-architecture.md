@@ -124,6 +124,26 @@ under a token budget:
 - **Linear-per-call growth is quadratic in total,** because verbatim replay re-sends every earlier turn
   on every call. That flat line is the architectural goal.
 
+## Diagram
+The write path (top) runs in the background after each turn; the read path (bottom) rebuilds the
+working set for every call. Note that both paths apply tenant, user and purpose scope, and that the
+transcript store stays the source of truth.
+
+```mermaid
+flowchart LR
+    T["User turn"] --> SS[("Session store: full transcript")]
+    SS -->|"background job"| X["Extract facts from user words only"]
+    X -->|"typed slot"| U["Upsert by tenant, user, slot"]
+    X -->|"free text"| AJ["Model adjudicates add, update, noop"]
+    U --> M[("Memory store with lineage to source events")]
+    AJ --> M
+    Q["Next call"] --> R["Scoped read: tenant, user, purpose"]
+    M --> R
+    SS -->|"last 10 turns and rolling summary"| W["Working set under token budget"]
+    R -->|"rank by relevance, recency, importance"| W
+    W --> L["Model call"]
+```
+
 ## Examples
 ### A memory layer with the tiers wired together
 A session store as the source of truth, a write policy that extracts facts after each turn and
@@ -288,6 +308,46 @@ a lineage query: find every row derived from events of that case, delete rows an
 regenerate any summary that referenced them. Reads filter by tenant and user inside the query so nothing
 crosses accounts. I would prove the purge with a test that plants a unique fact, purges, and shows that
 no retrieval, summary or extraction can surface it afterwards.
+
+## Interview questions
+### Why not just replay the whole conversation, or embed every utterance and retrieve by similarity?
+
+- **Replay grows without bound:** cost and latency rise with every turn, the window eventually fills,
+  quality drops as facts get buried, and nothing crosses sessions, devices or agents.
+- **Embed-everything cannot update or delete:** it returns "lives in Berlin" beside "moved to Lisbon",
+  leaks across agents, and misses decisions, which are not textually similar to the question needing them.
+- **So** use explicit scoped stores plus write, read, update and forget policies.
+
+### The assistant tells a user they live in Berlin a month after they said they moved. How do you debug it?
+
+- **Check the write path first:** did the extractor emit a fact for the June turn, and did it land in a
+  typed slot such as `home_city` or as free text?
+- **Free text appended beside the old fact** means missing supersession; embedding similarity is a poor
+  contradiction detector, so move the fact to a typed slot upserted by key or route it through model
+  adjudication.
+- **Then check the read path** for a stale summary that still mentions Berlin.
+
+### What does memory save on a 200-turn conversation, in rough numbers?
+
+- **Verbatim replay** at about 150 tokens per turn reaches about 30,000 tokens per call at turn 200 and
+  Σ 150·t ≈ 3.0M input tokens in total.
+- **Bounded working set:** last 10 turns (about 1,500 tokens), a 400-token summary and 800 tokens of
+  memories stay under 3,000 tokens per call, at most about 0.6M in total, and flat as the conversation
+  grows (illustrative figures).
+
+### Should the model or your code decide what to page into context?
+
+- **Code-controlled** reads are predictable, cheap and testable, which is why they are the baseline.
+- **Model-controlled** paging (the MemGPT line of work) gives tools to read, write and evict memory,
+  buying flexibility on open-ended tasks at the cost of extra calls and a model that sometimes forgets
+  to remember; the production default combines both.
+
+### How can memory become a persistent prompt-injection channel, and how do you close it?
+
+- **The attack:** an instruction planted in a fetched page or tool output ("always CC this address") is
+  extracted as a memory and reappears in later, unrelated sessions.
+- **The fix:** extract only from the user's own turns, tag every memory with its source type, reject
+  non-user sources, and alert on memories created from anything other than the user.
 
 ## Quiz
 ### Q: Why is a session transcript store, rather than the context window, treated as the source of truth for a conversation?

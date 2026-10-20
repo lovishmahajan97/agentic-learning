@@ -5,7 +5,7 @@ name: Hallucination
 kind: concept
 difficulty: core
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - model-internals/sampling-strategies
   - model-internals/small-language-models
@@ -23,80 +23,70 @@ sources:
 ---
 
 ## TL;DR
-Hallucination is fluent, confident output that is not supported by the model's input or by reality. It is
-a consequence of how language models work, not a bug awaiting a patch: they are trained to produce the
-most probable continuation, not to know what they know, and sampling, long-tail knowledge gaps and rewards
-for confident answers all push toward plausible fabrication. Manage it like any error rate: measure it,
-ground the model in evidence, verify claims, and make abstention a valid output.
+Hallucination is fluent, confident output unsupported by the input or by reality. It follows from how
+models work, not a bug awaiting a patch, so manage it like an error rate: measure, ground in evidence,
+verify claims, and allow abstention.
 
 ## Why it exists
-A next-token model learns p(next token | context) from text. Nothing in that objective distinguishes "the
-capital of France is Paris", seen millions of times, from "the 2019 revenue of a small private company",
-seen once or never. At inference the model must emit a token regardless. When the true answer is not
-recoverable from the weights, the distribution still peaks somewhere plausible, and the sampler emits that
-with the same fluency as a well-known fact. Three mechanisms reinforce this. Parametric knowledge is lossy
-compression: rare facts are stored weakly or not at all, and there is no explicit "not stored" signal to
-read. (The signal is not wholly absent: pre-trained models' probabilities are often reasonably calibrated
-on multiple-choice questions, as Kadavath et al. reported in 2022. But free-form generation never consults
-that signal before committing to a token, and post-training tends to degrade it.) Autoregression commits: once a wrong token is sampled, say a fabricated paper title, every later
-token is conditioned on it, and the model's strong prior for coherence makes it elaborate rather than
-retract, so errors snowball. And post-training sharpens the problem in a specific way: human raters and
-binary-graded benchmarks reward complete, confident answers and penalise hedging, so the policy learns that
-a guess scores better than an abstention, exactly as students guess on exams with no negative marking. The
-GPT-4 technical report showed calibration getting worse after RLHF.
-
-The naive fixes fail for the same reasons. "Train on more data" shrinks the long tail but cannot close it.
-"Set temperature to zero" removes sampling noise, but greedy decoding still takes the argmax of a wrong
-distribution; it cuts variance, not bias. "Tell it not to hallucinate" helps only at the margin, because
-the instruction cannot create a reliable "I don't know this" signal the decoding loop would act on. "Fine-tune on the facts" can teach some facts, but
-fine-tuning on knowledge the base model lacks has been reported to increase hallucination elsewhere. The
-durable fix is architectural: supply evidence, verify outputs, and make abstention cheap.
+- **The objective cannot tell known from unknown.** A next-token model learns p(next token | context).
+  Nothing distinguishes "the capital of France is Paris", seen millions of times, from "the 2019 revenue of
+  a small private company", seen once or never. The model must emit a token anyway, the distribution still
+  peaks somewhere plausible, and the sampler emits it with the same fluency as a well-known fact.
+- **Parametric knowledge is lossy compression.** Rare facts are stored weakly or not at all, with no
+  explicit "not stored" signal. The signal is not wholly absent: pre-trained models are often reasonably
+  calibrated on multiple-choice questions (Kadavath et al., 2022). But free-form generation never consults
+  it before committing to a token, and post-training tends to degrade it.
+- **Autoregression commits.** Once a wrong token is sampled, say a fabricated paper title, every later token
+  is conditioned on it, and the strong prior for coherence makes the model elaborate rather than retract,
+  so errors snowball.
+- **Post-training rewards guessing.** Human raters and binary-graded benchmarks reward complete, confident
+  answers and penalise hedging, so the policy learns a guess beats an abstention, like students on exams
+  with no negative marking. The GPT-4 technical report showed calibration getting worse after RLHF.
+- **The naive fixes fail.** More data shrinks the long tail but cannot close it. Temperature zero cuts
+  variance, not bias: greedy decoding still takes the argmax of a wrong distribution. A "do not
+  hallucinate" prompt helps only at the margin, since it creates no "I don't know" signal decoding acts on.
+  Fine-tuning can teach some facts, but on knowledge the base model lacks it has been reported to increase
+  hallucination elsewhere.
 
 ## How it works
 ### A taxonomy that determines the fix
-- **Faithfulness hallucination**: the output is not supported by the source it was given. The NLG
-  literature (Maynez et al., Ji et al.) splits this further into *intrinsic* (the output contradicts the
-  source, such as a summary that reverses a figure in the document) and *extrinsic* (the output adds content
-  the source neither states nor contradicts, such as an invented figure, which may or may not be true in the
-  world). Both are detectable by comparing against the source; reduced by grounding and verification.
-- **Factuality hallucination**: the output contradicts the world, judged against reality rather than against
-  a given source, such as a wrong date or an invented citation in a closed-book answer. Needs external
-  knowledge to detect; reduced by retrieval, tools and abstention. Note the axes are different: an extrinsic
-  addition can be factually true, and a faithful summary of a wrong document is factually wrong.
-- **Structural hallucination**: invented tool names, parameters that do not exist, API functions that were
-  never defined. Common in agents and code generation; eliminated almost entirely by schema validation.
+| Type | What it is | Detect with | Reduce with |
+|---|---|---|---|
+| Faithfulness: *intrinsic* | output contradicts the given source, such as a summary that reverses a figure in the document | comparison against the source | grounding and verification |
+| Faithfulness: *extrinsic* | output adds content the source neither states nor contradicts, such as an invented figure, which may or may not be true in the world | comparison against the source | grounding and verification |
+| Factuality | output contradicts the world, such as a wrong date or an invented citation in a closed-book answer | external knowledge | retrieval, tools and abstention |
+| Structural | invented tool names, parameters that do not exist, API functions never defined; common in agents and code generation | schema checks | schema validation, which eliminates it almost entirely |
 
-The split matters because each type has a different evaluation and a different mitigation, and a
-"hallucination rate" that mixes them is not actionable.
+- **The faithfulness split** into intrinsic and extrinsic comes from the NLG literature (Maynez et al.,
+  Ji et al.).
+- **The axes are different.** An extrinsic addition can be factually true, and a faithful summary of a
+  wrong document is factually wrong.
+- **Why it matters.** Each type has a different evaluation and a different mitigation, so a
+  "hallucination rate" that mixes them is not actionable.
 
 ### Where in the pipeline it arises
 1. **Knowledge.** The question is outside the training distribution or after the training cutoff.
-2. **Retrieval.** In a RAG system the retriever returns irrelevant, partial, conflicting or stale passages,
-   and a model instructed to answer bridges the gaps with its priors. A large share of "model
-   hallucinations" reported for RAG products are retrieval failures.
+2. **Retrieval.** In RAG the retriever returns irrelevant, partial, conflicting or stale passages, and a
+   model instructed to answer bridges the gaps with its priors. A large share of "model hallucinations"
+   reported for RAG products are retrieval failures.
 3. **Decoding.** High temperature or top-p widens the tail; long generations accumulate risk; the most
    surprising tokens are usually the fabricated specifics, such as numbers, names and URLs.
-4. **Prompt pressure.** "Always answer", "be definitive", role-play framing, and questions with false
-   premises ("Why did X do Y?" when X never did) all push the distribution toward fabrication.
+4. **Prompt pressure.** "Always answer", "be definitive", role-play framing, and false-premise questions
+   ("Why did X do Y?" when X never did) push the distribution toward fabrication.
 5. **Sycophancy.** The user asserts something and the model agrees, because agreement was rewarded in
    preference tuning.
 
 ### Detection mechanisms
-- **Sampling consistency.** Sample N answers; facts the model actually knows are stable across samples,
-  fabrications vary (SelfCheckGPT). Costs N× compute and misses confident, consistent errors.
-- **Semantic entropy.** Cluster the samples by meaning and compute entropy over clusters. High entropy flags
-  unreliable answers better than token-level entropy, because paraphrases of one answer no longer count as
-  disagreement.
-- **Token-level signals.** Low log-probability on entity and number tokens is a useful cheap flag, but
-  these probabilities are miscalibrated after RLHF, so thresholds must be tuned per model.
-- **Claim-level verification.** For grounded tasks, split the answer into atomic claims and check each
-  against the retrieved passages with an NLI model or an LLM judge, reporting an unsupported-claim rate. This
-  is the faithfulness metric in evals, and it is the most actionable measurement because it names the
-  claim that failed.
-- **Tool-based verification.** Run the code, call the API, look up the citation. Cheapest and most reliable
-  wherever a checker exists.
+| Method | How | Cost and limits |
+|---|---|---|
+| Sampling consistency (SelfCheckGPT) | sample N answers; known facts are stable, fabrications vary | N× compute; misses confident, consistent errors |
+| Semantic entropy | cluster samples by meaning, compute entropy over clusters | flags unreliable answers better than token-level entropy, because paraphrases of one answer no longer count as disagreement |
+| Token-level signals | low log-probability on entity and number tokens | cheap flag, but miscalibrated after RLHF, so thresholds must be tuned per model |
+| Claim-level verification | split the answer into atomic claims, check each against retrieved passages with an NLI model or LLM judge, report an unsupported-claim rate | the faithfulness metric in evals; most actionable because it names the claim that failed |
+| Tool-based verification | run the code, call the API, look up the citation | cheapest and most reliable wherever a checker exists |
 
 ### Reduction mechanisms
+The durable fix is architectural: supply evidence, verify outputs, and make abstention cheap.
 - **Grounding.** Retrieve evidence, instruct the model to quote or cite spans, verify the citations after
   generation, and show the sources to the user.
 - **Abstention paths.** Put an explicit "insufficient information" option in the output schema and score it
@@ -108,15 +98,34 @@ The split matters because each type has a different evaluation and a different m
 - **Verification loops.** Draft, generate verification questions, answer them independently, revise.
   Reasoning models perform a version of this inside their thinking trace.
 - **Training-side.** Preference data that rewards calibrated abstention and penalises confident errors more
-  than "I don't know"; this is a vendor-level lever, but it tells you what to look for in model choice.
-- **Product design.** Surface confidence and sources, make verification one click, keep a human in the loop
-  for consequential outputs.
+  than "I don't know". A vendor-level lever, but it tells you what to look for in model choice.
+- **Product design.** Surface confidence and sources, make verification one click, keep a human in the
+  loop for consequential outputs.
 
-## Example
-A claim-level faithfulness check for a RAG answer. It costs one call to extract claims plus one call per
-claim, so it is run as an offline eval on sampled traffic and as an online gate only for high-stakes
-categories. The judge is itself a model and can be wrong in the same direction as the generator, so its
-verdicts must be calibrated against human labels before the rate goes on a dashboard.
+## Diagram
+A grounded answer path with the three exits that keep hallucinations from reaching users: abstain on weak
+evidence, repair invalid structure, and verify claims before answering.
+
+```mermaid
+flowchart TD
+    Q["User question"] --> R["Retrieve passages"]
+    R --> G{"Evidence relevant?"}
+    G -->|"no"| AB["Answer: insufficient information"]
+    G -->|"yes"| GEN["Generate with cited spans"]
+    GEN --> V["Validate schema and tool calls"]
+    V -->|"invalid"| GEN
+    V --> CV["Verify each claim vs passages"]
+    CV -->|"unsupported"| FIX["Drop claim, regenerate or review"]
+    CV -->|"all supported"| OUT["Answer with sources"]
+    FIX --> OUT
+```
+
+## Examples
+### Claim-level faithfulness check for a RAG answer
+- **Cost:** one call to extract claims plus one call per claim, so it runs as an offline eval on sampled
+  traffic and as an online gate only for high-stakes categories.
+- **Caveat:** the judge is itself a model and can be wrong in the same direction as the generator, so
+  calibrate its verdicts against human labels before the rate goes on a dashboard.
 
 ```python
 import json
@@ -154,52 +163,118 @@ if report["unsupported_rate"] > 0:
     ...
 ```
 
-The same decomposition gives you error analysis for free: unsupported claims that are "not_found" with
-weak retrieval scores point at the retriever, while "contradicted" claims point at the generator.
+- **Free error analysis.** Unsupported claims that are "not_found" with weak retrieval scores point at the
+  retriever; "contradicted" claims point at the generator.
+
+### Semantic entropy on sampled answers
+A runnable sketch of the detection idea for closed-book questions. Farquhar et al. decide "same meaning"
+with bidirectional entailment from an NLI model; here a toy rule (same set of years) stands in for it.
+
+```python
+import math, re
+
+def semantic_entropy(samples, same_meaning):
+    clusters = []
+    for s in samples:
+        for c in clusters:
+            if same_meaning(c[0], s):
+                c.append(s)
+                break
+        else:
+            clusters.append([s])
+    n = len(samples)
+    return sum(-(len(c) / n) * math.log(len(c) / n) for c in clusters)
+
+years = lambda s: set(re.findall(r"\b\d{4}\b", s))
+same_year = lambda a, b: years(a) == years(b)
+
+known = ["Founded in 1998.", "1998", "It was founded in 1998", "In 1998.", "1998, in Ohio"]
+guess = ["Founded in 1998.", "2003", "It was founded in 1987", "In 2003.", "2011"]
+print(round(semantic_entropy(known, same_year), 2))   # 0.0: one meaning, likely known
+print(round(semantic_entropy(guess, same_year), 2))   # 1.33: four meanings, flag or abstain
+```
+
+### Worked scenario: splitting a reported 10% rate
+A customer says the assistant "hallucinates about 10% of the time". Labelling 200 failing answers gives a
+breakdown like this (illustrative counts, the shape is typical):
+
+| Root cause | Count | Share | Fix |
+|---|---|---|---|
+| Retrieval missed the answer passage | 110 | 55% | chunking, embeddings, missing documents |
+| Question unanswerable from the corpus | 30 | 15% | abstention path, scored as correct |
+| Extrinsic addition beyond the passage | 35 | 17.5% | quote-or-cite instruction, claim verification |
+| Intrinsic contradiction of the passage | 15 | 7.5% | lower temperature on the answer step, verification |
+| Citation attached to a passage that does not say it | 10 | 5% | post-hoc citation check |
+
+- **Reading.** Most of the "model" problem is retrieval and missing abstention, which is why fixing
+  retrieval first usually gives the largest drop.
+
+## Production patterns
+- **Abstention as a schema state.** Add a status field such as `answered` or `insufficient_information` to
+  the structured output, include unanswerable items in the eval set and score abstention on them as
+  correct. Monitor abstention rate separately on answerable and unanswerable items, so over-refusal shows.
+- **Log retrieval scores with every answer.** Store the top-k relevance scores and passage ids next to each
+  response, and route answers whose best score is below a tuned threshold to abstention or review.
+  Monitor the share of flagged failures with low retrieval scores to separate retriever from generator.
+- **Mechanical citation checks.** Require quoted spans with source indices and verify after generation that
+  each quote appears in the cited passage, a plain string match. Monitor the citation-mismatch rate per
+  release.
+- **Validate every tool call.** Check tool names against the live registry and arguments against the tool's
+  JSON Schema (for example with the Python `jsonschema` package), reflect the validation error back to the
+  model, and cap retries. Monitor invalid-call rate per tool.
+- **Calibrate the judge before the dashboard.** Have SMEs label a sample, measure agreement between the
+  LLM judge and humans, and only then publish an unsupported-claim rate. Re-check agreement when the judge
+  model or prompt changes.
+- **Tier verification by stakes.** Run claim-level verification online only for high-stakes categories and
+  offline on sampled traffic for everything else. Track the latency and cost it adds per tier.
 
 ## Trade-offs
-- Retrieval grounding cuts factual hallucination sharply, but moves the failure to retrieval quality; when
-  the corpus lacks the answer, a model told to "answer from context" either abstains or bridges the gap, so a
-  check is still needed.
-- Sampling-based detection is model-agnostic and needs no labels, but multiplies cost by N and only catches
-  instability, not confident errors the model learned consistently from training data.
-- Lower temperature reduces variance on factual tasks, but does not fix a wrong argmax and hurts tasks that
-  need diversity; the trade flips for brainstorming and creative generation.
-- Rewarding abstention reduces confident errors, but overdone it produces a model that refuses or hedges on
-  answerable questions; users punish both failures, so tune the abstention rate to your task's cost
-  asymmetry.
-- Claim-level verification gives precise, actionable numbers, but adds latency and a second model that can
-  be wrong; it earns its cost on high-stakes outputs and as an offline eval, rarely on every chat turn.
+- **Grounding vs retrieval dependence.** Retrieval cuts factual hallucination sharply but moves the failure
+  to retrieval quality; when the corpus lacks the answer, a model told to "answer from context" either
+  abstains or bridges the gap, so a check is still needed.
+- **Label-free detection vs cost and coverage.** Sampling-based detection is model-agnostic and needs no
+  labels, but multiplies cost by N and only catches instability, not confident errors the model learned
+  consistently from training data.
+- **Low temperature vs diversity.** It reduces variance on factual tasks but does not fix a wrong argmax and
+  hurts tasks that need diversity; the trade flips for brainstorming and creative generation.
+- **Abstention vs over-refusal.** Rewarding abstention reduces confident errors, but overdone it produces a
+  model that refuses or hedges on answerable questions; users punish both failures, so tune the abstention
+  rate to your task's cost asymmetry.
+- **Claim verification vs latency.** It gives precise, actionable numbers but adds latency and a second
+  model that can be wrong; it earns its cost on high-stakes outputs and as an offline eval, rarely on every
+  chat turn.
 
 ## Pitfalls
-- Blaming the model for a retrieval failure; the symptom is hallucinations clustered on questions whose
-  top-k passages have low relevance scores or whose answers are not in the corpus at all.
-- Reporting a hallucination rate from an LLM judge that was never calibrated against humans; the symptom is
-  a judge that shares the generator's priors and a dashboard reading 2% while SMEs find 15%.
-- Treating temperature 0 as "hallucination off"; the symptom is deterministic, repeatable fabrications that
+- **Blaming the model for a retrieval failure.** Symptom: hallucinations cluster on questions whose top-k
+  passages have low relevance scores or whose answers are not in the corpus at all.
+- **Reporting a rate from an uncalibrated LLM judge.** Symptom: a judge that shares the generator's priors
+  and a dashboard reading 2% while SMEs find 15%.
+- **Treating temperature 0 as "hallucination off".** Symptom: deterministic, repeatable fabrications that
   look like facts precisely because they are consistent.
-- Scoring "I don't know" as a failure in evals and demos; the symptom is that after a round of prompt or
+- **Scoring "I don't know" as a failure in evals and demos.** Symptom: after a round of prompt or
   fine-tuning iteration, abstentions vanish and confident errors rise.
-- Fine-tuning on domain facts the model never saw to "teach it the knowledge"; the symptom is a model that
-  learned the format and a few facts and now fabricates fluently about the rest.
-- Accepting a cited answer without checking that the citation supports the claim; the symptom is real
-  document titles attached to statements they do not contain, since citation hallucination survives
-  retrieval.
-- Letting an agent invent tool names or arguments; the symptom is "function not found" errors or calls with
-  parameters that do not exist, fixed by validating every call against the live schema and reflecting the
-  error back.
+- **Fine-tuning on unseen domain facts to "teach it the knowledge".** Symptom: a model that learned the
+  format and a few facts and now fabricates fluently about the rest.
+- **Accepting a cited answer without checking the citation.** Symptom: real document titles attached to
+  statements they do not contain, since citation hallucination survives retrieval.
+- **Letting an agent invent tool names or arguments.** Symptom: "function not found" errors or calls with
+  parameters that do not exist. Fix: validate every call against the live schema and reflect the error back.
 
 ## When to use
-You do not choose whether hallucination applies; you choose how much to spend against it per use case. For
-low-stakes creative or conversational features, light measures suffice: sources where available and a
-temperature appropriate to the task. For extraction and summarisation, ground every output in the input and
-measure faithfulness on a golden set. For factual question answering, use retrieval with citations, an
-abstention path and offline claim-level verification. For agents, validate every tool call against the real
-schema and verify consequential actions before executing them. Measure the unsupported-claim rate, the
-abstention rate on unanswerable items, calibration of confidence against correctness, and per-category
-error analysis. In interviews, explain the mechanism (objective, decoding, incentives), the
-faithfulness/factuality split and the intrinsic/extrinsic subdivision, three mitigations with their costs,
-and why temperature 0 is not a fix.
+You do not choose whether hallucination applies; you choose how much to spend against it per use case.
+- **Low-stakes creative or conversational features:** light measures, sources where available and a
+  temperature appropriate to the task.
+- **Extraction and summarisation:** ground every output in the input and measure faithfulness on a golden
+  set.
+- **Factual question answering:** retrieval with citations, an abstention path and offline claim-level
+  verification.
+- **Agents:** validate every tool call against the real schema and verify consequential actions before
+  executing them.
+- **Measure:** unsupported-claim rate, abstention rate on unanswerable items, calibration of confidence
+  against correctness, and per-category error analysis.
+- **Interviews:** explain the mechanism (objective, decoding, incentives), the faithfulness/factuality split
+  and the intrinsic/extrinsic subdivision, three mitigations with their costs, and why temperature 0 is not
+  a fix.
 
 ## Role lens
 - **Engineer:** Builds the grounding pipeline, adds an "insufficient evidence" output path, validates tool
@@ -222,6 +297,42 @@ retrieval first, since it is usually the largest share; require citations with q
 high-stakes categories; and calibrate the LLM judge against the SME labels before reporting any rate. I
 would refuse to fine-tune the model on the policy documents as a knowledge fix, or to add "do not
 hallucinate" to the prompt and call it done.
+
+## Interview questions
+### Why do language models hallucinate at all?
+- **Objective:** next-token training rewards plausible continuations and has no "not stored" signal, so an
+  unknown fact still yields a confident-looking peak.
+- **Decoding:** autoregression commits to sampled tokens and the coherence prior elaborates on an early
+  error instead of retracting it.
+- **Incentives:** preference tuning and binary-graded benchmarks score guesses above abstentions, and
+  calibration measurably worsens after RLHF.
+
+### Explain faithfulness versus factuality, with an example of each.
+- **Faithfulness** is judged against the given source: a summary that reverses a figure is intrinsic; one
+  that adds an invented figure is extrinsic.
+- **Factuality** is judged against the world: a wrong date in a closed-book answer.
+- **They are independent axes:** a faithful summary of a wrong document is factually wrong, and an
+  extrinsic addition can happen to be true.
+
+### There are no source documents for a closed-book QA feature. How would you detect likely hallucinations?
+- **Sample several answers** and measure agreement, or better, semantic entropy over meaning clusters, so
+  paraphrases do not count as disagreement.
+- **Act on it:** above a tuned threshold, abstain, add a caveat or route to retrieval or a tool.
+- **Know the limits:** it costs N× compute and misses confident, consistent errors the model learned from
+  training data.
+
+### Your LLM judge reports a 2% hallucination rate but SMEs find 15%. What happened and what do you do?
+- **Likely cause:** the judge shares the generator's priors, so it accepts the same plausible fabrications,
+  and it was never calibrated against human labels.
+- **Fix:** label a sample with SMEs, measure judge agreement, switch to claim-level verdicts against the
+  retrieved passages, and tune the judge prompt or model until agreement is acceptable.
+- **Then** report only the calibrated rate, split by failure type.
+
+### Why might fine-tuning on a customer's documents make hallucination worse?
+- **Fine-tuning teaches format faster than facts.** Training on knowledge the base model lacks has been
+  reported to increase hallucination elsewhere.
+- **The result** is a model that sounds like the domain and fabricates fluently about everything it did not
+  memorise. Supply the documents through retrieval with citations instead.
 
 ## Quiz
 ### Q: Why does setting temperature to 0 not eliminate hallucination?

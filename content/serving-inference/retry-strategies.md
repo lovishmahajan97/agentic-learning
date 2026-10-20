@@ -5,7 +5,7 @@ name: Retry strategies
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: reviewed
+status: crisp
 related:
   - serving-inference/timeouts
   - serving-inference/idempotency
@@ -22,100 +22,125 @@ sources:
 ---
 
 ## TL;DR
-A retry re-issues a request that failed for a reason likely to be transient. Done well, it classifies the
-error, waits with exponential backoff plus jitter, honours `Retry-After`, caps attempts and total time,
-keeps a global retry budget and relies on idempotency; it then absorbs the steady trickle of 429s, 5xx
-and connection resets that LLM APIs produce. Done naively, retrying everything immediately at every
-layer, it turns a brief provider hiccup into a self-inflicted outage.
+A retry re-issues a request that failed transiently. Classify the error, back off exponentially with
+jitter, honour `Retry-After`, cap attempts and time, keep a global budget, and rely on idempotency, or a
+brief hiccup becomes a self-inflicted outage.
 
 ## Why it exists
-Provider APIs fail a small fraction of the time by design: 429 when shared capacity is tight, 529 or 503
-when overloaded, 5xx during deployments, connection resets through proxies, and timeouts on long
-generations. At a 1% independent failure rate and 100,000 calls a day that is 1,000 user-visible errors;
-a single well-placed retry cuts it to about 10, because the probability of two independent failures is
-0.01%. That arithmetic is why every SDK retries by default.
-
-The arithmetic breaks when failures are correlated, and during an incident they always are. If the
-provider is saturated, each retry is new load on a system that is already dropping requests. Three
-immediate retries quadruple the offered load; stack an SDK that retries twice (3 attempts), a service that
-retries three times (4) and a browser that retries three times (4), and one user click becomes up to
-3 × 4 × 4 = 48 attempts. That is the retry storm, and it can turn a 30-second blip into an outage that
-lasts many minutes.
-
-LLM calls raise the stakes further. Each attempt costs seconds and real money, a timed-out call may have
-already done its work (or, in an agent, executed a tool with side effects), and a streaming response
-cannot be transparently retried once tokens have reached the user. So the design question is not whether
-to retry but exactly which failures, how many times, with what spacing, under what aggregate limit, and
-with what guarantee that a duplicate is harmless.
+- **Provider APIs fail a small fraction of the time by design:** 429 when shared capacity is tight, 529
+  or 503 when overloaded, 5xx during deployments, connection resets through proxies, timeouts on long
+  generations.
+- **One retry fixes most of it.** At a 1% independent failure rate and 100,000 calls a day that is 1,000
+  user-visible errors; a single retry cuts it to about 10, because two independent failures have
+  probability 0.01%. That is why every SDK retries by default.
+- **Correlated failures break the arithmetic,** and during an incident they always are. Each retry is new
+  load on a saturated system; three immediate retries quadruple offered load.
+- **Layers multiply.** An SDK retrying twice (3 attempts), a service retrying three times (4) and a
+  browser retrying three times (4) turn one click into up to 3 × 4 × 4 = 48 attempts. That retry storm
+  can turn a 30-second blip into an outage lasting many minutes.
+- **LLM calls raise the stakes.** Each attempt costs seconds and money, a timed-out call may already have
+  done its work (or run a tool with side effects), and a stream cannot be retried once tokens reach the
+  user. The question is which failures, how often, how spaced, under what limit, with what duplicate
+  guarantee.
 
 ## How it works
 ### Classify first
-Retry: 408, 429, 500, 502, 503, 504, 529 (Anthropic's overloaded status), connection errors and, only
-when the operation is idempotent, timeouts. Do not retry: 400 (malformed request, context-length
-overflow), 401 and 403 (credentials), 404 (wrong model id), 413, 422 and content-policy refusals; they
-fail identically next time. A 429 needs a second look: a per-minute rate limit clears in seconds, a
-monthly quota exhaustion does not, and `Retry-After` tells you which.
+| Retry | Do not retry |
+|---|---|
+| 408, 429, 500, 502, 503, 504 | 400 (malformed request, context-length overflow) |
+| 529 (Anthropic's overloaded status) | 401 and 403 (credentials) |
+| connection errors | 404 (wrong model id) |
+| timeouts, only when the operation is idempotent | 413, 422 and content-policy refusals |
+
+- **Non-retryable errors fail identically next time.**
+- **A 429 needs a second look:** a per-minute rate limit clears in seconds, a monthly quota exhaustion does
+  not, and `Retry-After` tells you which.
 
 ### Exponential backoff with jitter
-The wait before attempt *n* grows geometrically, `min(cap, base × 2ⁿ)`, so a persistent fault quickly
-spreads retries thin. Pure exponential backoff has a flaw: every client that failed at the same instant
-retries at the same instant, so the load arrives in synchronized waves at 1 s, 2 s, 4 s. Jitter breaks
-the synchrony. With *full jitter* the wait is uniform between 0 and the exponential ceiling; with
-*decorrelated jitter* it is uniform between the base and three times the previous wait, capped.
-Brooker's simulations showed both complete the same work with far fewer total calls than un-jittered
-backoff, which is why full jitter is a common library default.
+1. **Grow the wait geometrically:** before attempt *n*, wait `min(cap, base × 2ⁿ)`, so a persistent fault
+   quickly spreads retries thin.
+2. **Add jitter,** because pure exponential backoff synchronizes: every client that failed at the same
+   instant retries at the same instant, in waves at 1 s, 2 s, 4 s.
+3. **Pick a jitter style:**
+   - *Full jitter:* uniform between 0 and the exponential ceiling.
+   - *Decorrelated jitter:* uniform between the base and three times the previous wait, capped.
+- **Evidence:** Brooker's simulations showed both complete the same work with far fewer total calls than
+  un-jittered backoff, which is why full jitter is a common library default.
 
 ### Honour the server's schedule
-If the response carries `Retry-After`, use it instead of your own schedule: the server knows when
-capacity returns, and waiting less is wasted load that may count against you. The header may be a
-number of seconds or an HTTP date, so parse both, and still cap it: a `Retry-After` longer than the
-request's remaining deadline means "give up or fall back now", not "sleep". Providers also return
-remaining-quota and reset headers; an outbound rate limiter can read them to slow down *before* the
-first 429.
+- **Use `Retry-After` instead of your own schedule** when present: the server knows when capacity
+  returns, and waiting less is wasted load that may count against you.
+- **Parse both forms:** a number of seconds or an HTTP date.
+- **Still cap it.** A `Retry-After` longer than the request's remaining deadline means "give up or fall
+  back now", not "sleep".
+- **Slow down before the first 429.** Providers also return remaining-quota and reset headers; an outbound
+  rate limiter can read them.
 
 ### Caps and budgets
-Per request: a maximum attempt count (two or three) and a total deadline that includes the backoff
-sleeps, so a 30-second provider timeout cannot become a two-minute wait. Per client: a retry budget,
-retries allowed only while they stay below roughly 10% of recent requests (the figure the SRE book uses).
-The per-request cap bounds the worst case for one call; the budget bounds aggregate amplification during
-an incident to about 1.1× instead of 3×. A common implementation is itself a token bucket: every
-successful request deposits 0.1 tokens, every retry spends one, and retries stop when the bucket is
-empty. In normal operation the bucket stays full and nothing changes; in an outage, where nothing
-succeeds, it drains after a few retries and the client degrades to one attempt per request, which is
-exactly the behaviour you want from a fleet hammering a saturated provider.
+| Control | Scope | Typical setting | What it bounds |
+|---|---|---|---|
+| Max attempts | per request | two or three | worst case for one call |
+| Total deadline (includes backoff sleeps) | per request | from latency budget | a 30-second provider timeout cannot become a two-minute wait |
+| Retry budget | per client | retries below roughly 10% of recent requests (the SRE book's figure) | aggregate amplification to about 1.1× instead of 3× |
 
-Worked numbers make the point. A fleet sends 200 requests per second; the provider goes fully down.
-With three attempts per request and no budget, it receives 600 requests per second while it is trying
-to recover. With a 10% budget it receives about 220. As the provider recovers, every request it rejects
-from the first fleet comes back twice more, so partial recovery is met with up to triple load and can
-stay pinned in overload; the second fleet's offered load is near its real demand from the start, and
-successes refill the budget only as the provider actually heals.
+- **Budget as a token bucket.** Every successful request deposits 0.1 tokens, every retry spends one, and
+  retries stop when the bucket is empty.
+- **Normal operation:** the bucket stays full and nothing changes.
+- **Outage:** nothing succeeds, so it drains after a few retries and the client degrades to one attempt
+  per request, exactly what you want from a fleet hammering a saturated provider.
+
+Worked numbers, a fleet at 200 requests per second when the provider goes fully down:
+
+| Policy | Load on the provider | During recovery |
+|---|---|---|
+| Three attempts, no budget | 600 requests per second | every rejected request comes back twice more, so partial recovery meets up to triple load and can stay pinned in overload |
+| 10% budget | about 220 | offered load is near real demand from the start; successes refill the budget only as the provider heals |
 
 ### Retry at one layer
-Know what the SDK does. The official Anthropic and OpenAI SDKs retry twice by default with exponential
-backoff and honour `Retry-After` (check the current defaults for your version). Either disable that and
-own the policy, or let it be the only retrying layer; two layers multiply.
+- **Know what the SDK does.** The official Anthropic and OpenAI SDKs retry twice by default with
+  exponential backoff and honour `Retry-After` (check the current defaults for your version).
+- **Either disable it and own the policy, or let it be the only retrying layer;** two layers multiply.
 
 ### LLM-specific rules
-- Prefer a tight time-to-first-token timeout plus a retry over a long total timeout plus a retry, because
+- **Tight time-to-first-token timeout plus a retry** beats a long total timeout plus a retry, because
   stalled requests rarely recover and the user is waiting.
-- Never retry a stream after the first token has been forwarded; restart it as a new message id so the
+- **Never retry a stream after the first token was forwarded;** restart it as a new message id so the
   client can discard the partial one.
-- Give every retried operation an idempotency key, so a retried tool call does not send a second email.
-- Prompt caching makes retried prefill cheaper, since the retry reads the prefix the first attempt wrote,
-  provided the first attempt got far enough to write it (on Anthropic an entry becomes readable once the
-  first response begins).
-- A hedged request (start a second attempt once the first has exceeded the p95 latency and keep whichever
-  finishes first) cuts tail latency for a few percent of extra load, since only the slowest 5% of calls
-  spawn a hedge; firing it immediately would double the load. It needs cancellation of the loser to be
-  worth it (Dean and Barroso's "tail at scale" pattern).
-- A wrong answer is not a transient failure. Validation-driven regeneration is a separate loop with its
-  own bound and usually a changed prompt or temperature.
+- **Give every retried operation an idempotency key,** so a retried tool call does not send a second email.
+- **Prompt caching makes retried prefill cheaper,** since the retry reads the prefix the first attempt
+  wrote, provided it got far enough (on Anthropic an entry becomes readable once the first response
+  begins).
+- **Hedged requests** start a second attempt once the first exceeds the p95 latency and keep whichever
+  finishes first. Only the slowest 5% of calls spawn a hedge, so tail latency drops for a few percent of
+  extra load; firing immediately would double it. It needs cancellation of the loser (Dean and Barroso's
+  "tail at scale" pattern).
+- **A wrong answer is not a transient failure.** Validation-driven regeneration is a separate loop with
+  its own bound, usually with a changed prompt or temperature.
 
-## Example
-The helper below decides by status code, prefers the server's `Retry-After`, otherwise sleeps with full
-jitter under a cap, refuses to exceed the request's deadline, and consults a process-wide retry budget so
-that an incident cannot multiply load. In an async service replace `time.sleep` with `await asyncio.sleep`.
+## Diagram
+Each failure passes through four gates in order; any "no" ends the loop with an error or a fallback
+instead of another attempt.
+
+```mermaid
+flowchart TD
+    F["Call failed"] --> C{"Retryable status?"}
+    C -->|"no: 400, 401, 404, 422"| E["Raise to caller"]
+    C -->|"yes"| A{"Attempts left?"}
+    A -->|"no"| FB["Fallback or error"]
+    A -->|"yes"| B{"Retry budget allows?"}
+    B -->|"no"| FB
+    B -->|"yes"| W["Wait: Retry-After or full jitter"]
+    W --> D{"Fits remaining deadline?"}
+    D -->|"no"| FB
+    D -->|"yes"| R["Retry the call"]
+    R -.->|"fails again"| F
+```
+
+## Examples
+### Retry helper with full jitter, Retry-After and a budget
+The helper decides by status code, prefers the server's `Retry-After`, otherwise sleeps with full jitter
+under a cap, refuses to exceed the request's deadline, and consults a process-wide retry budget so an
+incident cannot multiply load. In an async service replace `time.sleep` with `await asyncio.sleep`.
 
 ```python
 import random, time
@@ -150,39 +175,94 @@ def call_with_retry(send):
             time.sleep(delay)
 ```
 
+### Token-bucket retry budget, simulated through an outage
+Pure Python, runs as is. Successes deposit 0.1, retries spend 1; during a full outage the bucket drains
+and the fleet falls back to one attempt per request.
+
+```python
+class TokenBucketBudget:
+    def __init__(self, capacity=10.0, deposit=0.1):
+        self.tokens, self.capacity, self.deposit = capacity, capacity, deposit
+    def on_success(self):
+        self.tokens = min(self.capacity, self.tokens + self.deposit)
+    def try_retry(self):
+        if self.tokens >= 1:
+            self.tokens -= 1
+            return True
+        return False
+
+b = TokenBucketBudget()
+calls = 0
+for _ in range(200):                 # 200 requests while the provider is fully down
+    calls += 1                       # first attempt always goes out
+    for _ in range(2):               # up to 2 retries per request
+        if not b.try_retry():
+            break
+        calls += 1
+print(calls)   # 210: 10 retries drained the bucket, then one attempt per request (vs 600 with no budget)
+```
+
+### Worked amplification audit
+One user click traced through a stack that retries at three layers, then after the fix:
+
+| Layer | Attempts before | Attempts after |
+|---|---|---|
+| Browser | 4 (retries three times) | 1 (no retries) |
+| Service | 4 (retries three times) | 1 (breaker and fallback instead) |
+| SDK | 3 (retries twice) | 3 (the only retrying layer) |
+| Worst case per click | 3 × 4 × 4 = 48 | 3 |
+
+## Production patterns
+- **SDK as the single retry layer.** Keep the official SDK's retries and set them explicitly, for example
+  `max_retries` and `timeout` on the Anthropic or OpenAI Python client, and remove retries above it.
+  Monitor the amplification factor (provider calls per user request).
+- **Process-wide retry budget.** Wrap outbound calls in a token bucket or sliding-window budget of about
+  10% of recent requests. Monitor budget exhaustion events; they should appear only during incidents.
+- **Tight TTFT timeout for chat.** Set a short time-to-first-token budget, retry once, then fall back,
+  because a stalled stream rarely recovers. Monitor TTFT p95 and success-after-retry rate.
+- **Quota-aware pacing.** Read the provider's remaining-quota and reset headers into an outbound rate
+  limiter so the client slows before the first 429. Monitor 429 rate and remaining-quota headroom.
+- **Batch jobs retry through the queue.** For pipelines, cap backoff in minutes and re-enqueue with a
+  delay instead of sleeping in a worker, with an idempotency key per item. Monitor retries per job and
+  dead-letter queue depth.
+
 ## Trade-offs
-- Retries raise success rates when failures are independent but amplify load when they are correlated;
-  the retry budget is what makes the trade safe, and without it the first incident proves the point.
-- A higher backoff cap is gentler on the provider but worse for the user; for interactive features cap at
-  one or two short retries and then fall back, for batch pipelines cap in minutes and let the queue absorb it.
-- Hedged requests cut tail latency but add load (a few percent when fired at the p95, up to double when
-  fired immediately) and need cancellation; they pay off only when time-to-first-token variance is high
-  and the call is cheap relative to the user's time.
-- Retrying after timeouts recovers from stalls but risks duplicated effects; without idempotency keys the
-  safe choice is to surface the timeout rather than retry.
+- **Success rate vs amplification.** Retries raise success rates when failures are independent but
+  amplify load when correlated. The retry budget makes the trade safe; without it the first incident
+  proves the point.
+- **Provider-friendly vs user-friendly caps.** A higher backoff cap is gentler on the provider but worse
+  for the user. Interactive features: one or two short retries, then fall back. Batch pipelines: cap in
+  minutes and let the queue absorb it.
+- **Hedging vs load.** Hedged requests cut tail latency but add load (a few percent when fired at the
+  p95, up to double when fired immediately) and need cancellation. They pay off only when
+  time-to-first-token variance is high and the call is cheap relative to the user's time.
+- **Retrying timeouts vs duplicates.** Retrying after timeouts recovers from stalls but risks duplicated
+  effects; without idempotency keys the safe choice is to surface the timeout.
 
 ## Pitfalls
-- Retrying 400s and context-length errors; the symptom is the identical error three times in a row in the
+- **Retrying 400s and context-length errors.** Symptom: the identical error three times in a row in the
   logs and triple the latency on every such request.
-- No jitter; the symptom is load spikes at 1, 2 and 4 seconds after an incident starts, visible as a
-  sawtooth on the provider's error graph.
-- Stacked retries across SDK, service and client; the symptom is one user action producing 20 or more
+- **No jitter.** Symptom: load spikes at 1, 2 and 4 seconds after an incident starts, a sawtooth on the
+  provider's error graph.
+- **Stacked retries across SDK, service and client.** Symptom: one user action producing 20 or more
   provider calls in a single trace.
-- Ignoring `Retry-After`; the symptom is long streaks of 429s whose remaining-quota headers never recover
+- **Ignoring `Retry-After`.** Symptom: long streaks of 429s whose remaining-quota headers never recover,
   because your retries keep spending the refill.
-- `time.sleep` inside an async handler; the symptom is every in-flight request stalling whenever one
-  request backs off.
-- Retrying inside an open stream; the symptom is duplicated paragraphs appearing in the user interface.
+- **`time.sleep` inside an async handler.** Symptom: every in-flight request stalls whenever one request
+  backs off.
+- **Retrying inside an open stream.** Symptom: duplicated paragraphs appear in the user interface.
 
 ## When to use
-Every outbound LLM call needs an explicit retry policy, even if that policy is "the SDK's two attempts and
-nothing else". Choose numbers from the latency budget: an interactive path gets one or two retries with a
-small cap and then a fallback; a background job gets more attempts, a larger cap and a queue to wait in.
-Pair retries with idempotency keys whenever the call has side effects, with a circuit breaker when the
-dependency can be down for minutes, and with a rate limiter so retries never push you over quota. Measure
-retry rate, success-after-retry rate and the amplification factor (provider calls per user request). In
-interviews, the expected answer names classification, exponential backoff with full jitter,
-`Retry-After`, per-request caps plus a global budget, and explains why layering retries is dangerous.
+- **Always have an explicit policy** for every outbound LLM call, even if it is "the SDK's two attempts
+  and nothing else".
+- **Choose numbers from the latency budget:** interactive paths get one or two retries with a small cap,
+  then a fallback; background jobs get more attempts, a larger cap and a queue to wait in.
+- **Pair retries** with idempotency keys for side effects, a circuit breaker when the dependency can be
+  down for minutes, and a rate limiter so retries never push you over quota.
+- **Measure** retry rate, success-after-retry rate and the amplification factor (provider calls per user
+  request).
+- **Interviews:** name classification, exponential backoff with full jitter, `Retry-After`, per-request
+  caps plus a global budget, and explain why layering retries is dangerous.
 
 ## Role lens
 - **Engineer:** Configures or replaces SDK retries, implements jittered backoff and a budget, and makes
@@ -206,6 +286,38 @@ that an incident cannot triple our load on the provider. Every turn carries an i
 makes retrying a timed-out tool call safe, and streaming responses are never retried after the first
 token; a failure there becomes a new message. I would monitor the amplification factor to prove the
 policy holds.
+
+## Interview questions
+### Why is exponential backoff without jitter not enough?
+- **Backoff spreads one client's retries,** but every client that failed at the same instant computes the
+  same schedule and retries in synchronized waves at 1, 2 and 4 seconds.
+- **Jitter randomizes each wait** (full jitter: uniform from 0 to the ceiling), flattening the waves and,
+  in Brooker's simulations, completing the same work with far fewer calls.
+
+### One user click produces 40 provider calls in a trace. How do you find and fix it?
+- **Look for stacked retries:** browser, service and SDK each retrying multiplies attempts (3 × 4 × 4 = 48
+  worst case).
+- **Fix by choosing one retrying layer,** usually the SDK, and replace retries above it with a breaker
+  and fallback.
+- **Add a retry budget** so even a misconfigured layer cannot amplify load during an incident.
+
+### When should a timeout not be retried?
+- **When the operation is not idempotent,** because the timed-out call may already have sent the email or
+  created the ticket. Without an idempotency key, surface the timeout instead.
+- **When tokens have already been streamed,** because a retry would duplicate text; restart as a new
+  message instead.
+
+### The provider goes fully down and your fleet sends 200 requests per second. What load does it see?
+- **Three attempts, no budget:** about 600 requests per second, and up to triple load during partial
+  recovery, which can keep the provider pinned in overload.
+- **A 10% retry budget:** about 220, close to real demand, because the bucket drains after a few retries
+  and refills only as successes return.
+
+### How do you handle a 429 differently from a 503?
+- **A 429 can mean two things:** a per-minute rate limit that clears in seconds, or quota exhaustion that
+  does not. `Retry-After` and the reset headers tell you which.
+- **A 503 is server-side capacity:** retry with jittered backoff, then fall back. In both cases cap the
+  wait at the remaining deadline.
 
 ## Quiz
 ### Q: Why add random jitter to exponential backoff?

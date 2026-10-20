@@ -104,6 +104,24 @@ later migration can drop by name.
    single head.
 3. A CI check that `alembic heads` prints exactly one line catches this before deploy.
 
+## Diagram
+From model change to production: autogenerate only drafts, a human decides whether the change needs
+expand-contract, and CI plus a single pre-deploy job move every database to head.
+
+```mermaid
+flowchart TD
+    M["Change SQLAlchemy or SQLModel model"] --> G["alembic revision --autogenerate"]
+    G --> R{"Human review: rename, data move or hot-table lock?"}
+    R -->|"plain add or drop"| CI["CI: upgrade head from empty, one head, no pending diff"]
+    R -->|"rename or backfill"| X["Rewrite as expand-contract over 3 releases"]
+    R -->|"index on large table"| CC["CONCURRENTLY inside autocommit_block, lock_timeout"]
+    X --> CI
+    CC --> CI
+    CI --> J["Pre-deploy job runs alembic upgrade head once"]
+    J --> V[("alembic_version row updated")]
+    J --> D["Roll out new replicas"]
+```
+
 ## Examples
 ### Expand step: add a column and index for re-embedding
 Safe to run while the old code still serves traffic: the new column is nullable with no default, so old
@@ -268,6 +286,38 @@ migration adds nullable `body`; code writes both columns and reads `body` fallin
 Backfill `body` from `content` in batches. Release 2: code reads and writes only `body`; add the `NOT
 NULL` constraint once the backfill is complete. Release 3: drop `content`. Each migration runs as a
 pre-deploy job with a lock timeout, and each step is compatible with the code still running.
+
+## Interview questions
+### Why use Alembic instead of calling Base.metadata.create_all() at startup?
+- **`create_all()` never alters existing tables.** It only creates missing ones, so the first new column
+  after launch silently does nothing and the app crashes on a missing column.
+- **Alembic versions every change and records position.** Each database's `alembic_version` row says
+  which revision it is at, so every environment, including customer VPCs, converges on the same schema.
+
+### The deploy pipeline fails with "multiple head revisions". What happened and how do you prevent it?
+- **Two branches each added a revision on the same parent,** so the graph has two heads and
+  `alembic upgrade head` refuses to guess an order.
+- **Fix:** `alembic merge heads` creates an empty revision whose `down_revision` is a tuple of both.
+- **Prevent:** a CI check that `alembic heads` prints exactly one line.
+
+### How do you add an index to a 50-million-row chunks table without an outage?
+- **Build it concurrently.** A plain `CREATE INDEX` blocks writes for the whole build; use
+  `postgresql_concurrently=True` inside `op.get_context().autocommit_block()`, because it cannot run in a
+  transaction.
+- **Set `lock_timeout` and check for leftovers.** A failed concurrent build leaves an `INVALID` index
+  that must be dropped before retrying.
+
+### When would you skip expand-contract and ship a single breaking migration?
+- **When a short maintenance window is acceptable,** for example an internal tool that can take two
+  minutes of downtime; expand-contract triples the releases per change.
+- **Never for a rename on a multi-replica service with rolling deploys,** because old replicas still read
+  the old column mid-rollout.
+
+### Should migrations run at app startup or as a separate job?
+- **A separate pre-deploy job for anything with replicas,** because ten replicas starting at once would
+  race to apply the same revision.
+- **Startup is acceptable for tiny single-instance apps,** trading safety for one fewer deploy step.
+- **Either way,** design each migration to be compatible with the code already running.
 
 ## Quiz
 ### Q: You rename the `content` attribute and column to `text` on a model and run autogenerate. What does the generated script typically contain?

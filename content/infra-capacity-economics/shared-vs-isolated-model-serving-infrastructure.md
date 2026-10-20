@@ -5,7 +5,7 @@ name: Shared vs isolated model-serving infrastructure
 kind: decision
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - infra-capacity-economics/inference-clusters
   - infra-capacity-economics/cost-allocation-by-tenant-and-feature
@@ -22,181 +22,252 @@ sources:
 ---
 
 ## TL;DR
-Shared serving puts every tenant's or team's traffic through one pool of model replicas; isolated
-serving gives a tenant its own replicas, nodes, cluster or account. Sharing wins on cost because
-continuous batching needs many concurrent requests to fill a GPU and because tenants' peaks rarely
-coincide. Isolation wins when a tenant can hurt others (noisy neighbour), must be protected from
-others (compliance, data separation) or needs a different model configuration. The decision is a
-spectrum, not a switch, and most platforms end up with both.
+Shared serving runs every tenant through one pool of replicas; isolated serving gives a tenant its own
+replicas, nodes, cluster or account. Sharing wins on cost; isolation wins on noisy neighbours,
+compliance and custom configs. It is a spectrum, and most platforms use both.
 
 ## Why it exists
-A GPU serving an LLM is efficient only when busy. Continuous batching reaches its throughput at
-tens of concurrent sequences; at two or three the GPU spends most of each decode step reading weights
-for almost no output, so the cost per token can be an order of magnitude higher than at full batch.
-A tenant whose traffic peaks at five concurrent requests cannot fill a replica on their own. Pooling
-many such tenants fills it, and because their peaks fall at different times, the pool needs capacity
-for the peak of the sum, which is much less than the sum of the peaks. That is the economic pull
-toward sharing, and it is strong: for a platform serving dozens of internal teams, dedicated
-replicas per team can multiply the GPU bill several times for the same total tokens.
-
-The naive conclusion, "share everything", fails the first time one tenant submits a batch job of
-50k-token documents. Those requests fill the KV cache, every other tenant's TTFT jumps, and the
-platform has no way to say whose fault it is or to stop it, because the engine's scheduler is
-first-come-first-served by default (some engines offer a request-priority policy) and knows nothing
-about tenants or fair shares. It fails again when a regulated tenant asks
-whether their prompts ever shared a GPU with another company's, or when a tenant needs a different
-model, a longer context limit, a fine-tuned adapter or a different region. Sharing without
-isolation mechanisms is a cost optimisation that quietly removes fairness, blast-radius control and
-contractual guarantees. The decision therefore is which of those properties each tenant actually
-needs, and the cheapest level of isolation that provides them.
+- **A GPU is efficient only when busy.** Continuous batching reaches its throughput at tens of concurrent
+  sequences; at two or three the GPU spends most of each decode step reading weights for almost no
+  output, so cost per token can be an order of magnitude higher than at full batch.
+- **Pooling fills the batch.** A tenant peaking at five concurrent requests cannot fill a replica alone.
+  Because many tenants' peaks fall at different times, the pool needs capacity for the peak of the sum,
+  which is much less than the sum of the peaks.
+- **The pull is strong.** For a platform serving dozens of internal teams, dedicated replicas per team can
+  multiply the GPU bill several times for the same total tokens.
+- **"Share everything" fails fast.** One tenant's batch job of 50k-token documents fills the KV cache and
+  everyone's TTFT jumps. Nobody can say whose fault it is or stop it, because the engine's scheduler is
+  first-come-first-served by default (some engines offer a request-priority policy) and knows nothing
+  about tenants or fair shares.
+- **And again on guarantees.** A regulated tenant asks whether their prompts ever shared a GPU with another
+  company's; another needs a different model, context limit, fine-tuned adapter or region. Sharing without
+  isolation quietly removes fairness, blast-radius control and contractual guarantees. So decide which
+  properties each tenant needs, and the cheapest isolation level that provides them.
 
 ## How it works
 ### The isolation spectrum
 From cheapest to most isolated, each level buys a specific guarantee:
 
-1. **Shared pool, no tenant awareness.** Maximum utilization, no guarantees. Acceptable only for
-   one team's own traffic or a prototype.
-2. **Shared pool with logical isolation.** Per-tenant rate limits and token budgets at the
-   gateway, priority classes, fair-share admission so one tenant cannot hold more than a share of
-   in-flight sequences, and per-tenant metrics and chargeback. This buys fairness and attribution
-   while keeping the batching economics. It exists *because* the engine scheduler is FCFS or at
-   best priority-ordered, never tenant-fair; fairness must be enforced before requests reach it.
-3. **Reserved capacity inside a shared cluster.** A tenant gets a guaranteed minimum (their own
-   replicas, or a reserved share of the pool) and may burst into the shared remainder. This is the
-   self-hosted analogue of what hosted providers sell as provisioned throughput next to a
-   pay-as-you-go pool.
-4. **Dedicated replicas or node pool.** Separate engine processes, possibly separate GPUs, so a
-   tenant's KV cache and queue are physically theirs. Buys latency isolation and lets the tenant run
-   a different model, context limit or quantization. Costs idle capacity whenever the tenant is quiet.
-5. **Dedicated cluster, VPC or cloud account.** Separate control plane, network and identity. Buys
-   the strongest compliance story (data residency, no shared control plane, independent blast
-   radius) and the highest operating cost, because every platform component is duplicated.
+| Level | What it is | Buys | Costs |
+|---|---|---|---|
+| 1. Shared pool, no tenant awareness | One pool, no limits | Maximum utilization | No guarantees: one team's own traffic or a prototype only |
+| 2. Shared pool with logical isolation | Gateway limits, priorities, fair-share admission, per-tenant metrics | Fairness and attribution, batching economics kept | Cannot govern what happens after admission |
+| 3. Reserved capacity in a shared cluster | Guaranteed minimum, burst into the shared remainder | A floor of capacity | Some reserved idle time |
+| 4. Dedicated replicas or node pool | Separate engine processes, possibly separate GPUs | Latency isolation, own model, context or quantization | Idle capacity whenever the tenant is quiet |
+| 5. Dedicated cluster, VPC or cloud account | Separate control plane, network and identity | Strongest compliance story | Highest operating cost: every platform component duplicated |
+
+- **Level 2 detail.** Per-tenant rate limits and token budgets at the gateway, priority classes, fair-share
+  admission so one tenant cannot hold more than a share of in-flight sequences, plus per-tenant metrics and
+  chargeback. It exists *because* the engine scheduler is FCFS or at best priority-ordered, never
+  tenant-fair; fairness must be enforced before requests reach it.
+- **Level 3 detail.** The tenant gets their own replicas or a reserved share of the pool. This is the
+  self-hosted analogue of what hosted providers sell as provisioned throughput next to a pay-as-you-go pool.
+- **Level 4 detail.** A tenant's KV cache and queue are physically theirs.
+- **Level 5 detail.** Data residency, no shared control plane, independent blast radius.
 
 ### The multiplexing arithmetic
-The saving from sharing has a precise form. With tenant loads Lᵢ(t) measured in concurrent
-sequences and a replica holding C sequences within the latency budget:
+The saving from sharing has a precise form. With tenant loads Lᵢ(t) in concurrent sequences and a replica
+holding C sequences within the latency budget:
 
 ```
 isolated replicas = Σᵢ ( ceil(max_t Lᵢ(t) / C) + spareᵢ )
 shared replicas   = ceil( max_t Σᵢ Lᵢ(t) / C ) + spare
 ```
 
-Two effects separate them. Rounding: every isolated tenant pays for at least one whole replica (and
-its own spare) even if it peaks at a tenth of one. Multiplexing: the peak of the sum is lower than
-the sum of the peaks whenever tenants peak at different times; for many independent tenants, the
-aggregate's relative fluctuation shrinks roughly as 1/√N, so a large pool needs proportionally
-less headroom. The second effect is the one that flips. When tenants' peaks are correlated (all
-in one time zone, all driven by the same month-end process or the same upstream event), the peak
-of the sum approaches the sum of the peaks and sharing saves little beyond rounding and spares. So
-the input to this decision is a per-tenant load time series, not a per-tenant average.
+1. **Rounding.** Every isolated tenant pays for at least one whole replica (and its own spare) even if it
+   peaks at a tenth of one.
+2. **Multiplexing.** The peak of the sum is lower than the sum of the peaks whenever tenants peak at
+   different times. For many independent tenants the aggregate's relative fluctuation shrinks roughly as
+   1/√N, so a large pool needs proportionally less headroom.
+3. **The second effect is the one that flips.** When peaks are correlated (one time zone, the same
+   month-end process, the same upstream event), the peak of the sum approaches the sum of the peaks and
+   sharing saves little beyond rounding and spares.
+4. **So the input is a per-tenant load time series,** not a per-tenant average.
 
 ### What is actually shared at each level
-Sharing a *replica* means sharing GPU memory: tenants' KV caches sit in the same pool of blocks,
-and the batch holds their sequences side by side. Within a correct engine, one sequence cannot read
-another's cache, so this is not a data-leak path in itself; the risks are side-channel timing,
-engine bugs and, more practically, prefix caching: if a cached prefix keyed only by its text can
-be hit by another tenant's identical text, the cached KV is never returned to the caller, but the
-faster TTFT of a hit is a timing side channel that can reveal that someone else recently sent that
-prefix. Cross-tenant cache sharing therefore has to be an explicit decision, and the usual answer is
-to salt the cache key with the tenant id (some engines accept a per-request cache salt). Sharing a *node* but not a replica removes
-cache co-residency and leaves shared host RAM, network and the node's failure domain. Sharing a
-*cluster* leaves shared control plane and shared operators. The compliance question is always "what
-exactly is shared", and the answer should be precise, because "dedicated" is sold at every level.
+- **Sharing a replica** means sharing GPU memory: tenants' KV caches sit in the same pool of blocks and the
+  batch holds their sequences side by side. Within a correct engine one sequence cannot read another's
+  cache, so this is not a data-leak path in itself.
+- **The real risks** are side-channel timing, engine bugs and, more practically, prefix caching.
+- **The prefix-cache side channel.** If a cached prefix keyed only by its text can be hit by another
+  tenant's identical text, the cached KV is never returned to the caller. But the faster TTFT of a hit is
+  a timing side channel that can reveal someone else recently sent that prefix.
+- **So cross-tenant cache sharing is an explicit decision.** The usual answer is to salt the cache key with
+  the tenant id (some engines accept a per-request cache salt).
+- **Sharing a node but not a replica** removes cache co-residency and leaves shared host RAM, network and
+  the node's failure domain.
+- **Sharing a cluster** leaves a shared control plane and shared operators.
+- **The compliance question is always "what exactly is shared",** and the answer should be precise,
+  because "dedicated" is sold at every level.
 
 ### Multi-LoRA: sharing the base, isolating the behaviour
-When tenants need customised models, the expensive choice is a dedicated replica per fine-tune. The
-cheaper design keeps one shared base model and loads each tenant's LoRA adapter into the same
-engine; the adapters are small, swapped per request, and the base weights are shared. This gives
-behavioural isolation (each tenant's outputs come from their adapter) with shared economics. The
-limit is that all tenants must agree on the base model, context limit and quantization.
+- **Expensive choice:** a dedicated replica per fine-tune.
+- **Cheaper design:** one shared base model, with each tenant's LoRA adapter loaded into the same engine.
+  Adapters are small and swapped per request; base weights are shared.
+- **What it gives:** behavioural isolation (each tenant's outputs come from their adapter) with shared
+  economics.
+- **The limit:** all tenants must agree on the base model, context limit and quantization.
 
 ### Logical isolation mechanics
-At the gateway: per-tenant token-bucket limits in requests and tokens per minute, a concurrency cap
-(in-flight sequences per tenant), and a priority tag. At the pool: weighted fair queueing across
-tenants before admission, so a tenant with a backlog of batch work cannot starve interactive users,
-and the option to route a tenant's batch traffic to a separate low-priority pool. In observability:
-every request carries a tenant id into metrics and traces so cost and tail latency can be attributed.
-Without attribution you cannot even argue about whether a tenant deserves dedicated capacity.
+- **At the gateway:** per-tenant token-bucket limits in requests and tokens per minute, a concurrency cap
+  (in-flight sequences per tenant), and a priority tag.
+- **At the pool:** weighted fair queueing across tenants before admission, so a tenant with a batch backlog
+  cannot starve interactive users, and the option to route a tenant's batch traffic to a separate
+  low-priority pool.
+- **In observability:** every request carries a tenant id into metrics and traces so cost and tail latency
+  can be attributed. Without attribution you cannot even argue about whether a tenant deserves dedicated
+  capacity.
 
 ### How the decision is made
-Score each tenant on four questions. Does their traffic shape threaten others (long contexts,
-bursty batch jobs)? Do they need guarantees others would violate (latency SLO, data separation,
-region)? Do they need a different model configuration? Would their dedicated capacity sit idle most
-of the day? A "yes" to any of the first three is a reason for separation; a "no" to the last means
-that separation will be expensive. A contractual or regulatory requirement wins regardless of
-cost (and the cost goes on the contract); a traffic-shape problem is first attacked with logical
-isolation or a separate low-priority pool, and becomes dedicated capacity only when the tenant can
-fill it. Everyone else lives in the shared pool behind logical isolation. The platform ends up with a shared pool plus
-a short list of exceptions, each with a documented reason.
+Score each tenant on four questions:
 
-## Example
-A worked comparison for a platform with ten internal product teams on one 70B model. Numbers are
-illustrative and come from the kind of measurements you would make yourself.
+1. Does their traffic shape threaten others (long contexts, bursty batch jobs)?
+2. Do they need guarantees others would violate (latency SLO, data separation, region)?
+3. Do they need a different model configuration?
+4. Would their dedicated capacity sit idle most of the day?
 
-Each team peaks at 20 concurrent sequences, but the peaks are spread over the day; the measured
-peak of the combined traffic is 80 concurrent sequences, not 200. A replica holds 48 concurrent
-sequences within the latency budget.
+- **Reading the score.** A "yes" to any of the first three is a reason for separation; a "no" to the last
+  means separation will be expensive.
+- **Contract or regulation wins regardless of cost,** and the cost goes on the contract.
+- **A traffic-shape problem** is first attacked with logical isolation or a separate low-priority pool, and
+  becomes dedicated capacity only when the tenant can fill it.
+- **Everyone else** lives in the shared pool behind logical isolation. The platform ends up with a shared
+  pool plus a short list of exceptions, each with a documented reason.
 
-- **Isolated per team:** every team needs its own replica, since no team's traffic can be combined
-  with another's. 10 replicas, each averaging perhaps 6 of 48 slots busy over the day.
-  Utilization near 12%, and that is before giving each team its own spare for N+1.
-- **Shared with logical isolation:** peak of the sum is 80, so ceil(80 / 48) = 2 replicas, plus
-  one for N+1 and headroom gives 3. The same 60 average busy slots now sit on 144 slots instead of
-  480, about 42% utilization (roughly 3.3x higher), and the bill is 3/10 = 30% of the isolated
-  design for the same tokens.
-- **Hybrid:** one team runs nightly document batches with 60k-token prompts. In the shared pool
-  those jobs would fill the KV cache during the batch window. Give that team a dedicated replica
-  for batch (or route their batch traffic to a low-priority pool), keep their interactive traffic
-  in the shared pool. Total: 4 replicas, fairness preserved. If one of the ten teams handles
-  regulated data and its compliance rule says "no shared GPU", none of this satisfies it: that
-  team needs level 4 or 5, at least two replicas of its own for N+1, and a cost line attached.
+## Diagram
+Walk a tenant down the decision path: hard requirements first, then configuration, then traffic shape;
+everyone who reaches the bottom stays in the shared pool.
 
-The arithmetic that matters is peak-of-sum versus sum-of-peaks, and whether a tenant's shape
-breaks the shared pool. Whenever the second is true, the first stops mattering for that tenant.
-Run the same numbers with all ten teams peaking in the same hour: the combined peak is then close
-to 200 sequences, ceil(200 / 48) = 5 replicas plus a spare, and sharing saves 40% instead of 70%,
-almost all of it from rounding and shared spares rather than multiplexing.
+```mermaid
+flowchart TD
+    T["Tenant request for capacity"] --> R{"Contract or regulation forbids sharing?"}
+    R -->|"yes"| D5["Level 4 or 5: dedicated nodes, cluster or account"]
+    R -->|"no"| C{"Needs a different model config?"}
+    C -->|"only an adapter"| ML["Multi-LoRA on the shared base"]
+    C -->|"different base or context"| D4["Level 4: dedicated replicas"]
+    C -->|"no"| S{"Traffic shape hurts others?"}
+    S -->|"no"| L2["Level 2: shared pool, logical isolation"]
+    S -->|"yes"| F{"Can they fill a replica most of the day?"}
+    F -->|"yes"| L3["Level 3 or 4: reserved or dedicated"]
+    F -->|"no"| LP["Low-priority batch pool"]
+```
+
+## Examples
+### Peak of the sum vs sum of the peaks, in code
+A runnable model of the multiplexing formula. Loads are illustrative hourly concurrency per team.
+
+```python
+import math
+
+def isolated_replicas(loads, cap, spare=1):
+    """loads: {tenant: [concurrent sequences per hour]}; cap: sequences per replica within budget."""
+    return sum(math.ceil(max(series) / cap) + spare for series in loads.values())
+
+def shared_replicas(loads, cap, spare=1):
+    combined = [sum(hour) for hour in zip(*loads.values())]   # peak of the sum, not sum of peaks
+    return math.ceil(max(combined) / cap) + spare
+
+hours, cap = range(24), 48
+# Ten teams, each peaking at 20 sequences and idling at 4 (illustrative).
+spread = {f"team{i}": [20 if h in (2 * i, 2 * i + 1) else 4 for h in hours] for i in range(10)}
+same = {f"team{i}": [20 if h in (14, 15) else 4 for h in hours] for i in range(10)}
+
+for name, loads in (("peaks spread over the day", spread), ("all peak at 14:00", same)):
+    iso = isolated_replicas(loads, cap, spare=0)          # before any per-team spare
+    iso_n1 = isolated_replicas(loads, cap, spare=1)       # each team gets its own N+1
+    sh = shared_replicas(loads, cap, spare=1)
+    print(f"{name}: shared={sh}, isolated={iso} ({iso_n1} with spares), "
+          f"shared costs {sh / iso:.0%} of isolated")
+# peaks spread over the day: shared=3, isolated=10 (20 with spares), shared costs 30% of isolated
+# all peak at 14:00: shared=6, isolated=10 (20 with spares), shared costs 60% of isolated
+```
+
+- **Spread peaks:** the combined peak is 20 + 9 × 4 = 56 sequences, so two replicas plus a spare.
+- **Correlated peaks:** the combined peak is 200, so the saving falls back to rounding and shared spares.
+
+### Worked comparison: ten product teams on one 70B model
+Numbers are illustrative and come from the kind of measurements you would make yourself. Each team peaks
+at 20 concurrent sequences, but peaks are spread over the day; the measured combined peak is 80
+concurrent sequences, not 200. A replica holds 48 concurrent sequences within the latency budget.
+
+| Design | Replicas | Utilization | Cost vs isolated |
+|---|---|---|---|
+| Isolated per team | 10, one per team, since no team's traffic can be combined with another's | each averages perhaps 6 of 48 slots busy: near 12%, before any per-team N+1 spare | 100% |
+| Shared with logical isolation | ceil(80 / 48) = 2, plus one for N+1 and headroom = 3 | the same 60 average busy slots on 144 slots instead of 480: about 42% (roughly 3.3x higher) | 3/10 = 30% |
+| Hybrid | 3 shared + 1 dedicated batch replica = 4 | fairness preserved | 40% |
+| All ten teams peak in the same hour | combined peak close to 200: ceil(200 / 48) = 5, plus a spare | sharing saves 40% instead of 70% | 60% |
+
+- **The hybrid case.** One team runs nightly document batches with 60k-token prompts that would fill the
+  KV cache during the batch window. Give that team a dedicated replica for batch (or route their batch
+  traffic to a low-priority pool) and keep their interactive traffic in the shared pool.
+- **The regulated case.** If one team handles regulated data and its compliance rule says "no shared GPU",
+  none of this satisfies it: that team needs level 4 or 5, at least two replicas of its own for N+1, and a
+  cost line attached.
+- **What matters:** peak-of-sum versus sum-of-peaks, and whether a tenant's shape breaks the shared pool.
+  Whenever the second is true, the first stops mattering for that tenant.
+- **Correlated peaks:** the saving is almost all from rounding and shared spares rather than multiplexing.
+
+## Production patterns
+- **Per-tenant token buckets at the gateway.** For any shared pool, enforce requests-per-minute,
+  tokens-per-minute and an in-flight concurrency cap per tenant id (for example counters in Redis keyed by
+  tenant), returning 429 when exceeded. Monitor 429s and in-flight sequences per tenant.
+- **Fair-share queue in front of the engine.** Keep one queue per tenant at the gateway and dequeue by
+  weight, because the engine itself is FCFS. Monitor per-tenant p95 TTFT against the pool-wide p95.
+- **Tenant-salted prefix cache.** Where the engine supports a per-request cache salt, pass the tenant id so
+  cache hits never cross tenants; share only deliberately public prefixes. Monitor prefix-cache hit rate
+  per tenant to see what the salt costs.
+- **Multi-LoRA on one base.** In vLLM, start the server with `--enable-lora`, register adapters with
+  `--lora-modules name=path` and bound residency with `--max-loras`; requests pick an adapter by model
+  name. Monitor TTFT per adapter and how often adapters are swapped in.
+- **Separate low-priority batch pool.** Route requests tagged as batch to their own pool sized for
+  throughput, so batch windows never touch interactive replicas. Monitor batch backlog and interactive TTFT
+  during the batch window.
+- **Exception register with quarterly review.** Every reserved or dedicated tenant has an owner, a reason
+  and a cost line. Monitor each exception's utilization and demote tenants that no longer fill their
+  capacity.
 
 ## Trade-offs
-- Sharing raises utilization and lowers cost per token, but it removes latency isolation; the
-  balance flips when one tenant's traffic shape (long prompts, batch bursts) dominates the pool.
-- Logical isolation at the gateway preserves batching economics and gives fairness, but it cannot
-  prevent cache contention once requests are admitted, so it does not satisfy hard latency SLOs.
-- Dedicated replicas give predictable latency and freedom to change model configuration, but
-  capacity sits idle outside the tenant's peak; it flips to worthwhile when the tenant's own traffic
+- **Utilization vs latency isolation.** Sharing raises utilization and lowers cost per token, but removes
+  latency isolation; the balance flips when one tenant's traffic shape (long prompts, batch bursts)
+  dominates the pool.
+- **Logical isolation vs hard SLOs.** Gateway isolation preserves batching economics and gives fairness,
+  but cannot prevent cache contention once requests are admitted, so it does not satisfy hard latency SLOs.
+- **Dedicated replicas vs idle capacity.** They give predictable latency and freedom to change model
+  configuration, but capacity sits idle outside the tenant's peak; worthwhile when the tenant's own traffic
   can fill a replica most of the day.
-- Multi-LoRA sharing lets many customised models ride one base at shared cost, but constrains every
-  tenant to the same base model, context and quantization, which breaks when one needs a different
-  model.
-- Dedicated clusters or accounts give the strongest compliance story, yet duplicate every platform
-  component and operator burden; they are justified by contract or regulation, rarely by
-  performance.
+- **Multi-LoRA vs configuration freedom.** Many customised models ride one base at shared cost, but every
+  tenant is constrained to the same base model, context and quantization, which breaks when one needs a
+  different model.
+- **Dedicated clusters vs operating burden.** They give the strongest compliance story, yet duplicate every
+  platform component and operator burden; justified by contract or regulation, rarely by performance.
 
 ## Pitfalls
-- Promising "dedicated" without stating the level; the symptom is a security review discovering the
-  tenant's "dedicated" model shares a node, control plane or prefix cache with others.
-- Running a shared pool without per-tenant concurrency caps; the symptom is platform-wide TTFT
-  spikes that line up with one tenant's cron schedule.
-- Keying a shared prefix cache on prompt text alone and not deciding whether cross-tenant hits are
-  acceptable; the symptom is an auditor asking why tenant B's request was faster because tenant A had
-  sent the same prompt.
-- No tenant id in metrics; the symptom is a cost-allocation argument nobody can settle and an
-  isolation decision made on anecdotes instead of load shape.
-- Giving every tenant who asks their own replica; the symptom is a fleet averaging single-digit
-  utilization and a GPU bill that scales with the number of customers rather than with tokens.
-- Treating isolation as permanent; the symptom is a tenant that outgrew or shrank below the
-  threshold still paying (or still being subsidised) a year later.
+- **Promising "dedicated" without stating the level.** Symptom: a security review discovers the tenant's
+  "dedicated" model shares a node, control plane or prefix cache with others. Fix: name what is not shared.
+- **A shared pool without per-tenant concurrency caps.** Symptom: platform-wide TTFT spikes that line up
+  with one tenant's cron schedule. Fix: caps and fair-share admission.
+- **Keying a shared prefix cache on prompt text alone** without deciding whether cross-tenant hits are
+  acceptable. Symptom: an auditor asks why tenant B's request was faster because tenant A had sent the same
+  prompt. Fix: salt with the tenant id.
+- **No tenant id in metrics.** Symptom: a cost-allocation argument nobody can settle and an isolation
+  decision made on anecdotes instead of load shape.
+- **Giving every tenant who asks their own replica.** Symptom: a fleet averaging single-digit utilization
+  and a GPU bill that scales with the number of customers rather than with tokens.
+- **Treating isolation as permanent.** Symptom: a tenant that outgrew or shrank below the threshold is still
+  paying (or still being subsidised) a year later. Fix: review exceptions.
 
 ## When to use
-Start shared with logical isolation: gateway limits, fair-share admission, per-tenant metrics. That
-is the default for internal platforms and for SaaS tiers without hard SLOs. Move a tenant to
-reserved or dedicated capacity when their traffic shape measurably damages others, when a contract
-specifies latency or data-separation guarantees you cannot meet in the pool, or when they need a
-different model configuration. Move to a dedicated cluster or account only for regulatory or
-contractual reasons, and attach the cost to the contract. Measure per-tenant p95 TTFT, in-flight
-sequences and tokens, and pool utilization; revisit each exception quarterly. In interviews, be
-ready to explain why continuous batching makes sharing cheap and why that same batching makes
-noisy neighbours hard to contain after admission.
+- **Start shared with logical isolation:** gateway limits, fair-share admission, per-tenant metrics. That is
+  the default for internal platforms and for SaaS tiers without hard SLOs.
+- **Move to reserved or dedicated capacity** when a tenant's traffic shape measurably damages others, when
+  a contract specifies latency or data-separation guarantees you cannot meet in the pool, or when they need
+  a different model configuration.
+- **Move to a dedicated cluster or account** only for regulatory or contractual reasons, and attach the cost
+  to the contract.
+- **Measure** per-tenant p95 TTFT, in-flight sequences and tokens, and pool utilization; revisit each
+  exception quarterly.
+- **Interviews:** explain why continuous batching makes sharing cheap and why that same batching makes noisy
+  neighbours hard to contain after admission.
 
 ## Role lens
 - **Engineer:** Implements tenant-tagged rate limits, concurrency caps and fair-share queueing at
@@ -219,6 +290,44 @@ give them reserved capacity: a dedicated replica for their guaranteed minimum wi
 pool. Only if the demand is about data separation or residency do you move to a dedicated node
 pool, cluster or account, and then the precise level of what is not shared goes into the contract
 along with its cost. Dedicated capacity is reviewed against their utilization every quarter.
+
+## Interview questions
+### Explain peak-of-sum versus sum-of-peaks, and when the saving from sharing disappears.
+- **Definition:** isolated capacity is sized for each tenant's own peak; shared capacity is sized for the
+  peak of the combined load, which is lower when tenants peak at different times.
+- **Why it grows with N:** for many independent tenants the aggregate's relative fluctuation shrinks
+  roughly as 1/√N, so a big pool needs proportionally less headroom.
+- **When it disappears:** correlated peaks (one time zone, month-end, one upstream event); then sharing
+  saves only rounding and spares.
+
+### A security reviewer asks whether tenants can learn anything from each other through your shared pool. What do you answer?
+- **No direct read path:** in a correct engine one sequence cannot read another's KV cache, even in the
+  same batch.
+- **Real risks:** engine bugs, side-channel timing and, most practically, a shared prefix cache whose
+  faster TTFT reveals that someone recently sent the same prefix.
+- **Mitigation and precision:** salt the cache key with the tenant id, and state exactly what is shared
+  (replica, node, cluster) rather than saying "dedicated".
+
+### Ten teams want their own fine-tuned version of the same 8B model. Dedicated replicas or multi-LoRA?
+- **Multi-LoRA by default:** one shared base with per-team adapters swapped per request keeps batching
+  economics while each team gets its own behaviour.
+- **Dedicated replicas when** a team needs a different base model, context limit or quantization, or has
+  a contractual reason not to share.
+- **Cost of dedicated:** ten replicas sized for ten separate peaks, mostly idle outside each team's peak.
+
+### What would you measure before agreeing to give a tenant dedicated capacity?
+- **Their load shape:** a per-tenant time series of in-flight sequences and tokens, not an average, to see
+  whether they could fill a replica most of the day.
+- **Their effect on others:** pool-wide KV utilization and other tenants' p95 TTFT during their peaks.
+- **Their requirement type:** a contract or regulation wins regardless of cost; a traffic-shape problem is
+  first tried with caps, fair-share admission or a batch pool.
+
+### Ten teams each peak at 20 concurrent sequences and a replica holds 48. How many replicas shared vs isolated?
+- **Isolated:** 10 replicas (one each), near 12% utilization, before giving each team a spare.
+- **Shared with spread peaks:** the measured combined peak of 80 gives ceil(80 / 48) = 2, plus one spare =
+  3 replicas, about 30% of the isolated bill.
+- **Shared with correlated peaks:** a combined peak near 200 needs 5 plus a spare, so sharing saves 40%
+  instead of 70%.
 
 ## Quiz
 ### Q: Why does a shared model pool usually cost far less per token than dedicated replicas per tenant?

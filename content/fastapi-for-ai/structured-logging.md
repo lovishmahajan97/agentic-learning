@@ -91,6 +91,26 @@ merge contextvars → add log level → ISO timestamp → exceptions as structur
 - Common pattern: disable it (`--no-access-log`) and emit one structured `request_finished` event from the
   middleware, with status, route template (not the raw path, to avoid high-cardinality ids) and duration.
 
+## Diagram
+Context is bound once in middleware and merged into every event by the pipeline; the dotted edge marks
+where it is silently lost unless you carry it yourself.
+
+```mermaid
+flowchart TD
+    R["Request with optional X-Request-ID"] --> M["Middleware: clear, then bind request_id and tenant"]
+    M --> CV[("contextvars, per asyncio task")]
+    CV --> H["Handler log calls, llm_call_finished"]
+    CV --> L["Library logs via stdlib: httpx, SQLAlchemy, Uvicorn"]
+    CV -->|"copied"| T["New tasks, asyncio.to_thread"]
+    CV -.->|"not copied"| E["run_in_executor, job queue workers"]
+    H --> P["Pipeline: merge contextvars, level, timestamp, exceptions"]
+    L --> P
+    T --> P
+    P --> RD["Redact sensitive field names"]
+    RD --> J["JSON line to stdout"]
+    J --> S[("Log platform: filter, group by tenant, join on trace_id")]
+```
+
 ## Examples
 ### JSON logs, request context and one event per LLM call
 ```python
@@ -260,6 +280,42 @@ net. Spend is then a group-by on tenant and feature multiplied by per-model pric
 would reconcile totals against the provider's billing for a day, confirm retries and streamed calls are
 each logged once with final usage, and check that sampling is off for this event, since sampled cost
 logs undercount.
+
+## Interview questions
+### What is structured logging and why is it worth the setup in an AI service?
+- **Definition:** each log call is a stable event name plus typed fields, rendered as one JSON object,
+  instead of a formatted sentence.
+- **Why it pays off:** the platform can filter and group by `tenant`, `model` or `prompt_version` and sum
+  `prompt_tokens`, with no regex that breaks the day someone rewords a message.
+
+### Some log lines from one request have no request_id. How do you find out why?
+- **Check how that code was scheduled:** `loop.run_in_executor`, raw `ThreadPoolExecutor.submit` and job
+  queue workers do not copy contextvars, while new tasks, `asyncio.to_thread` and `run_in_threadpool` do.
+- **Check the handler path:** library loggers on their own plain-text handler skip `merge_contextvars`, so
+  route them through `ProcessorFormatter` with it in the pre-chain.
+- **Fix the gap:** use a context-copying call, or pass `request_id` in the job payload and bind it first.
+
+### Would you log prompts and completions in production?
+- **Not by default:** they routinely contain personal data and secrets, and a log store usually has weaker access
+  controls and retention than the product database.
+- **Log the shape instead:** lengths, hashes, counts of messages and tool calls, plus model and token
+  fields.
+- **If you need content,** use an explicit, sampled, access-controlled path with retention limits, redact
+  before writing, and keep a redaction processor as a safety net.
+
+### Logging at high volume starts to raise p99 latency. What is happening and what do you change?
+- **Stdlib handlers write synchronously,** so a slow sink blocks the event loop on every log call.
+- **Put a `QueueHandler` in front** with a `QueueListener` owning the real handler, so I/O happens on a
+  listener thread; keep the `ProcessorFormatter` on the `QueueHandler` so contextvars merge on the request's
+  thread.
+- **Also cut volume:** one event per LLM call, never per token, and watch event-loop lag under bursts.
+
+### How do you tie a log line to its distributed trace?
+- **Add a processor** that reads `trace.get_current_span().get_span_context()` and writes the trace id as
+  32 hex characters with `format(ctx.trace_id, "032x")`.
+- **Optionally reuse it as `request_id`,** so one id works across logs, traces and the `x-request-id`
+  response header.
+- **Monitor** the share of request lines carrying a `trace_id` to catch paths where the span is missing.
 
 ## Quiz
 ### Q: Why do request fields bound with `contextvars` appear on log lines from deep inside library calls?

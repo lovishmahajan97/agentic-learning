@@ -5,7 +5,7 @@ name: Contract testing
 kind: practice
 difficulty: advanced
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - python-for-ai/test-doubles-mocks-fixtures
   - python-for-ai/integration-and-end-to-end-testing
@@ -21,86 +21,117 @@ sources:
 ---
 
 ## TL;DR
-A contract test checks that two components agree on the interface between them (request shapes,
-response fields, status codes, error formats) without running both at once. The consumer records what
-it relies on; the provider verifies, in its own build, that it still satisfies every consumer. It exists
-because mocks drift from the real service silently, and full end-to-end environments are too slow and
-fragile to catch every interface break.
+A contract test checks that two components agree on their interface (request shapes, response fields,
+status codes, error formats) without running both at once: the consumer records what it relies on, and
+the provider verifies it in its own build.
 
 ## Why it exists
-An AI system is a set of services talking over interfaces: an agent service calls a retrieval service,
-a tool gateway, a model gateway and customer APIs; tools exchange JSON with the model; an MCP server
-exposes schemas to clients. Each side is tested in isolation with doubles. The agent's tests stub the
-retrieval service's response as `{"hits": [{"doc_id", "score", "text"}]}`, and they pass. Then the
-retrieval team renames `text` to `content` in a release. Both test suites stay green, because each
-side's tests only check that side against its own assumptions, and the break appears in production as
-the agent quietly answering without context.
-
-The two obvious fixes both fail at scale. Shared end-to-end environments that run every service
-together do catch the rename, but they are slow, flaky, expensive to keep in sync, and they tell you
-something broke long after the commit that broke it. Writing an API spec document and asking teams
-to "follow it" does not work either, because nothing executes the spec against the code. The provider
-also cannot know which fields consumers actually use, so every change feels risky, and APIs ossify.
-
-Contract testing makes the agreement executable and splits it in two: each consumer's expectations
-become a file, and the provider runs that file against its real code on every build. A breaking change
-then fails the provider's CI, in the commit that caused it, naming the consumer it would break.
+- **AI systems are services talking over interfaces.** An agent service calls a retrieval service, a
+  tool gateway, a model gateway and customer APIs; tools exchange JSON with the model; an MCP server
+  exposes schemas to clients. Each side is tested in isolation with doubles.
+- **Mocks drift from the real service silently.** The agent's tests stub retrieval as
+  `{"hits": [{"doc_id", "score", "text"}]}` and pass. The retrieval team renames `text` to `content`.
+  Both suites stay green, because each checks only its own assumptions, and production shows the agent
+  quietly answering without context.
+- **Shared end-to-end environments are too slow and fragile.** They catch the rename, but they are flaky,
+  expensive to keep in sync, and report the break long after the commit that caused it.
+- **A spec document nobody executes does not help.** Asking teams to "follow it" fails because nothing
+  runs the spec against the code. The provider also cannot know which fields consumers use, so every
+  change feels risky and APIs ossify.
+- **Contract testing makes the agreement executable and splits it in two.** Each consumer's expectations
+  become a file the provider runs against its real code on every build, so a breaking change fails the
+  provider's CI in the commit that caused it, naming the consumer it would break.
 
 ## How it works
 ### Consumer-driven contracts
-1. **Consumer test.** The consumer's test talks to a mock provider that is configured with expected
+1. **Consumer test.** The consumer's test talks to a mock provider configured with expected
    interactions: "given the index contains a refunds document, `POST /search` with this body returns
-   200 and a list of hits each having a string `doc_id`, a number `score` and a string `text`." The
-   consumer code runs for real against that mock, so the expectations are exactly what the code uses.
+   200 and a list of hits each having a string `doc_id`, a number `score` and a string `text`."
+   - The consumer code runs for real against that mock, so the expectations are exactly what the code
+     uses.
 2. **Contract file.** The run writes the interactions to a contract (a pact file in Pact's terms).
-   Matchers express "a string" or "a list of at least one like this" rather than exact values, because
-   the consumer depends on shape, not on today's data.
+   - Matchers express "a string" or "a list of at least one like this" rather than exact values, because
+     the consumer depends on shape, not on today's data.
 3. **Provider verification.** The provider's CI fetches every consumer's contract, puts its real
    application into each named **provider state** (seeds the test index), replays each request, and
-   checks the response matches. Extra fields are fine; missing or retyped ones fail.
+   checks the response matches.
+   - Extra fields are fine; missing or retyped ones fail.
 4. **Broker and deploy gate.** Contracts are published to a shared store (the Pact Broker or similar)
-   tagged by version and environment, so the provider verifies against what is actually deployed and a
-   "can I deploy" check blocks releasing a version that breaks a live consumer.
+   tagged by version and environment.
+   - The provider verifies against what is actually deployed, and a "can I deploy" check blocks
+     releasing a version that breaks a live consumer.
 
-The design choice that matters is direction: the consumer states only what it uses, so the provider
-learns exactly which fields are load-bearing and is free to change everything else. The same
-mechanism covers asynchronous messages, where there is no request to replay: the consumer records the
-event payload it expects (a `document.indexed` event on a queue), and the provider's verification
-calls the producing code and checks the message it would publish.
+### Why the direction matters
+- **The consumer states only what it uses**, so the provider learns exactly which fields are
+  load-bearing and is free to change everything else.
+- **Asynchronous messages work the same way**, though there is no request to replay. The consumer records
+  the event payload it expects (a `document.indexed` event on a queue), and the provider's verification
+  calls the producing code and checks the message it would publish.
 
 ### Evolving a contract without a flag day
 Contracts make breaking changes visible; they do not make them free. Renaming `text` to `content`
-safely is an expand-and-contract sequence, and the broker's version matrix is what tells you when
-each step is allowed:
+safely is an expand-and-contract sequence, and the broker's version matrix says when each step is
+allowed.
 1. **Expand.** The provider returns both `text` and `content`. Every existing contract still passes,
    because extra fields are allowed.
 2. **Migrate.** Each consumer switches to `content` and publishes a new contract that no longer
    mentions `text`.
 3. **Contract.** The provider removes `text`. Verification now passes only if *every deployed*
-   consumer version has stopped relying on it, so the "can I deploy" check blocks the removal until
-   the last old consumer has actually been redeployed, not merely merged.
-The order matters because services deploy independently: at any moment several versions of each are
-live, and the contract that must hold is the one between the versions actually running together.
+   consumer version has stopped relying on it, so the "can I deploy" check blocks the removal until the
+   last old consumer has actually been redeployed, not merely merged.
+
+- **The order matters because services deploy independently.** At any moment several versions of each
+  are live, and the contract that must hold is the one between the versions actually running together.
 
 ### Provider-driven, schema-based contracts
-The alternative is that the provider publishes a schema (OpenAPI, JSON Schema, protobuf) and both
-sides test against it. Schemathesis generates requests from an OpenAPI document and checks the real
-service's responses conform, which is property-based testing applied to an API. Schema checks catch
-"the service does not do what its spec says"; they do not tell you which consumers break when the spec
-changes, which is what consumer-driven contracts add.
+- **The alternative:** the provider publishes a schema (OpenAPI, JSON Schema, protobuf) and both sides
+  test against it.
+- **Schemathesis** generates requests from an OpenAPI document and checks the real service's responses
+  conform, which is property-based testing applied to an API.
+- **What each catches:** schema checks catch "the service does not do what its spec says"; they do not
+  tell you which consumers break when the spec changes, which is what consumer-driven contracts add.
+
+| Approach | Who writes it | Catches | Cannot tell you |
+|---|---|---|---|
+| Consumer-driven (Pact) | each consumer | removed or retyped fields a consumer reads | whether the provider meets its own spec elsewhere |
+| Schema-based (OpenAPI + Schemathesis) | the provider | responses that violate the published schema | which consumer a change breaks |
 
 ### Contracts you cannot verify
-You cannot run provider verification against a model vendor's API. For third-party providers the
-pattern is: validate every response at your boundary with strict models, keep recorded real responses
-as consumer test fixtures, pin SDK versions, and run a small scheduled canary against the live API
-that validates real responses against your models, so a vendor-side change fails a check before
-users notice. Tool schemas and structured-output schemas shown to a model are contracts too, and they
-are verified the same way: by validating what actually comes back.
+You cannot run provider verification against a model vendor's API. For third-party providers:
+- **Validate every response at your boundary** with strict models.
+- **Keep recorded real responses** as consumer test fixtures.
+- **Pin SDK versions.**
+- **Run a small scheduled canary** against the live API that validates real responses against your
+  models, so a vendor-side change fails a check before users notice.
+- **Tool schemas and structured-output schemas shown to a model are contracts too**, verified the same
+  way: by validating what actually comes back.
 
-## Example
+## Diagram
+Follow one contract from the consumer's build to the provider's deploy gate; the provider never needs
+the consumer running, only its published file.
+
+```mermaid
+sequenceDiagram
+    participant C as Consumer CI
+    participant M as Mock provider
+    participant B as Contract broker
+    participant P as Provider CI
+    participant G as Deploy gate
+    C->>M: run real adapter against expected interactions
+    M-->>C: canned responses built from type matchers
+    C->>B: publish contract tagged with consumer version
+    B->>P: fetch contracts of every deployed consumer version
+    P->>P: seed provider state, replay requests against real app
+    P->>B: publish verification result
+    G->>B: can I deploy this provider version to production
+    B-->>G: yes only if every live consumer contract passes
+```
+
+## Examples
+### Hand-rolled contract: consumer model, provider verification
 An agent service consumes a retrieval service. The consumer models only the fields it reads and
-publishes one interaction; the provider's test replays it against the real app in a seeded state.
-This hand-rolled version shows the mechanism that Pact automates with matchers and a broker.
+publishes one interaction; the provider's test replays it against the real app in a seeded state. This
+hand-rolled version shows the mechanism that Pact automates with matchers and a broker.
 
 ```python
 from pydantic import BaseModel, ConfigDict
@@ -140,47 +171,133 @@ def test_retrieval_honours_agent_contract():
         assert body.hits, "provider state promised at least one hit"
 ```
 
-On the consumer side, the matching test runs the agent's real retrieval adapter against a stub
-server that returns a response built from the same interaction, so the contract cannot list a field
-the adapter does not parse, or omit one it does. That pairing is what Pact's mock provider automates.
+- **What fails and what passes.** If the retrieval team renames `text` to `content`, the provider test
+  fails in their pull request; adding a new `chunk_id` field passes because the consumer ignores extras.
+- **Why `strict=True` matters.** Pydantic's default lax mode would coerce a `score` that became the
+  string `"0.9"` back into a float. The retype would pass verification while breaking any consumer that
+  does not coerce.
+- **In a real setup** the consumer publishes the JSON Schema (or Pact matchers) rather than a Python
+  class.
 
-If the retrieval team renames `text` to `content`, the provider test fails in their pull request, while adding
-a new `chunk_id` field passes because the consumer ignores extras. `strict=True` matters: Pydantic's
-default lax mode would coerce a `score` that became the string `"0.9"` back into a float, and the
-retype would pass verification while breaking any consumer that does not coerce. In a real setup the
-consumer publishes the JSON Schema (or Pact matchers) rather than a Python class.
+### Consumer side: the real adapter against a stub built from the interaction
+The matching consumer test runs the agent's real retrieval adapter against a stub server that returns a
+response built from the same interaction. The contract then cannot list a field the adapter does not
+parse, or omit one it does; that pairing is what Pact's mock provider automates. Runnable with
+`pip install httpx pydantic pytest`.
+
+```python
+import json
+import httpx
+from pydantic import BaseModel, ConfigDict
+
+class Hit(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+    doc_id: str
+    score: float
+    text: str
+
+class SearchResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+    hits: list[Hit]
+
+def retrieve_context(http: httpx.Client, query: str, k: int = 3) -> list[str]:
+    """The agent's real adapter: the passages it will put in the prompt."""
+    r = http.post("/search", json={"query": query, "k": k})
+    r.raise_for_status()
+    return [h.text for h in SearchResponse.model_validate_json(r.content).hits]
+
+INTERACTION = {
+    "request": {"method": "POST", "path": "/search", "json": {"query": "refund policy", "k": 3}},
+    "response": {"status": 200,
+                 "json": {"hits": [{"doc_id": "d1", "score": 0.9, "text": "Refunds take 5 days."}]}},
+}
+
+def stub_provider(it: dict) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        exp = it["request"]
+        assert (request.method, request.url.path) == (exp["method"], exp["path"])
+        assert json.loads(request.content) == exp["json"]     # adapter sends what the contract says
+        return httpx.Response(it["response"]["status"], json=it["response"]["json"])
+    return httpx.MockTransport(handler)
+
+def test_adapter_matches_contract():
+    with httpx.Client(transport=stub_provider(INTERACTION), base_url="http://retrieval.test") as http:
+        assert retrieve_context(http, "refund policy") == ["Refunds take 5 days."]
+```
+
+If the adapter starts sending `"top_k"` instead of `"k"`, the request assertion fails here, before the
+provider ever sees the change.
+
+### Worked scenario: removing `text` across independent deploys
+Illustrative version numbers; the point is which check blocks which step.
+
+| Day | Provider | Agent on main | Agent in production | Gate result for removing `text` |
+|---|---|---|---|---|
+| 1 | v41 returns `text` and `content` | v12 reads `text` | v12 | not attempted; all contracts pass |
+| 3 | PR removes `text` | v13 reads `content` | v12 | **blocked**: deployed v12 still reads `text` |
+| 5 | same PR, re-checked | v13 | v13, deployment recorded | allowed |
+
+Verifying only against main (v13) on day 3 would have passed and caused an outage for the v12 still
+running.
+
+## Production patterns
+- **Gate releases on deployed versions.** When a service ships, record it with
+  `pact-broker record-deployment`; before each release run
+  `pact-broker can-i-deploy --pacticipant <name> --version <sha> --to-environment production`. Monitor
+  blocked releases and how long contracts sit unverified.
+- **Verify when a contract changes, not only when the provider changes.** Configure a broker webhook that
+  triggers the provider's verification build when a consumer publishes a changed contract, so the
+  consumer learns within one build whether its new expectation is met. Track verification lag.
+- **Schema fuzzing in provider CI.** Run Schemathesis against the running app's OpenAPI document
+  (`schemathesis run <url-to-openapi.json>`) on each pull request. It catches responses that violate the
+  spec, 500s on edge-case inputs and undocumented status codes. Watch for endpoints excluded from the run.
+- **Canary the vendor APIs you cannot verify.** A scheduled job sends a fixed small prompt to each model
+  provider, validates the response with the same strict models used at the boundary, and alerts on
+  validation failure. Pair it with pinned SDK versions and re-recorded fixtures on upgrade.
+- **Snapshot tool and structured-output schemas.** A test compares each tool's `model_json_schema()` with
+  a committed JSON file, so any change to what the model is shown needs an explicit, reviewed update.
+  Monitor schema validation failures on model tool calls after each change.
 
 ## Trade-offs
-- Contracts catch interface breaks in seconds per build, but only interface breaks; a provider that
-  returns the right shape with the wrong documents still passes, which integration tests or evals cover.
-- Consumer-driven contracts tell providers exactly which fields matter, but need a broker, versioning
-  discipline and buy-in from both teams; with one team owning both sides, a shared schema is often enough.
-- Schema-first contracts are simple to adopt and serve many unknown consumers, but cannot report which
-  consumer a change breaks; they flip to the better choice for public APIs with external clients.
-- Loose matchers (type, not value) keep contracts stable, but can admit semantically wrong data; tighten
-  them only where a value is genuinely part of the agreement, such as an enum of error codes.
+- **Fast interface checks vs narrow coverage.** Contracts catch interface breaks in seconds per build,
+  but only interface breaks; a provider that returns the right shape with the wrong documents still
+  passes, which integration tests or evals cover.
+- **Precise consumer knowledge vs process cost.** Consumer-driven contracts tell providers exactly which
+  fields matter, but need a broker, versioning discipline and buy-in from both teams; with one team
+  owning both sides, a shared schema is often enough.
+- **Schema-first simplicity vs blind spots.** Schema-first contracts are simple to adopt and serve many
+  unknown consumers, but cannot report which consumer a change breaks; they flip to the better choice for
+  public APIs with external clients.
+- **Loose matchers vs semantic gaps.** Type-not-value matchers keep contracts stable but can admit
+  semantically wrong data; tighten them only where a value is genuinely part of the agreement, such as an
+  enum of error codes.
 
 ## Pitfalls
-- Contracts that pin exact values from the consumer's fixtures; the symptom is provider verification
-  failing whenever test data changes, until teams stop trusting and then stop running it.
-- Consumers recording fields they do not actually read; the symptom is a provider that cannot remove
-  or rename anything, because every field appears to be load-bearing.
-- Missing provider states, so verification runs against an empty database; the symptom is contracts that
-  only ever verify the "no results" path while the populated path breaks unnoticed.
-- Treating a vendor LLM API as stable because your mocks are; the symptom is a production parse error
-  after an SDK or response-format change that no test of yours could have seen.
-- Removing a field as soon as consumers' main branches stop using it; the symptom is an outage in
-  the window before the last consumer is redeployed, which a deploy gate on deployed versions prevents.
-- Verifying against the main-branch contract instead of the deployed one; the symptom is a provider
-  release that passes CI and still breaks the consumer version currently running in production.
+- **Pinning exact values from the consumer's fixtures.** Symptom: provider verification fails whenever
+  test data changes, until teams stop trusting and then stop running it. Fix: type matchers.
+- **Recording fields the consumer does not read.** Symptom: a provider that cannot remove or rename
+  anything, because every field appears load-bearing. Fix: generate the contract from the real adapter.
+- **Missing provider states.** Verification runs against an empty database. Symptom: contracts that only
+  ever verify the "no results" path while the populated path breaks unnoticed.
+- **Treating a vendor LLM API as stable because your mocks are.** Symptom: a production parse error after
+  an SDK or response-format change that no test of yours could have seen. Fix: boundary validation and a
+  live canary.
+- **Removing a field as soon as consumers' main branches stop using it.** Symptom: an outage in the window
+  before the last consumer is redeployed, which a deploy gate on deployed versions prevents.
+- **Verifying against the main-branch contract instead of the deployed one.** Symptom: a provider release
+  that passes CI and still breaks the consumer version currently running in production.
 
 ## When to use
-Use consumer-driven contracts when separately deployed services are owned by different teams and
-interface breaks have actually reached production; that is when the broker and process pay for
-themselves. Use schema-based checks (OpenAPI plus Schemathesis, or shared Pydantic models) when one team
-owns both sides or the API is public. For third-party model and SaaS APIs, use boundary validation plus
-a live canary. Do not use contracts as a substitute for integration tests of behaviour. In interviews,
-contract testing is the expected answer to "how do you stop mocks drifting from the real service?"
+- **Use consumer-driven contracts when** separately deployed services are owned by different teams and
+  interface breaks have actually reached production; that is when the broker and process pay for
+  themselves.
+- **Use schema-based checks when** one team owns both sides or the API is public: OpenAPI plus
+  Schemathesis, or shared Pydantic models.
+- **For third-party model and SaaS APIs:** boundary validation plus a live canary.
+- **Avoid when:** you want to test behaviour; contracts are not a substitute for integration tests of
+  behaviour.
+- **Interviews:** contract testing is the expected answer to "how do you stop mocks drifting from the real
+  service?"
 
 ## Role lens
 - **Engineer:** Writes consumer tests that record only the fields the code reads, and provider tests
@@ -200,6 +317,45 @@ deploy gate checks deployed versions. For the LLM API, I cannot run provider ver
 validate every response with strict models at the boundary, keep recorded real responses as fixtures,
 pin the SDK, and run a scheduled canary that calls the live API and validates the shape. Neither
 replaces evals of answer quality; contracts only guarantee the shape of the conversation.
+
+## Interview questions
+### What is a consumer-driven contract, and why is the consumer the one writing it?
+- **Definition:** the consumer's tests run its real code against a mock provider and record the
+  interactions it relies on; the provider replays them against its real application in its own CI.
+- **Why the consumer:** it states only the fields it actually reads, so the provider learns which fields
+  are load-bearing and can change everything else freely.
+- **Result:** a breaking change fails the provider's build in the commit that caused it, naming the
+  consumer.
+
+### How would you rename a response field that three consumers read, without an outage?
+- **Expand:** return both the old and new field; every existing contract still passes because extra fields
+  are allowed.
+- **Migrate:** each consumer switches and publishes a contract without the old field.
+- **Contract:** remove the old field only when the "can I deploy" check passes against every *deployed*
+  consumer version, because merged-but-undeployed consumers still read it.
+
+### When would you choose OpenAPI plus Schemathesis over Pact?
+- **One team owns both sides, or the API is public** with unknown consumers: a provider-published schema
+  is simpler and needs no broker or cross-team process.
+- **What you give up:** a schema cannot tell you which consumer a change breaks, because it records what the
+  provider offers, not what each consumer uses.
+- **Pact pays off** when separately deployed services owned by different teams have shipped interface
+  breaks to production.
+
+### Your agent parses responses from a vendor LLM API. How do you get contract-like safety without provider verification?
+- **Validate every response at the boundary** with strict Pydantic models, so a shape change fails loudly
+  instead of degrading answers.
+- **Keep recorded real responses as fixtures and pin the SDK**, re-recording on upgrades.
+- **Run a scheduled canary** that calls the live API with a small fixed prompt and validates the shape, so a
+  vendor-side change alerts before users notice.
+
+### Provider verification passes, yet the consumer in production broke. What are the likely causes?
+- **Verified against the wrong version:** the provider checked the consumer's main-branch contract, not
+  the version actually deployed.
+- **Lax validation:** a field was retyped (a `score` that became the string `"0.9"`) and Pydantic's lax mode
+  coerced it back, so verification passed while a non-coercing consumer failed.
+- **Missing provider state:** verification ran against an empty index and only exercised the "no results"
+  path.
 
 ## Quiz
 ### Q: In consumer-driven contract testing, who verifies the contract against real code?

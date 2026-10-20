@@ -5,7 +5,7 @@ name: Latency percentiles (p50/p95/p99)
 kind: metric
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - observability/monitoring
   - observability/tracing
@@ -20,111 +20,128 @@ sources:
 ---
 
 ## TL;DR
-Latency is a distribution, not a number. A handful of slow requests drags the mean up while most users
-never see them, and a long tail hides behind a healthy-looking average. A percentile reports the value
-below which p% of requests finish: p50 is the typical experience, p95 and p99 are the tail that users
-notice and that fan-out amplifies. For LLM systems, measure percentiles per phase (time to first token,
-per-token, end to end) and compute them by merging histograms, never by averaging percentiles.
+Latency is a distribution, not a number: p50 is the typical request, p95 and p99 are the tail users notice
+and fan-out amplifies. For LLM systems, measure per phase (TTFT, per-token, total) and merge histograms
+before taking quantiles, never average percentiles.
 
 ## Why it exists
-A request's latency has a hard floor (network round trip plus the minimum compute) and no ceiling: a
-retry after a timeout, a garbage-collection pause, a cold start, a queue behind a 20,000-token prefill,
-or simply a long answer can take seconds. So the distribution is right-skewed, and the mean is pulled
-toward the few slow values. Take 100 requests where 95 finish in 200 ms and 5 take 6 s. The mean is
-(95 × 0.2 + 5 × 6) / 100 = 0.49 s, a number that describes nobody: 95 users waited 200 ms and 5 waited
-thirty times longer. The same data reads p50 = 200 ms, p95 = 200 ms, p99 = 6 s, which is exactly the
-story: typical experience fine, one user in twenty badly served.
-
-The tail matters more than its share of traffic because systems compose. A page, or one step of an agent,
-that waits on *N* backend calls is as slow as the slowest of them. If each call independently exceeds its
-own p99 with probability 1%, the chance the user waits at least that long is 1 − 0.99^N: about 10% for
-10 calls, 40% for 50, 63% for 100. Dean and Barroso called this the tail at scale: at enough fan-out, a
-dependency's p99 becomes the user's median. An agent making twenty sequential model and tool calls has the
-additive version of the same problem.
-
-The naive alternative, alert when average latency doubles, fails in both directions. It stays silent when
-2% of requests get five times slower, because 2% barely moves the mean, and it pages you when a single
-60-second outlier lands in a quiet minute. Service-level objectives are percentile statements by
-construction ("99% of requests under 2 s"), so you need the machinery to compute them correctly.
+- **The mean describes nobody.** Latency has a hard floor (network round trip plus minimum compute) and no
+  ceiling, so the distribution is right-skewed and the mean is pulled toward the few slow values. A handful
+  of slow requests drags it up while most users never see them, and a long tail hides behind a
+  healthy-looking average.
+- **Slow requests have many causes.** A retry after a timeout, a garbage-collection pause, a cold start, a
+  queue behind a 20,000-token prefill, or simply a long answer can take seconds.
+- **Worked case.** 100 requests: 95 finish in 200 ms, 5 take 6 s. Mean = (95 × 0.2 + 5 × 6) / 100 =
+  0.49 s. Percentiles tell the real story: p50 = 200 ms, p95 = 200 ms, p99 = 6 s. Typical experience is
+  fine; one user in twenty waited thirty times longer.
+- **Systems compose, so the tail matters more than its share.** A page or agent step waiting on *N* calls is
+  as slow as the slowest. If each call exceeds its p99 with probability 1%, the user waits that long with
+  probability 1 − 0.99^N: about 10% for 10 calls, 40% for 50, 63% for 100. Dean and Barroso called this
+  the tail at scale; an agent making twenty sequential model and tool calls has the additive version.
+- **Mean-based alerts fail both ways.** "Alert when average latency doubles" stays silent when 2% of
+  requests get five times slower, and pages you when one 60-second outlier lands in a quiet minute. SLOs
+  are percentile statements by construction ("99% of requests under 2 s").
 
 ## How it works
 ### Definition
-Sort the *n* latencies of a window ascending. The p-th percentile is the value at rank ⌈p/100 × n⌉
-(nearest-rank method; interpolating variants differ slightly and only matter for small *n*). p50 is the
-median. Each extra nine in the tail needs roughly ten times more samples for the same stability: in a
-window with 100 requests, p99 is the second-largest value, so a single retry defines it. With 1,000
-requests the top 1% is ten samples, still noisy. This is why p99 over a one-minute window on a low-traffic
-endpoint looks like random noise, and why percentiles should be paired with the sample count they came from.
+- **Nearest rank.** Sort the *n* latencies of a window ascending; the p-th percentile is the value at rank
+  ⌈p/100 × n⌉. It is the value below which p% of requests finish. Interpolating variants differ slightly
+  and only matter for small *n*. p50 is the median.
+- **Each extra nine needs ~10× more samples.** With 100 requests in a window, p99 is the second-largest
+  value, so a single retry defines it. With 1,000 requests the top 1% is ten samples, still noisy.
+- **So pair percentiles with their sample count.** That is why p99 over a one-minute window on a
+  low-traffic endpoint looks like random noise.
 
 ### You cannot keep every sample
-At 1,000 requests per second one endpoint produces 86 million latencies a day. Two standard compressions
-exist, and both are chosen for the same property: they can be **merged** across hosts and across time.
+At 1,000 requests per second one endpoint produces 86 million latencies a day. Two compressions are
+standard, both chosen because they can be **merged** across hosts and across time.
 
-1. **Fixed-bucket histograms** (Prometheus-style `_bucket` series with `le` boundaries). Each sample
-   increments the counter of every bucket whose upper bound is at or above it (the counts are cumulative). A quantile is estimated by
-   finding the bucket where the cumulative count crosses p × n and interpolating linearly inside it, so
-   the error is the bucket width. Put bucket edges on your SLO thresholds (say 0.5, 1, 2, 5, 10 s),
-   because the number you need exactly is "what fraction finished under the threshold", and that is exact
-   at an edge. Merging is just summing counts.
-2. **Quantile sketches** (t-digest, HDR Histogram, DDSketch, OpenTelemetry's exponential histogram).
-   Buckets grow geometrically, giving bounded *relative* error from 1 ms to 10 minutes with a few hundred
-   counters, which suits LLM calls whose latencies span four orders of magnitude. Also mergeable.
+| Approach | How it works | Error | Merge |
+|---|---|---|---|
+| **Fixed-bucket histogram** (Prometheus `_bucket` series with `le` bounds) | Each sample increments every bucket whose upper bound is at or above it (counts are cumulative). Find the bucket where cumulative count crosses p × n and interpolate linearly inside it | The bucket width; exact at an edge | Sum counts |
+| **Quantile sketch** (t-digest, HDR Histogram, DDSketch, OpenTelemetry exponential histogram) | Buckets grow geometrically | Bounded *relative* error from 1 ms to 10 minutes with a few hundred counters | Mergeable |
+| **Prometheus *summary*** or in-process `p99` gauge | Quantile computed inside each process, number exported | Precise per process | Not mergeable |
 
-The tempting third option is to compute the quantile inside each process and export the number (a
-Prometheus *summary*, or a `p99` gauge from an in-process library). It is precise per process and useless
-for the fleet, because the raw distribution is gone by the time it reaches the backend: you cannot combine
-40 per-process p99s into one fleet p99, for the reason in the next subsection. Use summaries only for a
-single process you will never aggregate.
+- **Put bucket edges on SLO thresholds** (say 0.5, 1, 2, 5, 10 s), because the number you need exactly is
+  "what fraction finished under the threshold", and that is exact at an edge.
+- **Sketches suit LLM calls** because their latencies span four orders of magnitude.
+- **Summaries are useless for the fleet.** The raw distribution is gone by the time it reaches the backend,
+  so you cannot combine 40 per-process p99s into one fleet p99. Use summaries only for a single process you
+  will never aggregate.
 
 ### Why you merge first and quantile last
-Percentiles do not compose. The fleet p99 is not the mean of per-host p99s, nor a traffic-weighted mean of
-them, and the daily p99 is not the mean of per-minute p99s. A canary host handling 1% of traffic with a
-terrible p99 would dominate an "average p99" while barely moving the real fleet tail; a loaded host's tail
-can be diluted the same way. The correct query sums the histograms first and takes the quantile once, which
-in PromQL reads `histogram_quantile(0.99, sum by (le) (rate(latency_seconds_bucket[5m])))`.
+- **Percentiles do not compose.** The fleet p99 is not the mean of per-host p99s, nor a traffic-weighted
+  mean of them; the daily p99 is not the mean of per-minute p99s.
+- **Averaging distorts in both directions.** A canary host on 1% of traffic with a terrible p99 dominates an
+  "average p99" while barely moving the real fleet tail; a loaded host's tail can be diluted the same way.
+- **Correct query:** sum the histograms first, take the quantile once. In PromQL:
+  `histogram_quantile(0.99, sum by (le) (rate(latency_seconds_bucket[5m])))`.
 
 ### Windows
-A percentile is always over a window. Short windows (1–5 min) react to incidents quickly but flap at low
-traffic; long windows (1 h, 1 day) are stable but a ten-minute outage inside a day barely registers. For
-alerting, "fraction of requests under the threshold" burning an error budget is more robust than alerting
-on the p99 value itself, because it is a ratio with a known sample size.
+- **Short windows (1–5 min)** react to incidents quickly but flap at low traffic.
+- **Long windows (1 h, 1 day)** are stable, but a ten-minute outage inside a day barely registers.
+- **Alert on a ratio.** "Fraction of requests under the threshold" burning an error budget is more robust
+  than alerting on the p99 value, because it is a ratio with a known sample size.
 
 ### What makes the tail
-Queueing is the usual culprit: in the simplest queue model the expected wait grows like ρ/(1−ρ) with
-utilisation ρ, so the tail explodes as a system approaches saturation while the mean still looks fine.
-Add retries (a retry after a 5-second timeout adds 5 seconds to that request), stop-the-world garbage
-collection, cold starts, lock contention and cache misses that only some requests pay.
+- **Queueing, usually.** In the simplest queue model expected wait grows like ρ/(1−ρ) with utilisation ρ, so
+  the tail explodes near saturation while the mean still looks fine.
+- **Retries.** A retry after a 5-second timeout adds 5 seconds to that request.
+- **Others.** Stop-the-world garbage collection, cold starts, lock contention, and cache misses that only
+  some requests pay.
 
-LLM serving adds its own sources. Time to first token (TTFT) tails come from prefill of unusually long
-prompts and from waiting for a slot in a continuous-batching scheduler; per-token latency rises with batch
-size and context length; provider rate limits turn into 429s plus backoff. Most importantly, end-to-end
-latency is roughly TTFT + output_tokens × seconds_per_token, so its "tail" is often just long answers.
-Measure three distributions, TTFT, inter-token latency (or tokens/s) and total, and when total regresses,
-look at the output-length distribution before blaming infrastructure.
+LLM serving adds its own sources:
+
+| Phase | Tail source |
+|---|---|
+| Time to first token (TTFT) | Prefill of unusually long prompts; waiting for a slot in a continuous-batching scheduler |
+| Per-token latency | Rises with batch size and context length |
+| Provider calls | Rate limits turn into 429s plus backoff |
+| End to end | ≈ TTFT + output_tokens × seconds_per_token, so the "tail" is often just long answers |
+
+- **Measure three distributions:** TTFT, inter-token latency (or tokens/s) and total.
+- **When total regresses, check output length first**, before blaming infrastructure.
 
 ### Cutting the tail
-Once you know where the tail comes from, the standard remedies follow from the arithmetic. **Hedged
-requests** send a duplicate to another replica only if the first has not answered by about the p95 delay,
-so at most roughly 5% of requests are duplicated while the slowest ones get a second chance; firing the
-duplicate immediately would double load to fix 1% of requests. **Timeouts with one retry** do the same for
-idempotent calls, but the retry adds the full timeout to that request, so set the timeout from the
-measured distribution, not a round number. **Admission control** (rejecting or queueing work above a
-utilisation target) attacks the ρ/(1−ρ) term directly. For LLM calls, capping `max_tokens` and streaming
-change what users perceive more than any infrastructure fix, because they shorten or hide the decode term.
+| Remedy | How | Cost |
+|---|---|---|
+| **Hedged requests** | Send a duplicate to another replica only if the first has not answered by about the p95 delay | At most ~5% of requests duplicated; firing immediately would double load to fix 1% |
+| **Timeouts with one retry** | For idempotent calls; set the timeout from the measured distribution, not a round number | The retry adds the full timeout to that request |
+| **Admission control** | Reject or queue work above a utilisation target | Attacks the ρ/(1−ρ) term directly |
+| **Cap `max_tokens`, stream** | Shortens or hides the decode term | Changes perceived latency more than any infrastructure fix |
+
 None of these is free near saturation: every duplicate is extra load arriving exactly when queues are long.
 
 ### Where you measure
-Server-side timers miss load-balancer queueing, TLS handshakes, network and client retries. Measure at the
-edge or client for the user-facing SLO and keep server-side percentiles for diagnosis. Record failures and
-timeouts with their elapsed time too: if only successes are timed, the p99 *improves* during an incident
-as the slowest requests become timeouts and vanish from the sample. Load generators that wait for a slow
-response before sending the next request under-sample the bad period in the same way (coordinated omission).
+- **Edge or client for the SLO.** Server-side timers miss load-balancer queueing, TLS handshakes, network
+  and client retries; keep server-side percentiles for diagnosis.
+- **Time failures and timeouts too.** If only successes are timed, the p99 *improves* during an incident as
+  the slowest requests become timeouts and vanish from the sample.
+- **Beware coordinated omission.** Load generators that wait for a slow response before sending the next
+  request under-sample the bad period the same way.
 
-## Example
-A simulation of two hosts behind one load balancer. Host A is busy and mostly healthy; host B is a tiny
-canary with a bad slow mode. The script prints the summary statistics, then shows the two mistakes this
-lesson is about: averaging per-host p99s instead of pooling, and underestimating how often a fan-out
-request meets a per-call p99. The numbers below are illustrative of the shape, not a benchmark.
+## Diagram
+Each host records into the same bucket layout; the fleet number comes from summing buckets, then taking
+one quantile. The dotted path is the mistake.
+
+```mermaid
+flowchart TD
+    R["Request timed at edge"] --> H1["Host A histogram"]
+    R --> H2["Host B histogram"]
+    H1 --> S["sum by le of bucket rates"]
+    H2 --> S
+    S --> Q["histogram_quantile 0.99, once"]
+    Q --> SLO["Fleet p99 and SLO ratio"]
+    H1 -.->|"per-host p99"| AVG["Average of p99s"]
+    H2 -.->|"per-host p99"| AVG
+    AVG -.->|"wrong"| X["Misleading dashboard"]
+```
+
+## Examples
+### Simulation: averaging p99s and fan-out
+Two hosts behind one load balancer. Host A is busy and mostly healthy; host B is a tiny canary with a bad
+slow mode. The script shows two mistakes: averaging per-host p99s instead of pooling, and underestimating
+how often a fan-out request meets a per-call p99. Numbers are illustrative of the shape, not a benchmark.
 
 ```python
 import numpy as np
@@ -154,47 +171,113 @@ for k in (1, 10, 50, 100):
     print(f"k={k:3}: P(at least one call >= its p99) = {1 - 0.99**k:.1%}")
 ```
 
-Note that the mean of host A (about 340 ms) sits between its p50 and p95 and says nothing about the 0.5%
-of users who waited over four seconds; the p99 misses them too, because they are fewer than 1%. That is
-the argument for also tracking p99.9, or the count of requests over a hard threshold, on user-facing paths.
+- **Host A's mean (about 340 ms)** sits between its p50 and p95 and says nothing about the 0.5% of users who
+  waited over four seconds.
+- **The p99 misses them too,** because they are fewer than 1%. That is the argument for also tracking p99.9,
+  or the count of requests over a hard threshold, on user-facing paths.
+
+### Estimating a quantile from cumulative buckets
+What `histogram_quantile` does, in pure Python: find the bucket where the cumulative count crosses p × n
+and interpolate linearly inside it. Hosts are merged by adding counts per bucket.
+
+```python
+edges = [0.5, 1, 2, 5, 10, float("inf")]           # bucket upper bounds (le), seconds
+host_a = [700, 900, 960, 990, 998, 1000]            # cumulative counts
+host_b = [10, 30, 60, 85, 98, 100]                  # small canary, slow
+
+def quantile(q, edges, cum):
+    target = q * cum[-1]
+    lo_edge, lo_count = 0.0, 0
+    for edge, count in zip(edges, cum):
+        if count >= target:
+            if edge == float("inf"):
+                return lo_edge                       # cannot interpolate into +Inf
+            return lo_edge + (edge - lo_edge) * (target - lo_count) / (count - lo_count)
+        lo_edge, lo_count = edge, count
+    return lo_edge
+
+merged = [a + b for a, b in zip(host_a, host_b)]    # merge = sum counts per bucket
+print(f"A p99      {quantile(0.99, edges, host_a):.2f} s")
+print(f"B p99      {quantile(0.99, edges, host_b):.2f} s")
+print(f"avg of p99 {(quantile(0.99, edges, host_a) + quantile(0.99, edges, host_b)) / 2:.2f} s")
+print(f"fleet p99  {quantile(0.99, edges, merged):.2f} s")
+print(f"under 2 s  {merged[2] / merged[-1]:.1%}")   # exact at an edge: the SLO ratio
+```
+
+- **Output:** A p99 5.00 s, B p99 10.00 s, average 7.50 s, fleet p99 5.30 s, 96.4% under 2 s.
+- **The SLO ratio is exact** because 2 s is a bucket edge; the p99 values are only as precise as the bucket
+  widths (5 to 10 s here).
+
+### Worked incident: a p99 that improved during an outage
+| Time | Successes timed | Timeouts (not timed) | Reported p99 |
+|---|---|---|---|
+| Before | 10,000 | 0 | 3.1 s |
+| Incident | 9,200 | 800 at the 30 s timeout | 2.4 s, "better" |
+| After fix (timeouts recorded with elapsed time) | 9,200 + 800 | counted | 30 s |
+
+Illustrative numbers. The fix was recording every request with its elapsed time and a status label, and
+alerting on the fraction under the threshold.
+
+## Production patterns
+- **SLO-edge histograms per phase.** Emit TTFT, inter-token and total as histograms labelled by model,
+  endpoint and tenant, with buckets on SLO thresholds, for example
+  `Histogram("llm_ttft_seconds", "TTFT", ["model", "route"], buckets=[0.25, 0.5, 1, 2, 5, 10])` in
+  `prometheus_client`. Monitor series count, because labels multiply buckets.
+- **Ratio-based SLO alerts.** Alert on
+  `sum(rate(latency_seconds_bucket{le="2"}[5m])) / sum(rate(latency_seconds_count[5m]))` burning the error
+  budget over a short and a long window together, not on the raw p99 value. Monitor the burn rate.
+- **Exponential histograms for wide ranges.** When you need p99.9 across milliseconds to minutes, use the
+  OpenTelemetry exponential bucket histogram aggregation or a t-digest instead of hand-picked buckets.
+  Monitor relative error against a sampled raw log.
+- **Hedge at the p95 delay, not immediately.** gRPC service config supports a hedging policy with a hedging
+  delay; set it near the measured p95 and only for idempotent calls. Monitor the duplicate rate (expect
+  ~5%) and backend utilisation.
+- **Time every outcome.** Record errors and timeouts with elapsed time and a `status` label so incidents
+  cannot improve the tail. Monitor the timeout count next to p99.
+- **Low-traffic fallback.** For endpoints below a few hundred requests per window, show p90 plus the
+  sample count, or widen the window.
 
 ## Trade-offs
-- A higher percentile describes the worst experience more faithfully but needs about ten times more
-  samples per extra nine; on a per-tenant endpoint doing 50 requests a minute, a one-minute p99 is the
-  maximum, so fall back to p90 or a longer window.
-- Fixed-bucket histograms are cheap, mergeable and exact at the bucket edges, but imprecise between them;
-  when you need p99.9 across a millisecond-to-minutes range, switch to exponential histograms or t-digest.
-- Tail-cutting techniques (hedged requests, retries, duplicate speculative calls) buy tail latency almost
+- **Higher percentile vs sample size.** A higher percentile describes the worst experience more faithfully
+  but needs about ten times more samples per extra nine. On a per-tenant endpoint doing 50 requests a
+  minute, a one-minute p99 is the maximum, so fall back to p90 or a longer window.
+- **Fixed buckets vs sketches.** Fixed-bucket histograms are cheap, mergeable and exact at the bucket edges,
+  but imprecise between them. When you need p99.9 across a millisecond-to-minutes range, switch to
+  exponential histograms or t-digest.
+- **Tail-cutting vs load.** Hedged requests, retries and duplicate speculative calls buy tail latency almost
   free when utilisation is low and make the tail worse near saturation, because they add load exactly when
   queueing is the cause.
-- End-to-end percentiles are what users feel, but for LLM calls they conflate answer length with speed;
-  TTFT and per-token percentiles are diagnosable at the cost of three charts instead of one.
-- Short windows catch incidents in minutes but flap; long windows are stable but hide short outages, so
-  dashboards usually need both.
+- **End-to-end vs per-phase.** End-to-end percentiles are what users feel, but for LLM calls they conflate
+  answer length with speed. TTFT and per-token percentiles are diagnosable at the cost of three charts
+  instead of one.
+- **Short vs long windows.** Short windows catch incidents in minutes but flap; long windows are stable but
+  hide short outages, so dashboards usually need both.
 
 ## Pitfalls
-- Averaging percentiles across hosts, shards or time buckets; the symptom is a dashboard p99 that moves
-  when you add an idle instance and never matches what a user with a stopwatch sees.
-- Alerting on mean latency; the symptom is a 5× regression on 2% of traffic that nobody notices until
-  support tickets arrive, while one 60-second outlier pages the on-call at 3 a.m.
-- Timing only successful requests; the symptom is a p99 that improves during an incident because the
-  slowest requests turned into timeouts and dropped out of the sample.
-- Mixing models, endpoints, tenants or prompt sizes in one percentile; the symptom is a shelf between p97
-  and p99 that turns out to be the 3% of traffic routed to a slower model.
-- Treating an end-to-end regression as an infrastructure problem; the symptom is unchanged TTFT and
-  tokens/s while the median output length doubled after a prompt edit.
-- Measuring only server-side; the symptom is a server p99 of 300 ms against customer reports of 4 s, the
-  gap being load-balancer queueing, SDK retries or provider-side queueing nobody instrumented.
+- **Averaging percentiles across hosts, shards or time buckets.** Symptom: a dashboard p99 that moves when
+  you add an idle instance and never matches what a user with a stopwatch sees. Fix: sum buckets, then
+  quantile.
+- **Alerting on mean latency.** Symptom: a 5× regression on 2% of traffic that nobody notices until support
+  tickets arrive, while one 60-second outlier pages the on-call at 3 a.m.
+- **Timing only successful requests.** Symptom: a p99 that improves during an incident because the slowest
+  requests turned into timeouts and dropped out of the sample.
+- **Mixing models, endpoints, tenants or prompt sizes in one percentile.** Symptom: a shelf between p97 and
+  p99 that turns out to be the 3% of traffic routed to a slower model.
+- **Treating an end-to-end regression as an infrastructure problem.** Symptom: unchanged TTFT and tokens/s
+  while the median output length doubled after a prompt edit.
+- **Measuring only server-side.** Symptom: a server p99 of 300 ms against customer reports of 4 s, the gap
+  being load-balancer queueing, SDK retries or provider-side queueing nobody instrumented.
 
 ## When to use
-Use percentiles for every latency you report, and pick the percentile by audience: p50 for capacity and
-cost conversations, p95/p99 for user-facing SLOs, p99.9 or a hard-threshold count for paths where a single
-bad experience is expensive. Instrument LLM calls as three histograms (TTFT, inter-token, total) labelled by
-model, endpoint and tenant, with bucket edges at your SLO thresholds, and compute every fleet-level number by
-summing histograms. Do not bother with p99 on anything that sees fewer than a few hundred requests per
-window; report p90 and the count instead. Day to day this is the first chart you open in an incident and
-the number in every capacity review. In interviews, expect to be asked why the mean is misleading, how to
-aggregate percentiles across hosts, and how fan-out turns a dependency's p99 into your p50.
+- **Use for every latency you report,** and pick the percentile by audience: p50 for capacity and cost
+  conversations, p95/p99 for user-facing SLOs, p99.9 or a hard-threshold count for paths where a single bad
+  experience is expensive.
+- **Instrument LLM calls** as three histograms (TTFT, inter-token, total) labelled by model, endpoint and
+  tenant, with bucket edges at your SLO thresholds; compute every fleet-level number by summing histograms.
+- **Avoid p99** on anything that sees fewer than a few hundred requests per window; report p90 and the count.
+- **Day to day,** this is the first chart you open in an incident and the number in every capacity review.
+- **Interviews:** expect why the mean is misleading, how to aggregate percentiles across hosts, and how
+  fan-out turns a dependency's p99 into your p50.
 
 ## Role lens
 - **Engineer:** Emits latency histograms with sensible buckets from the LLM gateway, splits TTFT from
@@ -217,6 +300,38 @@ release, since a new retry adds a full timeout to the tail, and check the gatewa
 confirm the measurement itself did not change, for example streaming end-time now including a post-processing
 step. Report which segment and which phase moved, the fraction of requests affected, and the fix, not just
 "p99 is up".
+
+## Interview questions
+### Why is mean latency a poor SLO metric, and what would you use instead?
+- **Latency is right-skewed.** A floor and no ceiling means a few slow requests pull the mean toward values
+  almost nobody experienced, while a 5× slowdown on 2% of traffic barely moves it.
+- **Use percentiles or threshold ratios.** p50 for the typical request, p95/p99 for the tail, and "fraction
+  under 2 s" for alerting, because it is exact at a bucket edge and has a known sample size.
+
+### You run 40 replicas. How do you compute the fleet p99, and why not average the per-replica p99s?
+- **Merge, then quantile.** Sum bucket rates by `le` across replicas, then run `histogram_quantile` once.
+- **Quantiles do not compose.** A tiny canary with a terrible p99 dominates an average of p99s while barely
+  moving the true fleet tail; weighting by traffic does not fix it either.
+- **So export histograms or sketches,** not per-process summaries, from anything you will aggregate.
+
+### An agent makes 20 tool calls per task, each with p99 of 1 s. What does that mean for users?
+- **Tails compound.** For parallel fan-out, the chance at least one call hits its p99 is 1 − 0.99^20, about
+  18%, so the per-call tail becomes a common user experience.
+- **Sequential calls add up,** so task latency is the sum of per-call latencies and its tail is fatter still.
+- **Response:** tighten per-call targets, hedge idempotent calls at the p95 delay, and cut the call count.
+
+### When would you not hedge requests to cut tail latency?
+- **Near saturation.** Hedging adds load exactly when queueing causes the tail, so the ρ/(1−ρ) term gets
+  worse; admission control is the better lever there.
+- **For non-idempotent calls,** where a duplicate can double a side effect.
+- **For expensive LLM calls,** where a duplicate doubles token cost; capping `max_tokens` and streaming
+  usually help perceived latency more.
+
+### End-to-end p99 doubled but TTFT and tokens per second are flat. What happened?
+- **Answers got longer.** End-to-end ≈ TTFT + output_tokens × seconds_per_token, so a flat per-phase speed
+  points at output length; check its distribution after the last prompt edit.
+- **Then slice** by model, route and tenant for a minority segment, and confirm the measurement end point
+  did not move.
 
 ## Quiz
 ### Q: A service reports mean latency 480 ms, p50 200 ms and p99 6 s. Which conclusion is best supported?

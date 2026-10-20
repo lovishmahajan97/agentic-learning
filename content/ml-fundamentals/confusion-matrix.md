@@ -5,7 +5,7 @@ name: Confusion matrix
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: reviewed
+status: crisp
 related:
   - ml-fundamentals/classification
   - ml-fundamentals/precision-recall-f1
@@ -22,29 +22,23 @@ sources:
 ---
 
 ## TL;DR
-A confusion matrix is the raw count of what the classifier said against what was true, one cell per
-(actual, predicted) pair. Every single-number classification metric is a ratio of its cells, so any one
-number throws away what the table shows: which class is mistaken for which, and in which direction.
-Read the table first and choose the metric second, because the right metric depends on which cell's
-errors are expensive, and that is a product decision.
+A confusion matrix counts predictions against truth, one cell per (actual, predicted) pair. Every
+classification metric is a ratio of its cells, so read the table first, then pick the metric from which
+errors are expensive, a product decision.
 
 ## Why it exists
-A classifier emits a label and the world has a true label. In the binary case four things can happen:
-the model says yes and is right (true positive), says yes and is wrong (false positive), says no and is
-wrong (false negative), says no and is right (true negative). Accuracy collapses the four into one
-number and in doing so discards the only thing you need in order to act: the *direction* of the errors.
-
-The cost of the two error types is almost never symmetric. A missed fraud and a wrongly declined card
-are both "errors", but one costs the bank money and the other costs a customer. A moderation model
-that lets harmful content through and one that blocks legitimate posts can both show "95% accuracy"
-if the harmful class is 5% of traffic; so does the model that never flags anything. Without the table,
-none of these are distinguishable.
-
-The naive alternative is to report accuracy, or "the metric", and move on. But precision, recall,
-specificity, F1 and MCC are all *derived* from the table; the table is the primary data. For
-multi-class problems the aggregate hides even more: an intent router with 85% accuracy may be nearly
-perfect on ten intents and useless on two that it confuses with each other, and the fix for that
-(merge them, relabel, add a disambiguation rule) is only visible in the off-diagonal cells.
+- **Four outcomes, one label each.** In the binary case the model says yes and is right (true positive), yes
+  and wrong (false positive), no and wrong (false negative), no and right (true negative).
+- **Accuracy throws away the direction of the errors.** It collapses the four into one number and discards
+  the only thing you need in order to act.
+- **Error costs are almost never symmetric.** A missed fraud costs the bank money; a wrongly declined card
+  costs a customer. A moderation model that lets harm through and one that blocks legitimate posts can both
+  show "95% accuracy" when harm is 5% of traffic; so does the model that never flags anything.
+- **Every other metric is derived from the table.** Precision, recall, specificity, F1 and MCC are ratios of
+  its cells; the table is the primary data, so reporting "the metric" and moving on loses information.
+- **Multi-class aggregates hide even more.** An intent router at 85% accuracy may be nearly perfect on ten
+  intents and useless on two it confuses with each other. The fix (merge, relabel, add a disambiguation
+  rule) is only visible in the off-diagonal cells.
 
 ## How it works
 ### Layout and the convention trap
@@ -57,79 +51,119 @@ actual 0 (neg)       TN            FP
 actual 1 (pos)       FN            TP
 ```
 
-so `tn, fp, fn, tp = cm.ravel()`. Other tools, textbooks and Wikipedia put predictions in rows. The
-numbers are the same; the positions of FP and FN swap. Because a swapped reading silently exchanges
-precision and recall, always label both axes and pass `labels=` explicitly. FP is the Type I error
-(false alarm); FN is the Type II error (miss).
+- **Unpack with** `tn, fp, fn, tp = cm.ravel()`.
+- **Other tools, textbooks and Wikipedia put predictions in rows.** The numbers are the same; FP and FN swap
+  positions.
+- **A swapped reading silently exchanges precision and recall,** so always label both axes and pass `labels=`
+  explicitly.
+- **FP is the Type I error** (false alarm); **FN is the Type II error** (miss).
 
 ### Every metric is a ratio of cells
 Group the derived quantities by what they *condition on*, because that determines how they behave.
 
-**Row-normalised (condition on the truth).** These ask "given what the item really was, what did the
-model do?" They are properties of the model alone; changing how many positives exist does not move
-them in expectation.
+**Row-normalised (condition on the truth).** "Given what the item really was, what did the model do?"
+Properties of the model alone; changing how many positives exist does not move them in expectation.
 - Recall = sensitivity = true-positive rate (TPR) = TP / (TP + FN)
 - Specificity = true-negative rate (TNR) = TN / (TN + FP)
 - False-positive rate (FPR) = FP / (FP + TN) = 1 − specificity
 - False-negative rate (FNR) = FN / (FN + TP) = 1 − recall
 
-**Column-normalised (condition on the prediction).** These ask "given the model said X, how often was
-it right?", which is what a consumer of the prediction experiences. They mix model quality with the
-base rate: the same model has lower precision when positives are rarer, because the FP column fills up
-from a larger pool of negatives.
+**Column-normalised (condition on the prediction).** "Given the model said X, how often was it right?" This is
+what a consumer of the prediction experiences. It mixes model quality with the base rate: the same model has
+lower precision when positives are rarer, because the FP column fills from a larger pool of negatives.
 - Precision = positive predictive value (PPV) = TP / (TP + FP)
 - Negative predictive value (NPV) = TN / (TN + FN)
 
 **Whole-table.**
-- Accuracy = (TP + TN) / N, dominated by whichever class is large.
-- Prevalence = (TP + FN) / N, the base rate; report it next to every metric.
-- Balanced accuracy = (TPR + TNR) / 2, accuracy with both classes weighted equally.
-- Matthews correlation coefficient, MCC = (TP·TN − FP·FN) / √((TP+FP)(TP+FN)(TN+FP)(TN+FN)). It is the
-  correlation between predicted and actual labels, ranges from −1 to 1, is 0 for a random classifier
-  (and, by convention, for a constant one, where the denominator vanishes; scikit-learn returns 0),
-  and uses all four cells, so it cannot be gamed by predicting one class.
+
+| Metric | Formula | Note |
+|---|---|---|
+| Accuracy | (TP + TN) / N | dominated by whichever class is large |
+| Prevalence | (TP + FN) / N | the base rate; report it next to every metric |
+| Balanced accuracy | (TPR + TNR) / 2 | accuracy with both classes weighted equally |
+| MCC | (TP·TN − FP·FN) / √((TP+FP)(TP+FN)(TN+FP)(TN+FN)) | see below |
+
+- **MCC is the correlation between predicted and actual labels,** ranging from −1 to 1.
+- **It is 0 for a random classifier** and, by convention, for a constant one, where the denominator vanishes
+  (scikit-learn returns 0).
+- **It uses all four cells,** so it cannot be gamed by predicting one class.
 
 ### Multi-class
-With *k* classes the matrix is *k × k*; the diagonal holds correct predictions and cell (i, j) counts
-items of class *i* predicted as *j*. Each class gets its own one-vs-rest counts: TP_i is the diagonal
-cell, FP_i the rest of column *i*, FN_i the rest of row *i*, TN_i everything else. Normalising by row
-(`normalize="true"`) shows per-class recall; by column (`normalize="pred"`) per-class precision. The
-off-diagonal *mass* is the diagnostic: one dense cell means two classes are not separable with the
-current features or prompt, and the fix is local to that pair. In LLM systems this is the matrix of
-an intent router, a guardrail classifier, or an LLM judge scored against human labels, where a judge
-that is too lenient shows up as a heavy FP cell and one that is too strict as a heavy FN cell.
+- **Shape:** with *k* classes the matrix is *k × k*; the diagonal holds correct predictions and cell (i, j)
+  counts items of class *i* predicted as *j*.
+- **One-vs-rest counts per class:** TP_i is the diagonal cell, FP_i the rest of column *i*, FN_i the rest of
+  row *i*, TN_i everything else.
+- **Normalise to read rates:** by row (`normalize="true"`) for per-class recall; by column
+  (`normalize="pred"`) for per-class precision.
+- **Off-diagonal *mass* is the diagnostic.** One dense cell means two classes are not separable with the
+  current features or prompt, and the fix is local to that pair.
+- **In LLM systems** this is the matrix of an intent router, a guardrail classifier, or an LLM judge scored
+  against human labels. A too-lenient judge shows a heavy FP cell; a too-strict one, a heavy FN cell.
 
 ### One matrix is one threshold
-A probabilistic model becomes a classifier only after you pick a threshold. Lowering it moves counts
-from FN into TP and from TN into FP at the same time. The matrix therefore describes one *operating
-point*; ROC and precision–recall curves are the matrix evaluated at every threshold. Comparing two
-models by their matrices at the default 0.5 compares two arbitrary points.
+- **A probabilistic model becomes a classifier only after you pick a threshold.**
+- **Lowering it moves counts from FN into TP and from TN into FP at the same time.**
+- **So the matrix describes one *operating point*;** ROC and precision–recall curves are the matrix evaluated
+  at every threshold. Comparing two models' matrices at the default 0.5 compares two arbitrary points.
 
 ### From cells to a decision: the cost matrix
-The table becomes a decision tool once each cell has a price. Write a cost matrix with the same layout
-(usually zero on the diagonal, C_FP and C_FN off it) and the expected cost of a model is the sum of
-cell count times cell cost. This is the only principled way to rank two matrices with different error
-mixes, and it is what every single-number metric approximates with a hidden, fixed cost ratio:
-accuracy assumes C_FP = C_FN, F1 assumes the two errors are equally bad and TN are free. For multi-class
-problems the cost matrix is k × k, because confusing "refund" with "cancel" may be cheap while confusing
-"cancel" with "legal complaint" is not. For multi-label problems (each item can carry several labels)
-there is no single k × k table; you get one 2 × 2 matrix per label (scikit-learn's
-`multilabel_confusion_matrix`) and aggregate as with per-class metrics.
+1. **Price each cell.** Write a cost matrix with the same layout, usually zero on the diagonal, C_FP and C_FN
+   off it.
+2. **Expected cost = Σ cell count × cell cost.** This is the only principled way to rank two matrices with
+   different error mixes.
+3. **Every single-number metric is a hidden, fixed cost ratio:** accuracy assumes C_FP = C_FN; F1 assumes the
+   two errors are equally bad and TN are free.
+4. **Multi-class cost matrices are k × k,** because confusing "refund" with "cancel" may be cheap while
+   confusing "cancel" with "legal complaint" is not.
+5. **Multi-label problems** (several labels per item) have no single k × k table: you get one 2 × 2 matrix per
+   label (scikit-learn's `multilabel_confusion_matrix`) and aggregate as with per-class metrics.
 
-## Example
-A fraud screen on 10,000 transactions where 1% (100) are fraud. The model flags 270 of them: 70 real
-frauds and 200 legitimate ones, and misses 30 frauds. Reading the table: recall = 70/100 = 0.70;
-precision = 70/270 ≈ 0.26; specificity = 9,700/9,900 ≈ 0.98; FPR ≈ 0.02; accuracy = 9,770/10,000 =
-0.977. That accuracy is *worse* than the 0.99 you would get by never flagging anything, which is the
-whole argument against accuracy on imbalanced data. Balanced accuracy is 0.84 and MCC ≈ 0.42, both of
-which say "useful but far from done", which is what the table says too.
+## Diagram
+From predictions to a decision: the table comes first, the cost of each cell decides.
 
-Now price the cells, with illustrative costs: a missed fraud loses $500 and a false decline costs $10
-in support time and goodwill. The model costs 30 × 500 + 200 × 10 = $17,000; "never flag" costs
-100 × 500 = $50,000. The model with the *lower* accuracy is the far cheaper one. Flip the costs (a
-false decline costs $500 because these are high-value customers, a missed fraud $10 because it is
-insured) and the model costs 30 × 10 + 200 × 500 = $100,300 against $1,000 for never flagging. Same
-table, opposite verdict: the cost of the cells, not the table, decides.
+```mermaid
+flowchart TD
+    S["Scores on validation split"] --> T["Pick threshold"]
+    T --> CM["Confusion matrix with labels"]
+    CM --> R["Row-normalised: recall, FPR"]
+    CM --> C["Column-normalised: precision, NPV"]
+    CM --> O["Off-diagonal pairs"]
+    O --> F["Fix the confused pair locally"]
+    R --> K["Apply cost matrix"]
+    C --> K
+    K --> D{"Cheaper than baseline?"}
+    D -->|"yes"| SHIP["Ship at this operating point"]
+    D -->|"no"| T
+```
+
+## Examples
+### Worked scenario: a fraud screen read and priced
+A fraud screen on 10,000 transactions where 1% (100) are fraud. The model flags 270: 70 real frauds and 200
+legitimate ones, and misses 30 frauds.
+
+| Metric | Calculation | Value |
+|---|---|---|
+| Recall | 70/100 | 0.70 |
+| Precision | 70/270 | ≈ 0.26 |
+| Specificity | 9,700/9,900 | ≈ 0.98 |
+| FPR | 200/9,900 | ≈ 0.02 |
+| Accuracy | 9,770/10,000 | 0.977 |
+| Balanced accuracy | (0.70 + 0.98)/2 | 0.84 |
+| MCC | formula above | ≈ 0.42 |
+
+- **Accuracy is *worse* than the 0.99 of never flagging anything,** the whole argument against accuracy on
+  imbalanced data.
+- **Balanced accuracy and MCC say "useful but far from done",** which is what the table says too.
+
+Now price the cells with illustrative costs (the model's cells: 30 misses, 200 false declines):
+
+| Costs | Model | Never flag | Cheaper |
+|---|---|---|---|
+| Missed fraud $500, false decline $10 | 30 × 500 + 200 × 10 = $17,000 | 100 × 500 = $50,000 | model, despite *lower* accuracy |
+| Flipped: false decline $500 (high-value customers), missed fraud $10 (insured) | 30 × 10 + 200 × 500 = $100,300 | $1,000 | never flag |
+
+Same table, opposite verdict: the cost of the cells, not the table, decides. Here the model beats
+"never flag" only when a miss costs more than about 2.9 times a false decline (200 × C_FP < 70 × C_FN).
 
 ```python
 import numpy as np
@@ -156,50 +190,95 @@ print(classification_report(y_true, y_pred, target_names=["legit", "fraud"], dig
 # confusion_matrix(y_true, y_pred, labels=intents, normalize="true")
 ```
 
-`classification_report` prints precision, recall, F1 and support per class plus macro and weighted
-averages. Note how the "legit" row looks excellent and the weighted average inherits that, while the
-"fraud" row carries the actual story.
+`classification_report` prints precision, recall, F1 and support per class plus macro and weighted averages.
+The "legit" row looks excellent and the weighted average inherits that, while the "fraud" row carries the
+actual story.
+
+### Intent router: find the confused pair, standard library only
+Count (actual, predicted) cells, read per-class recall, then list the heaviest off-diagonal cells.
+
+```python
+from collections import Counter
+
+y_true = ["refund"] * 50 + ["cancel"] * 40 + ["billing"] * 30 + ["legal"] * 10
+y_pred = (["refund"] * 46 + ["cancel"] * 4 +
+          ["cancel"] * 22 + ["refund"] * 16 + ["billing"] * 2 +
+          ["billing"] * 29 + ["refund"] * 1 +
+          ["legal"] * 7 + ["cancel"] * 3)
+
+cells = Counter(zip(y_true, y_pred))                 # (actual, predicted) -> count
+labels = sorted(set(y_true) | set(y_pred))
+for a in labels:                                     # per-class recall = diagonal / row total
+    row = sum(cells[(a, p)] for p in labels)
+    print(f"{a:8} recall={cells[(a, a)] / row:.2f}  support={row}")
+
+off = [(n, a, p) for (a, p), n in cells.items() if a != p]
+for n, a, p in sorted(off, reverse=True)[:3]:        # the pairs worth reading first
+    print(f"actual {a} -> predicted {p}: {n}")
+# billing 0.97, cancel 0.55, legal 0.70, refund 0.92
+# actual cancel -> predicted refund: 16 / refund -> cancel: 4 / legal -> cancel: 3
+```
+
+- **Accuracy is 0.80, but the story is one cell:** 16 of 40 cancellations routed to refunds.
+- **Read those 16 examples first;** overlapping definitions or inconsistent labels usually explain them, and the
+  fix is local to that pair.
+- **Legal has support 10,** so its 0.70 recall is noisy, yet a k × k cost matrix may still make legal → cancel
+  the most expensive cell.
+
+## Production patterns
+- **Labelled axes in every eval report.** Always call `confusion_matrix(y_true, y_pred, labels=[...])` with an
+  explicit label list and store it with axis names (rows actual, columns predicted) next to prevalence. Monitor
+  that the label list matches the model's current class set after each release.
+- **Row-normalised plots for routers.** Render `ConfusionMatrixDisplay.from_predictions(y_true, y_pred,
+  normalize="true")` for multi-class models and attach the top confused pairs. Review those pairs before
+  editing prompts or adding data.
+- **Cost-weighted model selection.** Keep a reviewed cost matrix C in the repo and rank candidates by
+  `(cm * C).sum()` at each one's chosen threshold, with a sweep across plausible cost ratios when prices are
+  uncertain. Monitor realised cost per day in production.
+- **Judges and guardrails scored by cell.** Score an LLM judge against human labels as a confusion matrix and
+  track the FP cell (too lenient) and FN cell (too strict) per release, not just agreement rate.
+- **Per-label matrices for multi-label.** Use `multilabel_confusion_matrix` and alert on per-label FN counts,
+  because a rare label's misses vanish in pooled averages.
 
 ## Trade-offs
-- The table holds all the information about one operating point but gives you no ranking of two models
-  by itself; to compare them you must first agree on a cost per cell, which is a product decision.
-- Row-normalised rates (recall, FPR) are free of prevalence and portable across datasets, but they hide
-  the absolute volume of false alarms; column-normalised rates (precision) show what users feel but
-  move whenever the base rate moves.
-- One matrix equals one threshold: cheap to compute and easy to explain, but comparing models at a
-  default threshold compares arbitrary points; use curves when the threshold is tunable and matrices
-  when the product has fixed it.
-- A cost matrix turns the table into a clear decision, but its prices are estimates; when they are
-  uncertain by more than the gap between candidate models, show the verdict across a range of cost
-  ratios instead of one number.
-- Multi-class matrices grow as k², readable at ten classes and unreadable at two hundred; past that
-  you summarise (per-class recall sorted, top confused pairs) and lose the full picture.
+- **All the information about one operating point vs no ranking on its own.** To compare two models you must
+  first agree on a cost per cell, which is a product decision.
+- **Portable row rates vs felt column rates.** Row-normalised rates (recall, FPR) are free of prevalence and
+  portable across datasets but hide the absolute volume of false alarms; column-normalised rates (precision)
+  show what users feel but move whenever the base rate moves.
+- **One matrix equals one threshold.** Cheap to compute and easy to explain, but comparing models at a default
+  threshold compares arbitrary points; use curves when the threshold is tunable and matrices when the product
+  has fixed it.
+- **A clear decision from a cost matrix vs estimated prices.** When prices are uncertain by more than the gap
+  between candidate models, show the verdict across a range of cost ratios instead of one number.
+- **Full picture vs readability at scale.** Multi-class matrices grow as k², readable at ten classes and
+  unreadable at two hundred; past that you summarise (per-class recall sorted, top confused pairs) and lose
+  the full picture.
 
 ## Pitfalls
-- Reading a rows-as-actual matrix with the predictions-as-rows convention swaps FP and FN; the symptom
-  is precision and recall exchanging values, and "the model misses everything" turning into "the model
-  over-flags".
-- Reporting accuracy on an imbalanced table; the symptom is a model with 97.7% accuracy that loses to
-  the constant classifier at 99%.
-- Omitting `labels=` when a class is absent from `y_true` or `y_pred`; the matrix silently shrinks or
-  reorders and `.ravel()` unpacks the wrong cells, so every derived metric is computed from the wrong
-  numbers.
-- Treating the matrix at threshold 0.5 as "the" performance of a probabilistic model; the symptom is a
-  model declared to have terrible recall when nobody tried a lower threshold.
-- Collapsing a multi-class matrix into macro-F1 before looking at which pairs are confused; the symptom
-  is weeks spent adding data to a class whose errors come from label ambiguity with its neighbour.
-- Scoring an LLM judge only by agreement rate; the symptom is a judge that "agrees 96%" because it
-  passes nearly everything, and the 4% it misses are exactly the failures you built it to catch.
+- **Reading a rows-as-actual matrix with the predictions-as-rows convention.** FP and FN swap. Symptom:
+  precision and recall exchange values, and "the model misses everything" turns into "the model over-flags".
+- **Reporting accuracy on an imbalanced table.** Symptom: a model with 97.7% accuracy that loses to the
+  constant classifier at 99%.
+- **Omitting `labels=` when a class is absent from `y_true` or `y_pred`.** The matrix silently shrinks or
+  reorders and `.ravel()` unpacks the wrong cells, so every derived metric uses the wrong numbers.
+- **Treating the matrix at threshold 0.5 as "the" performance of a probabilistic model.** Symptom: a model
+  declared to have terrible recall when nobody tried a lower threshold.
+- **Collapsing a multi-class matrix into macro-F1 before looking at confused pairs.** Symptom: weeks spent
+  adding data to a class whose errors come from label ambiguity with its neighbour.
+- **Scoring an LLM judge only by agreement rate.** Symptom: a judge that "agrees 96%" because it passes nearly
+  everything, and the 4% it misses are exactly the failures you built it to catch.
 
 ## When to use
-Every time you evaluate a classifier, before any single-number metric, and every time someone quotes
-one: ask for the table and the prevalence. It matters most where error costs are asymmetric (fraud,
-safety, medical triage), where classes are imbalanced, and where the "classifier" is an LLM: an intent
-router, a guardrail, a feedback classifier or a judge scored against human labels. In day-to-day work
-it is the first artefact of error analysis and the thing you put in front of a stakeholder to turn
-"the model is wrong" into "it confuses A with B". In interviews, expect to derive precision, recall,
-specificity and FPR from a table, to explain why accuracy misleads on rare classes, and to know which
-axis is which in the library you claim to use.
+- **Always first:** every time you evaluate a classifier, before any single-number metric, and every time
+  someone quotes one, ask for the table and the prevalence.
+- **Matters most** where error costs are asymmetric (fraud, safety, medical triage), where classes are
+  imbalanced, and where the "classifier" is an LLM: an intent router, a guardrail, a feedback classifier or a
+  judge scored against human labels.
+- **Day to day:** it is the first artefact of error analysis and what you put in front of a stakeholder to turn
+  "the model is wrong" into "it confuses A with B".
+- **Interviews:** derive precision, recall, specificity and FPR from a table, explain why accuracy misleads on
+  rare classes, and know which axis is which in the library you claim to use.
 
 ## Role lens
 - **Engineer:** Puts `confusion_matrix(y, ŷ, labels=...)` and the row-normalised multi-class plot into
@@ -221,6 +300,41 @@ wrongly removing 400 legitimate posts (precision 0.5). The PM sees the aggregate
 the FN cell, and the appeals team will see the FP cell. Report the four counts with the prevalence,
 then recall at a fixed false-positive budget (or precision and recall at a threshold chosen on
 validation), and compare candidate models with MCC or the precision–recall curve rather than accuracy.
+
+## Interview questions
+### Draw a binary confusion matrix and derive precision, recall, specificity and FPR from it.
+- **Layout (scikit-learn):** rows actual, columns predicted, so [[TN, FP], [FN, TP]] for labels [0, 1].
+- **Row rates:** recall = TP / (TP + FN), specificity = TN / (TN + FP), FPR = 1 − specificity; they condition on
+  the truth and ignore prevalence.
+- **Column rate:** precision = TP / (TP + FP); it conditions on the prediction, so it falls when positives get rarer.
+
+### Your intent router's recall on "cancel" is 0.55. How do you debug it?
+- **Read the row:** find where the missing cancellations went; one heavy cell such as cancel → refund points to
+  a pair problem, not a data-volume problem.
+- **Inspect those examples** for overlapping definitions or inconsistent labels.
+- **Fix locally:** merge the intents, relabel, add a disambiguation rule or clearer prompt wording for that
+  pair, then re-check the row.
+
+### Two models have different error mixes. How do you choose between them?
+- **Agree a cost matrix with the product owner,** then compare expected cost = Σ count × cost at each model's
+  chosen threshold.
+- **If prices are uncertain,** sweep the cost ratio and show where the verdict flips, as with the fraud screen
+  that beats "never flag" only above roughly a 2.9:1 miss-to-false-decline cost ratio.
+- **Avoid** accuracy or F1 as tie-breakers, because each hides a fixed cost ratio.
+
+### When is MCC a better headline than F1 or accuracy?
+- **When both classes matter:** MCC uses all four cells, while F1 ignores TN and changes if you relabel the
+  positive class.
+- **On imbalanced data:** a constant classifier scores 0 MCC but high accuracy; the fraud screen above has
+  accuracy 0.977 yet MCC about 0.42.
+- **Not when** the product only cares about the positive class at a fixed review budget; then report recall
+  and precision at that point.
+
+### An LLM judge agrees with humans 96% of the time. Is it good?
+- **Ask for the matrix:** if failures are about 4% of outputs, a judge that passes everything also agrees about 96%.
+- **Look at the FP cell** (failures passed) and compute recall on the failure class; that is the number the
+  judge exists for.
+- **Re-check per release,** because a prompt or model change can move errors between the FP and FN cells.
 
 ## Quiz
 ### Q: In scikit-learn's `confusion_matrix(y_true, y_pred)` with labels [0, 1], which cell holds the false negatives?

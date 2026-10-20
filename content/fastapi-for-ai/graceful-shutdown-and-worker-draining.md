@@ -106,6 +106,29 @@ strategies, in order of robustness:
 - **Fix:** exec form (`CMD ["uvicorn", ...]`), `exec` in an entrypoint script, or an init process such as
   tini.
 
+## Diagram
+Read it top to bottom as one grace budget: preStop, then SIGTERM and drain, then lifespan cleanup, all
+of which must finish before SIGKILL arrives at the end of `terminationGracePeriodSeconds`.
+
+```mermaid
+sequenceDiagram
+    participant K as Kubelet
+    participant LB as Load balancer
+    participant U as Uvicorn worker
+    participant A as App lifespan
+    K->>U: preStop hook runs, grace clock starts
+    U->>LB: readiness returns 503 via drain flag
+    LB-->>U: stops routing new requests
+    K->>U: SIGTERM after preStop returns
+    Note over U: close listening socket, finish in-flight requests
+    U-->>U: streams past cutoff send event reconnect
+    Note over U: bounded by the Uvicorn graceful shutdown timeout
+    U->>A: run code after yield
+    Note over A: close HTTP pool, dispose engine, flush telemetry
+    A-->>K: process exits before the deadline
+    K->>U: SIGKILL only if still running at grace end
+```
+
 ## Examples
 ### Worked timeline: SSE chat on a rolling deploy
 Answers take up to 50 seconds. **Defaults first:** grace 30 s, no preStop, Uvicorn waits indefinitely.
@@ -279,6 +302,41 @@ missing. I would check the entrypoint uses exec form so the signal reaches Uvico
 sleep for endpoint propagation, raise `terminationGracePeriodSeconds` to cover the longest answer plus
 cleanup, bound Uvicorn's `--timeout-graceful-shutdown` below that, and send a reconnect event when a stream
 must be cut. Very long generations should become resumable or move to a job queue.
+
+## Interview questions
+### What does graceful shutdown mean for a FastAPI worker, and why does it matter more for LLM services?
+- **Definition:** on SIGTERM the worker stops taking new traffic, finishes in-flight requests within a
+  bound, runs lifespan cleanup and exits before SIGKILL.
+- **Why it matters more:** a cut CRUD call is retried in 50 ms, but a cut LLM stream loses a 40-second
+  answer, and a killed agent run loses paid tool calls or leaves half-done side effects.
+
+### Every pod shutdown takes exactly 30 seconds and the app logs nothing. What do you check?
+- **Suspect the signal never arrived:** a shell-form `CMD` makes `/bin/sh -c` PID 1, and the shell does
+  not forward SIGTERM, so the kubelet waits out the grace period and sends SIGKILL.
+- **Confirm** by checking the Dockerfile and the process tree inside the container.
+- **Fix** with exec form (`CMD ["uvicorn", ...]`), `exec` in the entrypoint script, or tini as PID 1.
+
+### How do you size terminationGracePeriodSeconds for a chat service whose answers take up to 50 seconds?
+- **Use the budget:** grace ≥ preStop delay + longest request you intend to finish + cleanup time.
+- **With illustrative numbers:** a 5 s preStop, `--timeout-graceful-shutdown 60` and a few seconds of
+  cleanup give grace 75, so the server, not SIGKILL, decides what is cut.
+- **Check against data:** compare request-duration p99 with the drain timeout and alert when long requests
+  approach it.
+
+### When would you stop raising the grace period and redesign instead?
+- **When answers or agent runs approach minutes:** a long grace slows every rollout and scale-down
+  proportionally.
+- **Redesign options, most robust first:** move the work to a durable queue that returns a job id, make
+  streams resumable from persisted progress, or end streams cleanly with a reconnect event.
+- **Side effects force the queue:** runs that create tickets or send emails need checkpoints between tool
+  calls.
+
+### Your dashboard shows a burst of 502s in the first second of every rolling deploy. Why, and what is the fix?
+- **SIGTERM and endpoint removal happen in parallel on Kubernetes,** so for a short window traffic still
+  arrives after the server has stopped listening.
+- **Fix:** a `preStop` delay of a few seconds, which holds SIGTERM until endpoints update, plus a readiness
+  flip for external balancers that poll `/readyz`.
+- **Budget it:** the hook's duration comes out of the same grace period.
 
 ## Quiz
 ### Q: Why do new requests sometimes fail at the very start of a rolling deploy even though the app drains correctly?

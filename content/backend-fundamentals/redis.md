@@ -5,7 +5,7 @@ name: Redis
 kind: tool
 difficulty: core
 est_minutes: 15
-status: reviewed
+status: crisp
 related:
   - fastapi-for-ai/redis-caching
   - node-ts-for-ai/redis
@@ -21,109 +21,142 @@ sources:
 ---
 
 ## TL;DR
-Redis is an in-memory data-structure server: strings, hashes, lists, sets, sorted sets and streams,
-addressed by key, with every command executed atomically on a single thread. That combination makes it
-the default place for the fast, shared, short-lived state a backend needs (caches, rate limits, locks,
-sessions, queues) at the cost of memory-sized data and durability that is weaker than a database unless
-you configure and accept the trade.
+Redis is an in-memory data-structure server whose commands run atomically on one thread. That makes it
+the default home for shared, short-lived state (caches, rate limits, locks, sessions, queues), at the cost
+of memory-sized data and weaker durability than a database.
 
 ## Why it exists
-Every multi-instance backend needs some state that is shared across processes and read far more often
-than it changes: the cached answer to an expensive call, the count of requests a client made this minute,
-who currently holds a lock, the session for a logged-in user. Putting that in the primary database works
-until it does not: a relational database stores rows on disk with transaction logging and MVCC, so a
-simple counter increment costs a write-ahead-log append and a row version, and ten thousand increments a
-second from a rate limiter compete with real transactions for the same CPU and I/O. Keeping it in process
-memory is fast but wrong as soon as there are two processes, because each has its own copy and a load
-balancer sends consecutive requests to different ones.
-
-The naive middle ground, a plain key-value cache like memcached, solves the shared-lookup problem but
-offers only get and set, so anything that needs structure, such as "add this item to the user's
-sorted-by-time list and trim it to 100", becomes a read-modify-write race between two servers. Redis
-exists to make those operations single, atomic commands on rich data structures, executed in memory
-with sub-millisecond latency, and to add just enough persistence, replication and clustering that it can
-be trusted with more than a cache. In AI backends it ends up holding response caches keyed by prompt
-hash, per-tenant token-rate limits, semaphores that cap concurrent model calls, and the broker behind
-job queues.
+- **Backends need shared, hot state.** The cached answer to an expensive call, requests a client made this
+  minute, who holds a lock, a logged-in user's session: shared across processes and read far more than written.
+- **The primary database is the wrong place.** Rows on disk with transaction logging and MVCC mean a
+  counter increment costs a write-ahead-log append and a row version; ten thousand increments a second
+  from a rate limiter compete with real transactions for CPU and I/O.
+- **Process memory is wrong with two processes.** Each has its own copy, and a load balancer sends
+  consecutive requests to different ones.
+- **A plain key-value cache is too thin.** Memcached offers only get and set, so "add this item to the
+  user's sorted-by-time list and trim it to 100" becomes a read-modify-write race between two servers.
+- **Redis makes those single atomic commands** on rich structures, in memory with sub-millisecond latency,
+  plus enough persistence, replication and clustering to trust it with more than a cache. In AI backends
+  it holds response caches keyed by prompt hash, per-tenant token-rate limits, semaphores capping
+  concurrent model calls, and the broker behind job queues.
 
 ## How it works
 ### Data structures, not just values
-Each key maps to one typed value: a **string** (also used for integers, with `INCR`), a **hash** (field
-to value map, good for an object), a **list** (push/pop at either end: a queue), a **set** and **sorted
-set** (members with a score, kept ordered: leaderboards, sliding windows, scheduled jobs), and a
-**stream** (an append-only log with consumer groups, the closest thing to Kafka inside Redis). Separately,
-**pub/sub** broadcasts a message to whoever is subscribed at that instant and stores nothing, so a
-subscriber that is disconnected for a second misses what was published in that second; it suits live
-notifications (push a token stream to whichever web node holds the user's socket), never work that must
-be done. Commands
-operate on the structure in place, so "push onto the list and trim it" is two commands rather than a
-round trip to fetch, modify and write back. Keys can carry a TTL, after which they are deleted; TTLs are
-how caches and rate-limit windows expire without a cleanup job.
+Each key maps to one typed value:
+
+| Type | What it is | Typical use |
+|---|---|---|
+| **string** | bytes, also integers with `INCR` | counters, cached blobs |
+| **hash** | field-to-value map | an object |
+| **list** | push/pop at either end | a queue |
+| **set** / **sorted set** | members; sorted sets keep members ordered by a score | leaderboards, sliding windows, scheduled jobs |
+| **stream** | append-only log with consumer groups | the closest thing to Kafka inside Redis |
+
+- **Commands operate in place,** so "push onto the list and trim it" is two commands, not a round trip to
+  fetch, modify and write back.
+- **TTLs** delete a key after a set time; they are how caches and rate-limit windows expire without a
+  cleanup job.
+- **Pub/sub stores nothing.** It broadcasts to whoever is subscribed at that instant, so a subscriber
+  disconnected for a second misses that second. It suits live notifications (push a token stream to
+  whichever web node holds the user's socket), never work that must be done.
 
 ### Single-threaded execution is the point
-Commands are executed one at a time on a single thread (newer versions use extra threads for network
-I/O, but command execution stays serialized). That is why every command is atomic with no locking, and
-why `INCR`, `SET ... NX`, `ZADD` and friends can be used as the primitives of counters, locks and
-schedulers across many application servers. It is also why one slow command (`KEYS *`, a huge `SMEMBERS`,
-a long Lua script) stalls every client. For multi-command atomicity there are `MULTI`/`EXEC` transactions
-and Lua scripts, which run as a single unit on the server.
+- **Commands run one at a time on a single thread.** Newer versions use extra threads for network I/O,
+  but command execution stays serialized.
+- **So every command is atomic with no locking,** which is why `INCR`, `SET ... NX`, `ZADD` and friends
+  are the primitives of counters, locks and schedulers across many application servers.
+- **And one slow command stalls every client:** `KEYS *`, a huge `SMEMBERS`, a long Lua script.
+- **Multi-command atomicity** comes from `MULTI`/`EXEC` transactions and Lua scripts, which run as a single
+  unit on the server.
 
 ### Persistence and what "durable" means here
-Redis is memory-first; persistence is a configuration choice. **RDB** writes periodic snapshots, cheap
-but losing everything since the last snapshot on a crash. **AOF** appends every write to a log, and its
-`fsync` policy decides the window of loss (every write, every second, or left to the OS). Neither makes
-Redis a system of record: treat data in Redis as rebuildable, or at least as acceptable to lose a second
-of, and put anything that must survive in a database.
+| Mode | How | Loss on crash |
+|---|---|---|
+| **RDB** | periodic snapshots, cheap | everything since the last snapshot |
+| **AOF** | appends every write to a log | set by its `fsync` policy: every write, every second, or left to the OS |
+
+Neither makes Redis a system of record. Treat its data as rebuildable, or at least acceptable to lose a
+second of, and put anything that must survive in a database.
 
 ### Memory limits and eviction
-`maxmemory` caps the dataset; when it is reached, the eviction policy decides what happens:
-`noeviction` (writes fail), `allkeys-lru` (evict least recently used anything), `volatile-lru` and
-`volatile-ttl` (evict only keys with a TTL), plus LFU and random variants. LRU is approximated by sampling
-a few keys rather than tracking exact order. A cache wants `allkeys-lru` or `allkeys-lfu`; a queue or lock
-store wants `noeviction`, because evicting a job silently is worse than failing loudly. `maxmemory` and
-the policy apply to the whole instance, including every numbered logical database, which is why mixing a
-cache and a queue in one instance is a design error.
+`maxmemory` caps the dataset; when reached, the eviction policy decides:
+
+| Policy | Behaviour | Fits |
+|---|---|---|
+| `noeviction` | writes fail | queues and lock stores, because evicting a job silently is worse than failing loudly |
+| `allkeys-lru` / `allkeys-lfu` | evict least recently / least frequently used of any key | caches |
+| `volatile-lru`, `volatile-ttl` | evict only keys with a TTL | mixed instances (with care) |
+| random variants | evict at random | rarely |
+
+- **LRU is approximated** by sampling a few keys rather than tracking exact order.
+- **Policy is instance-wide.** `maxmemory` and the policy cover every numbered logical database, which is
+  why mixing a cache and a queue in one instance is a design error.
 
 ### Replication, Sentinel and Cluster
-A primary replicates asynchronously to replicas; Sentinel monitors and promotes a replica on failure.
-Because replication is asynchronous, a failover can lose the last writes, which matters for locks and
-queues. Redis Cluster shards keys across nodes by hashing the key into 16,384 slots; multi-key commands
-then only work when all keys hash to the same slot, which you control with hash tags such as
-`{tenant42}:limit`. Managed offerings (ElastiCache, Memorystore, Upstash, Redis Cloud) run these for you.
-Note that Redis changed its licence in 2024 (to source-available terms) and the Linux Foundation fork
-Valkey appeared; Redis 8 in 2025 added AGPLv3 as an option. The core commands are the same, but newer
-features diverge, so check which one your platform ships.
+- **Asynchronous replication.** A primary replicates to replicas; Sentinel monitors and promotes one on
+  failure. A failover can lose the last writes, which matters for locks and queues.
+- **Cluster sharding.** Keys hash into 16,384 slots spread across nodes. Multi-key commands work only when
+  all keys hash to the same slot, controlled with hash tags such as `{tenant42}:limit`.
+- **Managed offerings** (ElastiCache, Memorystore, Upstash, Redis Cloud) run these for you.
+- **Licensing.** Redis changed its licence in 2024 (to source-available terms) and the Linux Foundation
+  fork Valkey appeared; Redis 8 in 2025 added AGPLv3 as an option. Core commands match, newer features
+  diverge, so check which one your platform ships.
 
 ### The patterns that matter in AI backends
-- **Cache-aside:** look up `cache:{model}:{sha256(prompt+params)}`; on miss, call the model, `SET` with
+- **Cache-aside:** look up `cache:{model}:{sha256(prompt+params)}`; on miss, call the model and `SET` with
   a TTL. Only safe when the call is deterministic enough for your use (temperature 0, or you accept a
   stored sample).
-- **Rate limiting:** `INCR` a per-tenant-per-window key and set its TTL on first increment. Atomic, so it
-  is correct across all servers, but a *fixed* window lets a client spend its whole limit in the last
-  second of one window and again in the first second of the next: up to 2× the limit in two seconds.
-  When that burst matters, keep a sorted set of request timestamps per client (`ZREMRANGEBYSCORE` the
-  expired ones, `ZCARD`, `ZADD`, in one script) for an exact sliding window, at one entry of memory per
-  request, or weight the previous window's count to approximate one in constant memory.
+- **Fixed-window rate limiting:** `INCR` a per-tenant-per-window key and set its TTL on first increment.
+  Atomic, so correct across all servers, but a client can spend its whole limit in the last second of one
+  window and again in the first second of the next: up to 2× the limit in two seconds.
+- **Sliding-window rate limiting:** when that burst matters, keep a sorted set of request timestamps per
+  client (`ZREMRANGEBYSCORE` the expired ones, `ZCARD`, `ZADD`, in one script) for an exact window, at
+  one entry of memory per request; or weight the previous window's count to approximate one in constant memory.
 - **Concurrency semaphore:** cap concurrent calls to a model provider with a counter bounded by a Lua
   script, so a burst does not trip the provider's limits.
-- **Locks:** `SET lock:key token NX PX 30000` acquires only if absent and expires if the holder dies.
-  Release by checking the token in a Lua script, *because* a plain `DEL` from a holder whose lease
-  already expired would delete the next holder's lock. Expiry means a slow holder can lose the lock while
-  still working, so protected resources need a fencing token if correctness matters: a number from `INCR`
-  issued with each acquisition, which the resource stores and uses to reject writes carrying an older one.
-  Redlock (acquiring on a majority of independent nodes) addresses losing the lock on failover, but its
-  safety under clock drift and process pauses is disputed (Kleppmann's critique is the usual reference),
-  so treat Redis locks as an efficiency mechanism, not a correctness guarantee, unless fenced.
-- **Queues and streams:** lists for simple job queues (`LPUSH`/`BRPOP`), streams with consumer groups
-  for acknowledged, replayable delivery; BullMQ, Celery and RQ build on these.
+- **Queues and streams:** lists for simple job queues (`LPUSH`/`BRPOP`); streams with consumer groups for
+  acknowledged, replayable delivery. BullMQ, Celery and RQ build on these.
 
-## Example
-Three primitives in redis-py: an LLM response cache, a fixed-window rate limiter made atomic with a Lua
-script, and a lock with a safe release. The script runs server-side so the increment and the TTL cannot
-be separated by a crash: with two client calls, a process that dies after `INCR` and before `EXPIRE`
-leaves a key with no TTL, and that tenant is rate-limited forever once it reaches the limit. The cache key
-hashes every parameter that changes the output, because two requests that differ only in temperature or
-system prompt must not share an entry.
+### Locks, and why they need fencing
+1. **Acquire:** `SET lock:key token NX PX 30000` succeeds only if absent and expires if the holder dies.
+2. **Release by checking the token** in a Lua script, *because* a plain `DEL` from a holder whose lease
+   already expired would delete the next holder's lock.
+3. **Fence if correctness matters.** Expiry means a slow holder can lose the lock while still working. Issue
+   a number from `INCR` with each acquisition; the protected resource stores it and rejects writes carrying
+   an older one.
+4. **Redlock is disputed.** Acquiring on a majority of independent nodes addresses failover loss, but its
+   safety under clock drift and process pauses is contested (Kleppmann's critique is the usual reference).
+   Treat Redis locks as an efficiency mechanism, not a correctness guarantee, unless fenced.
+
+## Diagram
+One request path through Redis: an atomic rate-limit check first, then cache-aside with a short lock so
+only one caller pays for the model call on a miss.
+
+```mermaid
+flowchart TD
+    R["Incoming LLM request"] --> RL["EVAL rate script: INCR plus EXPIRE"]
+    RL --> O{"Over limit?"}
+    O -->|"yes"| X["Return 429"]
+    O -->|"no"| G["GET cache key from hash of params"]
+    G --> H{"Hit?"}
+    H -->|"yes"| A["Return cached answer"]
+    H -->|"no"| L["SET lock NX PX"]
+    L --> M["Call model provider"]
+    M --> S["SET cache key with TTL"]
+    S --> U["Release lock if token matches"]
+    U --> A
+```
+
+## Examples
+### Three primitives in redis-py
+An LLM response cache, a fixed-window rate limiter made atomic with a Lua script, and a lock with a safe
+release.
+
+- **Why the script:** it runs server-side so the increment and the TTL cannot be separated by a crash. With
+  two client calls, a process dying after `INCR` and before `EXPIRE` leaves a key with no TTL, and that
+  tenant is rate-limited forever once it reaches the limit.
+- **Why hash every parameter:** two requests that differ only in temperature or system prompt must not
+  share an entry.
 
 ```python
 import hashlib, json, redis, time, uuid
@@ -169,46 +202,107 @@ def with_lock(name, ttl_ms=30000):
         release_script(keys=[f"lock:{name}"], args=[token])   # only deletes if still ours
 ```
 
+### Runnable: the fixed-window burst, simulated
+Pure Python, no Redis needed. It replays 60 calls just before and 60 just after a minute boundary against
+both limiter designs, with a limit of 60 per minute.
+
+```python
+from collections import defaultdict, deque
+
+LIMIT, WINDOW = 60, 60.0                       # 60 requests per 60 s
+burst = [59.5] * 60 + [60.5] * 60              # 60 calls just before and just after the minute boundary
+
+def fixed_window(times):
+    counts, allowed = defaultdict(int), 0      # mirrors INCR on rl:{tenant}:{t // window}
+    for t in times:
+        counts[int(t // WINDOW)] += 1
+        allowed += counts[int(t // WINDOW)] <= LIMIT
+    return allowed
+
+def sliding_log(times):
+    log, allowed = deque(), 0                  # mirrors ZREMRANGEBYSCORE + ZCARD + ZADD
+    for t in times:
+        while log and log[0] <= t - WINDOW:
+            log.popleft()
+        if len(log) < LIMIT:
+            log.append(t); allowed += 1
+    return allowed
+
+print("fixed window allowed:", fixed_window(burst))   # 120 in one second: 2x the limit
+print("sliding log allowed: ", sliding_log(burst))    # 60
+```
+
+### Worked scenario: one hot key saturates one node
+A 5 MB cached response (say, a large shared document summary) is read 1,000 times a second in a cluster.
+
+| Quantity | Value |
+|---|---|
+| Bytes served per second from one key | 5 MB × 1,000 = ~5 GB/s |
+| In network terms | ~40 Gbit/s, from the single node owning that slot |
+| Other nodes | idle, because the key lives in exactly one slot |
+| Fixes | shrink the value, cache it in process memory for a few seconds, or replicate it under several keys |
+
+The arithmetic is illustrative, but the shape is common: one node's network saturates while the cluster
+looks underused.
+
+## Production patterns
+- **One instance per role.** Run the cache with `maxmemory-policy allkeys-lfu` (or `allkeys-lru`) and TTLs
+  on every key; run queues and locks on a separate instance with `noeviction` and `appendonly yes` plus
+  `appendfsync everysec`. Monitor `evicted_keys` and `used_memory` from `INFO`.
+- **Watch the slow log.** Set `slowlog-log-slower-than` (microseconds) and review `SLOWLOG GET` after
+  incidents; deny `@dangerous` commands such as `KEYS` and `FLUSHALL` to application users with an ACL.
+  Monitor command latency percentiles.
+- **Find big and hot keys.** Run `redis-cli --bigkeys` periodically and `MEMORY USAGE key` on suspects;
+  `--hotkeys` works when an LFU policy is set. Monitor per-node network throughput in a cluster.
+- **Stampede protection on popular cache keys.** On a miss, take a short `SET ... NX PX` lock so one caller
+  regenerates while others wait briefly or serve a stale copy, and add jitter to TTLs so keys do not expire
+  together. Monitor hit ratio from `keyspace_hits` and `keyspace_misses`.
+- **Pool connections.** Create one `redis.ConnectionPool` (or client) per process at startup, with a
+  bounded `max_connections`, rather than a client per request. Monitor `connected_clients` and handshake
+  latency.
+
 ## Trade-offs
-- Sub-millisecond operations in memory versus a dataset that must fit in RAM; when the working set
-  exceeds memory, either eviction or a move to a disk-based store is forced.
-- AOF with fsync every write approaches database durability but cuts throughput; fsync every second is
-  the usual compromise, accepting up to a second of loss on a crash.
-- Lua scripts and `MULTI` give atomicity across commands, but a long script blocks every other client;
-  the trade flips to application-side logic when the script would touch thousands of keys.
-- Cluster mode scales memory and throughput across nodes, but multi-key operations require hash tags and
-  cross-slot transactions are unavailable, which complicates scripts written for a single node.
-- Expiring locks never deadlock after a crash, but they can be lost by a slow holder; adding fencing
-  tokens restores safety at the cost of making the protected resource check the token.
-- Using Redis as a queue is simple and fast, but asynchronous replication and eviction can drop jobs;
-  when loss is unacceptable, a durable broker or a database-backed queue is the better trade.
+- **Speed vs RAM-sized data.** Sub-millisecond operations in memory, but the dataset must fit in RAM;
+  when the working set exceeds memory, eviction or a move to a disk-based store is forced.
+- **Durability vs throughput.** AOF with fsync every write approaches database durability but cuts
+  throughput; fsync every second is the usual compromise, accepting up to a second of loss on a crash.
+- **Atomic scripts vs blocking.** Lua scripts and `MULTI` give atomicity across commands, but a long script
+  blocks every other client; flip to application-side logic when a script would touch thousands of keys.
+- **Cluster scale vs multi-key ops.** Cluster mode scales memory and throughput, but multi-key operations
+  need hash tags and cross-slot transactions are unavailable, complicating single-node scripts.
+- **Expiring locks vs exclusivity.** They never deadlock after a crash but a slow holder can lose them;
+  fencing tokens restore safety at the cost of making the protected resource check the token.
+- **Redis queue simplicity vs loss.** Simple and fast, but asynchronous replication and eviction can drop
+  jobs; when loss is unacceptable, a durable broker or database-backed queue is the better trade.
 
 ## Pitfalls
-- Running `KEYS *` or a huge `SMEMBERS` in production; the symptom is every client stalling for seconds
-  while the single thread walks the keyspace. Use `SCAN`.
-- Caching without a TTL or a sensible eviction policy; the symptom is memory growth until `maxmemory`
-  and then either write failures (`noeviction`) or surprising evictions of non-cache keys.
-- Sharing one instance between cache and queue; the symptom is jobs vanishing under memory pressure
-  because `allkeys-lru` evicted them.
-- Setting a lock without an expiry; the symptom is a permanent "busy" after one worker crashes mid-task.
-- Treating a lock with expiry as exclusive without fencing; the symptom is two workers writing the same
-  resource after a GC pause or slow model call exceeded the TTL.
-- Hot keys and large values (a 5 MB cached response read 1,000 times a second); the symptom is one node
-  saturating its network while others idle.
-- Opening a new connection per request instead of pooling; the symptom is connection-count spikes and
-  latency dominated by handshakes.
-- Cache stampede when a popular key expires; the symptom is a burst of identical provider calls at the
-  same second. Use a short lock or early refresh on the miss path.
+- **Running `KEYS *` or a huge `SMEMBERS` in production.** Symptom: every client stalls for seconds while
+  the single thread walks the keyspace. Use `SCAN`.
+- **Caching without a TTL or sensible eviction policy.** Symptom: memory grows until `maxmemory`, then write
+  failures (`noeviction`) or surprising evictions of non-cache keys.
+- **Sharing one instance between cache and queue.** Symptom: jobs vanish under memory pressure because
+  `allkeys-lru` evicted them.
+- **Setting a lock without an expiry.** Symptom: a permanent "busy" after one worker crashes mid-task.
+- **Treating an expiring lock as exclusive without fencing.** Symptom: two workers write the same resource
+  after a GC pause or slow model call exceeded the TTL.
+- **Hot keys and large values** (a 5 MB cached response read 1,000 times a second). Symptom: one node
+  saturates its network while others idle.
+- **A new connection per request instead of pooling.** Symptom: connection-count spikes and latency
+  dominated by handshakes.
+- **Cache stampede when a popular key expires.** Symptom: a burst of identical provider calls in the same
+  second. Use a short lock or early refresh on the miss path.
 
 ## When to use
-Use Redis for state that is shared across processes, read-heavy or counter-shaped, and rebuildable or
-tolerable to lose: caches, rate limits, semaphores, sessions, short-lived coordination, and simple job
-queues where occasional loss is acceptable. Do not use it as the system of record for conversations,
-billing or anything you cannot recompute; use PostgreSQL for that and put Redis in front. Before adding
-it, confirm that the database genuinely cannot carry the load (a rate limit on a few hundred requests per
-second may be fine in PostgreSQL). Watch memory usage, evicted keys, hit ratio and slow-log entries. In
-interviews, be ready to explain why single-threaded execution makes `INCR` a correct distributed counter,
-and where an expiring lock is unsafe.
+- **Use when:** state is shared across processes, read-heavy or counter-shaped, and rebuildable or
+  tolerable to lose: caches, rate limits, semaphores, sessions, short-lived coordination, and simple job
+  queues where occasional loss is acceptable.
+- **Avoid when:** it would be the system of record for conversations, billing or anything you cannot
+  recompute; use PostgreSQL for that and put Redis in front.
+- **Check first:** confirm the database genuinely cannot carry the load (a rate limit on a few hundred
+  requests per second may be fine in PostgreSQL).
+- **Measure:** memory usage, evicted keys, hit ratio and slow-log entries.
+- **Interviews:** explain why single-threaded execution makes `INCR` a correct distributed counter, and
+  where an expiring lock is unsafe.
 
 ## Role lens
 - **Engineer:** Implements cache-aside, rate limiting and semaphores with atomic commands or Lua, sets
@@ -232,6 +326,38 @@ error. The fix is separation into two instances: numbered logical databases do n
 persistence, so running out of memory fails enqueues loudly instead of silently discarding work; the
 cache instance gets `allkeys-lru` and TTLs on every key. If loss is still unacceptable, move the queue to
 a durable broker or a database-backed queue.
+
+## Interview questions
+### Why is Redis fast, and what is the catch of its single-threaded model?
+- **In-memory structures plus serialized execution:** no disk on the hot path and no locks, so each
+  command is atomic and sub-millisecond.
+- **The catch:** one slow command (`KEYS *`, a huge `SMEMBERS`, a long Lua script) blocks every client, so
+  use `SCAN`, bound collection sizes and keep scripts short.
+
+### Design a per-tenant rate limiter for an LLM API running on 20 app servers.
+- **Shared counter in Redis,** because in-process counters split across servers. A Lua script does `INCR`
+  and sets `EXPIRE` on the first hit so a crash cannot leave a key without a TTL.
+- **Fixed window allows 2× bursts at boundaries;** if that matters, use a sorted-set sliding log in one
+  script, or a weighted two-window approximation in constant memory.
+- **Key by tenant and window,** and return 429 with a retry hint when over the limit.
+
+### Two workers both wrote to the same index while holding a Redis lock. How?
+- **The lease expired while the first worker was still busy** (a GC pause or slow model call longer than
+  `PX`), so the second worker acquired it legitimately.
+- **Fix:** issue a fencing token from `INCR` on each acquisition and have the index reject writes carrying
+  an older token; release with a token-checking script so nobody deletes another holder's lock.
+
+### When would you not put a queue in Redis?
+- **When losing a job is unacceptable.** Replication is asynchronous, so a failover can drop recent
+  writes, and an evicting policy can remove idle queue keys silently.
+- **Use** a durable broker or a database-backed queue instead; if you keep Redis, give the queue its own
+  instance with `noeviction` and AOF.
+
+### How would you size and monitor a Redis cache for LLM responses?
+- **Size:** average response size × distinct cached prompts within the TTL, plus overhead; set
+  `maxmemory` below the instance's RAM and an `allkeys-lfu` or `allkeys-lru` policy.
+- **Monitor:** hit ratio, evicted keys, memory usage, slow-log entries and per-node network for hot keys.
+  A falling hit ratio with rising evictions means the cache is too small or the TTL too long.
 
 ## Quiz
 ### Q: Why can a plain INCR in Redis be used as a correct rate-limit counter across many application servers?

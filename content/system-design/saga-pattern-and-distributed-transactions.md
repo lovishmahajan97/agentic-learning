@@ -5,7 +5,7 @@ name: Saga pattern & distributed transactions
 kind: pattern
 difficulty: advanced
 est_minutes: 17
-status: reviewed
+status: crisp
 related:
   - system-design/outbox-inbox-patterns
   - system-design/event-driven-architecture
@@ -23,116 +23,151 @@ sources:
 ---
 
 ## TL;DR
-A business operation spanning several services cannot be one ACID transaction, and two-phase commit
-blocks under coordinator failure and is unavailable across external APIs. A saga replaces it with a
-sequence of local transactions, each paired with a compensating action that undoes it. Sagas give
-atomicity and durability but not isolation, so you must order steps around the irreversible pivot, mark
-in-flight state and make every step idempotent. An agent calling several tools in sequence is a saga.
+A saga replaces one cross-service transaction with local transactions, each paired with a compensating
+action. It gives atomicity and durability but not isolation, so order steps around the irreversible pivot
+and make every step idempotent. An agent calling several tools is a saga.
 
 ## Why it exists
-Consider "place order": reserve stock in the inventory service, charge the card through a payment
-provider, create a shipment in logistics, and record the order. Each system has its own database and its
-own transaction. If the card charge succeeds and shipment creation fails, the customer has paid for
-nothing. Inside one database you would wrap all four in a transaction and roll back; across four systems
-there is no shared transaction to roll back.
-
-The textbook answer is **two-phase commit (2PC)**. A coordinator asks every participant to *prepare*
-(write the change durably and hold locks, promising it can commit), and only when all vote yes does it
-tell them to *commit*. 2PC does give atomicity, and it still lives inside many database clusters. It fails
-as a general tool for two reasons. First, it is **blocking**: if the coordinator crashes after participants
-have prepared, they must hold their locks until it returns, because committing or aborting unilaterally
-could disagree with the coordinator's decision. Rows stay locked for as long as the outage lasts.
-Second, it requires every participant to implement the prepare protocol; Stripe, Slack, Jira, a vector
-database and an LLM provider do not expose "prepare", so the step with the most consequential side
-effect is exactly the one that cannot participate. Availability also compounds: a 2PC commit needs every
-participant up at the same moment, which is the temporal coupling that event-driven designs try to
-remove.
-
-2PC is not dead, though; it has moved inside systems that can make its weak point safe. Spanner-style
-databases run 2PC across shards, but each participant and the coordinator is itself a replicated
-consensus group, so "the coordinator crashed" means a new leader of that group takes over with the
-decision already in its log and nobody blocks for long. The XA standard exposes 2PC across a database
-and a broker that both implement it, which works inside one organisation's infrastructure and still
-excludes every SaaS API. Three-phase commit adds a pre-commit round to avoid blocking under crash
-failures, but it can decide inconsistently under network partitions, so it is rarely deployed. The
-lesson: atomic commit across participants is available when you own all of them and replicate the
-coordinator; a business process across vendors is not that case.
-
-The saga, proposed in 1987 for long-lived database transactions, accepts that there is no global
-rollback and designs the undo explicitly instead. That design work, deciding what "undo a charge" means
-and when it is no longer possible, is the real content of the pattern.
+- **No shared transaction across systems.** "Place order" reserves stock in inventory, charges the card
+  through a payment provider, creates a shipment in logistics and records the order, each in its own
+  database. If the charge succeeds and the shipment fails, the customer has paid for nothing, and there is
+  no shared transaction to roll back.
+- **Two-phase commit (2PC) is blocking.** A coordinator asks every participant to *prepare* (write durably,
+  hold locks, promise it can commit), then tells them to *commit* once all vote yes. If the coordinator
+  crashes after prepare, participants must hold their locks until it returns, *because* deciding alone
+  could disagree with its decision. Rows stay locked for the whole outage.
+- **2PC excludes the riskiest participants.** Stripe, Slack, Jira, a vector database and an LLM provider
+  expose no "prepare", so the step with the most consequential side effect is exactly the one that cannot
+  join. Availability compounds too: every participant must be up at the same moment, the temporal coupling
+  event-driven designs try to remove.
+- **The saga designs the undo explicitly.** Proposed in 1987 for long-lived database transactions, it
+  accepts that there is no global rollback. Deciding what "undo a charge" means, and when undo is no longer
+  possible, is the real content of the pattern.
 
 ## How it works
+### Where 2PC still lives
+2PC is not dead; it moved inside systems that can make its weak point safe.
+
+| Variant | How it copes with the coordinator problem | Limit |
+|---|---|---|
+| Spanner-style databases | 2PC across shards, but each participant and the coordinator is a replicated consensus group; a new leader takes over with the decision already in its log | only inside that database |
+| XA standard | exposes 2PC across a database and a broker that both implement it | works inside one organisation's infrastructure; excludes every SaaS API |
+| Three-phase commit | adds a pre-commit round to avoid blocking under crash failures | can decide inconsistently under network partitions, so rarely deployed |
+
+- **The lesson:** atomic commit across participants is available when you own all of them and replicate the
+  coordinator. A business process across vendors is not that case.
+
 ### Structure
-A saga is a sequence of local transactions T₁ … Tₙ. Each Tᵢ commits on its own, in its own service.
-For every Tᵢ that may need undoing there is a compensating transaction Cᵢ. If Tₖ fails, the saga runs
-Cₖ₋₁, Cₖ₋₂, … C₁ in reverse order. The end state is either "all Tᵢ committed" or "every committed Tᵢ
-compensated", which is the saga's version of atomicity. Durability comes from each local commit plus a
-persisted saga log that records which step the saga has reached, *because* the coordinator process may
-crash between steps and must resume rather than restart. The log records intent before each step
-(`started charge_card`) and the outcome after (`done charge_card`): on recovery, a step with `started`
-but no `done` is exactly the unknown-outcome case below, and it is resolved by querying the participant
-with the step's idempotency key, never by assuming either answer.
+1. **Local transactions.** A saga is a sequence T₁ … Tₙ; each Tᵢ commits on its own, in its own service.
+2. **Compensations.** Every Tᵢ that may need undoing has a compensating transaction Cᵢ.
+3. **Failure path.** If Tₖ fails, the saga runs Cₖ₋₁, Cₖ₋₂, … C₁ in reverse order.
+4. **Saga atomicity.** The end state is either "all Tᵢ committed" or "every committed Tᵢ compensated".
+5. **Durability.** Each local commit plus a persisted saga log of which step the saga reached, *because* the
+   coordinator may crash between steps and must resume rather than restart.
+   - The log records intent before each step (`started charge_card`) and the outcome after
+     (`done charge_card`).
+   - On recovery, `started` with no `done` is the unknown-outcome case below: resolve it by querying the
+     participant with the step's idempotency key, never by assuming either answer.
 
 ### Compensation is semantic, not physical
-A rollback restores bytes; a compensation is a new business action that cancels the effect. "Charge
-card" is compensated by "refund", not by deleting the charge, and the refund is visible on the
-statement. "Reserve stock" is compensated by "release reservation". "Send email" has no compensation; at
-best you send a correction. This is why step ordering matters more in sagas than in transactions.
+- **A rollback restores bytes; a compensation is a new business action** that cancels the effect.
 
-A step can be made cheaper to undo by splitting it into a reservation and a confirmation, the
-**Try-Confirm-Cancel (TCC)** shape: *try* places a hold that expires on its own (a seat hold, a card
-authorisation), *confirm* turns it into the real effect at the end of the saga, and *cancel* releases it.
-Holding instead of acting means most compensations are "let the hold lapse or release it", which is
-invisible to the customer, *because* nothing irreversible happened until confirm. The cost is that the
-participant must support holds, and a hold's expiry must outlast the slowest path to confirm.
+| Step | Compensation | Visible to the customer? |
+|---|---|---|
+| Charge card | refund (not deleting the charge) | yes, on the statement |
+| Reserve stock | release reservation | no |
+| Send email | none; at best send a correction | yes |
+
+- **This is why step ordering matters more in sagas than in transactions.**
+
+### Try-Confirm-Cancel (TCC)
+Split a step into a reservation and a confirmation so it is cheaper to undo:
+1. **Try** places a hold that expires on its own (a seat hold, a card authorisation).
+2. **Confirm** turns it into the real effect at the end of the saga.
+3. **Cancel** releases it.
+
+- **Why it helps:** most compensations become "let the hold lapse or release it", invisible to the
+  customer, *because* nothing irreversible happened until confirm.
+- **Cost:** the participant must support holds, and a hold's expiry must outlast the slowest path to confirm.
 
 ### Compensatable, pivot and retriable steps
-Classify each step. **Compensatable** steps can be undone. The **pivot** is the step after which the saga
-can no longer be abandoned: the first action with no undo, such as a non-refundable booking or a message
-already delivered to a customer. Many payment flows treat the successful charge as the pivot even though
-refunds exist, because a refund is visible on the statement and costs fees. **Retriable** steps come after
-the pivot and are guaranteed to eventually succeed if retried (record the order, send the confirmation). The rule that falls out: put every step that might fail for
-business reasons (validation, stock check, fraud score) *before* the pivot, so compensation is rarely
-needed, and make everything after the pivot idempotent and retried forever, because you have promised
-the customer the outcome.
+| Class | Meaning | Examples |
+|---|---|---|
+| Compensatable | can be undone | seat hold, stock reservation |
+| Pivot | the first action with no undo; after it the saga can no longer be abandoned | non-refundable booking, message delivered to a customer |
+| Retriable | after the pivot; guaranteed to eventually succeed if retried | record the order, send the confirmation |
+
+- **Charges are often the pivot.** Many payment flows treat the successful charge as the pivot even though
+  refunds exist, *because* a refund is visible on the statement and costs fees.
+- **The ordering rule:** put every step that might fail for business reasons (validation, stock check,
+  fraud score) *before* the pivot, so compensation is rarely needed.
+- **After the pivot:** make everything idempotent and retried forever, *because* you have promised the
+  customer the outcome.
 
 ### No isolation
-Local transactions commit immediately, so other sagas and readers observe intermediate state. Garcia-Molina
-and Salem's original paper already states that other transactions can see a saga's partial results;
-Richardson summarises this as sagas being "ACD": atomicity, consistency and durability without
-isolation. Concrete anomalies: a **lost update** when
-another saga modifies the same order between a step and its compensation; a **dirty read** when a
-dashboard shows an order as paid that is about to be refunded. Countermeasures named in Richardson's
-treatment: a **semantic lock** (write `status = PENDING` so other logic treats the record as in flight),
-**commutative updates** (debit/credit rather than set-balance), the **pessimistic view** (reorder steps to
-shrink the window), **re-reading values** before acting, and a **version** check that rejects stale writes.
+- **Partial results are visible.** Local transactions commit immediately, so other sagas and readers see
+  intermediate state. Garcia-Molina and Salem's original paper already states this; Richardson summarises
+  sagas as "ACD": atomicity, consistency and durability without isolation.
+- **Lost update:** another saga modifies the same order between a step and its compensation.
+- **Dirty read:** a dashboard shows an order as paid that is about to be refunded.
+
+Countermeasures named in Richardson's treatment:
+
+| Countermeasure | What it does |
+|---|---|
+| **Semantic lock** | write `status = PENDING` so other logic treats the record as in flight |
+| **Commutative updates** | debit/credit rather than set-balance |
+| **Pessimistic view** | reorder steps to shrink the window |
+| **Re-reading values** | re-check before acting |
+| **Version** check | reject stale writes |
 
 ### Coordination styles
-In **choreography**, each service listens for the previous step's event and emits its own; compensation
-is triggered by failure events. It needs no central component but scatters the saga's logic across
-services. In **orchestration**, a saga orchestrator holds the state machine, sends commands, waits for
-replies and runs compensations. Beyond a handful of steps, or whenever someone must answer "which step is
-order 42 stuck on", orchestration wins. Durable-execution engines (Temporal and similar) are orchestrators
-with the saga log built in: your code is replayed from the log after a crash and the compensation list is
-ordinary code.
+- **Choreography:** each service listens for the previous step's event and emits its own; failure events
+  trigger compensation. No central component, but the saga's logic is scattered across services.
+- **Orchestration:** a saga orchestrator holds the state machine, sends commands, waits for replies and runs
+  compensations. Beyond a handful of steps, or whenever someone must answer "which step is order 42 stuck
+  on", orchestration wins.
+- **Durable-execution engines** (Temporal and similar) are orchestrators with the saga log built in: your
+  code is replayed from the log after a crash, and the compensation list is ordinary code.
 
 ### Unknown outcomes
-A step that times out has an unknown result: the charge may or may not have happened. Compensating
-blindly can refund a charge that never occurred. The correct move is to query the participant with the
-step's idempotency key before deciding, which means every step must be issued with such a key. Timeouts
-turn into a reconciliation step, not an error branch.
+- **A timeout is not a failure.** The charge may or may not have happened.
+- **Compensating blindly is wrong** because it can refund a charge that never occurred.
+- **Query first:** ask the participant with the step's idempotency key before deciding, which means every
+  step must be issued with such a key. Timeouts become a reconciliation step, not an error branch.
 
 ### Agents are sagas
-An agent that creates a Jira ticket, posts to Slack and emails a customer is executing T₁, T₂, T₃ with
-no transaction. Tool adapters should expose compensations where they exist (close ticket, delete
-message), the orchestrator should place irreversible tools after a pivot, and approval gates belong
-exactly at the pivot.
+- An agent that creates a Jira ticket, posts to Slack and emails a customer is executing T₁, T₂, T₃ with no
+  transaction.
+- **Tool adapters** should expose compensations where they exist (close ticket, delete message).
+- **The orchestrator** should place irreversible tools after a pivot, and **approval gates** belong exactly
+  at the pivot.
 
-## Example
-A small orchestrator: steps run forward, each with an idempotency key derived from the saga id and step
-name, and committed steps are compensated in reverse on failure. The persisted log is a list here; in
-production it is a table or a durable-execution engine's history.
+## Diagram
+An orchestrated saga: business checks come first, the pivot is gated, failures before the pivot unwind in
+reverse, and failures after it are retried forward.
+
+```mermaid
+flowchart TD
+    S["Start saga, write log"] --> T1["T1: hold seat"]
+    T1 --> T2["T2: fraud check"]
+    T2 --> T3["T3: charge card"]
+    T3 --> G{"Approval gate"}
+    G -->|"approved"| P["Pivot: book hotel"]
+    P --> R["Retriable: send itinerary"]
+    R -->|"fails"| R
+    R --> D["Completed"]
+    T2 -->|"declined"| C1["C1: release seat"]
+    T3 -->|"declined"| C1
+    T3 -.->|"timeout"| Q["Query participant by key"]
+    C1 --> X["Compensated"]
+```
+
+## Examples
+### Orchestrator with compensations and a pivot
+Steps run forward, each with an idempotency key derived from the saga id and step name, and committed
+steps are compensated in reverse on failure. The persisted log is a list here; in production it is a table
+or a durable-execution engine's history.
 
 ```python
 import logging
@@ -177,54 +212,132 @@ steps = [   # business failures first, the irreversible step as late as possible
 ]
 ```
 
-If `charge_card` is declined, the seat hold is released and the saga ends as `compensated`. If
-`send_itinerary` fails after the non-refundable hotel is booked, the orchestrator refuses to compensate
-and the caller re-runs the saga from the log; the idempotency keys make the hold, charge and booking
-no-ops on the second pass, so only the email is actually retried.
+- **Declined charge:** if `charge_card` is declined, the seat hold is released and the saga ends as
+  `compensated`.
+- **Failure after the pivot:** if `send_itinerary` fails after the non-refundable hotel is booked, the
+  orchestrator refuses to compensate and the caller re-runs the saga from the log.
+- **Why the re-run is safe:** the idempotency keys make the hold, charge and booking no-ops on the second
+  pass, so only the email is actually retried.
+
+### Runnable: reverse compensation with idempotent undo
+Self-contained fakes for a payment provider and an inventory service. The shipment step fails for a
+business reason, and each compensation is deliberately run twice to show that keyed undo is safe to retry.
+
+```python
+class Payments:
+    def __init__(self): self.charges, self.refunds = {}, {}
+    def charge(self, amount, key):
+        self.charges.setdefault(key, amount)        # same key => same charge, no double charge
+        return key
+    def refund(self, charge_id, key):
+        self.refunds.setdefault(key, self.charges[charge_id])   # same key => one refund
+
+class Stock:
+    def __init__(self): self.held = {}
+    def reserve(self, sku, key): self.held[key] = sku; return key
+    def release(self, hold_id, key): self.held.pop(hold_id, None)
+
+def ship(order, key):
+    raise ValueError("address rejected")            # business failure, outcome known
+
+pay, stock = Payments(), Stock()
+saga, done = "order-42", []
+steps = [("reserve", lambda: stock.reserve("sku-1", f"{saga}:reserve"),
+                     lambda r: stock.release(r, f"{saga}:reserve:undo")),
+         ("charge",  lambda: pay.charge(30, f"{saga}:charge"),
+                     lambda r: pay.refund(r, f"{saga}:charge:undo")),
+         ("ship",    lambda: ship("order-42", f"{saga}:ship"), None)]
+try:
+    for name, act, comp in steps:
+        done.append((name, act(), comp))
+except ValueError as e:
+    for name, result, comp in reversed(done):      # undo in reverse order
+        comp(result); comp(result)                  # run twice: a retried compensation
+    print("compensated:", e)
+print(stock.held, pay.charges, pay.refunds)
+# compensated: address rejected
+# {} {'order-42:charge': 30} {'order-42:charge:undo': 30}   one refund, not two
+```
+
+### Worked scenario: where the failure lands decides the outcome
+The travel saga above, failing at each step in turn.
+
+| Failure point | Committed so far | What the orchestrator does | Customer sees |
+|---|---|---|---|
+| Fraud check declines | seat hold | release hold | nothing |
+| Charge declined | seat hold | release hold | a declined payment |
+| Charge times out | seat hold, charge unknown | query payments by `order:charge_card` key, then refund or continue | nothing extra, if reconciled |
+| Hotel API fails cleanly | hold, charge | refund, release hold | a refund on the statement |
+| Itinerary email fails | hold, charge, hotel (pivot) | retry the email forward, never compensate | a delayed email |
+
+## Production patterns
+- **Durable-execution workflow as the saga log.** When a saga has more than a few steps, write it as a
+  workflow in an engine such as Temporal: after each activity succeeds, append its compensation to a list,
+  and in the failure handler run that list in reverse. Configure per-activity retry policies (bounded
+  attempts before the pivot, effectively unbounded after it). Monitor failed and long-running workflows.
+- **Authorise now, capture later.** Use the payment provider's two-step flow (for example a Stripe
+  PaymentIntent created with `capture_method="manual"`, captured at the end of the saga) so the charge is a
+  TCC hold until confirm. Monitor authorisations nearing expiry, because a slow approval can outlive them.
+- **Provider idempotency keys on every step.** Send the saga-derived key (`{saga_id}:{step}`) as the
+  provider's idempotency key (Stripe accepts an `Idempotency-Key` header) and as the lookup for
+  reconciliation after timeouts. Monitor the count of steps resolved by reconciliation.
+- **Semantic lock plus version column.** Write `status = PENDING` on the aggregate when the saga starts and
+  guard compensations with `UPDATE ... WHERE id = $1 AND version = $2`, so a compensation cannot silently
+  overwrite a human's edit. Monitor rejected stale writes and records stuck in `PENDING`.
+- **Stuck-saga reaper and repair queue.** A scheduled job finds sagas whose last log entry is older than a
+  threshold, resumes them, and after N attempts routes them to a human queue. Track saga completion rate,
+  compensation rate and manual-repair count.
 
 ## Trade-offs
-- Sagas keep every service available independently and need no shared lock manager, but they expose
-  intermediate state to other readers; when an invariant must never be observably violated, keep those
-  writes inside one database and one aggregate instead.
-- 2PC gives true atomicity with no application-level compensation code, yet it blocks on coordinator
-  failure and needs every participant to speak the protocol, which excludes external APIs and most
-  SaaS systems.
-- Orchestration centralises visibility and compensation logic at the cost of a component that every
-  service depends on; choreography removes that dependency but spreads the state machine across teams,
-  which flips in favour of orchestration as step count or compensation complexity grows.
-- Designing explicit compensations forces the business to decide what "undo" means, which is valuable
-  clarity, but some actions have no undo, and for those the only lever is ordering and approval gates.
-- Forward-only retry after the pivot guarantees completion without refunds, provided post-pivot steps
-  are idempotent and the retry budget is effectively unbounded, which requires a dead-letter path to a
-  human when a participant stays down.
+- **Independent availability vs visible intermediate state.** Sagas keep every service available on its own
+  and need no shared lock manager, but they expose intermediate state to other readers. When an invariant
+  must never be observably violated, keep those writes inside one database and one aggregate instead.
+- **2PC atomicity vs blocking and reach.** 2PC gives true atomicity with no application-level compensation
+  code, yet it blocks on coordinator failure and needs every participant to speak the protocol, which
+  excludes external APIs and most SaaS systems.
+- **Orchestration vs choreography.** Orchestration centralises visibility and compensation logic at the
+  cost of a component every service depends on. Choreography removes that dependency but spreads the state
+  machine across teams; it flips toward orchestration as step count or compensation complexity grows.
+- **Explicit compensations vs actions with no undo.** Designing compensations forces the business to decide
+  what "undo" means, which is valuable clarity, but some actions have no undo; for those the only levers
+  are ordering and approval gates.
+- **Forward-only retry vs a human escape hatch.** Retrying forward after the pivot guarantees completion
+  without refunds, provided post-pivot steps are idempotent and the retry budget is effectively unbounded,
+  which requires a dead-letter path to a human when a participant stays down.
 
 ## Pitfalls
-- Compensations that are not idempotent; a retried refund refunds twice, discovered when finance
-  reconciles payouts.
-- Compensating on timeout without querying the participant; refunds issued for charges that never
-  happened, or shipments created twice, visible as unexplained negative balances.
-- An irreversible step placed early; when a later validation fails there is nothing to compensate it
-  with, and the customer has an email or a ticket for an order that does not exist.
-- Ignoring isolation; a second saga (or a human in the admin panel) edits the record while the first is
-  mid-flight, and the compensation overwrites their change, surfacing as "the system reverted my edit".
-- No saga log or heartbeat; the orchestrator crashes between steps, nobody resumes, and orders sit in
-  `PENDING` until a customer complains.
-- Holds that expire before the saga confirms them; sagas that wait on a human approval or a slow
-  partner fail at confirm with "hold not found", and the seat or authorisation is gone.
-- Treating the LLM as a step that can be redone freely; re-running a non-deterministic step on retry
+- **Compensations that are not idempotent.** A retried refund refunds twice, discovered when finance
+  reconciles payouts. Fix: key every compensation (`{saga_id}:{step}:undo`).
+- **Compensating on timeout without querying the participant.** Refunds issued for charges that never
+  happened, or shipments created twice, visible as unexplained negative balances. Fix: reconcile by key.
+- **An irreversible step placed early.** When a later validation fails there is nothing to compensate it
+  with, and the customer has an email or a ticket for an order that does not exist. Fix: move it to the
+  pivot position.
+- **Ignoring isolation.** A second saga (or a human in the admin panel) edits the record mid-flight and the
+  compensation overwrites the change, surfacing as "the system reverted my edit". Fix: semantic lock and
+  version check.
+- **No saga log or heartbeat.** The orchestrator crashes between steps, nobody resumes, and orders sit in
+  `PENDING` until a customer complains. Fix: persisted log plus a reaper.
+- **Holds that expire before the saga confirms them.** Sagas that wait on a human approval or a slow partner
+  fail at confirm with "hold not found", and the seat or authorisation is gone. Fix: size expiry to the
+  slowest confirm path.
+- **Treating the LLM as a step that can be redone freely.** Re-running a non-deterministic step on retry
   produces different tool arguments, so the compensation keyed to the first attempt no longer matches.
+  Fix: persist the LLM's output in the log and replay it.
 
 ## When to use
-Use a saga whenever one business operation must update more than one service, database or external
-system and the operation can legitimately fail part-way. Do not use one when all the data can live in a
-single database and a local transaction suffices, which is the better design more often than microservice
-enthusiasm suggests. Before choosing, write down each step's compensation and its idempotency key; if a
-step has neither, it is your pivot and belongs as late as possible, possibly behind a human approval. In
-practice the pattern appears as a workflow definition in an orchestrator, as a `compensate` method on a
-tool adapter, or as a `status` column with `PENDING` values that other code must respect. Measure saga
-completion rate, compensation rate, time stuck per step and the count of sagas needing manual repair.
-In interviews, state why 2PC is unsuitable across heterogeneous services, define compensation versus
-rollback, and bring up the lack of isolation and the pivot step without prompting.
+- **Use when:** one business operation must update more than one service, database or external system and
+  can legitimately fail part-way.
+- **Avoid when:** all the data can live in a single database and a local transaction suffices, which is the
+  better design more often than microservice enthusiasm suggests.
+- **Before choosing:** write down each step's compensation and its idempotency key. A step with neither is
+  your pivot and belongs as late as possible, possibly behind a human approval.
+- **In practice:** a workflow definition in an orchestrator, a `compensate` method on a tool adapter, or a
+  `status` column with `PENDING` values that other code must respect.
+- **Measure:** saga completion rate, compensation rate, time stuck per step and the count of sagas needing
+  manual repair.
+- **Interviews:** state why 2PC is unsuitable across heterogeneous services, define compensation versus
+  rollback, and bring up the lack of isolation and the pivot step without prompting.
 
 ## Role lens
 - **Engineer:** Implements steps and compensations with idempotency keys, persists saga state, and
@@ -248,6 +361,44 @@ remaining steps until they succeed. If it does not, the agent may retry the book
 or compensate by refunding the charge and releasing the hold. Because the hotel is irreversible and
 costly, an approval gate belongs immediately before it, and the saga log must persist each step so a
 crashed worker resumes rather than rebooking.
+
+## Interview questions
+### What is the difference between a rollback and a compensation?
+- **A rollback restores bytes.** Inside one database, the uncommitted change simply never becomes visible.
+- **A compensation is a new business action.** A refund cancels a charge's effect but is itself visible on
+  the statement, may cost fees, and can fail and need retrying.
+- **Why it matters:** because compensations are visible and imperfect, sagas order steps so that the
+  irreversible pivot comes last and most failures happen before anything needs undoing.
+
+### Why not just use two-phase commit across your services?
+- **It blocks.** If the coordinator crashes after prepare, participants hold locks until it recovers, since
+  deciding alone could contradict it.
+- **It needs every participant to speak the protocol.** Payment providers, ticketing SaaS and LLM APIs have
+  no prepare phase.
+- **Where it does fit:** inside one system that replicates the coordinator (Spanner-style shards) or across
+  XA-capable components you own.
+
+### Finance reports a customer was refunded for a charge that never happened. How did your saga do that?
+- **Likely cause:** the charge step timed out and the orchestrator treated the timeout as a failure,
+  running compensations without knowing the outcome.
+- **Confirm in the saga log:** a `started charge_card` with no `done`, followed by `undone` entries.
+- **Fix:** on timeout, query the provider by the step's idempotency key, then either continue forward or
+  compensate; make the refund call keyed too so a retry cannot refund twice.
+
+### An admin edits an order while a saga is compensating it, and the edit disappears. What is going on and what do you change?
+- **No isolation.** Sagas commit each step immediately, so the compensation ran on a stale view and
+  overwrote the admin's write (a lost update).
+- **Semantic lock:** mark the order `PENDING` while the saga runs so the admin UI blocks or warns.
+- **Version check:** compensations update with `WHERE version = $expected` and re-read on conflict instead
+  of blindly writing the old state back.
+
+### Where would you put a human approval gate in an agent that files a ticket, charges a card and emails a customer?
+- **At the pivot.** Classify each tool call: ticket creation is compensatable (close it), the charge may be
+  treated as the pivot because refunds are visible, and the delivered email has no undo.
+- **Order around it:** run validation and compensatable steps first, gate before the first irreversible
+  action, and retry everything after it forward.
+- **Persist the agent's decisions** in the saga log, because re-running the LLM on retry can produce
+  different arguments than the ones the compensation expects.
 
 ## Quiz
 ### Q: Why is two-phase commit rarely used to coordinate a payment provider, a ticketing SaaS and an internal database?

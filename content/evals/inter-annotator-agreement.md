@@ -5,7 +5,7 @@ name: Inter-annotator agreement
 kind: metric
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - evals/golden-dataset
   - evals/rubrics
@@ -21,80 +21,131 @@ sources:
 ---
 
 ## TL;DR
-Inter-annotator agreement (IAA) measures how consistently independent humans label the same items. It
-matters because labels are the ground truth every eval and every judge is scored against: if two experts
-agree only 70% of the time, every score measured against those labels carries that noise, and the
-guideline, not the model, is usually the problem. Chance-corrected statistics (Cohen's κ, Fleiss' κ, Krippendorff's α) are
-used instead of raw agreement because raw agreement is inflated whenever one label dominates.
+Inter-annotator agreement (IAA) measures how consistently independent humans label the same items.
+Labels are the ground truth every eval and judge is scored against, so their noise is in every score.
+Use chance-corrected κ or α, not raw agreement.
 
 ## Why it exists
-You build a golden set of 500 support answers labeled "acceptable" or "not" by one subject-matter expert.
-Your model scores 85% against it. Is the missing 15% model error or label error? With one labeler you
-cannot know. Add a second expert and they agree with the first on 78% of items. Now at least a fifth of
-the set is ambiguous enough that two experts read it differently, and the model's "85%" carries label
-noise of that size. Every conclusion downstream, from "prompt B is 3 points better" to "the judge agrees
-with humans 88% of the time", inherits it.
-
-Agreement does three jobs. It sets the **reference point**: human–human agreement is what "as good as
-a person" looks like on these labels. It is not a hard ceiling: a perfect judge would agree with each
-annotator as often as that annotator is right, which is higher than two error-prone annotators agree with
-each other, so a strong judge can land slightly above it. What the labels cannot do is *demonstrate*
-that a judge is better than the people who wrote them. It **diagnoses guidelines**: low
-agreement on one criterion means the definition is ambiguous, which is fixed by rewriting anchors, not
-by replacing annotators. And it **sizes the process**: how many annotators per item, whether adjudication
-is needed, how much overlap to keep during production labeling.
-
-The naive measure, percent agreement, fails under class imbalance. If 95% of answers are acceptable, two
-annotators who label everything acceptable agree 95% of the time while conveying nothing about the 5%
-that matter. Chance-corrected statistics subtract the agreement you would expect from the label
-frequencies alone and report only what is left.
+- **One labeler cannot separate model error from label error.** A golden set of 500 support answers is
+  labeled "acceptable" or "not" by one subject-matter expert, and the model scores 85%. Is the missing
+  15% model error or label error? With one labeler you cannot know.
+- **A second labeler exposes the noise.** If a second expert agrees with the first on 78% of items, at
+  least a fifth of the set is ambiguous enough that two experts read it differently. The model's "85%"
+  carries label noise of that size; if two experts agree only 70% of the time, the noise is larger still.
+- **Everything downstream inherits it,** from "prompt B is 3 points better" to "the judge agrees with
+  humans 88% of the time". Low agreement usually means the guideline, not the model, is the problem.
+- **Percent agreement fails under class imbalance.** If 95% of answers are acceptable, two annotators who
+  label everything acceptable agree 95% of the time while conveying nothing about the 5% that matter.
+- **Chance correction fixes that.** Cohen's κ, Fleiss' κ and Krippendorff's α subtract the agreement
+  expected from the label frequencies alone and report only what is left, because raw agreement is
+  inflated whenever one label dominates.
 
 ## How it works
+### What agreement is for
+| Job | What it gives you |
+|---|---|
+| **Reference point** | human–human agreement is what "as good as a person" looks like on these labels |
+| **Guideline diagnosis** | low agreement on one criterion means the definition is ambiguous; fix it by rewriting anchors, not by replacing annotators |
+| **Process sizing** | how many annotators per item, whether adjudication is needed, how much overlap to keep during production labeling |
+
+- **The reference point is not a hard ceiling.** A perfect judge would agree with each annotator as often
+  as that annotator is right, which is higher than two error-prone annotators agree with each other, so a
+  strong judge can land slightly above it.
+- **What the labels cannot do** is *demonstrate* that a judge is better than the people who wrote them.
+
+### Choosing the statistic
+| Situation | Statistic | Why |
+|---|---|---|
+| Two raters, nominal labels | Cohen's κ | chance correction from each rater's own marginals |
+| Two raters, ordinal labels | weighted κ (linear or quadratic) | charges a one-level disagreement less than a three-level one |
+| Fixed panel, same number of raters per item | Fleiss' κ | generalises κ to many raters |
+| Any number of raters, missing ratings, any scale | Krippendorff's α | the general case; when in doubt, report α |
+| Numeric scores | intraclass correlation (ICC) | captures absolute agreement, unlike Pearson or Spearman |
+| Rankings | Kendall's τ | rank agreement |
+
 ### Cohen's kappa: two raters, nominal labels
-κ = (p_o − p_e) / (1 − p_e), where p_o is the observed agreement and p_e is the agreement expected by
-chance, computed from each rater's marginal label distribution: p_e = Σ_c P_A(c) · P_B(c). The
-denominator is the agreement available beyond chance and the numerator is how much of it was achieved,
-so κ = 1 is perfect, 0 is chance level and negative values are worse than chance. For ordinal labels use
-**weighted kappa**, which charges a one-level disagreement less than a three-level one (linear or
-quadratic weights); quadratic-weighted κ is numerically close to an intraclass correlation.
+
+```
+κ = (p_o − p_e) / (1 − p_e)        p_e = Σ_c P_A(c) · P_B(c)
+```
+
+- **p_o** is the observed agreement; **p_e** is the agreement expected by chance, computed from each
+  rater's marginal label distribution.
+- **Reading it:** the denominator is the agreement available beyond chance and the numerator is how much
+  of it was achieved, so κ = 1 is perfect, 0 is chance level and negative values are worse than chance.
+- **Weighted kappa** for ordinal labels uses linear or quadratic weights; quadratic-weighted κ is
+  numerically close to an intraclass correlation.
 
 ### Fleiss' kappa: many raters, same count per item
-Fleiss generalises p_o to the mean pairwise agreement within each item and p_e to the pooled label
-proportions. It requires each item to be rated by the same *number* of raters, though not the same
-raters. It is the right tool for a fixed panel of three SMEs labeling every item.
+- **How:** p_o becomes the mean pairwise agreement within each item; p_e uses the pooled label
+  proportions.
+- **Requirement:** each item is rated by the same *number* of raters, though not the same raters.
+- **Right tool for** a fixed panel of three SMEs labeling every item.
 
 ### Krippendorff's alpha: the general case
-α = 1 − D_o / D_e, observed disagreement over expected disagreement, with a distance function chosen for
-the scale: nominal, ordinal, interval or ratio. It tolerates any number of raters and missing ratings,
-which is the normal situation in a real project where annotators overlap only partially. When in doubt,
-report α.
+
+```
+α = 1 − D_o / D_e        (observed disagreement over expected disagreement)
+```
+
+- **A distance function chosen for the scale:** nominal, ordinal, interval or ratio.
+- **Tolerates any number of raters and missing ratings,** which is the normal situation in a real project
+  where annotators overlap only partially.
 
 ### Continuous scores and rankings
-For numeric scores, Pearson or Spearman correlation is tempting but ignores systematic offset: a rater
-who is consistently one point higher gets r = 1 while the scores are not interchangeable. The intraclass
-correlation coefficient (ICC) captures absolute agreement. For rankings, Kendall's τ.
+- **Pearson or Spearman correlation is tempting but ignores systematic offset.** A rater who is
+  consistently one point higher gets r = 1 while the scores are not interchangeable.
+- **ICC captures absolute agreement;** for rankings use Kendall's τ.
 
 ### Interpreting the number
-The Landis and Koch bands (0.41–0.60 moderate, 0.61–0.80 substantial, above 0.80 almost perfect) are a
-convention, not a law; what is acceptable depends on how the labels are used. Gating labels for a
-release need high agreement; preference labels for training tolerate less. Two **kappa paradoxes** catch
-people: high p_o with low κ when one class dominates (most agreement was predictable), and *higher* κ
-for raters whose marginals differ than for raters with matched marginals at the same p_o, because
-mismatched label rates lower p_e (so a systematic difference between raters can make κ look better).
-So report p_o, κ and the confusion table together,
-with a bootstrap interval over items, because κ = 0.7 on 30 items has a wide interval.
+| κ band (Landis and Koch) | Label |
+|---|---|
+| 0.41–0.60 | moderate |
+| 0.61–0.80 | substantial |
+| above 0.80 | almost perfect |
+
+- **The bands are a convention, not a law.** What is acceptable depends on use: gating labels for a
+  release need high agreement; preference labels for training tolerate less.
+- **Kappa paradox 1:** high p_o with low κ when one class dominates, because most agreement was
+  predictable.
+- **Kappa paradox 2:** *higher* κ for raters whose marginals differ than for raters with matched
+  marginals at the same p_o, because mismatched label rates lower p_e. So a systematic difference between
+  raters can make κ look better.
+- **So report p_o, κ and the confusion table together,** with a bootstrap interval over items, because
+  κ = 0.7 on 30 items has a wide interval.
 
 ### The process around the number
-Pilot on 30–50 items with two or three annotators, compute agreement per criterion, read every
-disagreement, rewrite the ambiguous anchors, and re-pilot. In production labeling keep a fraction of
-items double-labeled for monitoring. Resolve disagreements by adjudication (a third rater or discussion),
-and keep the "contested" flag on those items, because they are the ones a model will also get wrong for
-defensible reasons. When you later compare an LLM judge with humans, compute judge–human κ the same way
-and put it next to human–human κ: a judge at the human level is another annotator, not a better one.
+1. **Pilot** on 30–50 items with two or three annotators.
+2. **Compute agreement per criterion** and read every disagreement.
+3. **Rewrite the ambiguous anchors** and re-pilot.
+4. **In production labeling, keep a fraction of items double-labeled** for monitoring.
+5. **Resolve disagreements by adjudication** (a third rater or discussion) and keep the "contested" flag
+   on those items, because they are the ones a model will also get wrong for defensible reasons.
+6. **Compare an LLM judge the same way:** compute judge–human κ and put it next to human–human κ. A judge
+   at the human level is another annotator, not a better one.
 
-## Example
-Cohen's kappa by hand on two pilots of 100 support answers labeled pass or fail by two SMEs. The second
-pilot has *higher* raw agreement and a much *lower* kappa, which is the paradox you need to recognise.
+## Diagram
+The labeling loop: agreement is measured per criterion before labels can gate anything, low agreement
+sends you back to the guideline, and the same statistic later scores the judge.
+
+```mermaid
+flowchart TD
+    G["Guideline and anchors"] --> P["Pilot: 30-50 items, 2-3 annotators"]
+    P --> K["Per-criterion kappa or alpha plus CI"]
+    K --> Q{"Agreement high enough for this use?"}
+    Q -->|"no"| R["Read disagreements, rewrite anchors"]
+    R --> G
+    Q -->|"yes"| L["Production labeling with overlap sample"]
+    L --> A["Adjudicate disagreements"]
+    A --> C[("Golden set with contested flags")]
+    L -.->|"overlap kappa drops"| R
+    C --> J["Judge-human kappa next to human-human"]
+```
+
+## Examples
+### The kappa paradox, by hand
+Cohen's kappa on two pilots of 100 support answers labeled pass or fail by two SMEs. The second pilot has
+*higher* raw agreement and a much *lower* kappa, which is the paradox you need to recognise.
 
 ```python
 from collections import Counter
@@ -117,44 +168,123 @@ B2 = ["pass"] * 90 + ["fail"] * 2 + ["fail"] * 4 + ["pass"] * 4
 print("pilot 2: p_o=%.2f p_e=%.3f kappa=%.2f" % cohen_kappa(A2, B2))  # 0.92 0.887 0.29
 ```
 
-Pilot 1: A marks 62 pass, B marks 58, so chance agreement is 0.62 × 0.58 + 0.38 × 0.42 ≈ 0.519 and
-κ = (0.80 − 0.519) / (1 − 0.519) ≈ 0.58. Pilot 2 looks better at 92% raw agreement, but both raters
-pass 94%, so chance agreement is already 0.887 and κ drops to 0.29. Look at the failures, which are what
-the eval cares about: the two raters flagged ten distinct items between them and agreed on only two. A
-golden set built from pilot 2 would have a "fail" label that is mostly one person's opinion.
+| | Pilot 1 | Pilot 2 |
+|---|---|---|
+| Pass rates | A 62, B 58 | both 94% |
+| Chance agreement p_e | 0.62 × 0.58 + 0.38 × 0.42 ≈ 0.519 | 0.887 |
+| Raw agreement p_o | 0.80 | 92% |
+| κ | (0.80 − 0.519) / (1 − 0.519) ≈ 0.58 | 0.29 |
+
+- **Look at the failures, which are what the eval cares about.** In pilot 2 the two raters flagged ten
+  distinct items between them and agreed on only two.
+- **Consequence:** a golden set built from pilot 2 would have a "fail" label that is mostly one person's
+  opinion.
+
+### Krippendorff's alpha with missing ratings (runnable)
+Pure Python. Three SMEs rate helpfulness 1–3; each item has two or three ratings, so Fleiss' κ does not
+apply. The distance function makes near-misses cheap on a graded scale.
+
+```python
+from collections import Counter
+from itertools import permutations
+
+def alpha(units, delta=lambda c, k: c != k):
+    """units: one tuple of ratings per item, None = not rated. Items with <2 ratings are skipped."""
+    o = Counter()                                   # coincidence matrix
+    for u in units:
+        vals = [v for v in u if v is not None]
+        if len(vals) < 2:
+            continue
+        for i, j in permutations(range(len(vals)), 2):
+            o[vals[i], vals[j]] += 1 / (len(vals) - 1)
+    n_c = Counter()
+    for (c, _), w in o.items():
+        n_c[c] += w
+    n = sum(n_c.values())
+    d_o = sum(w * delta(c, k) for (c, k), w in o.items())
+    d_e = sum(n_c[c] * n_c[k] * delta(c, k) for c in n_c for k in n_c) / (n - 1)
+    return 1 - d_o / d_e
+
+N = None
+ratings = [(3, 3, N), (2, 3, 3), (1, 1, N), (3, N, 2), (2, 2, 2),
+           (1, 2, N), (3, 3, 3), (N, 1, 1), (2, N, 3), (3, 3, N)]
+print(round(alpha(ratings), 2))                                  # 0.47 nominal: every miss counts fully
+print(round(alpha(ratings, lambda c, k: (c - k) ** 2), 2))       # 0.73 interval: 2-vs-3 costs little
+```
+
+- **Reading it:** the disagreements are mostly one level apart, so the graded metric is much higher.
+- **For truly ordinal labels** use the rank-based ordinal metric from a library implementation (the
+  `krippendorff` package on PyPI is one) rather than treating levels as evenly spaced numbers.
+- **Sanity check:** this function reproduces α = 0.743 (nominal) and 0.849 (interval) on the worked
+  reliability-data example in Krippendorff's own computing notes.
+
+### Worked scenario: how big must the pilot be?
+Same label mix as pilot 1 (50/30/12/8 per 100), different sizes; 95% bootstrap intervals over items.
+
+| Pilot size | κ | 95% interval (bootstrap, illustrative) | Usable as a gate decision? |
+|---|---|---|---|
+| 30 | 0.59 | about 0.26–0.86 | no: spans "fair" to "almost perfect" |
+| 100 | 0.58 | about 0.41–0.74 | rough guidance only |
+| 400 | 0.58 | about 0.50–0.66 | yes, the band is clear |
+
+- **This is why κ = 0.7 on 30 items, then 0.45 on the next batch,** is not evidence the process changed:
+  both are inside the 30-item interval.
+
+## Production patterns
+- **Agreement in the labeling export.** Compute per-criterion, per-pair κ on every export, for example
+  `sklearn.metrics.cohen_kappa_score(a, b, weights="quadratic")` for ordinal labels, and α for partial
+  overlap. Monitor the lowest criterion, not the average.
+- **Standing overlap sample.** Route a fixed fraction of production items to a second annotator without
+  showing the first label. Monitor overlap κ per week and per annotator pair; a drop means drifting
+  guidelines or a new annotator who needs calibration.
+- **Adjudication queue with a contested flag.** Send disagreements to a third rater or a review
+  discussion, store the final label plus `contested=true`, and report model scores with and without
+  contested items. Monitor the contested share per criterion.
+- **Agreement gate on golden sets.** A golden set may gate releases only after its per-criterion κ, with
+  interval, clears the threshold the team set for that use. Monitor that new items added to the set go
+  through the same overlap.
+- **Same code for judges.** Score the LLM judge against the adjudicated label with the exact function
+  used for humans, and publish judge–human κ next to human–human κ. Monitor both on every judge or
+  prompt change.
 
 ## Trade-offs
-- Chance-corrected statistics are harder to explain to stakeholders than "they agreed 92%", but raw
-  agreement misleads under imbalance; report both, and show the confusion table when the two disagree.
-- More annotators per item improve label quality and make agreement measurable, but multiply cost; once
-  agreement is established, drop to a monitoring overlap of a fraction of items.
-- Adjudication by discussion produces cleaner gold labels but imports the most senior annotator's bias;
-  for subjective criteria, a majority of independent labels or an explicit "contested" tag is safer.
-- Tightening guidelines until agreement is high can define away the genuinely ambiguous cases; if the
-  product must handle those, keep them labeled as ambiguous rather than forcing a verdict.
+- **Correctness vs explainability.** Chance-corrected statistics are harder to explain to stakeholders
+  than "they agreed 92%", but raw agreement misleads under imbalance; report both, and show the
+  confusion table when the two disagree.
+- **Label quality vs cost.** More annotators per item improve label quality and make agreement
+  measurable, but multiply cost; once agreement is established, drop to a monitoring overlap of a
+  fraction of items.
+- **Clean gold vs imported bias.** Adjudication by discussion produces cleaner gold labels but imports
+  the most senior annotator's bias; for subjective criteria, a majority of independent labels or an
+  explicit "contested" tag is safer.
+- **High agreement vs real ambiguity.** Tightening guidelines until agreement is high can define away the
+  genuinely ambiguous cases; if the product must handle those, keep them labeled as ambiguous rather than
+  forcing a verdict.
 
 ## Pitfalls
-- Reporting only percent agreement; the symptom is 95% agreement on the pilot while model accuracy on the
-  minority class turns out to be near random.
-- One global kappa pooled across criteria or categories; the symptom is an acceptable aggregate hiding a
-  criterion that sits at chance.
-- Pearson correlation for score agreement; the symptom is r = 0.9 while one rater is consistently two
-  points higher, so the two raters' scores cannot be mixed in one dataset.
-- Annotators who are not independent (one sees the other's labels, or they confer during the pilot); the
-  symptom is a high pilot kappa followed by a much lower production kappa.
-- Comparing an LLM judge with labels from a single annotator; the symptom is a judge that "beats humans",
+- **Reporting only percent agreement.** Symptom: 95% agreement on the pilot while model accuracy on the
+  minority class turns out to be near random. Fix: κ plus the confusion table.
+- **One global kappa pooled across criteria or categories.** Symptom: an acceptable aggregate hiding a
+  criterion that sits at chance. Fix: per-criterion κ.
+- **Pearson correlation for score agreement.** Symptom: r = 0.9 while one rater is consistently two
+  points higher, so the two raters' scores cannot be mixed in one dataset. Fix: ICC.
+- **Annotators who are not independent** (one sees the other's labels, or they confer during the pilot).
+  Symptom: a high pilot kappa followed by a much lower production kappa. Fix: hide labels, no conferring.
+- **Comparing an LLM judge with labels from a single annotator.** Symptom: a judge that "beats humans",
   which often means it matches one person's habits and is unverified against everyone else.
-- Small pilots without intervals; the symptom is κ = 0.7 on 30 items followed by 0.45 on the next batch
-  with no change in process.
+- **Small pilots without intervals.** Symptom: κ = 0.7 on 30 items followed by 0.45 on the next batch
+  with no change in process. Fix: bootstrap intervals and a larger pilot.
 
 ## When to use
-Measure agreement at the start of every labeling effort, continuously on an overlap sample during
-production labeling, and whenever you evaluate an LLM judge against humans. Compute it per criterion and
-per annotator pair with bootstrap intervals; a single global number hides the one criterion that is
-broken. The target depends on use: labels that gate a release need agreement at the high end, preference
-labels for training can tolerate less. In practice this is a few lines of code in the labeling-tool
-export; in interviews it answers "how do you know your golden set is good?" and "how do you compare a
-judge to humans?".
+- **Measure at the start of every labeling effort,** continuously on an overlap sample during production
+  labeling, and whenever you evaluate an LLM judge against humans.
+- **Compute per criterion and per annotator pair** with bootstrap intervals; a single global number hides
+  the one criterion that is broken.
+- **Set the target by use:** labels that gate a release need agreement at the high end; preference labels
+  for training can tolerate less.
+- **Day to day,** this is a few lines of code in the labeling-tool export.
+- **Interviews:** it answers "how do you know your golden set is good?" and "how do you compare a judge
+  to humans?".
 
 ## Role lens
 - **Engineer:** Adds the kappa or alpha computation to the labeling export, routes disagreements to
@@ -177,6 +307,43 @@ which are the only items with a defensible truth, reporting judge–human κ nex
 bootstrap intervals. If the judge's κ is close to the humans', it is as reliable as another annotator and
 can scale the labeling; the contested items still need humans, and the judge's errors there cannot be
 measured at all.
+
+## Interview questions
+### Why use Cohen's kappa instead of percent agreement?
+- **Percent agreement counts chance matches.** When 95% of items pass, two raters who pass everything
+  agree 95% while telling you nothing about the failures.
+- **Kappa subtracts the agreement expected from each rater's label rates** and scales by what was left
+  to achieve, so 0 means chance and 1 means perfect.
+- **Report both plus the confusion table,** because kappa has its own paradoxes under skewed or mismatched
+  marginals.
+
+### Per-criterion agreement is fine everywhere except "completeness" at κ 0.3. What do you do?
+- **Read the disagreed items together** with the annotators; isolated low agreement points at the
+  criterion's definition, not at the people.
+- **Look for the usual causes:** a double-barreled criterion, no stated applicability condition, or no
+  example of each level.
+- **Rewrite anchors and re-pilot on 30–50 items,** keeping a confidence interval so you know whether the
+  new number is actually better.
+
+### Which statistic would you pick for five annotators who each labeled a different subset on a 1–5 scale?
+- **Krippendorff's alpha,** because it tolerates any number of raters and missing ratings.
+- **With an ordinal or interval distance,** so a 4-vs-5 disagreement costs less than 1-vs-5.
+- **Not Fleiss' kappa,** which needs the same number of raters per item and treats labels as nominal,
+  and not averaged pairwise Cohen's kappa, which mishandles partial overlap.
+
+### When is it acceptable to ship with moderate agreement?
+- **When the labels feed training preferences** rather than gate releases; noisy preferences still carry
+  signal in aggregate.
+- **When the ambiguity is real product ambiguity:** keep those items labeled as contested rather than
+  tightening guidelines until the hard cases disappear.
+- **Not for release gates,** where label noise of 20% swamps a 3-point model difference.
+
+### How much double-labeling would you budget for a 10,000-item labeling project?
+- **Pilot first:** 30–50 items fully double- or triple-labeled until per-criterion agreement is stable.
+- **Then a monitoring overlap** of a small fixed fraction, chosen so the weekly overlap sample is large
+  enough for a usable interval; around 100 items gives a κ interval roughly ±0.16 wide in the pilot-1
+  example above.
+- **Raise the overlap temporarily** when guidelines change or new annotators join.
 
 ## Quiz
 ### Q: Two annotators agree on 92% of items, yet Cohen's kappa is 0.29. What is the most likely explanation?

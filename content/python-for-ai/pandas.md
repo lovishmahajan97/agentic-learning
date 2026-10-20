@@ -102,6 +102,23 @@ decides whether empty categories appear as rows.
 - **Bigger than memory?** Chunked reading (`chunksize=`), a columnar engine such as Polars or DuckDB, or a
   database.
 
+## Diagram
+A typical eval-analysis pipeline, with the group-by split shown: built-in aggregations stay in compiled
+code, while a lambda drops back to one Python call per group.
+
+```mermaid
+flowchart TD
+    R["Read JSONL or CSV with pinned dtypes"] --> J["merge with validate=many_to_one"]
+    J --> C["Vectorized column math, no apply"]
+    C --> G["groupby: factorize keys into integer group codes"]
+    G --> Q{"Aggregation kind?"}
+    Q -->|"built-in name: mean, sum, size"| F["Compiled loop, roughly linear in rows"]
+    Q -->|"lambda or custom function"| S["One Python call per group"]
+    F --> O["Summary frame, reset_index"]
+    S --> O
+    O --> P[("Parquet hand-off, dtypes preserved")]
+```
+
 ## Examples
 ### Eval summary per model and category
 Summarising an eval run: pass rate, tail latency and cost per model and category.
@@ -245,6 +262,42 @@ so the work runs in the interpreter rather than in compiled column operations. F
 lookup as a join or a vectorized map: `df["unit"] = df["model"].map(price)` (or merge a price table),
 then `df["cost"] = df["unit"] * df["tokens"]`, both of which operate on whole columns. Also convert
 `model` to a categorical dtype if it repeats, and check the merge or map left no NaNs for unknown models.
+
+## Interview questions
+### What is a DataFrame, and why reach for pandas instead of lists of dicts or raw NumPy?
+- **Definition:** an ordered set of typed columns, each a `Series`, sharing one `Index` of row labels,
+  with numeric columns stored as NumPy arrays.
+- **Why:** eval and log data are mixed-type rows, and the questions (pass rate per model per category,
+  join a price table) are one `groupby` or `merge` instead of hand-written loops or parallel arrays kept
+  aligned by hand.
+- **Ecosystem:** scikit-learn, plotting libraries and most readers accept or produce DataFrames.
+
+### Cost totals inflated after a join. How do you find and prevent the cause?
+- **Likely cause:** the key is not unique on the side you assumed, so a left join multiplied rows.
+- **Find it:** compare row counts before and after the merge, and check duplicate keys with
+  `df.duplicated(subset=[key]).sum()` on the lookup table.
+- **Prevent it:** pass `validate="many_to_one"` so pandas raises instead of multiplying rows, and log
+  rows-before versus rows-after in the pipeline.
+
+### Why does `df[mask]["col"] = x` fail to update `df`, and what changed in pandas 3.0?
+- **Chained indexing:** the first `[]` may return a temporary copy, so the assignment lands there and
+  `df` is unchanged; pandas 2.x warns with `SettingWithCopyWarning`.
+- **pandas 3.0 Copy-on-Write:** every derived object behaves as a copy, so chained assignment never
+  modifies `df` and pandas emits `ChainedAssignmentError` instead.
+- **Fix:** one `.loc[mask, "col"] = x` call; enable `mode.copy_on_write` on 2.x in tests before upgrading.
+
+### A 10-million-row usage CSV exhausts memory. How do you cut it down?
+- **Read less:** pass `usecols=` for the needed columns and `chunksize=` to aggregate chunk by chunk.
+- **Pin dtypes:** `int32` and `float32` take 40 MB per column instead of 80 MB in int64 or float64, and a
+  repeated string as `category` costs about 1 byte per row instead of a pointer plus a Python string.
+- **Measure, then switch format:** `df.memory_usage(deep=True)` shows the offending columns, usually
+  `object` strings; Parquet keeps the dtypes for the next reader.
+
+### When would you not use pandas?
+- **Near RAM size or in repeated pipelines:** pandas is eager and mostly single-core, needing several
+  times the data size in RAM; Polars or DuckDB optimize lazily and stream.
+- **Shared or concurrently updated data:** a database gives durability and concurrent access.
+- **Keep pandas for:** notebook-scale exploration, eval reports and hand-offs to scikit-learn or plots.
 
 ## Quiz
 ### Q: `a` has index [0, 1, 2] and `b` has index [1, 2, 3]. What does `a + b` return?

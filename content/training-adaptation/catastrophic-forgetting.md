@@ -116,6 +116,27 @@ task-only evaluation and obvious to a user.
 - **Safer:** fine-tune from the base model on the union of all data each time, which also makes the run
   reproducible.
 
+## Diagram
+A guarded fine-tune: the general suite is measured on the base before training, replay and a bounded
+update keep old behaviour in the loss, and the gate decides between shipping, interpolating back or
+re-running.
+
+```mermaid
+flowchart TD
+    B["Base model, fixed weights"] --> S0["Run general suite: baseline numbers"]
+    T[("Task data")] --> M["Mixed set: task plus about 25 percent replay, shuffled"]
+    R[("General, chat-template and safety data")] --> M
+    M --> F["Fine-tune from base: LoRA or low LR, few epochs"]
+    S0 --> F
+    F --> E["Evaluate task metric and general suite at each checkpoint"]
+    E --> G{"Any suite metric dropped beyond tolerance?"}
+    G -->|"no"| SH["Promote"]
+    G -->|"yes, task checkpoint strong"| I["Interpolate toward base, pick alpha on both evals"]
+    I --> G
+    G -->|"yes, still failing"| RR["Raise replay share, lower LR or epochs, re-run from base"]
+    RR --> F
+```
+
 ## Examples
 ### Replay mix plus a regression gate
 A team fine-tunes an instruct model on 5,000 legal-clause extraction examples.
@@ -269,6 +290,43 @@ the behaviours to keep; train adapters at a lower rate for fewer epochs with eva
 at every checkpoint; and gate deployment on that suite. If a strong task checkpoint already exists,
 interpolating it toward the base can recover much of the lost behaviour quickly while the proper run is
 prepared.
+
+## Interview questions
+### What causes catastrophic forgetting, and why does a bigger model not solve it?
+- **Cause:** every capability shares one set of weights, and the fine-tuning gradient has no term for the
+  old tasks, so any weight the new loss wants to move will move, however important it was elsewhere.
+- **Scale is no protection:** some studies find larger models forget less per step and others the
+  opposite. A small dataset repeated for several epochs at a healthy rate still drags the network toward
+  those rows.
+
+### How would you design the evaluation for a fine-tune so forgetting cannot reach production?
+- **Fix a general suite first:** instruction following, a reasoning subset, chat-template adherence and
+  refusal rate on a harmful prompt set.
+- **Run it on the base model before training,** because a drop can only be recognised against the base's
+  own numbers, then at every checkpoint alongside the task metric.
+- **Gate promotion** on a per-metric tolerance (2 points is a reasonable starting value) and record the
+  deltas for every release.
+
+### Does training LoRA adapters instead of the full model prevent forgetting?
+- **It reduces it, it does not prevent it.** The base weights are frozen and the adapter is removable, but
+  behaviour still changes wherever the adapter is active.
+- **High rank plus many epochs forgets too,** and shows regressions similar to a full fine-tune.
+- **The trade runs both ways:** comparisons on code and maths found LoRA forgets less of the source domain
+  and also learns less of the target.
+
+### When would you pick weight interpolation over a replay re-run?
+- **Interpolation is the quick fallback:** when a strong task checkpoint already exists and has regressed,
+  sweep alpha (0.25, 0.5, 0.75) toward the base and ship the largest value that passes the gate.
+- **Replay is the proper fix,** because it attacks the cause by giving the loss a term for the old
+  behaviour; plan it as the next run.
+- **Interpolation needs a full fine-tune of the same architecture,** with state dicts that share keys and
+  shapes.
+
+### A customer chains monthly fine-tunes from last month's model. What breaks and what do you recommend?
+- **What breaks:** each hop forgets a little of every earlier batch, so first-month capabilities erode
+  quietly release by release, and no run is reproducible from scratch.
+- **Recommendation:** fine-tune from the base model on the union of all versioned data each release, and
+  monitor scores on each earlier batch's held-out set so any remaining erosion is visible.
 
 ## Quiz
 ### Q: What is the root cause of catastrophic forgetting during fine-tuning?

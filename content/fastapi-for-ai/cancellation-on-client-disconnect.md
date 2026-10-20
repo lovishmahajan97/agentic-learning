@@ -113,6 +113,28 @@ Two watcher designs:
 - **Test the full path:** start a long request through the real ingress, close the client, and confirm
   the app logs a cancellation.
 
+## Diagram
+Nothing interrupts the handler on its own: the disconnect is only a message until the watcher reads it,
+cancels the task and lets `finally` close upstream and record usage under a bounded shield.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as ASGI server
+    participant W as Disconnect watcher
+    participant T as Model task
+    participant P as Provider
+    T->>P: stream or complete request via httpx
+    C->>S: closes connection, tab closed or stop pressed
+    S-->>W: next receive returns http.disconnect
+    W->>T: task.cancel after is_disconnected is true
+    Note over T: CancelledError lands at the current await
+    T->>P: httpx aborts and closes the upstream connection
+    Note over T: finally releases slot, shielded usage record with timeout
+    T-->>W: task done, finally blocks finished
+    W-->>S: return 499 for logs and metrics
+```
+
 ## Examples
 ### Cancel a non-streaming call when the client leaves
 A helper that runs a non-streaming model call as a task and cancels it if the client disconnects,
@@ -297,6 +319,44 @@ done. If steps fan out into parallel tool calls, run them in a `TaskGroup` so th
 every child rather than leaving orphans that finish the job anyway. Make sure no broad `except`
 swallows `CancelledError`, and record the run's final state so the
 user can see what happened before they stopped it.
+
+## Interview questions
+### Why doesn't FastAPI stop work automatically when a client disconnects?
+- **Disconnect is a message, not an exception.** The ASGI server puts `http.disconnect` on the receive
+  channel, and the next `receive()` returns it.
+- **The handler is awaiting a provider call,** not reading that channel, so nothing interrupts it and
+  ordinary endpoints typically run to completion.
+- **Streaming gets partial help:** recent Starlette cancels a `StreamingResponse` iterator on disconnect,
+  but behaviour has changed across releases, so also check `is_disconnected()` between chunks.
+
+### Provider dashboards show far more output tokens than users received. How do you find and fix the leak?
+- **Suspect ghosts:** abandoned or retried requests whose generations kept running after the client left.
+- **Check each layer:** is anything watching for disconnect, is the upstream stream opened with `async with`
+  so it closes, and does a buffering proxy hide the disconnect from the app?
+- **Fix and verify:** race the call against a watcher, keep nginx `proxy_ignore_client_abort` off, and run
+  an end-to-end test that the app logs a cancellation.
+
+### Should you poll is_disconnected() or await request.receive() in a watcher task?
+- **Polling** reacts within one interval and is always safe; a quarter to half a second is usually ample
+  next to multi-second model calls.
+- **Awaiting `receive()`** reacts instantly, but only once the body has been fully read, because
+  `receive()` also delivers body chunks and a watcher would steal them from the handler.
+- **Default to polling** unless instant reaction matters and the body is already consumed.
+
+### An agent step fans out parallel tool calls. After the user presses stop, tools still finish. Why?
+- **Cancelling a task cancels what it is awaiting, not tasks it started,** so children created with bare
+  `asyncio.create_task(...)` are orphans and keep running.
+- **Use `asyncio.TaskGroup` (Python 3.11+) or an AnyIO task group:** cancelling the parent cancels every
+  child and waits for their `finally` blocks.
+- **The runnable example shows it:** bare tasks log "finished", TaskGroup children log "cancelled".
+
+### When is cancelling on disconnect the wrong choice, and what do you do instead?
+- **When the user expects the work to finish without watching,** such as a long report or batch ingestion,
+  because cancelling would lose work they will come back for.
+- **Move it to a durable job:** return 202 with a job ID and let the client poll or reconnect for the
+  result.
+- **Even for cancellable requests,** shield the usage and audit record with a timeout, because tokens
+  already spent were billed whether or not anyone read them.
 
 ## Quiz
 ### Q: How does an ASGI application learn that an HTTP client has disconnected?

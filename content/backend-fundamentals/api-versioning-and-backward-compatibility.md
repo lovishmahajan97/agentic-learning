@@ -5,7 +5,7 @@ name: API versioning & backward compatibility
 kind: practice
 difficulty: core
 est_minutes: 14
-status: reviewed
+status: crisp
 related:
   - backend-fundamentals/rest-graphql-api-design
   - fastapi-for-ai/openapi-contract-testing
@@ -23,106 +23,125 @@ sources:
 ---
 
 ## TL;DR
-Once someone else's code depends on your API, every change is a negotiation with clients you cannot
-redeploy. Backward compatibility means additive changes by default (new optional fields, new
-endpoints) and tolerant readers on both sides; versioning is the escape hatch for the rare breaking
-change, expressed in the path, a header or a pinned date, with an announced deprecation and sunset.
-In AI systems the same discipline covers model snapshots, prompt versions and tool schemas.
+Once others depend on your API, every change is a negotiation with clients you cannot redeploy. Make
+additive changes and tolerant readers the default; version only for rare breaks, with announced
+deprecation and sunset. The same applies to models, prompts and tool schemas.
 
 ## Why it exists
-The clients of an API are distributed in time as well as space: a mobile app that users never update,
-a partner integration built by a contractor who left, an SDK pinned in a lockfile, an agent whose
-system prompt describes your tool's arguments. Rename a field and each of them breaks silently at its
-own pace, and you cannot roll them back. Hyrum's law states the underlying fact: with enough users,
-every observable behaviour of your interface becomes something somebody depends on, documented or not.
-
-The first naive response is "never break anything", which freezes bad decisions forever and bloats
-the API with fields kept only for one client. The second is "bump to `/v2` whenever we change
-something", which produces version sprawl: each version is a fork to maintain, test and secure, and
-clients never migrate because nothing forces them. The third is "be careful", which fails the first
-time a well-meaning engineer makes a required field optional in the response and a strict client
-starts throwing.
-
-The working discipline sits between these: make additive, compatible changes the normal path so that
-versions are rare; when a break is unavoidable, version deliberately, announce a deprecation with
-dates, measure who is still on the old version, and remove it on schedule. For AI services the
-discipline matters twice over, because a model or prompt change can alter outputs for the same input,
-which is also a breaking change from the client's point of view.
+- **Clients are distributed in time as well as space.** A mobile app users never update, a partner
+  integration built by a contractor who left, an SDK pinned in a lockfile, an agent whose system prompt
+  describes your tool's arguments. Rename a field and each breaks silently at its own pace, with no
+  rollback.
+- **Hyrum's law.** With enough users, every observable behaviour of your interface becomes something
+  somebody depends on, documented or not.
+- **The three naive responses fail.** "Never break anything" freezes bad decisions and bloats the API
+  with single-client fields. "Bump to `/v2` whenever we change something" produces version sprawl: each
+  version is a fork to maintain, test and secure, and nothing forces clients to migrate.
+- **"Be careful" fails too**, the first time a well-meaning engineer makes a required response field
+  optional and a strict client starts throwing.
+- **The working discipline sits between.** Additive, compatible changes are the normal path so versions
+  are rare; an unavoidable break is versioned deliberately, deprecated with dates, measured, and removed
+  on schedule. AI services need it twice over, because a model or prompt change can alter outputs for the
+  same input, which is also a breaking change from the client's point of view.
 
 ## How it works
 ### What counts as breaking
-Breaking for clients: removing or renaming a field or endpoint; changing a field's type or format
-(integer to string, seconds to milliseconds); making an optional request field required; tightening
-validation; changing a default; changing the meaning of a value; changing status codes or the error
-envelope; changing authentication. Usually compatible: adding an optional request field, adding a
-response field, adding an endpoint, relaxing validation. Contested: adding an enum value, which breaks
-clients that switch exhaustively, so document that enums are open and clients must handle unknowns.
+- **Breaking for clients:** removing or renaming a field or endpoint; changing a field's type or format
+  (integer to string, seconds to milliseconds); making an optional request field required; tightening
+  validation; changing a default; changing the meaning of a value; changing status codes or the error
+  envelope; changing authentication.
+- **Usually compatible:** adding an optional request field, adding a response field, adding an
+  endpoint, relaxing validation.
+- **Contested:** adding an enum value, which breaks clients that switch exhaustively. Document that
+  enums are open and clients must handle unknowns.
 
 ### Tolerant readers
-Compatibility is a two-sided contract. Clients should ignore unknown response fields and treat enums
-as open; servers should accept missing optional fields and ignore unknown request fields unless the
-endpoint is security-sensitive. Pydantic's default of ignoring extra fields is the tolerant choice;
-`extra="forbid"` is stricter and turns a client's harmless new field into a 422, so choose it
-knowingly. This is Postel's principle applied with judgement, *because* total leniency hides bugs.
+- **Compatibility is a two-sided contract.** Clients ignore unknown response fields and treat enums as
+  open; servers accept missing optional fields and ignore unknown request fields unless the endpoint is
+  security-sensitive.
+- **Pydantic's default of ignoring extra fields is the tolerant choice.** `extra="forbid"` is stricter
+  and turns a client's harmless new field into a 422, so choose it knowingly.
+- **Postel's principle, applied with judgement**, *because* total leniency hides bugs.
 
 ### Versioning strategies
-- **URL path** (`/v1/...`, as OpenAI does): visible, routable, easy to test and cache; coarse, since
-  the whole API moves together.
-- **Header** (`Accept: application/vnd.acme.v2+json`, or a custom header such as Anthropic's
-  `anthropic-version` date): keeps URLs stable and allows per-request choice; harder to try in a
-  browser and easy to forget in a proxy.
-- **Pinned date per account** (Stripe's approach): each account is pinned to the version current
-  when it first called the API, overridable per request with a `Stripe-Version` header; the server
-  applies a chain of transformations to render new behaviour in old shapes. Maximum compatibility, maximum server-side machinery.
-- **Query parameter** (`?version=2`): simple but mixes with filters and cache keys.
-- **Evolution only** (GraphQL's stance): no versions; add fields, mark old ones `@deprecated`, remove
-  after usage reaches zero.
+| Strategy | Example | Gain | Cost |
+|---|---|---|---|
+| URL path | `/v1/...`, as OpenAI does | visible, routable, easy to test and cache | coarse: the whole API moves together |
+| Header | `Accept: application/vnd.acme.v2+json`, or a custom header such as Anthropic's `anthropic-version` date | stable URLs, per-request choice | harder to try in a browser, easy to forget in a proxy |
+| Pinned date per account | Stripe: pinned to the version current at the account's first call, overridable per request with `Stripe-Version` | maximum compatibility | a chain of server-side transformations renders new behaviour in old shapes |
+| Query parameter | `?version=2` | simple | mixes with filters and cache keys |
+| Evolution only | GraphQL: add fields, mark old ones `@deprecated`, remove after usage reaches zero | no versions at all | needs field-level usage telemetry |
 
-Whichever you choose, keep one implementation and render versions at the edge as representations,
-*because* two forked code paths drift and the old one stops getting fixes.
+- **Keep one implementation and render versions at the edge as representations**, *because* two forked
+  code paths drift and the old one stops getting fixes.
 
 ### Deprecation lifecycle
-Announce in docs and changelog; emit `Sunset` (RFC 8594, an HTTP date) and a `Link` to the migration
-guide on old-version responses, and mark the route deprecated in OpenAPI. RFC 9745 (2025) adds a
-`Deprecation` header whose value is a structured-field date (`@` followed by Unix seconds) and a
-`deprecation` link relation for the migration guide. Measure requests per
-version per client so you know who is left. Run brownouts (short planned outages of the old version)
-before removal. Remove on the announced date.
+1. **Announce** in docs and changelog.
+2. **Signal in-band.** On old-version responses emit `Sunset` (RFC 8594, an HTTP date) and a `Link` to
+   the migration guide, and mark the route deprecated in OpenAPI.
+3. **Add the deprecation header.** RFC 9745 (2025) adds a `Deprecation` header whose value is a
+   structured-field date (`@` followed by Unix seconds) and a `deprecation` link relation for the guide.
+4. **Measure** requests per version per client, so you know who is left.
+5. **Run brownouts**: short planned outages of the old version before removal.
+6. **Remove on the announced date.**
 
 ### Catching breaks before they ship
-Review by eye misses breaks, so make them mechanical. Two complementary checks run in CI. A schema
-diff compares the OpenAPI document generated from the branch against the one published from `main`
-and fails on any change in the breaking list (removed field, narrowed type, new required input); it
-catches what the provider changed. Consumer-driven contract tests (the Pact style) go the other way:
-each client publishes the requests it sends and the fields it reads, and the provider's build replays
-them; this catches the Hyrum's-law dependencies the schema never promised, such as a client relying
-on list order.
+Review by eye misses breaks, so make them mechanical with two complementary CI checks.
+- **Schema diff (provider side).** Compare the OpenAPI document generated from the branch with the one
+  published from `main`; fail on anything in the breaking list (removed field, narrowed type, new
+  required input).
+- **Consumer-driven contract tests (Pact style).** Each client publishes the requests it sends and the
+  fields it reads, and the provider's build replays them. This catches Hyrum's-law dependencies the
+  schema never promised, such as a client relying on list order.
 
 ### SDKs and client libraries
-A published SDK has its own compatibility surface on top of the wire API: method names, exception
-classes, default timeouts and retries. Version it with semantic versioning, so a breaking change to any
-of those is a major bump even when the HTTP API did not change, and decouple the SDK version from the
-API version it speaks (pinning the API version inside the SDK release is common) so upgrading the
-library is not silently also an API migration.
+- **An SDK has its own compatibility surface** on top of the wire API: method names, exception classes,
+  default timeouts and retries.
+- **Version it with semantic versioning**, so a breaking change to any of those is a major bump even when
+  the HTTP API did not change.
+- **Decouple the SDK version from the API version it speaks.** Pinning the API version inside each SDK
+  release is common, so upgrading the library is not silently also an API migration.
 
 ### Data and schema changes: expand and contract
-Rename a column or field in three phases. Expand: add the new field and populate both, so old and
-new readers both work. Migrate: move every consumer to the new field, verified by telemetry rather
-than by asking. Contract: stop writing the old field, then remove it. The order matters *because* at
-every point in time each deployed producer and consumer, old or new, still sees a field it
-understands, which is what lets the two sides deploy independently. The same pattern applies to message schemas and tool arguments.
+1. **Expand:** add the new field and populate both, so old and new readers both work.
+2. **Migrate:** move every consumer to the new field, verified by telemetry rather than by asking.
+3. **Contract:** stop writing the old field, then remove it.
+
+- **The order matters** *because* at every point each deployed producer and consumer, old or new, still
+  sees a field it understands, which lets the two sides deploy independently.
+- **Same pattern** for message schemas and tool arguments.
 
 ### AI-specific contracts
-Model providers retire model versions; pin exact snapshot names and track deprecation notices. A
-prompt revision that changes output format is a contract change for everything downstream, so version
-prompts alongside code. A tool schema change can break an agent that learned the old arguments from
-its prompt or few-shot examples. Re-embedding with a new model invalidates an index built with the old
-one, which is versioning applied to data.
+- **Model versions retire.** Pin exact snapshot names and track provider deprecation notices.
+- **Prompts are contracts.** A revision that changes output format is a contract change for everything
+  downstream, so version prompts alongside code.
+- **Tool schemas are contracts.** A change can break an agent that learned the old arguments from its
+  prompt or few-shot examples.
+- **Embeddings are versioned data.** Re-embedding with a new model invalidates an index built with the
+  old one.
 
-## Example
-Two versioned routers in FastAPI sharing one implementation. The v2 shape renamed `summary` to
-`text` and added citations, a breaking change, so v1 is kept as a thin representation with a `Sunset`
-header and an OpenAPI deprecation flag rather than as a forked code path.
+## Diagram
+Most changes take the additive path; only an unavoidable break enters the versioned deprecation
+lifecycle, and it leaves only when telemetry says nobody is left.
+
+```mermaid
+flowchart TD
+    C["Proposed change"] --> Q{"On the breaking list?"}
+    Q -->|"no"| A["Ship additively"]
+    Q -->|"yes"| X{"Expand-contract possible?"}
+    X -->|"yes"| E["Add new field, write both"]
+    E --> M["Migrate consumers, verify by telemetry"]
+    X -->|"no"| V["New version, one implementation"]
+    V --> D["Deprecation and Sunset headers"]
+    D --> M
+    M --> B["Brownouts"]
+    B --> R["Remove old shape on the date"]
+```
+
+## Examples
+### Two versioned routers over one implementation
+The v2 shape renamed `summary` to `text` and added citations, a breaking change. So v1 is kept as a thin
+representation with a `Sunset` header and an OpenAPI deprecation flag, not as a forked code path.
 
 ```python
 from fastapi import APIRouter, FastAPI, Response
@@ -162,38 +181,96 @@ app.include_router(v1)
 app.include_router(v2)
 ```
 
+### A tolerant reader on the client side
+Runnable with the standard library. The client survives a new enum value, a new field and the
+`summary` to `text` rename during the expand phase.
+
+```python
+from enum import Enum
+
+class Status(str, Enum):
+    QUEUED = "queued"
+    DONE = "done"
+    UNKNOWN = "unknown"
+
+    @classmethod
+    def _missing_(cls, value):          # open enum: a value added later maps to UNKNOWN
+        return cls.UNKNOWN
+
+def read_job(payload: dict) -> dict:
+    return {
+        "id": payload["id"],
+        "status": Status(payload.get("status", "unknown")),
+        "text": payload.get("text") or payload.get("summary"),  # new name first, old as fallback
+    }                                    # unknown fields such as "citations" are simply ignored
+
+print(read_job({"id": "j1", "status": "done", "summary": "old shape"}))
+print(read_job({"id": "j2", "status": "cancelled", "text": "new shape", "citations": []}))
+# {'id': 'j1', 'status': <Status.DONE: 'done'>, 'text': 'old shape'}
+# {'id': 'j2', 'status': <Status.UNKNOWN: 'unknown'>, 'text': 'new shape'}
+```
+
+### Worked scenario: renaming a field with expand and contract
+Rename `summary` to `text` on an endpoint with three integrators. Dates are illustrative.
+
+| Week | Server writes | Readers that work | Gate to move on |
+|---|---|---|---|
+| 0 (expand) | `summary` and `text` | old and new | deploy is additive, no gate |
+| 1-8 (migrate) | both; `Deprecation` and `Sunset` on responses | old and new | per-client telemetry: reads of `summary` |
+| 9 (brownout) | `text` only for two one-hour windows | new only | no errors from the remaining clients |
+| 10 (contract) | `text` only | new only | announced date reached, usage at zero |
+
+## Production patterns
+- **Breaking-change gate in CI.** Generate the OpenAPI document on every build and diff it against the
+  published one with a tool such as oasdiff (its `breaking` command), failing the build on removals,
+  narrowed types or new required inputs. Track deliberate breaks per release.
+- **Consumer contracts before deploy.** With Pact, consumers publish contracts to a broker and the
+  provider verifies them in CI; gate deploys with the broker's `can-i-deploy` check. Monitor contract
+  verification failures per consumer.
+- **Version usage telemetry.** Tag every request metric with API version and client id, and build a
+  "who is still on v1" dashboard before announcing a sunset. Alert when a deprecated version's traffic
+  rises instead of falls.
+- **Scheduled brownouts.** Before removal, return `410 Gone` (or the error your docs promise) from the old
+  version for short announced windows, with a body linking the migration guide. Watch support tickets
+  and the error rate of remaining clients.
+- **Pin model snapshots and prompt versions.** Store the exact model snapshot name and prompt version in
+  config, include them in responses or logs, and run the eval and format-parsing suite before changing
+  either. Monitor downstream parse-failure rate after each change.
+
 ## Trade-offs
-- Additive-only evolution keeps every client working with no migration, but the API accumulates
-  legacy fields and awkward names; the balance flips to a versioned break when the old shape actively
-  misleads new integrators.
-- Path versioning is simple and visible, but it moves the whole API at once; header or date pinning
-  allows fine-grained evolution at the cost of transformation code and harder debugging.
-- Stripe-style per-account pinning gives clients indefinite stability, but every change adds a
-  transformation layer the server must maintain and test forever.
-- Strict request validation (`extra="forbid"`) catches client typos early, but it turns harmless
+- **Additive-only vs a clean API.** Every client keeps working with no migration, but the API accumulates
+  legacy fields and awkward names; it flips to a versioned break when the old shape actively misleads
+  new integrators.
+- **Path versioning vs fine-grained evolution.** Path versions are simple and visible but move the whole
+  API at once; header or date pinning allows fine-grained evolution at the cost of transformation code
+  and harder debugging.
+- **Per-account pinning vs server cost.** Stripe-style pinning gives clients indefinite stability, but
+  every change adds a transformation layer the server must maintain and test forever.
+- **Strict validation vs tolerance.** `extra="forbid"` catches client typos early but turns harmless
   additive changes by clients into outages; loosen it on public endpoints, keep it on internal ones.
 
 ## Pitfalls
-- Shipping a field rename as a "small cleanup"; the symptom is a partner integration failing days
-  later with `KeyError` on a field you removed.
-- Forking the codebase per version; the symptom is a bug fixed in v2 that still ships in v1 and a
-  security patch applied to only one of them.
-- Announcing a deprecation without measuring usage; the symptom is removing v1 on the date and
-  discovering the largest customer was still on it.
-- Treating model or prompt updates as invisible; the symptom is downstream parsers breaking because
-  the new model stopped emitting the code fence the old one always produced.
-- Clients that switch exhaustively on an enum; the symptom is a crash the day a new status value is
-  added, even though no field changed.
+- **A field rename shipped as a "small cleanup".** Symptom: a partner integration fails days later with
+  `KeyError` on a field you removed.
+- **Forking the codebase per version.** Symptom: a bug fixed in v2 still ships in v1, and a security
+  patch reaches only one of them.
+- **Announcing a deprecation without measuring usage.** Symptom: v1 is removed on the date and the
+  largest customer turns out to be still on it.
+- **Treating model or prompt updates as invisible.** Symptom: downstream parsers break because the new
+  model stopped emitting the code fence the old one always produced.
+- **Clients switching exhaustively on an enum.** Symptom: a crash the day a new status value is added,
+  even though no field changed.
 
 ## When to use
-Apply the compatibility rules to every change on a published interface: review each diff of a
-response or request model for the breaking list above, and treat prompt and model changes with the
-same review. Introduce a version only when a break is unavoidable, and then introduce exactly one.
-Measure requests per version per client, error rates after a release, and time-to-migrate for
-deprecated versions. In day-to-day work this shows up as contract tests in CI that fail on breaking
-schema diffs and as release notes written for integrators. Interviews probe whether you can list
-what breaks, pick a strategy with reasons, and describe a deprecation lifecycle with dates and
-telemetry rather than hope.
+- **Every change to a published interface:** review each diff of a request or response model against the
+  breaking list, and give prompt and model changes the same review.
+- **Introduce a version** only when a break is unavoidable, and then exactly one.
+- **Measure** requests per version per client, error rates after a release, and time-to-migrate for
+  deprecated versions.
+- **Day to day:** contract tests in CI that fail on breaking schema diffs, and release notes written for
+  integrators.
+- **Interviews:** list what breaks, pick a strategy with reasons, and describe a deprecation lifecycle
+  with dates and telemetry rather than hope.
 
 ## Role lens
 - **Engineer:** Keeps changes additive, renders old versions as representations over one
@@ -214,6 +291,44 @@ as the integer, and deprecate it with a `Sunset` header and docs, removing it af
 zero use; or, if the API is already versioned, make the change in the next version and render the old
 shape from one implementation. I would avoid a bare `/v2` for one field. Either way, contract tests
 in CI should fail on the type change so it cannot ship by accident.
+
+## Interview questions
+### What is Hyrum's law, and how does it change how you evolve an API?
+- **Definition:** with enough users, every observable behaviour of an interface, documented or not,
+  becomes something somebody depends on.
+- **Consequence:** the schema is not the whole contract; list order, error wording and timing can all
+  be load-bearing for someone.
+- **Response:** consumer-driven contract tests and per-client telemetry reveal the dependencies the
+  schema never promised, before a change ships.
+
+### A partner reports `KeyError` failures the day after your release, but your schema diff passed. How do you investigate?
+- **Find the change:** diff actual responses before and after the release for the partner's calls; an
+  undocumented field or a behaviour (a null instead of a missing key) may have changed.
+- **Mitigate first:** roll back, or restore the old field as an additive shim.
+- **Prevent:** add the partner's expectations as a consumer contract, and extend the schema diff to
+  cover nullability and format changes.
+
+### Path, header or date-pinned versioning: how do you choose?
+- **Path** when the API is small or public and visibility, routing and caching matter more than
+  fine-grained change.
+- **Header or date pinning** when many small changes ship continuously and clients must opt in per
+  request or per account.
+- **The cost of pinning** is a growing chain of transformations rendering new behaviour in old shapes,
+  which you maintain and test forever.
+
+### How do you decide when it is safe to remove a deprecated version?
+- **Telemetry, not hope:** requests per version per client must reach zero, or the remaining clients have
+  agreed dates.
+- **In-band warnings:** `Deprecation`, `Sunset` and a `Link` to the migration guide on every old-version
+  response for the whole window.
+- **Brownouts:** short planned outages flush out stragglers before the hard cutoff.
+
+### Your provider retires the model snapshot behind a structured-extraction endpoint. How do you migrate without breaking clients?
+- **Treat it as a contract change:** output format and quality can shift for the same input.
+- **Pin and evaluate:** run the candidate snapshot through the eval and format-parsing suite, and adjust
+  the prompt version together with the model.
+- **Roll out gradually:** shadow or canary traffic, compare parse-failure and quality metrics, and keep
+  the response schema identical so clients see no change.
 
 ## Quiz
 ### Q: Which change is backward compatible for a typical JSON API client?

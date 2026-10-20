@@ -116,6 +116,25 @@ true ≈ (observed + r_fail − 1) / (r_pass + r_fail − 1)
 - **Placement:** judges belong in the offline harness and in sampled online monitoring. A synchronous
   guardrail adds a full model call to every request's latency and should be a deliberate decision.
 
+## Diagram
+The path a criterion takes to become a trusted grader: deterministic checks first, then a judge that
+must pass calibration before it may gate.
+
+```mermaid
+flowchart TD
+    C["Criterion to grade"] --> D{"Checkable by test, schema or regex?"}
+    D -->|"yes"| X["Deterministic grader, no judge"]
+    D -->|"no"| P["Judge prompt: one criterion, reference or context, reason then JSON verdict"]
+    P --> H["Run on human-labeled calibration set"]
+    H --> K["Agreement, kappa, recall on failures"]
+    K --> T{"Failure recall above the gate threshold?"}
+    T -->|"no"| R["Revise rubric on dev split"]
+    R --> H
+    T -->|"yes"| G["Gate in harness, with corrected pass rate"]
+    G --> O["Sampled online judging plus human spot checks"]
+    O -.->|"generator, task or judge model changes"| H
+```
+
 ## Examples
 ### Reference-guided binary judge and its calibration
 Single criterion, reasoning-first JSON verdict, then the calibration numbers that decide whether it can
@@ -281,6 +300,45 @@ would check for position and verbosity effects, use a judge from a different mod
 chatbot, and keep execution-based checks for anything computable. After that, the judge gates releases
 in the harness, the humans move to spot-checking a sample of live outputs weekly, and any disagreement
 feeds back into the rubric and triggers re-calibration when the generator changes.
+
+## Interview questions
+### What is LLM-as-a-judge, and why not use ROUGE or embedding similarity instead?
+- **Definition:** a model grades open-ended outputs against a rubric, often with a reference answer,
+  in place of a human reviewer.
+- **Why not overlap metrics:** BLEU and ROUGE reward wording, not correctness, and embedding similarity
+  cannot see that one number in a financial summary is wrong.
+- **The catch:** a judge is only as good as its measured agreement with humans on this task, because
+  judges carry position, verbosity and self-preference biases.
+
+### Design a judge for faithfulness of RAG answers.
+- **Reference-free mode:** give the judge the answer plus the retrieved context, and ask per claim
+  whether it is supported, not supported or contradicted.
+- **Prompt shape:** one criterion per call, a short justification before the verdict, JSON output with
+  `verdict` and `reason`, few-shot anchors kept out of the calibration set.
+- **Before trusting it:** calibrate on a human-labeled set with both passes and failures, and use a
+  judge from a different model family than the generator.
+
+### Your judge agrees with humans 90% of the time. Is it ready to gate releases?
+- **Not necessarily.** With most items passing, high agreement is compatible with missing many
+  failures; read recall on failures, which was 75% in the worked example.
+- **Check kappa too:** agreement corrected for chance (0.75 in the example) shows how much of the 90% is
+  more than base rate.
+- **Correct the headline:** the observed 0.75 pass rate was really about 0.70 after the Rogan–Gladen
+  correction, a 5-point bias that can flip a comparison.
+
+### When should you not use an LLM judge?
+- **Executable artifacts:** SQL, code and arithmetic should be run against fixtures or tests, because
+  judges misgrade them by inspection.
+- **Deterministic properties:** schema validity, length or regex-checkable content need no model call.
+- **Synchronous guardrails by default:** a judge on the request path adds a full model call to latency,
+  so it should be a deliberate decision rather than the default.
+
+### Judge costs now exceed generation costs. How do you bring them down?
+- **Move deterministic criteria off the judge** and keep it only for what cannot be checked otherwise.
+- **Use a smaller judge model per criterion** once its agreement has been re-measured, knowing cheap
+  judges fail first on subtle factual errors.
+- **Batch offline and sample online:** grade a fixed sample of live traffic asynchronously rather than
+  every request, and weigh the extra output tokens of reasoning-first prompts.
 
 ## Quiz
 ### Q: Why should a judge used as a release gate be evaluated on recall of failures rather than overall agreement with humans?
