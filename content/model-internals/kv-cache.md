@@ -98,6 +98,21 @@ Each lever attacks one factor of the formula, and each has a cost:
 - PagedAttention (vLLM) stores the cache in fixed-size blocks behind a page table, like OS virtual memory.
   That packs many more sequences per GPU and lets requests share prompt prefixes.
 
+## Diagram
+Prefill fills the cache once; each decode step adds one K/V entry and reads all of them.
+
+```mermaid
+flowchart TD
+    P["Prompt tokens"] --> PF["Prefill: one batched pass"]
+    PF --> C[("KV cache per layer")]
+    C --> D["Decode step t"]
+    D -->|"q, k, v for 1 token"| A["Attend: q vs all cached K, V"]
+    A --> T["Next token"]
+    D -->|"append k, v"| C
+    T -->|"until stop"| D
+    C -.->|"~0.5 MB per token"| M["GPU memory limit"]
+```
+
 ## Examples
 ### Decode loop with and without the cache
 The cached version feeds only the new token each step and passes `past_key_values` back in.
@@ -230,6 +245,34 @@ concurrency or context (about 20 chats fit); switch to a GQA model with 8 KV hea
 so ~80 chats fit; quantize the cache to 8-bit for another 2×; use paged attention so memory is not lost to
 fragmentation; add prefix caching if chats share a long system prompt; or shard across more GPUs. A strong
 answer also notes decode is bandwidth-bound, so higher concurrency raises per-request latency.
+
+## Interview questions
+### Why does decode get faster with a KV cache but not much faster on a GPU with more FLOPs?
+- **The cache removes recomputation.** Each past token's K and V are computed once, so a decode step only
+  projects the newest token.
+- **Decode is then bandwidth-bound.** Each step reads all weights and the whole cache for very little
+  arithmetic, so tokens per second tracks memory bandwidth, not peak FLOPs.
+
+### Walk me through sizing the KV cache for a model you are about to deploy.
+- **Formula:** 2 × layers × KV heads × head dim × bytes per element, per token.
+- **Multiply** by expected tokens per request and by concurrent requests.
+- **Compare** with GPU memory left after weights, keeping about 10% headroom; that gives the concurrency
+  limit to configure in the engine.
+
+### What would you do if long-context traffic started causing preemptions?
+- **Diagnose first:** KV utilization near 100% with rising preemption or swap counts means over-admission.
+- **Then pick levers:** cap context per route, lower max concurrent sequences, enable an FP8 cache after an
+  eval, move long-document work to a retrieval step or separate deployment, or choose a GQA model.
+
+### When is it safe to reuse a cached prefix across requests?
+- **Only for byte-identical prefixes.** Keys carry their position and depend on every earlier token.
+- **So** put stable content (system prompt, tool definitions) first and variable content last, and never
+  edit earlier conversation turns if you want cache hits.
+
+### How do MQA, GQA and MLA differ in what they save?
+- **MQA** shares one K/V head across all query heads: the biggest saving, often some quality cost.
+- **GQA** shares each K/V head across a group (for example 8 KV heads instead of 32), a 4x saving.
+- **MLA** caches a compressed latent per token and reconstructs K and V from it.
 
 ## Quiz
 ### Q: Why does the KV cache store keys and values but not queries?

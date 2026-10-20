@@ -21,8 +21,11 @@ KINDS = {"concept", "tool", "metric", "pattern", "practice", "decision"}
 DIFFS = {"intro", "core", "advanced"}
 TOPIC_SECTIONS = ["TL;DR", "Why it exists", "How it works", "Example", "Trade-offs", "Pitfalls",
                   "When to use", "Role lens", "Check yourself", "Quiz"]
-TOPIC_SECTIONS_V2 = ["TL;DR", "Why it exists", "How it works", "Example", "Production patterns", "Trade-offs",
-                     "Pitfalls", "When to use", "Role lens", "Check yourself", "Quiz"]
+TOPIC_SECTIONS_V2 = ["TL;DR", "Why it exists", "How it works", "Diagram", "Example", "Production patterns",
+                     "Trade-offs", "Pitfalls", "When to use", "Role lens", "Check yourself",
+                     "Interview questions", "Quiz"]
+MERMAID_KINDS = ("flowchart", "graph", "sequenceDiagram", "stateDiagram", "stateDiagram-v2", "classDiagram",
+                 "erDiagram", "timeline", "gantt", "pie", "mindmap", "quadrantChart")
 V2_FORCE = False          # set by --v2: check files against the crisp format even before they are stamped
 PARA_MAX, BULLET_MAX, TLDR_MAX_V2 = 60, 80, 45
 MODULE_SECTIONS = ["Overview", "Why it matters", "Mental model", "Suggested order", "Capstone"]
@@ -38,6 +41,8 @@ def norm_heading(h):
                "trade-offs": "Trade-offs", "tradeoffs": "Trade-offs", "trade offs": "Trade-offs",
                "pitfalls": "Pitfalls", "common pitfalls": "Pitfalls",
                "production patterns": "Production patterns", "in production": "Production patterns",
+               "diagram": "Diagram", "flowchart": "Diagram", "flow": "Diagram",
+               "interview questions": "Interview questions", "interview prep": "Interview questions",
                "when to use": "When to use", "when to use / decide": "When to use", "when to use it": "When to use",
                "when to use / when not to": "When to use", "when": "When to use",
                "role lens": "Role lens", "check yourself": "Check yourself", "quiz": "Quiz",
@@ -150,6 +155,34 @@ def long_blocks(md, para_max=PARA_MAX, bullet_max=BULLET_MAX):
     flush_para(); flush_item()
     return out
 
+def diagram(md, errs):
+    m = re.search(r"```mermaid[^\n]*\n(.*?)```", md, re.S)
+    if not m:
+        errs.append("'Diagram' needs a ```mermaid fenced block"); return None
+    code = m.group(1).strip("\n")
+    first = next((l.strip() for l in code.splitlines() if l.strip() and not l.strip().startswith("%%")), "")
+    if not first.split(" ")[0] in MERMAID_KINDS:
+        errs.append(f"'Diagram': first mermaid line must start with one of {MERMAID_KINDS[:4]}... (found {first[:30]!r})")
+    if code.count("\n") > 40: errs.append("'Diagram' too large (max ~40 lines); keep it to the core flow")
+    for bad in (";", "classDef", "click ", "style "):
+        if bad in code: errs.append(f"'Diagram': avoid {bad.strip()!r} (keeps the diagram portable and parseable)")
+    caption = (md[:m.start()] + md[m.end():]).strip()
+    if words(caption) < 8: errs.append("'Diagram' needs a one or two sentence caption saying what to look at")
+    return {"code": code, "caption": caption}
+
+def interview(md, errs):
+    secs, order, _ = split_sections(md, level=3)
+    qs = []
+    for h in order:
+        q = re.sub(r"^(Q\d*[.:)]?\s*)", "", h.strip(), flags=re.I).strip()
+        a = secs[h].strip()
+        if words(q) < 6: errs.append(f"Interview question too short: {q[:50]!r}")
+        if words(a) < 25: errs.append(f"Interview answer too short (min 25 words) for: {q[:50]!r}")
+        qs.append({"q": q, "a": a})
+    if not 4 <= len(qs) <= 6:
+        errs.append(f"'Interview questions' needs 4-6 questions as '### question' headings with answers (found {len(qs)})")
+    return qs
+
 def role_lens(md, errs, where):
     res = {}
     for b in bullets(md):
@@ -251,7 +284,7 @@ def parse_topic(path: Path):
     if any(s not in got for s in need):
         return None, errs, warns
     is_tool = kind == "tool"
-    patterns = []
+    patterns, dia, ivq = [], None, []
     if not v2:
         mins = {"TL;DR": 15, "Why it exists": 120, "How it works": 150 if is_tool else 250,
                 "When to use": 60}
@@ -281,8 +314,10 @@ def parse_topic(path: Path):
             if not b.startswith("**"): errs.append(f"production pattern must start with a **bold name**: {b[:50]!r}")
             if words(b) < 15: errs.append(f"production pattern too thin (min 15 words): {b[:50]!r}")
         if len(bullets(got["When to use"])) < 3: errs.append("'When to use' needs bullets (use when / avoid when / measure)")
-        for sec in ("TL;DR", "Why it exists", "How it works", "Example", "Production patterns",
-                    "Trade-offs", "Pitfalls", "When to use"):
+        dia = diagram(got["Diagram"], errs)
+        ivq = interview(got["Interview questions"], errs)
+        for sec in ("TL;DR", "Why it exists", "How it works", "Diagram", "Example", "Production patterns",
+                    "Trade-offs", "Pitfalls", "When to use", "Interview questions"):
             for kind_, w, head in long_blocks(got[sec]):
                 lim = PARA_MAX if kind_ == "paragraph" else BULLET_MAX
                 errs.append(f"'{sec}': {kind_} of {w} words (max {lim}); split it: {head!r}")
@@ -297,7 +332,7 @@ def parse_topic(path: Path):
          "taxonomy_name": tax_t["name"], "kind": kind, "difficulty": diff, "est_minutes": est,
          "related": [r for r in related if r in ALL_KEYS], "sources": sources,
          "tldr": got["TL;DR"], "why": got["Why it exists"], "how": got["How it works"],
-         "example": got["Example"], "patterns": patterns, "format": "crisp" if v2 else "long", "tradeoffs": tr, "pitfalls": pf, "when": got["When to use"],
+         "example": got["Example"], "patterns": patterns, "diagram": dia, "interview": ivq, "format": "crisp" if v2 else "long", "tradeoffs": tr, "pitfalls": pf, "when": got["When to use"],
          "role_lens": role_lens(got["Role lens"], errs, "Role lens"),
          "check": check_yourself(got["Check yourself"], errs), "quiz": quiz(got["Quiz"], errs)}
     if "caveat" in tax_t: t["caveat"] = tax_t["caveat"]
@@ -411,7 +446,7 @@ def build(report_only=False):
         for k, v in list(report["invalid"].items())[:40]:
             print(f"  ✗ {k}: {v[0]}")
         return
-    HEAVY = ("why", "how", "example", "patterns", "tradeoffs", "pitfalls", "when", "role_lens", "check", "quiz", "sources")
+    HEAVY = ("why", "how", "example", "patterns", "diagram", "interview", "tradeoffs", "pitfalls", "when", "role_lens", "check", "quiz", "sources")
     built = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     (ROOT / "site" / "data").mkdir(exist_ok=True)
     light_modules, total_bytes = [], 0

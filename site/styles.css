@@ -396,3 +396,67 @@ mark { background: var(--warn-soft); color: inherit; padding: 0 2px; border-radi
 .tier-section { scroll-margin-top: 12px; }
 .list-cards.patterns li .mark { color: var(--good); }
 .list-cards.patterns li { border-left: 3px solid var(--good); }
+
+/* ---------- spacing pass: room to breathe ---------- */
+.prose { line-height: 1.72; }
+.prose p { margin: 0 0 1.15em; }
+.prose ul, .prose ol { margin: .2em 0 1.3em; padding-left: 1.5em; }
+.prose li { margin: .55em 0; padding-left: .15em; }
+.prose li > ul, .prose li > ol { margin: .45em 0 .2em; }
+.prose li > p { margin: .35em 0; }
+.prose h3 { margin: 2.1em 0 .8em; }
+.prose h3:first-child { margin-top: .2em; }
+.prose h4 { margin: 1.6em 0 .6em; }
+.prose pre { margin: .6em 0 1.4em; padding: 16px 18px; }
+.prose table { margin: .6em 0 1.5em; }
+.prose th, .prose td { padding: 9px 14px; line-height: 1.5; }
+.prose blockquote { margin: .4em 0 1.3em; padding: 10px 16px; }
+.prose > :last-child { margin-bottom: 0; }
+.tldr { padding: 20px 22px; margin: 4px 0 44px; }
+.topic-head { gap: 14px; margin-bottom: 28px; }
+.section { margin: 0 0 52px; }
+.section > h2 { margin-bottom: 18px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
+.list-cards { gap: 12px; }
+.list-cards li { padding: 14px 18px; line-height: 1.62; }
+.lens { gap: 14px; }
+.lens div { padding: 16px 18px; line-height: 1.6; }
+.reveal, .qcard { padding: 20px 22px; }
+.quiz { gap: 18px; }
+.opts { gap: 8px; }
+.opt { padding: 11px 14px; }
+.expl { margin-top: 14px; padding: 12px 14px; line-height: 1.6; }
+.chips { gap: 10px; }
+.topic-list { gap: 8px; }
+.topic-list a { padding: 12px 14px; }
+.mod-grid { gap: 16px; }
+.mod-card { padding: 18px 18px 16px; gap: 10px; }
+.stats { gap: 16px; margin: 28px 0; }
+.row2 { gap: 18px; margin-bottom: 34px; }
+.tier-section { margin-top: 44px; }
+.tier-head { margin-bottom: 18px; }
+.flash { padding: 24px 26px; }
+.mod-items a { padding: 6px 8px 6px 10px; }
+.mod + .mod { margin-top: 2px; }
+
+/* ---------- diagrams ---------- */
+.diagram-caption { margin-bottom: 14px; color: var(--ink-2); }
+.diagram { margin: .4em 0 1.4em; padding: 22px 18px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow-x: auto; text-align: center; max-width: 100%; }
+.diagram pre.mermaid { margin: 0; padding: 0; background: transparent; color: var(--ink); font-family: var(--font-display); white-space: pre; display: inline-block; min-width: 0; }
+.diagram svg { max-width: none; height: auto; }
+.diagram.diagram-src { text-align: left; }
+.diagram.diagram-src pre.mermaid { font-family: var(--font-mono); font-size: 12.5px; color: var(--ink-2); }
+.diagram.diagram-src::before { content: "Diagram source"; display: block; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3); margin-bottom: 8px; }
+
+/* ---------- interview questions ---------- */
+.ivq-list { display: grid; gap: 10px; max-width: 72ch; }
+.ivq { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+.ivq summary { list-style: none; cursor: pointer; display: grid; grid-template-columns: 34px 1fr 18px; gap: 10px; align-items: start; padding: 15px 18px; font-weight: 500; font-size: 15.5px; line-height: 1.45; }
+.ivq summary::-webkit-details-marker { display: none; }
+.ivq summary::after { content: "+"; font-family: var(--font-mono); color: var(--ink-3); text-align: right; }
+.ivq[open] summary::after { content: "−"; }
+.ivq[open] summary { border-bottom: 1px dashed var(--line-strong); }
+.ivq summary:hover { background: var(--surface-2); border-radius: var(--radius); }
+.ivq-n { font-family: var(--font-mono); font-size: 12px; color: var(--accent); padding-top: 3px; }
+.ivq .prose { padding: 14px 18px 16px 62px; font-size: 15.5px; }
+.drill-q { font-size: 17px; }
+@media (max-width: 480px) { .ivq .prose { padding-left: 18px; } .section { margin-bottom: 40px; } }

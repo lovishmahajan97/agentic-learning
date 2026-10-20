@@ -39,6 +39,11 @@ like a senior colleague at a whiteboard: direct, concrete, numbers over adjectiv
 The mechanism as ### subsections, numbered steps, bullets and tables. Keep formulas and algorithms
 in fenced blocks. Every design choice keeps its "because".
 
+## Diagram
+One or two sentences saying what to look at, then ONE ```mermaid block (flowchart, sequenceDiagram or
+stateDiagram-v2) showing the mechanism, data flow, request lifecycle or decision path. See the
+mermaid rules below.
+
 ## Examples
 At least 2 examples, each under its own `### title`, at least one with a fenced code block:
 - a runnable code example (Python unless the topic is Node/TS or SQL; under ~40 lines);
@@ -61,8 +66,28 @@ actually do in production; name real tools only when you are sure the setting ex
 
 ## Role lens            (unchanged, copy exactly)
 ## Check yourself       (unchanged, copy exactly)
+
+## Interview questions
+4-6 questions a real interviewer would ask about this topic, each as a `### question` heading followed
+by a model answer of 2-4 bold-led bullets (25+ words). Mix levels: one definition-plus-why, one design
+or debugging scenario, one trade-off or "when would you not", one production or numbers question. Do not
+repeat the Check yourself question.
+
 ## Quiz                 (unchanged, copy exactly)
 ```
+
+## Mermaid rules (diagrams must render)
+
+- Start with `flowchart TD`, `flowchart LR`, `sequenceDiagram` or `stateDiagram-v2`.
+- Node ids are plain letters/digits (`A`, `KV1`); put every label in double quotes: `A["KV cache (per layer)"]`.
+  Never put a double quote inside a label; use words instead.
+- Edge labels also quoted: `A -->|"append k, v"| B`. Dotted: `A -.->|"label"| B`. Database shape: `C[("Store")]`.
+- Never use `;`, `classDef`, `style`, `click`, HTML tags (except `<br/>`), or `#` entities.
+- sequenceDiagram: `participant U as User`, messages like `U->>S: POST /chat`, notes like
+  `Note over S: validate`. Keep message text free of `;` and `#`.
+- Keep it to the core idea: at most ~12 nodes or ~10 messages, max 40 lines.
+- Prefer `flowchart TD` (top-down) for anything over 5 nodes; it fits a reading column. Use `LR`
+  only for short chains. Keep node labels under ~6 words; put detail in the caption, not the boxes.
 
 ## Rewriting an existing lesson (the no-loss rule)
 

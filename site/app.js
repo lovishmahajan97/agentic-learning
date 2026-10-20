@@ -12,9 +12,31 @@
   if (window.marked) marked.setOptions({ gfm: true, breaks: false, headerIds: false, mangle: false });
   const md = s => window.marked ? marked.parse(String(s || '')) : '<p>' + esc(s) + '</p>';
   const mdi = s => window.marked ? marked.parseInline(String(s || '')) : esc(s);
+  let mermaidSeq = 0;
+  function isDark() { const t = document.documentElement.getAttribute('data-theme'); return t ? t === 'dark' : !!(window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches); }
+  function renderDiagrams(root) {
+    const blocks = root.querySelectorAll('pre > code.language-mermaid');
+    if (!blocks.length) return;
+    const nodes = [];
+    blocks.forEach(code => {
+      const src = code.textContent; const pre = code.parentElement;
+      const wrap = document.createElement('div'); wrap.className = 'diagram';
+      const el = document.createElement('pre'); el.className = 'mermaid'; el.id = 'mmd-' + (++mermaidSeq); el.textContent = src;
+      wrap.appendChild(el); wrap.dataset.src = src; pre.replaceWith(wrap); nodes.push(el);
+    });
+    if (!window.mermaid) { nodes.forEach(n => n.closest('.diagram').classList.add('diagram-src')); return; }
+    try {
+      mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: isDark() ? 'dark' : 'neutral',
+        fontFamily: getComputedStyle(document.body).fontFamily, flowchart: { htmlLabels: true, curve: 'basis', useMaxWidth: false, nodeSpacing: 36, rankSpacing: 44 }, sequence: { useMaxWidth: false }, state: { useMaxWidth: false } });
+      mermaid.run({ nodes, suppressErrors: true }).finally(() => nodes.forEach(n => {
+        if (!n.querySelector('svg')) { const w = n.closest('.diagram'); if (w) { w.classList.add('diagram-src'); n.textContent = w.dataset.src; } }
+      }));
+    } catch (e) { nodes.forEach(n => n.closest('.diagram').classList.add('diagram-src')); }
+  }
   function highlight(root) {
+    renderDiagrams(root);
     if (!window.hljs) return;
-    root.querySelectorAll('pre code').forEach(b => { try { hljs.highlightElement(b); } catch (e) { } });
+    root.querySelectorAll('pre code:not(.language-mermaid)').forEach(b => { try { hljs.highlightElement(b); } catch (e) { } });
   }
 
   /* ---------------- state ---------------- */
@@ -141,7 +163,7 @@
     const root = document.documentElement; if (S.theme === 'system') root.removeAttribute('data-theme'); else root.setAttribute('data-theme', S.theme);
     $('#themeToggle').title = 'Theme: ' + S.theme;
   }
-  $('#themeToggle').onclick = () => { S.theme = { system: 'light', light: 'dark', dark: 'system' }[S.theme] || 'system'; save(); applyTheme(); toast('Theme: ' + S.theme); };
+  $('#themeToggle').onclick = () => { S.theme = { system: 'light', light: 'dark', dark: 'system' }[S.theme] || 'system'; save(); applyTheme(); toast('Theme: ' + S.theme); if (document.querySelector('.diagram')) route(); };
   const navToggle = $('#navToggle'), scrim = $('#scrim');
   function setNav(open) { app.classList.toggle('nav-open', open); scrim.hidden = !open; navToggle.setAttribute('aria-expanded', open); }
   navToggle.onclick = () => setNav(!app.classList.contains('nav-open'));
@@ -261,6 +283,7 @@
     }
     html += '</div>';
     main.innerHTML = html;
+    highlight(main);
     main.querySelectorAll('[data-cap]').forEach(cb => cb.onchange = () => { S.capstone[mid] = S.capstone[mid] || {}; S.capstone[mid][cb.dataset.cap] = cb.checked; save(); cb.closest('label').classList.toggle('done', cb.checked); });
   }
 
@@ -288,6 +311,7 @@
     const secs = [
       ['why', 'Why it exists', md(t.why)],
       ['how', 'How it works', md(t.how)],
+      ...(t.diagram && t.diagram.code ? [['diagram', 'Diagram', `<div class="prose diagram-caption">${md(t.diagram.caption)}</div><pre><code class="language-mermaid">${esc(t.diagram.code)}</code></pre>`]] : []),
       ['example', t.format === 'crisp' ? 'Examples' : 'Example', md(t.example)],
       ...((t.patterns && t.patterns.length) ? [['patterns', 'Production patterns', `<ul class="list-cards patterns">${t.patterns.map(b => `<li><span class="mark">▸</span><span>${mdi(b)}</span></li>`).join('')}</ul>`]] : []),
       ['tradeoffs', 'Trade-offs', `<ul class="list-cards tradeoffs">${(t.tradeoffs || []).map(b => `<li><span class="mark">⇄</span><span>${mdi(b)}</span></li>`).join('')}</ul>`],
@@ -296,6 +320,7 @@
       ['lens', 'Role lens', `<div class="lens">${['engineer', 'architect', 'fde'].map(r => `<div><b>${ROLE[r]}</b>${mdi((t.role_lens || {})[r] || '')}</div>`).join('')}</div>`],
     ];
     const related = (t.related || []).map(k => topics.get(k)).filter(Boolean);
+    const ivq = t.interview || [];
     let html = `<div class="reader"><article>${head}
       ${t.status === 'invalid' ? `<div class="banner">This lesson failed validation and may be incomplete.<pre style="font-size:12px;white-space:pre-wrap">${esc((t.errors || []).join('\n'))}</pre></div>` : ''}
       ${t.caveat ? `<div class="banner">Caveat: ${esc(t.caveat)}.</div>` : ''}
@@ -304,20 +329,24 @@
       ${related.length ? `<section class="section" id="s-related"><h2><span class="num">${pad2(secs.length + 1)}</span>Related lessons</h2><div class="chips">${related.map(r => `<a class="chip" href="#t.${r.module}.${r.id}"><span class="dot ${topicDot(r)}"></span>${esc(r.name)}<span class="sub">${esc(r.moduleTitle)}</span></a>`).join('')}</div></section>` : ''}
       <section class="section" id="s-check"><h2><span class="num">${pad2(secs.length + 2)}</span>Check yourself</h2>
         <div class="reveal"><div class="q prose">${md(t.check.q)}</div><button class="btn sm" id="revealBtn">Reveal a model answer</button><div class="a prose" id="answer" hidden>${md(t.check.a)}</div></div></section>
-      <section class="section" id="s-quiz"><h2><span class="num">${pad2(secs.length + 3)}</span>Quiz</h2><div class="quiz" id="quiz">${(t.quiz || []).map((q, qi) => `<div class="qcard" data-q="${qi}"><div class="q"><span class="n">Q${qi + 1}</span>${mdi(q.q)}</div><div class="opts">${q.options.map((o, oi) => `<button class="opt" data-o="${oi}"><span class="k">${'ABCD'[oi]}</span><span>${mdi(o)}</span></button>`).join('')}</div><div class="expl" hidden></div></div>`).join('')}<div id="quizResult"></div></div></section>
-      <section class="section notes" id="s-notes"><h2><span class="num">${pad2(secs.length + 4)}</span>Your notes</h2><textarea id="notes" placeholder="What clicked, what is still fuzzy, how this connects to your own work…">${esc(S.notes[key] || '')}</textarea></section>
+      ${ivq.length ? `<section class="section" id="s-interview"><h2><span class="num">${pad2(secs.length + 3)}</span>Interview questions</h2>
+        <div class="ivq-list">${ivq.map((x, xi) => `<details class="ivq"><summary><span class="ivq-n">Q${xi + 1}</span><span>${mdi(x.q)}</span></summary><div class="prose">${md(x.a)}</div></details>`).join('')}</div>
+        <div class="btn-row" style="margin-top:12px"><button class="btn sm" id="ivqAll">Expand all answers</button></div></section>` : ''}
+      <section class="section" id="s-quiz"><h2><span class="num">${pad2(secs.length + (ivq.length ? 4 : 3))}</span>Quiz</h2><div class="quiz" id="quiz">${(t.quiz || []).map((q, qi) => `<div class="qcard" data-q="${qi}"><div class="q"><span class="n">Q${qi + 1}</span>${mdi(q.q)}</div><div class="opts">${q.options.map((o, oi) => `<button class="opt" data-o="${oi}"><span class="k">${'ABCD'[oi]}</span><span>${mdi(o)}</span></button>`).join('')}</div><div class="expl" hidden></div></div>`).join('')}<div id="quizResult"></div></div></section>
+      <section class="section notes" id="s-notes"><h2><span class="num">${pad2(secs.length + (ivq.length ? 5 : 4))}</span>Your notes</h2><textarea id="notes" placeholder="What clicked, what is still fuzzy, how this connects to your own work…">${esc(S.notes[key] || '')}</textarea></section>
       ${t.sources && t.sources.length ? `<section class="section"><h2>Sources</h2><ul class="sources">${t.sources.map(s => `<li>${esc(s)}</li>`).join('')}</ul></section>` : ''}
       ${pager(prev, next, m, nextMod)}
     </article>
     <aside class="toc"><div class="toc-title">On this page</div>
       ${secs.map(([id, title]) => `<a href="#s-${id}" data-toc="s-${id}">${title}</a>`).join('')}
-      <a href="#s-check" data-toc="s-check">Check yourself</a><a href="#s-quiz" data-toc="s-quiz">Quiz</a>
+      <a href="#s-check" data-toc="s-check">Check yourself</a>${ivq.length ? '<a href="#s-interview" data-toc="s-interview">Interview questions</a>' : ''}<a href="#s-quiz" data-toc="s-quiz">Quiz</a>
       <div class="toc-side"><div class="toc-title">Module</div><a href="#m.${m.id}" style="border:0;padding-left:0">${esc(m.title)} →</a><div class="bar tier-${m.tier}"><i style="width:${modProgress(m).pct}%"></i></div><div class="muted" style="font-size:12px">${modProgress(m).done}/${modProgress(m).total} learned</div></div>
     </aside></div>`;
     main.innerHTML = html;
     highlight(main);
     bindLearn(t);
     $('#revealBtn').onclick = () => { $('#answer').hidden = false; $('#revealBtn').hidden = true; };
+    const ivAll = $('#ivqAll'); if (ivAll) ivAll.onclick = () => { const all = [...main.querySelectorAll('details.ivq')]; const open = !all.every(d => d.open); all.forEach(d => { d.open = open; }); ivAll.textContent = open ? 'Collapse all answers' : 'Expand all answers'; };
     main.querySelectorAll('.toc a[data-toc]').forEach(a => a.onclick = e => { e.preventDefault(); const el = document.getElementById(a.dataset.toc); if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' }); });
     const notes = $('#notes'); let nt; notes.oninput = () => { clearTimeout(nt); nt = setTimeout(() => { if (notes.value.trim()) S.notes[key] = notes.value; else delete S.notes[key]; save(); }, 300); };
     bindQuiz(t);
@@ -420,22 +449,26 @@
     const m = mid && modById.get(mid);
     const need = (m ? [m.id] : allModuleIds()).filter(id => !loaded.has(id));
     if (need.length) { main.innerHTML = loadingView('drill'); ensureModules(need).then(() => { if (location.hash === (m ? '#drill.' + m.id : '#drill')) renderDrill(mid); }); return; }
-    const pool = (m ? m.ordered : flat.filter(inPath)).filter(t => t.status === 'ok' && t.check && t.check.q);
+    const pool = [];
+    (m ? m.ordered : flat).filter(t => t.status === 'ok').forEach(t => {
+      if (t.check && t.check.q) pool.push({ t, q: t.check.q, a: t.check.a, kind: 'Check yourself' });
+      (t.interview || []).forEach(x => pool.push({ t, q: x.q, a: x.a, kind: 'Interview' }));
+    });
     for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
     const scope = m ? m.title : 'the whole track';
     main.innerHTML = `<div class="page-narrow"><div class="crumbs"><a href="#dashboard">Home</a><i>›</i>${m ? `<a href="#m.${m.id}">${esc(m.title)}</a><i>›</i>` : ''}<span>Interview drill</span></div>
       <h1>Interview drill</h1><p class="lede">${pool.length} questions from <strong>${esc(scope)}</strong>, shuffled. Answer out loud or in writing before you reveal; this does not change your review schedule unless you ask it to.</p>
-      ${m ? '' : `<div class="btn-row" style="margin-bottom:16px"><span class="muted" style="font-size:13px">Narrow to a module:</span><select id="drillMod" class="select" style="width:auto"><option value="">Whole path</option>${modules.filter(mm => modStatus(mm) !== 'skip').map(mm => `<option value="${mm.id}">${esc(mm.title)}</option>`).join('')}</select></div>`}
+      ${m ? '' : `<div class="btn-row" style="margin-bottom:16px"><span class="muted" style="font-size:13px">Narrow to a module:</span><select id="drillMod" class="select" style="width:auto"><option value="">Whole track</option>${modules.map(mm => `<option value="${mm.id}">${pad2(mm.num)} · ${esc(mm.title)}</option>`).join('')}</select></div>`}
       <div id="drill"></div></div>`;
     const sel = $('#drillMod'); if (sel) sel.onchange = () => { location.hash = sel.value ? `#drill.${sel.value}` : '#drill'; };
     const box = $('#drill'); let i = 0;
     if (!pool.length) { box.innerHTML = '<div class="empty">No lessons with check questions here yet.</div>'; return; }
     function step() {
       if (i >= pool.length) { box.innerHTML = `<div class="quiz-result good">Drill complete: ${pool.length} questions.</div><div class="btn-row" style="margin-top:14px"><a class="btn primary" href="${m ? '#drill.' + m.id : '#drill'}">Shuffle again</a></div>`; return; }
-      const t = pool[i];
-      box.innerHTML = `<div class="flash"><div class="where">${i + 1} / ${pool.length} · ${esc(t.moduleTitle)} · <a href="#t.${t.module}.${t.id}">${esc(t.name)}</a></div><div class="prose">${md(t.check.q)}</div>
+      const it = pool[i], t = it.t;
+      box.innerHTML = `<div class="flash"><div class="where">${i + 1} / ${pool.length} · <span class="pill">${it.kind}</span> ${esc(t.moduleTitle)} · <a href="#t.${t.module}.${t.id}">${esc(t.name)}</a></div><div class="prose drill-q">${md(it.q)}</div>
         <div class="btn-row" style="margin-top:14px"><button class="btn primary" id="dReveal">Reveal model answer</button><button class="btn" id="dSkip">Skip</button></div>
-        <div id="dA" hidden><div class="prose" style="margin-top:14px;padding-top:14px;border-top:1px dashed var(--line-strong)">${md(t.check.a)}</div>
+        <div id="dA" hidden><div class="prose" style="margin-top:14px;padding-top:14px;border-top:1px dashed var(--line-strong)">${md(it.a)}</div>
         <div class="grades"><button class="btn primary" id="dNext">Next question</button><button class="btn" id="dQueue">${S.review[t.key] ? 'Bring forward in review queue' : 'Add to review queue'}</button></div></div></div>`;
       $('#dReveal').onclick = () => { $('#dA').hidden = false; $('#dReveal').hidden = true; $('#dSkip').hidden = true; highlight(box); };
       $('#dSkip').onclick = () => { i++; step(); };
