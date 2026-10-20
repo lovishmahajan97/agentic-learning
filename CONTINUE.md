@@ -83,7 +83,9 @@ remaining by module:
 0. **Make sure no other session is still writing.** Check the branch on GitHub: if commits titled
    `wip: lesson content progress` are still arriving every ~15 minutes, the cloud session is alive;
    wait for it to stop (or stop it) before running locally, otherwise two sets of agents edit the same
-   files.
+   files. Quick check (anything older than ~30 minutes means it has stopped):
+
+       git fetch origin && git log -1 --format='%cr  %s' origin/claude/wizardly-wozniak-5lduqj
 1. Get the latest content:
 
        git fetch origin
