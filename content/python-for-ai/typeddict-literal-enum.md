@@ -4,217 +4,227 @@ module: python-for-ai
 name: TypedDict, Literal and Enum
 kind: concept
 difficulty: core
-est_minutes: 15
+est_minutes: 14
 related:
   - python-for-ai/type-hints
   - python-for-ai/pydantic
   - python-for-ai/dataclasses
   - python-for-ai/json-jsonl
-  - python-for-ai/mypy
-  - prompting/structured-outputs-json-mode
   - agents/tool-schemas-and-argument-validation
+  - prompting/structured-outputs-json-mode
+  - agents/state-machines
 sources:
   - Lehtosalo, 2019 — PEP 589: TypedDict
   - Lee, Levkivskyi, Lehtosalo, 2019 — PEP 586: Literal Types
   - Warsaw, Bendersky, Furman, 2013 — PEP 435: Adding an Enum type to the Python standard library
-  - Official docs: typing and enum modules
+  - Official docs: enum module
 ---
 
 ## TL;DR
-Three tools for "small, fixed vocabularies" that LLM code is full of. `TypedDict` gives a plain dict a
-checked set of keys and value types while it stays a dict, which is what JSON and SDK parameters want.
-`Literal["user", "assistant"]` restricts a value to specific constants so the checker catches typos and
-missing branches. `Enum` turns constants into real objects with identity, iteration, methods and a
-runtime lookup that rejects unknown values. Pick by whether you need a dict, a static constraint, or
-a runtime one.
+`TypedDict` types a plain dict with fixed keys, for JSON-shaped data you do not want to wrap in
+objects. `Literal` restricts a value to a small fixed set of constants at zero runtime cost. `Enum`
+turns such a set into real runtime objects with identity, iteration and methods. AI code is full of
+wire-format dicts and tiny closed vocabularies (roles, finish reasons, tool names), and the type
+checker can only protect those if you name them; these three are how you do it.
 
 ## Why it exists
-Every LLM API speaks JSON: a message is `{"role": "user", "content": "..."}`, a tool call is a dict
-of arguments, a response format is one of a few strings. Typing all of that as `dict[str, Any]` and
-`str` is honest but useless: the checker cannot tell you that `{"roel": "user"}` is wrong, that
-`role="User"` will be rejected by the provider, or that your `match` on the role forgot the new
-`"tool"` case added last sprint. The failures surface as HTTP 400s from the provider or, worse, as a
-silently ignored message.
+Provider responses, tool-call arguments and agent state arrive as dicts. Typed as
+`dict[str, Any]`, the checker accepts `msg["contnt"]` and `msg["role"] = "User"`, and both bugs
+surface as a 400 from the API or a silently skipped branch. Converting every dict into a class
+fixes the checking but costs allocations, forces conversion in both directions, and is often the
+wrong representation: the dict *is* what the SDK consumes, what gets stored in a graph state
+object, and what gets logged. What is missing is a type for "a dict with exactly these keys and
+these value types". That is `TypedDict`.
 
-The opposite reflex, "make everything a class", fights the boundary. Provider SDKs accept dicts for
-request parameters; JSON files, queue payloads and logs are dicts; converting back and forth at every
-edge adds code and copies without adding safety where it is actually missing, which is inside your
-own functions that pass those dicts around.
+The second problem is small vocabularies. `role: str` admits `"User"`, `"assistant "` and
+`"function"`; `finish_reason: str` admits anything. Without a way to say "one of these three
+strings", the checker cannot flag a typo, cannot tell you a `match` statement is missing a case,
+and cannot stop a new team member inventing a fourth role. `Literal` names the set with no runtime
+object at all, which is the right cost when the strings only travel over the wire.
 
-`TypedDict` exists so a dict can carry a static contract without ceasing to be a dict. `Literal`
-exists because many parameters are strings from a closed set and the set is the whole contract; the
-checker can enforce membership and exhaustiveness for free. `Enum` exists for the cases where you
-need the constants at *runtime*: validating user or model input, iterating all options, attaching
-behaviour, or guaranteeing that two modules mean the same thing by `is`. Each covers a gap the other
-two leave open, which is why all three are in the standard library.
+Sometimes the vocabulary needs behaviour: map each finish reason to an action, iterate every role
+to render a UI, attach a retry policy to each error class. Literals do not exist at runtime, so
+there is nothing to iterate or hang a method on. `Enum` makes each member a singleton object with a
+name, a value, and whatever methods you add, at the cost of a conversion step at the JSON boundary.
 
 ## How it works
 ### TypedDict: a dict with a declared shape
-`class Message(TypedDict): role: str; content: str` declares that a `Message` is a dict with exactly
-those keys. At runtime it is a normal `dict`; the class is only metadata, and `isinstance(x, Message)`
-raises `TypeError` because there is nothing to check against. The static checker verifies three
-things: literal constructions `{"role": "user", "content": "hi"}` have the required keys and no
-unknown ones, `m["content"]` is a `str`, and `m["contnet"]` is an error. Keys are required by default;
-`total=False` makes them all optional, and `NotRequired[str]` / `Required[str]` (Python 3.11, PEP 655)
-mark individual keys. The functional form `TypedDict("Params", {"max-tokens": int})` handles keys that
-are not valid identifiers. TypedDicts can inherit from each other to compose shapes.
+A `TypedDict` is declared like a class but creates nothing new at runtime: `Message(role="user",
+content="hi")` returns an ordinary `dict`, and `isinstance(x, Message)` raises `TypeError`. The
+class exists only so the checker knows the keys and value types. This design was chosen *because*
+the whole point is to type data you already hold as dicts without changing a single runtime
+object; a wrapper class would defeat that. Consequences follow: there is no validation, so a dict
+from `json.loads` (typed `Any`) must be validated by something (Pydantic's `TypeAdapter`
+can validate a `TypedDict`) or trusted via a `cast`.
 
-Two consequences follow from "it is just a dict". There is no validation: a dict that arrived from
-`json.loads` is whatever it is, and the checker will happily let you annotate it as a `Message`. For
-untrusted input, parse with Pydantic first. And a `TypedDict` is compatible with `Mapping[str, object]`
-but not with `dict[str, Any]`, *because* a function taking `dict[str, Any]` could insert arbitrary
-keys and break the contract; this surprises people who pass a TypedDict to a helper typed with
-`dict`. Provider SDKs lean on this design: request parameters are typically typed as TypedDicts (so
-you pass plain dicts) while responses are validated model objects.
+Keys are all required by default. `total=False` makes all of them optional; `NotRequired[T]` and
+`Required[T]` (3.11) mark individual keys, which matters for API payloads where `tool_calls` is
+present only on some turns. Reading an optional key with `d.get("k")` yields `T | None`, so the
+checker forces a narrowing branch. `ReadOnly[T]` (3.13) marks keys that must not be assigned.
+TypedDicts are structural: one with a superset of keys is assignable where the subset is expected,
+which lets a generic `Message` function accept richer provider-specific dicts. Keys that are not
+valid identifiers (`"content-type"`) use the functional form `TypedDict("Headers", {...})`.
 
-### Literal: the value is the type
-`Role = Literal["system", "user", "assistant"]` means a `Role` is one of those three strings, and the
-checker tracks the exact value. Comparisons narrow: inside `if role == "user":` the checker knows the
-value. Combined with `match` and `typing.assert_never` (3.11), you get exhaustiveness: if a new
-literal is added and a `match` does not handle it, the `case _: assert_never(role)` line fails type
-checking. Literals work for `str`, `int`, `bool`, `bytes` and enum members. They cost nothing at
-runtime, which also means nothing at runtime checks them; `typing.get_args(Role)` returns the tuple of
-allowed values if you need a quick membership test on external input.
+### Literal: a finite set, checked statically
+`Literal["system", "user", "assistant"]` is a type whose only inhabitants are those exact strings
+(ints, bools, bytes and enum members are also allowed). The checker narrows on comparison: inside
+`if role == "user":` the type of `role` is `Literal["user"]`. The payoff is exhaustiveness: in a
+`match` over a Literal (or an Enum), a final `case _: assert_never(x)` makes the checker report an
+error if any member is unhandled, which is how you learn at check time, not in production, that a
+new role was added and one handler forgot it. There is no runtime trace of a Literal; `role` is just
+a `str`. That is why Literal is the right tool for values that are only compared and serialized.
 
-### Enum: constants that exist at runtime
-`class Role(Enum): USER = "user"` creates one singleton member per name. Members have `.name` and
-`.value`, iterate in definition order, compare by identity, and support methods. `Role("user")` looks
-a member up by value and raises `ValueError` for anything else, which is the runtime validation that
-`Literal` lacks. A plain `Enum` member is *not* a string: `Role.USER == "user"` is `False` and
-`json.dumps({"role": Role.USER})` raises `TypeError`. `StrEnum` (3.11) and `IntEnum` subclass `str`
-and `int`, so members compare equal to and serialise as their values, which is almost always what you
-want at a JSON boundary. `auto()` gives the lowercased member name in a `StrEnum` and increasing
-integers in a plain `Enum`.
+### Enum: a finite set of runtime objects
+`class Reason(Enum): STOP = "stop"` creates singleton members. Each has `.name` (`"STOP"`) and
+`.value` (`"stop"`); `Reason("stop")` looks up by value, `Reason["STOP"]` by name, and `for r in
+Reason` iterates members in definition order. Identity comparison (`r is Reason.STOP`) works because
+there is exactly one object per member. A member whose value duplicates an earlier one becomes an
+*alias* rather than a new member, so iteration skips it, which is a documented feature that
+surprises people. `auto()` assigns values when you do not care what they are.
+
+Plain `Enum` members are not strings: `Reason.STOP == "stop"` is `False` and `json.dumps` of a
+member raises `TypeError`. `StrEnum` (3.11) and `IntEnum` mix in the primitive type so members
+compare equal to and serialize as their value, which is what you want for any enum that crosses a
+JSON boundary. Because members are objects, you can attach methods and properties (`reason.action`)
+and the behaviour lives next to the vocabulary rather than in scattered `if` chains.
 
 ### Choosing
-Keep a value a `TypedDict` when it must stay a dict (SDK parameters, JSON payloads) and has no
-behaviour. Use `Literal` when the set is small, string-shaped, and static checking is enough. Use an
-`Enum` when you need runtime validation, iteration, methods, or when the same constant is passed
-between modules and identity matters. In structured-output schemas all three map cleanly: Pydantic
-renders both `Literal` and `Enum` fields as JSON Schema `enum` constraints, so the model is told the
-allowed values either way.
+TypedDict for dict-shaped data whose runtime form must stay a dict (SDK payloads, graph state,
+tool arguments); switch to a Pydantic model when you need validation or the shape is consumed in
+many places. Literal for small string sets that are only compared and serialized. Enum when you
+need iteration, identity, methods, or a value referenced from many modules; prefer `StrEnum` when
+it meets JSON. Pydantic accepts all three and renders Literal and Enum as JSON Schema `enum`
+constraints, so the choice does not affect the schema you send to a model.
 
 ## Example
-A message type that stays a dict, a role literal checked for exhaustiveness, and a `StrEnum` that
-validates at runtime and serialises as a plain string. Needs Python 3.11+.
+A wire-format chat message with an optional key, a `StrEnum` carrying behaviour, and an
+exhaustive `match` the checker will police. Requires Python 3.11+ for `NotRequired`, `StrEnum`
+and `assert_never`.
 
 ```python
 import json
 from enum import StrEnum
-from typing import Literal, NotRequired, TypedDict, assert_never, get_args
+from typing import Literal, NotRequired, TypedDict, assert_never
 
-Role = Literal["system", "user", "assistant"]
+Role = Literal["system", "user", "assistant", "tool"]
 
-class Message(TypedDict):
+class ToolCall(TypedDict):
+    id: str
+    name: str
+    arguments: str                 # JSON text, exactly as the API sends it
+
+class ChatMessage(TypedDict):
     role: Role
-    content: str
-    name: NotRequired[str]            # optional key; the object is still a plain dict
+    content: str | None
+    tool_calls: NotRequired[list[ToolCall]]
 
-class Format(StrEnum):
-    TEXT = "text"
-    JSON = "json_object"
+class FinishReason(StrEnum):
+    STOP = "stop"
+    LENGTH = "length"
+    TOOL_CALLS = "tool_calls"
+    CONTENT_FILTER = "content_filter"
 
-def render(m: Message) -> str:
-    match m["role"]:
-        case "system":    return f"[sys] {m['content']}"
-        case "user":      return f"> {m['content']}"
-        case "assistant": return m["content"]
-        case other:       assert_never(other)   # mypy error here if Role grows a value
+    @property
+    def truncated(self) -> bool:
+        return self is FinishReason.LENGTH
 
-msgs: list[Message] = [{"role": "user", "content": "hi"}]
-# msgs.append({"role": "User", "content": "x"})   # checker: "User" is not a Role
-# msgs.append({"roel": "user", "content": "x"})   # checker: extra key "roel"
+def next_action(reason: FinishReason) -> Literal["return", "continue", "call_tools", "refuse"]:
+    match reason:
+        case FinishReason.STOP: return "return"
+        case FinishReason.LENGTH: return "continue"
+        case FinishReason.TOOL_CALLS: return "call_tools"
+        case FinishReason.CONTENT_FILTER: return "refuse"
+        case _: assert_never(reason)   # add a member above without a case: checker error here
 
-fmt = Format("json_object")                       # runtime lookup by value
-try:
-    Format("yaml")
-except ValueError as e:
-    print("rejected:", e)                         # 'yaml' is not a valid Format
-
-print(render(msgs[0]), isinstance(msgs[0], dict))        # > hi True
-print(json.dumps({"format": fmt}), fmt == "json_object")  # {"format": "json_object"} True
-print("tool" in get_args(Role), [f.value for f in Format])  # False ['text', 'json_object']
+msg: ChatMessage = {"role": "assistant", "content": None,
+                    "tool_calls": [{"id": "c1", "name": "search", "arguments": '{"q": "kv cache"}'}]}
+print(type(msg))                                   # <class 'dict'>: no wrapper object exists
+reason = FinishReason("tool_calls")                # lookup by wire value
+print(reason.truncated, next_action(reason))       # False call_tools
+print(json.dumps({"finish": reason}))              # {"finish": "tool_calls"}: StrEnum is a str
+# msg["role"] = "robot"   -> checker error: "robot" is not a Role
 ```
 
+Remove the `CONTENT_FILTER` case and mypy or pyright reports that `assert_never` received a
+`FinishReason`, not `Never`. That is the exhaustiveness guarantee in action.
+
 ## Trade-offs
-- `TypedDict` keeps zero-copy interoperability with JSON and SDKs, but gives no runtime guarantee;
-  once data crosses a trust boundary, Pydantic validation is worth its cost.
-- `Literal` costs nothing and catches typos statically, yet it cannot validate values that arrive as
-  `str` from a request; if inputs are external, an `Enum` or explicit `get_args` check is required.
-- A plain `Enum` gives identity and prevents accidental string comparisons, at the price of explicit
-  `.value` at every JSON edge; `StrEnum` removes that friction but reintroduces string equality.
-- Exhaustive `match` with `assert_never` turns "added a role" into a compile-time task list across
-  the codebase, which is a benefit when the set is yours and a maintenance burden when it is a
-  provider's set that changes under you.
+- TypedDict costs nothing at runtime and keeps data SDK-ready, but gives no validation or methods;
+  once the same shape is consumed in several modules, a Pydantic model's validation pays for itself.
+- Literal gives exhaustiveness checks for free, but there is no runtime object to iterate or attach
+  behaviour to; the moment you write `for role in ...` or want a method, switch to an Enum.
+- Enum members have identity and can carry methods, but a plain Enum needs `.value` at every JSON
+  boundary and compares unequal to raw strings; `StrEnum` removes that cost for string vocabularies.
+- `NotRequired` keys model optional payload fields precisely, but every `.get()` returns `T | None`
+  and forces narrowing; when the field is always present but nullable, a required `T | None` key is
+  simpler.
 
 ## Pitfalls
-- Serialising a plain `Enum` member with `json.dumps` and hitting `TypeError: Object of type Role is
-  not JSON serializable`; switch to `StrEnum`, or dump `.value`.
-- Comparing `Role.USER == "user"` with a plain `Enum` and silently getting `False` in a branch that
-  then never executes; the symptom is a message type that is "never seen" in logs.
-- Treating a `TypedDict` annotation as validation and getting `KeyError: 'content'` deep in a pipeline
-  from a malformed upstream dict; parse untrusted input with Pydantic at the boundary.
-- Passing a `TypedDict` to a helper typed `dict[str, Any]` and getting an incompatible-type error;
-  the helper should accept `Mapping[str, object]` or the specific TypedDict.
-- Using `auto()` in a plain `Enum` and discovering integers `1, 2, 3` in serialised payloads; use
-  explicit string values or `StrEnum`, where `auto()` yields the member name.
-- Forgetting `NotRequired` for optional keys, so every literal construction of the dict errors with a
-  missing key, and reaching for `total=False`, which makes *all* keys optional and loses the contract.
+- Calling `isinstance(x, SomeTypedDict)` to validate input; it raises `TypeError` at runtime because
+  TypedDict is not a real class, so validate with Pydantic or check keys explicitly.
+- Comparing a plain `Enum` member to the raw wire string (`reason == "stop"`); it is always `False`,
+  and the symptom is a branch that never executes. Use `StrEnum` or compare `.value`.
+- Passing a plain Enum member into `json.dumps`; it fails with "Object of type ... is not JSON
+  serializable", typically deep inside a logging or request-serialization call.
+- Assigning `json.loads(...)` output straight to a `TypedDict`-typed variable; the checker either
+  errors or, if you `cast`, trusts a shape nobody verified, and the `KeyError` appears later.
+- Giving two Enum members the same value; the second silently becomes an alias and disappears from
+  iteration, which looks like a "missing" member in a dropdown or a prompt listing valid options.
+- Adding a new Literal or Enum member without an `assert_never` guard in handlers; nothing warns, and
+  the new value falls through to a default branch at runtime.
 
 ## When to use
-Default to `TypedDict` for the shapes you exchange with SDKs and JSON files, and for lightweight
-internal records that have no behaviour; add `Literal` to any string field with a closed set of
-values, and make the branches that switch on it exhaustive. Promote to an `Enum` when the set needs
-to be validated at runtime, iterated (a settings UI, a CLI `--choices`), or carries behaviour such as
-"which models support this format". Promote to a dataclass or Pydantic model when the record needs
-methods or validation. The measure of success is how many shape errors move from the provider's 400
-responses into mypy's output. In interviews, the question is usually "when would you not use an Enum",
-and the answer is "when the value must stay a string the SDK accepts and static checking suffices".
+Use `TypedDict` for the messages, tool-call records and state dicts that flow into and out of
+provider SDKs and agent frameworks, where the dict is the runtime truth and validation already
+happened at the boundary. Use `Literal` for roles, modes and finish reasons that are compared and
+serialized but never iterated, and pair every `match` over them with `assert_never`. Use `Enum`
+(usually `StrEnum`) when a vocabulary needs behaviour, iteration or a single definition shared
+across modules, and when the same set appears in prompts, schemas and code. Measure: count the
+`str` parameters in your codebase that really mean "one of N values"; each one is a latent typo.
+In interviews, the expected depth is why TypedDict has no runtime, why Literal gives exhaustiveness,
+and what `StrEnum` changes about equality and JSON.
 
 ## Role lens
-- **Engineer:** Types provider message dicts as `TypedDict`s, roles and formats as `Literal`s, and
-  switches on them with exhaustive `match` blocks that fail CI when a case is missing.
-- **Architect:** Decides which vocabularies are owned enums (validated, versioned, iterable) and which
-  are passthrough literals mirroring a provider's API that may change independently.
-- **FDE:** Maps a customer's status codes and category strings into `StrEnum`s so integration payloads
-  validate on arrival and serialise back unchanged.
+- **Engineer:** Types the chat-message and tool-call dicts as TypedDicts and the role and finish
+  reason fields as Literals, so a typo fails in CI instead of as an API 400.
+- **Architect:** Decides which vocabularies become shared Enums in a common package, so every
+  service agrees on the same finish-reason and error-class names and schemas.
+- **FDE:** Maps a customer's status codes and category strings onto Enums with behaviour, turning
+  their undocumented string conventions into one checked, iterable definition.
 
 ## Check yourself
-**Q:** A pipeline receives JSON events with a `kind` field that your code switches on in six places.
-Product adds a seventh kind next month. How do you type `kind` so the change is safe, and what do you
-do at the ingestion boundary?
-**A:** Define `Kind` once, as a `StrEnum` if events are validated at ingestion or as a `Literal` if a
-Pydantic model already validates them, and switch on it with `match` plus `assert_never` in the
-default case so every one of the six sites fails type checking when the seventh value is added. At
-the boundary, parse the raw JSON into a Pydantic model whose `kind` field is that `Enum` or `Literal`,
-so an unknown value becomes a `ValidationError` with a clear location rather than a silent fall
-through. Keep the event itself a `TypedDict` or model, not a bare `dict[str, Any]`, so downstream
-helpers get checked key access. The outcome is that the new kind is a CI-visible checklist instead of
-a production surprise.
+**Q:** An agent's `finish_reason` field is a plain `str`. You want the checker to catch unhandled
+values when a provider adds a new one, you need to serialize it to JSON in logs, and one module
+needs to map each value to a retry policy. Which of TypedDict, Literal or Enum do you pick and why?
+**A:** A `StrEnum`. Literal would give exhaustiveness checking but has no runtime object to attach
+the retry-policy mapping to, so that logic would live in a separate dict that can drift. A plain
+Enum carries the mapping as a method or property but fails `json.dumps` and compares unequal to the
+wire string, costing a conversion at every boundary. `StrEnum` members are strings, so they
+serialize and compare transparently, you can still `match` over them with `assert_never` for
+exhaustiveness, and the policy lives on the member. TypedDict is irrelevant here: it types a
+dict's shape, not a single value's vocabulary.
 
 ## Quiz
-### Q: Which of the three rejects an unknown value at runtime without extra code?
-- [ ] `TypedDict`, because the class checks keys on construction
-- [ ] `Literal`, because the interpreter compares against the allowed constants
-- [x] `Enum`, because `Role("tool")` raises `ValueError` when no member has that value
-- [ ] All three, since they are all enforced by the typing module
-> `TypedDict` and `Literal` are pure annotations the interpreter ignores. Only `Enum` members exist
-> at runtime, so lookup by value is a real check that fails loudly on unknown input.
+### Q: What does `Message(role="user", content="hi")` return at runtime if `Message` is a TypedDict?
+- [ ] An instance of `Message` with attribute access
+- [x] A plain `dict`; the TypedDict class exists only for the type checker
+- [ ] A frozen mapping that rejects new keys
+- [ ] A `types.SimpleNamespace`
+> TypedDict adds no runtime type. The checker uses the declaration to verify keys and values, but
+> the object you hold is an ordinary dict, which is why `isinstance` against it fails.
 
-### Q: Why does `json.dumps({"role": Role.USER})` fail for a plain `Enum` but work for a `StrEnum`?
-- [ ] `json` only serialises enums whose values are integers
-- [x] A plain `Enum` member is not a `str`, while a `StrEnum` member subclasses `str` and serialises as its value
-- [ ] `StrEnum` registers a JSON encoder automatically on import
-- [ ] Plain `Enum` members are lazily created and not yet available to the encoder
-> `json` serialises `str` subclasses as strings. A plain `Enum` member is an opaque object, so the
-> encoder raises `TypeError`; `StrEnum` members are strings, which is why they are the usual choice at
-> JSON boundaries.
+### Q: Why does `match` with a final `case _: assert_never(x)` help when `x` is a Literal or Enum?
+- [ ] It raises at runtime for any unexpected value, replacing validation
+- [ ] It makes the match statement faster by skipping unreachable cases
+- [x] The checker reports an error if any member of the set is not handled by an earlier case
+- [ ] It converts the Literal into an Enum automatically
+> After every member is matched, the checker narrows `x` to `Never`; if one is missing, `x` still has
+> a type and `assert_never` is a static error. It documents and enforces exhaustiveness.
 
-### Q: When is a `TypedDict` the better choice over a dataclass for a record?
-- [x] When the value must remain a plain dict for JSON or SDK parameters and needs no methods
-- [ ] When the record needs runtime validation of its field types
-- [ ] When instances must be hashable so they can be dict keys
-- [ ] When fields need default values computed in `__post_init__`
-> A `TypedDict` adds a static contract to a dict without changing its runtime type, which is exactly
-> what passthrough payloads want. Validation, hashing and post-init logic are reasons to use a
-> dataclass or Pydantic model instead.
+### Q: Which statement about a plain `Enum` member such as `Reason.STOP = "stop"` is correct?
+- [ ] `Reason.STOP == "stop"` is `True` because the value is a string
+- [ ] `json.dumps(Reason.STOP)` produces `"stop"`
+- [x] `Reason("stop")` returns the member, and two members with the same value are aliases of one
+- [ ] Members can be created at runtime by assignment, such as `Reason.NEW = "new"`
+> Lookup by value is supported and duplicate values create aliases. Equality with the raw string and
+> direct JSON serialization only hold for `StrEnum`, which mixes in `str`.

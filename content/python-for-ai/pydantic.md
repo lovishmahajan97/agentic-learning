@@ -15,211 +15,219 @@ related:
   - prompting/structured-outputs-json-mode
   - agents/tool-schemas-and-argument-validation
 sources:
-  - Official docs: Pydantic (v2)
-  - Official docs: pydantic-core
+  - Official docs: Pydantic
+  - Official docs: JSON Schema
 ---
 
 ## TL;DR
-Pydantic turns a class with type hints into a validator, parser, serialiser and JSON Schema generator.
-It exists because the data entering AI systems (HTTP bodies, LLM output, config, queue messages) is
-untrusted and type hints alone check nothing at runtime. One `BaseModel` gives you the schema you send
-to the model or the API docs, the parser that rejects bad output with a precise error list, and the
-object your code can trust afterwards. Validation is compiled once per class into Rust
-(`pydantic-core`), so the per-instance cost is small but not zero.
+Pydantic turns type-annotated classes into validators, parsers, serializers and JSON Schema
+generators. You declare the shape once as a `BaseModel`; untrusted input (API payloads, LLM output,
+config files) is validated into typed objects with structured error reports, and the same class
+emits the JSON Schema you hand to a model for structured output or tool calling. It exists because
+AI systems are mostly untrusted JSON crossing boundaries, and type hints alone do nothing at runtime.
 
 ## Why it exists
-The boundary problem is simple to state: a function annotated `def handle(order: Order)` is only safe
-if something made sure the thing passed in really is an `Order`. Type hints are read by the checker
-and ignored by the interpreter, so `json.loads` output annotated as `Order` is a lie the moment the
-upstream changes a field name. In AI systems the upstream is often a language model, which adds
-hallucinated keys, writes `"2"` where an integer was asked for, and omits required fields a few
-percent of the time. "A few percent" across a million calls is tens of thousands of silent corruptions
-if nothing checks.
+Type hints are inert: a function typed `-> Ticket` will happily return a dict with a misspelled
+key. The data that flows through an AI system is almost entirely untrusted at the point it arrives:
+HTTP request bodies, model completions that are supposed to be JSON, tool arguments a model
+invented, environment variables, YAML configs, rows from a customer's export. Every one of those
+can be malformed, and a language model will malform them creatively: a string where an int was
+asked for, an extra field, a value outside the allowed set, valid-looking JSON with a trailing
+sentence.
 
-The naive alternatives each fail in a specific way. Hand-written `if "qty" not in d or not isinstance(
-d["qty"], int)` chains grow with every field, report only the first problem, and drift from the type
-hints they duplicate. `dataclasses` give structure but accept `Order(qty="two")` without complaint.
-`jsonschema` validation gives errors but no typed object afterwards, so you validate and then still
-index into dicts. And writing a JSON Schema by hand for the model's structured output, separately from
-the Python class that will parse the response, guarantees the two drift apart.
+The naive alternatives are each inadequate. Hand-written `if "title" not in data` checks grow into
+hundreds of lines that drift from the types they claim to enforce, and their error messages are
+whatever each author bothered to write. A `TypedDict` or `dataclass` documents the shape for the
+checker but validates nothing. A separate schema language (a JSON Schema file maintained next to
+the class) duplicates the definition and the two disagree within a month.
 
-Pydantic's premise is "parse, don't validate": a single declaration is the schema, the parser and the
-type. Errors are collected, not short-circuited, and come back as a structured list with the path to
-each failure, which is exactly what you need to send back to a model for a retry or to a client as a
-422. That closed loop, schema out and validated object in, is why nearly every LLM SDK and framework
-in Python is built on it.
+Pydantic collapses these into one artifact. The annotated class is simultaneously the static type,
+the runtime validator, the serializer and the JSON Schema source. For LLM work this is the lever:
+the schema you send to the model and the validator you run on its answer are generated from the
+same class, so they cannot disagree, and the validation error list is structured enough to feed
+back to the model for a repair attempt. FastAPI, the OpenAI and Anthropic SDK structured-output
+helpers, `instructor`, LangChain and most agent frameworks build on exactly this property.
 
 ## How it works
-### Compile once, validate many
-When the class body of a `BaseModel` subclass executes, the metaclass reads the annotations, `Field()`
-metadata and validators, and builds a *core schema*: a tree describing every field's type, constraints
-and defaults. `pydantic-core` compiles that tree into a validator and a serialiser implemented in
-Rust. This happens once per class, at import time, *because* validation is the hot path and
-interpreting the schema on every call would be too slow. Instances are then created by walking the
-compiled validator over the input.
+### From annotations to a validator
+At class creation, `BaseModel`'s metaclass reads `__annotations__` and each `Field(...)` and
+compiles them into a *core schema*, a tree describing every field's type and constraints. In
+Pydantic v2 that schema is executed by `pydantic-core`, a Rust extension, which is why validation is
+fast enough to run on every request. The compile happens once per class, *because* building the
+validator is far more expensive than running it, and models are defined once and used millions of
+times.
 
-### Validation and modes
-`Order(**data)` and `Order.model_validate(data)` validate Python objects; `Order.model_validate_json
-(raw)` parses JSON text directly inside `pydantic-core`, skipping the intermediate `json.loads`
-dicts, which is the fast path for LLM and HTTP responses. By default Pydantic runs in *lax* mode:
-`"2"` becomes `2` for an `int` field, `"true"` becomes `True`, an ISO string becomes a `datetime`.
-`ConfigDict(strict=True)` or `Field(strict=True)` turns that off so a type mismatch is an error.
-Lax is the right default at a JSON boundary where everything is a string; strict is right when the
-input is already typed and coercion would mask a bug.
+`Model.model_validate(obj)` validates a Python object (dict, attributes), `model_validate_json(s)`
+parses JSON text directly in Rust without an intermediate `json.loads`, and constructing
+`Model(**kwargs)` validates keyword arguments. On failure a `ValidationError` carries a list of
+errors, each with `loc` (the path to the bad field), `msg` and a machine-readable `type`. That
+structure, not a single string, is the design choice that makes "send the errors back to the model
+and retry" practical.
 
-Every failure is appended to a list rather than raised immediately, and the whole list is raised as
-one `ValidationError`. `e.errors()` yields dicts with `loc` (the path, e.g. `("items", 0, "qty")`),
-`type` (a stable code such as `int_parsing` or `missing`), `msg` and the offending `input`. Stable
-codes let you count failure modes across thousands of LLM calls and spot systematic prompt problems.
+### Lax versus strict
+By default Pydantic validates in *lax* mode: `"1200"` becomes `1200` for an `int` field, `"true"`
+becomes `True`. This is deliberate, because the inputs it was built for (query strings, env vars,
+model output) arrive as text. `ConfigDict(strict=True)` or `Field(strict=True)` turns coercion off
+when exact types matter, such as distinguishing `1` from `"1"` in an ID field. V2 tightened some
+rules relative to v1; for example an `int` is no longer accepted for a `str` field by default.
+Unknown fields are *ignored* by default; `ConfigDict(extra="forbid")` makes them errors, which is
+what you want for tool arguments, where a hallucinated field is a signal, not noise.
 
-### Fields, constraints and validators
-`Field()` carries constraints (`ge`, `min_length`, `pattern`), defaults, aliases and a `description`;
-the description goes into the JSON Schema, which is how it reaches the model. `Annotated[int,
-Field(ge=0)]` is the same thing attached to the type. `@field_validator("name")` runs custom logic
-after (default) or before (`mode="before"`) the type validation of one field; `@model_validator
-(mode="after")` sees the whole object for cross-field rules. Validators raise `ValueError` and
-Pydantic wraps it into the same error list. Unlike dataclasses, a mutable default such as `[]` is
-safe because Pydantic copies defaults per instance.
+### Validators, serialization, schema
+`@field_validator("name")` runs custom logic on one field (before or after type coercion);
+`@model_validator(mode="after")` checks cross-field invariants such as `start < end`.
+`@computed_field` exposes derived values in dumps. `model_dump()` produces a dict and
+`model_dump_json()` a string, with `exclude`, `by_alias` and `mode="json"` to control the output.
+`model_json_schema()` emits a JSON Schema for the class, including `enum` for `Literal` and `Enum`
+fields, `minimum`/`maximum` from `ge`/`le`, and `description` from `Field(description=...)`, which
+is text the model actually reads. `TypeAdapter(list[Ticket])` gives validation and schema for
+types that are not models, including `TypedDict`s and plain containers. Discriminated unions
+(`Field(discriminator="type")`) route a payload to the right variant by a tag field, which is how
+you validate "one of these N tool calls".
 
-### Serialisation and schema
-`model_dump()` returns Python objects, `model_dump(mode="json")` returns JSON-compatible ones
-(datetimes become strings), and `model_dump_json()` returns text; `exclude_none`, `by_alias` and
-`include` shape the output. `model_json_schema()` emits JSON Schema that FastAPI publishes as OpenAPI
-and that you pass as a tool's `parameters` or a structured-output format. Field descriptions,
-`Literal`s and `Enum`s become `description` and `enum` entries, so the prompt and the parser come from
-one place.
+### Against the alternatives
+Stdlib `dataclasses` are lighter and have no validation; use them for internal records you
+construct yourself. `TypedDict` is static-only and keeps data as dicts; use it for wire shapes that
+must stay dicts, and validate them with a `TypeAdapter` if needed. `attrs` offers validators but no
+schema generation. `msgspec` is faster with a smaller feature set. Pydantic's edge is the single
+definition serving checker, validator, serializer and schema, which is why the AI ecosystem
+standardized on it. Settings management lives in the separate `pydantic-settings` package.
 
-### Configuration that matters for LLM work
-`extra="forbid"` makes unknown keys an error, which is how you detect hallucinated or misspelled
-fields that the default `extra="ignore"` would silently drop. `frozen=True` makes instances immutable
-and hashable. `validate_assignment=True` re-validates on attribute set; it is off by default because
-of cost. Discriminated unions (`Field(discriminator="kind")`) select the right model for polymorphic
-payloads like tool calls by a tag field instead of trying every variant. `TypeAdapter(list[Item])`
-validates and serialises types that are not models, such as a top-level JSON array.
+### Sharp edges
+Validation has a cost: do it at boundaries, not inside hot loops where the data was already
+validated. Lax coercion can mask bugs (a float `1.0` silently becoming `1`). `Optional` fields
+render as `anyOf` with `null` in the schema, and some providers' strict structured-output modes
+require every property to be listed as required with `additionalProperties: false`; the SDK helpers
+rewrite the schema for you, a hand-built schema must do it itself. V1 and v2 APIs differ
+(`validator` became `field_validator`, `.dict()` became `.model_dump()`, `parse_obj` became
+`model_validate`, the inner `Config` class became `model_config = ConfigDict(...)`), so copying
+old snippets produces deprecation warnings or errors.
 
 ## Example
-An extraction schema for an LLM, the schema sent with the request, and the error list that a bad
-response produces. The nested `"qty": "2"` is coerced in lax mode; the wrong currency and the
-hallucinated `note` key are reported together with their paths.
+Structured extraction with a schema generated from the model and a validation-error message fed
+back for a repair attempt. `extra="forbid"` makes an invented field fail loudly.
 
 ```python
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-class LineItem(BaseModel):
-    model_config = ConfigDict(extra="forbid")        # hallucinated keys are errors, not silence
-    sku: str = Field(min_length=3, description="Catalogue SKU, e.g. 'AB-123'")
-    qty: int = Field(ge=1, description="Units ordered")
-    unit_price: float = Field(ge=0)
+class Ticket(BaseModel):
+    model_config = ConfigDict(extra="forbid")          # hallucinated keys are errors
+    title: str = Field(min_length=3, max_length=120, description="Short summary of the issue")
+    severity: Literal["low", "medium", "high"]
+    affected_users: int = Field(ge=0)
+    tags: list[str] = Field(default_factory=list)
 
-class Order(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-    customer: str
-    currency: Literal["USD", "EUR"]
-    items: list[LineItem] = Field(min_length=1)
-
-    @field_validator("customer")
+    @field_validator("tags")
     @classmethod
-    def strip_name(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("customer must not be blank")
-        return v.strip()
+    def normalise(cls, v: list[str]) -> list[str]:
+        return sorted({t.strip().lower() for t in v if t.strip()})
 
-    @property
-    def total(self) -> float:
-        return sum(i.qty * i.unit_price for i in self.items)
+schema = Ticket.model_json_schema()      # send this as the tool/response schema
+print(schema["properties"]["severity"]["enum"])          # ['low', 'medium', 'high']
+print(schema["properties"]["affected_users"]["minimum"]) # 0
 
-schema = Order.model_json_schema()                   # goes into the tool / response_format request
-print(sorted(schema["properties"]), schema["required"])
+def parse_or_feedback(text: str) -> Ticket | str:
+    try:
+        return Ticket.model_validate_json(text)
+    except ValidationError as e:
+        issues = "; ".join(f"{'.'.join(map(str, err['loc']))}: {err['msg']}" for err in e.errors())
+        return f"Your JSON was rejected. Fix these fields and resend: {issues}"
 
-raw = ('{"customer": " ACME ", "currency": "GBP", '
-       '"items": [{"sku": "AB-123", "qty": "2", "unit_price": 9.5, "note": "rush"}]}')
-try:
-    Order.model_validate_json(raw)
-except ValidationError as e:
-    for err in e.errors():
-        print(err["loc"], err["type"])               # ('currency',) literal_error
-                                                     # ('items', 0, 'note') extra_forbidden
-good = Order.model_validate_json(raw.replace("GBP", "USD").replace(', "note": "rush"', ""))
-print(good.customer, good.items[0].qty, good.total)  # ACME 2 19.0   ("2" was coerced to 2)
+raw = '{"title": "Login broken", "severity": "critical", "affected_users": "1200", "tags": ["Auth", "auth "]}'
+print(parse_or_feedback(raw))
+# Your JSON was rejected. Fix these fields and resend: severity: Input should be 'low', 'medium' or 'high'
+t = parse_or_feedback(raw.replace("critical", "high"))
+print(t)        # title='Login broken' severity='high' affected_users=1200 tags=['auth']
+print(type(t.affected_users))   # <class 'int'>: "1200" was coerced in lax mode
+print(t.model_dump_json())      # {"title":"Login broken","severity":"high","affected_users":1200,"tags":["auth"]}
 ```
 
+The second call succeeds because the only error was the `severity` literal; the string `"1200"`
+was coerced and the tags were normalized by the validator. The feedback string is what an
+`instructor`-style retry loop sends back to the model.
+
 ## Trade-offs
-- Validation costs CPU per object; it is negligible for request-sized payloads but wrong for hot
-  numeric loops, where arrays should stay NumPy or tensors and be validated at the edge only.
-- Lax coercion makes JSON boundaries forgiving, yet it can hide a model writing strings for numbers;
-  switch to strict mode when you want to *measure* the model's format compliance rather than tolerate it.
-- `extra="forbid"` catches hallucinated fields in LLM output, but on third-party API responses it turns
-  every benign new field upstream adds into an outage; use `ignore` for data you do not control.
-- Generating the schema from the model keeps parser and prompt in sync, but the emitted JSON Schema
-  (nested `$defs`, `anyOf` for optionals) is not accepted verbatim by every provider's strict
-  structured-output mode, so some flattening may be needed per provider.
+- One class gives you static type, validator, serializer and schema, but it couples all four to
+  Pydantic's interpretation; a major-version change (v1 to v2) touches every boundary at once.
+- Lax coercion makes real-world text inputs just work, but it can hide type confusion upstream; flip
+  to strict mode for identifiers, money and anything where `"1"` and `1` must differ.
+- Rust-backed validation is fast per call, yet running it on every object in a tight loop still
+  dominates when the data was already validated; validate once at the boundary and pass models.
+- Rich validation and nested models make schemas expressive, but deeply nested or recursive
+  schemas can confuse models and some providers' strict modes; flatten or simplify when the model's
+  output quality drops.
+- `extra="forbid"` catches hallucinated fields early, but on *inputs you do not control* (a vendor
+  adding a field) it turns a harmless addition into an outage; use it for model output, not for
+  third-party webhooks.
 
 ## Pitfalls
-- Mixing v1 and v2 APIs (`.dict()`, `@validator`, `class Config`) after an upgrade; the symptom is a
-  wall of deprecation warnings and, for `parse_obj`-style calls, outright `AttributeError`s.
-- Annotating `Optional[int]` and expecting it to be optional; without `= None` the field is required,
-  and the error list shows `type: missing` for it.
-- Assuming assignment is validated: `order.qty = -5` succeeds silently unless `validate_assignment=
-  True`, so an object that passed on entry can be invalid when it leaves.
-- Naming a field `model_name` or similar; the `model_` prefix is a protected namespace in v2 and
-  emits a warning until you rename or override `protected_namespaces`.
-- Calling `json.dumps(obj.model_dump())` with datetimes or enums inside and hitting `TypeError`; use
-  `model_dump(mode="json")` or `model_dump_json()`.
-- Building a response model from `model_validate` on a dict that was already the model's own
-  `model_dump()` output and losing information through aliases; set `by_alias` consistently on both sides.
+- Leaving `extra` at the default `ignore` for tool arguments, so a model's misspelled key vanishes
+  silently; the symptom is a tool receiving a default value and behaving as if the argument was
+  never supplied.
+- Hand-editing a JSON Schema instead of generating it from the model; the symptom is validation
+  rejecting responses that the schema allowed, or vice versa, after one side changed.
+- Catching `ValidationError` and logging `str(e)` only; you lose the structured `loc`/`type` list
+  that would let you retry the model with precise feedback or aggregate failure modes.
+- Mixing v1 and v2 idioms (`@validator`, `.dict()`, class `Config`) in a v2 project; the symptom is
+  a wall of deprecation warnings, then breakage when the compatibility shims are removed.
+- Using a mutable default like `tags: list[str] = []`; Pydantic copies defaults per instance so this
+  does not share state, but readers assume it does, and `default_factory` states the intent.
+- Validating inside a per-token streaming loop; the symptom is CPU-bound latency that disappears
+  when you accumulate chunks and validate once at the end.
 
 ## When to use
-Use Pydantic at every trust boundary: request and response bodies, LLM structured output and tool
-arguments, configuration, messages pulled from a queue, rows loaded from a file. Inside the boundary,
-plain dataclasses or TypedDicts are lighter and sufficient. Measure validation time only when payloads
-are large or per-request object counts are high; otherwise the cost is noise next to a network call.
-Day to day it shows up as the model you hand to the OpenAI or Anthropic SDK for structured output, the
-FastAPI body type, and the thing whose `ValidationError` you feed back into a retry prompt. In
-interviews, expect "how would you make LLM output reliable", and the strong answer is a Pydantic model
-with constrained fields, `extra="forbid"`, and an error-driven retry loop with a bounded attempt count.
+Reach for Pydantic at every trust boundary: HTTP requests and responses, LLM structured output,
+tool-call arguments, configuration, and any file or message produced by another system. Define the
+model, generate the schema from it, validate the input with it, and pass the resulting object
+inward. Do not reach for it for small internal records you construct yourself in a hot path; a
+`dataclass` is lighter there. Measure the error distribution from `ValidationError.errors()` over
+time: the `type` field tells you whether the model keeps failing on the same constraint, which is
+a prompt or schema problem, not a code problem. In day-to-day AI work Pydantic is the connective
+tissue between prompts, SDKs and your code; in interviews, be ready to explain lax versus strict,
+how the schema and the validator stay in sync, and what you do when the model's JSON fails.
 
 ## Role lens
-- **Engineer:** Declares the output model, passes `model_json_schema()` to the provider, parses with
-  `model_validate_json`, and turns `e.errors()` into a retry message with a cap on attempts.
-- **Architect:** Decides where the trust boundaries are, which models are the canonical contracts
-  shared across services, and how strict versus lax mode and `extra` policies differ per boundary.
-- **FDE:** Encodes a customer's domain rules as field constraints and validators so integration
-  failures surface as readable error paths during a pilot instead of silent data corruption.
+- **Engineer:** Defines response and tool-argument models, generates schemas from them, and builds
+  the validate-then-retry loop around model output with structured error feedback.
+- **Architect:** Decides where validation happens (edge, service, agent core), which models are
+  shared across services, and the strictness policy for inputs you control versus vendor inputs.
+- **FDE:** Models a customer's messy export or API payload as Pydantic classes on day one, so
+  every malformed record is reported with a field path instead of a stack trace.
 
 ## Check yourself
-**Q:** Three percent of your extraction calls fail to parse. Walk through how you would use Pydantic
-to drive a retry loop, and which configuration choices change what you learn from the failures.
-**A:** Parse with `Model.model_validate_json(text)` inside `try/except ValidationError`, then format
-`e.errors()` (each `loc`, `msg` and `input`) into a short correction message and re-prompt with the
-original schema, capped at two or three attempts before escalating. Keep `Field(description=...)` on
-every field so the schema itself teaches the model. Set `extra="forbid"` to catch hallucinated or
-misspelled keys that `ignore` would hide. Choose lax mode if you want tolerance for `"2"` instead of
-`2`, or strict mode if you want to count those as failures and fix the prompt. Aggregate `type` codes
-per field across calls: a cluster of `literal_error` on one field means the prompt's allowed values
-are unclear, which is a prompt fix, not a retry fix. Libraries such as Instructor package this loop.
+**Q:** A model is asked to return JSON matching a Pydantic class. About 5% of responses fail
+validation. Walk through how you would diagnose and reduce that rate without just retrying blindly.
+**A:** First log `ValidationError.errors()` as structured data and aggregate by `loc` and `type`.
+If one field dominates, it is usually a schema or prompt problem: an ambiguous `description`, an
+enum the model keeps paraphrasing, or a nested optional the provider's strict mode handles badly;
+fix the schema or the field description. Check that the schema sent to the model is generated from
+the same class that validates, not a stale copy. Consider `extra="forbid"` so hallucinated fields
+surface. Then add a bounded repair loop that sends the exact error list back to the model, and
+measure the residual failure rate; if it is still material, simplify the schema or split the
+extraction into two smaller calls.
 
 ## Quiz
-### Q: What does `Model.model_validate_json(text)` do that `Model(**json.loads(text))` does not?
-- [ ] It skips validation for fields with defaults to save time
-- [x] It parses and validates in one pass inside pydantic-core without first building Python dicts
-- [ ] It accepts JSON with trailing commas and comments
-- [ ] It runs validators in strict mode automatically
-> Parsing JSON directly in the Rust core avoids materialising intermediate Python objects and is the
-> intended fast path for API and LLM responses. Mode and leniency are governed by configuration either way.
+### Q: Why does Pydantic compile a model's annotations into a core schema once at class creation?
+- [ ] To register the model with FastAPI automatically
+- [x] Building the validator is expensive while running it is cheap, and models are defined once but validated many times
+- [ ] Because annotations are only available at class creation time
+- [ ] To make the model immutable
+> Compilation happens once per class and the compiled validator (executed in Rust) runs on every
+> call. Paying the build cost per validation would make request-time validation far too slow.
 
-### Q: In default (lax) mode, what happens when an `int` field receives the JSON string `"2"`?
-- [ ] A `ValidationError` with type `int_type` is raised
-- [x] The value is coerced to the integer `2`
-- [ ] The field is set to `None` and a warning is logged
-- [ ] The string is kept and the field's type becomes `str`
-> Lax mode coerces numeric strings to integers because JSON boundaries routinely stringify numbers.
-> Strict mode would reject it; a non-numeric string such as `"two"` fails in both with `int_parsing`.
+### Q: With default settings, what happens when an LLM returns `{"title": "x", "severty": "high"}` for a model whose field is `severity`?
+- [ ] A `ValidationError` for the unknown field `severty`
+- [x] `severty` is ignored and validation fails only because `severity` is missing
+- [ ] `severty` is matched to `severity` by fuzzy matching
+- [ ] The model instance is created with `severity=None`
+> `extra` defaults to `ignore`, so the misspelled key is dropped. The required `severity` is then
+> missing. Set `extra="forbid"` to make the hallucinated field itself an error.
 
-### Q: Why set `extra="forbid"` on models that parse LLM output specifically?
-- [ ] It makes parsing faster by skipping unknown keys
-- [ ] It is required for `model_json_schema()` to emit `required` lists
-- [x] It turns hallucinated or misspelled keys into errors instead of silently dropping them
-- [ ] It forces the model to return every optional field
-> The default `ignore` discards unknown keys, so a model writing `"quantity"` instead of `"qty"` would
-> pass with the field missing or defaulted. `forbid` surfaces the discrepancy so the retry loop can fix it.
+### Q: Which is the strongest reason to generate the JSON Schema from the Pydantic model rather than writing it by hand?
+- [ ] Generated schemas are smaller
+- [ ] Hand-written schemas cannot express enums
+- [x] The schema the model is given and the validator applied to its answer cannot drift apart
+- [ ] Providers reject schemas that were not produced by Pydantic
+> One definition serves both roles. A hand-maintained copy will eventually allow something the
+> validator rejects or vice versa, producing failures that are hard to attribute.
