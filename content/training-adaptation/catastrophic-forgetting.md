@@ -1,0 +1,211 @@
+---
+id: catastrophic-forgetting
+module: training-adaptation
+name: Catastrophic forgetting
+kind: concept
+difficulty: core
+est_minutes: 14
+related:
+  - training-adaptation/overfitting
+  - training-adaptation/supervised-fine-tuning
+  - training-adaptation/peft
+  - training-adaptation/rlhf
+  - training-adaptation/model-merging
+  - training-adaptation/learning-rate
+  - training-adaptation/data-curation
+  - evals/regression-tests
+sources:
+  - McCloskey & Cohen, 1989 — Catastrophic Interference in Connectionist Networks: The Sequential Learning Problem
+  - Kirkpatrick et al., 2017 — Overcoming Catastrophic Forgetting in Neural Networks
+  - Ouyang et al., 2022 — Training Language Models to Follow Instructions with Human Feedback
+  - Qi et al., 2023 — Fine-tuning Aligned Language Models Compromises Safety, Even When Users Do Not Intend To!
+---
+
+## TL;DR
+Fine-tuning computes gradients of the new loss only; nothing stops them overwriting the weights that
+encoded older capabilities, so the model forgets what it is not being trained on. For an LLM, a fine-tune
+on your task can silently lose general instruction following, reasoning or safety behaviour, because your
+evaluation measures only your task. Defences: mix in general data, keep the update small, isolate it in
+adapters, pull back toward the original weights, and gate every fine-tune on a general regression suite.
+
+## Why it exists
+A neural network stores everything in one shared set of weights. There is no region for "French", one for
+"SQL" and one for "refusing dangerous requests"; the same matrices participate in all of them. Training on
+a new dataset computes the gradient of the new loss alone, and that gradient has no term for the old
+tasks. Any weight that the new task wants to move will move, however important it was to something the
+loss cannot see. The phenomenon was named in the connectionist literature in the late 1980s as the
+sequential learning problem, and nothing about scale removes it; larger models have more capacity and
+more redundant features, which slows forgetting per step, but a small dataset repeated for several epochs
+at a healthy learning rate drags the whole network toward those rows.
+
+For LLMs the problem has a sharper edge because the capabilities you are forgetting are the product.
+The InstructGPT work reported an "alignment tax": models fine-tuned with RLHF regressed on public NLP
+benchmarks, and the authors mixed pretraining gradients back in to reduce it. Later work showed that
+fine-tuning an aligned chat model on ordinary, benign task data can erode its refusal behaviour, even
+when nobody intended that. The naive alternative, "my task evaluation went up, ship it", is exactly how
+these regressions reach production: the metric that would have caught them was never run.
+
+## How it works
+### The mechanism in one line
+Let θ* be the weights after pretraining and alignment. Fine-tuning minimises *L_new(θ)*. Its gradient
+moves θ along directions that reduce *L_new*; where those directions also raise *L_old* the old loss
+rises, and nothing in the update notices. A useful picture is curvature: directions in which *L_old* is
+sharply curved are the ones that matter to the old tasks (the Fisher information measures this), and a
+step of size η along such a direction costs roughly `½·F·η²` of old loss. Forgetting is therefore a
+function of three things: how far you move (steps × learning rate), in which directions (what the data
+asks for), and how sharp the old loss is there.
+
+### Mitigation families
+1. **Replay (rehearsal).** Mix data that represents the old behaviour into the fine-tuning set so the
+   loss has a term for it. The PPO-ptx variant in InstructGPT is this idea with pretraining data; in
+   practice teams mix a share of general instruction data, chat-formatted examples and safety examples
+   into a task fine-tune, with the proportion tuned on the regression suite. The limit: you need data that
+   represents what you want to keep, and for a closed base model you only have proxies.
+2. **Constrain the move.** A lower learning rate, fewer epochs and early stopping judged on the general
+   suite, not only on the task, keep the model near θ*. Explicit versions add a penalty on the distance:
+   elastic weight consolidation weights each parameter's displacement by its Fisher importance,
+   `λ/2 · Σ_i F_i (θ_i − θ*_i)²`; L2-SP uses a plain quadratic. RLHF and DPO carry a KL term to a
+   reference policy that plays the same role at the level of outputs. At LLM scale the learning-rate and
+   epoch controls plus the KL term are what is actually used; Fisher-weighted penalties are rare.
+3. **Isolate the update.** LoRA and other adapters freeze the base weights and train a small set of new
+   parameters. The base is untouched by construction, the adapter can be removed or swapped per task,
+   and the low rank limits how far outputs can move. But the model's behaviour still changes wherever the
+   adapter is active, so adapters reduce forgetting rather than preventing it, and a high-rank adapter
+   trained hard forgets too.
+4. **Average back.** Interpolating the fine-tuned weights with θ* (weight-space ensembling, model merging)
+   recovers much of the old behaviour while keeping most of the task gain, with the mixing coefficient
+   chosen on the two evaluations; see `training-adaptation/model-merging`.
+5. **Measure it.** None of the above is a guarantee. Run a fixed general-capability suite (instruction
+   following, a reasoning subset, format and chat-template adherence, refusal behaviour on a harmful
+   prompt set) before and after every fine-tune and block the release on regression beyond a tolerance.
+
+### What usually gets forgotten first
+Behaviours that are rare in the fine-tuning data and sharply defined in the original: the chat template
+and system-prompt handling when training on raw completions, refusals when training on compliant
+answers, multilingual ability when training in one language, and tool-call formatting when training on
+prose. Each is invisible to a task-only evaluation and obvious to a user.
+
+### Sequential fine-tunes compound
+Fine-tuning v2 from v1 on the second batch of data, then v3 from v2, forgets a little of each earlier
+batch at every hop. The safer pattern is to fine-tune from the base model on the union of all data each
+time, which also makes the run reproducible.
+
+## Example
+A team fine-tunes an instruct model on 5,000 legal-clause extraction examples. The first attempt (full
+fine-tune, three epochs, task data only) lifts the extraction metric but the general evaluation shows
+lower instruction following and a drop in refusal rate on harmful prompts. The second attempt mixes a
+quarter of general instruction data into every batch, trains adapters at a low rate for two epochs, and
+gates on the regression suite. The helpers (`load_jsonl`, `run_suite`, `finetune`) stand in for the
+team's pipeline functions.
+
+```python
+import random
+random.seed(0)
+
+task = load_jsonl("legal_clauses.jsonl")            # 5,000 new-task examples
+general = load_jsonl("general_chat_sample.jsonl")   # open instruction/chat data: the replay buffer
+
+REPLAY = 0.25                                       # general data as a share of the mixed set
+n_replay = int(len(task) * REPLAY / (1 - REPLAY))   # 1,666 rows so general = 25% of the total
+mixed = task + random.sample(general, n_replay)
+random.shuffle(mixed)                               # interleave; never train the sources in blocks
+
+SUITE = ["ifeval_subset", "gsm8k_subset", "chat_template_adherence", "refusal_rate_harmful"]
+
+def gate(before: dict, after: dict, max_drop: float = 0.02):
+    regressions = {k: (before[k], after[k]) for k in before if after[k] < before[k] - max_drop}
+    assert not regressions, f"general capability regressed: {regressions}"
+
+before = run_suite(base_model, SUITE)
+model = finetune(base_model, mixed, lr=1e-4, epochs=2, lora_r=16, eval_every_steps=100)
+after = run_suite(model, SUITE)
+gate(before, after)                                 # fails the release if any metric drops > 2 points
+```
+
+The replay share, the rank and the two-point tolerance are starting points to be tuned on the suite,
+not constants. The important design choice is that the suite runs before training too: a drop can only
+be recognised against the base model's own number.
+
+## Trade-offs
+- Replay costs training tokens and needs data that represents the old behaviour; for a closed base model
+  you use open instruction sets as a proxy, which protects general skills but not the vendor's specifics.
+- A lower learning rate and fewer steps reduce forgetting but may underfit the task; the balance tips
+  toward more movement when the task is far from pretraining and the old capabilities matter less.
+- Adapters bound the damage and keep the base swappable, but a task that needs deep changes may need full
+  fine-tuning with heavier replay instead.
+- A KL penalty or weight-space pull toward the reference keeps behaviour close but caps the reward or
+  task gain; raising the penalty trades task quality for retention.
+- Fisher-weighted penalties are principled but need an extra pass to estimate importance and are rarely
+  worth it at LLM scale when replay and early stopping achieve the same retention.
+
+## Pitfalls
+- Evaluating only on the task; the symptom is a model that aces the fine-tuning benchmark and fails users
+  on anything adjacent, discovered after release.
+- Training on raw completions without the chat template; the symptom is the model ignoring system prompts
+  or producing malformed turns after the fine-tune.
+- Fine-tuning on compliant answers only; the symptom is a measurable rise in compliance with harmful
+  requests even though the data was benign.
+- Chaining fine-tunes v1 → v2 → v3; the symptom is capabilities from the first batch quietly eroding with
+  each release.
+- Treating LoRA as a guarantee against forgetting; the symptom is a high-rank adapter trained for many
+  epochs showing the same regressions as a full fine-tune.
+- Diagnosing forgetting as overfitting and adding regularisation; the symptom is the task metric dropping
+  while the general metric does not recover, because the old data is still absent from the loss.
+
+## When to use
+Treat forgetting as a risk to manage on every fine-tune, including small adapter runs. Before training,
+fix the general suite and record the base model's numbers; during training, evaluate on both task and
+suite at the same cadence; after training, gate on the suite. Reach for replay first because it attacks
+the cause, then for a lower learning rate, fewer epochs and adapters, then for weight averaging when a
+good task checkpoint regressed and you want to recover most of it cheaply. Skip the heavier machinery
+unless the suite shows it is needed. Day to day, this is why "what did we lose" is as routine a question
+as "what did we gain" in a fine-tune review. In interviews, explaining the mechanism (no loss term for
+the old tasks) and the ordered set of mitigations is the expected depth.
+
+## Role lens
+- **Engineer:** Builds the data mix with a replay share, runs the general suite before and after, and
+  implements the regression gate that blocks a fine-tune from being promoted.
+- **Architect:** Owns the standing general-capability and safety suite every fine-tuned model must pass,
+  and the rule that fine-tunes start from the base on the union of data rather than chaining.
+- **FDE:** Shows a customer the before/after suite results alongside the task gain, so the decision to
+  deploy weighs what the model lost in their environment and not only what it learned.
+
+## Check yourself
+**Q:** A customer fine-tuned a chat model on 8,000 of their internal Q&A pairs and reports it now answers
+their questions well but "feels dumber", occasionally ignores the system prompt and answers questions it
+previously refused. Explain what happened and lay out a recovery plan.
+**A:** The fine-tune optimised only the Q&A loss, so weights supporting general instruction following,
+system-prompt handling and refusal behaviour were overwritten; the internal data likely lacked system
+prompts and refusals entirely, so those behaviours had no gradient keeping them in place. Recovery:
+re-run from the base model, not from the damaged checkpoint; format the data with the chat template and
+system prompts; mix in a share of general instruction data plus a safety set so the loss has a term for
+the behaviours to keep; train adapters at a lower rate for fewer epochs with evaluation on a general suite
+at every checkpoint; and gate deployment on that suite. If a strong task checkpoint already exists,
+interpolating it toward the base can recover much of the lost behaviour quickly while the proper run is
+prepared.
+
+## Quiz
+### Q: What is the root cause of catastrophic forgetting during fine-tuning?
+- [ ] The model's parameter budget is full, so new knowledge must evict old knowledge
+- [x] The fine-tuning loss has no term for the old tasks, so gradients freely move weights those tasks depended on
+- [ ] Adam's momentum carries the model past the optimum of the new task
+- [ ] The tokenizer vocabulary is changed by the new data
+> Shared weights are updated to reduce only the new loss; capacity is rarely the constraint, and neither
+> momentum nor tokenisation explains why old capabilities degrade while new ones improve.
+
+### Q: Which mitigation requires access to data representative of the capabilities you want to keep?
+- [ ] Lowering the learning rate
+- [ ] Training a low-rank adapter instead of the full model
+- [x] Replay, mixing general data into the fine-tuning set
+- [ ] Early stopping on the task metric
+> Replay works by giving the loss a term for the old behaviour, which needs examples of it; the other
+> options constrain the update without needing old data, and early stopping on the task metric alone does
+> not detect forgetting at all.
+
+### Q: A team ships monthly fine-tunes, each trained from the previous month's model on that month's new data. What should change?
+- [ ] Increase the learning rate so each month's data is learned faster
+- [x] Train each release from the base model on the union of all months' data, with a general regression suite
+- [ ] Drop the evaluation suite because the task data is growing
+- [ ] Use a larger rank for the adapters each month
+> Chained fine-tunes forget a little of every earlier batch per hop; starting from the base on all data
+> removes the compounding, makes runs reproducible, and the suite catches whatever is still lost.

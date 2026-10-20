@@ -5,6 +5,7 @@ name: Speculative decoding
 kind: concept
 difficulty: advanced
 est_minutes: 16
+status: fact-checked
 related:
   - model-internals/kv-cache
   - model-internals/sampling-strategies
@@ -69,8 +70,9 @@ method lossless rather than an approximation. Under greedy decoding the rule col
 the draft matches the target's argmax", which is the easiest version to reason about.
 
 ### What the speedup depends on
-Let α be the probability a draft token is accepted (a measure of draft–target agreement). The expected
-number of tokens produced per target pass is `(1 − α^(γ+1)) / (1 − α)`. With α = 0.8 and γ = 5 that is
+Let α be the probability a draft token is accepted (a measure of draft–target agreement). Treating each
+position as an independent trial, the expected number of tokens produced per target pass is
+`(1 − α^(γ+1)) / (1 − α)`. With α = 0.8 and γ = 5 that is
 about 3.7 tokens per pass; with α = 0.5 it is about 2. The wall-clock gain is that figure divided by the
 relative cost of the cycle (γ draft steps plus one slightly longer target pass), so the draft must be
 much cheaper than the target *and* agree with it often. Agreement is highest on predictable text, such
@@ -80,7 +82,7 @@ positions, and past a point the extra verification compute costs more than it sa
 
 ### Where the draft comes from
 - **A separate small model** with the same tokenizer (needed so draft token ids are meaningful to the
-  target). A model from the same family, roughly an order of magnitude smaller, is the usual choice.
+  target). A model from the same family, an order of magnitude or more smaller, is the usual choice.
 - **N-gram or prompt lookup**: propose the continuation that followed the same recent tokens earlier in
   the context. No second model, near-zero cost, strong on RAG answers that quote sources and on code
   edits that reproduce input, weak elsewhere.

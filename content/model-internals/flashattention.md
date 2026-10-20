@@ -5,6 +5,7 @@ name: FlashAttention
 kind: concept
 difficulty: advanced
 est_minutes: 15
+status: fact-checked
 related:
   - model-internals/self-attention
   - model-internals/multi-head-attention
@@ -112,8 +113,8 @@ compiles custom mask patterns into fused kernels for the cases FlashAttention do
 
 ## Example
 Naive attention against the flash backend on one GPU, comparing peak memory, time and the outputs. The
-naive version allocates two 4.3 GB tensors for the scores and probabilities; the flash version adds only
-a few hundred megabytes beyond the inputs.
+naive version allocates three ~4.3 GB tensors in sequence (scores, masked scores, probabilities), which
+are all live at once at the softmax; the flash version adds only a few hundred megabytes beyond the inputs.
 
 ```python
 import time, torch, torch.nn.functional as F
@@ -142,7 +143,7 @@ for name, fn in (("naive", naive), ("flash", flash)):
           f"peak {torch.cuda.max_memory_allocated() / 2**30:5.1f} GiB")
 
 print(torch.allclose(naive(), flash(), atol=2e-3, rtol=2e-3))   # True: same result up to fp16 rounding
-# Expect roughly 9-13 GiB peak for naive versus well under 1 GiB for flash, and flash several times faster;
+# Expect roughly 12 GiB peak for naive (3 x 4 GiB plus inputs) versus well under 1 GiB for flash, and flash several times faster;
 # the exact numbers depend on the GPU. Passing an explicit attn_mask instead of is_causal would disable flash.
 ```
 

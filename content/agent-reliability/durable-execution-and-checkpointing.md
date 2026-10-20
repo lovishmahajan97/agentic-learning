@@ -1,0 +1,224 @@
+---
+id: durable-execution-and-checkpointing
+module: agent-reliability
+name: Durable execution & checkpointing
+kind: concept
+difficulty: core
+est_minutes: 15
+related:
+  - agent-reliability/state-persistence-and-conversation-recovery
+  - agent-reliability/state-and-checkpoint-stores
+  - agent-reliability/idempotent-tool-execution
+  - agent-reliability/conversation-execution-identifiers
+  - reliability/durable-workflow-execution
+  - backend-fundamentals/background-jobs-durable-workers
+  - system-design/workflow-orchestration
+sources:
+  - Official docs: Temporal
+  - Official docs: LangGraph (persistence and checkpointers)
+---
+
+## TL;DR
+An agent run is a long, multi-step program whose process can die at any moment (deploys, OOMs, spot
+preemption) and whose steps cost real money and cause real side effects. Durable execution means the
+run's progress outlives the process; checkpointing is the mechanism: persist state at step boundaries
+so a resume continues from the last boundary instead of from scratch. The hard part is the boundary
+around side effects, which is why checkpointing is inseparable from idempotent tools.
+
+## Why it exists
+A chat completion is a single request: if the process dies, the client retries and nothing is lost
+but one call. An agent run differs in three ways. It is long: tens of steps, minutes to hours, with
+waits on tools, humans and rate limits. It is expensive: restarting re-pays every token already
+spent. And it has side effects: by step twelve it has created a branch, opened a ticket and sent a
+message; restarting from scratch creates a second branch, a second ticket and a second message. Add
+that the model is nondeterministic, so a restart does not even reproduce the same path: the "retry"
+is a different run that may make different decisions on top of the first run's half-finished effects.
+
+Process death is not rare. Every deploy restarts workers; autoscalers scale in; spot instances get
+reclaimed; one oversized tool output triggers an OOM that takes the whole process; a dependency bug
+raises somewhere unexpected. In a system running thousands of runs a day, "the process died mid-run"
+is a daily event.
+
+The naive answers are "run it in a background job with retries" (which restarts from zero, with the
+problems above) or "keep the state in memory and hope" (which is where most prototypes live). Neither
+answers the real question: when the process comes back, how does it know what already happened? That
+requires state written somewhere durable before the process can lose it, and a resume procedure that
+reads it and continues without redoing side effects.
+
+## How it works
+### What a checkpoint contains
+Everything needed to continue as if nothing happened: the message transcript (or a reference to it),
+the step index, budget counters, tool calls that were issued but not yet completed, pending human
+approvals, tool-side state (temp directories, branch names), the prompt and model version, and any
+random seed. Omit any of these and the resume is subtly different: budgets reset, a pending approval
+is forgotten, or a new prompt version runs against old context.
+
+### Two architectures
+**Snapshot checkpointing.** After each step, write the full state keyed by (run id, step). Resume
+means load the latest snapshot and continue the loop. It is simple and framework-agnostic, and it is
+what LangGraph's checkpointers do after each super-step, keyed by a thread id. The cost is writing a
+growing state on every step, mitigated by storing the transcript as append-only events and
+snapshotting only the small non-transcript part.
+
+**Event-sourced replay.** Persist each event (model response, tool result, timer fired, signal
+received) to an append-only history. On resume, re-run the orchestration code from the beginning;
+whenever it reaches a call whose result is already in the history, substitute the recorded result
+instead of executing. This is the Temporal model: workflow code must be deterministic (no clocks,
+randomness or I/O outside recorded activities) so replay follows the same path, while model calls and
+tool calls are activities with recorded results and their own retry policies. The pay-off is that
+orchestration code reads like ordinary sequential code while being crash-proof; the price is the
+determinism discipline and a learning curve.
+
+Both land in the same place: completed steps are never re-executed, and the only re-execution risk
+is the step in flight at the moment of death.
+
+### The side-effect boundary
+Consider the sequence: (1) the model asks for `create_ticket`; (2) the harness calls the API; (3) the
+ticket now exists; (4) the harness records the result. Death between 2 and 4 leaves a ticket with no
+record. On resume the pending call has no result, so it runs again: two tickets. No checkpoint
+placement fixes this, because the external effect and the local record cannot be made atomic. The
+answer is a three-phase protocol: record the *intent* (a pending call with a deterministic
+idempotency key derived from run id and step) before executing; execute, passing the key; record the
+result. On resume, a pending intent without a result is re-executed with the *same* key, and an
+idempotent tool or a dedup table turns the second execution into a no-op that returns the first
+result. Durable execution without idempotent tools gives at-least-once side effects; with them,
+effectively once.
+
+### Resume protocol
+1. A worker claims the run with an expiring lease, so two workers cannot resume it concurrently.
+2. Load the latest checkpoint, or replay the history.
+3. Validate the transcript: every tool call has a result; synthesize an error result for any that
+   cannot be re-executed, because model APIs reject histories with unmatched calls.
+4. Re-execute pending intents with their recorded keys.
+5. Continue the loop, bumping the attempt counter on the run record.
+
+### Versioning
+A checkpoint written by last week's code must load in this week's. Store a schema version in each
+checkpoint and keep loaders for old versions or migrate on read. In replay-based systems, changing
+orchestration code changes the path, so in-flight runs need versioned branches in the code or must be
+drained before deploy.
+
+### Checkpoint frequency
+Per step is the natural unit: the step is the boundary between "model decided" and "world changed".
+Checkpointing less often widens the window of lost work; more often, inside a step, is rarely useful.
+The write sits on the critical path of every step, so store latency matters; that is the topic of the
+state and checkpoint stores lesson.
+
+## Example
+The loop records tool-call intents with deterministic keys *before* executing them; on restart, any
+pending intents are re-executed with the same keys so idempotent tools return the original result
+instead of acting twice.
+
+```python
+def key_for(run_id, step, idx):                 # deterministic -> identical on retry
+    return f"{run_id}:{step}:{idx}"
+
+def resume_or_start(store, run_id, initial_messages):
+    cp = store.load_latest(run_id)              # None on first start
+    if cp is None:
+        cp = {"step": 0, "messages": initial_messages, "pending": [], "status": "running"}
+        store.save(run_id, cp)
+    return cp
+
+def run(store, run_id, model, tools, initial_messages):
+    cp = resume_or_start(store, run_id, initial_messages)
+    while True:
+        if cp["pending"]:                       # died mid-step: finish the intents first
+            for call in cp["pending"]:
+                res = tools[call["name"]](**call["args"], idempotency_key=call["key"])
+                cp["messages"].append({"role": "tool", "tool_call_id": call["id"],
+                                       "content": res})
+            cp["pending"] = []
+            store.save(run_id, cp)
+        resp = model(cp["messages"])
+        cp["messages"].append(resp.message)
+        if not resp.tool_calls:
+            cp["status"] = "done"
+            store.save(run_id, cp)
+            return cp
+        cp["pending"] = [{"id": c.id, "name": c.name, "args": c.args,
+                          "key": key_for(run_id, cp["step"], i)}
+                         for i, c in enumerate(resp.tool_calls)]
+        cp["step"] += 1
+        store.save(run_id, cp)                  # intent recorded BEFORE execution
+```
+
+## Trade-offs
+- Snapshot checkpointing is simple and framework-agnostic, but write size grows with the transcript;
+  splitting append-only events from a small snapshot restores per-step writes of constant size at the
+  cost of two tables.
+- Replay-based durable execution makes orchestration code crash-proof with no explicit save calls,
+  but demands deterministic workflow code and versioning discipline; worth it once runs are long and
+  numerous, overkill for a ten-step helper.
+- Checkpointing every step adds a durable write to each iteration's latency; acceptable with a
+  nearby Postgres or Redis, noticeable with a remote store, which is why some teams checkpoint only
+  before side effects.
+- Deterministic idempotency keys make retries safe, but require every side-effecting tool to honour
+  them; tools that cannot must be gated behind approvals or an outbox instead.
+
+## Pitfalls
+- Checkpointing only after tool execution; the symptom is duplicate tickets, emails or commits after
+  worker restarts, each a few seconds apart.
+- Regenerating idempotency keys randomly on resume; the symptom is a dedup layer that exists but
+  duplicates that still appear after crashes.
+- Resuming without a lease; the symptom is two workers continuing the same run and a transcript with
+  interleaved, contradictory tool results.
+- Changing the prompt or tool schema and resuming old checkpoints without a version check; the
+  symptom is resumed runs failing with malformed-history errors or behaving differently from fresh ones.
+- Storing the entire transcript in every snapshot; the symptom is checkpoint storage growing
+  quadratically and store latency climbing as runs lengthen.
+
+## When to use
+Reach for checkpointing as soon as a run can outlive a single request, touches external systems, or
+costs enough that restarting hurts, which in practice is nearly every production agent. A chat
+assistant with read-only tools and short turns can get by with transcript persistence alone. Choose
+snapshot checkpointing when you control a simple loop and want minimal dependencies; choose a replay
+engine when runs are long, span human waits of hours or days, and you already run workflow
+infrastructure. Measure resume success rate, duplicate-side-effect incidents and checkpoint write
+latency. In interviews the question is usually "what happens if the worker dies between the API call
+and recording its result"; have the three-phase answer ready.
+
+## Role lens
+- **Engineer:** Writes the save-before-execute loop and the resume path with pending-intent
+  re-execution, and tests that kill the process at every boundary and assert no duplicate effects.
+- **Architect:** Chooses between snapshot checkpointing and a replay engine, and defines checkpoint
+  schema versioning and the idempotency contract every tool must meet.
+- **FDE:** Explains to a customer why their agent created two Jira tickets during a deploy, and
+  delivers the checkpoint-plus-idempotency fix within their infrastructure constraints.
+
+## Check yourself
+**Q:** A worker dies right after calling an external API that creates a ticket but before recording
+the result. Walk through how a durable design prevents a second ticket on resume.
+**A:** Before calling the API the harness wrote a pending intent to the checkpoint containing a
+deterministic idempotency key derived from the run id, step and call index. On restart a worker takes
+the lease, loads the checkpoint, sees the intent without a result and re-executes it with the same
+key. If the ticketing API supports idempotency keys, it returns the existing ticket; if not, the tool
+adapter checks its own dedup table keyed by that value, or searches by an external reference it wrote
+into the ticket, and returns the first result. The result is recorded, the intent cleared, and the
+loop continues. Without the pre-execution intent, or with a random key, nothing links the two
+attempts and a second ticket appears.
+
+## Quiz
+### Q: Why can a crash between executing a tool and recording its result not be fixed by checkpoint placement alone?
+- [ ] Checkpoints are too slow to write synchronously
+- [x] The external side effect and the local record cannot be made atomic, so the resume must re-execute with an idempotency key that makes the second attempt a no-op
+- [ ] Models cannot be told that a tool was already executed
+- [ ] Tool results are too large to store in a checkpoint
+> No ordering of a remote call and a local write is atomic across the network boundary. Recording the
+> intent with a deterministic key before executing, and making the tool idempotent, prevents duplicates.
+
+### Q: What does event-sourced replay (the Temporal-style model) require of orchestration code?
+- [ ] It must be written in a compiled language
+- [ ] It must checkpoint explicitly after every step
+- [x] It must be deterministic, with all I/O, randomness and clocks confined to recorded activities so replay follows the same path
+- [ ] It must keep the whole transcript in memory
+> Replay re-runs the code and substitutes recorded results; if the code could take a different path on
+> replay, the substitution would be wrong. Determinism is the price of implicit checkpointing.
+
+### Q: Which item is most often missing from a checkpoint and causes subtly wrong resumes?
+- [ ] The system prompt text
+- [x] Pending tool calls that were issued but not yet completed, together with their idempotency keys
+- [ ] The user's display name
+- [ ] The model's temperature setting
+> Without recorded pending intents, a resume cannot tell whether an in-flight tool ran; it either
+> repeats the side effect or loses it. Prompt text and settings are reconstructable from a version id.

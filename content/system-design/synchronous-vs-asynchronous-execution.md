@@ -5,6 +5,7 @@ name: Synchronous vs asynchronous execution
 kind: decision
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - system-design/event-driven-architecture
   - fastapi-for-ai/job-queues-and-durable-workers

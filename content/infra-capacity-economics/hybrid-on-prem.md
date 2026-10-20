@@ -23,9 +23,9 @@ sources:
 Hybrid AI infrastructure runs some inference on hardware you control (your datacenter, a colo, a
 customer's VPC or an air-gapped site) and the rest on hosted model APIs, with a gateway routing each
 request by data classification, latency need and model need. It exists because some data cannot
-leave, some sites have no reliable connectivity, and high steady volume can be cheaper on owned
-GPUs, while on-prem alone loses frontier models and elasticity. The hard parts are the routing
-policy, keeping the API surface uniform, and keeping fixed capacity busy.
+leave, some sites lack connectivity, and high steady volume can be cheaper on owned GPUs,
+while on-prem alone loses frontier models and elasticity. The hard parts are the routing policy, a
+uniform API surface, and keeping fixed capacity busy.
 
 ## Why it exists
 Three forces push inference on-prem. Regulation and contracts: health, financial, defence and

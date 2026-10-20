@@ -5,6 +5,7 @@ name: OCR
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - multimodal/document-understanding
   - multimodal/vision-language-models
@@ -16,7 +17,7 @@ related:
 sources:
   - Smith, 2007 — An Overview of the Tesseract OCR Engine
   - Graves et al., 2006 — Connectionist Temporal Classification
-  - Shi et al., 2016 — An End-to-End Trainable Neural Network for Image-based Sequence Recognition (CRNN)
+  - Shi et al., 2017 — An End-to-End Trainable Neural Network for Image-based Sequence Recognition (CRNN)
   - Li et al., 2021 — TrOCR: Transformer-based Optical Character Recognition with Pre-trained Models
 ---
 
@@ -66,8 +67,9 @@ Each detected line or word image is recognised as a sequence. The dominant desig
 transformer feature extractor over the image width, producing one feature vector per horizontal slice,
 followed by a sequence model and the CTC loss (Connectionist Temporal Classification). CTC lets the
 network emit a character or a "blank" at every slice without knowing character boundaries in advance;
-repeated characters are collapsed and blanks removed, so "h-ee-l-l-l-o" over slices becomes "hello"
-while "l-blank-l" preserves a double letter. Tesseract moved to an LSTM-plus-CTC recogniser in
+repeated characters are collapsed first and blanks removed afterwards, so "hh-e-l-blank-ll-o" over
+slices becomes "hello", whereas "h-e-l-l-o" with no blank between the l's collapses to "helo"; the blank
+is what lets the network express a genuine double letter. Tesseract moved to an LSTM-plus-CTC recogniser in
 version 4. Transformer encoder-decoder recognisers (TrOCR) drop CTC and generate characters
 autoregressively, which handles handwriting and irregular text better at higher cost.
 

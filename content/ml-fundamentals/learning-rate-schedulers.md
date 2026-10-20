@@ -5,6 +5,7 @@ name: Learning-rate schedulers
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - ml-fundamentals/warmup
   - ml-fundamentals/optimizers
@@ -119,11 +120,11 @@ sched = torch.optim.lr_scheduler.LambdaLR(opt, multiplier)
 for step in range(total):
     # loss.backward(); opt.step()  -- one optimizer step per scheduler step
     opt.step(); sched.step()
-    if step in (0, 99, 550, 999):
+    if step in (0, 99, 549, 999):
         print(step, f"{opt.param_groups[0]['lr']:.2e}")
 # 0    -> 3.00e-06   (1/100 of the way up the ramp)
 # 99   -> 3.00e-04   (end of warmup: peak)
-# 550  -> 1.65e-04   (midpoint of decay: 0.1 + 0.9*0.5 = 0.55 of peak)
+# 549  -> 1.65e-04   (midpoint of decay: 0.1 + 0.9*0.5 = 0.55 of peak)
 # 999  -> 3.00e-05   (floor: 10% of peak)
 ```
 

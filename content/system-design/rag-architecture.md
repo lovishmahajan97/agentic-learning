@@ -5,6 +5,7 @@ name: RAG architecture
 kind: pattern
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/hybrid-search

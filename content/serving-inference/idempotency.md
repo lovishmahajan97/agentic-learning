@@ -5,6 +5,7 @@ name: Idempotency
 kind: concept
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - serving-inference/retry-strategies
   - serving-inference/timeouts

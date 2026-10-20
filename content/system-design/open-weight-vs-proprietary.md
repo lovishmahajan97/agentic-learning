@@ -5,6 +5,7 @@ name: Open-weight vs proprietary
 kind: decision
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - system-design/self-host-vs-api
   - system-design/build-vs-buy
@@ -117,14 +118,17 @@ model = AutoModelForCausalLM.from_pretrained(
 ).eval()
 
 labels = ["refund", "shipping", "other"]
-# first token of each label; check they are distinct for your tokenizer before relying on this
-label_ids = [tok(" " + l, add_special_tokens=False).input_ids[0] for l in labels]
+# First token of each label, with no leading space: the chat template ends the assistant header with a
+# newline, so the reply's first token is not space-prefixed. Check the ids are distinct for your tokenizer.
+label_ids = [tok(l, add_special_tokens=False).input_ids[0] for l in labels]
+assert len(set(label_ids)) == len(labels)
 
-msgs = [{"role": "user", "content": "Classify this message: 'My parcel never arrived'. Reply with one word."}]
-ids = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt")
+msgs = [{"role": "user", "content": "Classify this message: 'My parcel never arrived'. "
+                                    "Reply with exactly one lowercase word: refund, shipping or other."}]
+enc = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt", return_dict=True)
 
 with torch.no_grad():
-    next_logits = model(ids).logits[0, -1]          # full-vocabulary distribution for the next token
+    next_logits = model(**enc).logits[0, -1]        # full-vocabulary distribution for the next token
 probs = torch.softmax(next_logits[label_ids], dim=-1)   # renormalise over the allowed labels only
 for label, p in zip(labels, probs.tolist()):
     print(f"{label:9s} {p:.3f}")

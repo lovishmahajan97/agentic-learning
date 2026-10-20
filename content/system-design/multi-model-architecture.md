@@ -5,6 +5,7 @@ name: Multi-model architecture
 kind: pattern
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - system-design/model-portfolio
   - system-design/model-routing-cascading
@@ -71,7 +72,8 @@ detectable at the boundary instead of three stages downstream, and versions make
 ### Budgets compose, tails do not average
 Latency adds along the serial path, so parallelise what you can and budget with tail numbers: the p99 of a
 sum of four stages is at least the largest single-stage p99 and can exceed the sum of all four p99s,
-because tail events in different stages combine. Cost adds per request; find the dominant stage, which is
+because tail events in different stages combine (the sum of the p99s is only guaranteed to be at least
+the p96 of the total, by a union bound over the four stages). Cost adds per request; find the dominant stage, which is
 usually generation but is sometimes a reranker scoring 50 candidates with a large cross-encoder. Failure
 is per stage: each needs its own timeout, fallback and degraded mode (drop the reranker, skip the judge).
 
@@ -99,6 +101,7 @@ from dataclasses import dataclass, field
 
 MODELS = {"guard": "safety-classifier-v3", "embed": "text-embed-v2",
           "rerank": "cross-encoder-v1", "generate": "frontier-chat-2026-06", "judge": "small-chat"}
+BACKGROUND = set()                 # references to fire-and-forget tasks (asyncio only keeps weak ones)
 
 @dataclass
 class Trace:                       # one record per request: which model served which stage, how long
@@ -123,7 +126,8 @@ async def answer(question):
     top = await stage("rerank", rerank, trace, query=question, docs=candidates, k=5)
     draft = await stage("generate", generate, trace, question=question, context=top)
     if random.random() < 0.05:                                                   # sampled judge, off the hot path
-        asyncio.create_task(stage("judge", judge, trace, question=question, answer=draft, context=top))
+        t = asyncio.create_task(stage("judge", judge, trace, question=question, answer=draft, context=top))
+        BACKGROUND.add(t); t.add_done_callback(BACKGROUND.discard)              # keep a reference or it may be GC'd
     return {"answer": draft, "sources": [d.id for d in top], "trace": trace.stages}
 ```
 
@@ -211,5 +215,6 @@ and a feature flag, regardless of what the public benchmark says.
 - [ ] It is exactly 4 s, the sum of the p99s
 - [x] It is at least 1 s, may exceed 4 s, and cannot be derived from the p50s; measure it end to end
 > Latencies add pointwise, so the total is at least as slow as any stage. Tail events in different stages
-> combine, and by a union-bound argument the sum of the p99s is only about the p96 of the total, so the
-> true p99 can be higher still.
+> combine: the total can only exceed the sum of the p99s when at least one stage exceeds its own p99, which
+> by a union bound happens on at most about 4% of requests, so the sum of the p99s is guaranteed only to be
+> at least the p96 of the total, and the true p99 can be higher still.

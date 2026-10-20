@@ -5,6 +5,7 @@ name: Classification
 kind: concept
 difficulty: intro
 est_minutes: 13
+status: fact-checked
 related:
   - ml-fundamentals/regression
   - ml-fundamentals/loss-functions

@@ -5,6 +5,7 @@ name: Prefill vs decode
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - model-internals/kv-cache
   - serving-inference/ttft
@@ -36,8 +37,9 @@ Why does that matter enough to deserve its own lesson? Because a GPU's efficienc
 on the shape of the work. A matmul over 2,000 prompt tokens reads each weight once and uses it 2,000
 times; the arithmetic units are saturated. A decode step over one token reads the same weights and uses
 each once; the GPU spends the step waiting on memory. The result is that prefill of a 2,000-token prompt
-can take about as long as a few dozen decode steps, not 2,000 of them, and that a faster GPU helps prefill
-a lot and decode barely at all.
+can take about as long as a dozen or so decode steps, not 2,000 of them (with the illustrative numbers
+below: ~70 ms of compute-bound prefill against ~5.5 ms per bandwidth-bound step), and that a faster GPU
+helps prefill a lot and decode barely at all.
 
 The naive mental model, "cost is proportional to tokens", gets both pricing and scheduling wrong. It
 predicts that a long prompt with a short answer and a short prompt with a long answer cost the same; in

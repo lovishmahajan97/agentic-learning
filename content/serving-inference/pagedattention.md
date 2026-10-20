@@ -5,6 +5,7 @@ name: PagedAttention
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - model-internals/kv-cache
   - serving-inference/kv-cache-memory-estimation
@@ -90,8 +91,9 @@ copies it first, the same copy-on-write rule as `fork()`.
 
 ### Running out of blocks
 On-demand allocation means the pool can run dry mid-generation. The scheduler then preempts a sequence,
-either by swapping its blocks to CPU memory or by freeing them and recomputing the prefix later. Recompute
-is often cheaper for short sequences because prefill is compute-efficient; swap is cheaper for long ones.
+either by swapping its blocks to CPU memory or by freeing them and recomputing the prefix later (which of
+the two an engine offers varies by version: vLLM's V1 engine recomputes only). Recompute is often cheaper
+for short sequences because prefill is compute-efficient; swap is cheaper for long ones.
 Either way, preemption counters rising in the metrics is the sign the pool is too small for the traffic.
 
 ### Choosing the block size

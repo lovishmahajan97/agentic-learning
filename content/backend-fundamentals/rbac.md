@@ -2,232 +2,255 @@
 id: rbac
 module: backend-fundamentals
 name: RBAC
-kind: pattern
+kind: concept
 difficulty: core
 est_minutes: 14
 related:
   - backend-fundamentals/authentication-vs-authorization
   - backend-fundamentals/oauth-2-0-oidc
+  - backend-fundamentals/kubernetes
   - enterprise-integration/rbac-abac-mapping-to-customer-identity
   - enterprise-integration/scim-provisioning
   - agent-reliability/tool-permissions-and-least-privilege
   - safety-security/tool-privilege-escalation
-  - system-design/tenant-isolation
+  - agent-runtime-architecture/approval-and-authorization-boundaries
 sources:
+  - Sandhu, Coyne, Feinstein, Youman, 1996 — Role-Based Access Control Models
   - Ferraiolo, Sandhu, Gavrila, Kuhn, Chandramouli, 2001 — Proposed NIST Standard for Role-Based Access Control
   - Pang et al., 2019 — Zanzibar: Google's Consistent, Global Authorization System
-  - Official docs: Kubernetes RBAC
+  - Official docs: Kubernetes (Using RBAC Authorization)
 ---
 
 ## TL;DR
-Role-based access control puts an indirection between people and permissions: permissions attach to
-roles, people get roles, and a request is allowed if one of the caller's roles, within the right scope,
-carries the needed permission. It exists because per-user permission lists grow as users × permissions,
-drift silently, and cannot answer "who can delete production data?". The price is that roles describe
-job functions, not ownership or context, so RBAC needs a companion rule for "only the author may edit".
+Role-based access control puts one layer of indirection, the role, between who a caller is and what
+they may do: permissions attach to roles, callers are assigned roles within a scope, and a request is
+allowed only if some role of the caller grants that permission on that scope. It exists because
+assigning permissions directly to users does not survive growth: the assignment table explodes, access
+reviews become impossible and offboarding leaks. In AI systems the same model must also bound what an
+agent can do on a user's behalf and what a retriever may surface.
 
 ## Why it exists
-Start with the arithmetic. An application with 2,000 users and 300 distinct permissions has up to
-600,000 user-permission edges to maintain if each is granted directly, and every edge is a place to make
-a mistake. Onboarding means guessing which 40 edges a new analyst needs; offboarding means finding all
-of theirs; an auditor asking "who can export customer data?" gets a database scan nobody trusts.
+Authentication answers "who is calling"; every request after that has to answer "may they do this".
+The obvious implementation is a direct grant: a table of (user, permission) rows, or an access-control
+list on each resource naming the users allowed. It works for ten users and dies at a few hundred.
 
-The usual first attempt is boolean flags: `is_admin`, then `is_billing_admin`, then `can_export`,
-sprinkled through handlers as `if user.is_admin or user.can_export`. Policy and code become inseparable:
-nobody can list what an admin can do without grepping, adding a capability touches dozens of files, and
-the flags inevitably disagree between services.
+Do the arithmetic. 2,000 employees and 300 distinct permissions ("read invoices", "delete customer",
+"run eval job") can produce up to 600,000 direct grants. Onboarding a support engineer means someone
+deciding, grant by grant, which 40 of the 300 they need; when they move to another team, someone must
+remember to revoke those 40 and add 35 others. An auditor asking "who can delete customer records?"
+gets an answer only by scanning the whole table, and "is this person's access appropriate?" has no
+reference to compare against. Each grant is a bespoke decision, so the set drifts toward "whatever
+was needed once" and never shrinks. This is how a departed contractor keeps production access.
 
-RBAC, standardised by NIST in 2001 after a decade of practice, replaces both with a vocabulary the
-organisation already uses. Permissions are grouped into roles that mirror job functions ("editor",
-"billing admin"); users receive a handful of roles. Edges become users × roles-per-user plus roles ×
-permissions, both small. Policy lives in one table that can be reviewed, versioned and audited.
-Onboarding is "assign the analyst role"; offboarding is "remove it"; the audit question is a lookup.
+The structure RBAC exploits is that organisations are made of jobs, and jobs need bundles of
+permissions. Name the bundle (the role), attach permissions to it once, and assign people to roles.
+Assignments drop from users × permissions to users → roles plus roles → permissions: with twelve roles
+averaging forty permissions that is 2,000 + 480 rows instead of up to 600,000, and both reviews become
+tractable. "Is the editor role's permission set right?" is a question one owner can answer; "is Alice
+in the right roles?" is a question her manager can answer.
+
+For AI systems the stakes are sharper. An agent acting for a user must not be able to do more than
+that user; a retrieval system must not surface chunks from documents the user cannot open; a tool
+call must be checked at the moment it runs, not at login. All three need a decision that is cheap to
+evaluate on every request and every retrieved item, which is what a role lookup gives you.
 
 ## How it works
-### The core model
-Sets: users *U*, roles *R*, permissions *P* = operations × object types. Two relations: user assignment
-*UA ⊆ U × R* and permission assignment *PA ⊆ R × P*. The check is
+### The model
+Four sets and two relations. Subjects (human users, service accounts, agents), roles, permissions
+(an operation on an object type, written `documents:read`), and sessions, in which a subject activates
+some of its roles. User assignment `UA ⊆ subjects × roles` and permission assignment `PA ⊆ roles ×
+permissions`. The decision is: allow `(u, p)` iff there exists a role `r` with `(u, r) ∈ UA` and
+`(r, p) ∈ PA`. Anything not explicitly allowed is denied, *because* a default-allow system cannot be
+reasoned about: every missing rule is a hole rather than a lock.
 
-```
-allowed(u, op, obj)  ⇔  ∃ r ∈ roles(u) : (op, type(obj)) ∈ perms(r)
-```
+The NIST model layers refinements on this core. **Hierarchical** RBAC lets a senior role inherit a
+junior role's permissions (`admin ⊇ editor ⊇ viewer`), because without inheritance the admin's
+permission list duplicates the editor's and the two drift apart. **Constrained** RBAC adds separation
+of duty: nobody may hold both "submit payment" and "approve payment", because fraud should require
+collusion. These exist as named levels because they are the two extensions every real deployment
+reinvents.
 
-**Hierarchical RBAC** lets roles inherit (`admin ⊇ editor ⊇ viewer`) so each permission is defined once.
-**Constrained RBAC** adds separation of duty: a user may not hold both "submit expense" and "approve
-expense" (static), or may not activate both in one session (dynamic). **Sessions** let a user activate
-a subset of their roles, which is least privilege in practice: the `sudo` of application security.
+### Scope: where a role applies
+Flat RBAC answers "can this user read documents?", but the production question is "can this user read
+*this tenant's* documents?". The fix is to make assignments three-part: (subject, role, scope), where
+scope is a node in a resource tree such as `org → project → resource`. A role granted at a scope
+applies to everything beneath it, because that is how delegation works in organisations: the org
+admin administers every project. Kubernetes implements exactly this split: a `Role` and `RoleBinding`
+are namespaced, while `ClusterRole` and `ClusterRoleBinding` apply cluster-wide, and binding a
+ClusterRole inside a namespace restricts it to that namespace.
 
-### Scope: what the textbook model leaves out
-In a multi-tenant product "editor" is meaningless without "of what". The practical unit is a **role
-binding**: `(subject, role, scope)`, where scope is an organisation, project or namespace. Kubernetes
-models this literally: a `Role` lists verbs on resources, a `RoleBinding` ties a subject to a role within
-a namespace, and `ClusterRole`/`ClusterRoleBinding` do the same cluster-wide. The check becomes
-`roles(u, scope(obj)) ∪ roles(u, ancestors of scope(obj))`. Scope hierarchies are shallow (org → project)
-*because* every extra level multiplies the lookups and the explanations.
+### Where the decision runs
+Separate the *decision* (given subject, permission, scope, return allow/deny) from *enforcement*
+(middleware at the API boundary, a filter in a database query, a guard in front of a tool call). The
+decision needs the caller's role assignments, and there are two places to get them:
 
-### Where roles come from
-In B2B products the customer's identity provider is the source of truth: a `groups` or `roles` claim in
-the OIDC token or SAML assertion, or SCIM pushing group membership. Map provider groups to application
-roles in one data-driven place (`okta:eng-leads → admin`), never in code, so a customer reorganising
-their groups does not need a deploy.
+1. **From the token.** OIDC providers can put `groups` or `roles` claims in the ID or access token, so
+   the check is a local set lookup with no I/O. The cost is staleness: the token says what was true
+   when it was issued, so a revoked role stays usable until expiry. This is acceptable for coarse,
+   rarely-changing org roles with short token lifetimes.
+2. **From the authorization store.** Look the assignments up per request (cached with a short TTL).
+   One extra read, but revocation takes effect in seconds, and scoped assignments at project or
+   resource level, which would bloat a token, live naturally here.
 
-### Decision point versus enforcement point
-Keep the *decision* ("may u do op on obj?") in one function or service (your own module, Casbin, OPA,
-Cedar) and *enforce* it at every boundary: the API route and the data layer, because hiding a button is
-not security and a row returned by a query is already a leak. Deny by default: an endpoint with no
-permission attached should fail, not pass.
+Most systems do both: coarse roles in the token, scoped assignments resolved server-side.
 
-### Roles in the token or looked up per request
-Embedding roles in the access token costs no database calls but goes stale until expiry: a removed
-admin keeps rights for the token's lifetime. Looking roles up per request is fresh and instantly
-revocable at the price of one cached query. The usual compromise is short tokens with roles for ordinary
-reads and a live check for destructive or administrative operations.
+### Enforce at every boundary, not just HTTP
+A permission check in the request handler does nothing for the retrieval query that runs inside it,
+the background job that re-indexes documents, or the tool the agent calls. The same decision function
+has to be applied as a row or chunk filter at data access and as a guard at tool invocation, and it
+must run as the *end user's* identity, not as the service's. An agent that runs under a privileged
+service account has effectively every role at once; a prompt injection then inherits all of them.
 
-### Where RBAC stops: ABAC and ReBAC
-"Only the document's author may edit it" is not a role; it is a relationship between a user and one
-object. Encoding it as roles produces `editor-of-doc-123` and role explosion. Attribute-based access
-control evaluates a policy over user, resource and environment attributes (`resource.owner == user.id`).
-Relationship-based systems in the Zanzibar family (OpenFGA, SpiceDB) store tuples such as
-`doc:123#editor@user:alice` and `folder:7#viewer@group:eng#member` and answer checks by graph walk. The
-pattern that works in practice is RBAC for coarse job-function permissions plus ownership or
-relationship checks for the fine-grained ones.
-
-### Agents are subjects too
-An agent calling tools is a subject with roles. Either give it its own narrowly scoped role or, better,
-have it act on behalf of the user with the user's roles via a delegated token, so the tool layer runs
-the same `allowed()` check a human request would. A runtime granted a super-role "because it is
-internal" turns every prompt injection into privilege escalation.
+### When roles are not enough
+Roles describe job functions, not relationships. "The owner of a document can edit it" or "share this
+with Bob" cannot be expressed without a role per document, which is role explosion by another name.
+Two extensions handle this. Attribute-based access control (ABAC) adds conditions on attributes of the
+subject, resource and context: `resource.classification <= subject.clearance`, `request.time in
+business_hours`. Relationship-based access control (ReBAC), of which Google's Zanzibar is the
+canonical design, derives permissions from a graph of tuples such as `doc:7#viewer@group:eng#member`
+and is what sharing in Google Docs and Drive runs on. In practice you layer: RBAC for organisation-level
+capabilities, ownership or relationship checks for per-object access, and ABAC conditions where the
+customer's policy demands them.
 
 ## Example
-A scoped RBAC check as a FastAPI dependency. Permissions are strings of the form `action:resource`,
-roles are sets of permissions, and a user carries bindings per project plus an optional org-wide `*`
-scope. `current_user` is assumed to decode the session and load bindings.
+A scoped, hierarchical RBAC check with permission-named guards. Roles inherit downward, assignments
+carry a scope, and a role at any ancestor scope applies to the resource. `current_user` is the
+authentication dependency from the OAuth lesson; the point here is that handlers name *permissions*,
+never roles, so adding a role touches one table instead of every endpoint.
 
 ```python
-from dataclasses import dataclass, field
 from fastapi import Depends, FastAPI, HTTPException
 
-PERMS = {                                     # role -> permissions; the only place policy lives
-    "viewer": {"read:doc"},
-    "editor": {"read:doc", "write:doc"},
-    "admin":  {"read:doc", "write:doc", "delete:doc", "manage:members"},
-}
-
-@dataclass
-class User:
-    id: str
-    bindings: dict = field(default_factory=dict)   # scope -> set(roles); "*" means org-wide
-
-def allowed(user: User, action: str, project_id: str) -> bool:
-    roles = user.bindings.get(project_id, set()) | user.bindings.get("*", set())
-    return any(action in PERMS[r] for r in roles)  # deny unless some role in scope grants it
-
-def require(action: str):
-    def dep(project_id: str, user: User = Depends(current_user)):
-        if not allowed(user, action, project_id):
-            raise HTTPException(403, "forbidden")   # 403: identity known, permission absent
-        return user
-    return dep
-
 app = FastAPI()
+PERMS = {                                   # role -> permissions granted directly
+    "viewer": {"documents:read"},
+    "editor": {"documents:write"},
+    "admin":  {"documents:delete", "members:manage"},
+}
+INHERITS = {"admin": "editor", "editor": "viewer"}      # senior -> junior
 
-@app.delete("/projects/{project_id}/docs/{doc_id}")
-def delete_doc(project_id: str, doc_id: str, user: User = Depends(require("delete:doc"))):
-    return repo.delete(project_id=project_id, doc_id=doc_id)   # data layer also filters by project_id
+def permissions_of(role: str) -> set[str]:
+    out: set[str] = set()
+    while role:                             # walk down the hierarchy
+        out |= PERMS[role]; role = INHERITS.get(role, "")
+    return out
 
-alice = User("alice", {"p1": {"editor"}})
-bob   = User("bob",   {"*":  {"admin"}})
-assert allowed(alice, "write:doc", "p1") and not allowed(alice, "delete:doc", "p1")
-assert not allowed(alice, "read:doc", "p2")      # scope matters: editor of p1 says nothing about p2
-assert allowed(bob, "delete:doc", "p9")          # org-wide binding applies to every project
+# (subject, scope) -> roles. Scopes form a tree: project -> org.
+ASSIGNMENTS = {("alice", "org:acme"): {"viewer"}, ("alice", "project:42"): {"editor"}}
+PARENT = {"project:42": "org:acme", "project:7": "org:acme"}
+
+def allowed(subject: str, perm: str, scope: str) -> bool:
+    while scope:                            # a role at any ancestor scope applies here
+        if any(perm in permissions_of(r) for r in ASSIGNMENTS.get((subject, scope), ())):
+            return True
+        scope = PARENT.get(scope, "")
+    return False                            # deny by default
+
+def require(perm: str):
+    def guard(project_id: int, user: str = Depends(current_user)) -> str:
+        if not allowed(user, perm, f"project:{project_id}"):
+            raise HTTPException(403)        # authenticated, but not authorized
+        return user
+    return guard
+
+@app.delete("/projects/{project_id}/documents/{doc_id}")
+def delete_doc(project_id: int, doc_id: int, user: str = Depends(require("documents:delete"))):
+    return {"deleted_by": user}
+
+assert allowed("alice", "documents:write", "project:42")       # editor at the project
+assert allowed("alice", "documents:read", "project:7")         # viewer inherited from the org
+assert not allowed("alice", "documents:delete", "project:42")  # admin nowhere
 ```
 
-Adding a "billing admin" role is a one-line change to `PERMS`; adding an ownership rule ("authors may
-delete their own doc") is a separate check against the row, not a new role.
-
 ## Trade-offs
-- Edges drop from users × permissions to users × roles plus roles × permissions, but you must design
-  roles that match real job functions; when every user needs a unique set, you are back to ACLs and a
-  relationship-based model fits better.
-- A central decision point is auditable and changeable without code, but becomes a dependency on every
-  request; embed the policy library or cache decisions for a few seconds to keep latency flat.
-- Role hierarchies remove duplication but make "what can admin actually do" harder to read; flatten
-  the hierarchy once a reviewer cannot hold it in their head.
-- Roles carried in the token are fast and stateless but stale until expiry; per-request lookup is fresh
-  but adds a query. Choose by how quickly a revocation must take effect for the operation in question.
+- Indirection shrinks the assignment problem from users × permissions to users + roles, but the role
+  catalogue needs an owner; once roles are minted per team per exception ("role explosion") you are
+  back to per-user lists with an extra hop.
+- Roles carried in the token make every check a local set lookup with no database round trip, but
+  revocation lags by the token lifetime; the moment you need removal to bite within seconds
+  (offboarding, a compromised account) the balance flips to a server-side lookup.
+- Hierarchies remove duplication and mirror the org chart, but a senior role silently inherits every
+  new junior permission, which is how admins accumulate access nobody reviewed; for high-impact
+  permissions (payments, deletion, key management) flat, explicitly granted roles are safer.
+- Coarse roles are simple to audit, but cannot express ownership or sharing; as soon as the product
+  needs "share this document with Bob" you add a relationship layer and keep RBAC only for
+  organisation-level capabilities.
 
 ## Pitfalls
-- Role explosion: creating `project-123-editor` style roles per resource; the symptom is thousands of
-  roles nobody can review. Use scoped bindings or a relationship-based check instead.
-- Enforcing only in the router or UI and not in data access; the symptom is IDOR, where changing an id
-  in the URL returns another tenant's rows. Filter every query by scope.
-- Hard-coding `if role == "admin"` in handlers; the symptom is that adding a role touches forty files.
-  Check permissions, never role names.
-- Caching roles in long-lived tokens; the symptom is a removed employee who still has access for an
-  hour. Shorten expiry and re-check live for sensitive operations.
-- Mapping customer identity groups to roles in code; the symptom is that onboarding each customer
-  needs a deploy. Make the mapping a table the FDE can edit.
-- Forgetting deny-by-default; the symptom is a new endpoint that is open because nobody added a check.
-  Make the permission dependency mandatory, or lint for routes without one.
-- Giving the agent runtime an admin role; the symptom is an agent that deleted something the requesting
-  user could not have deleted themselves.
+- Comparing role strings in code (`if user.role == "admin"`) instead of checking permissions; the
+  symptom is that a new "support" role works nowhere until twenty endpoints are edited, and some
+  are missed.
+- Forgetting scope, so an editor in one tenant can edit in every tenant; the symptom is a
+  cross-tenant finding from a penetration test or, worse, a customer.
+- Enforcing only at the HTTP layer while the retrieval query or background job reads the index
+  unfiltered; the symptom is the assistant quoting a document the user cannot open in the source
+  system.
+- Running the agent under a privileged service account instead of the user's delegated roles; the
+  symptom is a prompt-injected agent deleting or reading what the asking user never could.
+- Role explosion: hundreds of near-duplicate roles; the symptom is that "who can do X?" needs a
+  script and quarterly access reviews are rubber-stamped.
+- Stale claims after a role change; the symptom is "I removed their access an hour ago and they are
+  still deleting things", because the token has not expired.
 
 ## When to use
-RBAC is the default authorization model for B2B software; the real decisions are granularity (three to
-seven roles per scope is usually enough), the scope hierarchy, whether roles ride in the token or are
-looked up, and whether a separate authorization service is warranted yet. Reach for ABAC or ReBAC when
-access depends on ownership, sharing, or nested resources such as folders and documents. Watch the
-number of roles (growth is a smell), time-to-revoke, and whether "who can do X" is answerable with one
-query. In interviews you will be asked to design the permission model for a multi-tenant app; the
-expected answer includes scoped bindings, deny by default, enforcement in the data layer, and an honest
-account of where RBAC ends and ownership checks begin.
+RBAC is the default for any multi-user system with a stable set of job functions: admin panels,
+SaaS workspaces, Kubernetes, cloud IAM. Add ABAC conditions when decisions depend on attributes of the
+resource or context (classification, region, time of day) and ReBAC when the product has per-object
+sharing. Watch the ratio of roles to users (creeping up signals explosion), time-to-revoke, the share
+of checks that are permission-named rather than role-string comparisons, and whether every retrieval
+and tool call carries the end user's identity. Day to day you write `require("x:y")` guards, map
+identity-provider groups to roles and filter queries by scope. In interviews, explain users → roles →
+permissions with scope, the token-versus-store freshness trade, and name the case RBAC cannot express.
 
 ## Role lens
-- **Engineer:** Writes the `allowed()` function and the route dependency, adds scope filters to
-  queries, and makes sure tool handlers in the agent call the same check as the HTTP layer.
-- **Architect:** Owns the role catalogue, the scope hierarchy, the token-versus-lookup decision, and the
-  boundary where RBAC hands off to relationship-based checks for shared or owned resources.
-- **FDE:** Maps the customer's identity-provider groups onto product roles, proves tenant scoping during
-  the security review, and configures what the deployed agent may touch in the customer's systems.
+- **Engineer:** Implements permission-named guards as middleware or dependencies, stores scoped
+  assignments, and applies the same decision as a chunk filter in retrieval and a check before each
+  tool call.
+- **Architect:** Owns the role catalogue and scope hierarchy, decides what rides in the token versus
+  the authorization service, and whether a central policy engine (OPA or a Zanzibar-style system) is
+  justified.
+- **FDE:** Maps the customer's IdP groups from Okta or Entra ID to product roles, wires SCIM-driven
+  assignment, and proves to their security team that the assistant cannot see what the user cannot.
 
 ## Check yourself
-**Q:** Design authorization for a multi-tenant AI document assistant with organisations, projects,
-documents, the ability to share one document with a colleague, and an agent that summarises documents on
-request. Where does RBAC fit and where does it not?
-**A:** Use RBAC with scoped bindings for job-function access: roles such as owner, admin, editor and
-viewer bound at the organisation or project level, sourced from the customer's identity provider through
-a data-driven group mapping. Sharing a single document is a relationship, not a role, so store it as a
-tuple (`doc:42#viewer@user:bob`) and check it after the role check fails. Enforce in one `allowed()`
-function called from both the API routes and the data layer, which filters every query by organisation
-id so a wrong document id can never cross tenants. The agent acts on behalf of the requesting user with
-a delegated token, so its tool calls run through the same check and it can only summarise what that user
-could read. Deny by default, keep tokens short, re-check live for deletes, and log every decision for
-audit.
+**Q:** A customer wants an AI assistant over a shared document store where every document has its own
+sharing list, and they also have org-level roles (admin, member, guest). Design authorization so the
+assistant never leaks a document.
+**A:** Separate two layers. Org-level RBAC handles coarse capabilities: who may use the assistant, who
+manages members, which features guests get; carry these as roles in the token and check them with
+permission-named guards at the API boundary. Document access is per-object sharing, which is
+relationship-based, so do not model it as roles. Record each document's allowed principals (users and
+groups) as metadata on every indexed chunk at ingestion, resolve the caller's identity and group
+memberships at request time, and apply them as a filter *inside* the vector or keyword query so
+unauthorized chunks never reach the prompt. Sync sharing changes incrementally and treat a stale ACL
+as a leak, so re-check the top-k hits against the source system when freshness matters. Run the
+assistant under the user's delegated identity, never a privileged service account, so a prompt
+injection cannot widen its reach.
 
 ## Quiz
-### Q: Why does RBAC scale better than granting permissions directly to users?
-- [ ] Roles are evaluated in constant time while direct grants require a database join
-- [x] The number of relationships drops from users × permissions to users × roles plus roles × permissions, so policy is small enough to review and change in one place
-- [ ] Roles are stored in the identity provider, which is faster than the application database
-- [ ] Direct grants cannot express hierarchical permissions
-> The win is combinatorial and organisational: a few roles each carrying a few dozen permissions
-> replace hundreds of thousands of individual grants, and onboarding, offboarding and audit become
-> single-row operations.
+### Q: Why do permissions attach to roles rather than directly to users in RBAC?
+- [ ] Because users cannot be identified reliably until after authorization has run
+- [x] Because it replaces a users × permissions assignment problem with users → roles plus roles → permissions, which is far smaller to manage, review and revoke
+- [ ] Because roles are stored in the identity provider while permissions are stored in the application
+- [ ] Because direct permission grants cannot be represented as JWT claims
+> The indirection collapses the number of assignments and makes reviews about a handful of roles.
+> Where roles are stored is an implementation choice, and JWTs can carry any claim, so neither explains
+> the design.
 
-### Q: Which requirement signals that RBAC alone is not enough?
-- [ ] Admins can delete any document in their organisation
-- [ ] Viewers can read every document in projects they belong to
-- [x] A document's author can edit it even without the editor role in that project
-- [ ] Billing administrators can manage invoices but not documents
-> Author-edits-own-document depends on a relationship between one user and one object. Expressing it
-> with roles means a role per document; an ownership or relationship check alongside RBAC is the usual
-> answer.
+### Q: A user's role was removed ten minutes ago but they can still call a protected endpoint. What is the most likely cause?
+- [ ] The role hierarchy still grants the permission through a junior role
+- [x] Roles are carried in the access token, which has not expired, so the check is using stale claims
+- [ ] The permission check is scoped to the wrong tenant
+- [ ] The identity provider has not propagated the change through SCIM
+> Token claims are a snapshot at issue time, so revocation lags by the token lifetime. A junior role
+> would mean the removed role was never the source of the permission, and SCIM lag affects assignment
+> creation, not a token that is already issued and valid.
 
-### Q: Where must the permission check be enforced to prevent a user from reading another tenant's data by changing an id in the URL?
-- [ ] In the frontend, by hiding links to resources the user cannot access
-- [ ] In the identity provider, by issuing tokens only to valid users
-- [x] In the API and data layer, by checking the permission within the resource's scope and filtering queries by tenant
-- [ ] In the load balancer, by routing each tenant to a separate pool
-> IDOR happens when a valid, authenticated user supplies an id outside their scope. Only a server-side
-> check against the resource's scope, backed by tenant-filtered queries, closes it; UI hiding and token
-> issuance do not look at the id at all.
+### Q: Which requirement is RBAC alone poorly suited to express?
+- [ ] Administrators can manage the members of their own organisation
+- [ ] Viewers can read documents in the projects they are assigned to
+- [x] A document's owner can edit it and share it with specific colleagues
+- [ ] Only staff in the billing role can issue refunds
+> Ownership and sharing are relationships between a subject and one object; expressing them with roles
+> needs a role per document. The other three are role-at-scope statements that core or hierarchical
+> RBAC handles directly.

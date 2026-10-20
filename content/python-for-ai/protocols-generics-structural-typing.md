@@ -7,240 +7,215 @@ difficulty: core
 est_minutes: 16
 related:
   - python-for-ai/type-hints
-  - python-for-ai/dependency-injection-and-interface-boundaries
-  - python-for-ai/decorators
   - python-for-ai/mypy
+  - python-for-ai/dependency-injection-and-interface-boundaries
   - python-for-ai/test-doubles-mocks-fixtures
-  - agent-reliability/tool-adapters-service-interfaces
+  - python-for-ai/pydantic
+  - agents/typed-tool-contracts
   - node-ts-for-ai/typescript-strict-mode-and-advanced-types
 sources:
   - Levkivskyi, Lehtosalo, Langa, 2017 — PEP 544: Protocols: Structural subtyping (static duck typing)
   - Traut, 2022 — PEP 695: Type Parameter Syntax
   - Official docs: typing module
+  - Official docs: mypy (Protocols and structural subtyping; Generics)
 ---
 
 ## TL;DR
-A Protocol says "anything with these methods is acceptable", so a type checker can verify duck
-typing without inheritance. Generics let you write a function or class once and have the checker
-track the element type through it, so `first(xs: list[Message])` is known to return a `Message`.
-Together they are how you type the swappable parts of an AI system (embedders, LLM clients, vector
-stores, retry decorators) without forcing third-party classes into your class hierarchy.
+A `Protocol` describes an interface by *shape* (which methods and attributes exist, with which
+signatures) rather than by inheritance, so any class that fits is accepted by the type checker without
+importing or subclassing your base. Generics (`TypeVar`, `Generic[T]`, or `class Box[T]` on 3.12+)
+let a container or function keep track of *which* type flows through it. Together they let AI code
+swap providers, embedders and stores freely while the checker still proves the pieces fit.
 
 ## Why it exists
-Python code is written against behaviour, not names. "Anything with an `embed(texts)` method" is a
-complete contract, and half the value of the language is that an OpenAI client, a
-sentence-transformers model and a test stub can all satisfy it without agreeing on a base class.
-The original type-hint design was nominal: a value was compatible with `Embedder` only if its class
-inherited from `Embedder`. That forces one of two bad outcomes. Either you write adapter classes
-whose only purpose is to inherit from your abstract base so the checker is satisfied, or you type
-the parameter as `Any` and lose checking exactly where it matters most, at the seam between your
-code and a vendor's.
+AI applications are mostly adapters around interchangeable backends: three LLM providers, two embedding
+models, a vector store you will replace next quarter, and a fake of each for tests. The application
+core should say "give me something I can call `embed(texts)` on" and not care who implements it.
 
-Generics solve a different hole. Without them, a utility like `first(xs)` must be typed
-`list[Any] -> Any`, and the element type is lost the moment it passes through. The checker then
-cannot tell you that `first(messages).content` is wrong when `messages` holds tool-call records.
-Writing one copy of the function per element type is obviously absurd. What is needed is a
-placeholder type that is bound per call: "whatever the elements are, that is what comes out".
+The nominal answer is an abstract base class: `class Embedder(ABC)` with an `@abstractmethod`, and
+every implementation subclasses it. That fails in exactly the cases that matter. You cannot make a
+third-party class (an SDK client, a `SentenceTransformer`, a customer's in-house gateway wrapper)
+inherit from your ABC without writing a wrapper whose only purpose is to inherit. Test doubles must
+import the production base, which drags production dependencies into the test suite. And a function
+that is happy with "anything that has `.embed`" is forced to demand a specific ancestry it never used.
 
-Protocols (PEP 544) and type variables give the checker both capabilities while keeping runtime
-behaviour unchanged. The design goal was explicit: make the existing duck-typed idioms of the
-standard library (`Iterable`, `Sized`, file-like objects) expressible, rather than forcing Python
-into a Java-shaped type system.
+Plain duck typing is the other extreme: accept anything, find out at runtime. That is how Python
+worked for twenty years and it is why "`AttributeError: 'OpenAI' object has no attribute 'embed'`"
+appears forty minutes into a batch job rather than in the editor. Protocols keep duck typing's
+flexibility and add the checker's proof: the shape is written down once, and every call site is
+verified against it before anything runs.
+
+Generics solve a different hole. Without them, a `VectorIndex` that stores "some payload" has to type
+it as `Any` (or `object`), and the moment a payload comes back out the checker has forgotten what it
+was. A generic `VectorIndex[Document]` remembers, so `index.nearest(q).title` is checked, and
+`VectorIndex[dict[str, str]]` is a different, equally checked, instantiation of the same code.
 
 ## How it works
-### Structural versus nominal compatibility
-Nominal typing asks "is this class a declared subclass?". Structural typing asks "does this object
-have the required members with compatible types?". `collections.abc.Iterable` is already treated
-structurally by checkers: any class with `__iter__` is an `Iterable`, no registration needed. A
-`Protocol` class lets you define your own such interfaces:
+### Nominal versus structural
+Nominal typing asks "is this class, or one of its ancestors, the named type?" That is what
+`isinstance` and ABCs do. Structural typing asks "does this object have the members the type
+requires?" PEP 544 added structural typing to the static checkers *because* that is what idiomatic
+Python code already assumed; the checker now verifies the assumption instead of trusting it.
 
-```python
-from typing import Protocol
-class Embedder(Protocol):
-    dim: int
-    def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
-```
+### Defining a Protocol
+Write a class that inherits from `typing.Protocol` and list the members with their signatures; bodies
+are `...`. Members can be methods, plain attributes (`dim: int`) or properties. A class satisfies the
+protocol when it has every member with a compatible signature: parameter types may be wider
+(contravariant) and return types may be narrower (covariant), the same rule as overriding a method.
+The implementing class never names the protocol. It *may* inherit from it explicitly to get default
+method bodies and an immediate error if a member is missing, which is a reasonable choice for classes
+you own and impossible for classes you do not.
 
-Any class with an `int` attribute `dim` and a compatible `embed` method is an `Embedder` to the
-checker. Compatibility is checked member by member, including parameter names, because a caller
-might pass `texts=` by keyword; declare parameters positional-only with `/` when names should not
-matter. The checker verifies the match at the point where an object is used as an `Embedder`, which
-is *why* errors show up at call sites rather than at the implementing class: the implementation
-never declared any intent. Adding `impl: Embedder = MyEmbedder()` in a test moves the error earlier.
+`@runtime_checkable` lets `isinstance(obj, Embedder)` work, but the runtime check only confirms that
+attributes with the right *names* exist; it cannot inspect signatures or types. Treat it as a cheap
+sanity check at a plugin boundary, not as validation. Protocols with data members cannot be used with
+`issubclass` at all.
 
-`@runtime_checkable` additionally makes `isinstance(obj, Embedder)` work. It only checks that the
-named attributes exist, not their signatures or types, because a full structural check at runtime
-would be slow and ambiguous. Treat it as a cheap plugin-discovery check, not validation.
+A protocol whose only member is `__call__` types a callback: `class ToolFn(Protocol): def
+__call__(self, *, query: str) -> str: ...` accepts any function or callable object with that exact
+keyword signature, which is more precise than `Callable[..., str]`.
 
-Compare this with an abstract base class (`abc.ABC` plus `@abstractmethod`): the ABC is nominal,
-enforces at instantiation time (a subclass missing a method cannot be constructed), and can carry
-shared default implementations. Protocols enforce only statically and carry no behaviour. Use the
-ABC when you own every implementation; use the Protocol when implementations come from outside.
+### Generics
+A `TypeVar` is a placeholder that the checker solves at each use. `def first(xs: Sequence[T]) -> T`
+means "whatever element type you pass, that is what you get back". A class that subclasses
+`Generic[T]` gets a type parameter that its methods can reference, and `Index[Document]` binds it.
+Python 3.12's PEP 695 syntax (`class Index[T]:`, `def first[T](xs: Sequence[T]) -> T:`) is sugar for
+the same thing and scopes the variable to the definition. A bound (`T: Hashable`, or
+`TypeVar("T", bound=Hashable)`) says what operations the body may rely on; constraints
+(`TypeVar("S", str, bytes)`) restrict it to a closed list. Protocols can be generic too:
+`class Retriever(Protocol[T])` with `def search(self, q: str) -> list[T]: ...`.
 
-### Generics: type variables
-A `TypeVar` is a placeholder the checker binds per use. `def first[T](xs: Sequence[T]) -> T` (PEP
-695 syntax, Python 3.12+) or the older `T = TypeVar("T")` plus `def first(xs: Sequence[T]) -> T`
-tells the checker that the return type equals the element type. A generic class,
-`class Index[T]:` or `class Index(Generic[T]):`, carries the binding across its methods, so
-`Index[Document].nearest(...)` returns a `Document`.
+### Variance, the part that bites
+`list[Child]` is **not** accepted where `list[Parent]` is expected, even though `Child` subclasses
+`Parent`. The reason is that a `list` can be written to: the callee could append a different `Parent`
+subclass into what the caller still believes is a `list[Child]`. Mutable containers are therefore
+*invariant*. Read-only views are *covariant*: `Sequence[Child]` is a `Sequence[Parent]`, because
+nothing can be put in. The practical rule: accept `Sequence`, `Mapping` or `Iterable` in parameters
+and return the concrete `list` or `dict`. Callables are contravariant in their arguments for the
+mirror-image reason.
 
-Two refinements exist because unconstrained `T` is often too loose. A bound,
-`T = TypeVar("T", bound=BaseModel)`, says T can be any subclass of `BaseModel`, so the checker
-allows `.model_dump()` on it. A constrained TypeVar, `TypeVar("N", int, float)`, says T is exactly
-one of those types, which is how `sum`-like helpers avoid accepting strings.
-
-### Variance, or why `list[Dog]` is not a `list[Animal]`
-A function typed `def rename(xs: list[Animal]) -> None` may legally `xs.append(Cat())`. If the
-checker accepted a `list[Dog]` there, the caller's list would now contain a `Cat`. So mutable
-containers are *invariant*: `list[Dog]` is compatible only with `list[Dog]`. Read-only views are
-*covariant*: a `Sequence[Dog]` is a `Sequence[Animal]` because nothing can be inserted. Function
-parameters are *contravariant*: a callback accepting `Animal` can be used where one accepting `Dog`
-is required. This is the single most common "but it obviously should work" checker error, and the
-fix is almost always to accept `Sequence[T]` or `Iterable[T]` for inputs. When you declare your own
-generic classes with the old syntax you must state variance (`TypeVar("T_co", covariant=True)`);
-the PEP 695 syntax infers it from how the parameter is used.
-
-### ParamSpec: typing decorators
-Every retry, tracing and caching decorator in an AI codebase wraps arbitrary functions. Typed as
-`Callable[..., Any]`, the decorator erases the wrapped function's signature and every call through
-it becomes unchecked. `ParamSpec` captures "whatever parameters the wrapped function has" so that
-`Callable[P, R] -> Callable[P, R]` preserves argument and return types through the wrapper. `Self`
-(3.11) solves the related problem of fluent builders and `copy`-style methods returning the subclass
-type rather than the base.
+### Where the runtime stands
+None of this runs. `Index[Document]` evaluates to a `_GenericAlias` object that constructs plain
+`Index` instances; `T` is never substituted at runtime. The guarantees come from running mypy or
+pyright in CI, which is why those tools sit next to this lesson in the module.
 
 ## Example
-A structural `Embedder` satisfied by two unrelated classes, a generic index that remembers what it
-stores, and a signature-preserving decorator. On Python 3.12+ the `Generic[T]` base can be replaced
-by `class Index[T]:`.
+A structural `Embedder` protocol, a generic index parameterised by payload type, and a fake that
+satisfies the protocol without inheriting. The checker verifies the `FakeEmbedder` shape and knows
+that `nearest` returns a `dict[str, str]`.
 
 ```python
-import functools
-from collections.abc import Callable, Sequence
-from typing import Generic, ParamSpec, Protocol, TypeVar, runtime_checkable
+from typing import Generic, Protocol, Sequence, TypeVar, runtime_checkable
 
 @runtime_checkable
 class Embedder(Protocol):
     dim: int
     def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
 
-class HashEmbedder:                       # no inheritance from Embedder anywhere
-    dim = 8
+class FakeEmbedder:                      # no base class: the shape alone satisfies Embedder
+    dim = 3
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        return [[float((hash(t) >> i) & 1) for i in range(self.dim)] for t in texts]
+        return [[float(len(t)), 0.0, 1.0] for t in texts]
 
-class OpenAIEmbedder:                     # wraps a vendor SDK; also structurally an Embedder
-    dim = 1536
-    def __init__(self, client) -> None: self.client = client
-    def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        r = self.client.embeddings.create(model="text-embedding-3-small", input=list(texts))
-        return [d.embedding for d in r.data]
+T = TypeVar("T")                         # Python 3.12+: `class Index[T]:` and drop Generic[T]
 
-T = TypeVar("T")
 class Index(Generic[T]):
     def __init__(self, embedder: Embedder) -> None:
-        self.embedder, self.items, self.vecs = embedder, [], []
-    def add(self, item: T, text: str) -> None:
-        self.items.append(item); self.vecs.append(self.embedder.embed([text])[0])
-    def nearest(self, text: str) -> T:              # the checker knows this is a T
-        q = self.embedder.embed([text])[0]
-        dot = lambda v: sum(a * b for a, b in zip(q, v))
-        return self.items[max(range(len(self.vecs)), key=lambda i: dot(self.vecs[i]))]
+        self._e = embedder
+        self._items: list[tuple[list[float], T]] = []
 
-P = ParamSpec("P"); R = TypeVar("R")
-def logged(fn: Callable[P, R]) -> Callable[P, R]:   # keeps fn's exact signature
-    @functools.wraps(fn)
-    def inner(*args: P.args, **kwargs: P.kwargs) -> R:
-        print("calling", fn.__name__); return fn(*args, **kwargs)
-    return inner
+    def add(self, text: str, payload: T) -> None:
+        self._items.append((self._e.embed([text])[0], payload))
 
-idx: Index[int] = Index(HashEmbedder())
-idx.add(42, "the answer"); idx.add(7, "a prime")
-print(idx.nearest("answer"))                       # 42 (int, per the checker)
-print(isinstance(HashEmbedder(), Embedder))        # True: attribute presence only
+    def nearest(self, query: str) -> T:
+        q = self._e.embed([query])[0]
+        dot = lambda v: sum(a * b for a, b in zip(v, q))
+        return max(self._items, key=lambda item: dot(item[0]))[1]
+
+idx: Index[dict[str, str]] = Index(FakeEmbedder())
+idx.add("refund policy", {"doc": "policy.md"})
+idx.add("pricing", {"doc": "pricing.md"})
+hit = idx.nearest("how do refunds work")           # checker: hit is dict[str, str]
+print(hit["doc"], isinstance(FakeEmbedder(), Embedder))   # policy.md True
+# idx.add("x", 42)  -> mypy: Argument 2 has incompatible type "int"; expected "dict[str, str]"
 ```
 
-Change `nearest` to return `self.vecs[0]` and the checker reports `list[float]` is not `T`; pass
-`idx: Index[int] = Index(object())` and it reports `object` is missing `embed`.
-
 ## Trade-offs
-- Protocols decouple your contracts from vendor classes, but mismatch errors surface at call sites
-  instead of at the implementation, so without an explicit `impl: Proto = Impl()` check in tests a
-  broken implementation is only reported where it is first used.
-- `@runtime_checkable` gives a cheap plugin check, but it verifies attribute names only, so using
-  it as validation of untrusted objects becomes harmful the moment signatures matter.
-- Generics make element types flow through containers and pipelines, but nested type variables and
-  variance annotations raise the reading cost; for a small private helper `list[Any]` can be the
-  honest choice.
-- An ABC enforces at instantiation and can hold shared defaults, which a Protocol cannot; when you
-  own all implementations and want shared behaviour, the ABC wins despite being nominal.
-- `ParamSpec` preserves signatures through decorators at the cost of more boilerplate per decorator;
-  skipping it turns every decorated function into `Callable[..., Any]` and silently disables checks.
+- Structural interfaces decouple callers from implementations, but you lose "find all subclasses" as
+  a discovery tool; when a team needs an explicit registry of implementations, explicit subclassing
+  of the protocol (allowed) restores it.
+- Generics give precise element types through containers, at the cost of variance reasoning; if a
+  container is only ever read, typing parameters as `Sequence` avoids the invariance errors entirely.
+- ABCs fail fast at instantiation when a method is missing; Protocols only fail under the checker, so
+  in a codebase without mypy or pyright in CI an ABC is the safer choice.
+- `@runtime_checkable` adds a cheap plugin-boundary check, but it verifies names only; when inputs
+  are untrusted, a Pydantic model or explicit validation is the right tool, not `isinstance`.
 
 ## Pitfalls
-- Declaring an input as `list[Message]` and getting "incompatible type list[ToolMessage]" from
-  callers; the cause is invariance of mutable containers, the fix is `Sequence[Message]`.
-- Implementing a Protocol method with a different parameter name (`def embed(self, docs)`) and
-  seeing "incompatible with protocol" errors; parameter names are part of the signature unless
-  declared positional-only.
-- Relying on `isinstance(x, SomeProtocol)` to confirm a vendor object is safe to call; the check
-  passes with the wrong signature and the failure appears later as a `TypeError` inside the call.
-- Using a bare `TypeVar` in a signature where it appears only once (`def f(x: T) -> None`); it
-  binds to nothing and checkers warn that it is meaningless, usually a sign `object` was intended.
-- Writing a decorator typed `Callable[..., Any]` and wondering why mypy never catches wrong
-  arguments to decorated LLM-call functions; the signature was erased.
+- Passing `list[OpenAIMessage]` to a parameter typed `list[Message]` and getting "incompatible type";
+  the fix is `Sequence[Message]` in the signature, not a cast, because `list` is invariant.
+- Implementing a protocol method with different parameter *names* or a positional/keyword mismatch;
+  mypy reports the class as not satisfying the protocol and lists the conflicting members.
+- Trusting `isinstance(obj, Proto)` to validate a plugin; an object with an `embed` attribute that is
+  a string passes the check and fails at the first call.
+- Writing `def get(self) -> T` on a generic class that never receives a `T` in its constructor or
+  methods; the checker infers `Index[Never]` or `Index[Any]` and the generic silently stops helping.
+- Forgetting that `Protocol` classes cannot be instantiated and that explicit subclasses inherit
+  default bodies while implicit ones do not; the symptom is a `NotImplementedError`-style surprise
+  only on the implicit path.
 
 ## When to use
-Reach for a Protocol whenever the *consumer* defines the interface and implementations come from
-elsewhere: an `LLMClient` your agent loop calls, an `Embedder` your retriever uses, a `Store` your
-memory layer writes to. It makes test doubles trivial, because a stub only needs the methods, and it
-keeps vendor SDKs out of your type signatures. Use an ABC instead when you ship a base class with
-shared behaviour that your own subclasses extend. Use generics for anything container-shaped whose
-element type varies: `Cache[K, V]`, `Pipeline[In, Out]`, `Result[T]`. Use `ParamSpec` on every
-decorator in a typed codebase. Measure success by how few `Any` and adapter-only classes remain. In
-interviews, expect to explain structural versus nominal typing, why `list` is invariant and what
-`ParamSpec` fixes.
+Reach for a Protocol whenever a function or class depends on behaviour rather than ancestry: the LLM
+client, the embedder, the retriever, the tool executor, the cache. It is the natural port in a
+ports-and-adapters design and the cheapest way to make tests use fakes. Use an ABC instead when you
+own every implementation, want runtime enforcement at construction time, and want shared concrete
+code. Use generics when a container or pipeline stage carries a payload type that callers need back
+intact; measure success by whether mypy or pyright reports zero `Any` leaking out of those paths. In
+interviews, being able to explain why `list` is invariant and when to prefer `Sequence` is the
+discriminating question.
 
 ## Role lens
-- **Engineer:** Types the LLM client, embedder and store as Protocols so a fake can replace each in
-  tests without monkeypatching vendor modules.
-- **Architect:** Defines the handful of Protocols that form the boundary between agent core and
-  providers, so swapping a vendor is an implementation change, not a refactor.
-- **FDE:** Fits a customer's existing classes (their search service, their auth client) into the
-  product's interfaces by matching method shapes instead of asking them to subclass anything.
+- **Engineer:** Writes `LLMClient` and `Embedder` protocols, codes the app against them, and ships
+  fakes for tests that never import a vendor SDK.
+- **Architect:** Owns the port boundaries: which capabilities are protocols, how vendor adapters map
+  onto them, and how generics keep document and tool payload types checked across layers.
+- **FDE:** Wraps a customer's unmodifiable in-house gateway class to satisfy the product's protocol,
+  proving compatibility with the checker before any integration test runs.
 
 ## Check yourself
-**Q:** Your team has a `Retriever` abstract base class with three in-house subclasses. A customer
-wants to plug in their vendor's search client, which already exposes a compatible `search(query,
-k)` method. A teammate proposes writing an adapter subclass. Is there a better option, and what do
-you give up?
-**A:** Define `Retriever` as a `Protocol` with the `search` signature; the vendor class then
-satisfies it structurally with no wrapper, and the checker verifies the signature match at the
-call site. What you give up is the ABC's instantiation-time enforcement and any shared default
-methods, and you must make sure parameter names match or declare them positional-only. A common
-compromise is both: a Protocol for consumers to depend on, and an ABC that your own
-implementations inherit for shared behaviour, which still satisfies the Protocol.
+**Q:** Your RAG library exposes `Retriever` as an ABC. A customer wants to plug in an internal search
+class they cannot modify, and your own tests are slow because fakes import the production module.
+What would you change, and what do you give up?
+**A:** Convert `Retriever` to a `Protocol`, generic in the document type (`Retriever[T]` with
+`search(q) -> list[T]`), so the customer's class satisfies it by shape and test fakes need no imports.
+Keep an optional concrete base (explicitly subclassing the protocol) for implementations you own that
+want shared helpers. Type the inputs as `Sequence`/`Mapping` to avoid invariance errors. What you give
+up: construction-time enforcement, so a missing method is only caught by mypy or pyright, which must
+run in CI; and `@runtime_checkable` checks at the plugin boundary verify names only, so argument
+validation at that boundary still needs explicit code.
 
 ## Quiz
-### Q: What makes a class compatible with a `Protocol` in the eyes of a type checker?
-- [ ] It must inherit from the Protocol class or be registered with it
-- [x] It must have the Protocol's members with compatible types and signatures, regardless of inheritance
-- [ ] It must be decorated with `@runtime_checkable`
-- [ ] It must define `__protocol__` returning the Protocol name
-> Protocols are structural: the checker compares members. Inheritance is allowed but never required,
-> and `@runtime_checkable` only affects `isinstance`, not static compatibility.
+### Q: What does `isinstance(obj, SomeProtocol)` check when the protocol is `@runtime_checkable`?
+- [ ] That `obj`'s class explicitly inherits from the protocol
+- [x] That attributes with the protocol's member names exist on `obj`, ignoring their signatures and types
+- [ ] That every method signature on `obj` matches the protocol exactly
+- [ ] That `obj` was validated by the type checker at import time
+> The runtime check is structural but shallow: it looks for the member names only. Signature and type
+> conformance exist only in the static checker, which is why `isinstance` is not a validation tool.
 
-### Q: Why does a checker reject passing a `list[Dog]` to a parameter typed `list[Animal]`?
-- [ ] Because `Dog` is not a subclass of `Animal` in the checker's eyes
-- [ ] Because lists cannot be generic over user-defined classes
-- [x] Because the function could append a non-`Dog` `Animal`, corrupting the caller's list, so `list` is invariant
-- [ ] Because `list` is covariant and `Animal` is more specific than `Dog`
-> Mutable containers are invariant precisely to prevent writes of the wrong subtype. A read-only
-> `Sequence[Animal]` accepts `list[Dog]` because nothing can be inserted through it.
+### Q: Why does mypy reject passing a `list[Child]` to a parameter annotated `list[Parent]`?
+- [ ] Because `Child` must be declared as a Protocol to be substitutable
+- [ ] Because mypy does not support subclass relationships inside containers
+- [x] Because `list` is invariant: the callee could insert another `Parent` subtype into the caller's list
+- [ ] Because generic aliases are erased at runtime, so the relationship cannot be proved
+> A mutable container accepted as `list[Parent]` may be written to with any `Parent`, which would
+> corrupt the caller's `list[Child]`. Read-only `Sequence[Parent]` is covariant and accepts it.
 
-### Q: What problem does `ParamSpec` solve for a retry decorator?
-- [ ] It lets the decorator run the wrapped function in a thread
-- [ ] It validates argument values at runtime before the call
-- [x] It preserves the wrapped function's parameter types so calls through the decorator stay type-checked
-- [ ] It makes the decorator usable on async functions
-> Without `ParamSpec`, the decorator's return type is `Callable[..., Any]` and every call to a
-> decorated function loses argument checking. `ParamSpec` carries the original signature through.
+### Q: Which statement about a third-party class and your `Protocol` is true?
+- [x] The class satisfies the protocol if its members match, even though it never imports your module
+- [ ] The class must be registered with `Protocol.register()` before the checker accepts it
+- [ ] The class must subclass the protocol, otherwise the checker treats it as `Any`
+- [ ] The protocol must be decorated with `@runtime_checkable` for static checking to work
+> Structural subtyping is the whole point of PEP 544: conformance is decided by shape, so classes you
+> cannot modify fit without wrappers. `register()` belongs to ABCs, and `@runtime_checkable` only
+> affects `isinstance`.

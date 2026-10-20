@@ -5,6 +5,7 @@ name: Mixture of experts (MoE)
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - model-internals/transformer
   - model-internals/llm-architecture

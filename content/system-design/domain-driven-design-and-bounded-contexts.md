@@ -5,6 +5,7 @@ name: Domain-driven design & bounded contexts
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - system-design/modular-monolith-vs-microservices
   - system-design/event-driven-architecture

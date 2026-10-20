@@ -5,6 +5,7 @@ name: Self-attention
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - model-internals/attention-mechanism
   - model-internals/multi-head-attention
@@ -81,7 +82,8 @@ problem FlashAttention removes.
 With no positional signal, permuting the rows of **X** permutes the rows of the output identically: the
 layer treats its input as a set. That is why positional encodings exist. A causal mask alone leaks some
 order information, since each token can tell roughly how many tokens precede it, and decoders trained
-with no explicit positions do learn something usable, but every production model adds an explicit scheme.
+with no explicit positions do learn something usable, but nearly every production model adds an explicit
+scheme (a few recent families drop it in some layers).
 
 ### What happens at inference
 Under the causal mask, the keys and values of earlier positions never change once computed, so they are

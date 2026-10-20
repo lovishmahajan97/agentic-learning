@@ -5,6 +5,7 @@ name: Arize Phoenix
 kind: tool
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - observability/opentelemetry
   - observability/tracing
@@ -21,8 +22,8 @@ sources:
 ---
 
 ## TL;DR
-Arize Phoenix is an open-source, self-hostable LLM observability and evaluation tool built directly on
-OpenTelemetry: applications send ordinary OTel spans annotated with OpenInference conventions (LLM,
+Arize Phoenix is a self-hostable (source-available, Elastic License 2.0) LLM observability and evaluation
+tool built directly on OpenTelemetry: applications send ordinary OTel spans annotated with OpenInference conventions (LLM,
 retriever, tool, agent span kinds) and Phoenix stores, visualises and evaluates them. Its strengths are
 ingestion without a proprietary SDK, an evaluation library that runs LLM-as-a-judge over traces as
 DataFrames and writes verdicts back onto spans, and embedding visualisation for retrieval failures. Arize
@@ -36,7 +37,8 @@ Early LLM tools solved it with their own SDKs and wire formats, which meant one 
 and traces that could not join the rest of the system's telemetry.
 
 Phoenix made a different bet: do not invent a tracing protocol. Standardise the *attribute names* for LLM
-work on top of OpenTelemetry (that specification is OpenInference), publish instrumentors that emit those
+work on top of OpenTelemetry (that specification is OpenInference, Apache-2.0 licensed, unlike the ELv2
+Phoenix server), publish instrumentors that emit those
 spans for OpenAI, Anthropic, Bedrock, LangChain, LlamaIndex, DSPy and others, and compete on what you do with
 the data. Because the spans are plain OTel, a Collector can send the same stream to Phoenix and to Tempo or
 Datadog, and switching away costs nothing.
@@ -95,8 +97,9 @@ the quickest way to see that a cluster of user queries has no nearby documents.
 ## Example
 A RAG answer traced with plain OpenTelemetry plus OpenInference attributes, with the OpenAI instrumentor
 producing the `LLM` span, followed by a notebook step that judges every answered question for hallucination
-against its retrieved context and writes the verdicts back onto the spans. Function names follow the current
-`phoenix.evals` API, which has changed across releases.
+against its retrieved context and writes the verdicts back onto the spans. Function names follow the
+long-standing evaluator/`run_evals` interface of `phoenix.evals`; newer releases add a redesigned API
+alongside it, so pin the version and check the import paths against the release you install.
 
 ```python
 # pip install arize-phoenix openinference-instrumentation-openai openai
@@ -182,8 +185,9 @@ to the hallucinated ones.
 ## When to use
 Reach for Phoenix when you already emit or intend to emit OpenTelemetry traces and want LLM-aware analysis
 without a second SDK, when the work is evaluation-heavy (hallucination, retrieval relevance, agent
-trajectories) and your team lives in notebooks, or when open source and self-hosting are requirements and
-the budget for a commercial platform is zero. Prefer Langfuse when prompt management and per-user cost are
+trajectories) and your team lives in notebooks, or when self-hosting is a requirement and the budget for a
+commercial platform is zero (check that the Elastic License 2.0 is acceptable to your legal team; it forbids
+offering Phoenix itself as a managed service, which is rarely an issue for internal use). Prefer Langfuse when prompt management and per-user cost are
 the daily workflow; prefer LangSmith when the stack is LangGraph and a hosted product is acceptable. Measure
 span completeness per project, judge-versus-human agreement on a labelled sample, and the retrieval
 relevance aggregates over time. Day to day it is the place you replay a bad RAG answer, see the chunks that

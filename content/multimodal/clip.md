@@ -5,6 +5,7 @@ name: CLIP
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - multimodal/image-embeddings
   - multimodal/vision-language-models

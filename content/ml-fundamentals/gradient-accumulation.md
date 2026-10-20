@@ -5,6 +5,7 @@ name: Gradient accumulation
 kind: practice
 difficulty: core
 est_minutes: 11
+status: fact-checked
 related:
   - ml-fundamentals/batch-size
   - ml-fundamentals/gradient-clipping
@@ -122,15 +123,16 @@ from torch.nn.utils import clip_grad_norm_
 def train_step(model, opt, sched, micro_batches, max_norm=1.0):
     """micro_batches: k dicts with input_ids and labels (-100 = ignore). Performs ONE optimizer step."""
     k = len(micro_batches)
-    n_tokens = sum((mb["labels"] != -100).sum().item() for mb in micro_batches)  # whole window
+    n_tokens = sum((mb["labels"][:, 1:] != -100).sum().item() for mb in micro_batches)  # whole window
     ddp = isinstance(model, torch.nn.parallel.DistributedDataParallel)
     opt.zero_grad(set_to_none=True)                     # once per window, not per micro-batch
     for j, mb in enumerate(micro_batches):
         sync_ctx = model.no_sync() if ddp and j < k - 1 else nullcontext()
         with sync_ctx:                                  # all-reduce only on the last micro-batch
-            logits = model(mb["input_ids"]).logits
+            logits = model(mb["input_ids"]).logits[:, :-1]   # position t predicts token t+1
+            labels = mb["labels"][:, 1:]                     # so shift labels left by one
             loss_sum = torch.nn.functional.cross_entropy(
-                logits.view(-1, logits.size(-1)), mb["labels"].view(-1),
+                logits.reshape(-1, logits.size(-1)), labels.reshape(-1),
                 ignore_index=-100, reduction="sum")
             (loss_sum / n_tokens).backward()            # grads add up in .grad across the k calls
     grad_norm = clip_grad_norm_(model.parameters(), max_norm)   # once, on the summed gradient

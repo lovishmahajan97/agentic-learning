@@ -5,6 +5,7 @@ name: Engines (vLLM, SGLang, TGI, TensorRT-LLM, Ollama, llama.cpp)
 kind: tool
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - serving-inference/model-serving
   - serving-inference/continuous-batching
@@ -82,9 +83,11 @@ ecosystem it is the shortest path. Its feature pace on the newest serving tricks
 vLLM and SGLang.
 
 ### TensorRT-LLM
-NVIDIA's engine. Models are compiled ahead of time into TensorRT engines specialised for a GPU
-architecture and a configuration (maximum batch size, sequence length, parallelism), which lets it fuse
-kernels aggressively and use FP8 on Hopper-class parts; it implements in-flight batching and paged KV
+NVIDIA's engine. Its distinctive workflow compiles models ahead of time into TensorRT engines specialised
+for a GPU architecture and a configuration (maximum batch size, sequence length, parallelism), which lets
+it fuse kernels aggressively and use FP8 on Hopper-class parts (recent releases also add a PyTorch-based
+backend that loads checkpoints directly, narrowing the operational gap, but the compiled path remains the
+reason to choose it); it implements in-flight batching and paged KV
 cache and is typically served behind Triton Inference Server (NVIDIA's NIM containers build on the same
 stack). It has the highest performance ceiling on NVIDIA hardware and the highest operational cost: a
 build step per model and GPU type, NVIDIA-only, and rebuilds when limits change.
@@ -97,7 +100,8 @@ system RAM. `llama-server` exposes an OpenAI-compatible API. It is designed for 
 commodity hardware; it has batching, but not the many-user throughput machinery of the datacenter engines.
 
 ### Ollama
-A packaging layer over llama.cpp: a model registry (`ollama pull`), a Modelfile for prompts and
+A packaging layer over llama.cpp and its ggml library (newer releases run some model families on
+Ollama's own ggml-based engine, but the design and limits are the same): a model registry (`ollama pull`), a Modelfile for prompts and
 parameters, a REST API on port 11434 with an OpenAI-compatible endpoint, and automatic GPU detection. It
 is the standard developer-laptop and prototyping runtime. Defaults are single-user; environment variables
 such as `OLLAMA_NUM_PARALLEL` and the per-model context length need changing before it serves a team,
@@ -168,11 +172,12 @@ stream("ollama", "Explain continuous batching in two sentences.")
 
 ## Pitfalls
 - Benchmarking a single request and choosing llama.cpp or Ollama for a multi-user service; the symptom is
-  latency that grows roughly linearly with concurrent users because there is no real batching.
+  latency that climbs steeply as users are added, because batching is limited to a handful of parallel
+  slots rather than the hundreds of sequences a datacenter scheduler juggles.
 - Setting `--max-model-len` and `--gpu-memory-utilization` without doing the KV-cache arithmetic; the
   symptom is an OOM at startup or a scheduler that admits only a handful of sequences.
-- Mixing weight formats; the symptom is a GGUF file that no GPU engine will load, or an AWQ checkpoint
-  llama.cpp cannot read, discovered on deploy day.
+- Mixing weight formats; the symptom is a GGUF file that the datacenter engines load only experimentally
+  or not at all, or an AWQ checkpoint llama.cpp cannot read, discovered on deploy day.
 - Assuming "OpenAI-compatible" means identical behaviour; the symptom is tool calls and JSON mode that
   parse differently across engines and models, because each implements function calling with its own
   parser and chat template.
@@ -207,8 +212,9 @@ llama.cpp and vLLM are not competitors, and what the TensorRT-LLM build step buy
 300 agents on two NVIDIA GPUs. What do you change, and what do you keep?
 
 **A:** Keep the model family, the prompts and the OpenAI-compatible client code, since those transfer.
-Change the runtime: Ollama's llama.cpp core serves one or a few users well but lacks the continuous
-batching and paged KV cache that 300 concurrent users need, so latency would grow with every added user.
+Change the runtime: Ollama's llama.cpp core serves one or a few users well but lacks the large-batch
+scheduler and paged KV-cache machinery that 300 concurrent users need, so latency would grow with every
+added user.
 Move to vLLM or SGLang on the GPUs; SGLang if the support prompts share a large system prefix, because
 RadixAttention reuses it automatically, otherwise vLLM for breadth. Switch from the GGUF file to the
 Hugging Face checkpoint, quantized with AWQ or FP8 if memory demands it, and do the KV-cache arithmetic
@@ -219,14 +225,14 @@ add backpressure and metrics in front. TensorRT-LLM is a later optimisation if t
 fixed.
 
 ## Quiz
-### Q: Which engine requires compiling the model ahead of time for a specific GPU architecture and configuration?
+### Q: Which engine's distinctive workflow compiles the model ahead of time for a specific GPU architecture and configuration?
 - [ ] vLLM
 - [ ] SGLang
 - [x] TensorRT-LLM
 - [ ] TGI
 > TensorRT-LLM builds a TensorRT engine specialised to the GPU type, batch and sequence limits, which
 > enables aggressive kernel fusion but means a rebuild when hardware or limits change. The others load
-> checkpoints at startup.
+> checkpoints at startup and never need a build step.
 
 ### Q: What is the relationship between Ollama and llama.cpp?
 - [ ] They are independent implementations of the same GGUF specification

@@ -5,6 +5,7 @@ name: Supply-chain security for models & datasets
 kind: practice
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - python-for-ai/safetensors
   - python-for-ai/hugging-face
@@ -40,7 +41,7 @@ behaviour triggered by a specific input that is otherwise invisible, was shown i
 in 2017 and in LLMs by Hubinger et al. in 2024, where trigger behaviour survived standard safety training.
 Fourth, datasets are often lists of URLs rather than content; Carlini et al. showed in 2024 that buying
 expired domains referenced in popular web-scale datasets lets an attacker control what future downloaders
-receive, for a cost they reported in the tens of dollars.
+receive; they estimated that about US$60 would have bought control of 0.01% of LAION-400M or COYO-700M.
 
 The naive defence, "we only use popular models from well-known organisations", does not hold. Hub
 namespaces can be squatted with look-alike names, accounts get compromised, a branch like `main` is

@@ -5,6 +5,7 @@ name: KV-cache memory estimation
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - model-internals/kv-cache
   - model-internals/grouped-query-attention
@@ -56,9 +57,10 @@ and with multi-query attention it is 1. `head_dim` is usually `hidden_size / n_a
 `bytes_per_element` is 2 for fp16/bf16, 1 for fp8 or int8 cache. All of these come from the model's
 config file (`num_hidden_layers`, `num_key_value_heads`, `hidden_size`, `num_attention_heads`).
 
-Multi-head latent attention (used by some recent models) replaces per-head K and V with a single compressed
-latent vector per layer per token, so the formula becomes 1 × layers × latent_dim × bytes; read the
-architecture before applying the standard formula.
+Multi-head latent attention (DeepSeek-V2/V3 and derivatives) replaces per-head K and V with one compressed
+latent vector per layer per token plus a small decoupled RoPE key, so the formula becomes
+1 × layers × (latent_dim + rope_dim) × bytes (for DeepSeek-V3: 61 × (512 + 64) × 2 ≈ 70 KB in bf16, versus
+several MB for an equivalent MHA layout); read the architecture before applying the standard formula.
 
 ### From per-token to per-GPU
 ```

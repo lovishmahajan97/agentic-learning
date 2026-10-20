@@ -5,6 +5,7 @@ name: NeMo Guardrails
 kind: tool
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - safety-security/input-output-guardrails
   - safety-security/llama-guard
@@ -21,11 +22,11 @@ sources:
 
 ## TL;DR
 NeMo Guardrails is NVIDIA's open-source toolkit that sits between your application and the LLM and runs
-programmable "rails" at five points: on input, over dialogue flow, on retrieved chunks, around tool
-execution, and on output. Rails are declared in Colang and YAML rather than scattered through code, and
-dialogue rails work by mapping free text to canonical intents with embeddings so policy can be written as
-deterministic flows. It is an orchestration layer, not a classifier: it calls classifiers such as Llama
-Guard, Presidio and the LLM itself.
+programmable "rails" at five points: input, dialogue flow, retrieved chunks, tool execution, and output.
+Rails are declared in Colang and YAML rather than scattered through code, and dialogue rails map free
+text to canonical intents via an embedding index of example utterances (plus a short LLM call by
+default), so policy becomes explicit flows. It orchestrates classifiers such as Llama Guard and Presidio
+rather than being one.
 
 ## Why it exists
 Teams that add guardrails by hand end up with the same shape: an if-statement before the model call, a
@@ -35,11 +36,12 @@ way to swap a rule per customer without a deploy, and no way to test the rules a
 obvious primitives are each wrong alone: pure LLM self-checks are expensive, slow and attackable by the
 same injection they are meant to catch, while pure string rules cannot understand language.
 
-NeMo Guardrails was built around a third primitive. Embed the user message, match it to the nearest
-"canonical form" (an intent such as `user ask about competitors` defined by a few example utterances),
-then decide what happens next with an explicit flow. Intent matching is cheap and deterministic enough to
-audit; flows are readable by non-engineers; and LLM calls are reserved for the steps that need
-generation. Around that core it provides a pipeline to compose the other checks, moderation models, PII
+NeMo Guardrails was built around a third primitive. Reduce the user message to a "canonical form" (an
+intent such as `user ask about competitors` defined by a few example utterances), then decide what
+happens next with an explicit flow. The reduction uses an embedding index of the examples, either alone
+or to ground a short, temperature-zero LLM classification; either way the flow branches on a discrete
+intent the team can read and test, and free-form generation is reserved for the steps that need it.
+Around that core it provides a pipeline to compose the other checks, moderation models, PII
 detection, jailbreak heuristics and fact-checks, from configuration, so the policy for one deployment is a
 directory of files rather than a diff across the codebase.
 
@@ -61,12 +63,16 @@ files. `LLMRails(config).generate(messages=...)` then runs the request through t
 
 ### Canonical forms and embeddings
 In Colang 1.0 you write `define user ask about competitors` followed by example utterances. At startup
-those utterances are embedded with a small sentence-embedding model (configurable; a MiniLM-class
-default) and indexed. At runtime the incoming message is embedded and the nearest examples determine the
-canonical form; if the match is weak the toolkit can ask the LLM to produce the canonical form instead,
-which costs a call but keeps the flow logic unchanged. The design choice is deliberate: policy branches on
-a discrete intent the team can read and test, not on free text, and the expensive model is consulted only
-in the ambiguous middle.
+those utterances are embedded with a small sentence-embedding model (configurable; the default is
+`all-MiniLM-L6-v2`) and indexed. At runtime the incoming message is embedded and the nearest examples
+are retrieved. What happens next depends on configuration. By default the toolkit puts those nearest
+examples into a few-shot prompt and asks the LLM, at temperature zero, to emit the canonical form; the
+embeddings narrow the candidates, the LLM makes the call. With `embeddings_only: true` under
+`rails.dialog.user_messages`, the nearest neighbour's intent is used directly and no LLM is involved; an
+optional `embeddings_only_similarity_threshold` sends weak matches back to the LLM path (or to a fixed
+`embeddings_only_fallback_intent`). The design choice is deliberate: policy branches on a discrete intent
+the team can read and test, not on free text, and the expensive model is consulted only for the
+ambiguous middle, or not at all if you accept the recall limits of pure similarity.
 
 ### Flows
 `define flow` blocks sequence user and bot canonical forms: when `user ask about competitors` matches,
@@ -85,8 +91,9 @@ NemoGuard microservices for content safety, topic control and jailbreak detectio
 
 ## Example
 A minimal configuration: a topical rail that deflects competitor questions without calling the LLM, plus
-LLM-based self-checks on input and output. The self-check rails need their prompts defined in
-`prompts.yml`; the snippet shows the input one.
+LLM-based self-checks on input and output. The `embeddings_only` block is what keeps intent matching off
+the LLM; without it the same flow still fires, but after a short classification call. The self-check
+rails need their prompts defined in `prompts.yml`; the snippet shows the input one.
 
 ```yaml
 # config/config.yml
@@ -95,6 +102,10 @@ models:
     engine: openai
     model: gpt-4o-mini
 rails:
+  dialog:
+    user_messages:
+      embeddings_only: true
+      embeddings_only_similarity_threshold: 0.75   # weaker matches fall back to the LLM
   input:
     flows:
       - self check input
@@ -134,17 +145,21 @@ res = rails.generate(messages=[{"role": "user", "content": "Is Acme's product be
 print(res["content"])    # -> "I can only help with questions about our own products."
 ```
 
-The competitor question never reaches the main model: it is embedded, matched to the canonical form, and
-answered by the flow. A question about your own product passes the input self-check, is generated by the
-main model, then passes the output self-check before returning.
+The competitor question is embedded, matched above threshold to the canonical form, and answered by the
+flow, so the main model is called once for the input self-check and not at all for the answer. A question
+about your own product passes the input self-check, falls below the similarity threshold, gets its intent
+from a classification call, is generated by the main model, then passes the output self-check before
+returning. Note that the self-check rails are themselves LLM calls on the `main` model unless you
+register a separate model for them.
 
 ## Trade-offs
 - Declaring rails in configuration makes policy reviewable and swappable per customer, but it adds a
   framework, a domain-specific language and a runtime in the request path; for a single simple check a
   few lines of middleware are cheaper.
-- Embedding-based intent matching is fast and deterministic, yet it only knows the example utterances it
+- Embeddings-only intent matching is fast and deterministic, yet it only knows the example utterances it
   was given; coverage of paraphrases and other languages depends entirely on the examples, and widening
-  them raises false matches.
+  them raises false matches. The default LLM-assisted path generalises better at the price of a model
+  call per turn.
 - LLM self-check rails are flexible and need no training, but each adds a model call to latency and cost
   and shares the main model's vulnerability to injection; use a separate, smaller model for them and
   reserve them for checks that cannot be done otherwise.
@@ -188,7 +203,9 @@ deterministic, which are embedding-based, and which need an LLM call, and why.
 
 **A:** Topic control is embedding-based: canonical forms for `user ask about other banks` and `user ask
 for investment advice` with a few dozen example utterances each, mapped by flows to fixed deflection
-messages, so the policy is cheap, auditable and never touches the LLM. Account-number suppression is
+messages, run with `embeddings_only` and a similarity threshold so that clear matches are cheap and
+auditable and never touch the LLM, while borderline messages fall back to the LLM intent call rather than
+being guessed. Account-number suppression is
 deterministic: an output rail running a Presidio recogniser or a regex for the bank's account format,
 masking matches before the reply is returned, because pattern detection does not need language
 understanding and must never miss. Investment-advice detection also needs a safety net beyond intents,
@@ -199,13 +216,14 @@ measure false-refusal rate on benign product questions and block rate on an adve
 English and the bank's other supported languages.
 
 ## Quiz
-### Q: How do NeMo Guardrails dialog rails decide that a user message is about a forbidden topic?
-- [ ] By asking the main LLM to classify every message before generation
-- [x] By embedding the message and matching it to the nearest canonical form's example utterances, with an LLM fallback when the match is weak
-- [ ] By running a keyword list defined in `config.yml`
-- [ ] By comparing the message to the system prompt with cosine similarity
-> Canonical forms are defined by example utterances that are embedded at startup; nearest-neighbour matching
-> is cheap and deterministic, and the LLM is consulted only when similarity is ambiguous.
+### Q: What role do the example utterances under `define user ask about competitors` play at runtime?
+- [ ] They are appended to the system prompt as a list of forbidden phrases
+- [x] They are embedded at startup; the nearest ones to the incoming message either decide the intent directly (`embeddings_only`) or become few-shot examples for a short LLM classification
+- [ ] They are used to fine-tune the main model on the forbidden topic before deployment
+- [ ] They are matched as exact strings, so only verbatim repeats trigger the flow
+> Canonical forms are defined by example utterances indexed by embedding; by default the nearest examples
+> ground an LLM call that emits the intent, and with `embeddings_only` the nearest neighbour's intent is used
+> without any model call.
 
 ### Q: What does NeMo Guardrails add over calling Llama Guard directly in your code?
 - [ ] A more accurate content-safety classifier trained by NVIDIA

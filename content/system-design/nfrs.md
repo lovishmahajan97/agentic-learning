@@ -5,6 +5,7 @@ name: NFRs (non-functional requirements)
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - system-design/trade-off-analysis
   - system-design/adrs

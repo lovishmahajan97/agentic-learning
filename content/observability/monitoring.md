@@ -5,6 +5,7 @@ name: Monitoring
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - observability/latency-percentiles
   - observability/token-cost-tracking
@@ -61,8 +62,8 @@ Latency, traffic, errors and saturation still apply, with two changes. Latency s
 first token and total time, since streaming makes the first matter most for perceived speed. And each
 signal gets *dimensions* that matter here: model, provider, route or feature, prompt version, and
 (carefully) tenant. Dimensions are labels on the series, so each distinct combination is a new
-series; a per-user label on a histogram with 20 buckets creates 20 series per user, which is how
-metrics systems fall over. The rule is bounded label values only: enums and small sets, never ids.
+series; a per-user label on a histogram with 20 buckets creates more than 20 series per user (one per
+bucket plus the sum and count), which is how metrics systems fall over. The rule is bounded label values only: enums and small sets, never ids.
 
 ### LLM-specific signals
 - **Provider health as you see it**: error rate by class (rate limited, server error, timeout,

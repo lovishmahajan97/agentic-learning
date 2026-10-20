@@ -5,6 +5,7 @@ name: Excessive agency
 kind: concept
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - safety-security/tool-privilege-escalation
   - agents/approval-gates-for-consequential-actions

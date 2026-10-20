@@ -5,6 +5,7 @@ name: PII redaction
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - security-governance-compliance/pii-protection-dlp
   - safety-security/data-leakage

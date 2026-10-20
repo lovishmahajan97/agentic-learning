@@ -5,6 +5,7 @@ name: Precision / recall / F1
 kind: metric
 difficulty: intro
 est_minutes: 14
+status: fact-checked
 related:
   - ml-fundamentals/confusion-matrix
   - ml-fundamentals/roc-auc

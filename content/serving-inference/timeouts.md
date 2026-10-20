@@ -5,6 +5,7 @@ name: Timeouts
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - serving-inference/streaming
   - serving-inference/cancellation

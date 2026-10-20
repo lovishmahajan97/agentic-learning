@@ -5,6 +5,7 @@ name: Cross-tenant data leakage
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - system-design/tenant-isolation
   - system-design/multi-tenancy

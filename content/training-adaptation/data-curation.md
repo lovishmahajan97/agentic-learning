@@ -5,6 +5,7 @@ name: Data curation
 kind: practice
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - training-adaptation/data-labeling
   - training-adaptation/synthetic-data-generation

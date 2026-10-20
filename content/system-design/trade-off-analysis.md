@@ -5,6 +5,7 @@ name: Trade-off analysis
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - system-design/nfrs
   - system-design/adrs
@@ -145,6 +146,9 @@ for util in (0.5, 0.4):
 #      5.0B tokens   hosted $   10,000   self-hosted $   14,333
 #     50.0B tokens   hosted $  100,000   self-hosted $   89,333
 # utilisation 40%: self-hosting pays off above never (GPU cost/token exceeds hosted)
+#      0.5B tokens   hosted $    1,000   self-hosted $    7,042
+#      5.0B tokens   hosted $   10,000   self-hosted $   16,417
+#     50.0B tokens   hosted $  100,000   self-hosted $  110,167
 ```
 
 ## Trade-offs

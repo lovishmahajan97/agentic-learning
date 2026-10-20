@@ -5,6 +5,7 @@ name: Token / cost tracking
 kind: practice
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - observability/monitoring
   - observability/spans
@@ -93,8 +94,8 @@ Suppose a system prompt plus tool definitions is 1,500 tokens and each turn adds
 tokens and 400 assistant tokens. Turn *n* sends the whole history, so its input is roughly
 1,500 + 700 × (n − 1). Over a 20-turn conversation total input is 20 × 1,500 + 700 × (0 + 1 + … + 19)
 = 30,000 + 133,000 = 163,000 tokens, against only 8,000 output tokens. Input dominates by a factor of
-twenty even though output is priced higher per token, and the last turn alone costs about ten times
-the first. This arithmetic is why prompt caching (the repeated prefix is billed at a discount) and
+twenty even though output is priced higher per token, and the last turn alone sends about ten times
+the input tokens of the first. This arithmetic is why prompt caching (the repeated prefix is billed at a discount) and
 history compaction exist, and why cost per conversation must be tracked separately from cost per turn.
 
 ### Budgets and enforcement
@@ -162,8 +163,8 @@ print(f"cold cache: {cost_usd('example-model', cold):.4f} USD")   # 0.0168+0.003
 - Switching to a cheaper model cuts cost per token immediately, but it can raise tokens per task (more
   retries, longer outputs, more agent steps); cost per successful task is the only comparison that
   settles it.
-- Prompt caching lowers input cost sharply for stable prefixes, but it adds a write premium and only
-  pays off when the prefix is reused within the cache window; tracking cache-read against cache-write
+- Prompt caching lowers input cost sharply for stable prefixes, but on some providers it adds a write
+  premium, and it only pays off when the prefix is reused within the cache window; tracking cache-read against cache-write
   tokens tells you whether it is paying.
 
 ## Pitfalls

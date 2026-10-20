@@ -5,6 +5,7 @@ name: RAG poisoning
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - safety-security/prompt-injection
   - rag-retrieval/acl-aware-retrieval
@@ -98,7 +99,7 @@ import re, unicodedata, hashlib
 from dataclasses import dataclass
 from typing import Optional
 
-ZERO_WIDTH = re.compile(r"[​-‏⁠﻿]")
+ZERO_WIDTH = re.compile(r"[\u200b-\u200f\u2060\ufeff]")   # written as escapes: the literal characters are invisible
 HIDDEN = re.compile(r"<!--.*?-->|<(\w+)[^>]*style=\"[^\"]*(display:\s*none|font-size:\s*0)[^\"]*\"[^>]*>.*?</\1>", re.S | re.I)
 INSTRUCTION_LIKE = re.compile(r"\b(ignore|disregard) (all|previous|prior)\b|\byou (must|should) (now|always)\b|\bAI assistant\b|\bsystem prompt\b", re.I)
 TRUST = {"policy-repo": 3, "confluence": 2, "tickets": 1, "web": 0}

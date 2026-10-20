@@ -5,6 +5,7 @@ name: Llama Guard
 kind: tool
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - safety-security/content-moderation
   - safety-security/input-output-guardrails
@@ -60,7 +61,8 @@ output format against exactly this prompt structure.
 ### Taxonomy and versions
 The first release in December 2023 was a Llama 2 7B fine-tune with six categories of its own. Later
 versions adopted the MLCommons hazard taxonomy: Llama Guard 2 (Llama 3 8B based) used S1 to S11, and
-Llama Guard 3 (Llama 3.1 based, in 8B and 1B sizes, with a vision variant) uses S1 to S14: violent
+Llama Guard 3 (an 8B model built on Llama 3.1, plus a 1B text model and an 11B vision model built on
+Llama 3.2) uses S1 to S14: violent
 crimes, non-violent crimes, sex-related crimes, child sexual exploitation, defamation, specialised advice,
 privacy, intellectual property, indiscriminate weapons, hate, suicide and self-harm, sexual content,
 elections, and code-interpreter abuse. A larger multimodal Llama Guard 4 followed in 2025. Because the

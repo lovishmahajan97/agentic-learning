@@ -5,6 +5,7 @@ name: Policy enforcement across agents & tools
 kind: pattern
 difficulty: advanced
 est_minutes: 16
+status: fact-checked
 related:
   - agent-runtime-architecture/approval-and-authorization-boundaries
   - agents/mcp-authentication-authorization-transport-security
@@ -50,7 +51,7 @@ chain without ever growing.
 
 ## How it works
 ### Decision point, enforcement points, information points
-Borrowing the terminology that OPA, Cedar and XACML share:
+Borrowing the terminology XACML introduced and that OPA- and Cedar-based deployments reuse:
 
 - A **policy enforcement point (PEP)** is any place an action can happen: the runtime's tool dispatcher,
   the tool gateway or MCP server, the model gateway (for prompt and output rules), the network egress of a
@@ -119,6 +120,9 @@ class Ctx:                     # minted by the runtime, signed, sent out of band
     labels: frozenset = frozenset(); chain: tuple = ()
 
 def attenuate(parent: Ctx, child_name: str, child_scopes, child_budget_usd) -> Ctx:
+    # budget_usd is the parent's *remaining* budget. The runtime must debit the child's share from it
+    # before the next spawn; otherwise a fan-out of N children each gets min(parent, child) and the
+    # tree spends up to N times the cap (the budget pitfall below).
     return Ctx(parent.tenant, parent.user, parent.scopes & frozenset(child_scopes),
                min(parent.budget_usd, child_budget_usd), parent.labels, parent.chain + (child_name,))
 

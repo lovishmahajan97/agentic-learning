@@ -5,6 +5,7 @@ name: Reference architectures
 kind: pattern
 difficulty: intro
 est_minutes: 14
+status: fact-checked
 related:
   - system-design/ai-solution-architecture
   - system-design/rag-architecture
@@ -201,7 +202,7 @@ tracing and an evaluation set built from historical tickets with their resolutio
 - [ ] A vector database and a reranker
 - [ ] A planning loop and a sandbox
 - [x] An evaluation harness with a golden set, tracing with cost attribution, and a control layer for validation and policy
-- [ ] A fine-tuning pipeline and a model registry
+- [ ] A fine-tuning pipeline and a distillation step
 > Retrieval, planning and fine-tuning are shape-specific. Evaluation, tracing and output control are
 > cross-cutting because every shape has probabilistic output whose quality must be measured and whose
 > downstream effects must be bounded.

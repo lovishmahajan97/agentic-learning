@@ -5,6 +5,7 @@ name: Saga pattern & distributed transactions
 kind: pattern
 difficulty: advanced
 est_minutes: 17
+status: fact-checked
 related:
   - system-design/outbox-inbox-patterns
   - system-design/event-driven-architecture
@@ -78,7 +79,9 @@ the customer the outcome.
 
 ### No isolation
 Local transactions commit immediately, so other sagas and readers observe intermediate state. Garcia-Molina
-and Salem were explicit that sagas give A, C and D without I. Concrete anomalies: a **lost update** when
+and Salem's original paper already states that other transactions can see a saga's partial results;
+Richardson summarises this as sagas being "ACD": atomicity, consistency and durability without
+isolation. Concrete anomalies: a **lost update** when
 another saga modifies the same order between a step and its compensation; a **dirty read** when a
 dashboard shows an order as paid that is about to be refunded. Countermeasures named in Richardson's
 treatment: a **semantic lock** (write `status = PENDING` so other logic treats the record as in flight),
@@ -128,7 +131,7 @@ def run_saga(saga_id, steps, ctx, saga_log):
         try:
             ctx[step.name] = step.action(ctx, idempotency_key=key)
             saga_log.append(("done", step.name)); done.append(step)
-        except Exception as e:
+        except Exception as e:   # production: on a timeout, query the participant by key first
             if any(s.compensate is IRREVERSIBLE for s in done):   # pivot passed
                 raise RuntimeError(f"cannot abandon saga; retry {step.name} forward") from e
             log.warning("step %s failed: %s; compensating", step.name, e)
@@ -139,7 +142,7 @@ def run_saga(saga_id, steps, ctx, saga_log):
     return "completed"
 
 def fraud_check(ctx, idempotency_key):
-    if not fraud.score(ctx["customer"]):             # fraud, payments, hotel, mail: service clients
+    if not fraud.passes(ctx["customer"]):            # flights, fraud, payments, hotel, mail: service clients
         raise ValueError("declined")
 
 steps = [   # business failures first, the irreversible step as late as possible

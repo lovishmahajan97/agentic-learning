@@ -5,6 +5,7 @@ name: OWASP Top 10 for LLMs
 kind: concept
 difficulty: intro
 est_minutes: 13
+status: fact-checked
 related:
   - safety-security/prompt-injection
   - safety-security/excessive-agency
@@ -84,7 +85,8 @@ The ten items are easier to remember as six trust boundaries than as a numbered 
 The 2023 list had Insecure Plugin Design, Model Denial of Service, Overreliance and Model Theft as
 separate items. In 2025, plugin design folded into Excessive Agency and Supply Chain, because the failure
 was authority and provenance rather than plugins specifically; Model DoS broadened into Unbounded
-Consumption to cover cost and extraction; Overreliance became Misinformation; and two new items, System
+Consumption to cover cost and extraction, absorbing Model Theft on the way; Overreliance became
+Misinformation; and two new items, System
 Prompt Leakage and Vector and Embedding Weaknesses, were added because RAG and agent deployments made
 them routine. The direction of travel is from "the model misbehaves" to "the system around the model
 grants it too much", which is also the direction your controls should take.

@@ -5,6 +5,7 @@ name: LLM architecture (encoder–decoder vs decoder-only)
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - model-internals/transformer
   - model-internals/attention-mechanism
@@ -74,9 +75,11 @@ through cross-attention; the decoder's self-attention KV cache grows with the ou
 pair a large encoder with a small decoder when the input is long and the output short, which is why
 speech models like Whisper keep the design: the audio encoder is expensive and runs once, the text decoder
 is cheap and runs per token. In a decoder-only model the prompt is processed by the same full stack as
-the answer (the prefill phase), populating one KV cache that the answer then extends. There is no way to
-make "reading" cheaper than "writing" per token, but there is also nothing to re-encode when the
-conversation grows: the cache from turn one is still valid for turn two.
+the answer (the prefill phase), populating one KV cache that the answer then extends. Prefill is fast in
+wall-clock terms because all prompt positions run in parallel, but in FLOPs per token "reading" costs
+the same full stack as "writing"; there is no smaller encoder to delegate it to. The compensation is that
+nothing has to be re-encoded when the conversation grows: the cache from turn one is still valid for turn
+two.
 
 ### Why decoder-only scaled better for general use
 - **Objective density.** Every position in a causal stream contributes a loss term. Span-corruption and

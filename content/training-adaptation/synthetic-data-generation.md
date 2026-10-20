@@ -5,6 +5,7 @@ name: Synthetic data generation
 kind: practice
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - training-adaptation/data-curation
   - training-adaptation/knowledge-distillation
@@ -43,7 +44,7 @@ and fails on real inputs. The generator's mistakes become the student's ground t
 the generated set from containing your evaluation questions, which makes your scores meaningless.
 
 Every effective synthetic-data recipe is built around the scarce resource, which is not generation but
-*verification*. Self-Instruct bootstrapped instruction data from a few hundred seed tasks and filtered for
+*verification*. Self-Instruct bootstrapped instruction data from 175 human-written seed tasks and filtered for
 novelty; STaR kept only reasoning traces that reached the correct answer; code pipelines keep only
 programs that pass tests; reasoning-model distillates keep only traces a checker accepts. Where
 verification is strong, synthetic data lets a model exceed its own data; where it is absent, synthetic data

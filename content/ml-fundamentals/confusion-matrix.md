@@ -5,6 +5,7 @@ name: Confusion matrix
 kind: concept
 difficulty: intro
 est_minutes: 12
+status: fact-checked
 related:
   - ml-fundamentals/classification
   - ml-fundamentals/precision-recall-f1
@@ -84,8 +85,9 @@ from a larger pool of negatives.
 - Prevalence = (TP + FN) / N, the base rate; report it next to every metric.
 - Balanced accuracy = (TPR + TNR) / 2, accuracy with both classes weighted equally.
 - Matthews correlation coefficient, MCC = (TP·TN − FP·FN) / √((TP+FP)(TP+FN)(TN+FP)(TN+FN)). It is the
-  correlation between predicted and actual labels, ranges from −1 to 1, is 0 for any constant or
-  random classifier, and uses all four cells, so it cannot be gamed by predicting one class.
+  correlation between predicted and actual labels, ranges from −1 to 1, is 0 for a random classifier
+  (and, by convention, for a constant one, where the denominator vanishes; scikit-learn returns 0),
+  and uses all four cells, so it cannot be gamed by predicting one class.
 
 ### Multi-class
 With *k* classes the matrix is *k × k*; the diagonal holds correct predictions and cell (i, j) counts

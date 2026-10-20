@@ -5,6 +5,7 @@ name: Image embeddings
 kind: concept
 difficulty: core
 est_minutes: 14
+status: fact-checked
 related:
   - multimodal/clip
   - multimodal/vision-language-models
@@ -62,8 +63,9 @@ common failure:
 
 Commercial multimodal embedding APIs are usually of the third kind. For scanned pages, a fourth option
 is a document-screenshot embedder such as ColPali, which keeps one vector per patch and scores queries by
-late interaction (sum over query tokens of the best-matching patch), trading index size for far better
-retrieval of text-heavy page images than a single pooled vector.
+late interaction (sum over query tokens of the best-matching patch), trading index size (on the order
+of a thousand small vectors per page instead of one) for far better retrieval of text-heavy page images
+than a single pooled vector.
 
 ### From pixels to one vector
 The image is resized and normalised to the encoder's input size (often 224 or 336 pixels on a side;
@@ -124,14 +126,17 @@ print("text->image ", top_k(q_txt))     # correct matches score lower, e.g. ~0.3
 S = E @ E.T
 np.fill_diagonal(S, 0)
 dupes = np.argwhere(np.triu(S) > 0.95)
-print(len(dupes), "candidate duplicate pairs")   # memory: 10,000 images x 512 x 4 bytes = ~20 MB for E
+print(len(dupes), "candidate duplicate pairs")
+# memory: E is 10,000 x 512 x 4 bytes = ~20 MB, but S is 10,000 x 10,000 x 4 bytes = 400 MB;
+# past ~10k images compute S in row blocks or ask an ANN index for each row's top-k instead.
 ```
 
 ## Trade-offs
 - Contrastive image-text encoders give one index for text and image queries, but their purely visual
   similarity is weaker than DINOv2's; pick the self-supervised encoder when queries are always images.
 - One pooled vector per image is compact and fast to search, while per-patch (late-interaction)
-  embeddings retrieve dense pages far better at several times the storage and a costlier scoring step.
+  embeddings retrieve dense pages far better at roughly two orders of magnitude more storage per page
+  (about a thousand 128-d vectors versus one) and a costlier scoring step.
 - Centre-cropping and resizing to a small square keep encoding cheap but drop edge content and fine
   print; when small details decide relevance, tile the image and index each tile.
 - A bigger model yields better neighbours yet multiplies indexing cost over millions of images; for

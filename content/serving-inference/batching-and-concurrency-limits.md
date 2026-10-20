@@ -5,6 +5,7 @@ name: Batching & concurrency limits
 kind: practice
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - serving-inference/continuous-batching
   - serving-inference/prefill-vs-decode
@@ -62,8 +63,8 @@ rather than a fixed number you pick.
 Every engine exposes some version of these (vLLM's names in parentheses):
 1. **Maximum sequences per step** (`max_num_seqs`): bounds decode batch size and therefore worst-case
    TPOT once compute-bound, and bounds the per-step sampling buffers.
-2. **Maximum tokens per step** (`max_num_batched_tokens`): bounds how many prompt tokens are prefetched
-   into one step. With chunked prefill (Sarathi-Serve's idea), a long prompt is split into chunks that
+2. **Maximum tokens per step** (`max_num_batched_tokens`): bounds how many tokens, prompt and decode
+   together, are processed in one step. With chunked prefill (Sarathi-Serve's idea), a long prompt is split into chunks that
    ride along with decode tokens, so a 20k-token prompt cannot monopolise a step and stall every
    in-flight conversation. Lower values give smoother TPOT; higher values give faster prefill.
 3. **KV-cache capacity** (the block pool): the hard ceiling on tokens in flight. The scheduler admits a
@@ -157,8 +158,9 @@ for level in (1, 4, 16, 64):
   still running: load doubles exactly when the system is saturated.
 - Disabling chunked prefill for peak prefill speed and then seeing in-flight conversations stall for
   hundreds of milliseconds each time a long prompt arrives.
-- Setting the tokens-per-step budget very high and OOMing on the activation peak of a large prefill, a
-  failure that only shows up when a big prompt and a full decode batch coincide.
+- Setting the tokens-per-step budget very high. Engines that profile the activation peak at startup
+  (vLLM) respond by shrinking the KV pool, so capacity silently drops; engines that do not profile OOM
+  on a large prefill, a failure that only shows up when a big prompt and a full decode batch coincide.
 
 ## When to use
 Every self-hosted deployment needs explicit limits; the question is their values. Start from the VRAM
@@ -182,8 +184,9 @@ batching is nearly free for decode, where it stops being free, and what you woul
 concurrency 96, so the team wants to raise the limit to 96. What would you check before agreeing, and
 what do those numbers suggest?
 **A:** Throughput rose only 13% for a 3× increase in concurrency, so the engine is already past the
-knee: it is compute-bound or, more likely with long contexts, bound by KV-cache reads. At 96 each user's
-TPOT is roughly three times worse than at 32 for almost no extra throughput, so goodput against the
+knee: it is compute-bound or, more likely with long contexts, bound by KV-cache reads. Per-user rate fell from
+about 94 tokens/s (3,000 ÷ 32) to about 35 (3,400 ÷ 96), so each user's TPOT is roughly 2.5–3× worse at
+96 for almost no extra throughput, so goodput against the
 latency SLO probably fell. I would check p95 TPOT and TTFT at both levels, preemption and queue-depth
 metrics, and KV block utilization, and I would re-run the sweep with production prompt and output length
 distributions. If more throughput is needed, the answer is a second replica, a quantized or smaller

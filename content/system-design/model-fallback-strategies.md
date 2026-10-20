@@ -5,6 +5,7 @@ name: Model fallback strategies
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - serving-inference/fallbacks
   - serving-inference/retry-strategies
@@ -103,20 +104,29 @@ advance; you cannot buy it during the incident. Failing over to a larger model i
 belong in the runbook before the first outage.
 
 ## Example
-A fallback ladder with per-target circuit breakers, error classification and a shared deadline.
-`call_model`, `ModelError` (with an HTTP `status`) and `ServiceDegraded` are the adapter types your client
-layer provides; the point is the control flow.
+A fallback ladder with per-target circuit breakers (closed, open, half-open with a single probe), error
+classification and a shared deadline. `call_model`, `ModelError` (with an HTTP `status`) and
+`ServiceDegraded` are the adapter types your client layer provides; the point is the control flow.
 
 ```python
 import asyncio, random, time
 
-class Breaker:
+class Breaker:                       # closed -> open (after N failures in window) -> half-open (one probe)
     def __init__(self, fails=5, window=30, cooldown=60):
-        self.fails, self.window, self.cooldown, self.errors, self.open_until = fails, window, cooldown, [], 0
+        self.fails, self.window, self.cooldown = fails, window, cooldown
+        self.errors, self.open_until, self.probing = [], 0.0, False
     def allow(self):
-        return time.time() >= self.open_until
+        now = time.time()
+        if now < self.open_until: return False          # open: skip this target without waiting
+        if self.open_until and self.probing: return False   # half-open: one probe is already in flight
+        if self.open_until: self.probing = True         # cooldown over: let exactly one probe through
+        return True
     def record(self, ok):
         now = time.time()
+        if self.probing:                                # half-open: the probe alone decides
+            self.probing = False
+            self.open_until, self.errors = (0.0, []) if ok else (now + self.cooldown, [])
+            return
         self.errors = [t for t in self.errors if now - t < self.window] + ([] if ok else [now])
         if len(self.errors) >= self.fails:
             self.open_until, self.errors = now + self.cooldown, []

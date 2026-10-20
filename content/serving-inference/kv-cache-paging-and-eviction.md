@@ -5,6 +5,7 @@ name: KV-cache paging & eviction
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - serving-inference/pagedattention
   - serving-inference/kv-cache-memory-estimation
@@ -176,9 +177,9 @@ least-recently-used of them instead of raising.
 ## Pitfalls
 - Reading "memory utilization 95%" as a healthy sign while the preemption counter climbs; symptom is
   periodic multi-second stalls on individual streams with no error logged.
-- Setting `max_model_len` far above real prompt lengths and assuming it is free; symptom is the scheduler
-  reserving fewer concurrent slots than the hardware could hold, because worst-case reservations matter
-  for guaranteed admission.
+- Setting `max_model_len` far above real prompt lengths and assuming it is free; symptom is a preemption
+  storm the first time a handful of requests actually grow into that headroom, because optimistic
+  admission let them in on their prompt size and the pool was sized for the typical case.
 - Enabling swap-based preemption on hosts with little pinned memory or slow PCIe; symptom is preempted
   requests taking longer to resume than recomputation would have.
 - Changing block size on a tuned deployment without re-measuring; symptom is a surprise drop in prefix

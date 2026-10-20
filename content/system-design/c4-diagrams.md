@@ -5,6 +5,7 @@ name: C4 diagrams
 kind: practice
 difficulty: intro
 est_minutes: 11
+status: fact-checked
 related:
   - system-design/ai-solution-architecture
   - system-design/reference-architectures

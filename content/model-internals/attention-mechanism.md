@@ -5,6 +5,7 @@ name: Attention mechanism
 kind: concept
 difficulty: intro
 est_minutes: 12
+status: fact-checked
 related:
   - model-internals/self-attention
   - model-internals/multi-head-attention
@@ -123,15 +124,16 @@ print(np.round(w, 3), np.round(out, 2))
 # scores 1.0, 0.0, 0.7 -> weights [0.474 0.174 0.351] -> output [6.5 3.5]
 # mostly the first value, a third of the third, a little of the second: a blend, never a pick.
 
-# With d_k = 64 and unit-variance vectors, raw scores have std ~8 and softmax saturates.
+# With d_k = 64 and unit-variance vectors, raw scores have std ~8 and softmax is nearly saturated.
 d, n = 64, 16
 K, q, V = np.random.randn(n, d), np.random.randn(d), np.eye(n)
 for s in (False, True):
     w, _ = attention(q, K, V, scale=s)
     entropy = -(w * np.log(w + 1e-12)).sum()
     print("scaled" if s else "raw   ", f"max weight {w.max():.3f}  entropy {entropy:.2f} (uniform = {np.log(n):.2f})")
-# raw    max weight ~1.000  entropy ~0.00   <- one-hot: gradients through softmax vanish
-# scaled max weight ~0.4    entropy ~2.2    <- a real distribution the model can learn to sharpen
+# raw    max weight 0.778  entropy 0.65 (uniform = 2.77)  <- almost all mass on 2-3 keys; near one-hot, gradients vanish
+# scaled max weight 0.176  entropy 2.53 (uniform = 2.77)  <- a real distribution the model can learn to sharpen
+# (exact values depend on the seed; the ratio of entropies is the point)
 ```
 
 ## Trade-offs

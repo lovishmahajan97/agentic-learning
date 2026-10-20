@@ -5,6 +5,7 @@ name: Context window
 kind: concept
 difficulty: intro
 est_minutes: 13
+status: fact-checked
 related:
   - model-internals/kv-cache
   - model-internals/positional-encoding
@@ -49,8 +50,9 @@ Every request must satisfy `input_tokens + max_output_tokens ≤ window`. Input 
 prompt after chat templating: system prompt, each prior user and assistant turn, tool definitions, tool
 outputs, retrieved chunks, and the template's own role markers. Many APIs cap output separately at a
 figure well below the window, so the practical limit on a long answer is the output cap, not the window.
-Tokens are counted by the model's own tokenizer, and the same text can cost 20–30% more or less across
-tokenizers, so budgets must be computed with the right one.
+Tokens are counted by the model's own tokenizer, and the same text can differ in token count by tens of
+percent across tokenizers (more for non-English text and code), so budgets must be computed with the
+right one.
 
 ### Why the limit sits where it does
 Three constraints set the number. **Training length**: models are pre-trained at some length and often
@@ -79,7 +81,7 @@ nominal one, and it must be measured for your task rather than read off a spec s
   needs. The default for large corpora; the `long-context-vs-rag` topic covers the trade.
 - **Prompt caching**: does not enlarge the window, but makes a long shared prefix cheap to re-send by
   reusing its KV cache across requests, which changes the economics of a big system prompt.
-- **Sliding-window attention** in the model itself (Mistral 7B attends over a 4,096-token window per
+- **Sliding-window attention** in the model itself (Mistral 7B v0.1 attends over a 4,096-token window per
   layer) bounds per-layer cost while deeper layers still propagate information further back; it is an
   architectural choice, not something you configure per request.
 
@@ -137,8 +139,8 @@ print(f"kept {len(kept)} of {len(history)} turns, {left} tokens spare")
   linearly, and the run eventually fails at the boundary.
 - Truncating from the front and cutting the system prompt or the schema of a tool; behaviour changes
   abruptly mid-conversation with no error.
-- Setting `max_tokens` so high that the engine must reserve it, which reduces concurrency even when
-  answers are short.
+- Setting `max_tokens` far above real answer lengths; engines whose schedulers budget KV memory against
+  a request's worst-case length then admit fewer concurrent requests even though answers are short.
 
 ## When to use
 There is no opting out; every request has a window. The decisions are how much of it to spend on

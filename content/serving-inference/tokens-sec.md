@@ -5,6 +5,7 @@ name: Tokens per second
 kind: metric
 difficulty: core
 est_minutes: 13
+status: fact-checked
 related:
   - serving-inference/tpot
   - serving-inference/throughput-vs-latency

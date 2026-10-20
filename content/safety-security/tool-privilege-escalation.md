@@ -5,6 +5,7 @@ name: Tool privilege escalation
 kind: concept
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - safety-security/excessive-agency
   - safety-security/prompt-injection

@@ -21,11 +21,11 @@ sources:
 ---
 
 ## TL;DR
-OAuth 2.0 is a delegated-authorization framework: it lets an application obtain a scoped, expiring
+OAuth 2.0 is a delegated-authorization framework: an application obtains a scoped, expiring
 access token to call an API on a user's behalf without ever seeing the user's password. OpenID Connect
 (OIDC) is a thin identity layer on top that adds a signed ID token so the application also learns *who*
-logged in. Keep the two questions apart: OAuth answers "may this app do X for this user", OIDC answers
-"who is this user", and most login bugs come from confusing the tokens that answer each.
+logged in. OAuth answers "may this app do X for this user"; OIDC answers "who is this user". Most login
+bugs come from confusing the tokens that answer each question.
 
 ## Why it exists
 Before OAuth, a third-party app that wanted to read your calendar asked for your Google password. That

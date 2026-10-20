@@ -5,6 +5,7 @@ name: Build vs buy
 kind: decision
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - strategy/vendor-evaluation
   - security-governance-compliance/vendor-exit-strategy

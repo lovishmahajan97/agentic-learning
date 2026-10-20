@@ -5,6 +5,7 @@ name: Data consistency
 kind: concept
 difficulty: core
 est_minutes: 17
+status: fact-checked
 related:
   - system-design/distributed-systems
   - system-design/saga-pattern-and-distributed-transactions
@@ -72,9 +73,12 @@ Ordered from strongest to weakest, each level is defined by the anomaly it forbi
   single instant between its start and end. Once any client sees a write, every later read sees it.
   Needed for locks, leader election, unique-name registration, quota debits. Costs a quorum or leader
   round trip per operation and is unavailable to the minority side of a partition.
-- **Sequential / causal.** All clients see writes in an order consistent with program order and with
-  cause and effect (a reply never appears before the message it answers), but not necessarily in real
-  time. Cheaper, and enough for most collaborative and conversational data.
+- **Sequential, then causal.** Sequential consistency: every client sees the same total order of writes,
+  consistent with each client's program order, but not necessarily aligned with real time. Causal
+  consistency relaxes that further: only causally related writes must be seen in order (a reply never
+  appears before the message it answers); concurrent writes may be seen in different orders by
+  different clients. Cheaper than linearizable, and causal is enough for most collaborative and
+  conversational data.
 - **Session guarantees.** Promises scoped to one client's session: **read-your-writes** (you see your own
   updates), **monotonic reads** (you never see time go backwards), **monotonic writes** (your writes apply
   in order), **writes-follow-reads**. These are what users actually notice, and they are cheap to provide
@@ -109,8 +113,9 @@ displayed lag ("index updated 4 s ago"). Aggregates in domain-driven design expr
 consistency inside an aggregate, eventual between aggregates.
 
 ## Example
-Read-your-writes across a Postgres primary and an asynchronous replica. After a write, the API returns a
-version token (the primary's write-ahead-log position); later reads carry it, and the replica is used
+Read-your-writes across a Postgres primary and an asynchronous replica. After a write commits, the API
+returns a version token (the primary's write-ahead-log position at or after the commit record); later
+reads carry it, and the replica is used
 only if it has replayed past that position, otherwise the read is routed to the primary.
 
 ```python
@@ -119,7 +124,9 @@ import psycopg
 def save_memory(primary, run_id, note):
     with primary.transaction():
         primary.execute("INSERT INTO agent_memory (run_id, note) VALUES (%s, %s)", (run_id, note))
-        (token,) = primary.execute("SELECT pg_current_wal_lsn()::text").fetchone()
+    # read the LSN AFTER commit: the commit record is what makes the row visible on the replica,
+    # and it is written after any LSN observed inside the transaction
+    (token,) = primary.execute("SELECT pg_current_wal_lsn()::text").fetchone()
     return token                       # hand this back to the client as a 'consistency token'
 
 def replica_is_fresh(replica, token):
@@ -162,8 +169,10 @@ fixed window (a few seconds) after any write, at the price of some unnecessary p
 ## Pitfalls
 - Reading from a replica right after writing to the primary; users see their new document, setting or
   memory vanish and reappear, and the bug cannot be reproduced on a single-node dev setup.
-- Treating snapshot isolation as serializable; two concurrent requests both pass a "balance is
-  sufficient" or "seat is free" check and both commit, and the invariant is found broken days later.
+- Treating snapshot isolation as serializable; two concurrent requests both pass a "seat is free" or
+  "usage is under quota" check, each inserts its own row, both commit, and the invariant is found
+  broken days later (a conflicting update to the *same* row would have been caught; disjoint writes
+  are not).
 - Enforcing authorisation only through copied index metadata; a revoked user still retrieves content
   for the lag window, which audit logs reveal as access after revocation.
 - Deleting source documents without emitting a tombstone to derived stores; embeddings of deleted or
@@ -219,14 +228,15 @@ revocation-to-enforcement time and report it.
 > for freshness. Global linearizability would solve it at far higher cost; eventual consistency gives no
 > promise; isolation levels govern concurrent transactions, not replica staleness.
 
-### Q: Two concurrent requests each check that a tenant's remaining quota is above zero and then decrement it, under snapshot isolation. What anomaly can occur?
+### Q: Two concurrent requests each sum a tenant's usage rows, find the total below the quota, and each insert a new usage row, under snapshot isolation. What anomaly can occur?
 - [ ] Dirty read
-- [ ] Phantom read
-- [x] Write skew: both see a positive quota and both decrement, driving it negative
-- [ ] Lost update, because the second transaction overwrites the first without reading
-> Each transaction reads a consistent snapshot in which the quota is positive and then writes; snapshot
-> isolation does not detect the conflict because they do not write the same row version they read. The
-> fix is serializable isolation, a row lock, or a single atomic conditional update.
+- [ ] Non-repeatable read
+- [x] Write skew: both see headroom in their snapshots and both insert, pushing the total over the quota
+- [ ] Lost update, because the second insert overwrites the first
+> Each transaction reads a consistent snapshot in which the quota has headroom and then writes a *different*
+> row; snapshot isolation only detects write-write conflicts on the same row, so both commit. The fix is
+> serializable isolation, locking the tenant row (`SELECT ... FOR UPDATE`) before the check, or keeping the
+> usage as one counter updated by a single atomic conditional statement.
 
 ### Q: Why is a query-time permission check more robust than relying on ACL metadata copied into a vector index?
 - [ ] Metadata filters are too slow for vector search

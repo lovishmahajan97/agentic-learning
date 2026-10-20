@@ -5,6 +5,7 @@ name: Self-host vs API
 kind: decision
 difficulty: core
 est_minutes: 15
+status: fact-checked
 related:
   - system-design/build-vs-buy
   - system-design/open-weight-vs-proprietary
@@ -168,8 +169,9 @@ revisit cadence, not a one-word preference.
 request?
 **A:** Quantify first. 2,000 chats at roughly 4,000 tokens each is about 8 million tokens a day, around
 240 million a month, which is a modest API bill at any current price tier. A 70B model in 16-bit
-precision has about 140 GB of weights, so it needs a multi-GPU node running around the clock; at this
-volume utilisation would be in the low single digits and the per-token cost many times the API's. Then
+precision has about 140 GB of weights, so it needs a multi-GPU node running around the clock; 240 million
+tokens a month averages under 100 tokens per second against a node that can serve many times that, so
+utilisation would be in the single-digit percent range and the per-token cost many times the API's. Then
 test the data claim: what exactly may not leave, and would zero-retention enterprise terms or an
 in-cloud model platform in their region satisfy legal? If a genuine air-gap requirement survives that
 conversation, propose a smaller model on one GPU after an eval shows it meets the quality bar, budget the

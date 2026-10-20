@@ -5,6 +5,7 @@ name: Tracing
 kind: concept
 difficulty: intro
 est_minutes: 13
+status: fact-checked
 related:
   - observability/spans
   - observability/distributed-tracing-across-services

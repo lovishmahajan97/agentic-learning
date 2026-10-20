@@ -5,6 +5,7 @@ name: SLM vs LLM trade-offs
 kind: decision
 difficulty: core
 est_minutes: 16
+status: fact-checked
 related:
   - model-internals/small-language-models
   - model-internals/scaling-laws

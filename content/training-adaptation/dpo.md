@@ -5,6 +5,7 @@ name: DPO
 kind: concept
 difficulty: advanced
 est_minutes: 17
+status: fact-checked
 related:
   - training-adaptation/rlhf
   - training-adaptation/grpo
