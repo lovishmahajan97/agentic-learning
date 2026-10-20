@@ -4,8 +4,8 @@ module: python-for-ai
 name: Lockfiles & dependency pinning
 kind: practice
 difficulty: core
-est_minutes: 13
-status: fact-checked
+est_minutes: 14
+status: reviewed
 related:
   - python-for-ai/uv-poetry-pip
   - python-for-ai/security-scanning-and-dependency-auditing
@@ -47,6 +47,20 @@ In `pyproject.toml` you declare intent with PEP 440 specifiers: `openai>=1.40,<2
 (uv, Poetry, pip-compile) searches for one version of every package in the transitive graph that satisfies
 all constraints at once, then writes the result. Keeping the two layers separate is the point: humans reason
 about compatibility in ranges; machines record the exact solution.
+
+### Reading specifiers precisely
+- `>=1.40,<2` is the common application-side range: newer minors allowed, next major excluded.
+- `~=1.4.2` is the *compatible release* operator and means `>=1.4.2, ==1.4.*`; `~=1.4` means
+  `>=1.4, ==1.*`. The number of components you write decides how much can float, which is easy to misread.
+- `==1.4.*` is a prefix match; `==1.4.2` is an exact pin; `!=1.4.3` excludes one known-bad release.
+- Pre-releases (`2.0.0rc1`) are skipped by default unless a specifier names one or you opt in.
+
+None of this encodes semantic versioning, *because* PEP 440 defines ordering, not compatibility promises.
+Many core AI-stack packages are still on `0.x`, where a minor bump is allowed to break, as the example
+below shows; a range is a bet about the maintainer's behaviour, and the lock is what makes that bet testable.
+The project's `requires-python` is a constraint too: a universal lock must find versions that work across
+the whole declared Python range, so declaring `>=3.9` when you only run 3.12 can force older releases or
+split resolutions for some packages.
 
 ### What a lockfile records
 - **Exact versions** for every package, direct and transitive.
@@ -118,6 +132,11 @@ and the cause was visible as a two-line lock diff rather than reconstructed from
   package cannot be installed alongside another common package.
 - Locking but never upgrading; the symptom is a security scan listing many known vulnerabilities whose fixes
   shipped months ago, and an eventual upgrade that changes dozens of packages at once.
+- Running `uv lock` (or `poetry lock`) locally with a different tool version than CI uses; the symptom is
+  lock diffs that rewrite many lines (format revision, metadata) with no dependency change, burying
+  the one real change in review noise. Pin the tool version alongside the lock.
+- Reading `~=1.4` as "1.4.x only"; the symptom is a 1.9 release appearing in an upgrade PR that someone
+  assumed the range excluded. Write `~=1.4.0` or `>=1.4,<1.5` when you mean patch releases only.
 - Treating the Python lock as full reproducibility; the symptom is identical locks giving different results
   because the base image, CUDA runtime or model revision changed underneath.
 

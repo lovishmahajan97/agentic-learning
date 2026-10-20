@@ -4,7 +4,8 @@ module: deployment
 name: Rollout criteria & rollback triggers
 kind: practice
 difficulty: core
-est_minutes: 16
+est_minutes: 18
+status: reviewed
 related:
   - llmops-platform/canary-shadow-deployments
   - llmops-platform/rollback
@@ -49,9 +50,27 @@ A typical ladder is internal users, then a small percentage or one friendly tena
 fraction, then everyone. Each stage has a **minimum duration** and a **minimum sample** (requests,
 sessions or completed tasks). Duration matters *because* traffic varies by hour and weekday; a stage that
 only saw Sunday-night traffic proved little about Monday morning. Sample size matters *because* rare
-failures cannot be observed in small samples: at a 1% baseline error rate, 100 requests produce about one
-error, so a doubling is invisible; at a few thousand requests it is clearly visible (illustrative orders
-of magnitude, from simple counting statistics).
+failures cannot be observed in small samples. Error counts are roughly Poisson, so with *n* requests at
+baseline rate *p* you expect *np* errors with a standard deviation of about √(np). At a 1% baseline, 100
+requests give about 1 error (±1), so a canary at 2% is indistinguishable from noise; 3,000 requests give
+about 30 (±5.5) for the old rate against about 60 for a doubled one, a gap of more than five standard
+deviations. The minimum sample is therefore derived from the baseline rate and the smallest regression
+you care about, not picked as a round number.
+
+### Quality signals need far bigger samples
+The same arithmetic is harsher for quality, because the regressions that matter are a few points on a
+rate near 90%, not a doubling. To detect a drop in LLM-judge pass rate from 91% to 88% with the usual
+significance (5%) and power (80%), the two-proportion sample size is
+
+```
+n per arm ≈ (z_α/2 + z_β)² · (p₁q₁ + p₂q₂) / (p₁ − p₂)²
+          = (1.96 + 0.84)² · (0.91·0.09 + 0.88·0.12) / 0.03² ≈ 1,600 judged responses
+```
+
+That is judged responses, not requests: if you judge 10% of traffic, the stage needs about 16,000
+requests before a 3-point quality drop is reliably visible. This is why quality criteria force longer
+bake times than error criteria, and why a stage that has "enough requests" may still have too few
+judgements to decide anything about quality.
 
 ### 2. Compare against a baseline, not an absolute
 Where possible run the old and new version side by side on comparable traffic, so seasonal or upstream
@@ -88,7 +107,7 @@ A stage gate evaluated every 15 minutes during a canary of a new prompt and mode
 are illustrative thresholds a team might agree, not recommendations.
 
 ```python
-def evaluate(canary, control, minutes_in_stage, min_minutes=120, min_requests=3000):
+def evaluate(canary, control, minutes_in_stage, min_minutes=120, min_requests=3000, min_judged=1600):
     # Hard triggers: checked as soon as there is enough data to trust them.
     if canary["requests"] >= min_requests:
         err_limit = max(2 * control["error_rate"], 0.01)          # relative, with an absolute floor
@@ -101,7 +120,8 @@ def evaluate(canary, control, minutes_in_stage, min_minutes=120, min_requests=30
         if canary["guardrail_block_rate"] > control["guardrail_block_rate"] + 0.02:
             return "ROLLBACK", "guardrail blocks"
     # Not enough evidence yet: neither promote nor roll back.
-    if canary["requests"] < min_requests or minutes_in_stage < min_minutes:
+    if (canary["requests"] < min_requests or minutes_in_stage < min_minutes
+            or canary["judged"] < min_judged):
         return "HOLD", "collecting evidence"
     # Soft trigger: sampled LLM-judge quality needs a human if it drops.
     if canary["judge_pass"] < control["judge_pass"] - 0.03:
@@ -109,16 +129,21 @@ def evaluate(canary, control, minutes_in_stage, min_minutes=120, min_requests=30
     return "PROMOTE", "all criteria met"
 
 control = {"error_rate": 0.004, "p95_ms": 4100, "cost_per_req": 0.011,
-           "guardrail_block_rate": 0.006, "judge_pass": 0.91}
-canary  = {"requests": 4200, "error_rate": 0.005, "p95_ms": 4500, "cost_per_req": 0.012,
+           "guardrail_block_rate": 0.006, "judge_pass": 0.91, "judged": 5000}
+canary  = {"requests": 18000, "judged": 1800, "error_rate": 0.005, "p95_ms": 4500, "cost_per_req": 0.012,
            "guardrail_block_rate": 0.007, "judge_pass": 0.86}
-print(evaluate(canary, control, minutes_in_stage=150))
+print(evaluate(canary, control, minutes_in_stage=240))
 # ('HOLD', 'quality drop: page release owner')
 ```
 
 Errors, latency (4500 is under 1.2 × 4100 = 4920) and cost are within limits, so no hard trigger fires,
-but the sampled judge pass rate fell five points. The gate holds and pages a human, who checks the judge
-sample and decides whether the drop is real before any promotion.
+but the sampled judge pass rate fell five points. With 1,800 judged canary responses (10% of 18,000
+requests) against 5,000 on control, the standard error of the difference is just under one point, so a
+five-point drop is more than five standard errors: very unlikely to be noise. The gate still holds and pages a human rather than rolling back automatically,
+*because* a judge-score drop can also mean the judge itself misreads the new model's style (for example
+shorter answers it penalises). The human reads a sample of failing judgements and decides. Had the same
+drop appeared after only 200 judgements, the gate would have returned "collecting evidence", which is the
+point of the judged-sample floor.
 
 ## Trade-offs
 - Long bake times and large minimum samples make decisions trustworthy, but slow down every release;
@@ -163,8 +188,9 @@ thresholds, hard versus soft triggers, and the irreversibility of agent side eff
 **Q:** A new model version is at 10% of traffic. Error rate and latency are fine, but the thumbs-down
 rate is 4.1% versus 3.2% on control after 900 rated responses. Roll back, hold or promote?
 **A:** Hold, not promote, and probably not an automatic rollback yet. Thumbs-down is a noisy soft
-signal: 900 ratings at roughly 3 to 4% means about 30 to 37 negative ratings, and a difference of that
-size can arise from chance or from which users happen to rate. I would extend the stage until the sample
+signal: 900 ratings at 4.1% is about 37 negatives against about 29 expected at the control rate. The
+standard error of a rate near 4% on 900 ratings is roughly 0.65 points (more once the control's own
+noise is added), so the 0.9-point gap is at most about 1.4 standard errors, well within chance, before even counting bias from which users choose to rate. I would extend the stage until the sample
 is large enough, read a sample of the negative responses to see whether they share a cause, and run the
 LLM judge on matched traffic for a less biased signal. If the failures cluster on a real regression,
 roll back; if they are spread and the gap closes with more data, continue.

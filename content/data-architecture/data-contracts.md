@@ -4,8 +4,8 @@ module: data-architecture
 name: Data contracts
 kind: pattern
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 15
+status: reviewed
 related:
   - data-architecture/ingestion-pipelines
   - data-architecture/data-lineage
@@ -64,6 +64,15 @@ production, where the person who made the change sees the failure.
    breaking change, and how long a deprecated version stays available.
 6. **Version.** The contract has a version; the data carries it, so consumers know which contract a
    record was written under.
+7. **Known consumers.** Which pipelines depend on which fields. This is what lets a producer's CI tell the
+   author of a breaking change whom it will break; the list is best derived from lineage (a forward
+   traversal from the dataset) rather than maintained by hand, because hand-kept lists miss the newest
+   consumer, which is usually the AI pipeline.
+
+The schema part is usually expressed in an existing format; the remaining parts are often kept in a YAML
+specification beside it. Open specifications for the whole document exist (the Open Data Contract
+Standard is one), but the format matters far less than that it is versioned, reviewed and checked by
+machines.
 
 ### Where enforcement lives
 The contract is enforced at the **producer boundary**, *because* a failure there is attributed correctly
@@ -73,6 +82,13 @@ versions at registration time (Confluent's registry has backward, forward and fu
 for exactly this); a batch pipeline runs a quality suite (Great Expectations or a hand-rolled equivalent)
 on the output partition and refuses to mark it complete if checks fail. Records that violate the contract
 go to a dead-letter location with the violation attached, not silently dropped and not passed through.
+
+Per-record dead-lettering needs a batch-level circuit breaker beside it. If 0.1% of a partition violates
+the contract, quarantining those rows and publishing the rest is right. If 40% violates it, the cause is
+almost certainly a systematic upstream change, and publishing the surviving 60% hands consumers a biased
+sample that looks valid: a training set missing every ticket from one product, say. So the contract also
+states a violation-rate threshold above which the whole partition fails and nothing is published,
+*because* "no new data today" is a loud, safe failure and "a skewed subset" is a silent one.
 
 Consumers still validate, but against the same published contract, so the two sides cannot disagree about
 what valid means. The contract file lives in version control; a CI check diffs proposed changes and
@@ -191,13 +207,16 @@ a message naming the field, before the embedding job ever sees it.
   and a training set that over-represents whatever happened to validate.
 - Making every field required to be safe; the symptom is the producer defaulting fields to placeholder
   values just to pass, which is worse than null.
+- Dead-lettering per record with no batch-level threshold; the symptom is a partition that publishes on
+  schedule with a fraction of its usual rows and a quietly shifted category distribution.
 
 ## When to use
 Introduce a contract for any dataset that crosses a team boundary into an embedding, fine-tuning, feature
 or evaluation pipeline; these are the consumers that fail silently, so they benefit most. A dataset
 produced and consumed by the same team can get by with in-pipeline validation until a second consumer
-appears. Measure the dead-letter rate, the time from an upstream change to its detection (should be
-minutes, at the producer), and the number of breaking changes per quarter. In day-to-day work the contract
+appears. Measure the dead-letter rate (and alert on its change, not only its level), partitions failed by the
+batch threshold, the time from an upstream change to its detection (should be minutes, at the producer),
+and the number of breaking changes per quarter. In day-to-day work the contract
 is the file you open before adding a metadata filter or a training feature. In interviews, "how do you
 keep upstream schema changes from degrading your model" is answered with producer-side contracts,
 compatibility checks in CI and versioned records, not with "we validate inputs".

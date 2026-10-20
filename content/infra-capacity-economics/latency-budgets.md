@@ -5,7 +5,7 @@ name: Latency budgets
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - reliability/slas-slos
   - observability/latency-percentiles
@@ -49,6 +49,10 @@ Pick the metric the user actually feels. For streamed chat that is time-to-first
 readable token rate; for a voice agent it is time to first audio; for an API that returns JSON it is
 total completion time; for a background agent it may be minutes per task. Fix the percentile (p95 or
 p99) and the load at which it must hold. A target with no percentile or no load is not a budget.
+Streamed output needs two numbers, not one: a TTFT budget for the wait before anything appears, and a
+time-per-output-token (inter-token latency) budget for the stream itself, because a fast first token
+followed by a stuttering stream still feels broken, and the two are bought with different levers
+(prompt length and queueing for TTFT, batch size and model size for per-token time).
 
 ### 2. Decompose the critical path
 Draw the path and mark which steps are sequential and which run in parallel. Only the critical path
@@ -61,7 +65,9 @@ Give each step a number derived from measured p95 (or p99) under realistic load,
 reserve of 10–20% (an illustrative rule of thumb) for network jitter, retries and growth. For the model
 step, split the budget into queue wait, prefill (grows with prompt length) and decode (time per output
 token × tokens). Prompt length is therefore a latency decision as well as a cost one: adding 20 retrieved
-chunks lengthens prefill and TTFT.
+chunks lengthens prefill and TTFT. Queue wait is the most load-sensitive line in the whole budget, because
+it grows as ρ/(1−ρ) with utilization (see queueing theory); an allocation measured at 50% load is only
+valid up to the utilization you tested, so state that utilization alongside the budget.
 
 ### 4. Enforce with deadlines, not just timeouts
 Turn the budget into a **deadline**: an absolute time by which the response must be produced, created
@@ -144,6 +150,8 @@ delay, which is exactly the bug deadline propagation exists to prevent.
   with timeouts, and more GPU work per successful request.
 - Budgeting the model step from a single-request benchmark; under load, queue wait and prefill grow,
   seen as TTFT p95 degrading at peak hours while prompt sizes are unchanged.
+- Enforcing the deadline only at the edge and never cancelling downstream work; the user sees a timeout
+  while the model keeps decoding, visible as GPU or token spend on requests whose clients already left.
 - Letting retrieval chunk counts creep upward without re-budgeting prefill; symptom is TTFT rising after
   a "quality" change that never touched serving.
 

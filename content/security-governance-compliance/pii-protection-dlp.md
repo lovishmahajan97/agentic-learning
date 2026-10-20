@@ -5,6 +5,7 @@ name: PII protection / DLP
 kind: practice
 difficulty: core
 est_minutes: 16
+status: reviewed
 related:
   - safety-security/pii-redaction
   - safety-security/data-leakage
@@ -75,7 +76,26 @@ every call already passes through them.
 ### Choose the action per destination
 Actions, from least to most disruptive: allow and record; mask for display (`****1234`); pseudonymise
 with typed placeholders and a short-lived mapping so the model still reasons about "PERSON_1"; tokenize
-irreversibly; block; alert a human. The policy matrix is data class by destination, not data class alone.
+(replace with a vault token that only the token service can map back, the usual PCI pattern); redact
+irreversibly (remove or one-way hash the value); block; alert a human. The policy matrix is data class
+by destination, not data class alone.
+
+Pseudonymisation has a return path that the design must own. The model answers in placeholders ("I have
+emailed PERSON_1 at EMAIL_1"), and the gateway re-substitutes real values only in the response going to
+the authorised user, using a mapping keyed to that request and deleted soon after. Two consequences
+follow. The mapping must be consistent within a conversation, *because* if "Jane" becomes PERSON_1 in
+turn one and PERSON_3 in turn two the model loses track of who is who. And pseudonymised data is still
+personal data under GDPR, *because* the mapping exists and re-identification is possible; only data that
+cannot reasonably be re-identified (anonymised) falls outside the regulation, and free text is very hard
+to anonymise.
+
+### Cover the other direction: people using outside AI tools
+An organisation also needs DLP for the reverse flow: employees pasting customer data into public chat
+assistants that the organisation never sanctioned. The controls here are different, because there is no
+gateway of yours in the path: a sanctioned enterprise tenant with contractual data terms (so there is a
+legitimate place to go), browser or endpoint DLP that inspects pastes and uploads to AI sites, and
+network or CASB controls that block or warn on unsanctioned AI domains. Blocking without offering a
+sanctioned alternative mostly moves the traffic to personal devices.
 
 ### Cover data at rest and retention
 DLP also scans stores: trace databases, prompt logs, evaluation datasets and vector indexes, where
@@ -94,7 +114,7 @@ it is going.
 ```python
 import re
 
-CARD = re.compile(r"\b(?:\d[ -]?){13,19}\b")
+CARD = re.compile(r"\b\d(?:[ -]?\d){12,18}\b")   # 13-19 digits, no trailing separator
 EMAIL = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
 
 def luhn_ok(digits: str) -> bool:
@@ -205,4 +225,5 @@ at-rest scans to catch whatever slipped through.
 - [ ] The identity provider's user directory
 - [x] The application's own traces and prompt logs
 > Teams focus on the provider egress and forget that their observability pipeline captures full prompts
-> and responses, often with broad access and long retention, making it the largest silent PII store.
+> and responses, often with broad access and long retention, which frequently makes it the largest
+> silent PII store.

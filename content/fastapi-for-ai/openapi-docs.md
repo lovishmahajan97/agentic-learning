@@ -5,7 +5,7 @@ name: OpenAPI docs
 kind: tool
 difficulty: intro
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - fastapi-for-ai/pydantic-request-response-models
   - fastapi-for-ai/response-model
@@ -49,7 +49,10 @@ for each path operation, collects the path, method, parameters (path, query, hea
 types and defaults), the request body model and the response model. Pydantic generates JSON Schema for
 each model, and FastAPI places shared models under `components/schemas` with `$ref` pointers. The result
 is cached on `app.openapi_schema`, so it is generated once per process; recent FastAPI versions emit
-OpenAPI 3.1, which aligns with JSON Schema.
+OpenAPI 3.1, which aligns with JSON Schema. Because generation is lazy, anything that breaks it (a bug in a
+custom `app.openapi` override, a type the schema generator cannot handle) does not stop the app from
+starting; it surfaces as a 500 on `/openapi.json` the first time someone opens the docs. Calling
+`app.openapi()` in a test turns that into a CI failure instead.
 
 ### What feeds it
 - **Models and fields:** `Field(description=..., examples=[...])`, constraints such as `ge`, `max_length`
@@ -58,7 +61,11 @@ OpenAPI 3.1, which aligns with JSON Schema.
   the UI), `operation_id`, `deprecated=True` and `include_in_schema=False`.
 - **Responses:** `response_model` defines the 200 body; `responses={404: {"model": ErrorOut}}` documents
   errors that the handler raises. FastAPI cannot infer those from `raise HTTPException`, because
-  exceptions are not part of a signature, so undocumented error shapes are the most common gap.
+  exceptions are not part of a signature, so undocumented error shapes are the most common gap. The one
+  error FastAPI documents for you is 422 (`HTTPValidationError`), added to every operation that takes
+  parameters or a body, because FastAPI itself produces that response. If you install a custom
+  `RequestValidationError` handler with a different envelope, that automatic 422 schema becomes wrong
+  unless you override it.
 - **App metadata:** `FastAPI(title=..., version=..., openapi_url=..., docs_url=..., redoc_url=...)`;
   setting a URL to `None` disables that endpoint.
 
@@ -153,6 +160,9 @@ produces the `code`/`message` envelope.
   symptom is clients that deserialise errors into `ErrorOut` and fail, because the real body is `{"detail": ...}`.
 - Documenting a streaming endpoint as JSON; the symptom is generated clients that wait for a complete
   JSON body and hang or fail to parse an event stream.
+- Assuming `/docs` works anywhere the API works; Swagger UI and ReDoc load their JavaScript and CSS from a
+  public CDN by default, so in an air-gapped customer network the symptom is a blank docs page while
+  `/openapi.json` loads fine. Self-host the assets and pass their URLs to the docs page helpers.
 
 ## When to use
 You get the schema for free, so the decision is how much to invest in it. Invest heavily (descriptions,

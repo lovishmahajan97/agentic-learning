@@ -5,7 +5,7 @@ name: Adoption & value-realization measurement
 kind: metric
 difficulty: advanced
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - adoption/usage-analytics
   - scoping/baseline-measurement-before-deployment
@@ -83,12 +83,25 @@ Use an intention-to-treat comparison (all work in the live group, used or not) w
 deployment's real effect. Dividing it by the adoption share gives a rough per-assisted-unit effect,
 under the assumption that non-assisted work did not change.
 
-### 4. Pair every value metric with guardrails
+### 4. Put a range on the estimate honestly
+The tempting error bar is the one computed from thousands of claims, which comes out tiny. It is wrong,
+because the treatment was assigned to *groups* (regions, teams), not to individual claims, and groups
+drift relative to each other for reasons that have nothing to do with the tool. With two regions you
+have, in effect, one comparison. Two practical ways to get a realistic range:
+- **Placebo tests:** run the same DiD calculation on pre-launch weeks, pretending a go-live happened when
+  it did not. The spread of those fake "effects" shows how much the groups wander apart on their own; a
+  real effect has to stand clearly outside it.
+- **Unit-level variation:** when the rollout is staggered over many teams, compute the estimate per team
+  (or bootstrap by resampling teams, not claims) and report the spread across teams.
+Also watch the effect over time. Week-6 numbers can include novelty and extra attention from the
+launch team, so re-check the per-assisted-unit effect at the 90-day point before it goes into a renewal.
+
+### 5. Pair every value metric with guardrails
 Speed gains that raise error, rework, complaint or compliance-exception rates are not value. Agree the
 guardrail thresholds with the customer in advance, so "faster but worse" is caught by the definition and
 not argued about afterwards.
 
-### 5. Run a value-realization cadence
+### 6. Run a value-realization cadence
 At each checkpoint, report projected versus realized value by factor. Give ranges, not point estimates,
 and state the attribution method, the assumptions and the guardrail status. Assign each shortfall to an
 owner: adoption gaps to enablement, effect gaps to engineering, conversion gaps to the customer's
@@ -105,17 +118,21 @@ Region A goes live in week 0 and region B in week 6, which gives a natural compa
 - Region B, not yet live: 41 → 38 minutes (−3). A simplified intake form shipped company-wide in week 2.
 - Difference-in-differences: −8 − (−3) = **−5 minutes per claim** attributable to the assistant (the
   pre-launch trends of the two regions were flat and parallel).
+- Placebo check: the same calculation over pre-launch weeks, with a pretend go-live, gave "effects"
+  between −1 and +1 minute. So the honest report is about −4 to −6 minutes, not −5.00 ± 0.1 from the
+  claim-level standard error.
 
 The naive before/after for adopters alone said −9 minutes. It included the form change and the fact that
 fast adjusters adopted first.
 
 Adoption in region A at week 6: 65% of adjusters weekly active, using it on 70% of their claims, so the
 adoption share is about 0.65 × 0.70 ≈ 0.46 of claims (assuming similar volumes per adjuster). The implied
-effect per assisted claim is 5 ÷ 0.46 ≈ **11 minutes**, slightly *better* than the projected 10.
+effect per assisted claim is 5 ÷ 0.46 ≈ **11 minutes** (about 9–13 across the range), in line with the
+projected 10.
 
 Realized value at full rollout, if region B reaches the same adoption as region A: 5 × 9,000 = 45,000
-minutes ≈ **750 hours a week**, about 56% of projection. The decomposition shows the gap is entirely
-adoption (0.46 against a planned 0.9), not model quality, so the next investment is enablement: the 35%
+minutes ≈ **750 hours a week** (600–900 across the placebo range), about 56% of projection (roughly
+45–65%). The decomposition shows the gap is adoption (0.46 against a planned 0.9), not model quality, so the next investment is enablement: the 35%
 of adjusters who do not use it, and the 30% of claims that active users still handle unassisted. Guardrail: claim reopen rate moved from 4.1% to 4.3%,
 inside the agreed ±0.5-point band. Conversion is checked separately: the customer's backlog fell, so the
 freed hours were absorbed rather than lost to slack.
@@ -131,6 +148,7 @@ freed hours were absorbed rather than lost to slack.
 - Before/after without a comparison group: a large effect appears that coincides with a seasonal dip or a process change, and it shrinks or reverses the following quarter.
 - Comparing adopters with non-adopters: the effect looks huge because self-selected adopters were already the strongest performers, which shows up as a gap that predates go-live.
 - Counting hours saved that are never redeployed: projected savings appear in slides, but headcount, overtime and backlog are unchanged, so the budget owner sees nothing.
+- Error bars computed from individual claims when the rollout was assigned by region: the reported range is implausibly tight, and the next region's result lands far outside it.
 - Skipping guardrails: handling time improves while rework or complaints rise, discovered later through escalations instead of the measurement plan.
 
 ## When to use

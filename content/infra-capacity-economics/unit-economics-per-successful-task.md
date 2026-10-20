@@ -5,7 +5,7 @@ name: Unit economics per successful task
 kind: metric
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - infra-capacity-economics/cost-modeling
   - infra-capacity-economics/cost-optimization
@@ -45,6 +45,9 @@ Write down what counts as a successful task in terms the customer would accept: 
 not reopened within a set window, extraction matching the source on all required fields, code change
 passing tests and merged. Decide how success is measured: automated checks, sampled human review, or
 a downstream signal. A metric without a fixed definition drifts toward whatever is easy to count.
+Downstream signals arrive late (a ticket counts as resolved only once the reopen window has passed), so
+compute the metric on cohorts of tasks whose window has closed, or this week's number will look better
+than it is.
 
 ### Count all the cost
 For a period or a cohort of tasks, sum:
@@ -67,7 +70,16 @@ of failures *not detected* at all.
 ### Compare with value
 Value per task is what the business gains: the human handling cost avoided, revenue per conversion, or
 time saved. Margin per task = value − fully loaded cost. Break-even success rate is the p at which that
-margin reaches zero; it tells you how good the system must be before automation pays.
+margin reaches zero; it tells you how good the system must be before automation pays. For the common
+case of a human fallback, the baseline is the all-human cost h. With one attempt at cost c, a detector
+that catches a fraction d of failures, and a cost e per silent error, automation is cheaper when
+
+```
+c + (1 − p)·(d·h + (1 − d)·e)  <  h     →     p  >  1 − (h − c) / (d·h + (1 − d)·e)
+```
+
+With perfect detection (d = 1) this reduces to p > c/h, which is why cheap models clear the bar
+easily when failures are always caught; as e grows and d falls, the required p climbs fast.
 
 ### Caveats that change the answer
 Attempts are not independent: if a model fails on a hard input, retrying the same model often fails
@@ -106,9 +118,15 @@ for name, c, p in (("small", 0.02, 0.60), ("large", 0.08, 0.90)):
 On AI spend per success the small model looks more than twice as good. Fully loaded, it costs about
 3.6× more per task (k=1), because its silent failures and escalations dominate. Retries help only with
 *detected* failures, and every extra attempt is another chance for a failure to slip past the verifier:
-for the small model, going from k=1 to k=3 cuts human escalation from $1.60 to about $0.13 per task but
+for the small model, going from k=1 to k=3 cuts human escalation from $1.28 to about $0.13 per task but
 *raises* the silent-error term from $1.60 to about $2.28, which now dominates its bill. That is why
 improving detection is often worth more than adding retries, or even than improving the model.
+
+Because a human finishes every caught failure, nearly every task ends in a good outcome here, so cost
+per task is close to cost per successful task; the silent failures are the exception, charged through
+the error term. Against the all-human baseline of $4.00, the break-even formula above gives
+p > 1 − 3.975 / 7.2 ≈ 0.45 for the small model, so at 60% it does beat doing everything by hand, but
+by a thin margin that a small rise in silent-error cost would erase.
 
 ## Trade-offs
 - A stricter success definition makes the metric trustworthy, but lowers the headline number and costs

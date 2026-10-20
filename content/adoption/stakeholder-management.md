@@ -4,8 +4,8 @@ module: adoption
 name: Stakeholder management
 kind: practice
 difficulty: core
-est_minutes: 13
-status: fact-checked
+est_minutes: 15
+status: reviewed
 related:
   - strategy/stakeholder-alignment
   - adoption/exec-communication
@@ -49,24 +49,48 @@ compliance, IT operations, team leads of end users, and employee representatives
 "who else should I talk to?", *because* informal vetoes are often invisible on the org chart.
 
 ### 2. Map influence, interest and stance
-The power-interest grid sorts people into four groups: high power and high interest (manage closely),
+The power-interest grid (usually attributed to Mendelow) sorts people into four groups: high power and high interest (manage closely),
 high power and low interest (keep satisfied), low power and high interest (keep informed), low power and
 low interest (monitor). Add a third attribute, current stance (supporter, neutral, skeptic, blocker), and
 what each person needs to believe to support the project and what they fear. *Because* engagement effort is
-finite, the grid tells you where to spend it.
+finite, the grid tells you where to spend it. Stance is the attribute that changes, so record the
+evidence for it ("asked twice about data residency") rather than a label, and expect to revise it.
+
+For each important stakeholder, write down what they are measured on and what this project does to that
+measure. A security lead is rewarded for incidents that did not happen and gains nothing from your
+launch; a team lead is judged on throughput that the pilot will dent for a few weeks; a data owner is
+blamed if their data leaks through someone else's system. Most "irrational" resistance becomes
+predictable once you see the project from their scorecard, and the fix is usually to change what the
+project costs them (a complete review package, a protected target during the pilot, a narrower data
+scope), not to argue harder about the benefits.
 
 ### 3. Define decision rights
 For each key decision (scope, data access, go-live, rollback), agree who is responsible, accountable,
 consulted and informed (RACI). This prevents the classic stall where three people each think another one
 approves the release, *because* an AI go-live usually needs sign-off from several functions.
 
-### 4. Plan engagement per person
+### 4. Sequence by lead time, not by friendliness
+Some approvals have long, fixed lead times: a security or vendor-risk review queue, a data-access
+request, a works-council consultation, a procurement cycle. Lay them out like a project plan and work
+backwards from go-live, *because* the latest-starting long-lead review sets the real launch date
+regardless of how fast the engineering goes. If go-live is in ten weeks and the security queue is
+running at six, the review package must be submitted by week four, which means the data-flow design
+must be stable before then.
+
+### 5. Plan engagement per person
 Manage-closely stakeholders get one-to-ones and early drafts. Security and legal get the architecture and
 data-flow documentation before they ask, *because* a reviewer who receives a complete package early is
 far less likely to block late. Users and team leads get workshops and pilots. Executives get short
 decision-focused updates.
 
-### 5. Maintain the map
+### 6. Escalate with options, not complaints
+When a stakeholder blocks and one-to-one work has not resolved it, escalate through the sponsor, but
+bring the blocker's concern stated fairly, two or three options (narrow scope, add a control, delay)
+and their costs. Tell the blocker before you escalate. Escalation framed as "they are in the way"
+costs you the relationship for the rest of the project; escalation framed as "we need a decision
+between these options" usually gets one.
+
+### 7. Maintain the map
 Keep a register with owner, stance, last contact and next action, review it weekly, and update it when
 people change roles. When a sponsor leaves, the successor inherits a project they did not choose and may cut it, so
 build relationships with more than one senior supporter.
@@ -127,12 +151,14 @@ The sponsor and the champion need nothing this week.
 - Ignoring team leads of end users, which shows up as adoption varying sharply between teams with the same tool.
 - Letting the sponsor's expectations drift from the eval results, so a normal error rate is read as project failure.
 - Never updating the map after reorganizations, discovered when a new executive cancels a project they never heard of.
+- Engaging long-lead reviewers in priority order of friendliness rather than lead time, revealed when the build is done and the project waits weeks in a review queue.
 
 ## When to use
 Keep a stakeholder map on any AI deployment that crosses team boundaries, needs data access from another
 owner, or requires security or compliance review, which covers most enterprise work. Build it in the first
 week of scoping and review it weekly through rollout and hypercare. Measure it indirectly: no late vetoes,
-decisions made on schedule, and sponsors whose expectations match the evals. For a small internal tool used
+decisions made on schedule, approvals submitted ahead of each reviewer's lead time, and sponsors whose
+expectations match the evals. For a small internal tool used
 by one team, a short list of approvers is enough. In interviews, show that you look for blockers and veto
 holders first, not just sponsors.
 
@@ -143,7 +169,7 @@ holders first, not just sponsors.
 
 ## Check yourself
 **Q:** Two weeks before go-live, the customer's security team, never formally engaged, asks to review the system and signals concern. How do you respond, and what would you have done differently?
-**A:** Now: treat it as legitimate, not an obstacle. I would meet them immediately with a complete package (architecture and data-flow diagram, data classification, where data is stored and for how long, vendor terms, access controls, logging) and ask for their specific concerns in writing so we can resolve them one by one. I would tell the sponsor honestly that go-live may move. Earlier: security has a veto on any system that sends company data to a model, so they belong in the high-power quadrant from week one, with the data-flow design reviewed before integration was built.
+**A:** Now: treat it as legitimate, not an obstacle. I would meet them immediately with a complete package (architecture and data-flow diagram, data classification, where data is stored and for how long, vendor terms, access controls, logging) and ask for their specific concerns in writing so we can resolve them one by one. I would tell the sponsor honestly that go-live may move. Earlier: security has a veto on any system that sends company data to a model, so they belong in the high-power quadrant from week one, with their review lead time on the plan and the data-flow design reviewed before integration was built. I would also ask what they are accountable for, because a package that answers their specific exposure questions moves faster than one that argues the business value.
 
 ## Quiz
 ### Q: On a power-interest grid, a security reviewer who rarely engages but can block go-live belongs where?

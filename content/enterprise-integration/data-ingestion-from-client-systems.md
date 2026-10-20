@@ -5,6 +5,7 @@ name: Data ingestion from client systems
 kind: pattern
 difficulty: core
 est_minutes: 16
+status: reviewed
 related:
   - data-architecture/ingestion-pipelines
   - enterprise-integration/incremental-synchronization-and-cdc
@@ -84,7 +85,12 @@ whole reason ingestion can be at-least-once without being wrong.
 Write each source record as received to a raw store, keyed by source system, object type, ID and content
 hash, before any parsing or mapping. Everything downstream (mapping, parsing, chunking, embedding) can
 be re-run from raw without re-contacting the client, which matters because access is slow to get and
-downstream logic will change.
+downstream logic will change. Two details decide whether this works. First, hash only the fields that
+carry content: many APIs return volatile fields (a computed "last viewed", a signed download URL that
+expires, a request timestamp), and hashing those makes every re-read look like a new version. Second,
+land the record's **permissions** with its content (ACLs, sharing, owning group), because retrieval
+must enforce them at query time and a raw zone without them cannot be replayed into a permission-aware
+index.
 
 ### 6. Protect the source
 Honour rate limits and `Retry-After`, cap concurrency, schedule heavy work outside business hours,
@@ -92,7 +98,9 @@ prefer replicas over primaries, and expose a client-side switch to pause ingesti
 neighbour is what keeps your access approved.
 
 ### 7. Catch what the channel misses
-Polling by `modified_at` does not see hard deletes and some permission changes. Use the source's
+Polling by `modified_at` does not see hard deletes and some permission changes, and it only sees what
+bumps the field you poll on: Salesforce, for example, updates `SystemModstamp` on system and automated
+changes that leave `LastModifiedDate` untouched, so a sync keyed on the latter misses them. Use the source's
 deleted-items endpoint or tombstones where it has one, CDC where available, and otherwise a periodic ID
 reconciliation comparing source and target key sets.
 
@@ -111,7 +119,8 @@ def get_with_backoff(api, path, params, max_tries=6):
     for attempt in range(max_tries):
         r = api.get(path, params=params, timeout=30)
         if r.status_code == 429 or r.status_code >= 500:
-            wait = float(r.headers.get("Retry-After", 2 ** attempt))
+            ra = r.headers.get("Retry-After", "")      # seconds, or an HTTP-date we ignore here
+            wait = float(ra) if ra.isdigit() else 2 ** attempt
             time.sleep(min(wait, 120)); continue
         r.raise_for_status()
         return r.json()
@@ -125,7 +134,7 @@ def sync_tickets(api, raw_store, state, tenant):
         if cursor: params["cursor"] = cursor
         page = get_with_backoff(api, "/tickets", params)
         for rec in page["items"]:
-            body = json.dumps(rec, sort_keys=True).encode()
+            body = json.dumps(rec, sort_keys=True).encode()   # assumes rec has no volatile fields
             key = f"{tenant}/tickets/{rec['id']}/{hashlib.sha256(body).hexdigest()[:16]}.json"
             if not raw_store.exists(key):          # dedupe the overlap window
                 raw_store.put(key, body)
@@ -136,15 +145,19 @@ def sync_tickets(api, raw_store, state, tenant):
 ```
 
 The overlap re-reads ten minutes of records each run; the content-hash key makes those re-reads no-ops,
-and an unchanged record never produces a second raw object. A crash mid-run leaves the watermark where
+and an unchanged record never produces a second raw object. The new watermark is the largest
+`updated_at` *seen in the data*, never your own clock at the end of the run, because the two clocks
+disagree and a watermark from your clock can jump past records the source stamped slightly earlier.
+The overlap should exceed the worst clock skew plus the longest transaction you expect at the source;
+ten minutes is a starting value, not a derived one. A crash mid-run leaves the watermark where
 it was, so the next run resumes. Note what this cannot see: a ticket hard-deleted in the source never
 appears in `updated_since`, which is why a separate reconciliation job compares ID sets.
 
 ## Trade-offs
 - API pull respects the vendor's permission model and is supported, but rate limits make large backfills
   slow; a read replica flips the balance for bulk history when the client's DBAs will provide one.
-- Polling by watermark is simple and works with almost any API, but adds latency equal to the interval
-  and misses deletes; events or CDC win once freshness or delete propagation becomes a requirement.
+- Polling by watermark is simple and works with almost any API, but adds latency of up to one polling
+  interval and misses deletes; events or CDC win once freshness or delete propagation becomes a requirement.
 - An agent inside the client network reaches on-premises systems and passes security review more
   easily, but you now operate software in an environment you cannot log into freely, so upgrades,
   monitoring and support get harder.
@@ -162,6 +175,9 @@ appears in `updated_since`, which is why a separate reconciliation job compares 
   when inserts shift page boundaries, fixed by cursor or keyset pagination ordered on a stable key.
 - Ignoring `Retry-After` and retrying immediately; the symptom is the client's API gateway throttling or
   blocking your service account, sometimes for the whole tenant's integrations.
+- Hashing the whole API response, volatile fields included, for the dedupe key; the symptom is a raw zone
+  that grows by roughly the full overlap window on every run and "changed" counts that never fall,
+  although nobody edited those records.
 - Writing straight to the index with no raw copy; the symptom is that a parser or mapping fix requires a
   full re-pull, which can take days against a rate-limited API.
 - Assuming polling sees deletes; the symptom is answers citing documents or records the customer deleted
@@ -213,7 +229,7 @@ and tombstones the difference through to the index.
 
 ### Q: What does a timestamp-watermark poll fundamentally fail to capture?
 - [ ] Records created after the last run
-- [ ] Records whose text changed but whose metadata did not
+- [ ] Records whose fields were edited in the source since the last run
 - [ ] Records returned on the second page of results
 - [x] Records that were hard-deleted in the source
 > A query for recently modified records can only return records that still exist. Hard deletes need a

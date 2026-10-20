@@ -5,7 +5,7 @@ name: GPU infrastructure
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - infra-capacity-economics/gpu-sizing
   - infra-capacity-economics/gpu-utilization-and-memory-bandwidth
@@ -71,7 +71,10 @@ them busy. Each can be the bottleneck:
   gives roughly 32 GB/s per direction. Sharding across PCIe-only cards works but leaves bandwidth on the
   table.
 - **Network.** Multi-node training needs RDMA (InfiniBand or RoCE) so gradient all-reduce does not
-  stall in the host networking stack; single-model serving rarely does.
+  stall in the host networking stack. Serving needs it only when one model replica spans machines (a
+  model too large for one eight-GPU node, or disaggregated prefill and decode that ship KV caches
+  between nodes); otherwise each request stays inside one node and ordinary data-centre Ethernet is
+  enough, *because* only prompts and tokens cross the network.
 
 ### 3. Driver and CUDA: will the code run at all?
 The kernel-mode NVIDIA driver is installed once per node and is the only piece that touches hardware.
@@ -116,6 +119,13 @@ in *cost modeling*, *TCO* and *serverless GPUs*; the operational rule is that pr
 The DCGM exporter publishes per-GPU utilisation, memory use, temperature, power, ECC and XID error
 counts to Prometheus. Without it the fleet is a black box; with it you discover that "100% utilised"
 often means one kernel at a time on an otherwise idle chip, which the utilization lesson unpacks.
+
+GPUs also fail in ways the host OS does not hide or recover from: uncorrectable ECC errors, retired
+memory rows, a card that drops off the PCIe bus. The driver records these as XID events in the kernel
+log and DCGM exports them. They matter for scheduling *because* Kubernetes still sees the device
+plugin's advertised count: unless a health check cordons the node, the scheduler keeps placing pods on
+a card that will crash them. Automated cordon-on-XID (or the GPU Operator's health checks) is part of
+the stack, not an optional extra.
 
 ## Example
 A minimal Kubernetes Deployment that asks for one GPU on a node labelled with a card model, tolerates
@@ -179,6 +189,9 @@ spec:
   in one deployment that correlate with traffic to another.
 - Judging fleet health by `nvidia-smi` GPU-Util; symptom is "95% busy" dashboards while tokens per
   second sit at a fraction of what the card can deliver.
+- Leaving a node with a faulty GPU in the pool; symptom is pods failing with CUDA "unknown error" or
+  illegal-memory-access on one node while identical pods elsewhere run, with XID entries in that node's
+  kernel log.
 - Treating quota and node lead time as instant; symptom is the autoscaler requesting a node, the cloud
   answering "insufficient capacity", and the request queue growing for twenty minutes.
 

@@ -4,7 +4,7 @@ module: agent-reliability
 name: Loop detection
 kind: pattern
 difficulty: core
-est_minutes: 13
+est_minutes: 15
 status: reviewed
 related:
   - agent-reliability/stopping-conditions-termination

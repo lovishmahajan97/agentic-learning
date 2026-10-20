@@ -5,6 +5,7 @@ name: Data classification
 kind: practice
 difficulty: intro
 est_minutes: 13
+status: reviewed
 related:
   - security-governance-compliance/pii-protection-dlp
   - security-governance-compliance/data-residency
@@ -71,6 +72,23 @@ highest of the five; a fine-tuned model inherits the highest label in its traini
 can memorise and reproduce training data. Store the label as metadata next to the artifact (vector
 payload, trace attribute, registry entry) so enforcement can read it without tracing lineage at runtime.
 
+High-water mark has one blind spot: aggregation. Many individually Internal facts (org-chart entries,
+meeting titles, ticket counts per customer) can combine into something Confidential, such as an
+unannounced reorganisation or a list of at-risk accounts. The maximum of the inputs is still Internal,
+so the rule under-labels. LLMs are very good at exactly this synthesis, which is why an assistant with
+broad Internal access is a different risk from the same documents sitting in a wiki. The practical
+response is to label known high-value aggregates (reports, exports, agent outputs that summarise across
+many sources) explicitly rather than trusting the computed label.
+
+### Labels are not permissions
+Classification answers "how sensitive is this, and what controls apply"; access control answers "may
+*this* user see *this* item". They are separate checks and a RAG system needs both. A Confidential HR
+document is correctly labelled and may be sent to an approved endpoint, yet most employees still must
+not retrieve it. Retrieval must filter by the user's entitlements (the ACL-aware retrieval lesson), and
+the label then decides where the permitted content may travel. Using labels as a substitute for ACLs
+lets anyone cleared for "Confidential" read every confidential document; using ACLs alone lets
+permitted content flow to an unapproved provider.
+
 ### Map labels to controls
 The payoff is a single control matrix: for each label, which model providers and regions are allowed,
 whether prompts may be logged, retention periods, who may retrieve it, encryption and approval
@@ -104,7 +122,7 @@ def prompt_label(user_label: Label, chunks: list[dict]) -> Label:
 
 def route(user_label, chunks):
     lvl = prompt_label(user_label, chunks)
-    for ep in PREFERENCE:                      # cheapest approved endpoint first
+    for ep in PREFERENCE:                      # preferred endpoint first, if approved
         if ENDPOINTS[ep] >= lvl:
             return ep, lvl.name
     raise PermissionError(f"no endpoint approved for {lvl.name}")
@@ -135,6 +153,8 @@ contract terms in the comments are illustrative; the point is that the decision 
 - Defining labels with no mapped controls; teams label diligently and nothing behaves differently, so the
   labels decay into decoration within a year.
 - Allowing automated scanners to downgrade labels; one missed detection declassifies a restricted file.
+- Trusting the computed label for cross-source summaries; the symptom is an agent-generated "account
+  health overview" labelled Internal that, read as a whole, reveals confidential commercial plans.
 - Classifying only confidentiality; an editable public knowledge base whose integrity matters gets no
   write protection, and poisoned content flows into answers.
 

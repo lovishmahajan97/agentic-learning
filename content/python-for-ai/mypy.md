@@ -5,7 +5,7 @@ name: mypy
 kind: tool
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/type-hints
   - python-for-ai/protocols-generics-structural-typing
@@ -55,6 +55,18 @@ targeted ignores and configuration.
 `TypeGuard`/`TypeIs` functions. Calling `assert_never(x)` in the final branch makes mypy prove a
 chain of checks is exhaustive, so adding a new literal value breaks the build where it is not handled.
 
+### Subtyping: nominal, structural, and variance
+By default a value is compatible with a class if it is an instance of that class or a subclass
+(nominal typing). A `Protocol` switches to structural typing: any object with matching methods
+qualifies, without inheriting anything, which is how you type "anything with an async `complete`
+method" so a real client and a test fake both satisfy one interface. Generic containers carry a
+subtlety that surprises most people: `list[int]` is *not* a `list[float]`, even though `int` is
+accepted where `float` is expected. The reason is soundness: a function taking `list[float]` may
+append `0.5`, which would corrupt the caller's `list[int]`. Mutable containers are therefore
+invariant, while read-only ones such as `Sequence` and `Mapping` (values) are covariant, so the usual
+fix is to accept `Sequence[float]` when the function only reads. `reveal_type(expr)` prints what mypy
+inferred at that point, and is the first tool when a message seems wrong.
+
 ### Gradual typing
 Anything typed `Any` is compatible with everything, in both directions, so errors stop propagating
 through it. By default mypy does not check the bodies of functions that have no annotations at all,
@@ -85,7 +97,10 @@ module = ["some_untyped_sdk.*"]
 ignore_missing_imports = true
 ```
 
-mypy caches results in `.mypy_cache` and rechecks only what changed; `dmypy` keeps a daemon running for
+mypy reads types from the packages installed in the environment it runs in, so it must run with the
+project's real dependencies installed and the same target Python version (`python_version`) as
+production; run it in a bare CI image and every third-party import becomes a missing-stubs error or
+silently `Any`. mypy caches results in `.mypy_cache` and rechecks only what changed; `dmypy` keeps a daemon running for
 faster editor-style feedback. The main alternative is pyright (the engine behind Pylance), which is
 faster and infers more aggressively, so the two disagree at the edges; newer Rust-based checkers such as
 Astral's ty and Meta's Pyrefly are much faster but younger, so check their current maturity and
@@ -157,6 +172,9 @@ and the last function shows why `strict` matters: unannotated bodies are skipped
   on their implicitly `Any` parameters that stay invisible until the parameters are annotated.
 - Running mypy only in editors, not in CI; the symptom is a main branch with hundreds of errors that
   nobody can turn on as a gate without a week of cleanup.
+- Annotating a read-only parameter as `list[float]` or `dict[str, float]`; the symptom is
+  `[arg-type]` errors at callers passing `list[int]`, "fixed" with casts or ignores, when
+  `Sequence[float]` or `Mapping[str, float]` states the real requirement.
 - Ignoring missing stubs globally rather than per module; the symptom is a typo in an import or a
   wrongly named function from a library that no longer produces any error.
 

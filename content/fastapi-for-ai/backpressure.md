@@ -5,7 +5,7 @@ name: Backpressure
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - fastapi-for-ai/concurrency-limits
   - fastapi-for-ai/streamingresponse
@@ -54,14 +54,20 @@ A bounded buffer is what turns "slow" into a signal. `asyncio.Queue(maxsize=n)` 
 q.put(x)` suspend when full, which slows a producer coroutine to the consumer's pace, and
 `q.put_nowait(x)` raise `QueueFull`, which lets an endpoint reject instead of waiting. A semaphore
 with a bounded acquire timeout is the same idea for in-flight calls. Size bounds from the latency
-you can tolerate, *because* by Little's law the wait at the back of a queue of length *L* in front
-of a stage with throughput *X* is about *L / X*.
+you can tolerate, *because* the wait at the back of a queue of length *L* in front of a stage with
+throughput *X* is about *L / X* (Little's law with arrivals matched to throughput). Inverting it gives
+the bound directly: `L_max = X × W_budget`. A stage doing 16 items per second with a 15-second wait
+budget should hold at most about 240 waiting items; anything deeper guarantees that the tail of the
+queue misses its deadline.
 
 ### At the HTTP edge you cannot slow the client, only answer it
 An HTTP client is a producer you do not control. The server's only backpressure tools are refusing
 early and telling the client when to come back: `503 Service Unavailable` (or `429 Too Many Requests`
 when it is a per-client quota) with a `Retry-After` header. Do it before reading large bodies or
-calling anything expensive, *because* rejection is only cheap if it happens first. Uvicorn's
+calling anything expensive, *because* rejection is only cheap if it happens first. Note that FastAPI
+reads and parses a declared body parameter before your endpoint function or its dependencies run, so
+a check inside the endpoint happens after the upload. For large bodies, admit in middleware or take
+the raw `Request` and read the body only once admitted. Uvicorn's
 `--limit-concurrency` gives a blunt server-wide version, returning 503 above a connection or task
 count; per-dependency semaphores give the precise version. Upstream load balancers and well-behaved
 clients turn these signals into retries with backoff or into routing to another replica.
@@ -95,17 +101,20 @@ queue is full the endpoint rejects at once instead of queueing more work than th
 within the latency budget.
 
 ```python
-import asyncio
+import asyncio, logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 
 EMBED_WORKERS, QUEUE_MAX = 8, 200   # 200 waiting chunks is the most we accept
+log = logging.getLogger(__name__)
 
 async def embed_worker(q: asyncio.Queue):
     while True:
         chunk = await q.get()
         try:
             await embed_and_store(chunk)          # slow stage: the embedding service
+        except Exception:
+            log.exception("embed failed")         # an escaping error would kill this worker
         finally:
             q.task_done()
 
@@ -124,15 +133,19 @@ async def ingest(body: dict, request: Request):
     q: asyncio.Queue = request.app.state.embed_q
     if q.qsize() + len(body["chunks"]) > QUEUE_MAX:            # all-or-nothing admission
         raise HTTPException(503, "ingest saturated", headers={"Retry-After": "10"})
-    for c in body["chunks"]:
+    for c in body["chunks"]:            # no await since the check, so nothing can interleave
         q.put_nowait(c)
     return {"accepted": len(body["chunks"]), "queued": q.qsize()}
 ```
 
 Numbers (illustrative): if each embed call takes 0.5 s, 8 workers drain 16 chunks per second, so a
 full queue of 200 waits about 200 / 16 ≈ 12.5 s. If the product needs ingested text searchable within
-15 s, 200 is the right bound; an unbounded queue under a 30-chunks-per-second burst would grow by 14
-chunks every second and push waits past minutes. This in-process queue is lost on restart; work that
+15 s, the ceiling is 16 × 15 = 240, and 200 leaves margin for the embed call itself and for slow
+calls; an unbounded queue under a 30-chunks-per-second burst would grow by 14 chunks every second;
+after five minutes it holds about 4,200 chunks, a wait of over four minutes for the newest one. Two details make the bound real.
+The worker catches errors, *because* a worker task that dies on one bad chunk silently cuts drain
+rate, and the queue then fills at a load it used to handle. And admission checks the whole batch
+before enqueuing any of it, so a client never gets a 503 for a request that was half accepted. This in-process queue is lost on restart; work that
 must survive belongs in a durable job queue with the same depth limit.
 
 ## Trade-offs
@@ -156,6 +169,8 @@ must survive belongs in a durable job queue with the same depth limit.
   while the generator waits on `send`.
 - Measuring only average latency; queue growth shows up first in p99 and in queue depth, so averages
   hide the collapse until it is total.
+- Consumer tasks that die on an unhandled exception; the symptom is queue depth and 503s rising at a
+  load the service handled yesterday, with fewer active workers than configured.
 
 ## When to use
 Design for backpressure in any service whose slowest stage is a model, a quota or a GPU, which is

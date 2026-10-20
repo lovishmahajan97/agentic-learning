@@ -5,7 +5,7 @@ name: Customer discovery
 kind: practice
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - scoping/ai-use-case-discovery
   - scoping/workflow-analysis
@@ -64,10 +64,17 @@ happen?", "What did you do about it?", "What have you tried before?", "What happ
 wrong?". If someone has never tried to solve the problem, it is probably not painful enough to fund.
 
 ### 3. Quantify the pain
-Turn anecdotes into a rough cost: frequency × time per occurrence × cost of time, plus the cost of
-errors (rework, refunds, regulatory findings) and of delay. You need this *because* it bounds the value
-of any solution and feeds the ROI model; a problem worth 200 hours a year does not justify a six-month
-integration.
+Turn anecdotes into a rough annual cost:
+
+```
+cost ≈ volume × (time per item × loaded hourly cost  +  error rate × cost per error)  +  cost of delay
+```
+
+Each term comes from a different person: volume from the system admin or a report, time per item from
+users, error rate and cost per error from the team lead or QA, cost of delay from the buyer. You need
+this *because* it bounds the value of any solution and feeds the ROI model; a problem worth 200 hours a
+year does not justify a six-month integration. Note which term dominates: when errors cost more than
+time, the design must optimise for accuracy and review, not speed.
 
 ### 4. Separate the problem from the proposed solution
 Restate each request as the outcome it serves. "A chatbot over policy documents" might really be
@@ -89,6 +96,15 @@ defined after a demo are negotiated to fit what was built.
 Write a one-page problem statement: who, what job, current cost, constraints, success evidence, open
 risks, and what you deliberately are not solving. Read it back to the champion and users. Disagreement
 here is cheap; disagreement after a build is expensive.
+
+### Interview hygiene and when to stop
+Interview users without their manager in the room, *because* people describe the official process in
+front of the person who owns it. Have a second person take notes so the interviewer can follow up
+instead of writing. Talk far less than the interviewee and never pitch the solution mid-interview; the
+moment you describe your idea, answers start rating it rather than describing work. Actively look for
+disconfirming evidence: ask "when is this *not* a problem?" and "who handles this without trouble?".
+Stop interviewing a role when two or three consecutive interviews add no new pain, workaround or
+exception (saturation), and not before you have covered every role on the map.
 
 ### Commitment is the real signal
 Enthusiasm is free. Customers who give you time with real users, sample data, a named sponsor and an
@@ -135,6 +151,8 @@ metric and an integration point.
   demo files and collapses on the first real batch of scanned or inconsistent records.
 - Skipping the decision process; the symptom is a successful pilot that stalls because security, legal
   or the budget holder were never asked what they needed to see.
+- Asking leading questions or pitching mid-interview; the symptom is notes full of quotes that agree
+  with the original idea and almost no concrete descriptions of past events, frequencies or workarounds.
 - Letting the first solution idea become the spec; the symptom is every later conversation being about
   features of the chatbot rather than whether claims get processed faster or more accurately.
 

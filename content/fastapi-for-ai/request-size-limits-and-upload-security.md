@@ -5,7 +5,7 @@ name: Request-size limits & upload security
 kind: practice
 difficulty: core
 est_minutes: 17
-status: fact-checked
+status: reviewed
 related:
   - fastapi-for-ai/uploadfile
   - fastapi-for-ai/middleware-ordering
@@ -52,6 +52,13 @@ or your gateway's equivalent). It rejects oversized requests before they consume
 it is the only layer that can cheaply stop a flood of huge bodies. Set it per route: chat JSON might
 get 1-2 MB, the document endpoint 50 MB.
 
+Size has a time dimension too. A client that trickles a 50 MB body at a few kilobytes per second
+stays under every byte cap while holding a connection and a worker slot for hours, and a few hundred
+such clients exhaust capacity (the slow-body variant of slowloris). Bound it with the proxy's body
+read timeout (nginx `client_body_timeout`, which limits the gap between reads) and, for large
+uploads, an overall wall-clock limit or a minimum transfer rate; buffering the full body at the proxy
+before forwarding also keeps slow clients off your Python workers.
+
 ### Layer 2: the app, counting bytes
 Uvicorn doesn't limit body size, and FastAPI parses JSON bodies fully into memory. Add ASGI
 middleware (or a dependency on a streaming route) that:
@@ -62,6 +69,10 @@ middleware (or a dependency on a streaming route) that:
    actually received holds regardless of what the headers say. (An HTTP/1.1 server frames the body by
    `Content-Length` when it is present, so a client cannot simply send more than it declared; the gap
    is the request with no length.)
+
+Count the bytes your code will actually hold, not just the bytes on the wire: if you accept
+`Content-Encoding: gzip` request bodies and decompress them in middleware, cap the *decompressed*
+total as well, or a small compressed body becomes a decompression bomb before any handler runs.
 
 Multipart parsing (used by `UploadFile`) spools files to temporary disk, so a missing cap there
 fills the disk instead of RAM. Recent Starlette versions limit the number of multipart fields and
@@ -141,8 +152,15 @@ async def upload(file: UploadFile):
 ```
 
 The `Content-Length` check rejects an honest 3 GB upload in microseconds. A chunked request that
-declares no size is cut off once it passes 50 MiB. Because the counter raises inside FastAPI's form parsing, the
-exception surfaces as a 413. A file named `report.pdf` that starts with `<svg` gets 415 regardless
+declares no size is cut off once it passes 50 MiB. The counter raises an `HTTPException` from
+`receive`, which looks like the "never raise HTTPException in middleware" mistake but is not: the
+middleware only *installs* `counted`, and it is FastAPI's body parsing, deep inside
+`ExceptionMiddleware`, that calls it. The exception is raised there, FastAPI re-raises
+`HTTPException` from body parsing unchanged, and the handler turns it into a 413. If something
+outside `ExceptionMiddleware` read the body instead, the same raise would become a 500.
+Note the order of events for the type check: the handler runs only after the whole multipart body has
+been received and spooled, so the 415 protects storage and parsing, while the byte counter is what
+protects the worker. A file named `report.pdf` that starts with `<svg` gets 415 regardless
 of its name or declared type.
 
 ## Trade-offs
@@ -161,6 +179,8 @@ of its name or declared type.
 ## Pitfalls
 - Relying on `Content-Length` only. The symptom is memory spikes or disk-full alerts from chunked
   uploads that never declared a size.
+- Capping bytes but not time. The symptom is worker or connection exhaustion with low bandwidth and
+  low CPU, and many requests stuck for minutes in "reading body".
 - Saving files using the client's filename. The symptom is files appearing outside the upload
   directory, or one user's upload overwriting another's identically named file.
 - Trusting the multipart `Content-Type` or extension. The symptom is HTML or SVG files with script

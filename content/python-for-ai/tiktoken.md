@@ -5,7 +5,7 @@ name: tiktoken
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: fact-checked
+status: reviewed
 related:
   - model-internals/tokenization
   - model-internals/context-window
@@ -49,6 +49,20 @@ repeatedly merges the adjacent pair of byte sequences with the lowest rank in th
 until no mergeable pair remains; each final piece maps to one token id. Working on bytes means any
 string, including emoji or invalid-looking input, can be encoded without an unknown-token fallback,
 because every byte is in the base vocabulary.
+
+A toy walk-through with made-up ranks shows the algorithm. Suppose the merge table ranks `(l, o)` = 1,
+`(lo, w)` = 2 and `(e, r)` = 3, and the chunk is `lower`. Start from bytes `l o w e r`. The
+lowest-ranked adjacent pair present is `(l, o)`, giving `lo w e r`; next `(lo, w)`, giving `low e r`;
+next `(e, r)`, giving `low er`. No adjacent pair (`low`, `er`) has a rank, so encoding stops with two
+tokens. Ranks come from training: the most frequent pairs in the training corpus were merged first, so
+common words collapse into single tokens and rare strings stay in many small pieces. That is the whole
+reason token counts depend on how "typical" your text is.
+
+The regex pre-split exists so merges never cross certain boundaries. A leading space stays attached to
+the following word (`" world"` is one token, not a space plus `world`), punctuation does not fuse onto
+words, and in `cl100k_base` and `o200k_base` digit runs are split into groups of at most three. Without
+the split, the vocabulary would waste entries on accidental cross-word fragments, and numbers would
+tokenise unpredictably.
 
 ### Encodings
 An encoding is the regex plus the merge ranks plus special tokens. `r50k_base` and `p50k_base` belong to
@@ -100,7 +114,9 @@ def pack(system: str, question: str, chunks: list[str]) -> list[str]:
 
 for s in ["hello world", '{"user_id": 98213, "ok": true}', "東京都の天気"]:
     ids = enc.encode(s)
-    print(len(s), "chars ->", len(ids), "tokens", ids[:6])
+    print(len(s), "chars ->", len(ids), "tokens", [enc.decode_single_token_bytes(t) for t in ids])
+# "hello world" -> [b'hello', b' world']: the space belongs to the second token.
+# For the Japanese string some pieces may be partial UTF-8 byte sequences, not whole characters.
 # The chars-to-tokens ratio differs sharply between English, JSON and Japanese; that spread is
 # exactly why a fixed chars/4 heuristic misbudgets prompts.
 ```

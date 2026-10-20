@@ -4,7 +4,8 @@ module: security-governance-compliance
 name: Compliance architecture (GDPR, SOC 2, HIPAA, ISO 42001, EU AI Act, DPDP Act)
 kind: concept
 difficulty: advanced
-est_minutes: 24
+est_minutes: 25
+status: reviewed
 related:
   - security-governance-compliance/data-residency
   - security-governance-compliance/data-classification
@@ -86,8 +87,10 @@ systems (Annex III areas such as employment, credit scoring, education and essen
 safety components of regulated products) require a risk management system, data governance, technical
 documentation, automatic logging, transparency to deployers, human oversight, accuracy and robustness,
 conformity assessment and post-market monitoring; deployers must use them as instructed, assign human
-oversight and keep logs. Transparency duties cover chatbots and synthetic content, and general-purpose
-AI model providers have their own obligations. Obligations phase in over several years from entry into
+oversight and keep logs. An Annex III use can escape the high-risk tier if it only performs a narrow
+procedural or preparatory task, or improves or checks prior human work, but never when it profiles
+people, and the provider must document that assessment. Transparency duties cover chatbots and synthetic
+content, and general-purpose AI model providers have their own obligations. Obligations phase in over several years from entry into
 force in August 2024, and parts of the timeline have been subject to amendment proposals, so check the
 current dates for your obligations.
 
@@ -107,11 +110,42 @@ implementing rules phase in over time, so verify which duties are in force.
    retrieval, model provider, logs, evals, training. Most compliance questions are answered here.
 3. **Common control framework.** One control ("access to production customer data requires SSO, MFA and a
    ticket; access is logged and reviewed quarterly") mapped to the clauses it satisfies in each framework.
+   The mapping is many-to-many, which is exactly why it saves work (excerpt below).
 4. **Enforcement in the platform.** Region pinning and routing by tenant, a gateway that only allows
    vendors with the right agreements for the data class, redaction before prompts leave, tenant-scoped
    retrieval, retention and deletion jobs that cover vectors and logs, audit trails.
 5. **Continuous evidence.** Controls emit evidence automatically (access reviews, config snapshots,
    deletion job results, eval reports), so audits sample existing evidence instead of triggering a scramble.
+   This matters most for SOC 2 Type II and ISO certification, *because* they test that a control operated
+   throughout a period, and evidence reconstructed afterwards cannot show that.
+
+### The control map, in miniature
+An indicative excerpt of a common control framework (verify references against current texts):
+
+| Control | GDPR | SOC 2 | HIPAA | EU AI Act (high-risk) | DPDP |
+|---|---|---|---|---|---|
+| SSO + MFA + logged, reviewed access to customer data | Art. 32 | CC6.1 | §164.312(a), (b), (d) | – | s.8(5) |
+| Per-request audit event with model, prompt and index versions | Art. 5(2) accountability | CC7.2 | §164.312(b) | Art. 12, 26 logging | s.8(5) |
+| Deletion job reaching rows, vectors, caches, logs, eval sets | Art. 17 | Confidentiality / privacy criteria | – (no general erasure right) | – | s.8(7), s.12 |
+| Gateway allows only vendors with the right agreement for the data class | Art. 28 | CC9.2 | BAAs, §164.502(e) | – | s.8(2) |
+
+Read the blanks as carefully as the entries: HIPAA has no general right to erasure, so a deletion
+control built only for GDPR and DPDP is not a HIPAA control, and the AI Act's logging duty attaches to
+high-risk systems, not to every chatbot. ISO/IEC 42001 is left out of the table only for width: its
+Annex A includes controls on AI system event logging and on suppliers that the second and fourth rows
+also evidence.
+
+### Where the regimes diverge: one event, five clocks
+A single incident shows why a common control set still needs regime-specific branches. Suppose a
+misconfigured retrieval filter shows one hospital patient's notes to another patient. GDPR: notify the
+supervisory authority within 72 hours of awareness unless the breach is unlikely to result in risk, and
+the affected people if the risk is high. HIPAA: notify affected individuals without unreasonable delay and
+no later than 60 days after discovery, plus HHS (and media for breaches affecting more than 500 residents
+of a state or jurisdiction). DPDP: notify the Data Protection Board and every affected Data Principal,
+with no "unlikely to result in risk" exemption. SOC 2 imposes no clock, but the auditor will test that
+your incident procedure ran. The EU AI Act adds serious-incident reporting if the system is high-risk.
+The architecture's job is to make the shared part (detection, scoping from audit trails, evidence) fast,
+so that the branching legal part starts with facts.
 
 ## Example
 A SaaS clinical documentation assistant serves a German hospital group, a US clinic network and an Indian
@@ -131,26 +165,32 @@ ENDPOINTS = [
     Endpoint("selfhost-in", "ap-south", baa=False, dpa=True, zero_retention=True),
 ]
 
-TENANT_POLICY = {   # derived from the applicability matrix, reviewed by legal
-    "de-hospital": {"regions": {"eu-central"}, "needs_baa": False},
-    "us-clinic":   {"regions": {"us-east"}, "needs_baa": True},    # PHI under HIPAA
-    "in-hospital": {"regions": {"ap-south", "eu-central"}, "needs_baa": False},
+TENANT_POLICY = {   # derived from the applicability matrix, reviewed by legal; regions in preference order
+    "de-hospital": {"regions": ["eu-central"], "needs_baa": False},
+    "us-clinic":   {"regions": ["us-east"], "needs_baa": True},    # PHI under HIPAA
+    "in-hospital": {"regions": ["ap-south", "eu-central"], "needs_baa": False},  # contract allows EU fallback
 }
 
-def route(tenant: str, contains_personal_data: bool) -> Endpoint:
+def route(tenant: str, contains_personal_data: bool, down=()) -> Endpoint:
     p = TENANT_POLICY[tenant]
-    for e in ENDPOINTS:
-        if e.region not in p["regions"]: continue
-        if p["needs_baa"] and not e.baa: continue
-        if contains_personal_data and not (e.dpa and e.zero_retention): continue
-        return e
+    for region in p["regions"]:
+        for e in ENDPOINTS:
+            if e.region != region or e.name in down: continue
+            if p["needs_baa"] and not e.baa: continue
+            if contains_personal_data and not (e.dpa and e.zero_retention): continue
+            return e
     raise PermissionError(f"no compliant endpoint for {tenant}")   # fail closed, and audit it
 
-print(route("us-clinic", True).name)    # vendor-a-us
-print(route("de-hospital", True).name)  # vendor-a-eu
+print(route("us-clinic", True).name)                       # vendor-a-us
+print(route("in-hospital", True).name)                     # selfhost-in
+print(route("in-hospital", True, down={"selfhost-in"}).name)   # vendor-a-eu, allowed by contract
+route("us-clinic", True, down={"vendor-a-us"})             # PermissionError: no BAA endpoint left
 ```
 
-The same routing table is evidence: the SOC 2 auditor samples its change history, the hospital's GDPR
+The last two calls are the point. When the Indian tenant's preferred endpoint fails, traffic falls back
+only to a region its contract permits; when the only BAA-covered endpoint fails, the US clinic gets an
+error rather than a silent reroute to an EU endpoint with no BAA, because an outage is recoverable and an
+unauthorized PHI disclosure is a reportable breach. The same routing table is evidence: the SOC 2 auditor samples its change history, the hospital's GDPR
 team sees region enforcement, the US clinic's HIPAA review sees the BAA check, and the ISO 42001 audit sees
 supplier controls. One control, four frameworks.
 
@@ -199,10 +239,14 @@ In interviews, show the mapping mindset, the AI-specific data paths, and the dif
 regimes and roles come into play, and what architectural controls follow?
 **A:** GDPR applies to applicant data; the bank is controller and we are likely processor, so we need a
 processing agreement, EU-region processing or valid transfer mechanisms, minimization, erasure across
-indexes and logs, and support for the bank's DPIA. Credit scoring is an Annex III high-risk area under the
-EU AI Act, so we must establish whether we are provider of a high-risk system, which means risk management,
+indexes and logs, and support for the bank's DPIA. Creditworthiness evaluation is an Annex
+III high-risk area under the EU AI Act; a tool that only reformats documents might argue the
+preparatory-task exemption, but one that scores or ranks applicants is profiling them, so the exemption is
+unavailable. We must establish whether we are provider of a high-risk system, which means risk management,
 technical documentation, logging, human oversight design and conformity assessment, while the bank as
-deployer needs oversight and log retention. Add SOC 2 evidence, audit trails, and human review of decisions.
+deployer needs oversight, log retention and, because credit scoring is specifically named in Article 27, a
+fundamental rights impact assessment before first use. If the bank rebrands or substantially modifies the
+system it can itself become the provider. Add SOC 2 evidence, audit trails, and human review of decisions.
 
 ## Quiz
 ### Q: What is a SOC 2 report?

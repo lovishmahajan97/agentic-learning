@@ -5,7 +5,7 @@ name: pytest
 kind: tool
 difficulty: intro
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/pytest-asyncio
   - python-for-ai/test-doubles-mocks-fixtures
@@ -76,6 +76,14 @@ and `caplog` (captured stdout and log records), `request` (introspection of the 
 The rule that a higher-scoped fixture cannot depend on a lower-scoped one exists *because* a
 session-wide object cannot be rebuilt once per test; violating it raises `ScopeMismatch` at setup.
 
+Three more rules explain most fixture surprises. Teardown runs in reverse order of setup, *because* a
+fixture's dependencies must still exist while it cleans up (the client closes before the server it
+talks to stops). `autouse=True` applies a fixture to every test in its scope without being named,
+which suits "always block real network calls" or "always reset settings", and also makes it invisible
+to the reader of a test. And a fixture with the same name in a nearer `conftest.py` (or in the test
+module) shadows the outer one, so `tests/integration/conftest.py` can replace the root `llm` fake with
+a real client for that directory alone.
+
 ### Parametrization
 `@pytest.mark.parametrize("raw,expected", cases, ids=[...])` expands one function into one test per
 row, each with its own id such as `test_parse[fenced-json]`. Stacking two decorators yields the
@@ -97,8 +105,11 @@ Settings live under `[tool.pytest.ini_options]` in `pyproject.toml`: `testpaths`
 `markers`, `filterwarnings`. Plugins are ordinary packages that implement `pytest_*` hook functions
 and register an entry point; `conftest.py` can implement the same hooks locally. The ones an AI
 engineer meets weekly: `pytest-asyncio` (coroutine tests), `pytest-xdist` (`-n auto` distributes tests
-across one worker process per CPU core), `pytest-cov` (coverage), `pytest-timeout` (kill hung tests), `pytest-mock` (the `mocker`
-fixture), and Hypothesis, which registers its own settings and database handling.
+across one worker process per CPU core), `pytest-cov` (coverage), `pytest-timeout` (kill hung tests),
+`pytest-mock` (the `mocker` fixture), and Hypothesis, which registers its own settings and database
+handling. xdist is the one that changes fixture semantics: each worker is a separate process with its
+own session, so a "session" fixture that starts a container runs once *per worker*, and any test that
+relies on another test's side effects breaks because the two may land on different workers.
 
 ## Example
 A chunker test file showing a session-scoped fixture from `conftest.py`, parametrized cases with
@@ -159,6 +170,9 @@ and `test_overlap_is_shared_tokens`.
 - Plugins give you parallelism, coverage and async support for free, but each adds configuration
   interactions (xdist and session fixtures, asyncio loop scopes) that you must understand when a test
   passes alone and fails in the suite.
+- `autouse` fixtures guarantee a safety net (no real network, clean settings) in every test, but hide
+  setup from the reader; keep them for invariants the whole suite must obey, and name a fixture
+  explicitly whenever only some tests need it.
 
 ## Pitfalls
 - Running tests in the wrong lane because a marker was misspelled; the symptom is an `e2e` test

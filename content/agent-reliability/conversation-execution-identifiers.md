@@ -4,7 +4,7 @@ module: agent-reliability
 name: Conversation / execution identifiers
 kind: concept
 difficulty: core
-est_minutes: 11
+est_minutes: 14
 status: reviewed
 related:
   - agent-reliability/state-persistence-and-conversation-recovery

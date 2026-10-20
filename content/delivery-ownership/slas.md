@@ -5,7 +5,7 @@ name: SLAs
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - reliability/slas-slos
   - delivery-ownership/incident-severity-and-escalation
@@ -52,9 +52,17 @@ The person who owns delivery has to understand that commercial clock as well as 
 2. **Metric definition.** The SLI formula in one sentence a query can implement: share of valid
    requests returning a non-error response within the latency bound, or minutes in which a synthetic
    probe failed. State the measurement point (your load balancer, not the customer's laptop) *because*
-   the two sides must compute the same number from data both can inspect.
+   the two sides must compute the same number from data both can inspect. Partial outages need an
+   explicit rule, usually a "bad minute" defined as a minute whose error rate exceeds a threshold;
+   without it, a month of 3 percent errors is either invisible (probe minutes rarely fail) or a total
+   breach, depending on who is reading. Say also what counts as "valid": requests over the rate limit,
+   malformed requests and client cancellations are normally excluded from the denominator.
 3. **Window and target.** Almost always a calendar month, *because* credits are paid against monthly
-   invoices. A 30-day month has 43,200 minutes, so 99.5 percent allows 216 minutes of downtime.
+   invoices. The allowance is `allowed_downtime = (1 − target) × minutes_in_window`. For a 30-day month
+   (43,200 minutes): 99 percent allows 432 minutes, 99.5 allows 216, 99.9 allows 43.2, 99.95 allows
+   21.6 and 99.99 allows about 4.3. Read that table as a staffing statement: 43 minutes a month is
+   less than one slow page-acknowledge-diagnose-rollback cycle, so 99.9 percent implies automated
+   detection and rollback, not a human noticing.
 4. **Exclusions.** Scheduled maintenance with notice, customer-caused load beyond contracted limits,
    force majeure, and features marked preview. Whether an upstream model provider's outage is excluded
    is the most contested line in AI contracts; customers usually refuse, reasoning that your vendor
@@ -72,12 +80,26 @@ Sev1 response around the clock implies a staffed on-call rotation, not one engin
 
 ### Deriving what you can commit
 List the serial dependencies on the request path with their own SLAs, multiply them, then account for
-your own failures. That product is your contractually backed ceiling, not a forecast: it assumes failures
+your own failures: `ceiling = A_own × ∏ SLA_dependency`, and the ordering you want is
+`SLA < internal SLO < ceiling`. That product is your contractually backed ceiling, not a forecast: it assumes failures
 are independent and that each dependency runs exactly at its SLA floor (real availability may be better or,
 for some providers, worse, so use measured history where you have it); set the internal SLO below it and the SLA below the SLO,
 *because* the gap is the room in which you detect and fix problems before they become contract events.
 Remember the asymmetry: when your provider misses its SLA you receive credits on your provider bill,
 while you owe credits on a customer contract that is usually far larger.
+
+### Operating the promise
+Signing is the start. The owner runs a month-to-date budget: minutes consumed so far against the
+allowance, visible to the on-call team, *because* a 20-minute incident on day 3 and on day 28 of a
+month that already burned 200 minutes are different decisions. When most of the budget is gone, the
+error-budget policy should slow risky changes (prompt edits, model swaps, migrations) until the window
+resets. Each incident record gets an SLA-impact field (covered minutes, excluded or not, and why),
+filled in during the postmortem rather than reconstructed at month end, *because* exclusion arguments
+are won with contemporaneous evidence. At month end, publish an attainment report built from the same
+query the contract describes, and handle credit claims against it. Two commercial facts shape this:
+credits are commonly capped and stated as the sole remedy, so their value to the customer is small
+next to the business they lost; what customers actually escalate over is repeated misses, which is
+why termination-on-repeated-breach clauses are the ones that matter.
 
 ### What AI changes
 - **Quality** rarely belongs in the SLA as a percentage. Put it in acceptance criteria, recurring eval
@@ -95,8 +117,10 @@ availability, measured as minutes in which a synthetic probe against the product
 row. Credits: below 99.5 percent, 10 percent of the fee; below 99.0 percent, 25 percent; below 95 percent,
 50 percent. The month has 30 days, so 43,200 minutes and an allowance of 216 minutes.
 
-Two incidents occur. The model provider has a regional outage for 140 minutes and your fallback was never
-configured for that region. Later, a bad deploy breaks the API for 95 minutes. Total downtime is 235
+Two incidents occur. On day 9 the model provider has a regional outage for 140 minutes and your fallback
+was never configured for that region. The month-to-date budget now shows 76 minutes left for 21 days,
+which is the moment the error-budget policy should have frozen risky changes. It did not, and on day 22
+a bad deploy breaks the API for 95 minutes. Total downtime is 235
 minutes; availability is 1 − 235/43,200 ≈ 99.456 percent. That is a breach in the first tier: a $4,000
 credit if the customer files a claim. If the contract had excluded upstream provider outages, downtime
 would be 95 minutes, 99.78 percent, no breach, which is exactly why that clause is fought over.
@@ -114,7 +138,8 @@ provider bill is $6,000, so even a 10 percent provider credit returns $600 again
 - Excluding upstream provider outages protects your margin, but customers read it as you not owning your
   architecture; it flips toward acceptable when the customer chose or mandated that provider.
 - Request-based measurement is fairer to partial outages than probe minutes, but needs logs both sides
-  trust; probe-based measurement is simpler to audit when the customer cannot see your logs.
+  trust; it flips to probe-based measurement when the customer cannot see your logs or traffic is too
+  sparse for per-minute error rates to mean anything.
 - Committing to resolution times reassures buyers, but you cannot control unknown root causes; it only
   becomes safe for narrow, well-understood failure classes with a documented workaround.
 - Automatic credits build trust and avoid claim disputes, but cost money on breaches nobody noticed;
@@ -129,6 +154,8 @@ provider bill is $6,000, so even a 10 percent provider credit returns $600 again
   the only person on call was asleep or on a plane.
 - Treating the SLA target as the alerting threshold; the symptom is learning about a breach from the
   customer's credit claim instead of from an internal SLO alert days earlier.
+- Leaving the "bad minute" and valid-request rules undefined; the symptom is a month with a sustained
+  partial error rate that your probe calls 100 percent available while the customer's users saw failures.
 - Changing the model or prompt without the notice the contract requires; the symptom is a customer escalating a
   "silent regression" that is also a contractual violation.
 

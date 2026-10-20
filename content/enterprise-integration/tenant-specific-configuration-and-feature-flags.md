@@ -5,6 +5,7 @@ name: Tenant-specific configuration & feature flags
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - system-design/tenant-isolation
   - enterprise-integration/sandbox-vs-production-environments
@@ -95,12 +96,22 @@ branching, and entitlements implemented as ad hoc flags get lost when someone cl
 
 ### Evaluation mechanics
 Flag and config lookups sit on the request path, so they are served from an in-process cache refreshed
-by polling or streaming from the flag service, with a safe default if the service is unreachable. The
-default must be the conservative path (feature off, stricter guardrail) *because* an outage of the
+by polling or streaming from the flag service. During an outage the cache keeps serving last-known
+values; the coded default is what a process uses when it has no value at all, typically a pod that
+started while the service was unreachable. That default must be the conservative path (feature off, stricter guardrail) *because* an outage of the
 config service should degrade capability, not remove protections. Percentage rollouts hash a stable key
-(tenant ID, or user ID within a tenant) so a given user stays in the same bucket across requests.
+(tenant ID, or user ID within a tenant) so a given user stays in the same bucket across requests, and
+salt it with the flag name so the same users are not first in line for every rollout.
 Vendor-neutral SDK interfaces such as OpenFeature let application code evaluate flags without binding
 to one flag vendor.
+
+Resolve once per unit of work and pin the result. An agent run or a multi-turn conversation that
+re-reads configuration at every step can switch prompt version, model or tool list halfway through when
+an admin saves a change, producing a run that no single configuration version explains and that cannot
+be reproduced. Snapshot the resolved config (and the flag decisions) at the start of the request, job or
+conversation, carry its version in the trace, and let changes take effect at the next unit. The cache
+itself must be keyed by tenant, *because* a cache keyed by flag name alone is a cross-tenant leak: the
+first tenant to resolve a key sets it for everyone.
 
 ### Keeping the matrix testable
 Each independent boolean doubles the number of possible combinations, so you cannot test them all. The
@@ -125,10 +136,11 @@ class TenantConfig:
     allowed_providers: tuple = ("provider-a", "provider-b")
     new_reranker_pct: int = 0           # release flag: % of users on the new reranker
 
-    def validate(self):
-        assert 1 <= self.retrieval_top_k <= 50, "retrieval_top_k out of range"
-        assert 0 <= self.new_reranker_pct <= 100
-        assert self.model_provider() in self.allowed_providers, "model not allowed for tenant"
+    def validate(self):   # explicit raises, not assert: asserts vanish under python -O
+        if not 1 <= self.retrieval_top_k <= 50: raise ValueError("retrieval_top_k out of range")
+        if not 0 <= self.new_reranker_pct <= 100: raise ValueError("new_reranker_pct out of range")
+        if self.model_provider() not in self.allowed_providers:
+            raise ValueError("model not allowed for tenant")
 
     def model_provider(self):
         return "provider-b" if self.model.startswith("b-") else "provider-a"
@@ -149,15 +161,17 @@ def resolve(tenant: str, plan: str) -> TenantConfig:
     cfg.validate()
     return cfg
 
-def in_rollout(user_id: str, pct: int) -> bool:   # stable bucket per user
-    return int(hashlib.sha256(user_id.encode()).hexdigest(), 16) % 100 < pct
+def in_rollout(flag: str, user_id: str, pct: int) -> bool:   # stable bucket per user and flag
+    return int(hashlib.sha256(f"{flag}:{user_id}".encode()).hexdigest(), 16) % 100 < pct
 
 cfg = resolve("globex", "enterprise")
-print(cfg.retrieval_top_k, in_rollout("globex:u-1842", cfg.new_reranker_pct))
+print(cfg.retrieval_top_k, in_rollout("new_reranker", "globex:u-1842", cfg.new_reranker_pct))
 ```
 
 Acme gets a German prompt and a single allowed provider; Globex gets a quarter of users on the new
-reranker; both inherit the enterprise `top_k`. Setting `model="b-large"` for Acme would fail validation
+reranker; both inherit the enterprise `top_k`. The rollout percentage sits in the config only to keep
+the sketch short; in practice it lives in the flag service with an owner and a removal date, which is
+the separation the section above argues for. Setting `model="b-large"` for Acme would fail validation
 before any request runs, because the contract forbids that provider for that tenant.
 
 ## Trade-offs
@@ -166,7 +180,9 @@ before any request runs, because the contract forbids that provider for that ten
   prompts, models or thresholds.
 - Layered overrides keep tenant records small and let new defaults propagate, but they make "what does
   this tenant actually run?" a computed answer; you need a tool that shows the resolved config and which
-  layer set each key.
+  layer set each key. The same propagation cuts the other way: editing a global default is a change to
+  every tenant that has not overridden it, so once a key affects model behaviour, a default change needs
+  a staged rollout (a release flag over the new default) rather than a single save.
 - Feature flags decouple deploy from release and give on-call kill switches, but each live flag doubles
   the theoretical test matrix; the benefit flips to a cost once flags outlive their purpose.
 - A managed flag service gives targeting, audit and UI for free, but adds a dependency on the request
@@ -185,6 +201,9 @@ before any request runs, because the contract forbids that provider for that ten
   attribute, because a prompt version changed by an admin left no trace in the trace.
 - Putting secrets or connector credentials directly in tenant configuration; the symptom is API keys
   appearing in admin UIs, config diffs and debug logs.
+- Re-reading configuration at every step of a long agent run or conversation; the symptom is a trace in
+  which the prompt version or model changes mid-run, and a bug report nobody can reproduce because no
+  single config version produced it.
 - Unvalidated free-form JSON config; the symptom is a typoed key that is silently ignored, so the tenant
   runs the default and nobody notices until the customer does.
 

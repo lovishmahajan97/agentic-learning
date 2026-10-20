@@ -5,6 +5,7 @@ name: Cost allocation by tenant & feature
 kind: practice
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - infra-capacity-economics/finops
   - infra-capacity-economics/unit-economics-per-successful-task
@@ -60,6 +61,15 @@ the source as a cross-check.
 Shared pools need a driver that approximates causation:
 - **GPU fleet**: GPU-seconds or token-seconds per request; concurrent batching makes exact
   attribution impossible, so tokens weighted by phase (prefill vs decode) is a common approximation.
+  For long-context traffic, KV-cache occupancy (context tokens × seconds resident) is often the fairer
+  driver, because memory rather than compute is what limits how many other requests fit alongside it:
+  a 100k-token session that decodes slowly crowds out many short ones while using little arithmetic.
+- **Shared prompt-cache prefixes**: the first request pays the cache write and later ones get the cheap
+  read. Charging each call its literal billed price rewards whoever arrives second; for a prefix shared
+  across tenants (a common system prompt), pricing every call at the blended rate is usually fairer.
+- **Commitments and discounts**: reserved capacity or committed-spend discounts should be allocated at
+  the effective (amortized) rate, not list price, and an unused commitment is idle capacity under
+  another name.
 - **Vector store**: stored vectors for storage-bound costs, query count for compute-bound costs.
 - **Embedding re-indexing**: to the tenant whose data was re-embedded.
 - **Idle and headroom capacity**: either spread proportionally to usage, or kept as a visible
@@ -67,6 +77,8 @@ Shared pools need a driver that approximates causation:
   over-provisioning instead of hiding it.
 
 Write the driver choice down; it is a policy decision, and changing it changes everyone's numbers.
+The same goes for platform-caused waste: retries after a provider 5xx or a bad deploy are usually
+better charged to platform overhead than to the tenant who happened to be calling.
 
 ### 4. Reconcile and track the unallocated share
 Each month, allocations must sum to the invoices. Track the unattributed share (untagged calls, shared
@@ -75,7 +87,8 @@ suspect.
 
 ### 5. Use it: showback, chargeback, pricing
 **Showback** reports cost per tenant and feature to teams and account owners; **chargeback** actually
-bills internal teams or customers. Most products start with showback, then use the data to set tier
+moves the cost onto internal teams' budgets. Passing cost on to external customers is a separate
+pricing decision (usage-based tiers, overages) that this data informs. Most products start with showback, then use the data to set tier
 limits, overage pricing, per-tenant quotas, and to flag tenants whose cost exceeds their revenue.
 
 ## Example
@@ -86,7 +99,7 @@ billed as lump sums (PostgreSQL; numeric columns).
 WITH usage AS (
   SELECT COALESCE(tenant_id, 'UNATTRIBUTED') AS tenant_id,
          COALESCE(feature,   'UNATTRIBUTED') AS feature,
-         SUM(api_cost_usd)::numeric      AS direct_usd,  -- priced per call at the gateway
+         COALESCE(SUM(api_cost_usd), 0)::numeric AS direct_usd,  -- priced per call at the gateway
          SUM(gpu_seconds)::numeric       AS gpu_s,       -- self-hosted calls
          SUM(retrieval_queries)::numeric AS rq
   FROM usage_events
@@ -121,7 +134,7 @@ should be small; if it is 15% of spend, fix tagging before trusting any tenant n
   effort; coarse token-proportional splits suffice while shared costs are a small share of spend.
 - Spreading idle capacity across tenants makes totals reconcile, but hides over-provisioning; keep it
   separate when the platform team needs to see and own utilization.
-- Chargeback changes behavior because teams and customers see their bill, but disputes over drivers
+- Chargeback changes behavior because internal teams pay from their own budget, but disputes over drivers
   follow; showback is the better start until the numbers are trusted.
 - Per-tenant API keys or dedicated pools make attribution exact, but lose pooling efficiency and add
   quota management; worth it for large enterprise tenants, not for a long tail of small ones.

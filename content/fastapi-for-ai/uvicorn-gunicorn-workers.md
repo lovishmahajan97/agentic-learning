@@ -5,7 +5,7 @@ name: Uvicorn / Gunicorn workers
 kind: tool
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - fastapi-for-ai/asgi-lifecycle
   - fastapi-for-ai/lifespan
@@ -47,7 +47,9 @@ orchestrator instead.
 ### Uvicorn alone
 `uvicorn app.main:app --host 0.0.0.0 --port 8000` runs one process with one event loop. With
 `--workers N`, Uvicorn starts a small supervisor that spawns N child processes sharing the listening
-socket; the kernel spreads incoming connections across them (not perfectly evenly). Recent Uvicorn
+socket; the kernel spreads incoming *connections* across them (not perfectly evenly). The unit is the
+connection, not the request: if traffic arrives through a proxy that holds a handful of long-lived
+keep-alive connections, most requests can land on one or two workers while the others idle. Recent Uvicorn
 versions (0.30 onward) also restart children that die. Each child runs lifespan startup independently, so
 every worker builds its own HTTP client pool, DB engine and model.
 
@@ -73,8 +75,12 @@ warns, so check which import path your pinned versions expect.
 
 ### Sizing
 Gunicorn's classic `2 × cores + 1` guidance is for synchronous workers that block on I/O. An async worker
-already overlaps I/O, so start near one worker per core and measure. Then apply the constraint that
-dominates AI workloads:
+already overlaps I/O, so start near one worker per core and measure. Concurrency per worker is a separate
+question, answered by Little's law: requests in flight = arrival rate × time in system. At 50 requests/s
+and 8 s per LLM call, about 400 requests are awaiting the provider at once. One event loop can hold 400
+pending awaits cheaply, so that alone needs no extra workers; what caps it is the shared HTTP client's
+connection pool (httpx defaults to 100 connections), beyond which requests queue inside the client and
+eventually raise pool timeouts. Then apply the constraint that dominates AI workloads:
 
 ```
 workers ≤ (container memory − headroom) ÷ (per-worker RSS, including model)
@@ -104,10 +110,11 @@ about 1.1 GiB of reranker weights and tokenizer, 0.5 GiB of Python, libraries an
 - A configuration that sends the reranker to a GPU node should run one worker per GPU, or better, put the
   model behind an inference server and keep FastAPI as a thin async I/O layer.
 
-The deploy command for the 4-worker case, with recycling to contain a slow leak in a native tokenizer:
+The deploy command for the 4-worker case (using the `uvicorn-worker` package), with recycling to contain
+a slow leak in a native tokenizer:
 
 ```
-gunicorn app.main:app -k uvicorn.workers.UvicornWorker -w 4 --bind 0.0.0.0:8000 \
+gunicorn app.main:app -k uvicorn_worker.UvicornWorker -w 4 --bind 0.0.0.0:8000 \
   --timeout 120 --graceful-timeout 60 --max-requests 5000 --max-requests-jitter 500
 ```
 
@@ -136,6 +143,8 @@ pool), then lowering the timeout back.
   traffic peaks, often reported as mysterious restarts with exit code 137.
 - Using in-process state (a dict cache, a rate-limit counter) and then adding workers; the symptom is
   rate limits that are N times too generous and cache hit rates that drop as workers increase.
+- Adding workers behind a proxy that reuses a few keep-alive connections; the symptom is one worker
+  pinned near 100% CPU with high event-loop lag while its siblings idle, so p99 barely improves.
 - Running many workers per pod and many pods without reckoning total connections; the symptom is the
   database or provider rejecting connections because workers × pool size × replicas exceeds its limit.
 

@@ -4,8 +4,8 @@ module: data-architecture
 name: Embedding versioning / re-indexing strategy
 kind: pattern
 difficulty: core
-est_minutes: 16
-status: fact-checked
+est_minutes: 18
+status: reviewed
 related:
   - rag-retrieval/embedding-models
   - rag-retrieval/embedding-pipelines
@@ -64,6 +64,38 @@ commit hashes. Pin them.
 Chunker parameters belong in the recipe because retrieval granularity changes what a vector means. A
 512-token chunk and a 128-token chunk of the same paragraph are different items even under the same
 model, and the citation offsets you return to users change with them.
+
+### Re-embedding versus re-indexing
+Two different operations hide behind the word "re-index", and they cost very different amounts.
+*Re-embedding* produces new vectors because the recipe changed; it is the expensive path described
+above. *Re-indexing* rebuilds only the ANN structure over the vectors you already have, and it is needed
+even when the model never changes:
+- **Parameter changes.** HNSW's `M` and `ef_construction` are fixed when the graph is built, so raising
+  them to buy recall means a rebuild. (`ef_search` is a query-time knob and needs no rebuild, which is why
+  it is the first thing to tune.)
+- **Centroid staleness.** IVF-style indexes assign each vector to the nearest of a set of centroids learned
+  from the data present at build time; pgvector's documentation advises creating an IVFFlat index only
+  after the table holds data for this reason. As the corpus grows into topics the original sample did not
+  cover, lists become unbalanced and recall at a fixed `nprobe` falls, so the centroids must be retrained.
+- **Accumulated deletes and updates.** Many implementations mark deleted vectors rather than removing
+  them, so a heavily churned index carries dead entries that cost memory and can weaken graph
+  connectivity until compaction or rebuild.
+
+Re-indexing uses the same blue-green swap but skips the embedding calls, so it takes hours of index
+build rather than days of API throughput. Keep the two version counters separate (`embedding_version`
+for the vectors, an index build id for the structure) so you can tell which one moved when recall changes.
+
+### The query side is part of the version
+The alias must resolve to a *pair*: the collection and the recipe that built it. The query path reads the
+recipe from the alias target and embeds the query with exactly that model, prefix and dimension, *because*
+swapping the collection while the query embedder stays on the old model recreates the cross-space
+mismatch in reverse. Any cache of query embeddings must therefore be keyed on
+`(query_text, embedding_version)`, never on text alone.
+
+A learned mapping from the new model's space into the old one (a linear or small adapter trained on pairs
+of embeddings of the same texts) is sometimes used as a bridge, letting a new query model run against the
+old index before the rebuild finishes. It recovers only part of the quality, so treat it as a temporary
+measure that must pass the same eval gate, not as an alternative to rebuilding.
 
 ### Content hashing to avoid re-embedding the unchanged
 Give each chunk a stable key: `chunk_key = hash(source_id, chunk_text)`. Keep a table mapping
@@ -190,15 +222,20 @@ The eval gate is deliberately a comment: in production `swap` runs only after re
   produces an index that passes retrieval eval and fails a security review.
 - Sizing memory for one copy of the index; symptom is out-of-memory or evictions precisely during the
   rebuild, the moment you can least afford it.
+- Caching query embeddings keyed on query text alone; the symptom after a swap is that popular
+  (cached) queries retrieve garbage while rare, uncached queries work fine.
+- Treating every recall drop as a model problem; when recall decays slowly with no recipe change, the
+  cause is usually stale IVF centroids or accumulated deletes, and a re-index (no re-embedding) fixes it.
 
 ## When to use
 Reach for explicit versioning from the first production index, because the first model upgrade arrives
 sooner than planned and the retrofit is painful. The alias-swap pattern is the default for any corpus that
 takes longer than a few minutes to rebuild; below that, a rebuild-and-replace in a transaction is fine.
-Content hashing pays for itself as soon as ingestion runs on a schedule rather than once. Measure three
+Content hashing pays for itself as soon as ingestion runs on a schedule rather than once. Measure four
 things: fraction of chunks re-embedded per run (should be small except on version changes), build duration
-versus the rate of upstream change (decides dual-write versus replay), and eval recall before and after
-every swap. In interviews, the expected answer to "how do you upgrade the embedding model in production"
+versus the rate of upstream change (decides dual-write versus replay), eval recall before and after
+every swap, and recall on a fixed eval set tracked weekly between swaps, since a slow decline with no
+recipe change is the signal to re-index rather than re-embed. In interviews, the expected answer to "how do you upgrade the embedding model in production"
 is this exact sequence: version the recipe, build beside, evaluate, swap the alias, retire later.
 
 ## Role lens

@@ -4,7 +4,8 @@ module: security-governance-compliance
 name: Model cards
 kind: practice
 difficulty: core
-est_minutes: 13
+est_minutes: 15
+status: reviewed
 related:
   - security-governance-compliance/model-governance
   - security-governance-compliance/ai-inventory-and-use-case-risk-classification
@@ -76,12 +77,17 @@ the provider's model card, your fine-tune's card that references it, and a syste
 
 ### Making it a living artifact
 A card written once at launch rots. The mechanism that keeps it honest is automation:
-- Store the card next to the model in the registry, keyed by the immutable version, so promoting a
-  version without a card is a failed check.
+- Store the card next to the model in the registry, keyed by the immutable version (or weights hash),
+  so promoting a version without a card is a failed check, *because* a card that can drift from its
+  artifact is worse than none: it lends false authority to the wrong model.
 - Generate the quantitative section from the evaluation pipeline, not by hand, so the numbers in the
   card are the numbers that gated the release.
 - Require human-written sections (intended use, out-of-scope, caveats) to be reviewed when the eval
-  set, training data or intended use changes.
+  set, training data or intended use changes, and record who signed them, *because* intent is the one
+  thing a pipeline cannot measure.
+- Make the gate fail on *missing* evidence, not only on bad evidence: a declared factor with no slice, or
+  a slice too small to be meaningful, blocks release just as a low score does. Otherwise the cheapest way
+  to pass is to not measure.
 - Keep machine-readable metadata (Hugging Face model cards put YAML front matter above Markdown) so the
   inventory can query licence, task and owner across all models.
 
@@ -97,30 +103,43 @@ card = {
     "model": "claims-router", "version": "2026.10.1", "owner": "claims-ml@corp",
     "intended_use": "Route inbound claim emails to one of 12 queues for human handling",
     "out_of_scope": ["Deciding claim approval or payout", "Non-English emails", "Voice transcripts"],
-    "metric": "macro-F1", "release_threshold": 0.85,
+    "metric": "macro-F1", "release_threshold": 0.85, "min_slice_n": 200,
     "factors": ["language_variant", "channel", "attachment_present"],
 }
 
-# Produced by the eval pipeline on the frozen eval set (illustrative numbers)
+# Produced by the eval pipeline on the frozen eval set: (score, n). Illustrative numbers.
 results = {
-    ("channel", "web_form"): 0.91, ("channel", "email"): 0.89, ("channel", "broker_portal"): 0.78,
-    ("attachment_present", True): 0.86, ("attachment_present", False): 0.90,
+    ("channel", "web_form"): (0.91, 1800), ("channel", "email"): (0.89, 950),
+    ("channel", "broker_portal"): (0.78, 240), ("channel", "fax_scan"): (0.88, 40),
+    ("attachment_present", True): (0.86, 1100), ("attachment_present", False): (0.90, 1930),
 }
 
-card["quantitative_analyses"] = [
-    {"factor": f, "value": str(v), "macro_f1": s} for (f, v), s in results.items()
-]
-failing = [r for r in card["quantitative_analyses"] if r["macro_f1"] < card["release_threshold"]]
-card["caveats"] = [f"Below threshold on {r['factor']}={r['value']} ({r['macro_f1']:.2f})" for r in failing]
+rows = [{"factor": f, "value": str(v), "macro_f1": s, "n": n} for (f, v), (s, n) in results.items()]
+card["quantitative_analyses"] = rows
+failing = [r for r in rows if r["n"] >= card["min_slice_n"] and r["macro_f1"] < card["release_threshold"]]
+too_small = [r for r in rows if r["n"] < card["min_slice_n"]]
+untested = [f for f in card["factors"] if f not in {f for f, _ in results}]
+card["caveats"] = [f"Below threshold on {r['factor']}={r['value']} ({r['macro_f1']:.2f}, n={r['n']})" for r in failing]
+card["caveats"] += [f"Too few examples to judge {r['factor']}={r['value']} (n={r['n']})" for r in too_small]
+card["caveats"] += [f"No evaluation results for declared factor {f}" for f in untested]
 
-print(json.dumps(card, indent=1))
-if failing:
-    raise SystemExit("Release blocked: disaggregated results below the card's threshold")
+print(json.dumps(card["caveats"], indent=1))
+if failing or too_small or untested:
+    raise SystemExit("Release blocked: a slice is below threshold, under-sampled, or unmeasured")
 ```
 
-If broker-portal mail is a small share of traffic, the aggregate macro-F1 still clears 0.85, yet that
-channel scores 0.78. The
-card surfaces it, and the team either fixes it or ships with "broker portal out of scope" written down.
+Why the aggregate hides the problem: if production traffic is roughly 60% web form, 31% email, 8% broker
+portal and 1% fax, the traffic-weighted score is about 0.6 × 0.91 + 0.31 × 0.89 + 0.08 × 0.78 +
+0.01 × 0.88 ≈ 0.89 (F1 does not decompose exactly by slice, but the order of magnitude holds). The
+headline clears 0.85 comfortably, while broker-portal claims, which are a small share of traffic but all
+come from one class of customer, get a router measurably worse than everyone else's. The card surfaces it, and the team either fixes it or ships with "broker portal
+out of scope" written down.
+
+The gate also refuses two kinds of false comfort. `fax_scan` scores 0.88, but on 40 examples that number
+is noise: for an accuracy-like metric near 0.8, the standard error at n = 100 is already
+√(0.8 × 0.2 / 100) ≈ 0.04, so a 95% interval is about ±0.08, and at n = 40 it is wider still. And
+`language_variant` is declared as a factor with no slice at all; a declared factor that was never measured
+is a silent gap, not a pass. Both become caveats a reviewer must read, instead of numbers that look fine.
 
 ## Trade-offs
 - A strict template gives comparability across hundreds of models, but invites box-ticking; it flips

@@ -4,7 +4,8 @@ module: security-governance-compliance
 name: Responsible AI
 kind: concept
 difficulty: intro
-est_minutes: 15
+est_minutes: 16
+status: reviewed
 related:
   - security-governance-compliance/ai-risk-management
   - security-governance-compliance/model-cards
@@ -64,10 +65,22 @@ Each principle becomes a requirement with a metric, a threshold and an owner, sc
 - **Equal opportunity**: true positive rates equal, so qualified people in each group are selected at the
   same rate. Needs ground-truth labels, which are themselves often biased.
 - **Equalized odds**: true positive *and* false positive rates equal.
-- **Calibration**: a score of 0.7 means the same probability of the outcome in every group.
+- **Calibration**: a score of 0.7 means the same probability of the outcome in every group. Its
+  thresholded cousin is **predictive parity**: among people the model selects, the same share are truly
+  positive in every group (equal precision).
 
 Kleinberg et al. and Chouldechova showed that when base rates differ between groups, a non-perfect
-classifier cannot satisfy calibration and equal error rates at once. This is *why* choosing a fairness
+classifier cannot satisfy calibration and equal error rates at once. The thresholded version is one line
+of algebra. With base rate *p*, precision is
+
+```
+PPV = p·TPR / (p·TPR + (1 − p)·FPR)
+```
+
+Hold TPR = 0.8 and FPR = 0.1 equal for two groups (equalized odds) with base rates 0.5 and 0.2. Group A
+gets PPV = 0.40 / 0.45 ≈ 0.89; group B gets 0.16 / 0.24 ≈ 0.67. Equal error rates *force* unequal
+precision, and equalizing precision would force the error rates apart. The only escapes are equal base
+rates or a perfect classifier. This is *why* choosing a fairness
 definition is a policy decision with an owner, not an engineering default: you are choosing which kind of
 unfairness you will tolerate. Legal context constrains the choice; US employment practice, for example,
 uses the "four-fifths" rule of thumb for adverse impact on selection rates.
@@ -109,7 +122,12 @@ print(round(tpr_gap, 3))                             # 0.183: qualified B applic
 ```
 
 Both views flag a problem, and the equal-opportunity view says something sharper: qualified applicants in
-group B are shortlisted far less often, so the gap is not explained by qualification. The team traces it
+group B are shortlisted far less often, so the gap is not explained by qualification (qualification rates
+are 0.375 and 0.333, much closer than the selection rates). Now compute the view a team might pick by
+default. Precision is 110/120 ≈ 0.917 for A and 55/60 ≈ 0.917 for B: identical. A team that measured only
+"when we shortlist someone, are they equally likely to be qualified?" would declare this tool fair. The
+same data is fair, unfair, or sharply unfair depending on the definition, which is the impossibility result
+in miniature. The team traces it
 to a feature correlated with group membership (gaps in employment history), removes it, re-evaluates, and
 records before-and-after results and the chosen definitions in the system card. The policy decision about
 which threshold applies was made by the HR and legal owners, not by the engineer running the script.

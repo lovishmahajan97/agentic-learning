@@ -5,7 +5,7 @@ name: API provider quotas & regional limits
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - infra-capacity-economics/cloud-ai-architecture
   - infra-capacity-economics/capacity-planning
@@ -81,6 +81,22 @@ for example OpenAI's `x-ratelimit-remaining-tokens` family and Anthropic's
 `anthropic-ratelimit-tokens-remaining` family, which a gateway can read to slow down before the
 first 429 rather than after it.
 
+### The ceiling a quota actually gives you
+Every limit converts into a request ceiling, and the lowest one binds:
+
+```
+max RPM from TPM  = TPM quota ÷ tokens charged per request
+tokens charged    = prompt tokens + max_tokens     (on providers that reserve output)
+binding ceiling   = min(RPM quota, max RPM from TPM, concurrency cap ÷ mean seconds per request × 60)
+```
+
+With a 400k TPM quota and 1,000-token prompts, `max_tokens=4000` charges 5,000 tokens a request,
+so the ceiling is 80 requests per minute even if answers average 300 tokens. Setting
+`max_tokens=800` charges 1,800 and lifts the ceiling to about 220 per minute, with no change to the
+quota or the bill. The concurrency term is Little's Law: at a cap of 50 in-flight requests and 15
+seconds per long generation, you cannot exceed 200 requests per minute whatever the token quota
+says. Running this calculation per model per region is the core of quota planning.
+
 ### Quota versus capacity
 A quota is a promise about *your* admission, not about the pool's availability. When the regional
 pool is saturated, requests fail with overload or capacity errors (Anthropic's 529, Bedrock's
@@ -109,7 +125,10 @@ them is a residency decision as much as a capacity one.
 4. **Retry correctly.** Honour `Retry-After`, add jitter, cap attempts, and open a circuit breaker
    when the failure rate shows the pool is overloaded, since retries cannot create capacity.
 5. **Spread and fall back.** Weighted routing across regions, deployments, accounts or providers
-   where allowed, with the fallback order chosen by residency and quality constraints.
+   where allowed, with the fallback order chosen by residency and quality constraints. Spreading
+   across accounts is legitimate when they map to real organisational boundaries; creating accounts
+   purely to multiply a limit can breach a provider's terms, so check them and prefer a quota
+   increase or reserved capacity.
 6. **Buy reserved capacity for the base load** and use pay-as-you-go for burst, with batch APIs for
    offline work because they have separate limits and typically a lower price.
 7. **Operate the quota.** Alert on remaining-budget headers and 429 rates; file increases before
@@ -222,7 +241,9 @@ minute. Explain what is probably happening and how you would raise effective cap
 breaking the residency rule.
 **A:** The provider reserves `max_tokens` at admission; if requests set `max_tokens` at 4,000 while
 real answers average a few hundred tokens, each request reserves far more than it uses, so the
-limiter sees the quota exhausted at a third of the measured usage. First, set `max_tokens` from
+provider's limiter counts the full 400k as consumed while only about 120k tokens are actually
+processed (with prompts around 1,300 tokens, each request charges about 5,300 but uses about
+1,600, a ratio near 0.3). First, set `max_tokens` from
 observed output-length percentiles per endpoint, which can roughly triple effective capacity on
 its own. Second, add a gateway token bucket at 85% of quota with a priority queue so interactive
 traffic is admitted first and batch work is deferred rather than retried. Third, move offline work

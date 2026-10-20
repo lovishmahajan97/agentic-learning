@@ -4,7 +4,7 @@ module: agent-reliability
 name: Stopping conditions / termination
 kind: concept
 difficulty: core
-est_minutes: 13
+est_minutes: 16
 status: reviewed
 related:
   - agent-reliability/max-step-budgets

@@ -4,7 +4,8 @@ module: security-governance-compliance
 name: AI incident response
 kind: practice
 difficulty: core
-est_minutes: 16
+est_minutes: 17
+status: reviewed
 related:
   - security-governance-compliance/audit-trails
   - security-governance-compliance/ai-risk-management
@@ -15,7 +16,7 @@ related:
   - system-design/graceful-degradation
   - customer-data-evaluation/customer-specific-regression-suites
 sources:
-  - NIST SP 800-61 — Computer Security Incident Handling Guide
+  - NIST, 2012 — SP 800-61 Rev. 2, Computer Security Incident Handling Guide (Rev. 3, 2025, recasts it on CSF 2.0)
   - NIST, 2023 — AI Risk Management Framework (AI RMF 1.0)
   - Regulation (EU) 2016/679 — General Data Protection Regulation
 ---
@@ -38,8 +39,10 @@ Teams without a plan improvise in exactly the wrong ways. They cannot switch the
 because no kill switch exists. They patch the prompt live without capturing what the old one was, so the
 investigation cannot reproduce the failure. They do not know which users received the bad outputs, so
 they cannot notify them. They miss a legal clock: a personal data breach under GDPR must normally be
-reported to the supervisory authority within 72 hours of becoming aware of it, and AI regulation adds its
-own serious-incident reporting for some systems.
+reported to the supervisory authority within 72 hours of becoming aware of it, and the EU AI Act requires
+providers of high-risk systems to report serious incidents to market surveillance authorities, generally
+within 15 days and faster for the gravest cases. These clocks start at awareness, not at root cause, so
+triage must decide early whether personal data or a high-risk system is involved.
 
 The naive alternative, "our SRE incident process covers it", is half right: severity levels, incident
 commanders and postmortems carry over. What it lacks is AI-specific detection, containment levers,
@@ -77,6 +80,17 @@ one of: input data, retrieved content, prompt or config, model version, tool per
 behaviour. Reproduce with the recorded versions; because outputs are stochastic, measure a failure rate
 over many runs instead of trusting one reproduction.
 
+Scope is a number, not a feeling: the count of requests in the onset window whose recorded inputs match
+the failure condition (retrieved the bad document, hit the changed model version, called the abused tool),
+then the subset whose outputs actually went wrong, judged by re-running a check on the *logged* outputs.
+The first number bounds who might be affected; the second decides who is notified.
+
+### Verify the fix with a rate, not a run
+Zero failures in *n* independent runs does not mean a zero failure rate. A useful rule of thumb (the "rule
+of three") is that the 95% upper bound on the true rate is about 3/n. Ten clean runs only show the rate is
+probably below about 30%; to claim below 1% you need roughly 300 clean runs across the failing cases. Size
+the verification to the harm: a wrong leave policy and a leaked salary file deserve different bounds.
+
 ### Remediate and notify
 Fix the cause, add the failing cases to the regression suite so it cannot silently return, and assess
 notification duties with legal: affected users, customers under contract, data protection authorities,
@@ -105,10 +119,12 @@ that document; 187 of them produced the wrong figure (measured by re-running the
 the logged outputs).
 
 **11:30** Remediation: archived folder excluded at ingestion, document removed from the index, an expiry
-metadata filter added. The 187 affected employees are identified from the trail and HR sends a correction.
+metadata filter added. The 20 failing questions are re-run 15 times each against the fixed system: 300
+runs, zero stale answers, so the remaining failure rate is plausibly below about 1% (rule of three). The
+employees behind those 187 conversations are identified from the trail and HR sends them a correction.
 Legal confirms no personal data breach occurred, so no regulator notification.
 
-**Next day** Twenty leave-policy questions added to the regression suite, which now runs after every index
+**Next day** The same twenty leave-policy questions added to the regression suite, which now runs after every index
 refresh. Postmortem action: ingestion requires a source allow-list. Risk register likelihood for "stale
 policy retrieved" raised; new KRI: share of answers citing documents older than policy effective dates.
 

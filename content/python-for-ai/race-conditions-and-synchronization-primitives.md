@@ -5,7 +5,7 @@ name: Race conditions & synchronization primitives (asyncio.Lock, Semaphore)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/asyncio
   - python-for-ai/async-cancellation-and-exception-propagation
@@ -51,6 +51,21 @@ In asyncio a race needs three things: shared mutable state, a read and a depende
 the audit question for a coroutine is: "what shared state did I read before this await, and do I still
 rely on it after?"
 
+The interleaving for the token refresh, with two requests A and B:
+
+```
+A: token expired? yes          B: (not yet run)
+A: await refresh()  -> yields
+                               B: token expired? yes   (A has not written yet)
+                               B: await refresh()  -> yields
+A: store token_1
+                               B: store token_2        (token_1 now revoked)
+```
+
+Nothing here is a torn write or a corrupted object, which is what threads give you; it is a stale
+decision. That is why asyncio races are logic bugs that pass unit tests (which run one coroutine at a
+time) and appear only under concurrent load.
+
 ### asyncio.Lock
 A lock is owned by at most one coroutine. `async with lock:` awaits `acquire()`; if the lock is held,
 the coroutine is parked in a FIFO queue of waiters and the loop runs other work. On release the next
@@ -58,7 +73,18 @@ waiter is woken. Waiting costs nothing but a queued future, *because* no thread 
 standard pattern for a shared cache is **double-checked locking**: check without the lock on the fast
 path, take the lock on a miss, then check again inside, *because* another coroutine may have refreshed
 the value while you waited for the lock. The lock is not reentrant: acquiring it again from the
-coroutine that holds it deadlocks.
+coroutine that holds it deadlocks. An uncontended `acquire()` returns without suspending, so a lock
+costs almost nothing until there is contention. Because `async with` releases in its exit, a
+coroutine cancelled while holding the lock still releases it, and one cancelled while *waiting* is
+removed from the queue.
+
+### Single-flight: share the in-flight work instead of locking around it
+An alternative to the lock for "compute once, many waiters" is to store the in-flight task itself:
+the first caller on a miss creates `self._refresh = asyncio.create_task(fetch())`, and every caller,
+first or later, does `await self._refresh`. All waiters get the same result, or the same exception, from
+one network call. It needs care with failure (clear the stored task when it raises, or every later
+caller re-reads the cached error) and with cancellation (one caller being cancelled should not cancel
+the shared task, which is what `asyncio.shield` around the await is for).
 
 ### asyncio.Semaphore
 A semaphore holds a counter initialised to N. `acquire()` decrements it, or waits if it is zero;
@@ -66,8 +92,11 @@ A semaphore holds a counter initialised to N. `acquire()` decrements it, or wait
 most N calls in flight no matter how many tasks exist. `BoundedSemaphore` additionally raises if you
 release more times than you acquired, which catches bookkeeping bugs. A semaphore caps *concurrency*.
 Throughput is concurrency divided by latency (Little's law), so if latency rises, the same semaphore
-yields fewer requests per second. A provider limit expressed in requests or tokens per minute needs a
-rate limiter, such as a token bucket, often combined with a semaphore.
+yields fewer requests per second. The same law sizes it: to sustain λ requests per second against
+latency W seconds you need N ≈ λ × W slots, so 20 requests/s at 1.5 s latency needs about 30. Fewer and
+you cannot reach the target; many more and you only queue inside the provider instead of inside your
+process. A provider limit expressed in requests or tokens per minute needs a rate limiter, such as a
+token bucket, often combined with a semaphore.
 
 ### The other primitives
 `asyncio.Event` lets many coroutines wait until one sets a flag, useful for "model warmed up" or

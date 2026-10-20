@@ -5,6 +5,7 @@ name: Customer VPC / on-prem / air-gapped deployment
 kind: pattern
 difficulty: core
 est_minutes: 18
+status: reviewed
 related:
   - deployment/private-endpoints
   - deployment/vpn
@@ -87,7 +88,11 @@ hosted model. Updates are a new bundle carried in; support is a log bundle carri
 2. **Sign and attest.** Sign images and the bundle manifest (cosign is the common choice), ship an SBOM
    (SPDX or CycloneDX), and publish SHA-256 hashes. This is done *because* the receiving side cannot
    ask you "is this file right?" and *because* the security review will ask how they know the
-   artifact is yours and unmodified.
+   artifact is yours and unmodified. For an air gap, the simplest choice is a long-lived key pair whose
+   public key ships out of band. Cosign's default keyless mode ties signatures to a short-lived
+   certificate (Fulcio) and a transparency log (Rekor); it can be verified offline only if you also
+   ship the signature bundle with its log inclusion proof and the Sigstore trusted root, and keep that
+   root current, which is extra machinery many air-gapped sites decline.
 3. **Package.** Images exported with `docker save` or `skopeo copy` into a tarball or OCI layout, the
    chart, the weights, a wheelhouse built with `pip download` for anything installed on-site, the
    docs, and a verify script.
@@ -119,7 +124,12 @@ that exact model and prompt set before the bundle was cut.
 A minimal bundle manifest tool. `build` runs on your connected side after packaging; `verify` runs on
 the customer's side, before anything is loaded into their mirror registry, so a corrupted 140 GB copy
 is caught before the install starts rather than during it. The manifest is then signed with
-`cosign sign-blob` so the customer can check authorship as well as integrity.
+`cosign sign-blob` (key-pair mode, so `cosign verify-blob --key` works offline) so the customer can
+check authorship as well as integrity. `verify` rejects three distinct failures: a file that is
+missing (truncated transfer), a file whose hash differs (corruption or tampering), and a file that is
+present but not in the manifest (something added after signing, which an installer that globs the
+directory would otherwise load). Hashing streams 1 MB blocks *because* a 140 GB weights file cannot be
+read into memory.
 
 ```python
 """Build and verify an offline install bundle: `build <dir> <version>` or `verify <dir>`."""
@@ -144,10 +154,18 @@ def build(bundle_dir, version):
 def verify(bundle_dir):
     root = pathlib.Path(bundle_dir)
     manifest = json.loads((root / "manifest.json").read_text())
-    bad = [rel for rel, meta in manifest["artifacts"].items()
-           if not (root / rel).exists() or sha256(root / rel) != meta["sha256"]]
-    print("OK" if not bad else f"CORRUPT OR MISSING: {bad}")
-    return not bad
+    listed = manifest["artifacts"]
+    present = {str(p.relative_to(root)) for p in root.rglob("*")
+               if p.is_file() and p.name != "manifest.json"}
+    missing = [r for r in listed if r not in present]
+    altered = [r for r in listed if r in present and sha256(root / r) != listed[r]["sha256"]]
+    extra = sorted(present - set(listed))
+    for label, items in (("MISSING", missing), ("ALTERED", altered), ("UNLISTED", extra)):
+        if items:
+            print(label, items)
+    ok = not (missing or altered or extra)
+    print("OK" if ok else "REJECT BUNDLE")
+    return ok
 
 if __name__ == "__main__":
     cmd, path = sys.argv[1], sys.argv[2]

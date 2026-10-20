@@ -5,7 +5,7 @@ name: Authentication vs authorization
 kind: concept
 difficulty: intro
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - backend-fundamentals/oauth-2-0-oidc
   - backend-fundamentals/rbac
@@ -63,7 +63,14 @@ each handler.
 The common mechanisms differ in what is verified and where state lives. Passwords are checked against a
 slow, salted hash (bcrypt, scrypt or Argon2) *because* a leaked database must not be crackable offline
 at GPU speed. After login the browser holds a **session** cookie: an opaque id looked up in a server-side
-store, which makes revocation instant but requires every server to reach the store. API clients send a
+store, which makes revocation instant but requires every server to reach the store. Because the browser
+attaches cookies automatically, the cookie needs `HttpOnly` (script cannot read it, so an XSS bug cannot
+exfiltrate it), `Secure` (never sent over plain HTTP) and `SameSite=Lax` or `Strict` (not sent on most
+cross-site requests), and state-changing endpoints still need CSRF protection where `SameSite` alone does
+not cover the case. Issue a fresh session id at login rather than upgrading the anonymous one, or an
+attacker who planted a known id before login inherits the authenticated session (session fixation). A
+second factor (TOTP, or a phishing-resistant WebAuthn key) raises the bar from "knows the password" to
+"also holds the device", which matters because reused and phished passwords are the common way in. API clients send a
 **bearer token**: either opaque (looked up like a session) or a self-contained **JWT**, which the server
 verifies locally with the issuer's public key. A JWT check must cover four things: signature, issuer,
 audience and expiry. Signature verification includes pinning the accepted algorithm rather than trusting
@@ -86,6 +93,12 @@ resource and the environment ("analysts may read documents whose classification 
 from the corporate network"). **ReBAC** answers through relationships ("user is an editor of this
 document via membership of this group"), which is the Zanzibar model behind systems such as OpenFGA and
 suits deeply shared, hierarchical data.
+
+Collections need the same care as single resources. `GET /documents/42` is authorized by loading 42 and
+checking it; `GET /documents?q=refund` must put the permission into the query itself
+(`WHERE tenant_id = $1 AND (owner_id = $2 OR ...)`), because fetching a page and filtering afterwards
+returns short or empty pages, leaks totals through counts, and on a vector search lets disallowed chunks
+crowd out allowed ones in the top-k.
 
 Two placement rules matter more than the model. First, enforce on the server, as close to the data as
 possible, on every request; the UI hiding a button is not authorization. In multi-tenant systems every

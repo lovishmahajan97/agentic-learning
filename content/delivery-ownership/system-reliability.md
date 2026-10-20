@@ -5,7 +5,7 @@ name: System reliability
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - reliability/high-availability
   - reliability/fault-tolerance
@@ -35,9 +35,10 @@ or when an agent's tenth tool call times out and leaves half a workflow done. No
 dependencies and change rather than from logic errors.
 
 The naive answer is to treat reliability as a property you add once, typically by putting redundancy
-everywhere. That fails twice. First, it is expensive and still misses the dominant cause: in mature
-organisations most outages are triggered by changes (deploys, config, prompts, model versions), which
-redundant copies of the same bad change do not survive. Second, it optimises only one lever. A system
+everywhere. That fails twice. First, it is expensive and still misses the dominant cause: postmortem
+experience across the industry, Google's SRE writing included, finds that a large share of outages is
+triggered by changes (deploys, config, prompts, model versions), and redundant copies running the same
+bad change fail together. Second, it optimises only one lever. A system
 that fails rarely but takes four hours to diagnose each time can be less available than one that fails
 weekly and rolls back in five minutes.
 
@@ -50,14 +51,30 @@ incidents and only on whatever the last incident touched.
 Availability over time is approximately MTBF / (MTBF + MTTR): mean uptime between failures over the whole
 cycle of working plus being broken. (Strictly that numerator is MTTF, mean time to failure; if your MTBF
 already includes repair time, the formula is (MTBF − MTTR) / MTBF. Conventions differ, so say which you use.) Split MTTR into time to detect, time to diagnose and time to
-recover, and add blast radius (the share of users affected), and you have every lever you can pull:
+recover, and add blast radius (the share of users affected), and you have every lever you can pull.
+They combine into one cost function the owner can rank work by:
+
+```
+user_impact_minutes per period ≈ Σ over incidents of
+    (time_to_detect + time_to_diagnose + time_to_recover) × blast_radius_share
+expected for a failure mode ≈ frequency × mean_duration × mean_blast_radius
+```
+
+Each term is a separate lever, and the product form is the point: halving any one term halves the
+impact, so the cheapest term to halve is where the next sprint goes.
+
 
 1. **Fail less often (raise MTBF).** Change safety beats hardware: canary and shadow releases, evaluation
    gates on prompt and model changes, pinned model versions, config review. *Because* change causes most
    incidents, this is usually where the first effort pays off.
 2. **Fail smaller (reduce blast radius).** Per-tenant quotas, bulkheads between workloads, feature flags,
    cell or region isolation. A failure that hits 2 percent of users for an hour costs far less error
-   budget than one that hits everyone.
+   budget than one that hits everyone. Two further tools shrink the *depth* of a failure rather than its
+   width. Graceful degradation serves a worse answer instead of none (a smaller or secondary model, a
+   cached response, retrieval-only results without generation, a read-only mode), *because* users
+   tolerate degraded far better than down. Timeouts, retry budgets, circuit breakers and load shedding
+   stop one slow dependency from exhausting threads, connections or quota for everything else,
+   *because* the usual way a small failure becomes a big one is queueing behind it.
 3. **Notice sooner (reduce detection time).** Alert on symptoms users feel (SLO burn, failed tasks,
    quality-eval pass rate on sampled traffic), not on CPU. For AI systems, quality monitoring is the
    difference between detecting a regression in an hour or from a customer email a week later.
@@ -80,8 +97,18 @@ agents compound the same way per task: ten steps at 99 percent each complete abo
 - **Nondeterminism**: the same input sometimes fails, so "could not reproduce" is not evidence of a fix.
 
 ### The ownership loop
-Define SLOs including a quality SLO; review the error budget weekly; rank failure modes from incidents
-and failure analysis by user impact; fund the top items; verify with game days and chaos tests; repeat.
+1. **Define SLOs**, including a quality SLO (for example, the pass rate of an automated evaluation on
+   sampled production traffic), *because* availability alone cannot see the silent failures above.
+2. **Agree an error-budget policy in advance**: what happens when the budget is spent (change freeze
+   except fixes, reliability work moves to the top of the queue). Agreeing it before the crisis is what
+   stops the argument from being re-litigated every time a launch is due.
+3. **Review weekly**: budget burn, incidents, and the per-incident split of detect, diagnose and recover
+   time, *because* incident count alone hides which lever is failing.
+4. **Rank failure modes** from incidents and failure analysis with the impact formula, and fund the
+   top items, not the most recent ones.
+5. **Verify** with game days, failover drills and chaos tests, *because* a recovery path that has not
+   been exercised should be assumed broken. Then repeat.
+
 Before launch, a production readiness review checks each lever explicitly.
 
 ## Example
@@ -129,8 +156,9 @@ and the tools are idempotent; a deterministic bug fails both attempts.
   complaints about wrong answers after a provider's model update.
 - Adding retries everywhere without idempotency or budgets; the symptom is duplicate side effects and
   retry storms that turn a brief provider blip into a long outage.
-- Building a fallback path nobody tests; the symptom is discovering during the first real outage that
-  the backup provider's credentials expired or its prompt format was never adapted.
+- Building a fallback or degraded path nobody tests; the symptom is discovering during the first real
+  outage that the backup provider's credentials expired, its prompt format was never adapted, or its
+  quota cannot absorb full production traffic.
 - Fixing whatever the last incident touched; the symptom is the same failure class recurring across
   postmortems while the team feels busy.
 - Assuming failures are independent when computing redundancy; the symptom is both "redundant"
@@ -157,7 +185,8 @@ cheapest for the given failure profile, with the composition arithmetic shown.
 **Q:** Your assistant had six incidents last quarter: two provider outages of 30 minutes, three bad prompt
 deploys each taking about three hours to notice and roll back, and one stale index. Where do you invest first?
 **A:** The prompt deploys dominate: roughly nine hours of degraded service versus one hour from the
-provider, and they are self-inflicted, so they are cheap to fix. I would add an evaluation gate and a
+provider, and they are self-inflicted, so they are cheap to fix. The formula also says where in their
+duration to cut: I would expect most of those three hours to be detection, because a bad prompt returns 200s, so I would confirm that from the incident timelines before choosing the fix. I would add an evaluation gate and a
 canary for prompt changes to cut their frequency, quality monitoring on sampled traffic to detect a bad
 prompt within minutes, and one-step prompt rollback to shrink recovery. The stale index points to the
 same detection gap and needs a freshness check. A second provider is worth less until those are done,

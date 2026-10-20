@@ -5,6 +5,7 @@ name: Data mapping & canonical schemas (schema mapping)
 kind: pattern
 difficulty: core
 est_minutes: 16
+status: reviewed
 related:
   - data-architecture/data-contracts
   - scoping/domain-modeling
@@ -29,7 +30,8 @@ instead of N × M, and every downstream component, prompts and retrieval filters
 Suppose your AI product consumes tickets from Zendesk, ServiceNow and Jira Service Management across
 twelve customers, and feeds a retriever, a summarizer, an analytics view and an evaluation harness. If
 each consumer reads each source's native shape, every consumer contains knowledge of every source:
-the summarizer knows ServiceNow calls priority `urgency` with values 1 to 3 and Zendesk uses strings, the
+the summarizer knows ServiceNow's `priority` is an integer from 1 (critical) to 5, derived from impact and
+urgency, while Zendesk uses strings such as `urgent` and `low`, the
 retrieval filter knows which field holds the product name in each system. Adding a source means editing
 every consumer; changing a consumer means testing it against every source. That is the N × M problem.
 
@@ -48,7 +50,12 @@ place per source: a mapping, reviewed with the people who know the data, tested,
 ### Designing the canonical schema
 The canonical schema models *your* domain, the concepts your product reasons about (case, party,
 document, interaction), not a union of every source's fields. Keep it small and stable, *because* each
-field is a promise every mapping must keep. Typical choices:
+field is a promise every mapping must keep. Keep its scope to your product too. The pattern has a
+well-known failure at enterprise scale: a single canonical model for a whole company tries to make
+"customer" mean the same thing to sales, billing and support, needs every team's agreement to change,
+and becomes the bottleneck. Domain-driven design's answer is a model per bounded context with
+translation at the edges, and your product's canonical schema is exactly one such context; it does not
+need to be the client's enterprise data model, and should not try. Typical choices:
 - Types are normalized: timestamps in UTC with zone, money as amount plus ISO currency, explicit units.
 - Enumerations are closed and documented (`status ∈ {open, pending, resolved, closed}`), *because*
   downstream logic branches on them.
@@ -74,6 +81,15 @@ Express each source's mapping as data (a field table and value crosswalks) inter
 rather than as hand-written code per customer, *because* data can be reviewed by non-engineers, diffed,
 validated and reused for the next tenant on the same system. Tenant-specific overrides layer on top of a
 per-system base mapping, since two customers on the same CRM often customize the same fields differently.
+
+### Mapping back: write paths need the reverse direction
+An assistant that only reads needs the inbound mapping. One that writes back (updating a
+ticket's status, filing a case) needs the reverse, and the reverse is not automatic, *because* value crosswalks
+are often many-to-one. If source codes `W` and `K` both map to canonical `pending`, then canonical
+`pending` has no single source code to write. Either keep the original source value on the canonical
+record (provenance makes this cheap) and write it back unchanged when the meaning has not changed, or
+define an explicit reverse crosswalk agreed with the data owner (`pending` writes `W`), and test the
+round trip, source → canonical → source, as a fixture.
 
 ### Unmapped values are errors, not defaults
 When a value has no crosswalk entry, the record goes to a quarantine with the reason, and the value is
@@ -107,18 +123,21 @@ MAPPING = {  # versioned config for tenant "acme", source "legacy_helpdesk"
     "status_crosswalk": {"N": "open", "W": "pending", "K": "pending", "E": "resolved", "Z": "closed"},
 }
 
-class Unmapped(Exception): pass
+class Unmapped(Exception): pass                     # caller sends the record to quarantine
 
 def map_ticket(src: dict, m=MAPPING) -> dict:
-    out, ext = {"source_system": "legacy_helpdesk", "mapping_version": m["version"]}, {}
-    for k, v in src.items():
-        (out.__setitem__(m["fields"][k], v) if k in m["fields"] else ext.__setitem__(k, v))
+    out = {"source_system": "legacy_helpdesk", "mapping_version": m["version"]}
+    out.update({m["fields"][k]: v for k, v in src.items() if k in m["fields"]})
+    ext = {k: v for k, v in src.items() if k not in m["fields"]}   # lossless: nothing is dropped
+    missing = {"source_id", "opened_at", "status"} - out.keys()
+    if missing:
+        raise Unmapped(f"missing {missing} in {src.get('TicketNo')!r}")
     local = datetime.strptime(out["opened_at"], "%d.%m.%Y %H:%M").replace(tzinfo=ZoneInfo(m["tz"]))
     out["opened_at"] = local.astimezone(timezone.utc).isoformat()
     code = out["status"]
     if code not in m["status_crosswalk"]:
-        raise Unmapped(f"status={code!r} for ticket {out['source_id']}")   # -> quarantine
-    out["status"] = m["status_crosswalk"][code]
+        raise Unmapped(f"status={code!r} for ticket {out['source_id']}")
+    out["status"], out["source_status"] = m["status_crosswalk"][code], code   # keep original for write-back
     out["extensions"] = ext
     return out
 
@@ -130,6 +149,11 @@ print(map_ticket({"TicketNo": "T-1042", "Subj": "VPN drops", "Opened": "03.11.20
 The crosswalk maps two source codes, `W` and `K`, to one canonical `pending`; that decision came from the
 client's helpdesk lead, not from the data. A new code `X` appearing next quarter raises `Unmapped` and
 lands in quarantine with a message the FDE can forward, instead of becoming a silently wrong status.
+Keeping `source_status` means a later write-back can restore `K` rather than guessing between `W` and
+`K`. One edge the sketch does not handle: naive local times are ambiguous for one hour each autumn (the
+clock repeats 02:00 to 03:00) and nonexistent for one hour each spring, and `replace(tzinfo=...)`
+silently picks one reading. If ordering within that hour matters, flag those values rather than trusting
+the default.
 
 ## Trade-offs
 - A canonical schema turns N × M translations into roughly N + M, but costs an upfront modelling effort
@@ -155,6 +179,9 @@ lands in quarantine with a message the FDE can forward, instead of becoming a si
   that belong elsewhere.
 - No mapping version on records; the symptom is that after a crosswalk fix you cannot tell which records
   were mapped under the old rule and need remapping from raw.
+- Writing back through an inverted many-to-one crosswalk; the symptom is source records whose status
+  changes from `K` to `W` when the assistant updates an unrelated field, and the client's reports
+  shifting for no visible reason.
 - Letting the LLM interpret raw source records at query time instead of mapping; the symptom is filters
   and permissions that do not work and answers that vary across model versions.
 

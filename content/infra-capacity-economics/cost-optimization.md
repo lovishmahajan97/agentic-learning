@@ -5,7 +5,7 @@ name: Cost optimization
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - infra-capacity-economics/cost-modeling
   - infra-capacity-economics/quality-latency-cost-optimization
@@ -60,7 +60,11 @@ Input usually dominates RAG and agent cost. Retrieve fewer, better chunks (reran
 trim system prompts and tool schemas, compact long histories, and stop pasting entire tool outputs into
 context. Turn on prompt caching for stable prefixes: put fixed instructions and schemas first and
 variable content last *because* caching only matches identical prefixes. Cap output with concise
-formats and `max_tokens`, since output tokens cost more per token.
+formats and `max_tokens`, since output tokens are usually priced higher than input. Two output sources
+are easy to miss: reasoning ("thinking") tokens, which are billed as output on most providers even when
+not shown, so a reasoning budget or effort setting is a cost control; and agent loops, where every extra
+step re-sends the growing context, so cost per task grows faster than linearly with step count and
+cutting one redundant tool round-trip can save more than trimming the prompt.
 
 ### 3. Use a cheaper model where it is good enough
 Route easy requests to a smaller model and escalate hard or low-confidence ones (routing or cascading).
@@ -79,7 +83,9 @@ weights or the KV cache where evals allow, enable prefix caching, right-size GPU
 replicas. These matter most once the fleet is large.
 
 ### Guardrails on the process
-Each change ships behind an eval and, ideally, an A/B or shadow comparison; the acceptance criterion is
+Levers compound multiplicatively, so estimate each one on the base left after the previous ones, not on
+the original bill: a 50% context cut and a 50% routing saving give 75%, not 100%. They also interact;
+routing traffic away from the large model shrinks the value of the large model's prompt cache. Each change ships behind an eval and, ideally, an A/B or shadow comparison; the acceptance criterion is
 cost per successful task at equal or better quality and within the latency budget.
 
 ## Example
@@ -120,6 +126,9 @@ saving is illusory, so the success rate per route is the number to watch.
   rising retries, escalations or human-review volume.
 - Breaking prompt caching by putting timestamps, user names or request IDs at the start of the prompt;
   the cached-token share drops to near zero after a prompt change.
+- Keying a response or semantic cache only on the question text; one tenant or user is served an answer
+  built from another's documents, found as a data-exposure incident rather than a cost metric. Include
+  tenant, permission scope and source versions in the key.
 - Shipping a cheaper configuration without an eval gate; quality complaints or lower acceptance rates
   appear weeks later and are hard to trace to the change.
 

@@ -4,8 +4,8 @@ module: customer-data-evaluation
 name: SME review & annotation guidelines
 kind: practice
 difficulty: core
-est_minutes: 15
-status: fact-checked
+est_minutes: 16
+status: reviewed
 related:
   - evals/rubrics
   - evals/inter-annotator-agreement
@@ -39,6 +39,15 @@ explicit, shared one; review protocol exists to prevent the process itself (seei
 an output, reviewing in a fixed order, discussing before labelling) from biasing the result.
 
 ## How it works
+### Two jobs, one guideline
+SMEs do two different things with customer data. **Annotation** creates the reference: the expert sees
+only the input and writes the correct label or answer. **Review** judges a system's output against the
+input (and sometimes a reference). Review is faster per item, because recognising an error is easier
+than producing the answer, but it is anchored by what the system wrote: a plausible output pulls the
+reviewer toward accepting it. Annotation is slower and unanchored. Use annotation for the golden set's
+references and review for judging runs, and write one guideline that both follow, so "correct" means the
+same thing in the reference and in the verdict.
+
 ### What goes in the guideline
 1. **Scope.** What the reviewer is judging and, just as important, what they are not: "judge whether the
    answer is correct for this policy; do not judge writing style unless it misleads".
@@ -60,8 +69,12 @@ an output, reviewing in a fixed order, discussing before labelling) from biasing
 - **Independent first, discuss second.** Labels are committed before any group discussion; otherwise
   the most senior voice becomes the label.
 - **Measure agreement.** On a double-labelled subset, compute raw agreement and a chance-corrected
-  statistic such as Cohen's κ = (p_obs − p_chance)/(1 − p_chance). Raw agreement alone is inflated when
-  one label dominates.
+  statistic such as Cohen's κ = (p_obs − p_chance)/(1 − p_chance), where p_chance is the agreement two
+  reviewers would reach by labelling at random with their own label rates. Raw agreement alone is
+  inflated when one label dominates. Because κ itself drops when one label is very rare even if
+  reviewers are good, also report agreement specific to the label you care about: for fails,
+  2·n_both_fail / (2·n_both_fail + n_disagree). For more than two reviewers use Fleiss' κ; when items receive
+  different numbers of labels or the scale is ordinal, Krippendorff's α handles both.
 - **Attribute disagreement.** Use the cited guideline sections to see which criterion causes splits; fix
   that section, not the reviewers.
 - **Version the guideline.** Store guideline version per label, because a definition change can
@@ -96,10 +109,14 @@ cited = ["G3-completeness"] * 7 + ["G1-accuracy"] * 2 + ["G5-tone"]
 k, po = cohen_kappa(a, b)
 print(f"raw agreement {po:.2f}, kappa {k:.2f}")   # raw agreement 0.80, kappa 0.52
 print(Counter(cited).most_common())              # G3 drives most disagreement
+both_fail, disagree = 10, 10
+print(f"agreement on fails {2 * both_fail / (2 * both_fail + disagree):.2f}")  # 0.67
 ```
 
 Raw agreement of 80% looks fine, but chance agreement here is about 58% because both reviewers pass most
-answers, so κ is only about 0.52. Seven of ten disagreements cite completeness: one SME fails answers
+answers, so κ is only about 0.52. Fail-specific agreement is 0.67: when either reviewer fails an
+answer, the other agrees only two times in three, and the fails are what the eval exists to find. Seven
+of ten disagreements cite completeness: one SME fails answers
 that omit the waiting-period rule even when the question did not ask about it. The fix is in G3 ("an
 answer is incomplete only if it omits a condition that changes the answer to the question asked"), plus
 two boundary examples, then a fresh calibration batch, not more reviewer training.
@@ -109,12 +126,16 @@ two boundary examples, then a fresh calibration batch, not more reviewer trainin
   when choosing between two good systems, add pairwise preference judgements alongside them.
 - Detailed guidelines raise consistency, but long documents go unread; past a few pages, move rarely
   needed detail into an appendix and keep a one-page decision card for reviewers.
+- Review of system outputs costs less expert time than annotating from scratch, but anchors on the
+  output; for golden references and hard strata, annotate unaided, and keep review for judging runs.
 - Blind review removes version bias, but hides context reviewers sometimes need, such as which data
   source a system had; provide the input context, never the system identity.
 - An "unsure" label surfaces policy gaps honestly, but some reviewers overuse it; when its rate climbs,
   review those items in session and add boundary examples.
 
 ## Pitfalls
+- Building references by having SMEs approve system outputs; the symptom is a golden set that agrees
+  suspiciously well with the system that drafted it and scores a different system unfairly low.
 - Using a single holistic 1–5 score; the symptom is reviewers agreeing on the average but rarely on any
   individual item.
 - Discussing items as a group before labelling; the symptom is suspiciously high agreement that drops

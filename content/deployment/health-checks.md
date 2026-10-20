@@ -5,6 +5,7 @@ name: Health checks
 kind: practice
 difficulty: core
 est_minutes: 14
+status: reviewed
 related:
   - fastapi-for-ai/health-readiness-endpoints
   - backend-fundamentals/kubernetes
@@ -79,6 +80,25 @@ retrieval, model, guardrails) and assert on the answer, for example that it cite
 This catches failures probes never see: a stale index, an expired credential to a customer system, a
 model silently changed behind an alias. Synthetic results feed alerts and dashboards, not restarts.
 
+### Probe timing is arithmetic, not taste
+Each probe acts only after `failureThreshold` consecutive failures, checked every `periodSeconds`, so
+the time before the platform reacts is roughly
+
+```
+reaction_time ≈ periodSeconds × failureThreshold   (+ up to timeoutSeconds per attempt)
+```
+
+That one product sets three budgets. For **startup**, it must exceed the worst-case initialisation, not
+the typical one: if weights load in 90 seconds normally but 4 minutes on a cold node pulling from object
+storage, `periodSeconds: 10, failureThreshold: 30` gives a 300-second window, while a 60-second window
+would kill every pod on a cold node and loop forever. For **liveness**, it is how long a hung process
+keeps receiving its share of traffic before a restart, so a short product detects hangs fast but also
+restarts pods that were merely slow under a load spike (a long GC pause, a CPU-starved event loop). For
+**readiness**, it is how long an overloaded or draining instance keeps getting new requests, and the
+matching `successThreshold` decides how quickly it is trusted again. Choosing these from measured load
+times and latency, rather than copying defaults, is most of the difference between probes that help and
+probes that cause outages.
+
 ### Making checks cheap and honest
 Probes run often, so they must be fast and must not call the LLM. Deeper checks run on a background
 schedule and the endpoint returns the cached result, *because* a probe that waits on a slow dependency
@@ -87,7 +107,9 @@ operators following a runbook can see why an instance is unready.
 
 ## Example
 A FastAPI service that loads a model at startup, separates liveness from readiness and reports
-overload. The model loader is a stand-in for real initialisation.
+overload. The model loader is a stand-in for real initialisation. It runs as a background task because
+an `await` inside the lifespan would delay the server from accepting connections until loading ends:
+probes would see connection refused rather than a 503 with a reason.
 
 ```python
 import asyncio
@@ -98,13 +120,14 @@ state = {"model": None, "in_flight": 0}
 MAX_IN_FLIGHT = 32                       # illustrative per-replica concurrency budget
 
 async def load_model():
-    await asyncio.sleep(5)               # stand-in for loading weights onto the GPU
-    return object()
+    await asyncio.sleep(5)               # stand-in; real blocking loads go in asyncio.to_thread
+    state["model"] = object()
 
 @asynccontextmanager
 async def lifespan(app):
-    state["model"] = await load_model()
+    task = asyncio.create_task(load_model())   # load in background so probes answer meanwhile
     yield
+    task.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -176,8 +199,10 @@ correct.
 ## Check yourself
 **Q:** After a 90-second outage at the LLM provider, the whole fleet restarted and the service was down
 for twelve minutes. What went wrong in the health check design, and how would you change it?
-**A:** The provider was almost certainly checked by the liveness probe, or by readiness with no fallback.
-When the provider failed, every replica failed at once; liveness restarted them all, and each restart
+**A:** The provider was almost certainly checked by the liveness probe: readiness failures only remove
+pods from endpoints and never restart them, so a fleet-wide restart points at liveness (a provider check
+in readiness would instead have emptied the endpoints for roughly the outage's duration). When the
+provider failed, every replica failed at once; liveness restarted them all, and each restart
 meant reloading model weights or warming caches, so recovery took far longer than the upstream outage.
 I would make liveness local only (process responsive), keep readiness to per-instance conditions such as
 model loaded, capacity and draining, and report provider health through metrics, alerts and a synthetic

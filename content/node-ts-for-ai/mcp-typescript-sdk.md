@@ -5,7 +5,7 @@ name: MCP TypeScript SDK
 kind: tool
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - agents/model-context-protocol
   - agents/mcp-authentication-authorization-transport-security
@@ -49,6 +49,24 @@ as the schema-validation lesson, applied at a protocol boundary: the model sees 
 handler enforces, and the host can validate what it sends.
 
 ## How it works
+### What happens on connect
+Every session, on either transport, starts with the same three messages, and the SDK sends and
+checks all of them:
+1. The client sends `initialize` with the newest protocol version it supports, its own
+   capabilities (for example `sampling`, `roots`, `elicitation`) and its name and version.
+2. The server answers with the version it will speak (the client's if it supports it, otherwise
+   one it does; a client that cannot speak that version disconnects) and its capabilities (`tools`,
+   `resources`, `prompts`, `logging`, each possibly with `listChanged`).
+3. The client sends the `notifications/initialized` notification. Only then do ordinary requests
+   such as `tools/list` flow.
+
+Negotiation exists *because* hosts and servers upgrade independently: each side may only use
+features the other advertised, so an old host and a new server still interoperate on the common
+subset. After the handshake, every request carries a JSON-RPC `id` and gets exactly one response;
+notifications (progress, log messages, `notifications/cancelled`, list-changed) carry none. The
+client side of the SDK also enforces a per-request timeout (60 seconds by default in 1.x) and
+rejects with a request-timeout `McpError` when it expires, which matters for slow tools.
+
 ### Server side: two levels
 `McpServer` (from `@modelcontextprotocol/sdk/server/mcp.js`) is the high-level API. You construct it
 with a name and version, then register capabilities: `registerTool(name, { description, inputSchema,
@@ -94,7 +112,10 @@ header that the server issues during `initialize`; the SDK supports stateful mod
 session id, every request self-contained). Stateless is what you want behind a load balancer with
 several replicas, since a stateful session pins a client to the replica holding its transport; the
 cost is that server-initiated requests and resumable streams are unavailable. The older HTTP+SSE
-transport is still shipped for compatibility but is superseded. Remote servers authenticate with
+transport is still shipped for compatibility but is superseded. Over HTTP the specification also
+requires servers to validate the `Origin` header, *because* a server listening on localhost is
+otherwise reachable from any web page the user opens (DNS rebinding); bind local servers to
+`127.0.0.1` and turn on the SDK transport's host and origin checks. Remote servers authenticate with
 OAuth 2.1 per the specification's authorization section; the SDK ships helpers for both sides, and the
 dedicated security lesson covers the trust decisions.
 
@@ -124,7 +145,10 @@ tools from three servers pays in tokens and in tool-selection accuracy on every 
 ## Example
 A stdio server exposing one tool with a Zod-typed input, and a host that discovers the tool, hands it
 to Claude, and routes the resulting `tool_use` back through `callTool`. The server logs to stderr
-because stdout is the wire. Written against the 1.x `registerTool` API; older minors used `tool()`.
+because stdout is the wire. Written against the 1.x `registerTool` API; older minors used `tool()`,
+and the maintainers have been preparing a v2 line that splits client and server into separate packages, so import paths depend on
+which line you install. The host completes the round trip: MCP `text` items map directly onto
+Anthropic text blocks, while images would need re-encoding into Anthropic's `source` shape.
 
 ```ts
 // server.ts — one tool over stdio. Nothing but JSON-RPC may touch stdout.
@@ -158,15 +182,20 @@ const claudeTools: Anthropic.Tool[] = tools.map((t) => ({
   name: t.name, description: t.description ?? "", input_schema: t.inputSchema as Anthropic.Tool.InputSchema,
 }));
 const anthropic = new Anthropic();
-const reply = await anthropic.messages.create({
-  model: "claude-opus-5-5", max_tokens: 1024, tools: claudeTools,
-  messages: [{ role: "user", content: "What is the status of ord_42?" }],
-});
+const ask = (messages: Anthropic.MessageParam[]) =>
+  anthropic.messages.create({ model: "claude-opus-5-5", max_tokens: 1024, tools: claudeTools, messages });
+const messages: Anthropic.MessageParam[] = [{ role: "user", content: "What is the status of ord_42?" }];
+const reply = await ask(messages);
+const results: Anthropic.ToolResultBlockParam[] = [];
 for (const block of reply.content) {
   if (block.type !== "tool_use") continue;
-  const result = await mcp.callTool({ name: block.name, arguments: block.input as Record<string, unknown> });
-  console.log(result.isError ? "tool error" : "ok", result.content);  // becomes a tool_result next turn
+  const r = await mcp.callTool({ name: block.name, arguments: block.input as Record<string, unknown> });
+  const text = (r.content as { type: string; text?: string }[])        // keep text items only here
+    .flatMap((c) => (c.type === "text" ? [{ type: "text" as const, text: c.text ?? "" }] : []));
+  results.push({ type: "tool_result", tool_use_id: block.id, is_error: r.isError === true, content: text });
 }
+messages.push({ role: "assistant", content: reply.content }, { role: "user", content: results });
+const final = await ask(messages);                 // the model now answers from the tool result
 ```
 
 ## Trade-offs
@@ -201,6 +230,10 @@ for (const block of reply.content) {
   `search` silently shadowing another's.
 - Building a public HTTP server with no authentication because the local stdio version needed none;
   the symptom is anyone with the URL calling your tools.
+- Calling a tool that runs longer than the client's default request timeout; the symptom is a
+  request-timeout `McpError` at about a minute while the server keeps working. Pass a longer
+  `timeout` in the request options, or have the server send progress notifications and set
+  `resetTimeoutOnProgress`.
 - Leaving the child process running when the host exits; the symptom is orphaned server processes
   accumulating on developer machines.
 

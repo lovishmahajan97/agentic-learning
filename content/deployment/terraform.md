@@ -4,7 +4,8 @@ module: deployment
 name: Terraform (infrastructure as code)
 kind: tool
 difficulty: core
-est_minutes: 17
+est_minutes: 19
+status: reviewed
 related:
   - deployment/customer-vpc-on-prem-air-gapped
   - deployment/private-endpoints
@@ -23,7 +24,7 @@ sources:
 ## TL;DR
 Infrastructure as code (IaC) describes networks, clusters, GPU node pools, buckets and permissions in
 versioned files that a tool reconciles against reality, instead of clicking through consoles. Terraform
-is the most widely used IaC tool: you declare desired state in HCL, it diffs that against a recorded
+is the most widely used multi-cloud IaC tool: you declare desired state in HCL, it diffs that against a recorded
 state file and the provider APIs, shows a plan, and applies only the difference. That makes environments
 reproducible, reviewable and repeatable in every customer account you deploy to.
 
@@ -75,10 +76,34 @@ Modules package resources behind input variables and outputs, like functions. A 
 module might take a VPC ID, subnet IDs, region and KMS key, and output the service URL. Each environment
 or customer is then a small root configuration calling that module with different inputs.
 
+### How the diff decides update versus replace
+For each resource the plan compares three things: the configuration, the last-recorded state, and what
+the refresh read from the API. If an argument differs, the provider's schema says whether the API can
+change it in place (a tag, an instance count) or whether it is immutable once created (a bucket name,
+a cluster's subnet), in which case the action becomes replace. Replacement defaults to
+destroy-then-create *because* many names must be unique; `lifecycle { create_before_destroy = true }`
+reverses the order for stateless things like launch templates or certificates, so there is no gap.
+
+### Resource addresses are identity
+State keys each object by its address in code (`module.rag.aws_s3_bucket.documents`), not by its
+cloud ID. Renaming a block, moving it into a module or switching `count` to `for_each` therefore looks
+to Terraform like "delete the old address, create a new one", even though nothing real changed. A
+`moved { from = ..., to = ... }` block (or `terraform state mv`) tells it the object merely changed
+address, and the plan becomes a no-op. This is the mechanism behind most "harmless refactor recreated
+the database" stories.
+
 ### Drift and import
 If someone changes a resource in the console, the next plan shows drift and proposes reverting it.
-Existing hand-built resources can be adopted with `import` so they come under management without being
-recreated.
+Existing hand-built resources can be adopted with an `import` block or `terraform import` so they come
+under management without being recreated.
+
+### One state per environment
+Each environment or customer gets its own state, so a plan for staging cannot touch production.
+Two layouts are common: separate root directories per environment (explicit, each with its own
+backend key and credentials) or CLI workspaces sharing one configuration (less duplication, but the
+same credentials and an easy-to-forget `terraform workspace select`). For customer accounts with
+separate change boards, separate roots with separate backends is the usual choice *because* the
+isolation boundary should match the approval boundary.
 
 ### Alternatives
 CloudFormation (AWS) and Bicep/ARM (Azure) are native single-cloud equivalents with no state file to
@@ -102,7 +127,7 @@ terraform {
     bucket         = "acme-tfstate"
     key            = "ai-platform/prod.tfstate"
     region         = "eu-west-1"
-    dynamodb_table = "tf-locks"   # newer versions also offer S3-native locking
+    use_lockfile   = true         # S3-native lock file (added in 1.10, GA in 1.11); supersedes dynamodb_table
     encrypt        = true
   }
 }
@@ -138,7 +163,9 @@ resource "aws_s3_bucket" "documents" {
 ```
 
 `terraform plan` on a fresh account shows three resources to add; changing `bucket` later would show a
-replace, and `prevent_destroy` turns that into an error rather than a deleted archive.
+replace, and `prevent_destroy` turns that into an error rather than a deleted archive. The guard lives in
+the resource block, so it does not protect against someone deleting the block itself; pair it with
+bucket versioning or a deletion-protection setting on the cloud side.
 
 ## Trade-offs
 - Declarative plans make every change reviewable before it happens, but the state file becomes critical
@@ -154,9 +181,11 @@ replace, and `prevent_destroy` turns that into an error rather than a deleted ar
 - Committing state or secrets to git, or storing state unencrypted; the symptom is a secret scanner
   alert, or an auditor finding database passwords readable by everyone with repository access.
 - Approving a plan without reading "must be replaced" lines; the symptom is a vector database or
-  bucket recreated empty after an apparently harmless rename or argument change.
-- Unpinned provider versions; the symptom is a plan that suddenly proposes changes nobody made, after a
-  new provider release changed a default.
+  bucket recreated empty after an apparently harmless argument change.
+- Refactoring resource names or module structure without `moved` blocks; the symptom is a plan that
+  shows an equal number of destroys and creates for a pull request that "only renamed things".
+- Unpinned provider versions or an uncommitted `.terraform.lock.hcl`; the symptom is a plan that
+  suddenly proposes changes nobody made, after a new provider release changed a default.
 - Making emergency fixes in the console and never back-porting them; the symptom is the next routine
   apply silently reverting the fix and re-causing the incident.
 - Assuming the customer's air-gapped environment can download providers; the symptom is

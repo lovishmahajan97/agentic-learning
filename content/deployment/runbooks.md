@@ -5,6 +5,7 @@ name: Runbooks
 kind: practice
 difficulty: core
 est_minutes: 13
+status: reviewed
 related:
   - deployment/health-checks
   - deployment/hypercare
@@ -78,6 +79,18 @@ A runbook step that is run identically every time is a candidate for a script, t
 remediation. Keep the runbook even after automation, describing what the automation does and what to do
 when it fails, *because* automation fails in exactly the unusual situations where humans need context.
 
+### Store them where the outage is not
+A runbook is useless if it is unreachable during the incident it covers. Keep runbooks somewhere that
+does not share fate with the system: not only on a wiki behind the same single sign-on that may be
+failing, not only in a cloud account the customer's on-call cannot access, and with an offline or mirrored
+copy for the scenarios (identity outage, network partition into an air-gapped site) where the primary
+location goes down too. The alert should carry the link, *because* searching for the right page costs
+minutes the incident does not have.
+
+Terminology varies: some teams say *playbook* for the broader incident-handling process (roles,
+communication, severity) and *runbook* for the per-situation procedure described here. The distinction
+matters less than having both, and not expecting one to do the other's job.
+
 ### Keep them alive
 Each runbook has an owner and a last-tested date. Teams rehearse them in game days (deliberately
 injected failures in staging) and update them after every incident where the runbook was wrong or
@@ -106,7 +119,7 @@ Mitigate (pre-authorised, no approval needed)
 
 Verify
 7. Upstream error rate < 1% and p95 < 8 s for 15 min. Then revert step 3 first, watch 15 min,
-   then restore concurrency.
+   then restore concurrency, then re-enable batch jobs last.
 
 Escalate
 8. Not recovered 30 min after step 3, or fallback also failing: page vendor on-call
@@ -116,6 +129,11 @@ Afterwards: export the incident timeline and five failing trace IDs to the postm
 
 Notice what it encodes: a split between rate-limit and outage causes, a hot-tenant branch, actions the
 operator may take without approval, an explicit recovery condition, and an order for reverting changes.
+The two branches exist *because* the same alert has opposite fixes: for a provider outage you move traffic
+away, while for rate limiting you reduce your own pressure, and failing over a rate-limited workload can
+simply exhaust the fallback's quota too. The revert order is deliberate as well: one change at a time,
+with a watch period, so that if errors return you know which reverted change they depended on, and the
+most load-generating change (batch jobs) comes back last, when the system has proven it is stable.
 
 ## Trade-offs
 - Detailed, command-level runbooks make incidents fast for unfamiliar operators, but go stale quickly as
@@ -136,6 +154,9 @@ operator may take without approval, an explicit recovery condition, and an order
   and no consistent mitigation time.
 - Leaving out AI-specific situations such as cost spikes, guardrail-block surges or prompt-injection
   reports; the symptom is a generic "service degraded" response to a problem that needed a kill switch.
+- Keeping runbooks only behind the system's own login or on infrastructure that fails with it; the
+  symptom is an identity or network outage in which the on-call cannot open the page that tells them
+  what to do.
 - Writing them only for the vendor team; the symptom is a customer operations team that escalates every
   page during hypercare because the runbooks assume access and context they do not have.
 

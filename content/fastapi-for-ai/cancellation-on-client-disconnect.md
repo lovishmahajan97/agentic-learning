@@ -5,7 +5,7 @@ name: Cancellation on client disconnect
 kind: pattern
 difficulty: advanced
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - fastapi-for-ai/asgi-lifecycle
   - fastapi-for-ai/streamingresponse
@@ -63,12 +63,31 @@ the block closes the upstream connection. Closing the upstream stream is what te
 inference engine to stop; self-hosted engines such as vLLM abort the sequence and free its cache,
 while hosted providers' billing for partial output is vendor-specific.
 
+Where the cancellation lands matters. If the generator is suspended at an `await` on the provider,
+it receives `CancelledError` there and its `finally` runs immediately. If it is suspended at `yield`,
+waiting for the server to take the next chunk, the generator itself is not running; it is finalised
+when it is closed (`GeneratorExit` at the `yield`), which may happen only when the iterator is
+cleaned up, later than you expect. So do not put time-critical release logic only in the generator's
+`finally`; pair it with a release-once guard that the endpoint's own cleanup can also trigger.
+
 ### Ordinary endpoints
 For a non-streaming endpoint, run the expensive work as a task and race it against a disconnect
 watcher. If the watcher wins, cancel the task. Cancellation raises `CancelledError` at the task's
 current `await`; inside httpx that aborts the request and closes the connection, *because* httpx
 treats cancellation as abandoning the exchange. The result is cooperative: cancellation lands only at
 an `await`, so CPU-bound code or a blocking call in a thread cannot be interrupted this way.
+
+The watcher can poll `is_disconnected()` on an interval, as in the example below, or be a task that
+awaits `request.receive()` until it returns `http.disconnect`, which reacts instantly with no polling.
+The second form is only safe once the body has been fully read, *because* `receive()` also delivers
+body chunks and a watcher that consumes them steals them from the handler.
+
+### Cancellation must reach every child task
+Cancelling a task cancels what it is awaiting, not tasks it started. An agent loop that fires
+parallel tool calls with bare `asyncio.create_task(...)` leaves those children running after the
+parent is cancelled. Start them in an `asyncio.TaskGroup` (Python 3.11+) or an AnyIO task group,
+*because* structured concurrency ties the children's lifetime to the block: cancelling the parent
+cancels every child and waits for their `finally` blocks before the parent finishes.
 
 ### Rules for code that may be cancelled
 1. **Do not swallow `CancelledError`.** Catching `Exception` is safe because `CancelledError` derives
@@ -157,6 +176,8 @@ concurrency cap translates directly into shorter queues for the users who stayed
   capacity shrinks until the worker appears hung.
 - Testing only against the app directly; behind a buffering proxy the disconnect never arrives, so
   cancellation works in development and silently does nothing in production.
+- Spawning parallel tool or model calls with bare `create_task` inside a cancellable agent step; the
+  symptom is tool side effects and provider usage logged seconds after the request was cancelled.
 
 ## When to use
 Wire up disconnect-driven cancellation for every interactive endpoint whose work is long or expensive:
@@ -183,7 +204,9 @@ returns true, or have the loop check before each step. Cancellation lands at the
 place explicit cancel points between steps rather than relying on wherever it happens to land. The
 ticket-creating call should either complete or not start: check for disconnect before it, give it an
 idempotency key so a retry cannot duplicate it, and shield only the bookkeeping that records what was
-done. Make sure no broad `except` swallows `CancelledError`, and record the run's final state so the
+done. If steps fan out into parallel tool calls, run them in a `TaskGroup` so the cancellation reaches
+every child rather than leaving orphans that finish the job anyway. Make sure no broad `except`
+swallows `CancelledError`, and record the run's final state so the
 user can see what happened before they stopped it.
 
 ## Quiz

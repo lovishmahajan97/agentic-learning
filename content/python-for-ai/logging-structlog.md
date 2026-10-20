@@ -4,8 +4,8 @@ module: python-for-ai
 name: logging / structlog
 kind: tool
 difficulty: core
-est_minutes: 13
-status: fact-checked
+est_minutes: 15
+status: reviewed
 related:
   - observability/logging
   - fastapi-for-ai/structured-logging
@@ -59,7 +59,25 @@ dict**. That dict passes through a **processor chain**, an ordered list of funct
 `merge_contextvars` (pull in request-scoped context), `add_log_level`, `TimeStamper(fmt="iso")`,
 `format_exc_info` or `dict_tracebacks` (structured exceptions), a custom redaction step, then
 `JSONRenderer()` in production or `ConsoleRenderer()` locally. The pipeline design means policy (timestamps,
-redaction, sampling) lives in one place instead of at every call site.
+redaction, sampling) lives in one place instead of at every call site. A processor is just a function, so
+redaction and sampling look like this:
+
+```python
+SENSITIVE = {"api_key", "authorization", "prompt", "completion"}
+def redact(logger, method_name, event_dict):
+    for key in SENSITIVE & event_dict.keys():
+        event_dict[key] = "[redacted]"
+    return event_dict
+
+def sample_debug(logger, method_name, event_dict):
+    if method_name == "debug" and random.random() > 0.01:
+        raise structlog.DropEvent          # silently discards this event
+    return event_dict
+```
+
+Order matters *because* each processor sees only what earlier ones produced: redaction must run after
+`merge_contextvars` (or a key bound in context escapes it) and before the renderer (after which there is
+only a string). Every processor runs on every emitted event, so keep them cheap.
 
 ### Context binding
 `log = log.bind(conversation_id=cid)` returns a new logger carrying that field; bound loggers are immutable,
@@ -67,7 +85,23 @@ so binding in one function cannot leak into another. For request-wide context, `
 (`bind_contextvars`, `clear_contextvars`) stores fields in a `contextvars.ContextVar`. Context variables are
 copied into each asyncio task, so a request ID bound in FastAPI middleware appears on every line emitted
 while handling that request, even across `await`s, without passing it explicitly. Clear it at the start of
-each request so a reused worker does not carry stale values.
+each request so a reused worker does not carry stale values. The copy is one-way and happens at task
+creation: a value bound inside a child task is invisible to its parent, and work handed to a thread with
+`loop.run_in_executor` does not inherit the context at all (`asyncio.to_thread` does copy it), so lines
+logged from that thread lose their `request_id`.
+
+### Handlers can block the event loop
+A stdlib handler writes synchronously inside the logging call. Writing to stdout or stderr in a container
+is normally cheap, but a file on a slow disk or a network handler (syslog, HTTP) stalls every coroutine in
+the process while it writes. The stdlib answer is `QueueHandler` on the hot path plus a `QueueListener`
+thread that owns the slow handlers, *because* enqueueing is fast and the I/O moves off the event loop. In
+containers the usual pattern sidesteps this: write JSON to stdout and let the platform's log agent ship it.
+
+### Level discipline
+Levels are only useful if they mean the same thing everywhere: DEBUG for detail you would enable while
+investigating, INFO for one summary event per meaningful unit of work (a request, an LLM call, a tool
+call), WARNING for something that recovered (a retry, a fallback model), ERROR for a failed unit of work
+someone may need to look at. Alerting is then built on ERROR rate and on fields, not on message text.
 
 ### Integrating the two
 Third-party libraries (httpx, openai, uvicorn) log through stdlib. structlog can either use stdlib loggers as
@@ -138,6 +172,8 @@ handle_request("u_42", "Summarize this contract ...")
   failed but have no traceback, because only `log.exception` or `exc_info=True` captures it.
 - Logging raw prompts that contain API keys, PII or retrieved documents; the symptom is a security review
   finding customer data in a log index that half the company can query.
+- Offloading blocking work with `loop.run_in_executor` and logging inside it; the symptom is a subset of
+  lines, exactly those from the thread pool, missing `request_id` and impossible to join to their request.
 - Emitting a log line per streamed token; the symptom is log volume and cost scaling with output length and
   the useful summary line drowning in noise.
 

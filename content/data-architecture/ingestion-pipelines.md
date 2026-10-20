@@ -5,7 +5,7 @@ name: Ingestion pipelines
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - data-architecture/etl-elt-for-rag
   - data-architecture/document-processing-pipelines
@@ -90,6 +90,33 @@ deletes are written as tombstone rows carrying the same key, so a replay of any 
 end state. The watermark is committed *after* the batch's writes are durable; committing it first is the
 classic bug that turns a crash into a silent gap.
 
+The delivery guarantee this buys is worth stating precisely. No stage is exactly-once: the overlap window,
+retries and redelivered webhooks all mean the same change can arrive twice. The pipeline is
+*at-least-once with idempotent effects*. Re-applying a change keyed by `(source, source_id, version)`
+leaves the store unchanged, so a duplicate does no harm and a gap is the only failure you must prevent.
+That is why the commit order matters more than deduplication: duplicates are absorbed downstream, gaps
+are not.
+
+### Initial load, backfills and the handoff to incremental
+Every connector has two modes: the first full load and steady-state increments. The dangerous moment is
+the switch from one to the other. If you snapshot the source and then start polling "from now", changes
+made during the snapshot, which can take hours for a large source, fall between the two. The fix is to
+record the change position *before* the snapshot starts: the cursor value, the provider's delta token,
+or the log position for CDC. Then the incremental reader starts from that recorded position, and the
+idempotent upserts absorb the overlap. Debezium works this way: it takes a consistent initial snapshot,
+then streams from the log offset it recorded at snapshot time. Run backfills, such as re-ingesting a
+source after a connector bug, in a separate lane with their own rate-limit budget. Otherwise a
+multi-day backfill uses up the API quota and the incremental sync goes stale while it runs.
+
+### Treat source schemas as a contract that will break
+SaaS APIs add fields, rename them and change pagination without notice, and a database team will
+eventually drop a column the connector reads. Validate each fetched record against an expected schema
+at the landing boundary. Store unknown fields in the raw record instead of dropping them, and send
+records that fail validation to quarantine rather than letting them flow on with nulls. A connector
+that quietly writes `title = null` for a whole source is worse than one that stops, because the index
+fills with untitled chunks and nothing alarms. The data-contracts lesson covers making this explicit
+with the source owner.
+
 ### Decouple fetch rate from processing rate
 Sources impose rate limits; parsers and embedders have their own throughput. A queue between the connector
 and the transformation stages absorbs the mismatch, gives retries with backoff a place to live, and lets a
@@ -173,6 +200,9 @@ the standard pairing for sources that only expose `updated_at`.
 - Re-fetching on every `updated_at` bump without a content hash; the symptom is a large embedding bill
   for a corpus that barely changes, because the SaaS source bumps timestamps on permission edits. The
   opposite error, skipping hash-identical items entirely, silently drops those permission edits.
+- Starting the incremental cursor at the time the initial snapshot *finished* rather than when it
+  started; the symptom is documents edited during the first load that stay at their old version until
+  someone edits them again.
 - No dead-letter path; the symptom is a whole nightly run that fails repeatedly on the same oversized or
   malformed file while thousands of healthy documents go stale.
 

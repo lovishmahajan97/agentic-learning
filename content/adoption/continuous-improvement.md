@@ -5,7 +5,7 @@ name: Continuous improvement
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - evals/error-analysis
   - evals/regression-tests
@@ -39,7 +39,9 @@ can say whether the system is getting better overall. The team is busy but the a
 
 Continuous improvement replaces that with a loop that has a measurable input (classified failures), a
 measurable gate (no regression on a frozen suite) and a measurable output (the targeted bucket shrinks
-in production). This is the same discipline as test-driven bug fixing, adapted to probabilistic systems.
+in production). It is the plan-do-check-act cycle from quality management, with test-driven bug fixing
+as the "check" step, adapted to systems whose outputs are probabilistic and whose dependencies change
+underneath them.
 
 ## How it works
 ### 1. Observe
@@ -73,9 +75,18 @@ system. This proves the suite catches the failure, and keeps it caught after lat
 
 ### 6. Gate, release, verify
 Run the full frozen suite on the candidate. Require improvement on the targeted slice and no regression
-beyond noise on every other slice. Ship behind a canary or shadow deployment, then check online that the
-bucket's weekly count fell. Version every prompt, retrieval config and model, so a change in production
-metrics can be attributed to a specific release.
+beyond noise on every other slice. "Noise" needs a number, for two reasons. Slices are small, so a pass
+rate over *n* cases has a standard error of about `sqrt(p(1−p)/n)`; and LLM outputs and LLM judges vary
+between runs even on identical inputs. Because baseline and candidate run on the *same* cases, compare
+them paired: count cases that flipped pass→fail (*b*) and fail→pass (*c*). McNemar's test treats
+`(b − c)² / (b + c)` above about 3.84 as a change unlikely to be chance at the 5% level (with only a
+handful of flips, use the exact binomial version instead). For flaky
+cases, run each several times and score the majority, or the gate will block and pass at random.
+
+Ship behind a canary or shadow deployment, then check online that the bucket shrank. Use a *rate* (failures
+per 1,000 conversations) compared with the bucket's own pre-release weeks, not a raw count, because
+traffic growth makes a fixed bucket look bigger. Version every prompt, retrieval config and model, so a
+change in production metrics can be attributed to a specific release.
 
 ### 7. Run it on a cadence
 A weekly triage and a fixed release train keep the loop moving without turning every complaint into an
@@ -127,6 +138,13 @@ The refund guardrail goes first despite the lowest score. The candidate fixes re
 because the fix cost the French slice four points. That is exactly the regression that
 reactive patching would have shipped.
 
+Is four points real or noise? Suppose (illustratively) the French slice has 250 cases: 0.88 → 0.84 is
+ten net cases. Paired, say 13 flipped pass→fail and 3 fail→pass: `(13 − 3)² / 16 ≈ 6.3`, above 3.84, so
+block. Had the slice held 25 cases, four points would be one case, and the right response is to rerun or
+grow the slice, not to trust a fixed 2-point tolerance. In this scenario the cause was that the new
+refund instruction ("always state the policy in English legal terms") overrode the language rule, which
+the trace of a flipped case shows directly.
+
 ## Trade-offs
 - A fast release train shortens time-to-fix but makes attribution harder; batch fewer changes per release when you need to know which change moved the metric.
 - Fixing at the prompt layer is quick and cheap, but it accumulates brittle instructions; once the same bucket returns after several prompt fixes, move the fix to retrieval, tools or fine-tuning.
@@ -137,6 +155,8 @@ reactive patching would have shipped.
 - Whack-a-mole prompt edits without a suite: the symptom is complaints you already fixed reappearing a few releases later.
 - Prioritising by who complained loudest: the dashboard shows a large, steady bucket that has gone untouched for weeks while small anecdotes get fixed.
 - Overfitting to the regression suite: offline pass rates climb every release while production acceptance and edit rates stay flat.
+- Tracking bucket counts instead of rates: a fixed failure appears to "come back" in the month traffic doubles, while its rate per 1,000 conversations is still down.
+- A gate that ignores run-to-run variance: the same candidate passes on Monday and fails on Tuesday, and the team learns to rerun until green.
 - Unversioned changes: production quality shifts and nobody can tell whether the prompt edit, the re-index or the vendor's model update caused it.
 - Feedback that disappears into a backlog: feedback volume drops over time because users learn that reporting changes nothing.
 

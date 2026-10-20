@@ -4,7 +4,8 @@ module: deployment
 name: UAT (user acceptance testing)
 kind: practice
 difficulty: core
-est_minutes: 15
+est_minutes: 16
+status: reviewed
 related:
   - customer-data-evaluation/acceptance-testing-against-customer-kpis
   - evals/task-specific-acceptance-criteria
@@ -68,14 +69,34 @@ with minor edit*, *wrong*, *harmful*). Overlap a fraction of cases between teste
 *because* if two adjusters disagree on the same output the criterion itself is ambiguous and must be
 fixed before the numbers mean anything.
 
-### 5. Triage defects by cause
+### 5. Size the sample and handle non-determinism
+A rate threshold is a claim about the true pass rate, so the sample must be big enough that the lower
+end of its confidence interval clears the bar. A quick planning estimate uses the normal approximation:
+
+```
+n ≈ z² · p(1 − p) / m²        z = 1.96 for 95%, p = expected pass rate, m = margin you can afford
+```
+
+If you expect about 88% against an 85% bar, the margin is 3 points: 1.96² × 0.88 × 0.12 / 0.03² ≈ 450
+cases. The Wilson interval used to report the result is slightly more conservative and needs roughly 550.
+The lesson of the formula is the *m²* in the denominator: halving the margin quadruples the cases, which
+is why a criterion set just below the expected rate is expensive to prove, and why negotiating the bar
+and the sample together during scoping is cheaper than discovering the problem at sign-off.
+
+Non-determinism changes what counts as a sample. Running each case three times does not turn 200 cases
+into 600 independent observations, *because* runs of the same case share the same input and difficulty
+and fail together. Score at the case level (for example "passes on at least 2 of 3 runs", or the
+per-case pass fraction averaged across cases), and report the run-to-run flip rate separately: a case
+that passes once and fails once is a stability defect in its own right, even if the average looks fine.
+
+### 6. Triage defects by cause
 Every failure gets a severity (blocker, major, minor) and a cause: **integration** (wrong data reached the
 model), **retrieval** (right data existed, was not found), **model/prompt** (right context, wrong answer),
 or **requirement** (system did what was specified, specification was wrong). The cause decides the fix and
 whether a re-test is needed. A "requirement" finding is a change request, not a defect, and treating it as
 a defect is how UAT never ends.
 
-### 6. Exit and sign off
+### 7. Exit and sign off
 UAT exits when hard gates are clean, rate thresholds are met with enough confidence, and no open blockers
 remain. Sign-off is a named person on the customer side, recorded. Every failing case found during UAT
 goes into the customer-specific regression suite so it stays fixed.

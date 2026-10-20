@@ -4,8 +4,8 @@ module: data-architecture
 name: Vector store sizing
 kind: practice
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 15
+status: reviewed
 related:
   - data-architecture/vector-database-architecture
   - data-architecture/embedding-versioning-re-indexing-strategy
@@ -91,7 +91,18 @@ on dimension, `ef`, filter selectivity and hardware, so it must be measured with
 filters, not taken from a benchmark. `nodes = max(ceil(total_RAM / RAM_per_node), ceil(peak_QPS /
 QPS_per_node))`, sized at peak rather than average, within the latency budget the product allows retrieval.
 
-### Step 7: migrations
+### Step 7: decide what must be RAM-resident, then size the disk
+Not every byte has to be in RAM, and the line between "must be" and "may be" is set by access pattern.
+The graph links and whatever vectors the traversal compares against are read at random on every hop,
+so they must be resident; if they are memory-mapped from disk and the working set falls out of the page
+cache, latency rises by orders of magnitude. Full-precision vectors used only for rescoring are read a
+few dozen to a few hundred times per query (k times the oversampling factor), so on an SSD they can live
+on disk. Payload is fetched only for the final k. Engines expose this as per-collection settings (for
+example on-disk vectors or payload in Qdrant, with the quantized copy kept in RAM). Then size the disk
+separately: full-precision vectors, the quantized copy, the write-ahead log, and snapshots or backups,
+which are complete copies. Disk is cheap but not free, and the snapshot is what you restore from.
+
+### Step 8: migrations
 A change of embedding model means the new vectors coexist with the old until cutover. Budget for the
 collection to double during that window, or plan to migrate tenant by tenant so the overlap is bounded;
 the re-indexing lesson in this module covers the strategy.
@@ -117,6 +128,14 @@ configuration varies: pgvector, for instance, offers half-precision (`halfvec`, 
 binary (`bit`) types rather than int8, so its nearest equivalent is about 4.9 GB of vectors, still small
 enough for an existing database host. All figures are illustrative order-of-magnitude arithmetic; measure
 recall after quantizing.
+
+Push one step further to see the next bottleneck. Binary quantization stores 1,024 bits, which is 128
+bytes per vector, so the vectors take 2.4 M × 128 B ≈ 0.3 GB. That is the same as the HNSW links. From
+here, shrinking vectors further barely helps, because the graph and the per-point ids and filter fields
+now dominate. The remaining levers are a smaller `M` (fewer links, lower recall), or IVF-style or
+disk-based indexes whose overhead is not per-link. Binary codes also lose more recall than int8, so they
+are normally used with heavier oversampling and rescoring from full-precision vectors on disk. Each
+lever you pull exposes the next term of the formula as the largest one.
 
 ```python
 import math
@@ -176,7 +195,7 @@ chunks-per-document distribution from a sample rather than assuming the mean, me
 after any quantization, and load-test QPS with production-shaped filters. The number tells you whether
 pgvector in the existing database suffices, whether quantization is worth its recall cost, and what the
 managed-service bill will be at the chosen precision. In interviews, "how big a vector store does this
-corpus need" is answered by walking the seven steps with explicit assumptions and then naming the two
+corpus need" is answered by walking the eight steps with explicit assumptions and then naming the two
 levers, quantization and payload placement, that change the answer most.
 
 ## Role lens

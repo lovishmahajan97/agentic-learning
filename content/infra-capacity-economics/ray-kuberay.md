@@ -5,7 +5,7 @@ name: Ray / KubeRay
 kind: tool
 difficulty: advanced
 est_minutes: 18
-status: fact-checked
+status: reviewed
 related:
   - infra-capacity-economics/keda-autoscaling
   - infra-capacity-economics/inference-clusters
@@ -73,6 +73,17 @@ and object store). The head is a single point of failure: lose it and, by defaul
 goes with it. The **autoscaler** scales on *pending logical demand*, not utilisation: if tasks are queued
 asking for GPUs that no node has free, it adds workers; idle workers are removed after a timeout.
 
+### Failure semantics
+Ray's recovery model follows from the primitives. A failed task is retried (by default a few times) on
+any node with resources, *because* it is stateless. A lost object is rebuilt by re-running the tasks
+that produced it (lineage reconstruction), which works for task outputs but not for objects created
+with `ray.put`. An actor can be restarted (`max_restarts`), but its in-memory state is gone, so a
+model actor reloads its weights and any per-actor progress must be checkpointed by your code. Every
+object has an owner, the worker that created the reference; if the owner dies, its objects are lost
+even if copies survive elsewhere. Design batch pipelines so a retried batch is idempotent and long runs
+checkpoint their output, and treat the head node as the one component whose loss is not automatically
+survivable.
+
 ### Libraries
 **Ray Data** streams datasets through CPU and GPU stages with back-pressure, the usual tool for offline
 batch inference and embedding. **Ray Train** and **Ray Tune** wrap distributed training and
@@ -83,7 +94,10 @@ hyperparameter search. **Ray Serve** runs deployments as replica actors with req
 KubeRay adds three CRDs. **RayCluster** declares a head group and worker groups (each with pod template,
 `minReplicas`, `maxReplicas`); with in-tree autoscaling enabled, an autoscaler sidecar in the head pod
 edits worker-group replica counts, and a node autoscaler (cluster autoscaler or Karpenter) supplies GPU
-nodes. **RayJob** creates a cluster, submits an entrypoint and can tear the cluster down when it
+nodes. Scale-down is why this is an operator rather than a plain Deployment: Ray must choose *which*
+worker to remove (an idle one holding no actors or primary object copies), so the autoscaler names
+specific pods for KubeRay to delete instead of decrementing a replica count and letting Kubernetes pick
+one at random. **RayJob** creates a cluster, submits an entrypoint and can tear the cluster down when it
 finishes, so a nightly batch run pays for GPUs only while it runs. **RayService** runs a Serve application
 and handles cluster-spec upgrades by bringing up a new cluster, waiting until it is healthy, then
 switching traffic; changes to only the Serve config are applied in place on the running cluster.
@@ -154,8 +168,8 @@ means you pay for about that long, not for an always-on pool. The argument names
 ## Pitfalls
 - Mismatched Ray or Python versions between the client, head image and worker images; the symptom is
   cryptic connection or deserialisation errors at job submission rather than a clear version message.
-- Exposing the dashboard or job-submission port beyond the cluster; these endpoints are not authenticated
-  by default and accept arbitrary code, and the symptom is unknown jobs (often crypto-mining) on your GPUs.
+- Exposing the dashboard or job-submission port beyond the cluster; these endpoints have historically had no
+  authentication by default and accept arbitrary code (check what your Ray version offers), and the symptom is unknown jobs (often crypto-mining) on your GPUs.
 - Declaring `num_gpus` that do not match what the code uses; the autoscaler provisions by declarations,
   so the symptom is idle GPU nodes held by actors or, conversely, two processes OOMing one card.
 - Running GCS on the head without fault tolerance for a RayService; the symptom is a head-pod restart

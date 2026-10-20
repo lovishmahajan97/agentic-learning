@@ -4,8 +4,8 @@ module: node-ts-for-ai
 name: API clients with retries & circuit breakers
 kind: pattern
 difficulty: core
-est_minutes: 15
-status: fact-checked
+est_minutes: 17
+status: reviewed
 related:
   - serving-inference/retry-strategies
   - reliability/circuit-breakers
@@ -58,10 +58,14 @@ chunks, not one giant budget that must cover a 90-second answer. Carry a request
 the call chain so attempt timeouts plus backoff never exceed what the caller can wait for.
 
 ### Classify before retrying
-Retry only what can succeed on a second try: network errors (`ECONNRESET`, `ETIMEDOUT`,
-`ECONNREFUSED`), 408, 429, 500, 502, 503, 504 and Anthropic's 529. Do not retry 400, 401, 403, 404 or
-422: the request is wrong and will be wrong again. Treat a timeout as retryable only if the operation is
-idempotent, *because* the first attempt may have succeeded server-side after you stopped listening.
+Retry only what can succeed on a second try: 408, 429, 500, 502, 503, 504, Anthropic's 529 and network
+errors. Do not retry 400, 401, 403, 404 or 422: the request is wrong and will be wrong again. Network
+errors split by *when* they happened. A refused connection or a connect timeout (`ECONNREFUSED`,
+`UND_ERR_CONNECT_TIMEOUT`) means the request never reached the server, so it is always safe to retry. A
+reset or timeout after the request was sent (`ECONNRESET`, a read timeout, a socket closed mid-body) is
+ambiguous: the server may have processed it and the reply was lost. Treat those as retryable only if the
+operation is idempotent, *because* the first attempt may have succeeded server-side after you stopped
+listening, and an LLM call that completed is billed whether or not you received it.
 
 ### Exponential backoff with full jitter
 Attempt *n* sleeps `random(0, min(cap, base × 2^n))`. The exponential term backs off fast enough to help
@@ -79,8 +83,8 @@ ambiguity to the caller.
 ### The vendor SDKs
 The Anthropic TypeScript SDK retries connection errors, 408, 409, 429 and 5xx with backoff, honours
 `Retry-After`, and exposes `maxRetries` (default 2) and `timeout` (default 10 minutes, in milliseconds;
-for non-streaming calls with a large `max_tokens` the SDK raises the default, up to 60 minutes). A
-timed-out attempt is itself retried, so wall-clock time can reach roughly `timeout × (maxRetries + 1)`
+for a non-streaming call whose `max_tokens` implies a generation longer than that, the SDK refuses and
+asks you to stream unless you set `timeout` explicitly). A timed-out attempt is itself retried, so wall-clock time can reach roughly `timeout × (maxRetries + 1)`
 plus backoff, which is the number to put in your deadline arithmetic. The OpenAI Node SDK follows the same design with the
 same defaults. Errors come back as typed classes (`Anthropic.RateLimitError` for 429,
 `Anthropic.InternalServerError` for 5xx including 529, `Anthropic.APIConnectionError`, all subclasses
@@ -105,14 +109,37 @@ full load. A breaker needs a fallback: a smaller model, a cached answer, a degra
 error with a `Retry-After` for your own callers. In Node, `opossum` is the common breaker library;
 `cockatiel` composes retry, timeout, breaker and bulkhead policies; `p-retry` covers retry alone.
 
+Breaker state is per process. With 20 replicas, each one counts its own failures, trips on its own
+schedule and sends its own half-open probe, so the provider sees up to 20 probes per reset period. That
+is usually acceptable and keeps the breaker free of dependencies; sharing state through Redis makes the
+fleet trip together, but puts a network call in front of every request to protect against a network
+failure.
+
 ### Bulkheads
 Limit concurrent in-flight calls per dependency (`p-limit` or a semaphore) so one slow provider cannot
 consume every worker slot. For LLM providers this doubles as a way to stay under concurrency-based
 quotas, and backed by Redis it works across replicas.
 
+### Retry budgets
+Per-request attempt limits do not bound fleet-wide amplification: if every request may make 3 attempts,
+an outage can triple traffic. A retry budget caps retries as a fraction of recent successful or total
+requests (for example, at most one retry per ten requests over the last minute, an illustrative ratio
+to tune): during a blip almost every failure gets its retry, during an outage the budget empties and
+further failures surface immediately. It is the per-client analogue of a breaker, and some service
+meshes and gRPC clients implement it as retry throttling.
+
+### Composing the layers
+Order matters, from the outside in: request deadline, then bulkhead, then breaker, then retry with
+backoff, then the per-attempt timeout around the actual call. The deadline is outermost *because* it is
+the caller's promise and every inner wait must fit inside it. The breaker sits outside the retry loop
+*because* one exhausted retry sequence is one logical failure; inside, it would count each attempt and
+trip three times faster than intended, and an open breaker should stop the retries from starting at
+all. The timeout is innermost *because* it bounds a single attempt, so a hung attempt becomes a
+classifiable error the retry layer can act on.
+
 ## Example
 A minimal `fetchWithRetry` with per-attempt timeout (combined with the caller's own signal),
-error classification that retries timeouts only for idempotent requests, full-jitter backoff and
+error classification that retries ambiguous failures (timeouts, resets) only for idempotent requests, full-jitter backoff and
 `Retry-After`, plus a small consecutive-failure circuit breaker that lets exactly one probe through when
 half-open. Production code uses the SDK's built-in retries and `opossum` or `cockatiel`, but the
 mechanics are these. After the last retryable status the response is returned, not thrown, so the
@@ -120,7 +147,8 @@ breaker's wrapped function must turn 5xx and 429 into failures itself, as the us
 
 ```ts
 const RETRYABLE = new Set([408, 429, 500, 502, 503, 504, 529]);
-const TRANSIENT_CODES = ["ECONNRESET", "ETIMEDOUT", "ECONNREFUSED", "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT"];
+const NEVER_SENT = ["ECONNREFUSED", "UND_ERR_CONNECT_TIMEOUT"];           // safe for any method
+const MAYBE_SENT = ["ECONNRESET", "ETIMEDOUT", "UND_ERR_SOCKET"];         // idempotent requests only
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const jitter = (n: number, base: number, cap: number) => Math.random() * Math.min(cap, base * 2 ** n);
 
@@ -138,7 +166,8 @@ export async function fetchWithRetry(url: string, init: RequestInit,
       await sleep(retryAfter > 0 ? retryAfter * 1000 : jitter(n, o.baseMs, o.capMs));
     } catch (err: any) {
       const code = err?.cause?.code;                                          // undici wraps socket errors in err.cause
-      const transient = (err?.name === "TimeoutError" && idempotent) || TRANSIENT_CODES.includes(code);
+      const transient = NEVER_SENT.includes(code) ||
+        (idempotent && (err?.name === "TimeoutError" || MAYBE_SENT.includes(code)));
       if (!transient || n + 1 >= o.attempts) throw err;                       // caller aborts (AbortError) are never retried
       await sleep(jitter(n, o.baseMs, o.capMs));
     }
@@ -171,11 +200,12 @@ export class CircuitBreaker {
 - Aggressive per-attempt timeouts keep latency predictable but cut off slow-yet-successful long completions; for large outputs use a time-to-first-token timeout plus an idle timeout rather than one short total budget.
 - A circuit breaker protects your latency and the provider, but a mis-tuned threshold trips on normal error noise and takes a healthy dependency offline; thresholds should be rate-based over a minimum call volume.
 - Falling back to a cheaper model or a cached answer keeps the product up at a quality cost users may notice; whether that beats a clean error depends on the task (a chat assistant can degrade, a compliance extraction probably cannot).
+- A retry budget bounds fleet-wide amplification during outages, but it also denies retries to some requests during a genuine blip that a per-request policy would have saved; it flips from worth it to overhead when traffic is low enough that amplification cannot hurt the provider.
 - The SDK's built-in retry is simpler and correct for its own error classes, but it knows nothing about your deadline or breaker; the integration point is its `maxRetries` and `timeout` options, not a wrapper loop around it.
 
 ## Pitfalls
 - Nested retry loops (SDK retries inside your retries inside the queue's retries): the symptom is a single user action producing dozens of provider calls during an incident, visible as a cost spike in the same hour as the outage.
-- Retrying non-idempotent POSTs on timeout: the symptom is duplicate runs, messages or charges that each carry a different request id but trace back to one user click.
+- Retrying non-idempotent POSTs on timeout or `ECONNRESET`: the symptom is duplicate runs, messages or charges that each carry a different request id but trace back to one user click.
 - No jitter: the symptom is provider error rates oscillating in neat waves at your backoff intervals, as every client retries at the same instant.
 - Breaker without a minimum volume: the symptom is the breaker opening at 03:00 because two of the night's three requests failed.
 - Ignoring `Retry-After`: the symptom is 429s that keep coming despite backoff, because the server told you its window and you retried earlier than it.

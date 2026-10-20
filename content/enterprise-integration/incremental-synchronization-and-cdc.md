@@ -5,6 +5,7 @@ name: Incremental synchronization & CDC
 kind: pattern
 difficulty: advanced
 est_minutes: 18
+status: reviewed
 related:
   - enterprise-integration/webhooks
   - enterprise-integration/enterprise-connectors
@@ -65,10 +66,28 @@ completely and in a defined order.
    `r` snapshot read). Every committed change appears, in commit order per table key, with no load from
    polling queries.
 
+### What log-based CDC events actually contain
+The log records what the database needs for replication, which is not always what a consumer expects.
+In PostgreSQL the table's `REPLICA IDENTITY` decides the `before` image: with the default, an update or
+delete carries only the primary key as `before`, so a consumer that needs the old values (to remove a
+document from the right shard, say) must set `REPLICA IDENTITY FULL` and pay for larger log records.
+Large out-of-line (TOASTed) column values that an update did not touch may arrive as a placeholder rather
+than the value, so a consumer that blindly writes `after` can overwrite a document body with that
+placeholder. A multi-row transaction arrives as separate per-row events, so a consumer can observe the
+transaction half-applied unless it groups by transaction ID. And schema changes flow through the same
+pipeline: a renamed or retyped column changes the event shape, which is why CDC deployments usually pair
+with a schema registry and a consumer that tolerates added fields. Delivery is at-least-once, so every
+consumer is an idempotent upsert keyed by primary key, ideally guarded by the log position (LSN) so a
+replayed older event cannot overwrite a newer one.
+
 ### Snapshot, then stream
 Every incremental system starts with an initial snapshot and then follows changes. The hand-off must not
 lose changes made during the snapshot: log-based tools record the log position before snapshotting and
-stream from it, so overlap is resolved by idempotent upserts.
+stream from it, so overlap is resolved by idempotent upserts. A one-shot snapshot of a large table can hold
+a long-running read transaction on the source for hours; Debezium's incremental snapshots instead read the
+table in key-ordered chunks interleaved with the stream, using watermarks in the log to resolve conflicts
+between a chunk and concurrent changes (the approach described in Netflix's DBLog work), so a table can be
+re-snapshotted without pausing the stream.
 
 ### Applying changes downstream
 Upsert by primary key and apply deletes as deletes (remove chunks and embeddings). Make application
@@ -81,7 +100,9 @@ through the same path, or the index serves revoked content.
 Persist cursors transactionally with the applied changes (or after them, with idempotent replays). Monitor
 lag: for watermarks, now minus high-water mark; for CDC, consumer offset behind the log head. A stalled
 PostgreSQL replication slot makes the server retain WAL, which can fill the source's disk, so slot lag is a
-production alert, not a dashboard curiosity.
+production alert, not a dashboard curiosity. PostgreSQL 13+ can cap retained WAL with
+`max_slot_wal_keep_size`, at the price of invalidating a slot that falls too far behind, which then forces a
+re-snapshot.
 
 ## Example
 A watermark sync from a PostgreSQL table with soft deletes, an overlap window, keyset paging on
@@ -94,8 +115,8 @@ from datetime import timedelta
 OVERLAP = timedelta(minutes=10)  # illustrative; must exceed your longest write transaction
 
 def sync_once(conn, state: dict, index, page: int = 500) -> None:
-    hi = conn.execute("SELECT now()").fetchone()[0]           # database clock, not the worker's
-    cursor = (state["high_water"] - OVERLAP, "")              # re-read the overlap window
+    hi = conn.execute("SELECT clock_timestamp()").fetchone()[0]  # DB clock; now() is frozen per txn
+    cursor = (state["high_water"] - OVERLAP, "")              # overlap; "" sorts first for text ids
     while True:
         rows = conn.execute(
             """SELECT id, updated_at, deleted_at, title, body, acl FROM documents
@@ -117,8 +138,11 @@ def sync_once(conn, state: dict, index, page: int = 500) -> None:
     state["high_water"] = hi                                  # persist only after a full pass
 ```
 
-Run it every few minutes and the illustrative 10,000 daily changes cost 10,000 row reads plus re-embedding
-only the subset whose text changed. Hard deletes that bypass `deleted_at` are still invisible here, which is
+`clock_timestamp()` rather than `now()` matters if the connection is reused inside one open transaction:
+`now()` returns the transaction's start time, so the upper bound would never advance. Run it every five minutes and the illustrative 10,000 daily changes cost a few tens of thousands of row reads
+(each changed row is re-read by every run whose 10-minute overlap window covers it, about three runs here),
+plus re-embedding only the subset whose text changed; the hash gate is what keeps the overlap cheap. The
+`""` starting id assumes text ids; with integer or UUID keys start from 0 or the nil UUID instead. Hard deletes that bypass `deleted_at` are still invisible here, which is
 the argument for log-based CDC or a periodic full key comparison.
 
 ## Trade-offs
@@ -139,6 +163,9 @@ the argument for log-based CDC or a periodic full key comparison.
   changes, rather than content changes.
 - An abandoned PostgreSQL replication slot after decommissioning a consumer; the symptom is the source
   database's disk usage climbing until the customer's DBA pages you.
+- Applying Debezium `after` images blindly on a PostgreSQL source with default replica identity; the symptom
+  is documents whose body becomes a placeholder string after an unrelated metadata update, or deletes the
+  consumer cannot route because `before` holds only the key.
 - Saving the cursor before changes are applied; the symptom is changes lost permanently after a worker crash
   mid-batch.
 
@@ -147,7 +174,9 @@ Use full reloads for small sources and early pilots. Move to watermark or source
 or staleness hurts, insisting on a delete mechanism. Choose log-based CDC when you own or can access the
 database, need every change including hard deletes, or need low lag, and when someone will operate the
 pipeline. Keep a periodic full reconciliation regardless. Measure sync lag, changes applied per run, re-embed
-ratio, deletes applied, and drift found by reconciliation. In interviews, explaining why naive watermarks miss
+ratio (re-embeds over changes; a ratio near 1 on a metadata-heavy source means the hash gate is missing),
+deletes applied, replication-slot retained WAL for log-based CDC, and drift found by reconciliation (keys or
+hashes that differ between source and index). In interviews, explaining why naive watermarks miss
 changes and how CDC avoids it is the expected depth.
 
 ## Role lens
@@ -161,8 +190,8 @@ changes and how CDC avoids it is the expected depth.
 ## Check yourself
 **Q:** A sync uses `WHERE updated_at > :last_run` every five minutes. A few records modified during busy periods
 never appear in the index, and deleted records never disappear. Explain both and fix them.
-**A:** Missing records: `updated_at` is set when the statement runs, but the row becomes visible only when its
-transaction commits. A long transaction can commit after the sync advanced past that timestamp, so the row is
+**A:** Missing records: `updated_at` is set when the write happens (with `DEFAULT now()`, at transaction start,
+even earlier), but the row becomes visible only when its transaction commits. A long transaction can commit after the sync advanced past that timestamp, so the row is
 skipped forever; worker clock skew and shared boundary timestamps make it worse. Fix with the database clock
 for the upper bound, an overlap window longer than the longest transaction, keyset paging on `(updated_at,
 id)`, and idempotent upserts. Deleted records: hard deletes leave no row to match. Fix with soft deletes or a

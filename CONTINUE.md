@@ -1,5 +1,10 @@
 # Continuing the lesson build (handoff)
 
+> **Status 2026-10-20 (session 3, local): the build is complete.** 584/584 lessons written, fact-checked
+> and pedagogy-reviewed; 30/30 module guides; `python3 scripts/build.py` reports `ok=584/584`,
+> `modules missing=0 invalid=0`. The cloud branch was merged into `main` and deleted, so work on `main`.
+> The rest of this file is kept as a record of how the build was resumed.
+
 This file records where the 584-lesson generation stands, why it was interrupted, and exactly how to
 resume it from a **local** Claude Code / Cowork session on your own computer. Read it top to bottom
 before launching anything.

@@ -5,7 +5,7 @@ name: Serverless GPUs
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - infra-capacity-economics/keda-autoscaling
   - infra-capacity-economics/break-even-analysis
@@ -85,7 +85,8 @@ below.
 
 ### Billing shape
 You pay per second of container lifetime (not per request), often for CPU and memory as well, at a
-GPU rate above on-demand hourly pricing: the premium funds the idle pool and the fast storage.
+GPU rate usually above like-for-like on-demand hourly pricing (compare the same card from the same class
+of provider): the premium funds the idle pool and the fast storage.
 Cold-start seconds are usually billed, and so is the idle tail of every scale-down window: each
 container that scales to zero was first paid for while it sat idle for the full window. Egress, storage volumes and request overhead may be separate lines.
 
@@ -129,6 +130,9 @@ affects a small tail of requests during ramps. The arithmetic, not the branding,
   them or traffic gaps are rare, wrong for tight tail-latency targets.
 - Warm minimums and long idle windows buy latency with money, and past a point you are paying
   dedicated prices for a platform you do not control.
+- Pooled third-party hardware removes node operations but puts your weights and prompts in the
+  provider's regions and tenancy model; for regulated data the compliance review, not the price, often
+  decides.
 - Managed pooling hides nodes, drivers and images, at the cost of vendor-specific SDKs, less control
   over GPU topology and limits on multi-GPU or multi-node models.
 
@@ -141,6 +145,9 @@ affects a small tail of requests during ramps. The arithmetic, not the branding,
   so GPU-seconds per request are several times higher than on a batched dedicated server.
 - Forgetting that cold-start seconds are billed; symptom is a bill where start-up time rivals
   serving time, which happens whenever the scale-down window is short relative to request gaps.
+- Assuming serverless capacity is unlimited; symptom is requests queueing or failing with capacity or
+  quota errors during a burst, because the provider's pool for that GPU type in that region, or your
+  account's container limit, is exhausted exactly when everyone's traffic peaks.
 - Promising a tight p95 on a scale-to-zero deployment; symptom is an SLO breach on the first request
   after every lull.
 

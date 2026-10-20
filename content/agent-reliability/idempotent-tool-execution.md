@@ -4,8 +4,8 @@ module: agent-reliability
 name: Idempotent tool execution
 kind: pattern
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 18
+status: reviewed
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/conversation-execution-identifiers
@@ -50,6 +50,14 @@ That requires an identity for each logical call, a place to remember what it pro
 adapters around them) that honour the identity.
 
 ## How it works
+### What "idempotent" means here
+In mathematics an operation is idempotent when applying it twice equals applying it once:
+f(f(x)) = f(x). For a tool call the useful definition is stricter in one way and looser in another:
+repeating a call *with the same identity* must leave the world in the same state as one call **and**
+return the same response as the first call. Same state alone is not enough, because the caller who
+lost the first response needs the ticket id it contained. And "same identity" is not "same
+arguments": two identical-looking calls with different identities are two intended actions.
+
 ### Classify every tool
 - **Read-only** (`search`, `get_record`): naturally idempotent. Retry freely, and never replay cached
   results across retries because freshness matters.
@@ -59,6 +67,16 @@ adapters around them) that honour the identity.
 Record the classification in the tool schema so the harness can pick the retry policy automatically.
 MCP tool annotations (`readOnlyHint`, `idempotentHint`, `destructiveHint`) exist for exactly this,
 and they are hints, not guarantees: verify them in integration tests.
+
+### Make the operation idempotent where you can
+Often the cheapest fix is to change the operation rather than wrap it. A *relative* write
+(`increment(balance, 10)`, `append(list, item)`) changes the state again on every repeat; an
+*absolute* write (`set(balance, 110)`) does not. Turning one into the other needs care, because a
+blind `set` can overwrite someone else's concurrent change, so pair it with a precondition: a
+conditional update `set balance = 110 where version = 7`, an HTTP `If-Match` with an ETag, a
+compare-and-set. The first execution matches the precondition and succeeds; a repeat finds the
+version already moved and becomes a no-op you can recognise. This is the same move as "create" to
+"upsert by natural key", and it removes the need for a dedup table for that tool entirely.
 
 ### Derive the key
 The key must be identical across every retry of the same logical call and different for distinct
@@ -78,7 +96,7 @@ that is a product decision, not a runtime default.
    a tag, part of the subject line) and look it up before creating, or use a conditional create
    (`If-None-Match`, `INSERT ... ON CONFLICT DO NOTHING`). Lookup-then-create is racy across
    concurrent workers, so prefer conditional writes where the API offers them.
-3. **Local dedup table.** `tool_executions(key primary key, status, result, started_at,
+3. **Local dedup table.** `tool_executions(key primary key, args_hash, status, result, started_at,
    finished_at)`. Before executing, insert the key with status `in_flight`; if the insert conflicts,
    return the stored result when the status is `done`, or wait briefly when it is `in_flight` because
    another worker is on it. After executing, update to `done` with the result. The table must be
@@ -86,6 +104,18 @@ that is a product decision, not a runtime default.
    downstream support, but cannot cover a crash between the effect and the `done` update: the resume
    finds `in_flight` and must look the effect up downstream or treat the tool as "possibly executed"
    and escalate.
+
+### Keys need a fingerprint and a lifetime
+Store a hash of the arguments next to the key. A repeat with the same key and the same hash is a
+retry; the same key with *different* arguments is a bug (a key derivation that collides, or a
+resumed step whose model output changed), and silently replaying the first result would hide it.
+Stripe behaves this way: reusing a key with different parameters returns an error rather than the
+cached response. Keys also expire. Stripe documents that keys may be pruned once they are at least 24
+hours old, and other providers have their own windows; your dedup table needs a retention period
+too. The rule that follows: the dedup window must be longer than the longest time a run can be
+parked and later resumed. A run that waits three days for an approval and then re-executes a pending
+call with a key the provider forgot after one day gets a duplicate, with every component behaving as
+documented.
 
 ### Return the same response
 Idempotency applies to the response too. The second call must return the first result, marked as
@@ -122,7 +152,8 @@ support should instead mark the row "unknown" and reconcile before retrying.
 ```python
 import hashlib, time
 
-class DedupStore:                 # key -> {status, result}; back with a durable table in prod
+class DedupStore:   # key -> {status, result}; in prod a durable table that also stores an
+                    # args hash and rejects a key reused with different arguments
     def __init__(self):
         self.rows = {}
     def begin(self, key):         # existing row, or None if we now own the key; in prod an
@@ -165,6 +196,17 @@ def create_ticket(title, body, idempotency_key):
 # in the agent loop:  create_ticket({"title": t, "body": b}, key=key_for(ids, i))
 ```
 
+Trace the three paths. First call for key `k1`: `begin` finds no row, records `in_flight`, the API
+creates ticket `T-901`, `finish` stores it, and the model gets `{"id": "T-901"}`. The worker then dies
+before the checkpoint records that result, so the resume re-executes the pending call with `k1`:
+`begin` finds `done` and returns `{"id": "T-901", "replayed": true}` without touching the API. Two parallel workers both resuming
+the same step: one owns `k1`, the other waits up to ten seconds, then either replays the stored
+result or raises `in_flight`, which the harness schedules for later instead of showing the model an
+error. If the API call itself raises after the ticket was actually created (a timeout on the
+response), the row is released and the retry sends `k1` again; the ticketing API's own dedup returns
+`T-901`. Remove that downstream support and the same sequence creates `T-902`, which is why the
+release-on-exception rule is only safe with it.
+
 ## Trade-offs
 - Downstream idempotency keys give the strongest guarantee with the least code, but only where the
   API supports them; everything else needs an adapter-level dedup table that cannot see effects
@@ -176,6 +218,10 @@ def create_ticket(title, body, idempotency_key):
   second action.
 - Replaying the stored result keeps the model moving, but a replayed result may be stale if the
   resource has changed since; for reads prefer fresh execution, for writes prefer the replay.
+- Rewriting relative writes as conditional absolute writes removes the need for a dedup table, but
+  a repeat that finds the version moved is indistinguishable from a genuine concurrent change unless
+  you also record which version your call produced; where conflicts are common, keyed dedup is
+  clearer.
 
 ## Pitfalls
 - Random idempotency keys generated at call time; the symptom is dedup infrastructure in place while
@@ -188,6 +234,11 @@ def create_ticket(title, body, idempotency_key):
   labelled idempotent creating duplicates under retry in integration tests.
 - Never expiring in-flight rows; the symptom is a key stuck in flight after a crash so every retry
   errors forever.
+- A dedup window shorter than the longest parked run; the symptom is duplicates that appear only
+  for runs resumed days later, typically after a slow human approval, and never in tests.
+- Replaying on key match without comparing arguments; the symptom is a resumed step whose model
+  produced a different call (another recipient, another amount) silently "succeeding" with the
+  first call's result while the intended action never happens.
 
 ## When to use
 Every tool that writes, from the first prototype that touches a real system. Start by classifying

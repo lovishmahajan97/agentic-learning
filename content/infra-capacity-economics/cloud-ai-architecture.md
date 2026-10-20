@@ -5,7 +5,7 @@ name: Cloud AI architecture (AWS Bedrock, Azure OpenAI, Vertex AI)
 kind: concept
 difficulty: core
 est_minutes: 17
-status: fact-checked
+status: reviewed
 related:
   - infra-capacity-economics/api-provider-quotas-and-regional-limits
   - infra-capacity-economics/hybrid-on-prem
@@ -101,8 +101,9 @@ All three platforms present the same architectural layers, and your design decis
   account; Vertex has moved Gemini pay-as-you-go toward a dynamically shared quota rather than
   fixed per-project limits. The practical consequence is the same: plan capacity per model per
   region and request increases early, since increases are tickets, not API calls.
-- **SDK shape.** Bedrock has its own SDK (boto3) and the Converse API, plus vendor SDKs that
-  support Bedrock as a backend; Azure OpenAI uses the OpenAI SDK with an Azure client where
+- **SDK shape.** Bedrock has its own SDK (boto3) with two call styles: `InvokeModel`, whose
+  request body is each vendor's native format, and the Converse API, one message format across
+  models; vendor SDKs can also use Bedrock as a backend; Azure OpenAI uses the OpenAI SDK with an Azure client where
   `model` means the deployment name (Azure has also added a versionless "v1" endpoint usable from
   the standard OpenAI client, so check which style the current docs recommend); Vertex uses the Google Gen AI SDK or vendor SDKs with a Vertex
   backend. An internal gateway or an abstraction such as LiteLLM usually hides this so that
@@ -113,6 +114,25 @@ All three platforms present the same architectural layers, and your design decis
   you may be upgraded), so the retirement calendar is part of the plan.
   Unplanned upgrades change behaviour under your evals, so pinning plus a scheduled re-evaluation
   is the safe pattern.
+
+### Choosing the capacity mode
+Reserved capacity is a fixed hourly or monthly price for a throughput ceiling; pay-as-you-go is a
+per-token price with no ceiling guarantee. The comparison is the same arithmetic as owning GPUs:
+
+```
+on-demand cost  = tokens actually served × price per token
+reserved cost   = units × price per unit-hour × hours (paid whether used or not)
+break-even utilization u* = reserved cost ÷ (tokens the reservation could serve at full use × on-demand price)
+```
+
+Above u*, reserved is cheaper per token; below it, you are paying for a guarantee. The number that
+is hard to get is "tokens the reservation could serve", because each platform's unit (model unit,
+PTU) delivers a throughput that depends on the model and on the input/output mix: prompt-heavy
+traffic and generation-heavy traffic consume a unit differently. Each platform publishes sizing
+guidance or a calculator, but the reliable figure comes from a load test of your own traffic mix
+against a small reservation. Two further facts usually decide it: a latency SLO at peak can justify
+reserved capacity below u*, since the alternative is 429s at the worst moment; and commitment
+terms (hourly, monthly, longer) mean a forecast error is paid for the length of the term.
 
 ### The reference architecture
 Application → internal AI gateway (auth, routing, quotas, logging, prompt and response capture) →
@@ -164,6 +184,16 @@ def via_vertex(model_name: str) -> str:
 In production none of these calls live in application code; they sit behind the gateway, which
 tags each request with tenant, feature and region so that quota use and cost can be attributed and
 a fallback can be configured without touching the application.
+
+The decision the gateway's telemetry feeds is the capacity mode. A worked version with
+illustrative prices (not any platform's list price): a reservation costs $30,000 a month and your
+load test shows it sustains about 1.5 billion tokens a month of your mix at full use; the same
+tokens on pay-as-you-go cost $40 per million, so full use would cost $60,000 on demand. Break-even
+utilization is 30,000 ÷ 60,000 = 50%. If the workload keeps the reservation 70% utilised on
+average, reserved costs $30,000 against $42,000 on demand; at 30%, reserved costs $30,000
+against $18,000, and only a peak-latency SLO justifies it. The usual design reserves for the base
+and lets the burst above it spill to a pay-as-you-go deployment, which the gateway does by trying
+the reserved endpoint first and falling over on a 429.
 
 ## Trade-offs
 - You inherit the cloud's identity, network, logging and compliance perimeter, but you accept model

@@ -5,6 +5,7 @@ name: Threat modeling
 kind: practice
 difficulty: core
 est_minutes: 16
+status: reviewed
 related:
   - security-governance-compliance/ai-security
   - security-governance-compliance/zero-trust
@@ -82,13 +83,25 @@ attacker techniques and documented case studies. Write each threat as an attacke
 get a document into the knowledge base can make the agent email conversation contents to an external
 address." Stories are testable; categories are not.
 
+STRIDE is a prompt for completeness, not the only method, and two complements are worth knowing.
+**Attack trees** start from one attacker goal ("exfiltrate another tenant's tickets") and decompose it
+into the alternative and required steps beneath it, which is the better tool once STRIDE has found a
+threat that matters and you need to see every path to it and which single control cuts the most
+branches. **LINDDUN** applies the same per-element walk to privacy threats (linkability,
+identifiability, disclosure, unawareness, non-compliance and others), which STRIDE's
+information-disclosure bucket covers only crudely; reach for it when the system processes personal data
+at scale, as most LLM products with conversation logs do.
+
 ### Step 3: rate and decide
-Rate each threat by likelihood and impact. For LLM systems, assume the likelihood of injection is high
+Rate each threat by likelihood and impact, in coarse buckets (low, medium, high) rather than
+precise scores, because the inputs are judgements and two reviewers will not agree on a 7 versus an 8;
+the rating exists to order the work, not to compute risk. For LLM systems, assume the likelihood of injection is high
 wherever untrusted text flows in: the technique is public, cheap and needs no access. That moves the work
-to bounding impact. For each threat choose exactly one response: eliminate (remove the flow: the agent
-does not need web access), reduce (least privilege, approval gate, allowlist, output validation), transfer
-(vendor contract, insurance) or accept (documented, with an owner and a review date). A threat without a
-decision is itself the finding.
+to bounding impact. For each threat record a decision: eliminate (remove the flow: the agent does not need
+web access), reduce (least privilege, approval gate, allowlist, output validation), transfer (vendor
+contract, insurance) or accept (documented, with an owner and a review date). Reduction rarely drives risk
+to zero, so a reduced threat usually also carries an explicit acceptance of the residual risk. A threat
+without a decision is itself the finding.
 
 ### Step 4: validate and repeat
 Turn each mitigated threat into a test: injection cases in the evaluation suite, authorisation tests that

@@ -4,8 +4,8 @@ module: scoping
 name: Productionization
 kind: practice
 difficulty: advanced
-est_minutes: 15
-status: fact-checked
+est_minutes: 17
+status: reviewed
 related:
   - scoping/pilot-to-production-plan
   - scoping/rapid-prototyping-poc
@@ -56,6 +56,17 @@ bounded re-try (or a repair prompt) often succeeds, but count it separately so a
 hidden by retries. Define a fallback: a secondary model, a cached answer, or a graceful
 "cannot answer, routing to a person".
 
+Two retry details decide whether this helps or hurts during an incident. First, retries multiply across
+layers: if your code makes 3 attempts, the gateway in front of the provider makes 3, and the SDK
+underneath also retries by default (many do), one user request can become up to 27 provider calls just
+when the provider is struggling. Pick one layer to own retries and turn the others off or down, and add
+a circuit breaker so that when most recent calls are failing, new requests go straight to the fallback
+instead of each discovering the outage separately. Second, retries must fit the caller's deadline:
+attempts × timeout + total backoff is the worst-case latency, and it should be below whatever the user
+or upstream service will wait. And only retry what is safe to repeat: re-sending a classification is
+harmless, but re-running a tool call that sends an email or files a refund duplicates it unless the
+action carries an idempotency key.
+
 ### 2. Quality as a release gate
 Turn the PoC eval set into a regression suite that runs on every change to prompts, models, retrieval or
 tools. Version prompts and pin model versions where the provider allows, *because* an unpinned alias can
@@ -75,7 +86,20 @@ PII is redacted, and how long data is kept.
 
 ### 5. Cost and capacity
 Set per-user and per-tenant quotas, maximum input and output tokens, and budget alerts. Estimate cost at
-expected volume, *because* PoC cost per call times production volume is often the first surprise.
+expected volume, *because* PoC cost per call times production volume is often the first surprise:
+
+```
+monthly cost ≈ requests/month × (tokens_in × price_in + tokens_out × price_out) × (1 + retry rate)
+in-flight requests ≈ arrival rate × mean latency          (Little's law)
+tokens/minute ≈ requests/minute × (tokens_in + tokens_out)
+```
+
+The last two lines are what you check against provider rate limits, which are usually set per minute in
+both requests and tokens. At an illustrative 20 requests/second with 6 seconds of latency, about 120
+calls are in flight at once, and at 3,500 tokens each the system consumes over 4 million tokens per
+minute; a PoC that never ran more than one call at a time tells you nothing about whether that fits your
+quota tier. Long outputs dominate latency (they are generated token by token) and usually cost more per
+token than input, so capping output length is often the strongest cost and latency lever.
 
 ### 6. Operations and ownership
 Define SLOs, write runbooks for known failure modes (provider outage, quality regression, cost spike),
@@ -129,7 +153,12 @@ def production(ticket: str, user_id: str, max_attempts: int = 3) -> Triage | Non
 ```
 
 Each added line answers a production question the prototype ignored: what if it hangs, rate-limits,
-returns broken output, or costs too much, and how will we debug it next week?
+returns broken output, or costs too much, and how will we debug it next week? Note the worst case it
+implies: three 15-second timeouts plus up to 2 and 4 seconds of backoff is about 51 seconds before the
+human fallback. That is acceptable for a background triage queue and far too long for a chat reply,
+where you would cut attempts, shorten the timeout, or pass a single overall deadline through the loop.
+What it deliberately omits, a circuit breaker and cost quotas, belongs in a shared gateway rather than in
+every call site.
 
 ## Trade-offs
 - Retries improve success rates during transient faults, but they add latency and cost and can amplify an
@@ -154,6 +183,10 @@ returns broken output, or costs too much, and how will we debug it next week?
   content from documents they cannot open directly.
 - No per-request traces or cost attribution; the symptom is a large bill or a bad answer that nobody can
   explain or reproduce.
+- Stacked retries in application code, gateway and SDK; the symptom is provider call volume several times
+  the request volume during an incident, with rate-limit errors that persist after the provider recovers.
+- Retrying side-effecting tool calls without idempotency keys; the symptom is duplicate emails, tickets
+  or refunds that line up with timeout spikes in the traces.
 
 ## When to use
 Start productionization when a pilot shows the system is worth running, and scope it by risk: a

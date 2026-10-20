@@ -4,8 +4,8 @@ module: node-ts-for-ai
 name: PostgreSQL transactions & migrations
 kind: practice
 difficulty: core
-est_minutes: 16
-status: fact-checked
+est_minutes: 18
+status: reviewed
 related:
   - backend-fundamentals/postgresql-transactions-and-isolation-levels
   - backend-fundamentals/sql
@@ -63,7 +63,11 @@ hang on `connect()`. Every library wraps this: `pg` leaves it to you, Drizzle ex
 `db.transaction(async (tx) => { ... })`, Prisma has interactive `$transaction(async (tx) => { ... })`,
 Kysely and Knex have equivalents. The callback form exists *because* it makes rollback-on-throw and
 release impossible to forget. Inside the callback use `tx`, never the outer `db`: the outer handle goes
-back to the pool and escapes the transaction.
+back to the pool and escapes the transaction. Postgres has no true nested transactions; a nested
+`tx.transaction(...)` in Drizzle or Knex becomes a `SAVEPOINT`, so an inner failure can roll back to the
+savepoint while the outer transaction continues. If the client errors at the socket level, release it
+with `client.release(err)` so the pool destroys it instead of handing a broken connection to the next
+caller.
 
 ### Isolation and contention
 Postgres defaults to READ COMMITTED: each statement sees data committed before it started. That is
@@ -73,14 +77,25 @@ tools:
   and the usual answer for counters and "claim this job" patterns.
 - Atomic updates with a predicate: `UPDATE budgets SET remaining = remaining - $1 WHERE tenant = $2 AND
   remaining >= $1`, then check the row count. There is no lock to reason about *because* the condition
-  and the write are one statement.
+  and the write are one statement. The reason it is safe even at READ COMMITTED: when two such updates
+  hit the same row, the second blocks on the row lock until the first commits, then re-evaluates its
+  `WHERE` against the newly committed row version. With 1,200 remaining and two charges of 1,000, the
+  first leaves 200, the second re-checks `200 >= 1000`, matches zero rows, and the caller sees
+  "exhausted". A `SELECT` followed by a JavaScript check and an `UPDATE ... SET remaining = $computed`
+  has no such re-check, which is exactly the lost-update bug.
+- REPEATABLE READ gives the whole transaction one snapshot; if it tries to update a row that a
+  concurrent transaction changed and committed after the snapshot, it aborts with `40001` rather than
+  overwrite. It prevents lost updates but not every multi-row anomaly (write skew).
 - SERIALIZABLE isolation makes the database detect anomalies and abort one transaction with SQLSTATE
   `40001`. Your code must retry the whole transaction on `40001` (and on `40P01`, deadlock) in a small
   bounded loop, *because* the abort is the mechanism, not a bug.
 
 Keep transactions short and never hold one open across an LLM call: a 20-second completion inside a
 transaction pins a connection, holds locks and blocks the next migration. Do the model call, then open a
-transaction for the writes.
+transaction for the writes. Back the rule with server-side safety nets: `idle_in_transaction_session_timeout`
+kills a session that sits inside an open transaction doing nothing (the leaked-client case), and
+`statement_timeout` bounds any single query. Both can be set per role or per connection, so the
+application role can be strict while the migration role is not.
 
 ### Idempotency and the outbox
 Retries from queues and clients mean the same logical write arrives twice. A unique constraint plus
@@ -97,7 +112,13 @@ whole batch, and some need an explicit opt-out per file). The practices that mat
 - **Forward-only, expand/contract.** Renaming a column is: add the new column; deploy code that writes
   both and reads new-or-old; backfill in batches; deploy code that uses only the new one; drop the old.
   Each step is compatible with the version before and after *because* during a rolling deploy both
-  versions run at once.
+  versions run at once. Down migrations exist in most tools but are rarely the production rollback:
+  once new code has written data in the new shape, reversing the schema destroys it, so you roll back
+  the *code* (which the expand step keeps compatible) and fix forward.
+- **Backfill in batches, outside the DDL.** `UPDATE ... WHERE id BETWEEN $1 AND $2` in chunks of a few
+  thousand rows, each its own short transaction, *because* one giant `UPDATE` holds row locks on
+  every touched row until it commits, generates a burst of WAL that replicas must replay, and leaves
+  dead tuples that vacuum cannot reclaim while the transaction is open.
 - **Know which statements lock.** `ADD COLUMN` with a constant (non-volatile) default is a
   metadata-only change since Postgres 11; `ALTER COLUMN ... SET NOT NULL` on an existing column, or
   adding a CHECK or foreign key, scans the table under a lock that blocks writes. Use
@@ -113,7 +134,10 @@ whole batch, and some need an explicit opt-out per file). The practices that mat
   waiting.
 - **Run migrations as a separate step** (CI job or init container), not inside every replica's startup,
   and make sure a `pg_advisory_lock` guards the run so two runners cannot apply the same file
-  concurrently (many tools take one automatically; check yours rather than assuming).
+  concurrently (many tools take one automatically; check yours rather than assuming). Point the
+  migration runner at Postgres directly, not through a transaction-mode pooler such as PgBouncer:
+  session-level advisory locks and `SET lock_timeout` belong to a server connection that the pooler may
+  swap between statements.
 
 ## Example
 A `withTransaction` helper on raw `pg` that pins one client, releases it on every path and retries
@@ -128,17 +152,18 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 10 });
 export async function withTransaction<T>(fn: (tx: PoolClient) => Promise<T>, retries = 3): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     const client = await pool.connect();                // one connection for the whole transaction
+    let broken = false;
     try {
       await client.query("BEGIN");                      // add "ISOLATION LEVEL SERIALIZABLE" if you rely on it
       const result = await fn(client);
       await client.query("COMMIT");
       return result;
     } catch (err: any) {
-      await client.query("ROLLBACK").catch(() => {});
+      await client.query("ROLLBACK").catch(() => { broken = true; });   // socket gone: do not reuse
       const transient = err.code === "40001" || err.code === "40P01";   // serialization failure / deadlock
       if (!transient || attempt >= retries) throw err;
     } finally {
-      client.release();                                 // otherwise the pool leaks a connection
+      client.release(broken);                           // always release; `true` destroys a broken client
     }
   }
 }
@@ -178,6 +203,7 @@ CREATE INDEX CONCURRENTLY documents_embedding_hnsw ON documents USING hnsw (embe
 - Forgetting `client.release()` on an error path; the symptom is the service hanging on `pool.connect()` after exactly `max` failures.
 - `CREATE INDEX CONCURRENTLY` inside the migration tool's transaction; the symptom is `cannot run inside a transaction block`, and a failed concurrent build leaves an INVALID index that must be dropped by hand.
 - Adding a NOT NULL column with an inline backfill in one statement on a large table; the symptom is a deploy that holds an exclusive lock for minutes while every API request queues behind it.
+- Running migrations through PgBouncer in transaction mode; the symptom is `lock_timeout` apparently ignored or an advisory lock that never seems to be held, because consecutive statements ran on different server connections.
 - Running migrations on container start with several replicas and no advisory lock; the symptom is duplicate-apply errors or two runners racing on the same `ALTER`.
 
 ## When to use

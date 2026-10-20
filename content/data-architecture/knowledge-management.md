@@ -4,8 +4,8 @@ module: data-architecture
 name: Knowledge management
 kind: practice
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 15
+status: reviewed
 related:
   - data-architecture/document-processing-pipelines
   - data-architecture/ingestion-pipelines
@@ -73,6 +73,24 @@ same passage three times. Exact duplicates are caught by content hashing at inge
 rule for which copy survives, usually the one in the canonical source. Keep the mapping so that
 retrieval hits on the discarded copy can be redirected to the surviving one.
 
+### Decide what belongs in the index at all
+Not every fact should be embedded. An index is a snapshot refreshed on the ingestion cadence, so any fact
+that changes faster than that cadence, or that must be exact for this user right now (a price, stock
+level, account balance, ticket status), is stale by construction once indexed. Those facts belong in the
+system of record and are fetched at query time through a tool or API call; the index holds the stable
+prose that explains them (how pricing tiers work, what a status means). The rule of thumb: index
+explanations, look up values. This is *because* a retrieved chunk carrying last week's price is
+indistinguishable to the model from a correct one, while a live lookup either returns the current value or
+fails visibly.
+
+### Keep a controlled vocabulary
+Products get renamed, teams reorganise, and three departments call the same thing three names. If tags
+are free text, a filter on `product = "Atlas Pro"` misses every page still tagged with last year's name.
+Maintain a small glossary that maps aliases and former names to one canonical term, apply it to tags at
+ingestion, and use it for query expansion at retrieval time. It is cheap, it is owned like any other
+source, and it fixes a class of misses that no embedding model reliably closes, because a new product
+name often has no semantic relationship to the old one.
+
 ### Carry metadata that the retriever can act on
 At minimum: source system, owner, authority rank, lifecycle state, verified date, audience or access
 scope, product or domain tags, and language. These are what metadata filters and rerankers use to turn
@@ -86,6 +104,11 @@ query misses, classify the cause: missing document, stale document, duplicate cr
 one, or a genuine retrieval failure. Route the first three to the content owner with the query attached.
 This is the mechanism that keeps the corpus healthy over time, and it is cheap once ownership exists.
 Without it, the same gap is rediscovered by every user who hits it.
+
+Two equally authoritative sources that disagree are a special case worth detecting explicitly. When the
+top candidates share an authority rank but contradict each other on a value, the better behaviour is to
+show the user both with their dates and open a ticket for the owners, rather than let the model pick one
+silently, because the silent pick is right only by chance and nobody learns the conflict exists.
 
 ### Access and tenancy are part of knowledge, not an afterthought
 A document's permissions are knowledge about who may see it. Ingestion must capture ACLs from the source
@@ -144,6 +167,8 @@ unanswered question clusters, owned by the support leads.
   page they could never open in the source system.
 - No feedback path from users to content owners; the symptom is the same gap reported many times with
   nobody positioned to fix it.
+- Indexing volatile values such as prices or stock levels instead of looking them up; the symptom is answers
+  that were right on the day of ingestion and drift wrong until the next run.
 
 ## When to use
 Knowledge management is required for any RAG system over content that people maintain, which is nearly

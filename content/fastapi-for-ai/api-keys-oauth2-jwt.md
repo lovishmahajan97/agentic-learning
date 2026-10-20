@@ -4,8 +4,8 @@ module: fastapi-for-ai
 name: API keys / OAuth2 / JWT
 kind: decision
 difficulty: core
-est_minutes: 20
-status: fact-checked
+est_minutes: 22
+status: reviewed
 related:
   - fastapi-for-ai/dependency-injection
   - fastapi-for-ai/cors
@@ -58,8 +58,9 @@ logs and leaked-secret scanners without storing it in plaintext. On each request
 key and look it up, which gives you the tenant, scopes and rate-limit tier. Revocation is immediate
 because you check the store every time. The weakness is that the key is a bearer secret with no
 expiry: anyone who copies it from a log, a front-end bundle or a notebook is that customer until you
-rotate it. So keys never go into browsers, and you support several active keys per account so
-rotation needs no downtime.
+rotate it. So keys never go into browsers, travel only in a header (a query-string key ends up in
+access logs and proxy caches), and you support several active keys per account so rotation needs no
+downtime.
 
 ### OAuth2
 OAuth2 (RFC 6749) defines *roles* (resource owner, client, authorization server, resource server) and
@@ -93,9 +94,30 @@ it. Verifying it means:
    required.
 4. Authorize from the claims: scopes, tenant.
 
+Why asymmetric keys for IdP tokens: with `HS256` the same shared secret both signs and verifies, so
+every service that can check a token can also *mint* one for any user. With `RS256`/`ES256` only the
+issuer holds the private key, and verifiers get the public half, so compromising one resource server
+does not let it forge tokens for the others. HS256 is reasonable only when one service both issues and
+verifies its own tokens.
+
 Verification needs no network call per request, which is why JWTs scale across services. The cost is
 **revocation**: a stolen token stays valid until `exp`. Hence the standard design is short-lived
 access tokens (minutes) plus longer-lived refresh tokens that the IdP *can* revoke.
+
+### Choosing, by caller
+The three are not competitors so much as answers to "who is calling, and who vouches for them":
+- **A customer's backend, no human present, customer has no IdP**: an API key per integration,
+  hashed at rest, scoped and rate-limited per key. Revocation is instant because you look it up.
+- **A customer's backend that runs an IdP, or demands short-lived credentials**: OAuth2 client
+  credentials; the token is usually a JWT your API verifies locally.
+- **A human in your UI**: authorization code + PKCE against your or the customer's IdP (OIDC); your
+  API receives a short-lived JWT access token.
+- **An agent or tool acting for that human**: a token derived from the user's (token exchange or a
+  downscoped token with the tool's audience), never a shared service key that can reach every tenant.
+
+The decision variables are whether a human is present, who owns identity (you or the customer), how
+fast a credential must die after compromise (instant lookup vs. wait for `exp`), and how many services
+must verify it (one lookup is cheap; a lookup on every hop of an agent chain is not).
 
 ### In FastAPI
 `fastapi.security` provides `APIKeyHeader`, `HTTPBearer` and `OAuth2PasswordBearer`. They extract
@@ -108,13 +130,13 @@ One dependency that accepts either a customer API key (server-to-server) or an I
 (users), and returns the same principal type.
 
 ```python
-import hashlib, jwt
+import asyncio, hashlib, jwt
 from dataclasses import dataclass
 from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 
 ISSUER, AUDIENCE = "https://login.acme-idp.com/", "api://ai-platform"
-jwks = jwt.PyJWKClient(ISSUER + ".well-known/jwks.json")   # caches keys; fetch is sync, warm it at startup
+jwks = jwt.PyJWKClient(ISSUER + ".well-known/jwks.json")   # caches keys; its fetch is blocking I/O
 api_key_hdr = APIKeyHeader(name="X-API-Key", auto_error=False)
 bearer = HTTPBearer(auto_error=False)
 KEYS = {}   # sha256(key) -> {"tenant": ..., "scopes": [...]}, really a DB table
@@ -131,7 +153,8 @@ async def principal(key: str | None = Security(api_key_hdr),
             return Principal(rec["tenant"], "key:" + key[:12], set(rec["scopes"]))
     elif cred:
         try:
-            signing_key = jwks.get_signing_key_from_jwt(cred.credentials).key
+            jwk = await asyncio.to_thread(jwks.get_signing_key_from_jwt, cred.credentials)
+            signing_key = jwk.key                    # thread: a cache miss must not stall the loop
             c = jwt.decode(cred.credentials, signing_key, algorithms=["RS256"],
                            audience=AUDIENCE, issuer=ISSUER, leeway=30,
                            options={"require": ["exp", "sub"]})   # PyJWT accepts a token with no exp otherwise
@@ -158,6 +181,15 @@ async def chat(body: dict, p: Principal = Depends(require("chat:write"))):
 401 means "I don't know who you are" (with `WWW-Authenticate`). 403 means "I know, and you can't
 do this".
 
+Walk two requests through it. A customer backend sends `X-API-Key: sk_live_ab12...`; the dependency
+hashes it, finds the record for tenant `t_42` with scopes `{"chat:write"}`, and the route runs with
+`p.tenant == "t_42"`. A browser user sends a JWT whose payload is `{"iss": ISSUER, "aud":
+"api://ai-platform", "sub": "u_9", "tenant_id": "t_42", "scope": "chat:read", "exp": ...}`. Signature,
+issuer, audience and expiry all pass, so authentication succeeds, but `require("chat:write")` finds
+only `chat:read` and returns 403. Change `aud` to another API's audience and the same token gets 401,
+because it was never meant for this service. Note that the tenant comes from the verified credential
+in both paths, never from the request body.
+
 ## Trade-offs
 - API keys are trivial for customers to use and revoke instantly, but they are long-lived bearer
   secrets. Prefer OAuth client credentials when customers already run an IdP or demand short-lived
@@ -179,6 +211,9 @@ do this".
   unknown IPs and the key turning up in a public repository scanner alert.
 - Authenticating but not scoping queries by tenant. The symptom is one customer's retrieved documents
   appearing in another customer's answers, which is the worst possible AI incident.
+- Verifying IdP tokens with a shared HS256 secret distributed to every service. The symptom is
+  that one compromised or misconfigured service can mint valid tokens for any user, and audits cannot
+  tell which service issued a forged token.
 - Logging full `Authorization` headers or keys in request logs. The symptom is credentials sitting in
   your log platform, readable by everyone with log access.
 

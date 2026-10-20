@@ -5,7 +5,7 @@ name: pandas
 kind: tool
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/numpy
   - python-for-ai/polars
@@ -69,6 +69,14 @@ speed, so it should be a last resort. String and datetime operations live under 
 into a new frame. Named aggregation (`agg(pass_rate=("passed", "mean"))`) keeps output columns explicit.
 `merge` performs SQL-style joins; its `validate=` argument checks the expected cardinality so a
 duplicate key cannot silently multiply rows. `pivot_table` and `melt` switch between wide and long shapes.
+
+Under the hood, `groupby` first *factorizes* the key columns: one hash pass maps each distinct key to
+an integer group code. Built-in aggregations named by string (`"mean"`, `"sum"`, `"size"`) then run a
+compiled loop that adds each row's value into its group's accumulator, so cost is roughly linear in rows
+whatever the number of groups. A lambda or custom function instead gets called once per group with a
+Series, which is fine for tens of groups and slow for a million. Two defaults matter: `dropna=True`
+drops rows whose key is missing, and for categorical keys `observed=` decides whether empty
+categories appear as rows.
 
 ### Indexing, copies and views
 Use `.loc[row_mask, "col"]` for label-based selection and assignment and `.iloc` for positions. Chained
@@ -143,7 +151,11 @@ route that category to the large one.
 - One missing value turning an ID column into `float64`; the symptom is IDs printed as `1234.0` and
   failed joins against integer keys.
 - Loading a multi-gigabyte CSV with default dtypes; the symptom is memory exhaustion, fixed by
-  specifying dtypes, reading only needed columns, or switching to Parquet.
+  specifying dtypes, reading only needed columns, or switching to Parquet. `df.memory_usage(deep=True)`
+  shows which columns (usually `object` strings) are responsible.
+- Grouping by a column with missing values under the default `dropna=True`; the symptom is per-group
+  counts that sum to fewer rows than the frame, because cases with no category vanished from the
+  report. Pass `dropna=False` or fill the key first.
 
 ## When to use
 Use pandas for exploratory analysis and reporting on data that fits comfortably in memory: eval results,

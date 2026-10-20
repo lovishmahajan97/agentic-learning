@@ -5,7 +5,7 @@ name: Worker threads for CPU-bound tasks
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - node-ts-for-ai/event-loop-and-microtask-queue
   - node-ts-for-ai/bullmq-and-durable-jobs
@@ -81,6 +81,41 @@ threads. Check the CPU count the runtime reports against the container's CPU quo
 versions and some orchestrators `availableParallelism()` reflects the host, and a pool sized to 64 host
 cores inside a 2-CPU container just thrashes.
 
+### Parallelism across jobs versus within one job
+A pool parallelises *across* jobs: eight queries on eight workers can finish in about the time of
+one, if there are eight free cores and the work is compute-bound. A brute-force scan of a 1.2 GB matrix
+is often limited by memory bandwidth instead, so eight concurrent scans share that bandwidth and the
+speed-up is smaller; measure it rather than assuming linear scaling.
+It does nothing for the latency of a single query, which still scans every vector on one thread. To
+cut one job's latency, split the data: give each of N workers a range of rows in the shared matrix,
+have each return its local top-k, and merge the N small lists on the main thread. That divides the
+scan by up to N (less when memory bandwidth is the limit), at the cost of N messages and a merge per query, and it occupies the whole pool
+for one request, so it fits low-concurrency, latency-sensitive paths rather than high-throughput ones.
+
+### Cancelling work inside a worker
+A worker running a tight synchronous loop is in the same position as the main thread was: its own
+event loop is blocked, so it cannot receive a `'message'` saying "stop". Passing an `AbortSignal`
+does not help either, since the abort is delivered as a callback the busy worker never runs. Two real
+options exist. `worker.terminate()` stops the thread at the next safe point regardless of what it is
+doing, which is reliable but throws away the worker (the pool must spawn a replacement, paying
+startup again). Or the job checks a cancellation flag in a `SharedArrayBuffer` with `Atomics.load`
+every few thousand iterations, which the main thread sets with `Atomics.store`; that keeps the worker
+alive but requires the job to cooperate. Libraries such as `piscina` map an `AbortSignal` onto these
+mechanisms for you.
+
+### Memory limits per worker
+Each worker has its own V8 heap limits. `new Worker(file, { resourceLimits: { maxOldGenerationSizeMb } })`
+caps a worker's heap so one runaway document parse kills that worker (an `'error'` the pool can
+handle) instead of pushing the whole process into the container's out-of-memory killer. Budget
+container memory as main heap + N × worker heap + shared buffers.
+
+### Workers versus `cluster` and child processes
+`cluster` (or several replicas behind a load balancer) runs N copies of the whole server so I/O-bound
+traffic uses N cores; each copy still blocks on its own CPU work. Worker threads keep one server and
+move the CPU work aside. Child processes give stronger isolation (a crash or native-module segfault
+does not take down the server) at higher memory and IPC cost. Many production services use replicas
+for I/O scale and a worker pool inside each replica for CPU steps.
+
 ### What workers are not for
 I/O-bound work gains nothing: a worker waiting on an HTTP call is a wasted thread. Work that native
 code already runs off the loop (the async `crypto` and `zlib` APIs use libuv's pool) does not need a
@@ -154,6 +189,9 @@ if (!isMainThread) {
   `Atomics` guarding writes.
 - A pool bounds concurrency and amortizes startup, but a job that blocks a worker for seconds blocks
   that slot; give long jobs their own pool or move them to a queue.
+- `terminate()` cancels anything instantly but costs a worker restart, while a shared-memory cancel flag
+  is cheap but needs the job to poll it; terminate wins for rare cancellations of untrusted or
+  third-party code, the flag wins when cancellation is routine (users abandoning requests).
 - Compared with a separate service, workers are simpler to deploy and share the process's memory, yet
   they die with the process and cannot scale beyond one machine; durable or horizontally scaled work
   belongs in a job queue.
@@ -171,6 +209,8 @@ if (!isMainThread) {
   database client initialized twice because the module was loaded again in the worker.
 - Not handling `'error'` and `'exit'` events; the symptom is a pool that silently shrinks after a
   worker crashes and eventually hangs with all jobs queued.
+- Expecting a timeout or abort to stop a worker mid-computation; the symptom is the request returning
+  an error while the worker's CPU stays at 100% and its pool slot stays busy until the job finishes.
 
 ## When to use
 Reach for worker threads when a code path performs sustained synchronous computation (more than a few

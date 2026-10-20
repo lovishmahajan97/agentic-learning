@@ -5,7 +5,7 @@ name: Scalability
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - infra-capacity-economics/capacity-planning
   - infra-capacity-economics/queueing-theory
@@ -54,19 +54,27 @@ only until a shared component saturates. For LLM serving, tensor or pipeline par
 one model instance; data-parallel replicas are scale-out.
 
 ### Amdahl and the Universal Scalability Law
-Amdahl's law: speedup(N) = 1 / ((1 − p) + p/N), with p the parallel fraction. Gunther's Universal
+Amdahl's law: speedup(N) = 1 / ((1 − p) + p/N), with p the parallel fraction. The ceiling is
+1/(1 − p): if 5% of each request's time is spent holding one shared lock or primary, no fleet size gets
+past 20×, and 64 workers already give only about 15×. Gunther's Universal
 Scalability Law (USL) adds coherency:
 
 ```
 C(N) = N / (1 + α(N − 1) + β·N(N − 1))
 ```
 
-α is contention (queueing on a shared resource), β is coherency (pairwise coordination). With β > 0,
+α is contention (queueing on a shared resource), β is coherency (pairwise coordination). With β = 0
+this is exactly Amdahl rewritten (α = 1 − p), and capacity flattens toward 1/α. With β > 0,
 capacity peaks at N* = √((1 − α)/β) and declines after. The value of the model is diagnostic: fit α and
 β from a few load-test points, and they tell you whether to remove a serialization point (α) or reduce
 cross-node chatter (β), and roughly where adding nodes stops paying.
 
 ### Where AI systems stop scaling
+- **Batch is the first axis, inside one replica**: with continuous batching, a replica's throughput
+  rises steeply with concurrent sequences, because each weight read from memory is shared by the whole
+  batch, while each request's per-token latency rises more slowly. The useful operating point is the
+  largest batch that still meets the per-token latency target; adding replicas before reaching it
+  buys GPUs you are not using.
 - **GPU memory per replica**: concurrency per replica is bounded by KV-cache memory, so throughput per
   replica plateaus; you scale by adding replicas, not by pushing more requests into one.
 - **Provider quotas**: tokens-per-minute and requests-per-minute limits per key, per model and per region

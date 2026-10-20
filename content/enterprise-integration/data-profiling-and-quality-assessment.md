@@ -5,6 +5,7 @@ name: Data profiling & quality assessment
 kind: practice
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - enterprise-integration/data-onboarding
   - enterprise-integration/data-mapping-and-canonical-schemas
@@ -53,6 +54,24 @@ values after replacing digits and letters with placeholders (for example `9999-9
 `99/99/9999` for dates). Across columns and tables: candidate key uniqueness, referential integrity
 (do child rows point to existing parents), functional dependencies you rely on, exact and near
 duplicates, and freshness (how old is the newest record, how often does it change).
+
+Two checks deserve to be called out because standard null counts miss them. **Disguised missing
+values** are placeholders that are not null: `N/A`, `-`, `0`, `1900-01-01`, `unknown`, "see email". They
+show up as a single value with suspiciously high frequency in the top-values list, or as a date
+distribution with a spike on one day, and the real completeness of the field is the null rate *plus*
+their share. A **sensitivity scan** (pattern and dictionary detection of emails, phone numbers, national
+ID formats, card numbers, and names in free text) tells you which fields need redaction or tighter
+handling before anything is indexed or sent to a model; free-text fields often hold identifiers that the
+schema never declared.
+
+### How big a sample
+A sample can only report problems it contains. If a defect affects a share *p* of records, a random
+sample of *n* contains at least one with probability `1 − (1 − p)^n`, which is about `1 − e^(−np)`. For a
+0.1% defect, 2,000 rows catch it about 86% of the time and 5,000 rows over 99% of the time. The converse,
+the "rule of three": if *n* rows show zero defects, the 95% upper bound on the true rate is roughly
+`3 / n`, so a clean 5,000-row sample still allows up to about 0.06%. Apply this per slice, not overall: a
+stratum with 200 sampled rows can hide a defect rate up to about 1.5%. This is why cheap metrics run on
+the full table and the sample is reserved for checks that need human eyes or heavy compute.
 
 ### What to profile in document corpora
 File type mix; share of PDFs with a usable text layer versus image-only scans; encrypted or corrupt
@@ -120,11 +139,14 @@ print(r["null_pct_by_slice"][["closed_at", "resolution_notes"]])
 
 Illustrative output on a 5,000-row stratified sample: 212 duplicate `ticket_id` values (a past
 migration loaded one year twice); `status` has 23 distinct values against 8 documented; `opened_at` has
-two shapes, `9999-99-99 99:99` and `99/99/9999 99:99`, meaning one source system writes US-style
-dates; and `resolution_notes` is 4% null overall but 37% null in the APAC slice. The assessment then
+two shapes, `9999-99-99 99:99` and `99/99/9999 99:99`, meaning one source system writes slash dates
+whose order (US `MM/DD` or European `DD/MM`) the shape cannot reveal, so you check for values with a
+first field above 12 and confirm with the source owner; and `resolution_notes` is 4% null overall but 37% null in the APAC slice. The assessment then
 reads: deduplicate on key plus latest version (pipeline fix); crosswalk the 23 statuses with the support
-lead (mapping); parse dates per source (pipeline fix); and for APAC, ask whether notes live in another
-system, because a resolution assistant without resolutions is blocked there (source question).
+lead (mapping); parse dates per source once the order is confirmed (pipeline fix); and for APAC, ask whether notes live in another
+system, because a resolution assistant without resolutions is blocked there (source question). The
+`top` entries are also where disguised nulls show: if "see email" is the most common
+`resolution_notes` value, the field's effective completeness is far below what `null_pct` reports.
 
 ## Trade-offs
 - Profiling a stratified sample is fast and cheap, but can miss rare problems; profile the full dataset
@@ -143,6 +165,8 @@ system, because a resolution assistant without resolutions is blocked there (sou
   one department or region the pilot serves.
 - Profiling once at onboarding and never again; the symptom is a sudden quality drop months later traced
   to a source-side upgrade that renamed a picklist value.
+- Counting only true nulls; the symptom is a field reported 98% complete whose most frequent value is
+  `N/A` or `1900-01-01`, and prompts or filters that treat the placeholder as real data.
 - Treating format validity as accuracy; the symptom is clean-looking data that SMEs reject because
   values are stale, defaulted or entered into the wrong field.
 - Ignoring duplicates and near duplicates in document corpora; the symptom is retrieval returning five

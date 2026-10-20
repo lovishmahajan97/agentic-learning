@@ -4,8 +4,8 @@ module: data-architecture
 name: Data lineage
 kind: concept
 difficulty: core
-est_minutes: 15
-status: fact-checked
+est_minutes: 16
+status: reviewed
 related:
   - data-architecture/model-and-dataset-provenance
   - data-architecture/data-contracts
@@ -69,7 +69,8 @@ fine-tuning or a model's outputs.
 ### Capture at run time, not by declaration
 The job emits lineage events as it runs: a start event naming the job, run id and inputs with their
 versions; a complete event naming outputs with their versions and facets such as row counts, schema and
-the code commit. This design is chosen *because* declared lineage (a YAML file describing the DAG) tells
+the code commit. Failed and aborted runs emit events too (OpenLineage defines FAIL and ABORT states),
+*because* a run that wrote half its output before crashing is exactly the one you need to find later. This design is chosen *because* declared lineage (a YAML file describing the DAG) tells
 you the intended graph, not the actual one for a specific run. OpenLineage is the common open standard for
 these events; orchestrators and transformation tools (Airflow, Spark, dbt among them) can emit them,
 Marquez is the reference backend that stores and renders the graph, and catalogs such as DataHub can
@@ -91,6 +92,26 @@ diff their facets.
 - **Root cause (backward):** from an artifact, its ancestors. Used when quality regresses: compare the
   ancestor facets of the good run and the bad run.
 - **Reproduction:** the backward closure plus the code versions is the recipe to rebuild an artifact.
+
+### Lineage versus provenance
+The two words are often used interchangeably; the useful distinction is scope. Lineage is the whole
+derivation graph across the platform, queried by traversal ("what depends on this table"). Provenance is
+the verifiable record attached to one artifact ("this checkpoint was built from these digests by this
+commit, and here is a signature"). Provenance manifests are nodes and facets in the lineage graph; the
+graph is what lets you walk from one manifest to every other artifact that shares an input.
+
+### Runtime-derived artifacts are the usual hole
+Batch jobs are easy to instrument because an orchestrator wraps them. The artifacts that escape lineage
+are the ones the application creates on the request path: an agent's memory summary of a conversation, a
+semantic-cache entry, a generated answer saved as a draft, a user-feedback row copied into an eval set.
+Each is derived data with inputs, and each needs the same treatment: record the ids of the inputs it was
+derived from (conversation, retrieved chunk ids, model version) at write time. Without that, forward
+traversal from a deleted document stops at the batch boundary and misses the copies users actually see.
+
+Note also where traversal stops being actionable. Forward traversal can tell you that a document reached
+a training snapshot and therefore a checkpoint, but it cannot remove the document's influence from the
+weights; it tells you which models must be retrained or retired. Lineage finds the blast radius;
+retention and deletion architecture decides what to do about it.
 
 ### Lineage for RAG specifically
 Each chunk stored in the vector index carries `source_id`, `source_version`, `parser_version`,
@@ -182,6 +203,8 @@ log the chunk ids it retrieved so a user-visible answer links back to `backward(
   that cannot be linked to a specific document version when a user disputes it.
 - Skipping lineage for manual one-off fixes ("I just patched that table by hand"); the symptom is an
   unexplained discontinuity nobody can reproduce.
+- Instrumenting batch pipelines but not request-path writes such as memories, caches and saved answers; the
+  symptom is a deletion drill that finds every chunk yet misses the summaries that quote the document.
 
 ## When to use
 Lineage becomes mandatory the moment a system must honour deletion requests, must explain its outputs,

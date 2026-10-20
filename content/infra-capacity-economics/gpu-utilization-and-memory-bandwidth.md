@@ -5,7 +5,7 @@ name: GPU utilization & memory bandwidth
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - serving-inference/prefill-vs-decode
   - serving-inference/continuous-batching
@@ -67,8 +67,9 @@ of how many sequences share the step. So for a batch of *B* sequences the dense 
 `2 × B` FLOPs per 2 bytes, an intensity of roughly *B* FLOP/byte. At *B* = 1 that is 1 FLOP/byte
 against a ridge of ~300: the H100 is using well under 1% of its arithmetic and is entirely limited by
 how fast HBM can stream 16 GB of 8B-model weights. Doubling the batch doubles tokens per second at
-almost no cost in per-token latency, until *B* approaches the ridge point. This is the whole case for
-continuous batching.
+almost no cost in per-token latency, until *B* approaches the ridge point or, usually sooner, until the
+sequences' KV-cache reads rival the weight reads (next section). This is the whole case for continuous
+batching.
 
 The lower bound on a decode step is therefore `bytes read ÷ bandwidth`. For an 8B bf16 model: 16 GB ÷
 3.35 TB/s ≈ 4.8 ms per step on an H100 (at most ~200 tokens/s for a single stream); on an L4 at
@@ -98,8 +99,12 @@ time-per-output-token scales with bandwidth, and why engines schedule prefill an
   (`DCGM_FI_PROF_DRAM_ACTIVE`): memory bandwidth in use. A decode-bound server shows high DRAM
   activity and low tensor activity; a prefill-heavy one shows the reverse.
 - **Model FLOPs utilisation (MFU)**: observed tokens/s × FLOPs per token ÷ peak FLOP/s. It is the
-  honest single number for training; for decode it is naturally low and should be read alongside
-  bandwidth utilisation (bytes moved per second ÷ peak bandwidth).
+  honest single number for training and prefill; for decode it is naturally low, *because* the roofline
+  caps a memory-bound step far below peak FLOPs, so a low decode MFU is not by itself a problem.
+- **Model bandwidth utilisation (MBU)**: bytes a step must read (weights plus every sequence's KV cache)
+  × steps per second ÷ peak bandwidth. This is the decode counterpart of MFU: it asks how close the
+  server is to its real ceiling. High MBU with poor tokens/s means you need fewer bytes or bigger batches;
+  low MBU means something other than the GPU is in the way.
 
 ### Other things that masquerade as GPU limits
 Kernel-launch overhead when batches are tiny (CUDA graphs fix it), Python-side scheduling and
@@ -187,7 +192,8 @@ requests, and `nvidia-smi` shows 97% utilisation. They want to buy three more H1
 them?
 **A:** The bandwidth bound for one decode step is about 16 GB ÷ 3.35 TB/s ≈ 5 ms, so a single stream
 could approach 200 tokens/s and a batch of four should deliver far more than 160 aggregate. At 40
-tokens/s per stream the step takes ~25 ms, five times the bound, and GPU-Util at 97% only means some
+tokens/s per stream the step takes ~25 ms, five times the bound: ~16 GB read every 25 ms is about
+0.65 TB/s, an MBU near 20% of 3.35 TB/s. GPU-Util at 97% only means some
 kernel was always running. Check DCGM: low DRAM activity and low tensor activity point to host-side
 stalls, kernel-launch overhead or a misconfigured engine, which more cards will not fix. Raise
 concurrency and batch size, enable CUDA graphs, and confirm the engine is using fused attention.

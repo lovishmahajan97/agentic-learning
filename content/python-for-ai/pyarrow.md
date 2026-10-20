@@ -5,7 +5,7 @@ name: pyarrow
 kind: tool
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/pandas
   - python-for-ai/polars
@@ -58,7 +58,12 @@ or streams, and chunking avoids copying them into one buffer. Many operations wo
 
 ### Sharing without copying
 Within one process, the Arrow C Data Interface lets libraries exchange buffers by pointer, which is how
-Polars, DuckDB and pandas' Arrow-backed dtypes interoperate cheaply. Across processes, the Arrow IPC
+Polars, DuckDB and pandas' Arrow-backed dtypes interoperate cheaply; in Python this is increasingly
+exposed through the Arrow PyCapsule protocol (`__arrow_c_stream__` and friends), so a library can accept
+"anything Arrow-shaped" without importing the producer. Zero-copy holds only while both sides keep the
+Arrow layout. `table.to_pandas()` with default settings turns a string column into an `object` column of
+Python strings, which is a full copy and often several times larger; `to_pandas(types_mapper=pd.ArrowDtype)`
+keeps Arrow-backed columns instead. Across processes, the Arrow IPC
 format (also called Feather v2 on disk) writes the in-memory layout directly, so a file can be
 memory-mapped and read with almost no decoding. Hugging Face `datasets` stores data as Arrow files and
 memory-maps them, which is why a dataset larger than RAM can still be indexed randomly.
@@ -139,6 +144,8 @@ two-thirds of the data belonging to other tenants without even opening those fil
   int column as double or a field missing entirely.
 - Assuming `to_numpy()` is always zero-copy; the symptom is an error or memory spike on columns with
   nulls or multiple chunks.
+- Calling `to_pandas()` on a large text table with default settings; the symptom is peak memory far
+  above the Arrow table's `nbytes`, because every string became a Python object.
 
 ## When to use
 Use Parquet via pyarrow as the default storage for any tabular dataset you will read more than once:

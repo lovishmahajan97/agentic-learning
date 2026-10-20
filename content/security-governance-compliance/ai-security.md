@@ -5,6 +5,7 @@ name: AI security
 kind: concept
 difficulty: intro
 est_minutes: 13
+status: reviewed
 related:
   - security-governance-compliance/threat-modeling
   - security-governance-compliance/prompt-injection-defense
@@ -69,9 +70,10 @@ decisions (what users and downstream systems trust the output for).
 - Inference-time output: improper output handling, meaning model text flowing unescaped into HTML, SQL,
   a shell or a tool call; and excessive agency, meaning the model holding more permissions than the task
   needs.
-- Exfiltration and privacy: system prompt leakage, training data extraction (Carlini et al. showed
-  memorised sequences can be recovered from a production-scale language model), cross-tenant leakage
-  through shared indexes or caches, and membership inference.
+- Exfiltration and privacy: system prompt leakage, training data extraction (Carlini et al. recovered
+  verbatim memorised training sequences, including personal contact details, from GPT-2, and Nasr et al.
+  later extended extraction to a deployed chat model), cross-tenant leakage through shared indexes or
+  caches, and membership inference.
 - Availability and cost: unbounded consumption, sometimes called denial of wallet, via long inputs,
   recursive agent loops or expensive tool calls triggered by injected content.
 - Model theft: approximating a model by querying its API at scale.
@@ -82,6 +84,19 @@ decisions (what users and downstream systems trust the output for).
 2. The model will be steered some fraction of the time. Security must come from what a steered model
    cannot do, not from what it is told not to do.
 3. Output is attacker-influenced. Treat it as untrusted input to everything downstream.
+
+A quick composition test follows from these facts. A data-theft attack needs three things in one
+session: untrusted content that can carry the instruction, access to something worth stealing, and a
+channel out (an email, a fetched URL, a rendered image, a write to a shared document). Simon Willison
+calls this the "lethal trifecta". Each capability is harmless alone; the breach is in the combination,
+which is why a review must look at the whole agent rather than at each tool in isolation, and why the
+strongest fix is usually to remove one leg in code. The prompt-injection-defense lesson turns this into
+a policy (the "rule of two").
+
+Persistence deserves its own mention. An agent with long-term memory, a shared notes store or write
+access to the knowledge base can be made to write the injected instruction somewhere it will be read
+again, so one poisoned page becomes an attack on every later session. Memory writes are therefore a
+sink to gate, not a convenience.
 
 ### The controls that follow
 - Identity and least privilege for the model's tools: the agent acts with at most the user's permissions,
@@ -110,7 +125,8 @@ around them: threat modeling, policy, classification, residency and governance.
 
 ## Example
 A tool boundary that encodes the three facts. Reading untrusted content taints the turn; a tainted turn
-cannot cause an external side effect without a human seeing the real arguments; and argument limits
+cannot cause an external side effect without a human approving those exact arguments (an approval is
+keyed on tool plus arguments, so approving one email does not pre-approve the next); and argument limits
 (recipient allowlist, refund ceiling) hold no matter what the model says, because they are checked in
 code the model cannot reach.
 
@@ -121,7 +137,7 @@ from dataclasses import dataclass, field
 class Turn:
     user_id: str
     tainted: bool = False                       # set once any untrusted content entered the context
-    approvals: set = field(default_factory=set)
+    approvals: set = field(default_factory=set)  # (tool, args) pairs a human has approved
 
 TOOLS = {
     "search_tickets": {"effect": "read"},
@@ -140,10 +156,11 @@ def run_tool(turn: Turn, name: str, args: dict, approve):
         raise PermissionError("recipient outside allowlist")     # exfiltration channel closed regardless of model
     if name == "issue_refund" and args["amount"] > spec["max_amount"]:
         raise PermissionError("amount above tool ceiling")        # the model cannot talk its way past this
-    if spec["effect"] == "external" and turn.tainted and name not in turn.approvals:
+    key = (name, tuple(sorted(args.items())))
+    if spec["effect"] == "external" and turn.tainted and key not in turn.approvals:
         if not approve(turn.user_id, name, args):                 # a human sees the actual arguments
             raise PermissionError("not approved")
-        turn.approvals.add(name)
+        turn.approvals.add(key)                                   # this call only, not the whole tool
     result = dispatch(name, args)
     if spec.get("taints"):
         turn.tainted = True                                       # everything after this is suspect
@@ -156,6 +173,13 @@ try:
 except PermissionError as e:
     print(e)   # "not approved": the turn read untrusted content, so sending needs a human
 ```
+
+Two design choices are worth noticing. The hard limits (allowlist, ceiling) run before the approval
+check, because a human approving a 5,000 refund under time pressure is exactly what an attacker hopes
+for; some limits should not be approvable at all. And taint is per turn and binary, which is coarse:
+it over-gates turns where the untrusted content was irrelevant to the action, and it under-protects if
+the agent's memory carries injected text into a fresh, "clean" turn, so a real system must taint
+whatever is loaded from stores that untrusted content can write to.
 
 ## Trade-offs
 - Least privilege and approval gates bound the blast radius but cost autonomy; the gate is worth it when an
@@ -176,6 +200,8 @@ except PermissionError as e:
   to unknown domains carrying conversation text in query strings.
 - Loading weights from an unverified hub in a pickle-based format; symptom: arbitrary code runs at load
   time, usually discovered only in the incident review.
+- Letting the agent write to its own long-term memory without gating; symptom: a behaviour change
+  (an odd instruction followed, a link inserted) that persists across sessions after one bad page was read.
 - Securing the chat UI and forgetting the logs, traces and eval datasets that duplicate every prompt;
   symptom: customer PII found in an observability SaaS during an audit.
 

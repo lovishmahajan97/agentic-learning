@@ -5,7 +5,7 @@ name: Workflow analysis
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - scoping/customer-discovery
   - scoping/problem-decomposition
@@ -78,10 +78,22 @@ below the arrival rate. Little's law (average items in progress = throughput × 
 for a stable system) then explains why that hurts: with throughput capped by the constraint, every extra
 item queued adds directly to time in system. That is where improvement changes the outcome.
 
+A quick sanity check with illustrative numbers: if 200 tickets are open and the team closes 50 a day,
+average time in system is 200 ÷ 50 = 4 days. Halving research effort does not raise the 50 a day if
+approval is what caps it, so the 4 days stay. Doubling approval capacity, or removing the items that
+did not need approval, does raise throughput, up to the capacity of the next-slowest step, and the same WIP clears faster. This is the
+theory-of-constraints rule in one line: an hour saved at a non-constraint is a mirage; an hour saved at
+the constraint is an hour for the whole system.
+
 ### 7. Identify AI insertion points
 Now ask which steps AI could help at, and how: removing a step, shortening touch time, preventing a
 rework loop (by catching missing information at intake), or eliminating a wait (by pre-computing what the
 approver needs). Mark where humans must stay in the loop and what they will review.
+
+Then check where the constraint moves. An AI step that lets agents finish research twice as fast sends
+items to approval twice as fast; if approval was close to capacity, it becomes the new constraint and
+its queue grows. Every human review you add is also a new step with its own capacity: 400 items a day
+at 2 minutes of review each is over 13 reviewer-hours daily, which someone must staff.
 
 ### 8. Draft the to-be workflow and the baseline
 Draw the proposed flow with the AI component, its human checkpoints and the fallback path when it is
@@ -151,6 +163,8 @@ little; catching missing information at intake and pre-packaging the approver's 
   system, because a check or lookup it supported was never modelled.
 - Inserting AI without redesigning the human step around it; the symptom is reviewers who either approve
   everything unread or redo the work from scratch, erasing the saving.
+- Speeding up one step without checking downstream capacity; the symptom is a queue that shrinks in
+  front of the improved step and grows in front of the next one, with cycle time unchanged.
 - Not recording a baseline before changing the flow; the symptom is an argument after launch about
   whether things improved, settled by anecdote.
 

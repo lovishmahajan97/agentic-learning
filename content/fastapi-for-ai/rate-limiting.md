@@ -4,8 +4,8 @@ module: fastapi-for-ai
 name: Rate limiting (slowapi)
 kind: tool
 difficulty: core
-est_minutes: 15
-status: fact-checked
+est_minutes: 17
+status: reviewed
 related:
   - fastapi-for-ai/api-keys-oauth2-jwt
   - fastapi-for-ai/concurrency-limits
@@ -76,9 +76,29 @@ atomic operations, so concurrent increments don't race.
 - **Moving window**: stores a timestamp per hit and counts those within the trailing window. It is
   exact, but memory and work grow with the limit.
 - Recent versions of `limits` also offer a **sliding-window counter**, which approximates the
-  trailing window from two fixed-window counters weighted by overlap. It is nearly exact and cheap.
-- Gateways often use **token bucket** or GCRA: capacity *b* refills at rate *r*. It allows bursts up
-  to *b* and a sustained rate of *r*, which suits chat traffic.
+  trailing window from two fixed-window counters weighted by overlap:
+  `count ≈ previous × (1 − elapsed / window) + current`. Twenty seconds into a minute, with 90 hits
+  last minute and 30 so far, the estimate is 90 × 2/3 + 30 = 90. It assumes last window's hits were
+  spread evenly, so it is nearly exact and costs two counters.
+- Gateways often use **token bucket** or GCRA: a bucket of capacity *b* refills at rate *r*
+  (`tokens = min(b, tokens + r × Δt)` on each arrival), and a request is admitted if it can take its
+  cost from the bucket. It allows bursts up to *b* and a sustained rate of *r*, which suits chat
+  traffic, and the cost can be a token estimate rather than 1, which makes it a natural fit for TPM.
+  GCRA is the same policy stored as a single "theoretical arrival time" per key instead of a count.
+
+### Telling the client when to come back
+A 429 is only useful if the client knows how long to wait. slowapi emits `Retry-After` and the
+`X-RateLimit-Limit / -Remaining / -Reset` headers only when the limiter is created with
+`headers_enabled=True`; without it, even the default 429 handler sends no `Retry-After`, and SDKs fall
+back to their own guesses. With headers enabled, a decorated endpoint that returns a plain dict must
+also accept a `response: Response` parameter so slowapi has somewhere to inject them.
+
+### When the counter store fails
+Every limited request now depends on Redis. If Redis is unreachable you must choose: fail closed
+(reject everything, an outage caused by your limiter) or fail open (serve unlimited, exposing spend).
+slowapi exposes this as options (`swallow_errors`, and an in-memory fallback that keeps per-process
+limits while Redis is down). For a paid LLM route, per-process fallback is usually the right middle:
+limits get looser by the worker count, but never disappear.
 
 ### Requests are not tokens
 "60 requests/minute" treats a 50-token classification and a 100k-token document summary the same,
@@ -99,7 +119,7 @@ Per-API-key request limits with slowapi, plus a token-per-minute budget as a dep
 
 ```python
 import hashlib, time
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -112,7 +132,7 @@ def caller(request: Request) -> str:            # key by credential, not IP
     return hashlib.sha256(key.encode()).hexdigest()[:16] if key else get_remote_address(request)
 
 limiter = Limiter(key_func=caller, storage_uri="redis://redis:6379",
-                  default_limits=["600/hour"])
+                  default_limits=["600/hour"], headers_enabled=True)   # emit Retry-After
 app = FastAPI()
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -134,7 +154,8 @@ async def token_budget(request: Request) -> int:
 
 @app.post("/v1/chat")
 @limiter.limit("30/minute")
-async def chat(request: Request, body: dict, est: int = Depends(token_budget)):
+async def chat(request: Request, response: Response, body: dict,
+               est: int = Depends(token_budget)):
     # after the call: await r.incrby(key, actual_tokens - est) to reconcile
     return {"reply": "..."}
 ```
@@ -168,8 +189,12 @@ when slowapi rejects it. Stash the reservation on `request.state` and release it
   startup or on the first call complaining that no request argument was found.
 - Limiting only requests on an LLM endpoint. The symptom is a tenant within its RPM limit blowing
   through the provider's TPM quota and causing upstream 429s for everyone.
-- Returning 429 without `Retry-After`, or with CORS middleware inside the limiter. The symptom is
-  clients retrying instantly in a tight loop, or browsers reporting a CORS error instead of the 429.
+- Returning 429 without `Retry-After` (slowapi's default, unless `headers_enabled=True`), or with
+  CORS middleware inside the limiter. The symptom is clients retrying instantly in a tight loop, or
+  browsers reporting a CORS error instead of the 429.
+- Setting each tenant's limit independently of the upstream quota. The symptom is every tenant
+  within its own limit while the provider still returns 429s at peak, because the limits sum to more
+  than the organisation's TPM.
 
 ## When to use
 Put per-caller limits on every endpoint that triggers paid or scarce work: chat, embeddings, document

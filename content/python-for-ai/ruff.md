@@ -5,7 +5,7 @@ name: ruff
 kind: tool
 difficulty: intro
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/mypy
   - python-for-ai/pytest
@@ -50,11 +50,21 @@ representation, in parallel across files, with a per-file cache so files unchang
 speed: the old toolchain ran each Python tool as its own process and re-parsed each file once per tool. The maintainers publish benchmarks showing large speedups
 over flake8; treat any specific multiple as illustrative and measure on your own repository.
 
+The same design sets the limit of what it can see. Rules work on one file at a time, with a semantic
+model of that file's scopes, bindings and imports (enough to know that `requests.get` refers to the
+`requests` package, or that a name is unused), but with no cross-module type inference. That is why
+Ruff recognises a blocking call by its qualified name and cannot follow it through your own wrapper
+function in another module, and why the pylint checks that depend on whole-program inference are not
+among the ones it re-implements.
+
 ### Rules are namespaced by origin
 Each rule has a code whose prefix names the tool it re-implements: `F` (pyflakes: unused imports,
 undefined names), `E`/`W` (pycodestyle), `I` (isort), `B` (bugbear), `UP` (pyupgrade), `S` (bandit
 security checks), `ASYNC` (flake8-async), `PT` (pytest style), `SIM`, `C4`, plus `RUF` for Ruff's own
-rules. You enable by prefix (`select = ["B"]`) or single code. The default set is deliberately small,
+rules. You enable by prefix (`select = ["B"]`) or single code; `extend-select` adds to the inherited
+selection instead of replacing it. Newly added rules start in **preview** and run only with
+`preview = true`, so upgrading Ruff does not silently add findings to your CI; rules graduate to
+stable in later releases. The default set is deliberately small,
 covering pyflakes and a subset of pycodestyle errors, because a linter that floods a new project with
 warnings gets switched off. `ruff rule B006` prints the rationale for any rule.
 
@@ -72,8 +82,8 @@ disable lint rules that fight it (line length is the usual one).
 ### Configuration
 Everything lives in `pyproject.toml` (or `ruff.toml`): `[tool.ruff]` for shared settings such as
 `target-version` and `line-length`, `[tool.ruff.lint]` for `select`, `ignore` and `per-file-ignores`.
-Inline `# noqa: B006` suppresses one rule on one line, and Ruff can flag `noqa` comments that no
-longer suppress anything. What Ruff does not do is type checking: it does not know that a value may be
+Inline `# noqa: B006` suppresses one rule on one line, and `RUF100` flags `noqa` comments that no
+longer suppress anything, so suppressions do not outlive the code they excused. What Ruff does not do is type checking: it does not know that a value may be
 `None`, which is mypy's or pyright's job, so the two run side by side.
 
 ## Example
@@ -121,6 +131,11 @@ def docs_for(cur, tenant: str):
 `ruff check --fix` resolves the import, `List` and some other findings safely; the async, SQL and
 default-argument findings need a human, because the fix is a design change (an async client, a
 parameterised query, a `None` default).
+
+In a pre-commit hook, run `ruff check --fix` before `ruff format`, because a lint fix (removing an
+import, rewriting a comprehension) can leave code the formatter would lay out differently. In CI, run
+`ruff check` and `ruff format --check`; neither writes files, so CI fails on findings instead of
+quietly fixing them in a throwaway checkout.
 
 ## Trade-offs
 - One fast tool replaces a fragmented chain and runs on every save, but you depend on Ruff's

@@ -4,8 +4,8 @@ module: python-for-ai
 name: tenacity
 kind: tool
 difficulty: core
-est_minutes: 12
-status: fact-checked
+est_minutes: 14
+status: reviewed
 related:
   - serving-inference/retry-strategies
   - reliability/circuit-breakers
@@ -62,6 +62,14 @@ Waits can be added together, e.g. `wait_fixed(1) + wait_random(0, 2)`. Exponenti
 overloaded server; jitter spreads clients out so their retries do not arrive in synchronized waves. The
 default is no wait at all.
 
+The arithmetic is worth doing once. `wait_exponential(multiplier=m, max=c)` waits `min(m · 2^(n−1), c)` after
+the *n*-th failed attempt, so with `m=1` the waits are 1, 2, 4, 8, 16 s. `wait_random_exponential` uses the
+same curve as an upper bound and draws uniformly below it (the "full jitter" scheme from Brooker's analysis):
+the waits after attempts 1 to 4 fall in [0, 1], [0, 2], [0, 4] and [0, 8] s, about 7.5 s in expectation
+before the fifth attempt instead of exactly 15 s. Two hundred workers rate-limited in the same second
+therefore return spread over seconds rather than as one spike. The cost is that one unlucky client can
+draw near-zero waits and retry almost immediately; the cap and the attempt limit bound how much harm that does.
+
 ### retry: which outcomes count as failures
 `retry_if_exception_type((RateLimitError, APITimeoutError))`, `retry_if_exception(predicate)`, or
 `retry_if_result(lambda r: r is None)` for "successful" responses that are actually bad, combined with `|`
@@ -73,8 +81,20 @@ and `&`. This is where you encode the classification: retry 429, 5xx and timeout
 When the stop condition fires, tenacity raises `RetryError` wrapping the last attempt; with `reraise=True`
 it re-raises the original exception instead, which is usually what callers and error handlers expect.
 Every callback receives a `RetryCallState` (attempt number, elapsed time, `outcome`), so a custom wait can,
-for example, honor a server's `Retry-After` header. Decorated functions expose `.retry.statistics` and
-`.retry_with(...)` to override the policy per call site.
+for example, honor a server's `Retry-After` header. Any callable that takes the state and returns seconds
+is a valid `wait`:
+
+```python
+fallback = wait_random_exponential(multiplier=1, max=20)
+def wait_retry_after(state):
+    exc = state.outcome.exception()
+    hdr = getattr(getattr(exc, "response", None), "headers", {}).get("retry-after")
+    return min(float(hdr), 60) if hdr and hdr.isdigit() else fallback(state)
+```
+
+The server knows its own rate window, so its hint beats any guess; the `min` cap stops a hostile or buggy
+header from parking a worker for an hour, and the `isdigit` check skips the HTTP-date form of the header.
+Decorated functions expose `.retry.statistics` and `.retry_with(...)` to override the policy per call site.
 
 ### Async and code blocks
 Decorating an `async def` works directly: tenacity detects the coroutine and sleeps with the event loop
@@ -91,8 +111,9 @@ before adding your own layer.
 A policy for a chat-completion call: retry only transient errors, exponential backoff with jitter, a
 30-second retry budget, a log line per retry, and the original exception re-raised at the end. The SDK's own
 retries are switched off so attempts do not multiply. Because the budget is checked between attempts, the
-worst case here is about 30 s + one wait (up to 20 s) + one 20 s attempt timeout, roughly 70 s; if a caller
-needs a strict ceiling, shrink the per-attempt timeout and wait cap or enforce an outer deadline.
+worst case is a failure just under 30 s, plus one wait (at most 8 s, since five attempts allow only four
+waits with windows of 1, 2, 4 and 8 s), plus one 20 s attempt timeout: just under a minute. If a caller
+needs a strict ceiling, shrink the per-attempt timeout or enforce an outer deadline.
 
 ```python
 import logging
@@ -142,6 +163,9 @@ def summarize(text: str) -> str:
   up to 27 upstream calls per user action and rate limits that get worse under load.
 - Forgetting `reraise=True`; the symptom is error handlers that catch `RateLimitError` never firing because
   the exception arriving is a `tenacity.RetryError`.
+- Retrying a bad LLM *result* (invalid JSON, failed schema) with the identical prompt at temperature 0; the
+  symptom is every attempt failing the same way, because the same input tends to reproduce the same output.
+  Feed the validation error back into the next attempt, as Instructor does, or change something.
 - Retrying on `Exception` and thereby on your own bugs; the symptom is a `KeyError` in response parsing that
   costs five paid API calls before surfacing.
 

@@ -4,8 +4,8 @@ module: customer-data-evaluation
 name: Feedback loops to product
 kind: practice
 difficulty: core
-est_minutes: 13
-status: fact-checked
+est_minutes: 14
+status: reviewed
 related:
   - customer-data-evaluation/production-feedback-classification
   - customer-data-evaluation/customer-specific-regression-suites
@@ -66,6 +66,26 @@ Decision rules make triage predictable, for example: anything severe is a produc
 several customers is reviewed for productisation; a local workaround is allowed only with a tracking issue
 and an expiry.
 
+The config-versus-product line is the decision people get wrong most. The test is whether the
+behaviour is *correct but different* or *wrong*. "Dates in this market are day-first" is a legitimate,
+stable customer difference, so it is configuration. "The parser guesses the order and is sometimes
+wrong" is a defect, and hiding it behind a per-customer flag leaves it live for every customer who has
+not set the flag yet.
+
+### Rank clusters on comparable terms
+Triage needs a way to compare clusters that does not reward volume of complaint. One reasonable scheme
+(a convention to adapt, not a standard) scores each cluster as:
+
+`priority = Σ over affected customers of (affected share of that customer's traffic × severity weight) + workaround cost`
+
+with severity weights such as 1 cosmetic, 3 wrong-but-harmless, 10 acted-upon, 30 compliance, and
+workaround cost expressed on the same scale (for example one point per engineer-day per quarter).
+Using *share of traffic* rather than *number of tickets* is the point: a customer whose users complain
+loudly about a cosmetic issue on 20% of requests scores 0.2 × 1 = 0.2, while a silent acted-upon error on
+3% of requests at each of three customers scores 3 × 0.03 × 10 = 0.9. Whatever the exact weights, writing
+them down makes the trade-off arguable, and strategic-account weight becomes an explicit term rather than
+a side conversation.
+
 ### 4. Every fix closes three things
 A resolved cluster: (a) adds regression cases to each affected customer's suite and, if general, to the
 shared suite, so it cannot silently return; (b) retires the local workarounds, which is how the deployments
@@ -108,6 +128,9 @@ closed and the number of open workarounds goes down by three.
   strategic customer's real need; give account strategy an explicit, visible weight instead of a backdoor.
 - Rich clusters with traces and cost make decisions easy, but take FDE time to assemble; automate
   clustering from the feedback classifier so FDEs only add context and cost.
+- Expressing customer differences as tenant config instead of branches keeps one codebase, but each flag
+  multiplies the combinations that must be tested; once flags interact, prefer a few vetted presets and
+  retire flags nobody has changed in months.
 - Closing the loop with every reporter builds trust and keeps feedback flowing, but adds communication
   work; batch it into release notes per customer rather than individual replies.
 
@@ -120,6 +143,8 @@ closed and the number of open workarounds goes down by three.
   again after a later release.
 - Never retiring workarounds after the product fix; the symptom is local patches conflicting with the new
   behaviour, like a post-processor double-correcting fixed output.
+- Turning a defect into a per-customer config flag because that ships fastest; the symptom is a new
+  customer hitting the "already fixed" bug on day one because nobody set their flag.
 - Reading falling feedback volume as rising quality; the symptom is churn or low renewal from a customer
   whose dashboards looked quiet.
 

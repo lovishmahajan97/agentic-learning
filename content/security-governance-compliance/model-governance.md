@@ -5,6 +5,7 @@ name: Model governance
 kind: practice
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - security-governance-compliance/ai-inventory-and-use-case-risk-classification
   - security-governance-compliance/model-cards
@@ -84,6 +85,19 @@ than forced. Retirement removes the endpoint, archives evidence and records why.
 A model or use-case owner is accountable; an independent validator reviews evidence for higher tiers; a
 risk or compliance function owns the policy; platform engineering owns enforcement. Separation between
 builder and validator is the point SR 11-7 insists on, because builders grade their own work generously.
+Its term for what the validator must provide is "effective challenge": critical review by people with
+the competence, independence and authority to force changes. A validator who reports to the product
+owner, or who can comment but not block, is review in name only.
+
+### What counts as a change
+The practical question every week is which edits re-open approval. A useful rule: anything that can
+change the distribution of outputs for the approved use case is a change, and its depth of re-review
+follows the tier. That covers a new model snapshot, a prompt or system-instruction edit, a change to
+retrieval sources or chunking, new tools, a fine-tune refresh, and a provider's change to data-handling
+terms (which affects which data classes the model may receive, not its quality). Purely operational
+edits, such as scaling or a timeout, are not. Writing this list down per tier is what stops both
+failure modes: re-validating on every typo, and shipping a new retrieval corpus to a high-tier use case
+without anyone noticing it was a material change.
 
 ## Example
 A gateway check against the registry before routing a request. The scenario: a team's code asks for

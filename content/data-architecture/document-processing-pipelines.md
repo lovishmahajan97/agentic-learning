@@ -5,7 +5,7 @@ name: Document processing pipelines
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - rag-retrieval/document-parsing
   - multimodal/ocr
@@ -75,6 +75,13 @@ expected to succeed:
 The reason for the ladder is that cost per page differs by orders of magnitude between tiers while most
 pages in a typical corpus are born-digital text that tier one handles well.
 
+Route at the level of the *page* where the format allows it. Real files are mixed: a born-digital
+report with a scanned appendix, a slide deck where one slide is a screenshot of a table. A per-document
+decision has to choose one tier for the whole file, which either loses the odd pages or overpays for
+the ordinary ones. Some decisions must stay at document level, because they need several pages at once:
+header and footer detection, tables that continue across a page break, and section hierarchy. These
+run after the per-page extraction, over the assembled blocks.
+
 ### 3. The canonical document model
 Every tier emits the same structure: a list of blocks, each with `type` (title, heading with level,
 paragraph, list item, table, figure, caption, header, footer, footnote), `text`, `page`, `bbox`, and a
@@ -107,17 +114,13 @@ documents with gold text and gold tables (measured by character error rate and t
 run on every parser change.
 
 ## Example
-A routing function with a text-layer check, a quality score and escalation. The extractors are stand-ins
-for the real tiers; the shape of the control flow is the point.
+A per-page router with a text-layer check, a quality score and escalation. The extractors are stand-ins
+for the real tiers that take one page and return canonical blocks; the control flow is the point.
 
 ```python
 import fitz, re                                   # PyMuPDF
 
 MIN_CHARS_PER_PAGE, MIN_WORD_RATIO = 200, 0.85
-
-def text_layer_ratio(pdf):
-    pages = [p.get_text() for p in pdf]
-    return sum(len(t.strip()) > MIN_CHARS_PER_PAGE for t in pages) / max(len(pages), 1)
 
 def quality(blocks):                              # English prose heuristic; tables scored separately
     text = " ".join(b["text"] for b in blocks if b["type"] not in ("header", "footer", "table"))
@@ -129,29 +132,46 @@ def quality(blocks):                              # English prose heuristic; tab
     return (wordlike / len(tokens)) * (0.0 if garbage > 20 else 1.0)
 
 def process(path, tiers):
-    """tiers: ordered list of (name, extractor) producing canonical blocks."""
-    pdf = fitz.open(path)
-    start = 0 if text_layer_ratio(pdf) > 0.8 else 1          # scans skip native extraction
-    errors = []
-    for name, extract in tiers[start:]:
-        try:
-            blocks = extract(pdf)                               # run under a worker timeout in production
-        except Exception as e:                                  # malformed file must not kill the batch
-            errors.append((name, repr(e)))
-            continue
-        q = quality(blocks)
-        if q >= MIN_WORD_RATIO:
-            return {"blocks": blocks, "parser_tier": name, "quality": q, "errors": errors}
-    return {"blocks": [], "parser_tier": "needs_review", "quality": 0.0, "errors": errors}
+    """tiers: ordered list of (name, extract_page) returning canonical blocks for one page."""
+    pages, errors = [], []
+    for page in fitz.open(path):
+        native = page.get_text().strip()
+        if not native and not page.get_images():
+            pages.append({"page": page.number, "tier": "blank", "blocks": []}); continue
+        start = 0 if len(native) >= MIN_CHARS_PER_PAGE else 1   # no usable text layer: skip native
+        for name, extract in tiers[start:]:
+            try:
+                blocks = extract(page)                          # worker timeout in production
+            except Exception as e:                              # a bad page must not kill the batch
+                errors.append((page.number, name, repr(e))); continue
+            if (q := quality(blocks)) >= MIN_WORD_RATIO:
+                pages.append({"page": page.number, "tier": name, "quality": q, "blocks": blocks})
+                break
+        else:
+            pages.append({"page": page.number, "tier": "needs_review", "blocks": []})
+    return {"pages": pages, "errors": errors}
 
-# tiers = [("native", native_extract), ("ocr", ocr_extract), ("layout", layout_extract), ("vlm", vlm_extract)]
+# tiers = [("native", native_page), ("ocr", ocr_page), ("layout", layout_page), ("vlm", vlm_page)]
 ```
 
-Each returned record is stored with the raw file's hash; a document that landed in `needs_review` is
-counted on the pipeline dashboard rather than silently indexed as an empty document. The word-ratio score
-is deliberately crude and English-specific, and it excludes table blocks because a correct financial
-table is mostly numbers and would otherwise fail the gate; tables need their own check (consistent column
-counts per row, numeric cells that parse).
+Walk a real document through it: a 60-page born-digital contract whose last 8 pages are a scanned,
+signed annex. The 52 text pages pass the native tier at near-zero cost. The 8 annex pages have no text
+layer, so they start at OCR. Suppose 2 of them are handwritten and fail the word-ratio gate; they
+escalate through layout to the vision model. The document costs 52 native pages, 8 OCR pages and 2
+vision-LLM pages. A per-document router would have done worse either way. It would have sent the whole
+file to native extraction, because 87 % of pages have text, and silently lost the annex. Or, with a
+stricter threshold, it would have OCR'd 52 pages that already had perfect text. The cost argument
+scales. With an illustrative vision-model price of one cent per page, a 1-million-page corpus costs
+about $10,000 per full pass when every page goes to the vision model, and about $500 when only the 5 %
+that fail the cheaper tiers do. Re-processing after a parser change multiplies whichever figure you
+chose.
+
+Each record is stored with the raw file's hash and per-page tiers, and `needs_review` pages are counted
+on the pipeline dashboard rather than silently indexed as empty. The word-ratio score is deliberately
+crude and English-specific. It excludes table blocks, because a correct financial table is mostly
+numbers and would otherwise fail the gate; tables need their own check (consistent column counts per
+row, numeric cells that parse). Header and footer removal runs after routing, across all pages, because
+it depends on text repeating from page to page.
 
 ## Trade-offs
 - Tiered routing keeps average cost near the cheapest extractor, but it adds a scoring step and a second
@@ -175,6 +195,8 @@ counts per row, numeric cells that parse).
   wrong column or year.
 - No parser version in the output; the symptom is an inability to re-process only the documents an old,
   buggy extractor touched, so every parser fix becomes a full re-run.
+- Routing whole documents by an average text-layer ratio; the symptom is a contract whose scanned
+  signature annex is missing from the index while the rest of the document retrieves fine.
 - Running parsers in the orchestrator's process; the symptom is one malformed file hanging or OOM-killing
   an entire nightly batch.
 

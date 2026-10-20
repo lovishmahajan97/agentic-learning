@@ -5,7 +5,7 @@ name: polars
 kind: tool
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/pandas
   - python-for-ai/pyarrow
@@ -65,9 +65,13 @@ read until `.collect()`. Before executing, the optimizer applies rules such as:
 ### Memory and parallelism
 Columns are Arrow-style buffers with a validity bitmap for nulls, so `null` is distinct from a float
 `NaN` and an integer column with missing values stays an integer column. The engine is multi-threaded
-in Rust, outside the GIL, so a group-by uses all cores without multiprocessing. For data larger than
-RAM, Polars has a streaming engine that processes the plan in batches; how you enable it has changed
-across releases, so check the docs for your version.
+in Rust, outside the GIL, so a group-by uses all cores without multiprocessing. A parallel group-by
+works the way a distributed one does: threads hash rows into partitions, build partial aggregates
+independently, and merge them. That is why output group order is not guaranteed unless you pass
+`maintain_order=True` (which costs speed), and why it matters for tests and reports that compare
+frames row by row. For data larger than RAM, Polars has a streaming engine that processes the plan in
+batches, and `sink_parquet` writes a lazy result straight to disk without materializing it; how you
+enable streaming has changed across releases, so check the docs for your version.
 
 ### No index, strict types
 There is no row index and no label alignment: rows are positions, and joins are explicit. Schemas are
@@ -131,6 +135,9 @@ equivalent eager pandas code would load all 40 columns, text included, before fi
   come out NaN.
 - Assuming code copied from older blog posts still runs; the symptom is `AttributeError` or deprecation
   warnings because names such as `groupby` became `group_by` and other APIs evolved quickly.
+- Relying on `group_by` output order; the symptom is a test or a diff of a daily report that fails
+  intermittently with the same data, because groups come back in a different order each run. Sort
+  explicitly or pass `maintain_order=True`.
 - Reading wide JSONL with inferred schemas; the symptom is a type error deep in the file when a field
   that was always an integer suddenly holds a string, fixed by passing an explicit schema.
 

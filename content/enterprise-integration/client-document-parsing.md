@@ -5,6 +5,7 @@ name: Client document parsing (PDF, scans, OCR)
 kind: practice
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - rag-retrieval/document-parsing
   - multimodal/ocr
@@ -64,12 +65,24 @@ This sets the routing rules and the cost and time estimate for the backfill.
   that are letters, the share of tokens found in a dictionary for the expected language, or replacement
   and private-use characters. Broken font encodings produce text that exists but means nothing; treat
   those pages as images.
+- **Text layer that is itself old OCR:** many scanners and document-management systems save
+  "searchable PDFs" with an invisible OCR layer under the page image, produced by whatever engine and
+  settings were in use at the time. It passes a naive "has text" test, but its quality is unknown, so
+  give it the same quality check, and re-OCR when it fails.
+- **Text plus embedded images:** a born-digital page can carry a pasted scan, a screenshot of a table or
+  a stamped signature block as an image. The text check passes and the image's content is lost. Measure
+  the share of the page area covered by images (PDF libraries expose image bounding boxes) and send
+  those regions, or the whole page, to OCR when it is large.
 
 ### 3. OCR with preprocessing and confidence
 Render pages at sufficient resolution (Tesseract's documentation recommends at least 300 DPI), deskew,
 and set the expected languages explicitly, *because* OCR accuracy depends heavily on image quality and on
 the language model the engine applies. Keep word-level confidence: OCR engines report it, and the page's
-mean or low-percentile confidence is the signal for routing.
+mean or low-percentile confidence is the signal for routing. Treat it as a ranking signal, not a
+probability: an engine's confidence is not calibrated against your documents, and it can be high on a
+confidently misread stamp or low on a perfectly read unusual font. The routing threshold is therefore
+set by plotting confidence against measured error rate on labelled pages from this client and choosing
+the point where the error becomes unacceptable for the use case.
 
 ### 4. Escalate the hard pages
 Pages with low OCR confidence, complex layouts, dense tables, handwriting or stamps go to a stronger and
@@ -90,8 +103,14 @@ target exactly the pages that used the weak route.
 
 ### 7. Evaluate on the client's documents
 Build a small labelled set from their corpus, stratified by route and template, and measure text accuracy
-(character or word error rate against a transcription), table cell accuracy and, end to end, whether
-retrieval finds the right page. Rerun it when you change a parser or a threshold.
+against a human transcription, table cell accuracy and, end to end, whether retrieval finds the right
+page. Character error rate is the edit distance between output and reference divided by the reference
+length: `CER = (S + D + I) / N`, counting substituted, deleted and inserted characters against *N*
+reference characters (word error rate is the same over words). Because insertions count, CER can exceed
+100% on a page of hallucinated text. Report it per route and per template, not only averaged, and add a
+field-level check for the values the use case depends on (amounts, dates, policy numbers), since a 1%
+CER that lands on the digits of a limit is worse than 5% spread over boilerplate. Rerun the set when you
+change a parser or a threshold.
 
 ### Boundary and sensitivity
 Scanned documents frequently contain signatures, ID numbers and health or financial details. Where
@@ -134,7 +153,12 @@ for p in parse_pdf("claim_88213.pdf"):
 On a typical scanned claim file this might print a text-layer cover page, several OCR pages in the
 80s, and one handwritten page in the 40s routed to escalation. Across the backfill, the share of pages
 per route becomes a cost forecast, and the escalation queue size tells you how much review capacity the
-client must provide.
+client must provide. The crude usability check has its own failure mode to tune for: a born-digital rate
+table or invoice is mostly digits and punctuation, falls under the alphabetic threshold, and gets sent to
+OCR, which can only make its exact text worse, so count digits as valid characters for such templates.
+Two more simplifications to remove before production: joining OCR words with spaces discards the line
+and block numbers Tesseract returns, which is where reading order and table rows live, and the
+200-character floor sends short but genuine digital pages (a signature page) to OCR for no gain.
 
 ## Trade-offs
 - Per-page routing spends expensive OCR and vision calls only where they are needed, but adds triage
@@ -155,6 +179,10 @@ client must provide.
   never appear in retrieval, found only when a user asks about one.
 - Trusting any non-empty text layer; the symptom is garbled text from broken font encodings embedded and
   retrieved, producing confident answers grounded in nonsense.
+- Treating OCR confidence as an accuracy guarantee, with a threshold never checked against labelled
+  pages; the symptom is
+  a page that passed at high confidence with a misread amount, found by a user comparing the answer with
+  the original scan.
 - Deciding route per file instead of per page; the symptom is hybrid PDFs where the digital cover page is
   indexed and the scanned body is lost.
 - OCR with the wrong language setting; the symptom is high error rates on accented and non-Latin
@@ -186,7 +214,8 @@ many older contracts, though they are in the source library. What is your diagno
 **A:** First compare per-document coverage: how many files produced zero or near-zero text, grouped by
 year and folder. Older contracts are likely scans with no text layer, extracted as empty strings and
 silently indexed as nothing, or hybrid PDFs where only a digital cover page was read. Also check for
-garbled text layers by measuring alphabetic ratio and dictionary hit rate. The fix is per-page triage:
+garbled text layers by measuring alphabetic ratio and dictionary hit rate, including the invisible OCR
+layers that older scanners wrote, which "have text" but may be too poor to retrieve on. The fix is per-page triage:
 route image-only and unusable pages to OCR with the right languages, escalate low-confidence pages, and
 reprocess from the stored raw files. Then add a coverage check per batch so empty extractions alert.
 

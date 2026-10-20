@@ -5,7 +5,7 @@ name: Context managers / resource cleanup
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/generators
   - python-for-ai/async-cancellation-and-exception-propagation
@@ -55,6 +55,30 @@ are `None`. On an exception they describe it, and if `__exit__` returns a truthy
 must return `None` or `False`. Multiple managers in one statement exit in reverse order of entry, so
 dependencies unwind correctly.
 
+Written out, `with mgr as x: body` is approximately what PEP 343 specifies:
+
+```
+enter, exit = type(mgr).__enter__, type(mgr).__exit__   # looked up on the type, once
+x = enter(mgr)                    # if this raises, exit is never called
+ok = True
+try:
+    body
+except BaseException as e:
+    ok = False
+    if not exit(mgr, type(e), e, e.__traceback__):
+        raise                     # falsy return: propagate the original
+finally:
+    if ok:
+        exit(mgr, None, None, None)   # normal exit, including return/break
+```
+
+Three consequences follow from that expansion. First, `__exit__` runs only if `__enter__` succeeded,
+*because* the protocol cannot know how far a failed setup got; a manager that acquires two things in
+`__enter__` must clean up the first itself if the second fails. Second, `except BaseException` means
+`KeyboardInterrupt` and `CancelledError` trigger cleanup too. Third, if `__exit__` itself raises, that
+new exception replaces the original (which survives only as `__context__` in the traceback), so a
+cleanup that can fail should log and swallow its own error rather than mask the real one.
+
 ### async with
 `async with` calls `await __aenter__()` and `await __aexit__(...)`, *because* closing a network
 resource is itself I/O: flushing a stream, returning a connection, sending a close frame. `httpx.AsyncClient`,
@@ -68,9 +92,19 @@ itself be interrupted during shutdown.
 bound by `as`, code after is teardown. The exception from the block is thrown in at the `yield`, so
 teardown must sit in `finally` or it is skipped on error. `@asynccontextmanager` is the async version, and
 it is what FastAPI's `lifespan` expects. `ExitStack`/`AsyncExitStack` manage a number of resources known
-only at runtime and unwind whatever was entered if a later setup step fails. Smaller helpers: `closing()`
-for objects with only `close()`, `suppress()`, `nullcontext()` for optional managers, and `aclosing()` for
-async generators.
+only at runtime and unwind whatever was entered if a later setup step fails, which is exactly the
+partial-setup problem from the expansion above. Smaller helpers: `closing()` for objects with only
+`close()`, `suppress()`, `nullcontext()` for optional managers, and `aclosing()` for async generators.
+A `@contextmanager` object is single-use (it wraps one generator, so entering it twice raises), its
+generator must yield exactly once, and it doubles as a decorator: `@timed_span()` above a function
+wraps every call in the block.
+
+### When there is no block to hang it on
+Some lifetimes do not fit a lexical block: an object handed to a caller, a cache entry, a worker that
+lives until shutdown. Then the owner of that lifetime (the app's lifespan, the pool, the cache's
+eviction hook) must call close explicitly. `weakref.finalize(obj, cleanup)` is a better last-resort
+safety net than `__del__`, since it runs at most once and also at interpreter exit, but it still runs
+on garbage-collection timing, so treat it as leak insurance, not as the cleanup plan.
 
 ### Context managers that are not about I/O
 `torch.no_grad()` and `torch.inference_mode()` switch autograd off for a block and restore it after.
@@ -138,6 +172,12 @@ created once per process, not once per request, which is the point of putting th
   vanish and callers see `None` results with no traceback.
 - Relying on `__del__` to close connections; the symptom is "unclosed client session" warnings and
   pool exhaustion that varies with garbage-collection timing.
+- Acquiring a second resource in `__enter__` after the first without guarding it; when the second
+  fails, `__exit__` never runs, and the first leaks only on that rare setup-failure path, which shows up
+  as slowly climbing open connections after upstream outages.
+- A cleanup step in `__exit__` or `finally` that can raise (closing an already-broken stream); the
+  traceback reports the cleanup error and the real cause is buried under "During handling of the above
+  exception".
 
 ## When to use
 Use a context manager for anything with an acquire-and-release pair: clients and connection pools, streams,

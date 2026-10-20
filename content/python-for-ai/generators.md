@@ -5,7 +5,7 @@ name: Generators
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/async-await
   - python-for-ai/context-managers-resource-cleanup
@@ -52,10 +52,21 @@ the frame. When the function returns, the generator raises `StopIteration` (carr
 and `for` loops treat that as the end. A generator is single-pass: once exhausted, iterating it again
 yields nothing, with no error.
 
+Mechanically, the generator object owns a frame: the local variables, the evaluation stack and the
+position of the last executed instruction. An ordinary call creates a frame and discards it on
+return; a generator keeps its frame alive between `next()` calls, which is the whole trick. You can
+watch the lifecycle with `inspect.getgeneratorstate(g)`: `GEN_CREATED` before the first `next()`,
+`GEN_RUNNING` while executing, `GEN_SUSPENDED` at a `yield`, `GEN_CLOSED` once finished. A generator
+cannot be resumed while it is running, so calling `next()` on one already executing, for example from
+a second thread, raises `ValueError: generator already executing`.
+
 ### Pipelines compose lazily
 Generators chain: `chunks(read_jsonl(path))` builds a pipeline, but no work happens until the consumer
 asks for the first item. Then one line is read, parsed, chunked and passed down. Memory is bounded by
-what each stage holds, not by the dataset, *because* items flow one at a time. Generator expressions,
+what each stage holds, not by the dataset, *because* items flow one at a time. The flow is
+**pull-based**: the consumer's `next()` propagates up the chain, so a slow consumer (an embedding API
+at its rate limit) automatically slows reading, and nothing piles up between stages. That is
+backpressure without any queue. Generator expressions,
 `(f(x) for x in xs)`, are the inline form; `itertools` (`islice`, `chain`, and `batched` from 3.12)
 supplies the standard pipeline stages.
 
@@ -108,6 +119,13 @@ chunk in memory before the first API call. This pipeline holds one line, one par
 batch of 64 × 800 characters (about 50 KB of text) at a time, and the first batch is ready to send within
 milliseconds of starting, instead of after the whole corpus is parsed. A malformed line is skipped and logged rather than killing a long job.
 
+To see the laziness, put a `print` in each stage and run it on a two-document file with 2,000-character
+texts. The output interleaves: read doc 1, chunk 1a, chunk 1b, chunk 1c, read doc 2, chunk 2a, and so on,
+with the batch closing once 64 chunks (or the end of input) arrive. A list pipeline would print every
+"read" before the first "chunk". The interleaving is the mechanism: `batched` pulls a chunk, `chunks`
+needs a document, `read_jsonl` resumes inside its `for` over the file, reads one line, and suspends
+again at `yield`, with the file still open and the line counter intact.
+
 ## Trade-offs
 - Lazy pipelines keep memory flat and deliver first results early, but each item is produced once; if
   you need random access, `len()` or several passes, materialise to a list or reopen the source.
@@ -129,6 +147,12 @@ milliseconds of starting, instead of after the whole corpus is parsed. A malform
   during iteration, outside the handler, so the guard never triggers.
 - Converting the pipeline to a list for debugging (`list(gen)`) and leaving it in; memory use returns
   to dataset-sized and the job slows on large inputs.
+- Calling `next(it)` inside a generator on an iterator that may be exhausted; since PEP 479 the stray
+  `StopIteration` is converted to `RuntimeError: generator raised StopIteration` instead of silently
+  ending the outer generator, so use `next(it, None)` or catch it explicitly.
+- Sharing one generator between threads or DataLoader-style workers; the symptom is
+  `ValueError: generator already executing` or duplicated and missing items, so give each worker its own
+  source or put a `queue.Queue` between them.
 
 ## When to use
 Use generators whenever you process sequences that are large, slow to arrive or potentially unbounded:

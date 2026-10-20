@@ -5,6 +5,7 @@ name: Webhooks
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - enterprise-integration/incremental-synchronization-and-cdc
   - enterprise-integration/retry-deduplication-reconciliation
@@ -29,7 +30,9 @@ never arrive.
 ## Why it exists
 An AI assistant indexed over Jira, Slack or SharePoint is only as fresh as its last sync. Polling every few
 minutes for every tenant and every container multiplies API calls by tenants × containers × polls, most of
-which return "nothing changed", and still leaves minutes of staleness. For agent workflows ("when a ticket
+which return "nothing changed", and still leaves minutes of staleness. Illustratively, 200 tenants with 50
+watched containers each, polled every 5 minutes, is 200 × 50 × 288 ≈ 2.9 million calls a day, and the
+average staleness is still about half the interval. Halving staleness doubles the calls. For agent workflows ("when a ticket
 is assigned to the AI queue, draft a reply") polling also adds latency the user feels.
 
 Webhooks invert the direction: the source tells you when something happens. The naive receiver, though,
@@ -47,20 +50,31 @@ Register your URL with the source, per tenant, for specific event types. Some so
 first: Slack sends a `url_verification` challenge you must echo; Microsoft Graph sends a `validationToken`
 that you return as plain text, and Graph subscriptions expire, so you must renew them on a schedule.
 Store subscription IDs and expiry, *because* an expired subscription fails silently: nothing arrives.
+Graph also sends lifecycle notifications (for example that a subscription needs reauthorization, or that
+notifications were missed); handle them, *because* "missed" is the sender telling you to run a catch-up sync.
 
 ### 2. Verify
 Reject anything not provably from the sender. Most use an HMAC of the raw body (often with a timestamp)
 under a shared secret; some use a client-state token you chose at subscription time, or mutual TLS.
 Compare in constant time and reject old timestamps to limit replay. The details belong to the
-signature-verification lesson; the integration rule is: verify the **raw bytes** before parsing.
+signature-verification lesson; the integration rule is: verify the **raw bytes** before parsing. In a
+multi-tenant receiver, derive the tenant from which secret verified the request (or from the subscription ID
+you stored), never from a tenant field in the body, *because* the body is exactly what an attacker controls.
 
 ### 3. Acknowledge fast, process later
-Return 2xx within the sender's timeout (often a few seconds) after verifying and durably enqueueing,
-*because* any slow work in the handler causes timeouts, retries and duplicates.
+Return 2xx within the sender's timeout (Slack, for example, expects a response within three seconds)
+after verifying and durably enqueueing, *because* any slow work in the handler causes timeouts, retries and
+duplicates. Senders differ in what happens next: most retry with backoff a bounded number of times (Slack
+marks retries with `X-Slack-Retry-Num` and `X-Slack-Retry-Reason` headers), and some disable a subscription
+whose endpoint keeps failing. Either way, your failure window becomes lost events.
 
 ### 4. Process idempotently
 Use the sender's event ID (or a hash of the payload) as a deduplication key in the consumer. Senders retry
-on non-2xx and sometimes even after success, so duplicates are normal.
+on non-2xx and sometimes even after success, so duplicates are normal. A dedup table is an optimisation,
+not the guarantee: two workers can pick up the same event concurrently and both see "not seen yet". The
+real guarantee is that processing is itself idempotent (re-fetch current state, upsert by key), so a
+duplicate that slips through does no harm. For side effects that are not naturally idempotent, such as
+posting a reply, claim the event with an atomic insert-if-absent before acting.
 
 ### 5. Treat payloads as hints
 Many events are "thin" (an ID and a type). Even fat payloads may be stale by the time you process them.
@@ -103,16 +117,23 @@ async def slack_events(req: Request):
     return Response(status_code=200)
 
 async def consume(msg):                                      # runs in a worker, not the handler
-    if not await dedup.first_time(msg.key):                  # event_id seen before: retry duplicate
+    if await dedup.seen(msg.key):                            # event_id seen before: retry duplicate
         return
     ev = msg.payload["event"]
     if ev["type"] == "message":
-        current = await slack.conversations_replies(ev["channel"], ev.get("thread_ts") or ev["ts"])
+        m = ev.get("message") or ev.get("previous_message") or ev   # edits/deletes nest the original
+        root = m.get("thread_ts") or m["ts"]
+        current = await slack.conversations_replies(ev["channel"], root)
         await indexer.upsert_thread(msg.payload["team_id"], ev["channel"], current)  # re-fetched state
+    await dedup.mark(msg.key)                                # mark only after success, so a crash retries
 ```
 
 The consumer re-fetches the whole thread rather than trusting the single message in the event, which also
-handles edits and out-of-order delivery for that thread.
+handles edits and out-of-order delivery for that thread. Edit and delete events (`message_changed`,
+`message_deleted` subtypes) carry the affected message nested inside the event, and the event's own `ts`
+is not a message, which is why the root timestamp is read from the nested message. A deleted thread root
+makes the re-fetch return not-found, which the indexer must treat as a delete. The dedup key is marked only
+after processing succeeds: marking it first would turn a worker crash into a silently dropped event.
 
 ## Trade-offs
 - Webhooks cut freshness lag to seconds and save API calls, but add a public endpoint, subscription
@@ -133,6 +154,8 @@ handles edits and out-of-order delivery for that thread.
   a user complains.
 - Letting subscriptions expire or get disabled after repeated failures; the symptom is a tenant's freshness
   quietly dropping to the reconciliation interval.
+- Processing non-idempotent side effects with only a check-then-mark dedup; the symptom is occasional
+  double replies or double tickets under load, when two workers race on the same retried event.
 - Trusting payload content as instructions or index text without fetching from the source; the symptom is
   forged events injecting attacker-controlled text into retrieval.
 

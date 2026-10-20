@@ -4,7 +4,8 @@ module: deployment
 name: Security questionnaires
 kind: practice
 difficulty: intro
-est_minutes: 13
+est_minutes: 15
+status: reviewed
 related:
   - deployment/security-and-architecture-reviews
   - deployment/compliance-constraints
@@ -53,6 +54,27 @@ governance and policies, access control and identity, encryption in transit and 
 management, network security, vulnerability management and penetration testing, logging and
 monitoring, incident response and notification, business continuity, data retention and deletion,
 privacy, subprocessors, secure development, and increasingly an AI section.
+
+### What happens on the buyer's side
+Understanding the reviewer's workflow explains what they reward:
+1. **Inherent-risk tiering.** Before sending anything, the risk team classifies the engagement by what
+   you will touch: data sensitivity, volume, whether you get network or system access, and how
+   critical you are to operations. A vendor that processes patient records with agent tool access
+   lands in the top tier; a vendor that sees only marketing copy does not. The tier sets the depth,
+   *because* the team's review hours are the scarce resource. (Templates are built for this: the SIG
+   comes in a shorter Lite and a fuller Core form, and CAIQ maps each question to a control in the CSA
+   Cloud Controls Matrix.)
+2. **Scoring and findings.** Each answer is compared with the buyer's required control. A "No" or a
+   vague answer on a required control becomes a finding with a severity.
+3. **Follow-up and evidence requests.** Reviewers ask for proof on the answers that matter most to
+   their tier; precise first answers mean fewer rounds.
+4. **Disposition.** Findings are accepted as risk, mitigated by a compensating control, or turned into
+   remediation commitments with dates, which often land in the contract.
+5. **Reassessment.** High-tier vendors are typically re-reviewed periodically and on material change,
+   so an answer you give today will be compared with the one you give next year.
+
+The practical upshot: a reviewer is looking for residual risk they can sign off on, not a perfect
+score, so a clearly scoped gap with a mitigation is easier to approve than an ambiguous "Yes".
 
 ### Evidence that shortcuts it
 Buyers accept independent assurance in place of many answers. A SOC 2 Type II report is an auditor's
@@ -123,6 +145,10 @@ and the remaining answers were drafted from the library and approved by owners w
   question answered differently in a renewal, prompting a full re-review.
 - Never revisiting answers after architecture changes; the symptom is stale claims, for example
   "data never leaves the EU" after someone added a US-hosted model fallback route.
+- Attaching sensitive evidence without controls, such as a full penetration-test report with
+  unfixed findings or a detailed network diagram, to a portal outside an NDA; the symptom is your
+  internal security detail circulating among people you have never met. Share summaries and attestation
+  letters by default, full reports under NDA on request.
 - Treating "not applicable" as a shortcut; the symptom is reviewer follow-ups asking why, which slow
   the review more than a one-line justified answer would have.
 

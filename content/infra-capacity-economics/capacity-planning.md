@@ -5,7 +5,7 @@ name: Capacity planning (tokens/sec, requests/sec, concurrent sessions)
 kind: practice
 difficulty: core
 est_minutes: 18
-status: fact-checked
+status: reviewed
 related:
   - infra-capacity-economics/queueing-theory
   - infra-capacity-economics/latency-budgets
@@ -74,6 +74,13 @@ Little's Law holds for any stable system in steady state, whatever the arrival o
 distribution, which is *why* it is the safe bridge between units. It does not tell you queueing delay;
 that is the job of the queueing-theory lesson.
 
+One subtlety makes LLM planning circular: W depends on load. TPOT rises as the batch grows, so more
+in-flight sequences make each call longer, which makes L larger still. Break the loop by using the
+TPOT and TTFT measured *at the concurrency you plan to run*, not at batch 1; if you plug in an
+unloaded TPOT, the plan undercounts in-flight sequences exactly when it matters. A useful identity
+for checking the result: a replica running B sequences at TPOT t produces about B ÷ t output tokens
+per second, so in-flight sequences, TPOT and output tokens/sec must agree with each other.
+
 ### 3. Measure capacity per replica at the SLO
 Per-replica capacity is not a spec-sheet number. Run a load test with a realistic token mix and sweep
 concurrency. Throughput rises with batch size while per-request TPOT and TTFT degrade; the usable
@@ -84,10 +91,15 @@ or the latency knee, is the replica's capacity, and you should know which one it
 differ (more memory or GQA/quantized cache vs. more replicas).
 
 ### 4. Size, then add headroom
-Replicas = peak in-flight sequences ÷ (per-replica capacity × target utilization), rounded up. The
+Replicas = max over the binding units: peak in-flight sequences ÷ (per-replica sequence capacity ×
+target utilization), and peak input tokens/sec ÷ per-replica prefill capacity at that load, rounded
+up. Usually one dominates, but a prefill-heavy mix (long RAG contexts, short answers) can be bound by
+prefill while sequence slots sit free. The
 target utilization sits below 100% *because* queueing delay grows sharply as utilization approaches
 one, and the count is increased again for N+1 failure tolerance, rolling deploys and autoscaler lag (GPU nodes and model
-loading can take minutes). For a managed API, the same numbers become requests-per-minute and
+loading can take minutes). Finally, plan over a horizon at least as long as your procurement or
+quota lead time: if reserved GPUs take a quarter to arrive and traffic grows 10% a month, the plan
+you act on today must cover the peak expected a quarter from now, not today's. For a managed API, the same numbers become requests-per-minute and
 tokens-per-minute quotas per region and per model; check whether your provider counts the requested
 `max_tokens` against the token quota at admission time, because some do, which makes generous
 `max_tokens` settings consume quota you never use.
@@ -119,7 +131,10 @@ sequences in flight, so only 40% of the 1,200 sessions are busy at any instant. 
 replica, 7.5 replicas would run at 100%; at a 70% target that is 11, plus one spare gives 12.
 Now cross-check memory: for a Llama-3-8B-shaped model (32 layers, 8 KV heads, head dim 128, fp16) the
 cache is 2 × 32 × 8 × 128 × 2 bytes = 128 KiB per token, so 64 sequences × 3,250 tokens ≈ 27 GB, which
-fits beside ~16 GB of weights on an 80 GB GPU. Then check prefill: 180,000 input tokens/sec across 12
+fits beside ~16 GB of weights on an 80 GB GPU. Then check decode consistency: 480 sequences over 12
+replicas is 40 per replica, and 40 ÷ 0.03 s ≈ 1,330 output tokens/sec per replica, about 16,000
+across the fleet, slightly above the 15,000 demanded because part of each call's 8 s is TTFT rather
+than decode; if the numbers disagreed badly, one of the inputs would be wrong. Then check prefill: 180,000 input tokens/sec across 12
 replicas is 15,000 per replica, which the load test must confirm; if the 2,000-token system prompt is
 shared, prefix caching removes most of that work.
 
@@ -142,6 +157,8 @@ shared, prefix caching removes most of that work.
   429s on requests-per-minute at a user load the plan said was safe.
 - Sizing to the daily average; the symptom is queue depth and TTFT climbing every weekday morning while
   the dashboard shows modest mean utilization.
+- Load-testing with fixed-length synthetic prompts; the symptom is a replica that met its SLO in the
+  test but misses it in production, where the long tail of contexts fills KV memory sooner.
 - Treating open sessions as concurrent load; the symptom is a GPU fleet several times larger than needed
   because idle conversations were counted as in-flight sequences.
 

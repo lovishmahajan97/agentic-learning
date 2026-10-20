@@ -4,8 +4,8 @@ module: customer-data-evaluation
 name: Golden dataset creation with client SMEs
 kind: practice
 difficulty: core
-est_minutes: 15
-status: fact-checked
+est_minutes: 16
+status: reviewed
 related:
   - evals/golden-dataset
   - evals/inter-annotator-agreement
@@ -44,7 +44,11 @@ leaves no artefact the customer will sign as the acceptance standard.
 ### 1. Anchor the dataset to a decision
 Write down what the dataset will be used to decide: prompt iteration, model choice, go-live acceptance.
 This sets the size, the error tolerance and who must sign off. An acceptance dataset needs the business
-owner's signature; an iteration dataset only needs the working SMEs.
+owner's signature; an iteration dataset only needs the working SMEs. Size follows from the precision the
+decision needs, per segment that has its own threshold: for a pass rate near p and a desired 95%
+half-width E, n ≈ 1.96² · p(1−p) / E². At p = 0.9 and E = 0.05 that is about 140 items, and it applies
+to *each* segment with its own bar, which is why segment thresholds, not the headline, usually drive the
+total and the expert-hours.
 
 ### 2. Clear data access first
 Agree where the data lives, who may see it, and whether de-identification is needed before anyone
@@ -55,7 +59,7 @@ the work away.
 ### 3. Sample from production, stratified
 Draw candidate inputs from real recent traffic, stratified by the segments the business cares about,
 with deliberate oversampling of rare high-stakes cases (see representative test-case sampling).
-Synthetic or hand-picked items are allowed only as a labelled minority, *because* experts write
+Synthetic or hand-picked items are allowed only as a tagged minority, *because* experts write
 cleaner inputs than the world does.
 
 ### 4. Write guidelines, then calibrate
@@ -64,20 +68,32 @@ independently, measure agreement, and revise the guideline where they split. Onl
 Calibrating first is cheap; discovering disagreement after 500 labels is not.
 
 ### 5. Label for reference and rationale
-Each item gets the reference answer (or acceptable-answer criteria for open-ended outputs), a short
-rationale, and a difficulty or "ambiguous" flag. The rationale is what lets an engineer later tell a
-model error from a label error.
+Each item stores more than an answer, because each field answers a later question:
+
+| Field | Why it is there |
+|---|---|
+| input, source record id | reproducibility, and deletion if the customer revokes the record |
+| reference answer, or acceptance criteria | closed tasks get a label; open-ended ones get must-include facts and must-not errors, because many wordings are correct |
+| rationale citing the guideline section | lets an engineer tell a model error from a label error later |
+| ambiguous / difficulty flag | ambiguous items are scored separately, not silently counted |
+| labeller, guideline version, date | a definition change can then be traced to the labels it affects |
+
+Decide early whether SMEs label from scratch or correct a pre-label (model output or engineer draft).
+Pre-labels can cut expert time substantially but anchor reviewers toward the draft, so measure how
+often SMEs change them; a change rate near zero on hard items signals rubber-stamping.
 
 ### 6. Double-label a subset and adjudicate
-Have a fixed fraction labelled by two experts, compute agreement per category, and send disagreements to
-an adjudicator, normally the policy owner. Persistent disagreement in a category is a policy gap; resolve
-it as a written rule rather than by majority vote, *because* the model will be judged against the
-rule in production.
+Have a fixed fraction labelled by two experts, compute chance-corrected agreement (Cohen's κ) per
+category, and send disagreements to an adjudicator, normally the policy owner. Persistent disagreement
+in a category is a policy gap; resolve it as a written rule rather than by majority vote, *because* the
+model will be judged against the rule in production. Agreement also sets a ceiling on what the metric
+can show: if two experts agree on 85% of items, a model "scoring" 95% against one of them is partly
+fitting that expert's quirks.
 
 ### 7. Freeze, version and sign off
 Freeze a version with a changelog, record guideline version and labeller per item, split off a holdout
-that the team never inspects during iteration, and get written sign-off from the business owner that
-this set, at this threshold, is the acceptance standard.
+(stratified, so rare segments appear in it) that the team never inspects during iteration, and get
+written sign-off from the business owner that this set, at this threshold, is the acceptance standard.
 
 ### 8. Refresh on a schedule
 Production drifts. Add newly sampled cases each cycle, retire items that no longer reflect policy, and
@@ -87,23 +103,29 @@ never edit a label silently; changes go through the same review and bump the ver
 A worked plan for a commercial-insurance claims triage pilot, with numbers stated as illustrative.
 
 The customer offers three senior adjusters for two hours a week each, six expert-hours weekly. The
-target is a 400-item acceptance set. Week 1: the data team confirms claims can be labelled only inside
-the customer's tenant, so the labelling tool is deployed there and policyholder names are masked. A
+target is a 400-item set. Week 1: the data team confirms claims can be labelled only inside the
+customer's tenant, so the labelling tool is deployed there and policyholder names are masked. A
 stratified sample of 600 candidates is drawn from the last quarter: by line of business, claim size
 band, and an oversample of the roughly 3% of claims with litigation flags so they get 40 of the 400
 final slots rather than the 12 a proportional sample would give.
 
-Week 2: a 40-item calibration batch is labelled by all three adjusters independently. Agreement is high
-on routing to fast-track, but they split on "potential subrogation" in 11 of 40 cases. The claims
-director rules that subrogation applies only when a third party is named in the first notice, and that
-rule goes into the guideline and the prompt.
+Week 2: a 30-item calibration batch is labelled by all three adjusters independently; at an assumed 4
+minutes per item that is 90 labels, about 6 hours, the whole week's budget. Agreement is high on routing
+to fast-track, but they split on "potential subrogation" in 8 of 30 cases. The claims director rules
+that subrogation applies only when a third party is named in the first notice, and that rule goes into
+the guideline and the prompt.
 
-Weeks 3 to 8: at an assumed 4 minutes per item, 400 items take about 27 hours single-labelled; 20%
-double-labelled adds about 5 hours, so roughly 32 expert-hours, which is between five and six weeks of
-the offered time. The FDE shows this to the sponsor up front rather than promising three weeks.
-Adjudication takes one 45-minute session per week. Week 9: version 1.0 is frozen with 80 items held out,
-and the claims director signs that 90% routing accuracy overall and 85% on litigation-flagged claims is
-the acceptance bar.
+Weeks 3 to 8: 400 items single-labelled take about 27 hours; 20% double-labelled adds about 5, so
+roughly 32 expert-hours, between five and six weeks of the offered time. The FDE shows this to the
+sponsor up front rather than promising three weeks. Adjudication takes one 45-minute session per week.
+
+Week 9: version 1.0 is frozen and split 240 iteration / 160 holdout, stratified, so 16 litigation items
+land in the holdout. The FDE then runs the interval arithmetic in front of the sponsor before anyone
+signs. On 160 holdout items, 90% overall routing accuracy carries about ±5 points (√(0.9·0.1/160) ≈
+0.024). On 16 litigation items, an 85% floor carries about ±17 points, which cannot separate a good
+system from a poor one. So the signed bar is 90% overall on the holdout, and 85% on litigation measured
+on those 16 plus 60 litigation claims sampled and labelled after iteration ends (about 4 more
+expert-hours), giving roughly ±8 points on 76 items with no tuned-on item counted.
 
 ## Trade-offs
 - More SMEs per item gives cleaner labels and measurable agreement, but multiplies scarce expert time;
@@ -124,6 +146,8 @@ the acceptance bar.
   dataset versions because no policy was ever written.
 - Reusing golden items as prompt examples or retrieval content; the symptom is a score that collapses on
   freshly sampled production cases.
+- Signing a segment threshold the holdout is too small to test; the symptom is a go/no-go meeting where
+  a 3-item swing in a 16-item segment decides the outcome.
 - Skipping the formal sign-off; the symptom is the acceptance bar being renegotiated after results come
   in.
 

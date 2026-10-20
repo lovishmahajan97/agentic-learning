@@ -5,7 +5,7 @@ name: AI use-case discovery
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - scoping/customer-discovery
   - scoping/workflow-analysis
@@ -63,11 +63,31 @@ order-of-magnitude at this stage; the ROI model refines the winners later. Note 
 full automation or only assistance, *because* assisted value (say, half the time saved) is reachable far
 sooner than full automation.
 
+### 3a. Ask what accuracy the value requires
+Value is not independent of accuracy, and the dependence is different for reviewed and unreviewed use
+cases. That difference is what verification asymmetry means in numbers.
+
+*Reviewed (assist).* Let *w* be the minutes to do the item by hand, *e* the minutes to check and edit a
+good draft, and *r* the minutes wasted reading a bad draft before doing it by hand anyway. With draft
+quality *p*, expected time is `p·e + (1−p)·(r + w)`, so the assistant breaks even at
+`p* = r / (w − e + r)`. With w = 12, e = 3, r = 1 (illustrative), p* ≈ 10%, and at p = 70% expected time
+is 0.7·3 + 0.3·13 = 6 minutes, half the manual time. Mediocre accuracy still pays.
+
+*Unreviewed (automate).* Each error now lands as its full cost *C*, so the break-even error rate is
+`value saved per item ÷ C`. Saving about $8 of handling time per item against a $200 average cost per
+wrong decision allows at most a 4% error rate, so 96% accuracy only breaks even, before any regulatory
+or reputational cost. The same model can therefore be a clear win as an assistant and a loss as an
+automaton. Both calculations assume reviewers really check; as drafts get better, reviewers start
+approving without reading (automation bias), so measure how many errors the review step actually catches.
+
 ### 4. Assess feasibility
 Can you get representative data this month? Is there an integration point where output can land (an
 API, a queue, a UI people already use)? Are there examples of correct outputs to evaluate against? Is
 latency or cost per item compatible with the volume? A candidate blocked on a six-month data-access
-approval is not a first use case regardless of value.
+approval is not a first use case regardless of value. For each shortlisted candidate, run a one- or
+two-day probe: a plain prompt against 20 to 50 real items, scored by someone who does the work. It will
+not tell you the final accuracy, but it separates "plausibly reachable" from "the model cannot read
+these documents at all" before anyone writes a business case.
 
 ### 5. Classify risk
 Consider consequence of error, who is affected (internal staff vs customers vs the public),
@@ -145,6 +165,8 @@ contract extraction is blocked on data, which tells you what to start in paralle
   or queue to deliver into, so nobody uses its results.
 - Not checking for a measurable baseline; the symptom is a finished pilot where nobody can say whether
   it improved anything, because the current time or error rate was never recorded.
+- Assuming human review makes any accuracy acceptable; the symptom is reviewers approving drafts
+  unread once they are usually right, so errors reach customers at the model's raw error rate.
 - Treating the candidate list as fixed; the symptom is a stale backlog that ignores what the first
   deployment taught about data quality and user adoption.
 

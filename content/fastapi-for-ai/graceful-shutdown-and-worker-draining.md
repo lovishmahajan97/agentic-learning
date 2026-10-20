@@ -5,7 +5,7 @@ name: Graceful shutdown & worker draining
 kind: practice
 difficulty: advanced
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - fastapi-for-ai/lifespan
   - fastapi-for-ai/uvicorn-gunicorn-workers
@@ -88,6 +88,15 @@ Three strategies, in order of robustness:
   a final event that says "reconnect" and closes, so the client retries rather than rendering a truncated
   answer. This must happen before the server's drain timeout; after that the connection is just closed.
 
+### Draining that is not pod termination
+The same drain happens inside a running pod. Gunicorn's `--max-requests` recycling and a `SIGHUP` reload
+both retire workers: the retiring worker stops accepting and finishes its in-flight requests within
+`--graceful-timeout` while the master starts a replacement, so siblings carry the load. With a single
+worker there are no siblings, so new connections wait in the socket backlog until the replacement has
+finished lifespan startup, which is a latency spike every few thousand requests if the model takes long to
+load. Cloud load balancers also drain on their own timer (an AWS ALB target group's deregistration delay
+defaults to 300 s): it should cover the server's drain timeout, and anything much longer only slows deploys.
+
 ### Containers
 The process must actually receive the signal. A Dockerfile `CMD` in shell form wraps the server in
 `/bin/sh -c`; the shell becomes PID 1 and does not forward SIGTERM to a child, so the server is SIGKILLed
@@ -144,6 +153,9 @@ Answers longer than the budget are the signal to move that workload to a job que
   every rolling deploy, even though shutdown itself looks clean.
 - Leaving readiness green during shutdown behind a balancer that polls it; the symptom is new requests
   landing on a draining worker and failing or being cut a few seconds later.
+- A `preStop` exec hook that calls `curl` in a slim image that has no curl; the symptom is a
+  `FailedPreStopHook` event on the pod and a drain flag that never flips. Use a tool the image has (Python),
+  or the built-in `sleep` preStop action that recent Kubernetes versions provide when only a delay is needed.
 - Treating agent runs as ordinary requests; the symptom is half-completed side effects (tickets created,
   emails sent) with no record, because the run was killed between tool calls.
 

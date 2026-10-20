@@ -5,7 +5,7 @@ name: Training data pipelines
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - training-adaptation/data-curation
   - training-adaptation/synthetic-data-generation
@@ -69,10 +69,22 @@ The stages run in an order chosen so that cheap operations shrink the data befor
    locality-sensitive hashing so documents sharing a band become candidate pairs, and cluster candidates
    with union-find, keeping one per cluster. It exists because exact hashing misses the same article with
    a different footer, and pairwise comparison of a billion documents is impossible.
+   The reason it works: for one random hash function, the chance that two documents have the same
+   minimum shingle hash equals their Jaccard similarity *s*. So a signature of *k* minima estimates
+   *s*. Split the signature into *b* bands of *r* rows (with *k = b·r*). Two documents become a candidate
+   pair if all *r* values in at least one band match, which happens with probability
+   `P(s) = 1 − (1 − s^r)^b`. That is an S-curve with its steep part near `(1/b)^(1/r)`. With *k* = 100
+   split as *b* = 20, *r* = 5, the threshold is about 0.55. Pairs with *s* = 0.8 become candidates with
+   probability about 0.9996, pairs at 0.5 about 0.47, and pairs at 0.3 about 0.05. More rows per band
+   moves the threshold up and makes the curve steeper. Candidates are usually checked against a real
+   similarity before they are merged, because LSH controls recall, not precision.
 4. **Decontamination.** Compare training text against every evaluation set the model will be judged on,
    using n-gram overlap (the GPT-3 report used 13-gram overlap; the right *n* is a judgement between
    missing paraphrases and deleting common phrases), and remove or flag overlapping training documents.
-   This must be redone whenever an eval set is added.
+   This must be redone whenever an eval set is added. Your own validation split needs the same care.
+   Split *after* near-duplicate clustering and by group (customer, thread, product), so a cluster never
+   has members on both sides. A random row-level split of support tickets puts near-identical tickets in
+   train and validation, and the validation loss then reports memorization.
 5. **Model-based quality filtering.** A small classifier or a perplexity threshold from a reference model
    ranks remaining documents for "educational" or domain quality. It runs late because it is the most
    expensive per document and operates on the smallest set. The FineWeb work is a good public reference
@@ -91,7 +103,11 @@ The stages run in an order chosen so that cheap operations shrink the data befor
 9. **Sharding and mixture.** Write fixed-size shards (Parquet, Arrow, WebDataset tar, or a streaming
    format such as MDS) with a shard index, so the loader can shuffle at shard level and within a buffer,
    resume from a global sample offset, and sample sources according to a mixture weight (for example
-   up-weighting the customer's domain data relative to general text).
+   up-weighting the customer's domain data relative to general text). A mixture weight implies a
+   repetition count: `epochs_of_source = weight × total_training_tokens / source_tokens`. Giving a
+   50M-token domain source 20 % of a 1B-token run means 200M tokens drawn from it, which is four passes
+   over it. Write that number down per source, because a small source with a high weight is repeated
+   many times, and repetition is where memorization and overfitting come from.
 10. **Versioning.** A dataset version is the ordered list of shard hashes plus the pipeline config. The
     training run records that version; lineage goes from any training sample back to its source manifest.
 
@@ -172,6 +188,8 @@ of shard hashes is what the training config references so the run is reproducibl
   whose loss curve does not continue the original, and a divergence nobody can reproduce.
 - Running near-dup detection before cheap filters; the symptom is MinHash jobs that take days on data
   most of which is then discarded by a one-line length rule.
+- Splitting train and validation at random rows instead of by group after dedup; the symptom is a
+  validation loss that keeps falling while quality on genuinely new customers or threads stays flat.
 - Dropping provenance at the first join; the symptom is a takedown or license question that can only be
   answered by retraining without the disputed source.
 

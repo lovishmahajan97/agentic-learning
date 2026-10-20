@@ -4,7 +4,8 @@ module: deployment
 name: Compliance constraints
 kind: concept
 difficulty: core
-est_minutes: 16
+est_minutes: 18
+status: reviewed
 related:
   - security-governance-compliance/compliance-architecture
   - security-governance-compliance/data-residency
@@ -60,7 +61,11 @@ naturally: configuration in code, logs, test results.
   processing agreements with processors, honoring rights such as erasure and access, and safeguards
   for transfers outside the EEA (adequacy decisions or mechanisms such as standard contractual clauses).
   It does not strictly mandate EU hosting, but many customers impose EU residency contractually because
-  it is the simplest way to stay safe.
+  it is the simplest way to stay safe. Two points change designs: the customer is usually the
+  **controller** and you the **processor**, so you act only on their documented instructions and
+  your subprocessors (model, cloud, tracing) need their approval; and European regulators generally
+  treat *remote access* from outside the EEA, such as a US support engineer opening an EU tenant's
+  traces, as a transfer, so residency is about who can read the data, not only where disks sit.
 - **HIPAA (US health data).** Covered entities may share protected health information with a vendor only
   under a business associate agreement, and that obligation flows down to the vendor's subprocessors,
   including model and cloud providers. Security Rule safeguards cover access control, audit controls and
@@ -85,6 +90,22 @@ it, including vendors and personnel; **what** data may enter prompts, logs and i
 or may it be kept; **how** must it be protected (encryption, customer-managed keys); **what proof** must
 exist (audit trails, change records); and **AI-specific** rules (no training use, human oversight,
 disclosure that users are talking to AI).
+
+### Enforce at a chokepoint, check in the pipeline
+A constraint written only in a policy document is broken by the first engineer who adds a fallback
+region. So each constraint should be enforced where every request must pass, and checked where every
+change must pass:
+- **Runtime chokepoint.** Route all model calls through one gateway that holds a per-tenant policy
+  (allowed providers, allowed regions, whether content may be logged) and refuses anything else.
+  It is a chokepoint *because* a single enforcement point cannot be bypassed by a new code path the
+  way scattered checks can, and its configuration plus its refusal logs are the evidence.
+- **Change-time check.** Run policy checks on infrastructure plans (for example, fail any Terraform
+  plan that creates storage outside approved regions or a log sink without a retention setting), and
+  require review when a new subprocessor appears in the dependency or egress list. This catches the
+  violation before it reaches production, which is when it is cheapest.
+- **Periodic proof.** Access reviews, deletion tests that confirm an erased record is gone from the
+  database, the vector index and the caches, and a reconciliation of actual egress against the
+  declared subprocessor list.
 
 ### Constraints conflict
 Audit retention can collide with erasure; debug logging with minimization; a cross-region fallback with

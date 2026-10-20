@@ -77,7 +77,8 @@ mainly buys cost and TTFT. Agents and chains multiply all of it by the number of
 
 ### Cost per success, and when quality *is* cost
 If each attempt succeeds with probability *q* and a verifier lets you retry until success, expected
-attempts are `1/q`, so `cost_per_success = (c_call + c_verify) / q`. If failures instead go to a human,
+attempts are `1/q`, so `cost_per_success = (c_call + c_verify) / q`. That assumes independent attempts; in practice the
+same hard input tends to fail again, so retries recover less than `1/q` predicts. If failures instead go to a human,
 `cost_per_task = c_call + (1 − q) · c_human`. Illustratively, a $0.001 model at 86% with a $2 human
 escalation costs 0.001 + 0.14 × 2 ≈ $0.28 per task; a $0.018 model at 94% costs 0.018 + 0.06 × 2 ≈ $0.14.
 When failure is expensive, the quality axis collapses into the cost axis and the "expensive" model is the

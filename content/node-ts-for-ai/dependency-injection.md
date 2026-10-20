@@ -4,8 +4,8 @@ module: node-ts-for-ai
 name: Dependency injection
 kind: pattern
 difficulty: core
-est_minutes: 13
-status: fact-checked
+est_minutes: 14
+status: reviewed
 related:
   - node-ts-for-ai/vitest-jest-and-integration-testing
   - node-ts-for-ai/typescript-strict-mode-and-advanced-types
@@ -63,6 +63,24 @@ The important word is *explicit*: you can read a function's signature and know e
    where lifecycle lives: it starts things in dependency order and shuts them down in reverse.
 4. **Tests build a different graph.** `createChatService({ llm: fakeLLM, db: testDb, clock: fixed })`.
    No module mocks, no monkey-patching, no environment variables.
+
+### Composing behaviour at the root
+Because every adapter satisfies the same `LLM` interface, cross-cutting behaviour is added by wrapping
+one implementation in another (the decorator pattern), and the wrapping happens only at the root:
+
+```
+llm = withCache(redis,                       // outermost: a hit skips everything below
+        withFallback(                        // on failure or open breaker, try the next provider
+          withBreaker(openaiAdapter),        // per provider, so one outage does not trip the other
+          withBreaker(anthropicAdapter)))
+```
+
+The order is a design decision, not decoration. The cache sits outside *because* a hit should cost
+neither a retry nor a breaker slot; each breaker wraps exactly one provider *because* its state
+describes that provider's health; the vendor SDK's own retries stay innermost, so a fallback is taken
+only after a provider has genuinely failed. The handler sees none of this: it still calls
+`llm.complete()`, and a test can wire the same stack around a fake that fails on demand to prove the
+fallback path. Without injection each of these behaviours ends up as an `if` inside business logic.
 
 ### Scopes
 Infrastructure clients (pool, Redis, SDK) are singletons: constructing them is expensive and they own
@@ -151,6 +169,7 @@ const svc = createChatService({
 - Service locator in disguise: passing one giant `container` object and calling `container.get('llm')` inside business logic; the symptom is that a signature no longer tells you what a function touches, and every test must build the whole container.
 - Mixing scopes: injecting a request-scoped object (tenant config, trace span) into a singleton; the symptom is one tenant's model or API key leaking into another tenant's request under concurrency.
 - Mocking by file path (`vi.mock('../clients')`) instead of injecting: the symptom is tests that break when files move, and mocks that stay green after the real wiring changed.
+- Leaky capability interfaces that return vendor types (`OpenAI.ChatCompletion`, `Anthropic.Message`): the symptom is that fakes must construct vendor objects and adding a second provider still forces edits in business code; return your own small result type instead.
 - Circular dependencies between services, which some containers can paper over with lazy proxies (NestJS `forwardRef`) and hand-wiring cannot construct at all; the symptom is `undefined` at runtime or a NestJS circular-dependency boot error, and the fix is usually splitting an interface.
 
 ## When to use

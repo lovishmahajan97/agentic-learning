@@ -5,7 +5,7 @@ name: Usage analytics
 kind: practice
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - adoption/adoption-and-value-realization-measurement
   - observability/tracing
@@ -62,6 +62,13 @@ timestamp. The `request_id` is the design choice that matters most: it lets you 
 dropped on Tuesday" to the exact traces, prompt version and retrieved documents behind the dropped
 requests, *without* storing content in the analytics store.
 
+Edit size deserves a precise definition, because "edited" alone lumps a fixed typo together with a full
+rewrite. Compute it in the client, where the draft and the sent text are both already present, for
+example as `1 − similarity(draft, sent)` with a character- or token-level diff ratio, and emit only the
+number. Bucket it (0, under 10%, 10–50%, over 50%) so the dashboard shows the shape of the distribution;
+the mean hides the difference between "most drafts need a light touch" and "half are fine, half are
+rewritten from scratch".
+
 ### 3. Prefer implicit signals, calibrate them with explicit ones
 Disposition events are emitted for every response, so they avoid the self-selection bias of explicit
 ratings. They are not bias-free: "abandoned" has to be inferred from a timeout or a closed panel, and
@@ -81,7 +88,20 @@ against human-labelled samples, so you know what a 60% acceptance rate means for
 Frameworks such as Google's HEART (Happiness, Engagement, Adoption, Retention, Task success) are a
 useful checklist that the views above cover the whole journey.
 
-### 5. Keep it clean and lawful
+### 5. Check noise and mix before reading a change
+Every rate on the dashboard is a proportion over a finite count, so it moves by chance. For a rate *p*
+over *n* events, the standard error is about `sqrt(p(1−p)/n)`, and for the difference between two
+periods or two prompt versions it is about `sqrt(p₁(1−p₁)/n₁ + p₂(1−p₂)/n₂)`. Treat a move smaller than
+roughly two standard errors as unproven. Small pilots make this bite: at 50 drafts a week, acceptance
+can swing ten points with nothing changed.
+
+The second check is mix. An aggregate rate is a weighted average over segments, so it moves when the
+weights move even if no segment changes. If a new team with naturally harder tickets joins in the same
+week a prompt ships, overall acceptance falls and the prompt gets blamed. Slice the change by team or
+cohort first: a real regression shows up *within* segments; a mix shift shows flat segments and a moving
+total.
+
+### 6. Keep it clean and lawful
 Exclude internal, test and service accounts, or the vendor team's own testing inflates week one. Hash or
 tokenize user IDs. Keep prompt and response text in the access-controlled tracing store, not in analytics.
 Agree retention periods and works-council or employee-monitoring constraints with the customer *before*
@@ -125,8 +145,13 @@ GROUP BY 1, 2 ORDER BY 1, 2;
 ```
 
 Reading them together is the point. Suppose (illustrative numbers) the week-4 retention of the first
-cohort is 0.35, and `sent_as_is / shown` fell from 0.42 to 0.30 the week prompt v7 shipped. You then
-have a quality regression to chase in the traces by `request_id`, not an adoption problem.
+cohort is 0.35, and `sent_as_is / shown` fell from 0.42 to 0.30 the week prompt v7 shipped, over about
+500 drafts on each version. The standard error of the difference is about
+`sqrt(0.42·0.58/500 + 0.30·0.70/500) ≈ 0.03`, so a 12-point drop is roughly four standard errors: not
+noise. With 50 drafts per version the same error would be about 0.095, and the drop would prove nothing.
+Next, slice by team: if every team's sent-as-is rate fell, it is the prompt; if only the newly onboarded
+billing team is low and the others are flat, it is mix. Here every team fell, and regenerations rose,
+so you have a quality regression to chase in the traces by `request_id`, not an adoption problem.
 
 ## Trade-offs
 - Rich disposition events give unbiased coverage of every response, but they need front-end work in the customer's UI; when you cannot touch the UI, you fall back to sparse explicit feedback.
@@ -139,6 +164,8 @@ have a quality regression to chase in the traces by `request_id`, not an adoptio
 - Reporting adoption without a denominator: leadership celebrates "1,200 users" until someone asks how many were licensed and the answer is 9,000.
 - Leaving internal and test accounts in: week-one usage looks spectacular and then "collapses" when the vendor team stops testing.
 - Treating thumbs-down rate as quality: it moves with UI placement and annoyance, so it disagrees with acceptance and edit-size trends and with human review.
+- Blaming a prompt for a mix shift: overall acceptance drops in the week a new team onboards, yet every segment's rate is flat when sliced.
+- Turning acceptance rate into a target: drafts get shorter and blander, acceptance climbs, and downstream outcomes such as reopen rate or customer satisfaction slip.
 - Logging raw prompts into the product analytics tool: discovered at a security review, after customer data has spread to a system with broad access.
 
 ## When to use
@@ -146,7 +173,9 @@ Instrument usage analytics before the pilot starts, not after someone asks for n
 reconstruct disposition events afterwards, and the first weeks are when the funnel is most informative.
 Use it whenever you need to separate "the system is wrong" from "people are not using it" from "people
 use it but it doesn't help". Those three diagnoses lead to engineering, training and scoping work
-respectively. Do not use it as a substitute for outcome measurement: high usage proves engagement, not value
+respectively. A minimal dashboard that covers those three diagnoses is: weekly active ÷ eligible,
+AI-assisted share of work items, week-4 cohort retention, and accepted-unchanged, edit-size and
+regeneration rates sliced by prompt version and team. Do not use it as a substitute for outcome measurement: high usage proves engagement, not value
 (see adoption and value-realization measurement). In interviews, expect to design the event schema for
 an AI feature and say which implicit signals you would trust and why.
 

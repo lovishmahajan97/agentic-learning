@@ -4,8 +4,8 @@ module: data-architecture
 name: Data retention & deletion architecture
 kind: pattern
 difficulty: core
-est_minutes: 16
-status: fact-checked
+est_minutes: 17
+status: reviewed
 related:
   - data-architecture/data-lineage
   - rag-retrieval/freshness-document-deletion-index-consistency
@@ -30,7 +30,8 @@ designed in, because a deletion you cannot propagate is a promise you cannot kee
 ## Why it exists
 Privacy law (GDPR's right to erasure, similar rights under CCPA and other regimes) and most enterprise
 contracts require that personal or customer data is kept no longer than needed and deleted on request
-within a bounded time. For a classic web application the data lives in a database with backups, and
+within a bounded time (under GDPR, a response is due without undue delay and within one month, extendable
+by two further months for complex requests). For a classic web application the data lives in a database with backups, and
 deletion is a `DELETE` plus a backup expiry policy. An AI application breaks that model.
 
 Trace the life of one support conversation. The user's message, containing their name and order number,
@@ -65,6 +66,16 @@ an embedding of a deleted message is still a representation of it. Enforce TTLs 
 partitions dropped by date, object storage lifecycle rules, vector collections partitioned by ingestion
 month, trace stores with built-in retention. Policy that depends on someone remembering to run a cleanup
 is not a policy.
+
+### Retention minimums and legal holds
+Retention is not only a maximum. Some data must be kept for a minimum period (financial records, security
+audit logs, records a regulator requires), and litigation can place a *legal hold* on data that would
+otherwise expire or be erased. GDPR's erasure right itself has exceptions, including data needed to comply
+with a legal obligation or to establish or defend legal claims. So each retention class needs both a
+floor and a ceiling, and the deletion job must consult a hold register before deleting: a held record is
+skipped and reported as held, not deleted and not silently ignored. Resolving conflicts between the
+floor, the ceiling, a hold and an erasure request is a policy decision for counsel; the architecture's
+job is to make the rule explicit and executable rather than to decide it.
 
 Vendors are a store too. Model API providers typically retain request logs for a period for abuse
 monitoring unless a zero-retention arrangement is in place; the exact terms vary by provider and
@@ -102,6 +113,10 @@ Partial completion must be visible, not silently treated as done.
   ciphertext remains but is unrecoverable, which is widely treated as meeting the intent of erasure for
   backups and append-only logs; regulators have not uniformly codified that view, so confirm the
   approach with your privacy counsel.
+- **Summaries and memories:** an LLM-written summary or agent memory derived from a conversation is a new
+  document that may blend several people's data. It cannot be filtered row by row; it must record which
+  conversations and subjects it was derived from, and erasing one subject means deleting the summary or
+  regenerating it from the remaining inputs.
 - **Training datasets:** rows must carry subject or tenant identifiers so they can be removed, and the
   dataset's snapshot digest changes, which flows into provenance.
 - **Model weights:** data that has been trained into a model cannot be deleted from it; machine
@@ -117,8 +132,8 @@ faster and more verifiable. Per-tenant encryption keys make the backup problem d
 reason as crypto-shredding.
 
 ### Proof
-The output of a deletion job is a report: request id, subject, each store touched, receipts, verification
-results, and the tombstone id. Regulators and customers ask for this, and the job is the only thing that
+The output of a deletion job is a report: request id, a keyed reference to the subject, each store
+touched, receipts, verification results, and the tombstone id. Regulators and customers ask for this, and the job is the only thing that
 can produce it accurately.
 
 ## Example
@@ -126,8 +141,11 @@ A deletion orchestrator that fans out over registered stores, retries, verifies,
 Stores are small stand-ins; the shape of the job is what matters.
 
 ```python
-import time
+import hashlib, hmac, time
 from dataclasses import dataclass, field
+
+TOMB_KEY = b"from-a-secret-store"                       # tombstones must not hold the raw id
+def tomb_id(subject): return hmac.new(TOMB_KEY, subject.encode(), hashlib.sha256).hexdigest()
 
 @dataclass
 class Store:
@@ -144,7 +162,7 @@ class KeyVault(Store):                                  # crypto-shredding for b
     def find(self, subject): return [subject] if subject in self.rows else []
 
 def erase(subject: str, stores: list[Store], tombstones: set, max_tries=3) -> dict:
-    receipt = {"subject": subject, "stores": {}, "complete": True}
+    receipt = {"subject_ref": tomb_id(subject)[:16], "stores": {}, "complete": True}
     for s in stores:
         ids = s.find(subject)
         for attempt in range(1, max_tries + 1):
@@ -156,8 +174,8 @@ def erase(subject: str, stores: list[Store], tombstones: set, max_tries=3) -> di
         ok = not remaining
         receipt["stores"][s.name] = {"found": len(ids), "verified": ok, "attempts": attempt}
         receipt["complete"] &= ok
-    tombstones.add(subject)                             # blocks re-ingestion from live sources
-    receipt["tombstone"] = subject in tombstones
+    tombstones.add(tomb_id(subject))                    # blocks re-ingestion from live sources
+    receipt["tombstone"] = tomb_id(subject) in tombstones
     return receipt
 
 app_db   = Store("app_db",   {"m1": {"subject": "u42", "text": "order 991"}, "m2": {"subject": "u7"}})
@@ -166,7 +184,7 @@ cache    = Store("sem_cache",{"k9": {"subject": "u42"}})
 backups  = KeyVault("backup_keys", {"u42": {"subject": "u42", "key": "..."}})
 tomb = set()
 print(erase("u42", [app_db, vectors, cache, backups], tomb))
-# ingestion must consult `tomb` before writing anything for u42 again
+# ingestion computes tomb_id(subject) and skips any record whose id is in `tomb`
 ```
 
 The `complete` flag is what an audit reads; a `False` means the job must be rerun or escalated, never
@@ -203,6 +221,10 @@ from a forward lineage traversal rather than a per-store scan.
   and nobody knowing whether zero-retention was ever enabled.
 - Deletion jobs that report success on partial completion; the symptom is a later discovery in a store
   that was down during the run.
+- Tombstones and deletion receipts that store the raw email or user id; the symptom is a deny-list that is
+  itself a growing register of exactly the people who asked to be forgotten. Store a keyed hash instead.
+- Deleting data that is under legal hold because the erasure job never consults the hold register; the
+  symptom surfaces in litigation, which is the worst place to discover it.
 
 ## When to use
 This architecture is required wherever personal data, customer-confidential data or regulated data

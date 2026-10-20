@@ -5,7 +5,7 @@ name: Test doubles, mocks and fixtures
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/pytest
   - python-for-ai/pytest-asyncio
@@ -56,8 +56,13 @@ Meszaros's taxonomy, which most of the industry uses loosely:
   second attempt sent with a lower temperature?").
 - **Mock:** pre-programmed with expectations about calls; the test fails if the interactions differ.
   In Python, `unittest.mock.Mock` is technically a spy you assert on after the fact.
-- **Fake:** a working, simplified implementation: an in-memory vector store, a dict-backed cache, a
-  scripted LLM that pops replies off a list. Fakes are more code, but they make tests read like usage.
+- **Fake:** a working, simplified implementation: an in-memory vector store that really ranks by
+  cosine similarity, a dict-backed cache with real TTL logic, a model server that speaks the provider's
+  HTTP API. Fakes are more code, but they make tests read like usage and can be shared across suites.
+
+Strictly, a "fake LLM" that pops scripted replies off a list is a stub that also records calls (a
+spy); it has no behaviour of its own. Teams call it a fake anyway, and the label matters less than the
+question it answers: does this double *compute* anything, or only replay what the test told it?
 
 The distinction matters because it decides what the test verifies. Stubs and fakes support
 **state verification**: run the code, check the result. Mocks and spies support **behaviour
@@ -78,7 +83,11 @@ arguments, a charge was not made twice).
   and the typo ships.
 - `patch("pkg.module.name")` replaces a name *where it is looked up*, not where it is defined. If
   `app/summarize.py` does `from app.llm import call_llm`, you patch `app.summarize.call_llm`;
-  patching `app.llm.call_llm` changes nothing the code under test sees.
+  patching `app.llm.call_llm` changes nothing the code under test sees. The reason is mechanical:
+  `from x import y` copies a reference into the importing module's namespace at import time, and
+  `patch` only rebinds one namespace entry. `patch.object(obj, "attr")` avoids the string path entirely.
+- `Mock(wraps=real)` is Python's true spy: calls go through to the real object and are recorded, which
+  suits "did the retry wrapper call the real tokenizer exactly once?"
 
 ### Fixtures
 A pytest fixture is a function whose return value (or `yield`ed value) is injected into any test that
@@ -95,10 +104,23 @@ If a function takes its client as a parameter (or a constructor does), the test 
 needs no patching at all. Patching is the tool for code you cannot restructure; dependency injection
 is what makes doubles cheap.
 
+### Where to put the seam
+For an LLM call there are three places to cut, and each decides what the test still exercises:
+1. **Your own interface** (`LLMClient.complete`): a fake replaces everything below it. Fastest and
+   simplest, but the SDK, request building, retries and response parsing are not tested at all.
+2. **The HTTP transport**: libraries such as `respx` (for httpx) or recorded cassettes (vcrpy,
+   pytest-recording) intercept requests below the SDK. The real SDK serialises your request and
+   parses a realistic response, so a wrong field name or a changed response shape fails here.
+3. **A fake server process**: the code under test talks to a real socket. This is the integration
+   level, covered in the integration-testing lesson.
+Cut as high as the test allows, because higher seams are faster and less brittle; move the seam down
+only for the code whose correctness depends on what is below it, such as response parsing.
+
 ## Example
 A summarizer retries once when the model returns empty output and truncates to a limit read from the
-environment. Three tests use three kinds of double: a scripted fake for state checks, an autospecced
-mock for one interaction that matters, and `monkeypatch` for configuration.
+environment. The tests use three kinds of double: a scripted stub-with-spy (what most teams call a fake
+LLM) for state checks, an autospecced mock for one interaction that matters, and `monkeypatch` for
+configuration.
 
 ```python
 import os
@@ -116,7 +138,7 @@ def summarize(text: str, *, client, model: str = "large") -> str:
             return out[:limit]
     raise RuntimeError("model returned empty output twice")
 
-class FakeLLM:                                     # fake: scripted replies, records calls
+class FakeLLM:                                     # stub + spy: scripted replies, records calls
     def __init__(self, replies): self.replies, self.calls = list(replies), []
     def complete(self, messages, *, model):
         self.calls.append((messages, model))
@@ -169,6 +191,9 @@ None of these tests hit the network, and none breaks if `summarize` changes how 
   parser that passes every test and fails on the first real response wrapped in markdown fences.
 - Mutating a session-scoped fixture inside a test; the symptom is tests that pass alone and fail
   depending on order, or only under parallel runs.
+- Using a plain `Mock` for an async client; awaiting its result raises `TypeError: object Mock can't be
+  used in 'await' expression`, or, worse, code that never awaits passes silently. Use `AsyncMock` or
+  autospec, which creates async methods for coroutine functions.
 
 ## When to use
 Use doubles at the boundary of your process: model APIs, HTTP services, databases, clocks and
@@ -201,7 +226,7 @@ destructive tool never running without approval, and spec every remaining mock a
 ## Quiz
 ### Q: Which double is best described as a working, simplified implementation?
 - [ ] A stub that always returns the same canned response
-- [x] A fake, such as an in-memory vector store or a scripted LLM client
+- [x] A fake, such as an in-memory vector store that really ranks documents by similarity
 - [ ] A mock configured with expected calls
 - [ ] A dummy passed only to satisfy a parameter
 > A fake actually behaves like the dependency, just simplified. A stub only returns canned answers and

@@ -4,8 +4,8 @@ module: python-for-ai
 name: Package structure & import design
 kind: practice
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 16
+status: reviewed
 related:
   - python-for-ai/dependency-injection-and-interface-boundaries
   - python-for-ai/protocols-generics-structural-typing
@@ -39,8 +39,12 @@ test collection. Third, **tests that pass for the wrong reason**: with a flat la
 package from the working directory rather than from what `pip install` would ship, so a missing file in the
 wheel or a wrong package-data declaration is invisible until production.
 
-The naive fix, "just be careful", does not scale because nothing enforces it. Import structure has to be
-designed, given a direction, and checked by a tool, the same way you would design service boundaries.
+The naive fixes make each symptom go away locally and leave the cause. `sys.path.insert(0, "..")` at the
+top of a test or a `PYTHONPATH=.` in someone's shell makes imports resolve on one machine and differently
+in CI, Docker and a teammate's laptop, because the import result now depends on where the process was
+started. Wrapping a failing import in `try/except ImportError` hides a cycle until a different import
+order triggers it. "Just be careful" does not scale because nothing enforces it. Import structure has to
+be designed, given a direction, and checked by a tool, the same way you would design service boundaries.
 
 ## How it works
 ### What an import actually does
@@ -50,6 +54,21 @@ consequences drive every rule below. A module's body runs once per process, at f
 top level (network clients, file reads, model loading, `logging.basicConfig`) is an import-time side effect.
 And because the half-built module is already registered, a cycle does not loop forever: the second module
 gets the partially initialized first one, and `from a import X` fails if `X` has not been defined yet.
+
+The two import forms bind different things. `import a` binds the module object, so a cycle using it
+survives as long as `a.X` is only looked up later, at call time. `from a import X` copies the current value
+of `a.X` into the importing module's namespace *now*, which is why it fails mid-cycle, and also why
+`mock.patch("a.X")` does not affect a module `b` that already did `from a import X`: `b` holds its own
+reference, so you must patch `b.X`, the name where it is *used*.
+
+### Where `sys.path[0]` comes from
+`python path/to/script.py` puts the script's own directory first on `sys.path`; `python -m pkg.mod` puts
+the current directory there and imports `pkg.mod` as part of its package. So running
+`python src/myapp/entrypoints/cli.py` makes `entrypoints/` the top of the search path: sibling files become
+top-level modules, relative imports fail with "attempted relative import with no known parent package", and
+a sibling named like a library shadows it. Run code as `python -m myapp.entrypoints.cli`, or declare a
+console script under `[project.scripts]` in `pyproject.toml`, *because* both resolve imports through the
+installed package rather than through wherever the file happens to sit.
 
 ### src layout
 Put code in `src/myapp/` with `tests/` beside `src/`, and install it in editable mode (`uv sync`, or
@@ -85,6 +104,15 @@ never executes it. Function-local imports also break cycles, but use them delibe
 `import myapp` load everything. For heavy optional dependencies, import inside the function that needs them,
 or use a module-level `__getattr__` (PEP 562) to defer loading until first attribute access.
 `python -X importtime -c "import myapp"` prints per-module import cost, so you can see what to defer.
+
+### Regular vs namespace packages
+A directory with `__init__.py` is a regular package. Since PEP 420, a directory *without* one is still
+importable as a namespace package, which exists so that several separately installed distributions can
+contribute subpackages to one name (`acme.llm` and `acme.rag` shipped independently). Use that on purpose
+only. An accidental namespace package, a forgotten `__init__.py`, usually still imports in development,
+but setuptools' `find_packages()` skips directories without `__init__.py`, so the subpackage can silently
+be left out of the wheel, and some tools resolve module names differently for it. In a single application
+package, give every package directory an `__init__.py`.
 
 ### Absolute vs relative imports
 Absolute imports (`from myapp.domain import Query`) are explicit and survive copying a module elsewhere;
@@ -150,6 +178,12 @@ class LocalEmbedder:
 - Naming a module after a dependency (`openai.py`, `logging.py`, `datasets.py`) inside a directory on
   `sys.path`; the symptom is `AttributeError: module 'openai' has no attribute 'OpenAI'` because your file
   shadowed the library.
+- Patching where a name is defined rather than where it is looked up (`patch("myapp.adapters.llm.OpenAI")`
+  when `services/rag.py` did `from myapp.adapters.llm import OpenAI`); the symptom is a test that still
+  makes real network calls even though the patch "is applied".
+- Running modules as files (`python src/myapp/cli.py`) instead of with `-m` or a console script; the
+  symptom is "attempted relative import with no known parent package", or imports that work from one
+  directory and fail from another.
 - Using a flat layout and never building the wheel in CI; the symptom is `ModuleNotFoundError` or missing
   prompt templates only after deployment, because package data was never declared.
 

@@ -4,7 +4,7 @@ module: agent-reliability
 name: Durable execution & checkpointing
 kind: concept
 difficulty: core
-est_minutes: 15
+est_minutes: 18
 status: reviewed
 related:
   - agent-reliability/state-persistence-and-conversation-recovery

@@ -4,7 +4,8 @@ module: security-governance-compliance
 name: Audit trails
 kind: pattern
 difficulty: core
-est_minutes: 15
+est_minutes: 17
+status: reviewed
 related:
   - security-governance-compliance/compliance-architecture
   - security-governance-compliance/ai-incident-response
@@ -57,7 +58,9 @@ An event answers who, what, when, on what basis and with what result:
   every one of them changes behaviour.
 - **Inputs by reference**: request ID, retrieved document IDs and their content hashes, tool arguments.
   Store references and hashes, not necessarily full text, *because* full prompts often contain personal
-  data and turn the audit store into the largest PII copy you own.
+  data and turn the audit store into the largest PII copy you own. A hash only proves *which* text was
+  used if you can still produce that text, so references must point at a versioned document store (or a
+  retained payload store) whose own retention is at least as long as the trail's.
 - **Output and decision**: the output (or its hash and a pointer to a retained copy), the action taken,
   any human approval with approver identity, and overrides.
 - **Time** from a trusted clock, plus the trace ID linking to the debugging trace.
@@ -66,11 +69,22 @@ An event answers who, what, when, on what basis and with what result:
 Two mechanisms, usually combined:
 1. **Hash chaining.** Each record stores `h_i = SHA256(h_{i-1} || canonical(record_i))`. Changing or
    deleting any past record breaks every later hash, so tampering is detectable by re-walking the chain.
-   Periodically anchoring the latest hash somewhere the writer cannot alter (a separate account, a signed
-   timestamp) prevents an attacker from rewriting the whole chain.
+   Two attacks survive a bare chain. Someone with write access can recompute every hash after an edit, and
+   someone can silently drop the most recent records, since a truncated chain still verifies. Periodically
+   anchoring the latest hash and a monotonically increasing sequence number somewhere the writer cannot
+   alter (a separate account, a signed timestamp, a customer-visible digest) defeats both: the anchored
+   head no longer matches a rewritten chain, and a sequence number below the anchored one exposes truncation.
 2. **WORM storage.** Write-once-read-many storage such as object-lock buckets in compliance mode refuses
    deletion or overwrite until the retention period ends, even for administrators. This *prevents*
    tampering rather than merely detecting it.
+
+### Scaling the chain
+A single chain serializes every write through one "previous hash", which becomes a bottleneck when many
+services emit events. The usual answer is per-partition chains (per service or tenant) plus a periodic
+Merkle tree over the latest heads or over each batch of events, whose root is the only thing anchored.
+This is the structure of transparency logs such as Certificate Transparency, and it has a second benefit:
+you can prove a single record is included by handing an auditor a short Merkle path, without exposing
+other tenants' events.
 
 ### Separation of duties
 The audit store lives in a different account or project from the application, writes go through an
@@ -83,12 +97,24 @@ Audit trails want to keep everything; privacy law wants personal data minimized 
 by design: keep identifiers pseudonymous in the trail, store content payloads separately under their own
 retention, and use crypto-shredding (per-subject encryption keys you destroy on erasure) where content must
 be retained but later made unreadable. Retention periods come from the strictest applicable rule for each
-record type, decided with legal, not by default bucket settings.
+record type, decided with legal, not by default bucket settings; for example, the EU AI Act requires
+deployers of high-risk systems to keep the automatically generated logs under their control for at least
+six months unless other law says otherwise, while a credit or employment dispute may need records for years.
 
 ### Write path reliability
 An audit event that is lost when the system is busy is worse than useless, *because* gaps look like
 concealment. Write audit events with the same transaction as the business action (or via a transactional
-outbox) so either both happen or neither does.
+outbox) so either both happen or neither does. For agents, each tool call is its own event carrying the
+same run ID and the step number, *because* the question after an incident is usually "which step, on
+which retrieved text, led to this action", not just "what was the final answer".
+
+### Answering a reconstruction query
+The test of the design is a question such as "show everything that led to decision D". The path is:
+look up the event by object ID, verify its chain position against the latest anchor, follow the version
+fields to the exact prompt template and guardrail policy in their registries, follow the document
+references to the versioned store and check the content hashes match, and join any later override events
+on the same object. If any hop requires a person's memory or a system that has since been rotated, the
+trail has a gap.
 
 ## Example
 A minimal hash-chained audit log with verification. In production the chain would be appended to WORM
@@ -124,13 +150,18 @@ append(log, {"actor": "svc:refund-agent", "on_behalf_of": "user:4821", "action":
              "retrieved": ["policy-77#sha256:9f1c..."], "decision": "deny", "approver": None})
 append(log, {"actor": "user:ops-17", "action": "refund.override", "decision": "approve",
              "reason": "policy-77 outdated"})
+anchor = (len(log), log[-1]["hash"])      # copied to a store the writer cannot alter
 print(verify(log))                         # None: chain intact
+dropped = log[:1]                          # an insider deletes the override record
+print(verify(dropped), len(dropped) < anchor[0])   # None True: chain still verifies, anchor exposes it
 log[0]["decision"] = "approve"             # an insider edits history
 print(verify(log))                         # 0: tampering detected at record 0
 ```
 
-The second record shows why the trail records overrides: the dispute can be answered with the original
-model decision, its inputs, and the human who reversed it.
+Note the middle case: deleting the newest record leaves a perfectly valid chain, which is why the head
+must be anchored outside the writer's reach. The second record also shows why the trail records
+overrides: the dispute can be answered with the original model decision, its inputs, and the human who
+reversed it.
 
 ## Trade-offs
 - Logging full prompts and outputs makes reconstruction easy but creates a large sensitive-data store;

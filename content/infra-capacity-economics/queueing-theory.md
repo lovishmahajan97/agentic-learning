@@ -5,7 +5,7 @@ name: Queueing theory
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - infra-capacity-economics/capacity-planning
   - infra-capacity-economics/latency-budgets
@@ -100,6 +100,30 @@ concurrency*. The queue is wherever requests wait for a slot: the engine's waiti
 or a provider's rate limiter. Measure service time and its variance from real traffic, not from a
 single-request benchmark, because per-request speed depends on load.
 
+### Tails, not means
+SLOs are written on p95 or p99, and the tail of queue wait grows faster than the mean. In M/M/c the
+wait has a simple shape: a request waits at all with probability P(wait) (Erlang C), and if it waits,
+the extra delay is exponential with rate (c·μ − λ). So
+
+```
+P(Wq > t) = P(wait) × exp(−(c·μ − λ)·t)      →   t_p = ln(P(wait) / (1 − p)) / (c·μ − λ)
+```
+
+The rate (c·μ − λ) is the *spare* service capacity; as it shrinks toward zero, every percentile
+stretches in proportion. In the 16-slot example below, p99 queue wait is about 3 s at 75% utilization
+and about 22 s at 95%, while the mean goes from 0.2 s to 3.9 s. Planning on the mean hides most of the
+damage an SLO will see.
+
+### Open versus closed load, and queue order
+The formulas above assume an *open* system: arrivals keep coming regardless of how slow you are, which
+is true of public traffic. A *closed* system has a fixed population that waits for each response before
+sending the next (a load test with N virtual users, or an agent that calls the model, then a tool, then
+the model again). Closed systems self-throttle, because slow responses delay the next request, so a
+closed-loop load test reports gentler latency than real open traffic at the same throughput. Queue
+order matters too: FIFO lets one 2,000-token job delay many 20-token ones, and priority classes or
+shortest-expected-job-first scheduling cut mean wait for interactive traffic, at the price of possible
+starvation for the long jobs unless they are aged up or given reserved capacity.
+
 ## Example
 A fleet exposes 16 concurrency slots in total; a request holds a slot for 4 s on average. Erlang C
 shows how waiting behaves as arrival rate rises, and what pooling buys. Exponential service is an
@@ -154,6 +178,8 @@ traffic more than doubles the wait. L follows Little's law throughout.
   so the model underestimates ρ and the fleet saturates earlier than predicted.
 - Letting clients retry immediately on timeout; retries raise λ exactly when the system is already
   saturated, visible as request rate climbing while successful completions stay flat.
+- Load testing with a fixed pool of virtual users that wait for each reply; the closed loop hides the
+  knee, so the test passes at a rate where open production traffic shows a p99 cliff.
 - Treating an unbounded queue as safety; requests wait past their useful deadline, so the system does
   work nobody is waiting for, seen as high latency together with high client-side cancellation.
 

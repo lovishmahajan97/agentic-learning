@@ -5,7 +5,7 @@ name: Requirements traceability
 kind: practice
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - scoping/statement-of-work
   - scoping/success-metrics-kpis
@@ -64,6 +64,13 @@ the global average, decides the result *because* requirements differ in critical
 100% requirement such as "never reveal another employee's data" can be outvoted by hundreds of
 routine cases in an average. Slicing also gives each requirement a sample size, so you can tell
 whether a slice has enough cases for its result to mean anything.
+
+Sample size matters most for zero-tolerance requirements. If a slice of n cases has no failures, the
+95% upper bound on the true failure rate is about 3/n (the "rule of three"). Thirty clean cases show
+only that the rate is below roughly 10%; three hundred show below roughly 1%. A 100% threshold on a
+small slice is therefore evidence of "not frequent", not of "never". A requirement that truly must
+never fail should also trace to a deterministic control, such as a permission filter or a hard
+validator with its own unit tests, with the eval slice as a second line of evidence.
 
 ### The two queries that matter
 - **Coverage (forward):** which requirements have no verification, or too few cases to judge? Fill
@@ -132,7 +139,10 @@ print("orphans:", orphans)   # -> ['c005', 'c006']
 The output shows R4, the data-isolation requirement, as UNTESTED. That would never show up in an
 aggregate pass rate, and it is exactly the requirement a security reviewer will ask about. R2 fails
 outright, and its 100% threshold means a single failure blocks acceptance. Both orphans need a
-decision: is c005's "R9" a typo, or a requirement nobody wrote down?
+decision: is c005's "R9" a typo, or a requirement nobody wrote down? And when R4 does get cases, a
+30-case slice passing at 100% only bounds the leak rate below about 10%. That is why R4 should also
+trace to the retrieval layer's per-employee access filter and its deterministic tests, not to the
+eval slice alone.
 
 ## Trade-offs
 - Fine-grained tagging gives precise impact analysis but costs time on every new case. Tag at the

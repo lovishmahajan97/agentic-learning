@@ -4,8 +4,8 @@ module: customer-data-evaluation
 name: Domain prompt engineering
 kind: practice
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 16
+status: reviewed
 related:
   - prompting/prompt-engineering
   - prompting/few-shot
@@ -46,85 +46,117 @@ make it explicit and unambiguous, and prove each piece earns its place on real c
 Interview SMEs around concrete cases, not abstractions. Hand them ten real inputs and ask "what would you
 do, and why?" People cannot list their own rules from memory, but they can explain a decision on a case
 in front of them. Record each reason as a candidate rule along with the case that triggered it, because
-the case later becomes an eval item that proves the rule works.
+the case later becomes an eval item that proves the rule works. Ask SMEs to also say *which* reason
+decided each case; that annotation ("rule R3 decided this") is what later lets you tell a precedence
+error from a definition error.
 
 ### 2. Write a glossary of contested terms
 Most domain errors are definitional. List every term whose customer meaning differs from the common one,
 define it operationally (what data field, what threshold, what time window), and state the default when
 the input is ambiguous. A glossary entry like "Late: delivered after the promised window, where the
 window is extended by any customer-requested reschedule" removes a whole class of disagreements. It is
-written this way *because* the model resolves undefined terms toward the public meaning.
+written this way *because* the model resolves undefined terms toward the public meaning, and says so
+explicitly ("use these definitions, not general meanings") because a definition that merely sits in
+the prompt competes with a strong prior and can lose.
 
 ### 3. Order the rules as a procedure
 Domain policies have precedence: regulatory rules override contract terms, which override house
 preferences. Write rules in the order they should be checked and say explicitly which wins on conflict.
-An unordered bullet list lets the model weight rules by how prominent they look, which is not the
-customer's precedence.
+Data-validity checks ("delivery time missing") go before any rule that needs that data, because a rule
+evaluated on missing data invites the model to invent the value. An unordered bullet list lets the
+model weight rules by how prominent they look, which is not the customer's precedence.
 
 ### 4. Choose examples at the boundaries
 Few-shot examples from the customer's own data teach format and judgement at once. Pick them where the
 decision flips (just inside and just outside a threshold, the exception that overrides the default)
-*because* easy central examples teach nothing the instructions did not already say. Keep examples out of
-the golden set, or the eval measures memorisation.
+*because* easy central examples teach nothing the instructions did not already say. Pairs that differ in
+one field are the strongest form: they isolate the feature the customer's rule turns on. Keep examples
+out of the golden set, or the eval measures memorisation. Watch the label mix of the examples too,
+because models tend to drift toward labels that are over-represented in the shots.
 
 ### 5. Specify abstention and escalation
 Domain work always has cases outside policy. Give the model a legitimate exit ("needs_review" with the
 reason) and say when to use it. Without one, it is forced to guess, and guesses on out-of-policy cases
 are where customers lose trust fastest.
 
-### 6. Separate stable knowledge from per-request context
+### 6. Fix the output contract
+State the closed label set and a machine-checkable format, and ask the output to name the rule that
+decided it and the glossary terms it relied on. The citation is not proof of the model's reasoning (a
+self-reported rule can be a post-hoc rationalisation), but it turns failures into a diagnosable signal:
+a wrong label that cites the wrong rule points at precedence or rule wording; a wrong label that cites
+the right rule points at a term definition.
+
+### 7. Separate stable knowledge from per-request context
 Policies and glossary go in a versioned system prompt; customer-specific facts that change per request
 (the account, the contract, the retrieved clause) go in the user turn or via retrieval. When the domain
 knowledge outgrows a prompt, move the long tail into retrieval and keep only the core procedure inline.
+The split also matters for cost: a stable prefix can be served from a prompt cache where the provider
+supports it, while per-request content cannot.
 
-### 7. Test every change against the customer's cases
-Each rule, glossary entry and example is a hypothesis. Run the prompt on the golden set after each
-change, and review the failures with SMEs. A rule that does not move any eval case is either redundant or
-untested; a rule that fixes three cases and breaks two needs rewording. Version the prompt per customer
-so a regression can be traced to the change that caused it.
+### 8. Test every change, on a split you did not tune on
+Each rule, glossary entry and example is a hypothesis. The cases SMEs used to elicit the rules are, by
+construction, the cases the prompt fits best, so iterate on an iteration split and keep a holdout that
+nobody reads while writing rules. After each change, run the iteration split and review failures with
+SMEs; at milestones, run the holdout. A rule that moves no case is redundant or untested (ablate it: drop
+it and re-run); a rule that fixes three cases and breaks two needs rewording. If the iteration score
+climbs while the holdout stays flat, the rules are memorising cases rather than capturing policy.
+Version the prompt per customer so a regression can be traced to the change that caused it.
 
 ## Example
 A freight customer wants shipment exceptions classified. The prompt is assembled from SME-owned parts so
-each piece can be versioned and tested separately, and the eval reports how many failing cases involve
-each glossary term as either the gold or the predicted label.
+each piece can be versioned and tested separately, and the output cites the rule that fired so failures
+can be sorted into precedence errors and definition errors.
 
 ```python
+import json
 GLOSSARY = {
-    "late": "Delivered after the promised window. The window moves if the consignee requested a "
-            "reschedule (field reschedule_by == 'consignee'). Carrier reschedules do NOT move it.",
+    "late": "Delivered after the promised window. The window moves only if the consignee requested a "
+            "reschedule (reschedule_by == 'consignee'). Carrier reschedules do NOT move it.",
     "damaged": "Consignee noted damage on the POD, or a photo claim was filed within 48h of delivery.",
 }
 RULES = [  # checked in order; the first matching rule wins
-    "1. If a hazmat flag is set and any exception exists, output needs_review (regulatory).",
-    "2. If both late and damaged apply, output damaged (claims take priority over SLA credits).",
-    "3. If the record is missing delivery_ts, output needs_review; never infer a delivery time.",
+    ("R1", "hazmat flag set and any exception exists -> needs_review (regulatory)"),
+    ("R2", "delivery_ts missing -> needs_review; never infer a delivery time"),
+    ("R3", "both late and damaged apply -> damaged (claims outrank SLA credits)"),
+    ("R4", "otherwise apply the definitions -> late, damaged or on_time"),
 ]
-EXAMPLES = [  # boundary cases chosen by SMEs, excluded from the golden set
+EXAMPLES = [  # SME boundary pair, differs only in who rescheduled; excluded from the golden set
     ({"promised_end": "10:00", "delivery_ts": "10:20", "reschedule_by": "consignee",
-      "new_end": "12:00"}, "on_time"),
+      "new_end": "12:00"}, {"label": "on_time", "rule": "R4"}),
     ({"promised_end": "10:00", "delivery_ts": "10:20", "reschedule_by": "carrier",
-      "new_end": "12:00"}, "late"),
+      "new_end": "12:00"}, {"label": "late", "rule": "R4"}),
 ]
 
 def build_prompt(version="acme-freight-v7"):
     terms = "\n".join(f"- {k}: {v}" for k, v in GLOSSARY.items())
-    shots = "\n".join(f"Input: {x}\nLabel: {y}" for x, y in EXAMPLES)
-    return (f"[prompt {version}]\nClassify the shipment as one of: on_time, late, damaged, "
-            f"needs_review.\nDefinitions (use these, not general meanings):\n{terms}\n"
-            "Rules, in priority order:\n" + "\n".join(RULES) + f"\nExamples:\n{shots}")
+    rules = "\n".join(f"{rid}. {text}" for rid, text in RULES)
+    shots = "\n".join(f"Input: {json.dumps(x)}\nOutput: {json.dumps(y)}" for x, y in EXAMPLES)
+    return (f"[prompt {version}]\nClassify the shipment. Use these definitions, not general "
+            f"meanings:\n{terms}\nRules, in priority order:\n{rules}\n"
+            'Reply only with JSON: {"label": on_time|late|damaged|needs_review, "rule": "R1".."R4"}\n'
+            f"Examples:\n{shots}")
 
-def failures_by_term(results):
-    """results: list of dicts with 'gold' and 'pred' labels (plus the raw record for review)."""
-    counts = {t: 0 for t in GLOSSARY}
+def diagnose(results):
+    """results: dicts with the SME's gold_label and gold_rule, and the model's label and rule."""
+    out = {"correct": 0, "precedence": 0, "definition": 0}
     for r in results:
-        if r["gold"] != r["pred"]:
-            for t in GLOSSARY:
-                counts[t] += t in (r["gold"], r["pred"])
-    return counts  # a term dominating failures means its definition needs SME review
+        if r["label"] == r["gold_label"]:
+            out["correct"] += 1
+        elif r["rule"] != r["gold_rule"]:
+            out["precedence"] += 1      # fired the wrong rule: fix ordering or rule wording
+        else:
+            out["definition"] += 1      # right rule, wrong reading of a term: fix the glossary
+    return out
 ```
 
-The two examples differ only in who rescheduled, which is the exact point where the public meaning of
-"late" and the customer's meaning diverge.
+A walk-through of one iteration, numbers illustrative. Prompt v6 defined "late" as "after the promised
+window" with no reschedule clause. On a 160-case iteration split it gets 121 right; `diagnose` reports 9
+precedence and 30 definition errors, and 24 of the definition errors are carrier reschedules the model
+treated as moving the window, which is the public reading of "rescheduled delivery". The SMEs confirm
+the rule, v7 adds the consignee-only clause and the boundary pair above, and the iteration split rises
+to 146 of 160. The holdout of 80 cases, untouched while writing the rule, goes from 60 to 71, so the fix
+generalises rather than memorising the 24 cases. The 9 precedence errors are a separate problem: most
+are damaged-and-late shipments labelled late, so the next change targets R3's wording, not the glossary.
 
 ## Trade-offs
 - Explicit rules make behaviour predictable and auditable, but each rule adds tokens and a chance of
@@ -143,6 +175,10 @@ The two examples differ only in who rescheduled, which is the exact point where 
   cases over and over, all of which contain that word.
 - Reusing few-shot examples inside the golden set; the symptom is an eval score that drops sharply when a
   fresh sample of production cases is labelled.
+- Tuning rules on the same cases used to elicit them, with no holdout; the symptom is an iteration score
+  that keeps rising while a fresh sample or the holdout does not move.
+- Trusting the model's cited rule as an explanation of its reasoning; the symptom is "fixing" a rule the
+  output cited and seeing no change, because the citation was rationalised after the label.
 - Encoding one SME's personal preference as policy; the symptom is a second SME rejecting outputs the
   first one approved, which means the rule needs the policy owner's decision, not more prompting.
 
@@ -171,8 +207,10 @@ pull the rejected outputs, sit with two adjusters and ask them to explain each r
 I expect clusters around a few terms or exceptions, such as what counts as a pre-existing condition. I
 would write operational definitions for those terms, order the rules by the customer's precedence, add
 boundary examples from their data that are kept out of the golden set, and add a needs_review exit for
-out-of-policy cases. Then I would re-run the golden set and check that the rejected clusters shrink
-without new failures elsewhere. Where adjusters disagree with each other, I escalate to the policy owner.
+out-of-policy cases, and have outputs cite the rule applied so remaining failures split into precedence
+and definition errors. Then I would re-run the iteration split, check the rejected clusters shrink without
+new failures elsewhere, and confirm the gain on a holdout the rules were not written from. Where adjusters
+disagree with each other, I escalate to the policy owner rather than prompting around it.
 
 ## Quiz
 ### Q: Why does a persona prompt ("you are an expert in X") rarely fix domain errors on customer data?

@@ -4,7 +4,8 @@ module: security-governance-compliance
 name: AI inventory & use-case risk classification
 kind: practice
 difficulty: core
-est_minutes: 15
+est_minutes: 16
+status: reviewed
 related:
   - security-governance-compliance/model-governance
   - security-governance-compliance/ai-risk-management
@@ -61,14 +62,17 @@ Combine declaration with detection, *because* self-reporting alone misses shadow
 ### 3. Record a minimum useful entry
 Owner (a named person, not a team alias), business purpose, users and affected people, decision type
 (advisory or automated), models and providers with versions, data categories processed (linking to data
-classification), deployment surface, geographies, status, and links to the model or system card. Keep it
+classification), deployment surface, geographies, *your role* (built it, bought it, or substantially
+modified something bought, which under the EU AI Act decides whether you are provider or deployer), the
+lifecycle status, and links to the model or system card. Keep it
 small enough that people fill it in; fields nobody reads are fields nobody maintains.
 
 ### 4. Classify the use case
 Use a short questionnaire whose answers map to tiers, so classification is repeatable rather than a
 judgement call each time. The deciding factors:
 - **Legal category**: does the use fall in a regulated list? Under the EU AI Act: prohibited practices
-  (for example social scoring by public authorities, or manipulative techniques causing significant harm);
+  (for example social scoring, which the final text bans for public and private actors alike, or
+  manipulative techniques causing significant harm);
   high-risk areas listed in Annex III such as employment, education, access to essential services
   including credit scoring, biometric identification, law enforcement, migration and justice, plus AI that
   is a safety component of regulated products; transparency obligations for systems like chatbots and
@@ -78,6 +82,18 @@ judgement call each time. The deciding factors:
 - **Autonomy**: human decides with AI advice, human approves AI decision, or fully automated action.
 - **Data sensitivity**: health, financial, children's, biometric or other special-category data.
 - **Exposure**: internal staff only, customers, or the public.
+
+The order and the combining rule matter. Ask the knock-out questions first: a prohibited practice stops
+the process, and a use in a regulated high-risk area sets a floor that no other answer can lower. Then
+take the tier as the *maximum* across the remaining factors, not an average, *because* averaging lets
+"internal only" cancel out "decides who gets disciplined", and harm does not average. Some factors, data sensitivity in particular, can instead be wired to specific
+controls that apply at any tier (vendor terms, redaction, access logging); which factors drive the tier
+and which only trigger controls is a policy choice to write down once. The EU AI Act has
+one refinement worth encoding: an Annex III use is not high-risk if it only performs a narrow procedural
+task, improves the result of a completed human activity, detects patterns without replacing human
+assessment, or does preparatory work, but that exemption never applies when the system profiles people,
+and the reasoning must be documented. Record the answers, not just the tier, so a later change in one
+answer re-runs the classification instead of requiring someone to remember why.
 
 ### 5. Attach controls to tiers
 Each tier maps to required controls: low tier needs inventory entry and acceptable-use rules; medium adds
@@ -102,7 +118,10 @@ must be by use case:
 All three run on the same model. The first needs an inventory entry and a rule against pasting customer
 data. The second processes personal and possibly health data, informs a consequential decision and needs
 evaluation on real claim files, a groundedness check, a system card and an audit trail of which summary
-an adjuster saw. The third falls in an area the EU AI Act lists as high-risk (employment) and affects
+an adjuster saw. It is also the contested row: health data alone would make it high under a pure
+maximum rule, and this insurer chose to let sensitive data trigger data controls rather than the tier
+when a human makes the decision. Another organization could reasonably tier it high; what matters is
+that the rule is explicit and applied the same way to every entry. The third falls in an area the EU AI Act lists as high-risk (employment) and affects
 people who never consented to the tool: it needs an impact assessment, bias testing across applicant
 groups, documented human oversight, vendor documentation, and review board approval.
 
@@ -135,8 +154,9 @@ governance team where their review effort should go: the handful of high-tier us
 ## When to use
 Start the inventory as soon as an organization has more than a handful of AI uses or faces any AI
 regulation, audit or customer due-diligence questionnaire, which today is nearly everyone. It is a
-prerequisite for an ISO/IEC 42001 management system, the "Map" function of the NIST AI RMF, and EU AI Act
-role and obligation analysis. Measure coverage (discovered uses reconciled against declared), freshness
+prerequisite for an ISO/IEC 42001 management system, for the NIST AI RMF (inventorying AI systems is an
+explicit Govern outcome, GOVERN 1.6, and every Map activity presumes the list), and for EU AI Act role and
+obligation analysis. Measure coverage (discovered uses reconciled against declared), freshness
 (entries reviewed within their cycle) and time-to-classify. In interviews, the key insight is that risk
 attaches to use, autonomy and affected people, not to the model, and that tiering exists to make
 governance proportionate.

@@ -5,7 +5,7 @@ name: Runtime schema validation (Zod)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - node-ts-for-ai/typescript-strict-mode-and-advanced-types
   - node-ts-for-ai/openai-anthropic-node-sdks
@@ -53,6 +53,12 @@ schema object carrying both the runtime checks and the phantom static type, whic
 Schema>` extracts. The type is derived from the schema rather than the reverse *because* a type
 cannot be inspected at runtime, while a value can be both executed and reflected on.
 
+A schema has two types, not one. `z.input<typeof S>` is what the producer may send; `z.output<typeof
+S>` (which is what `z.infer` returns) is what `parse` gives back. They differ whenever a field has a
+`.default()` (optional on input, required on output) or a `.transform()` (a string in, a `Date` out).
+Use the input type for whoever constructs the payload, including the model, and the output type for
+the code that consumes it.
+
 ### `parse` versus `safeParse`
 `Schema.parse(input)` returns the typed value or throws a `ZodError`; `Schema.safeParse(input)` returns
 `{ success: true, data }` or `{ success: false, error }` without throwing. Use `parse` at boundaries
@@ -65,7 +71,10 @@ Validation often needs to change the value: `z.string().transform((s) => s.trim(
 for a port read from `process.env`, `.refine((v) => v.end > v.start, { message })` for cross-field
 rules, `.pipe()` to chain a transform into a further schema. A transform makes the output type differ
 from the input type, which is exactly what `parse` is for: the result is a domain value, not the wire
-shape.
+shape. Refinements that need I/O (does this `customerId` exist?) can be async, but then only
+`parseAsync`/`safeParseAsync` will run them; keep such checks few, because they turn a cheap pure
+parse into a database round trip at every boundary. `.brand<"CustomerId">()` makes the output a
+branded type, so code that requires a `CustomerId` cannot be handed an unparsed string.
 
 ### Objects: strict, strip, passthrough
 By default Zod *strips* unknown keys from objects. `.strict()` rejects them, which is what you want for
@@ -107,17 +116,19 @@ import { z } from "zod";
 
 const ScheduleArgs = z.object({
   title: z.string().min(1).describe("Short title for the calendar event"),
-  start: z.string().datetime({ offset: true })            // default accepts only a trailing "Z"
+  start: z.iso.datetime({ offset: true })                 // without offset: only a trailing "Z"
     .describe("ISO 8601 start time with timezone offset"),
   durationMinutes: z.number().int().min(5).max(480).default(30),
-  attendees: z.array(z.string().email()).max(20).default([]),
+  attendees: z.array(z.email()).max(20).default([]),
 }).strict();
-type ScheduleArgs = z.infer<typeof ScheduleArgs>;       // { title: string; start: string; ... }
+type ScheduleArgs = z.infer<typeof ScheduleArgs>;       // output: durationMinutes: number (required)
+type ScheduleInput = z.input<typeof ScheduleArgs>;      // input: durationMinutes?: number
 
 export const scheduleTool = {
   name: "schedule_event",
   description: "Create a calendar event",
-  // Zod 4 (zod-to-json-schema on Zod 3). io "input": defaulted fields are optional for the model.
+  // Zod 4 APIs throughout (on Zod 3: z.string().datetime(), z.string().email(), zod-to-json-schema).
+  // io "input" describes ScheduleInput: defaulted fields are optional for the model.
   parameters: z.toJSONSchema(ScheduleArgs, { io: "input" }),
   run: async (args: ScheduleArgs) => ({ id: "evt_123", ...args }),
 };
@@ -158,6 +169,9 @@ void port;
   the failure rate in the first place.
 - JSON-Schema-first tools (TypeBox, Ajv) align with OpenAPI-driven teams, while Zod's TypeScript-first
   style is more ergonomic for application code; mixing both in one service is where contracts drift.
+- Tightening a schema (a new required field, a narrower enum) protects consumers but breaks producers
+  still sending the old shape, such as queued messages written before a deploy or a prompt not yet
+  updated; add fields as optional with a default first, and tighten only once every producer has moved.
 
 ## Pitfalls
 - Casting untrusted JSON with `as` instead of parsing; the symptom is a `TypeError` on an `undefined`
@@ -172,6 +186,9 @@ void port;
   running and a provider-side change or bug reaching production unchecked.
 - Reading `process.env` without coercion; the symptom is `"3000" + 1` style bugs and a port compared as a
   string.
+- Using `z.coerce.boolean()` for env flags; it applies JavaScript truthiness, so the symptom is
+  `FEATURE_X=false` turning the feature *on* because `"false"` is a non-empty string. Parse with an enum
+  (`z.enum(["true", "false"]).transform((v) => v === "true")`) or Zod 4's `z.stringbool()` instead.
 
 ## When to use
 Parse at every boundary where data enters the process: HTTP bodies and query strings, webhook payloads,

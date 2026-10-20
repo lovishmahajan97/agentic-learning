@@ -5,7 +5,7 @@ name: ETL / ELT for RAG
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - data-architecture/ingestion-pipelines
   - data-architecture/document-processing-pipelines
@@ -99,6 +99,21 @@ dependency order on partitions of changed documents. Writes to the index are ide
 `chunk_id`, so a retried stage is harmless; the version columns are what make "re-run everything from
 `parsed` with chunker v3" a one-line change rather than a project.
 
+The rule for deciding what to recompute is the same one a build system uses. Each row's key includes
+the hash of its inputs plus the version of the function that produced it, and a stage runs only for
+keys whose output row does not exist yet. A document edit changes `doc_version`, so new keys appear in
+every stage for that document only. A chunker change changes `chunker_version`, so new keys appear
+from `chunks` onward for every document. An embedding-model change appears only in `embeddings`.
+Nothing has to track "what changed"; the missing keys are the work list.
+
+### Not every change needs a re-embed
+Some changes only touch metadata: an ACL edit, a document moved to a new folder, a retention label.
+These should go to the index as a payload update keyed by `doc_id`, without re-chunking or re-embedding,
+because the vectors did not change. The pipeline needs two paths, a content path through every stage
+and a metadata path straight to the index payload. Without the metadata path, a permission change
+either triggers an expensive full re-run or never reaches the index, and the second outcome is a
+security bug.
+
 ## Example
 A content-addressed transform stage: chunk ids include the chunker version, embeddings are cached by
 `(model, text_hash)`, and index reconciliation deletes orphaned chunks of re-chunked documents. The
@@ -137,8 +152,25 @@ def reconcile_index(index, doc_id, rows):
     return {"upserted": len(live), "deleted": len(stale)}
 ```
 
-Switching chunkers is now `CHUNKER_VERSION = "v4"` plus a re-run from the parsed table; unchanged text
-still hits the embedding cache, and `reconcile_index` removes the v3 chunks per document as v4 lands.
+Switching chunkers is now `CHUNKER_VERSION = "v4"` plus a re-run from the parsed table. Unchanged text
+still hits the embedding cache, and `reconcile_index` removes the v3 chunks of each document as its v4
+chunks land. Three details in the code are deliberate. `reconcile_index` upserts before it deletes. A
+reader can briefly see old and new chunks of a document together, which is better than briefly seeing
+none of them. A source deletion needs no special path: calling `reconcile_index(index, doc_id, [])`
+deletes every chunk of that document. And `text_hash` deliberately leaves out `doc_version`. When one
+paragraph of a 40-chunk document is edited, all 40 chunk ids change because the version changed, but
+39 texts hash the same, so only one embedding call is made. This holds for structure-aligned chunking,
+where boundaries follow sections and paragraphs. With fixed-size token windows, an edit that changes the
+length of the text moves every later boundary, so every later chunk gets a new hash. Chunk-boundary
+stability is therefore a cost property as well as a quality one.
+
+The cache matters most for the expensive optional stage. Take 2 million documents at 4,000 tokens and
+12 chunks each, which is 24 million chunks. Embedding them reads each chunk once: about 24 M × 400 ≈
+10 billion tokens per full pass. Contextual enrichment is far bigger. Each chunk's LLM call usually
+includes the whole document as context, so it reads about 24 M × 4,400 ≈ 100 billion input tokens,
+about ten times the embedding pass, plus an output sentence per chunk. Prompt caching of the shared
+document prefix reduces that, and a content-hash cache means a chunker change does not repeat it for
+text that did not move. Run this arithmetic before choosing which stages to re-run and how often.
 
 ## Trade-offs
 - Materializing every stage costs storage and one extra write per stage, but it flips to a clear win as

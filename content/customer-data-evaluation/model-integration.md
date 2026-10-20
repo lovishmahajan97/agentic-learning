@@ -4,8 +4,8 @@ module: customer-data-evaluation
 name: Model integration
 kind: practice
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 15
+status: reviewed
 related:
   - system-design/ai-gateway
   - system-design/model-selection
@@ -75,7 +75,10 @@ format and refusal behaviour to need the most work.
 ### 6. Map errors and quotas
 Translate each provider's errors into your own taxonomy (rate limited, overloaded, context too long,
 content filtered, invalid request, auth) so retries, fallbacks and alerts behave the same on every model.
-Size concurrency to the customer's quota on their deployment, which is often lower than yours.
+Size concurrency to the customer's quota on their deployment, which is often lower than yours. Map
+parameters, not just responses: an output limit can be required on one API and optional on another,
+and on reasoning models it may also have to cover hidden reasoning tokens, so a limit copied from a
+non-reasoning model can truncate answers.
 
 ### 7. Pin versions and gate the switch
 Configure an exact model version or snapshot, not a moving alias, so the model cannot change under you.
@@ -83,56 +86,61 @@ Then: adapter contract tests, the customer's regression suite, shadow mode on th
 per-tenant routing switch with the old model as fallback. Register what was deployed (model id, version,
 adapter, prompt version) so incidents can be traced to a specific combination.
 
+A **fallback model is an integrated model too**. If the router fails over from the primary to a second
+model during an outage, that second model needs its own capability entry, ported prompt and suite run.
+Failing over to an unported model turns an availability incident into a quality incident that is harder
+to see.
+
 ## Example
-A minimal normalised interface and a capability check. The application only sees `Completion`, and a
-deployment refuses to start if the configured model lacks a capability it depends on.
+Two adapters mapping raw response shapes (as plain dicts, the way they arrive over HTTP) into one
+internal `Completion`. The two shapes differ in exactly the ways that break naive integrations: where tool
+calls live, whether arguments are a JSON string or an object, and what the finish reasons are called.
 
 ```python
-from dataclasses import dataclass, field
-from typing import Optional, Protocol
 import json
-
-@dataclass
-class ToolCall:
-    name: str
-    args: dict
+from dataclasses import dataclass, field
 
 @dataclass
 class Completion:
     text: str
-    tool_calls: list = field(default_factory=list)
-    finish: str = "stop"            # normalised: stop | length | tool_use | filtered
+    tool_calls: list = field(default_factory=list)   # [(name, args_dict)]
+    finish: str = "stop"                             # stop | length | tool_use | filtered
     input_tokens: int = 0
     output_tokens: int = 0
 
-class ModelError(Exception):
-    def __init__(self, kind: str, retryable: bool):  # kind: rate_limited | context_length | ...
-        super().__init__(kind); self.kind, self.retryable = kind, retryable
+def from_openai_chat(r: dict) -> Completion:
+    ch, msg = r["choices"][0], r["choices"][0]["message"]
+    calls = [(c["function"]["name"], json.loads(c["function"]["arguments"]))  # args: JSON string
+             for c in msg.get("tool_calls") or []]
+    finish = {"stop": "stop", "length": "length", "tool_calls": "tool_use",
+              "content_filter": "filtered"}[ch["finish_reason"]]
+    return Completion(msg.get("content") or "", calls, finish,
+                      r["usage"]["prompt_tokens"], r["usage"]["completion_tokens"])
 
-class ChatModel(Protocol):
-    capabilities: set
-    context_window: int
-    def complete(self, messages: list, tools: Optional[list] = None) -> Completion: ...
-
-def parse_args(raw) -> dict:
-    """Some APIs return tool arguments as a JSON string, others as an object."""
-    return json.loads(raw) if isinstance(raw, str) else dict(raw)
-
-def check_deployment(model: ChatModel, needs: set, min_context: int) -> None:
-    missing = needs - model.capabilities
-    if missing:
-        raise RuntimeError(f"model lacks required capabilities: {sorted(missing)}")
-    if model.context_window < min_context:
-        raise RuntimeError(f"context {model.context_window} < required {min_context}")
-
-# At startup for tenant "acme", whose deployment uses the customer's own model endpoint:
-# check_deployment(acme_model, needs={"tools", "json_schema"}, min_context=32_000)
+def from_anthropic_messages(r: dict) -> Completion:
+    text = "".join(b["text"] for b in r["content"] if b["type"] == "text")
+    calls = [(b["name"], dict(b["input"]))                                     # args: object
+             for b in r["content"] if b["type"] == "tool_use"]
+    finish = {"end_turn": "stop", "stop_sequence": "stop", "max_tokens": "length",
+              "tool_use": "tool_use"}[r["stop_reason"]]
+    return Completion(text, calls, finish,
+                      r["usage"]["input_tokens"], r["usage"]["output_tokens"])
 ```
 
-In practice, the first run of a customer's regression suite on a newly integrated model usually shows
-format failures before reasoning failures: these are fixed in the adapter (argument parsing, finish-reason
-mapping) or the per-model prompt, then the suite is re-run until the paired flips against the old model
-are acceptable.
+The application branches only on `finish == "length"` or `"tool_use"`. Without the mapping, code that
+checks `finish_reason == "length"` silently never fires on a provider that says `max_tokens`, so
+truncated answers are shipped as complete. (Field names follow these two public APIs at the time of
+writing. Both adapters raise on an unknown finish value, which is the strict choice: providers add values
+over time, and defaulting an unknown one to "stop" is how truncation or refusals go unnoticed.)
+
+Now the budget arithmetic that the adapter cannot fix. A deployment packs a 32,000-token window as:
+system prompt 1,500 + history 4,000 + 10 retrieved chunks × 2,000 = 25,500 input tokens, plus 4,000
+reserved for output, leaving a 2,500-token margin. Suppose the new model's tokenizer counts this
+customer's text 15% higher (illustrative; measure it on their documents, since the ratio depends on
+language and content). Input becomes about 29,300, plus 4,000 output reserved, about 33,300: over the
+window. Depending on the stack, requests now fail with a context-length error, or a packer that trusts the
+old counts silently drops the last two chunks. The second is worse, because it shows up only as lower
+answer quality on long, document-heavy questions, which is exactly where the customer's hard cases are.
 
 ## Trade-offs
 - A normalising adapter makes models swappable, but a lowest-common-denominator interface hides features
@@ -153,6 +161,8 @@ are acceptable.
   score clearly below the model's expected quality, with no errors logged.
 - Configuring a moving alias instead of a pinned version; the symptom is a quality or format change on a
   date when nothing was deployed.
+- Configuring a fallback model that was never run against the customer's suite; the symptom is a quality
+  dip and format failures that coincide exactly with the primary provider's outage window.
 - Not mapping provider errors; the symptom is retries hammering a model on non-retryable errors, or
   giving up immediately on rate limits.
 

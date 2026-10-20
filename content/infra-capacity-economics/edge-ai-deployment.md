@@ -5,7 +5,7 @@ name: Edge AI deployment
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - infra-capacity-economics/hybrid-on-prem
   - infra-capacity-economics/gpu-utilization-and-memory-bandwidth
@@ -50,6 +50,15 @@ field. Edge deployment is therefore a budgeting and engineering discipline, not 
 model.
 
 ## How it works
+### Which edge
+"Edge" covers two different deployments. **On-device** means the user's phone, laptop, browser or
+an embedded controller: you do not own the hardware, it is shared with other apps, and the fleet is
+heterogeneous. **On-site edge servers** are a small box or rack you do own at a store, plant,
+hospital or cell site (a Jetson-class module, a workstation GPU, a telco edge node): fewer devices,
+known hardware, a few users each, and the same latency and connectivity benefits. The second is
+closer to a tiny on-prem cluster and is planned like one; the rest of this lesson is mostly about
+the first, where the constraints are hardest.
+
 ### Start from the device budget
 Three numbers bound the design. **Memory**: weights plus KV cache plus activations must fit in what
 the platform grants an app, with margin for the app itself. Weight bytes ≈ parameters × bits per
@@ -58,7 +67,17 @@ weight ÷ 8, so a 3B model at 4-bit is about 1.5 GB and an 8B model about 4 GB, 
 memory bandwidth ÷ model bytes; as an illustrative order of magnitude, a device with tens of GB/s
 of memory bandwidth and a 2 GB model cannot exceed a few tens of tokens per second, whatever the
 compute. **Power and thermal**: sustained throughput is lower than burst throughput because the
-chip throttles, so plan for sustained figures measured on warm devices.
+chip throttles, so plan for sustained figures measured on warm devices, and battery cost per
+interaction is a product metric on phones and laptops.
+
+The prefill/decode split from the datacenter still applies, with a twist. Decode is bandwidth-bound
+as above, but prefill is compute-bound, and on a phone compute is scarce too, so time to first
+token grows with prompt length: TTFT ≈ prompt tokens ÷ prefill tokens per second. A 2,000-token
+prompt (system prompt plus a retrieved document) on a device that prefills a few hundred tokens a
+second waits several seconds before the first word appears, which is why on-device features keep
+prompts short, reuse a cached system-prompt prefix across turns, and use the NPU or GPU for prefill
+where the runtime supports it. Plan both numbers: TTFT from prompt length, streaming speed from
+bandwidth.
 
 ### Make the model fit
 - **Choose a small model first.** Down to about 4 bits per weight, a larger quantized model often
@@ -156,10 +175,13 @@ whether streaming feels responsive, and it will drop as the device heats up.
   dependency and a privacy event, so the rule must be visible to the user and the product.
 - Per-device runtimes extract the most from each accelerator, but multiply the build, test and
   update matrix; a single portable runtime is slower and simpler.
-- Owning the fleet's compute makes marginal cost near zero, but makes rollouts, debugging and
-  telemetry slower and partial compared with a server you control.
+- Running on the user's hardware makes your marginal compute cost near zero, but makes rollouts,
+  debugging and telemetry slower and partial compared with a server you control; for a small or
+  internal user base the cloud bill it saves may not repay that engineering.
 
 ## Pitfalls
+- Measuring only tokens per second and ignoring prompt length; the symptom is a feature that
+  streams quickly once started but sits blank for seconds whenever a long document is in context.
 - Benchmarking on a developer laptop; the symptom is a model that is fast in the demo and crawls or
   crashes on the median user's device.
 - Measuring burst throughput; the symptom is responsiveness collapsing after a minute of use as the

@@ -5,7 +5,7 @@ name: sentence-transformers
 kind: tool
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/hugging-face
   - python-for-ai/pytorch
@@ -55,6 +55,12 @@ padding waste, runs batches on the chosen device under no-grad, pools and return
 tensor of shape `[n, dim]`. Normalising to unit length means dot product equals cosine similarity,
 which is what most vector indexes compute fastest.
 
+Mean pooling is `e = Σᵢ mᵢ·hᵢ / Σᵢ mᵢ`, where `hᵢ` is token i's output vector and `mᵢ` is 1 for real
+tokens and 0 for padding. The mask matters because padding vectors are not zero; averaging them in would
+make the same sentence embed differently depending on what else was in its batch. Which pooling is
+correct is a property of how the model was trained, not a free choice, which is why the library stores
+the pooling config with the weights instead of asking you to pick.
+
 ### Prompts and asymmetry
 Many retrieval models are trained asymmetrically: queries and passages get different instruction
 prefixes (for example E5's `"query: "` and `"passage: "`). The library stores such prompts in the model
@@ -70,10 +76,27 @@ bi-encoder fetches the top 50-200 candidates cheaply, then a cross-encoder resco
 
 ### Training
 Fine-tuning uses contrastive losses. `MultipleNegativesRankingLoss` takes (anchor, positive) pairs and
-treats every other positive in the batch as a negative, so larger batches give more negatives for free;
-this is why batch size matters more here than in classification. Recent versions train through a
+treats every other positive in the batch as a negative. For anchor `aᵢ` in a batch of B pairs it is a
+B-way softmax cross-entropy:
+
+```
+loss_i = -log( exp(s·cos(aᵢ, pᵢ)) / Σⱼ exp(s·cos(aᵢ, pⱼ)) )      # j = 1..B, s is a scale (default 20)
+```
+
+so each step asks "pick your true positive out of B candidates". Larger batches mean more, and on
+average harder, negatives for free, which is why batch size matters more here than in classification;
+`CachedMultipleNegativesRankingLoss` reaches large effective batches without the memory by computing
+embeddings in chunks. Adding a mined hard negative per pair (anchor, positive, negative), a passage that
+looks relevant but is not, teaches the distinctions random in-batch negatives never test. One trap:
+duplicates in a batch (two pairs with the same positive) become false negatives, so deduplicate. Recent versions train through a
 `SentenceTransformerTrainer` built on the Hugging Face Trainer, with evaluators that report retrieval
 metrics such as recall@k and NDCG on a held-out set.
+
+### Matryoshka embeddings
+Models trained with `MatryoshkaLoss` pack the most important information into the leading dimensions, so
+you can keep, say, the first 256 of 768 dimensions (`truncate_dim=256`) and accept a modest recall loss
+for a 3× smaller index. A model not trained this way degrades badly when truncated, so check the model
+card before cutting dimensions, and re-normalise after truncation.
 
 ### Truncation
 Each model has a `max_seq_length`; longer inputs are silently truncated. That limit, not the model's
@@ -107,8 +130,14 @@ for i, s in sorted(zip(top, rerank), key=lambda t: -t[1]):
 print(bi.max_seq_length)                       # inputs beyond this many tokens are truncated
 ```
 
+What to look for when you run it: both refund-related passages score well with the bi-encoder because
+they share the topic of returns, while the cross-encoder, which reads the query and passage together,
+should separate the one that answers "how long" (the 14-day passage) from the one that only mentions
+returns. Exact scores vary by model version; the ordering is the lesson.
+
 Cost shape: with N documents and k candidates, a query costs 1 bi-encoder pass plus k cross-encoder
-passes, instead of N cross-encoder passes.
+passes, instead of N cross-encoder passes. At N = 1,000,000 and k = 50 that is 51 forward passes per
+query instead of a million.
 
 ## Trade-offs
 - Bi-encoders allow precomputed document vectors and millisecond search, but compress each text to one
@@ -130,6 +159,9 @@ passes, instead of N cross-encoder passes.
   are never retrievable.
 - Mixing vectors from two model versions in one index after an upgrade: similarity scores become
   meaningless, and the symptom is a sudden, unexplained retrieval quality drop.
+- Thresholding cross-encoder scores ("keep passages scoring above 0.5") and then swapping the model:
+  scores are model-specific logits or sigmoid outputs, not calibrated probabilities, and the symptom is a
+  reranker that suddenly keeps nothing or everything; re-tune thresholds per model, or keep a fixed top-k.
 - Encoding one text at a time in a loop: throughput collapses because the GPU processes batches of one;
   pass lists and let `encode` batch.
 

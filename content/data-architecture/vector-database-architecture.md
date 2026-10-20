@@ -5,7 +5,7 @@ name: Vector database architecture
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - rag-retrieval/vector-databases
   - rag-retrieval/ann-indexes
@@ -119,48 +119,59 @@ quantization options, segment management and horizontal scaling. The architectur
 deciding which of those you will actually hit.
 
 ## Example
-A small Qdrant session showing the pieces: an HNSW-indexed collection, a payload index so the tenant
-filter is a bitmap lookup rather than a scan, an upsert, a filtered query with an explicit search beam,
-and a delete that becomes a tombstone until compaction.
+The filtering problem, made visible. This simulation uses exact similarity, so the only variable is
+*when* the filter is applied. One collection holds three tenants owning 90 %, 9.5 % and 0.5 % of the
+points. Post-filtering takes the top-k′ by similarity and then drops other tenants' points.
+Pre-filtering builds the allowed-id set first and scans it exactly.
 
 ```python
-from qdrant_client import QdrantClient
-from qdrant_client.models import (Distance, VectorParams, HnswConfigDiff, PointStruct,
-                                  Filter, FieldCondition, MatchValue, SearchParams, PointIdsList)
+import numpy as np
 
-client = QdrantClient(":memory:")                 # swap for QdrantClient(url="http://localhost:6333")
-client.create_collection(
-    collection_name="chunks",
-    vectors_config=VectorParams(size=4, distance=Distance.COSINE),   # real width: 384-3072
-    hnsw_config=HnswConfigDiff(m=16, ef_construct=128),              # graph degree, build beam
-)
-client.create_payload_index("chunks", field_name="tenant", field_schema="keyword")
+rng = np.random.default_rng(0)
+N, D, K = 200_000, 64, 10
+X = rng.standard_normal((N, D)).astype(np.float32)
+X /= np.linalg.norm(X, axis=1, keepdims=True)              # cosine = dot product
+share = {"big": 0.90, "mid": 0.095, "small": 0.005}         # tenant sizes: 90 %, 9.5 %, 0.5 %
+tenant = rng.choice(list(share), size=N, p=list(share.values()))
 
-client.upsert("chunks", points=[
-    PointStruct(id=1, vector=[0.10, 0.90, 0.00, 0.20], payload={"tenant": "acme",   "doc_id": "d-1"}),
-    PointStruct(id=2, vector=[0.80, 0.10, 0.10, 0.00], payload={"tenant": "acme",   "doc_id": "d-2"}),
-    PointStruct(id=3, vector=[0.10, 0.90, 0.00, 0.10], payload={"tenant": "globex", "doc_id": "d-3"}),
-])
+def post_filter(q, t, k_prime):                             # ANN-style: top-k' first, then filter
+    top = np.argpartition(-(X @ q), k_prime)[:k_prime]
+    return [i for i in top if tenant[i] == t][:K]
 
-hits = client.query_points(
-    "chunks",
-    query=[0.10, 0.90, 0.00, 0.10],
-    query_filter=Filter(must=[FieldCondition(key="tenant", match=MatchValue(value="acme"))]),
-    search_params=SearchParams(hnsw_ef=128),      # query-time beam: recall vs latency knob
-    limit=2,
-).points
-print([(h.id, round(h.score, 3), h.payload["doc_id"]) for h in hits])   # point 3 is excluded by filter
+def pre_filter(q, t):                                       # allowed ids first, exact scan over them
+    allowed = np.flatnonzero(tenant == t)
+    scores = X[allowed] @ q
+    return allowed[np.argsort(-scores)[:K]], len(allowed)
 
-client.delete("chunks", points_selector=PointIdsList(points=[2]))        # tombstone; freed at compaction
+q = rng.standard_normal(D).astype(np.float32); q /= np.linalg.norm(q)
+for t in share:
+    got = [len(post_filter(q, t, kp)) for kp in (10, 100, 1000)]
+    ids, scanned = pre_filter(q, t)
+    print(f"{t:>5}: post-filter results for k'=10/100/1000 -> {got}; "
+          f"pre-filter -> {len(ids)} results, scanned {scanned:,} vectors")
+# Output (seed 0):
+#   big: post-filter results for k'=10/100/1000 -> [9, 10, 10]; pre-filter -> 10 results, scanned 179,893 vectors
+#   mid: post-filter results for k'=10/100/1000 -> [1, 10, 10]; pre-filter -> 10 results, scanned 19,110 vectors
+# small: post-filter results for k'=10/100/1000 -> [0, 0, 4]; pre-filter -> 10 results, scanned 997 vectors
 ```
 
-Point 3 is identical to the query, so it is the nearest vector overall, but it belongs to another tenant;
-on a Qdrant server the payload index lets the planner restrict the search to `acme` points rather than
-retrieving top-k and discarding. The delete returns quickly because it only marks the point; the memory
-comes back when the segment is optimized. Two caveats about running this snippet: the `:memory:` local
-mode is a brute-force reimplementation that ignores HNSW and payload-index settings, and even a real
-server brute-forces a segment this small (below its indexing threshold), so the code shows the API shape,
-not the index behaviour, which only appears at realistic collection sizes.
+Read the output as the planner's decision table. Post-filtering returns about `k′ × selectivity`
+survivors: fine for the big tenant, and empty for the small one even at k′ = 1,000, a hundred times the
+requested k. Pre-filtering is always correct, but its cost is the size of the allowed set. Now scale to a
+production collection of 10 million 1,024-dimensional float32 vectors (4 KB each). The small tenant's
+50,000 vectors are about 200 MB to scan exactly, a few milliseconds to a few tens of milliseconds on one
+node depending on memory bandwidth and threads. The big tenant's 9 million are about 36 GB, which is far
+too much per query, so for it the engine must walk the graph and check the filter during traversal,
+where the filter hardly prunes anything. A good engine estimates the allowed-set size from the payload
+index and picks per query: exact scan below a threshold (Qdrant's `full_scan_threshold`, Weaviate's
+`flatSearchCutoff`), filter-aware graph search above it. When you evaluate an engine, test the tenant
+sizes in between, where neither strategy is cheap.
+
+In a real engine the setup is a payload index on the filtered field, for example
+`client.create_payload_index("chunks", field_name="tenant", field_schema="keyword")` in Qdrant, plus a
+filter passed with the query. A delete marks a tombstone and returns at once; its memory comes back when
+the segment is optimized. Neither behaviour shows on a toy collection, because servers brute-force
+segments below their indexing threshold. Benchmark at realistic sizes.
 
 ## Trade-offs
 - HNSW gives high recall at low latency but costs RAM for links plus vectors and a slow build; IVF or
@@ -194,7 +205,10 @@ Think in these terms whenever you choose or tune a vector store, size a cluster,
 is correct in notebooks and wrong in production. The questions to answer are concrete: how selective are
 the filters you will run, how many writes and deletes per hour, does the index fit in RAM with headroom,
 how many tenants and how skewed are they, and what recall at what p99 latency. Benchmark filtered recall
-and latency at your real selectivity, not the vendor's. Start with pgvector when the chunk tables already
+and latency at your real selectivity, not the vendor's. Recall has a precise meaning here: take a few
+hundred real queries with their real filters, compute the exact top-k by brute force, and report the
+fraction of those ids the engine returns, at the p99 latency you get with the same settings. Repeat
+after a month of writes and deletes, because a freshly built index is the best case. Start with pgvector when the chunk tables already
 live in Postgres and the corpus is in the low millions; move to a dedicated engine when the architecture
 above says one of its mechanisms is what you need. In interviews, explaining why a selective filter
 breaks naive ANN and how segments and tombstones make deletes eventual is the level expected of an
@@ -215,18 +229,20 @@ architect.
 Small tenants complain that search returns only one or two results, large tenants report slow queries,
 and a security audit asks how cross-tenant leakage is prevented. Explain the mechanisms behind each
 symptom and propose an architecture.
-**A:** Small tenants get few results because the engine is post-filtering: it retrieves top-k′ by
-similarity over all tenants and then applies the filter, and a tenant owning 0.1 % of points rarely
-survives. Large tenants are slow for different reasons: any workaround for the small ones (a larger k′ or
-`ef` applied to every query) makes each query walk much more of the shared graph, the big tenants'
-points are spread over every shard so each query pays scatter-gather, and if the engine does build
-per-filter candidate sets, materializing a bitmap covering a large fraction of the collection is costly. Leakage prevention currently rests on application
-code remembering the filter. The fix is a tenant-aware index: a payload index on `tenant_id` so the engine
-can build per-tenant graph structure or route queries to a per-tenant subgraph, so small tenants are
-searched as small graphs and large tenants as their own full graphs. For the handful of very large
-tenants, dedicated shards or collections give isolation and predictable latency. Enforce the filter
-structurally, in a retrieval service that derives `tenant_id` from authentication rather than from the
-caller's request, and test filtered recall at both the smallest and largest tenant sizes before rollout.
+**A:** Small tenants get few results because the filter is applied after similarity search: the engine
+takes the top-k′ over all 3,000 tenants and then discards the others, so a tenant owning 0.1 % of points
+gets about `k′ × 0.001` survivors, which is effectively none. Large tenants are slow for related reasons.
+The usual workaround for small tenants, a larger k′ or `ef` on every query, makes each query walk much
+more of the shared graph. And a large tenant's points are spread over every shard, so each of its
+queries pays scatter-gather and waits for the slowest shard. Leakage prevention currently depends on
+application code remembering the filter. The fix has three parts. First, give the engine what it needs
+to plan by selectivity: a payload index on `tenant_id`, and ideally per-tenant index structure inside the
+collection (in Qdrant, a tenant-marked keyword index with graphs built per payload value instead of one
+global graph). Small tenants are then searched exactly or as small graphs, and none of them is a sliver
+of a huge one. Second, put the handful of very large tenants on dedicated shards or collections, which
+gives them isolation and predictable latency. Third, enforce the filter in a retrieval service that
+derives `tenant_id` from authentication, never from the request body. Then verify with recall@k against
+exact search, measured separately at the smallest, median and largest tenant sizes.
 
 ## Quiz
 ### Q: Why does an HNSW index need to be resident in RAM to perform well?

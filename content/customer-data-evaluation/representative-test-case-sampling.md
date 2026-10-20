@@ -4,8 +4,8 @@ module: customer-data-evaluation
 name: Representative test-case sampling
 kind: practice
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 16
+status: reviewed
 related:
   - evals/golden-dataset
   - evals/error-analysis
@@ -39,22 +39,36 @@ eval set that is both faithful to production in aggregate and dense enough in th
 are made.
 
 ## How it works
-### 1. Define the population
+### 1. Define the population and the sampling unit
 State exactly which traffic the system will see: which channels, products, languages and date range.
 Pull from the most recent representative window, ideally the same period of the business cycle the
-launch will face, *because* traffic composition drifts and old samples encode old policies.
+launch will face, *because* traffic composition drifts and old samples encode old policies. Pick the
+unit deliberately: sample conversations or documents, not turns or pages, when the system is judged on
+the whole, and cap items per account so one heavy customer cannot dominate. Check what the logs cannot
+contain, too: if today's process routes legal threats straight to a phone team, they never reach the
+ticket log, and no sampling scheme recovers them; that gap must be filled from another source.
 
 ### 2. Choose strata from the decision, not the data
 Strata are the segments where you need a separate answer: intent or document type, customer tier,
 language, risk class, input length band, source system. Pick them by asking "if quality differed here,
 would we act differently?" Each stratum you add costs sample budget, so keep only those with a
-consequence.
+consequence. When nobody knows the segments yet, cluster a large unlabelled slice by embedding,
+have SMEs name the clusters, and promote the ones with distinct risk to strata.
 
-### 3. Allocate with a floor
-Give every important stratum a minimum count, then distribute the remaining budget in proportion to
-traffic. The floor exists *because* precision depends on the count in the stratum, not its share of
-traffic. For a pass rate near p measured on n items, the standard error is about √(p(1−p)/n): at p = 0.9
-and n = 100 that is 0.03, so a 95% interval is roughly ±6 points. Six items cannot distinguish anything.
+### 3. Size the budget and allocate with a floor
+Precision depends on the count in a stratum, not its share of traffic. For a pass rate near p measured
+on n items, the standard error is about √(p(1−p)/n): at p = 0.9 and n = 100 that is 0.03, so a 95%
+interval is roughly ±6 points, and six items cannot distinguish anything. Inverting it gives the count
+a stratum needs for a target half-width E: n ≈ 1.96² · p(1−p) / E². When failures should be rare, the
+"rule of three" is the quick check: zero failures in n items still leaves a one-sided 95% upper bound of
+about 3/n on the failure rate, so proving "under 1% failures" needs roughly 300 clean items in that
+stratum.
+
+Allocation is then a deliberate compromise. Proportional allocation mirrors traffic and is best for the
+headline number only when strata behave alike; Neyman allocation (n_h ∝ N_h·σ_h, where σ_h is the
+stratum's spread) minimises the variance of the population estimate. Neither guarantees a usable count
+in a 2% stratum, so give every important stratum a floor first and distribute the rest of the budget in
+proportion to traffic.
 
 ### 4. Deduplicate before sampling
 Production logs are full of near-duplicates: templated emails, retries, the same invoice resubmitted.
@@ -63,8 +77,11 @@ of one template make the set look large while testing one case.
 
 ### 5. Re-weight to report the population number
 Because strata were sampled at different rates, the raw average over the set is biased toward the
-oversampled strata. Weight each item by stratum size divided by stratum sample count to get the
-production-weighted metric, and report per-stratum numbers alongside it.
+oversampled strata. With W_h the stratum's share of traffic and p_h its measured pass rate, the
+production estimate is p̂ = Σ W_h·p_h, and its standard error is √(Σ W_h²·p_h(1−p_h)/n_h). The second
+formula shows the price of floors: oversampled small strata contribute almost nothing to the variance
+(W_h² is tiny), while the bulk stratum, which lost items to the floors, contributes most of it. Report
+per-stratum numbers with their own intervals alongside the weighted one.
 
 ### 6. Add targeted cases as a labelled minority
 Known failure modes, adversarial inputs and SME-nominated edge cases belong in the suite, but tagged as a
@@ -81,7 +98,7 @@ Ticket triage for a telecom customer. Of 10,000 recent tickets, 9,000 are billin
 stratum so the rare one is measurable.
 
 ```python
-import random
+import random, math
 from collections import defaultdict
 
 def stratified_sample(logs, key, budget, floor, seed=7):
@@ -97,9 +114,17 @@ def stratified_sample(logs, key, budget, floor, seed=7):
         weight[s] = len(items) / n          # each sampled item stands for this many real ones
     return sample, weight
 
-def weighted_accuracy(graded, weight):
-    """graded: list of (stratum, correct). Re-weights results back to the production mix."""
-    return sum(weight[s] * ok for s, ok in graded) / sum(weight[s] for s, _ in graded)
+def weighted_estimate(graded, weight, N):
+    """graded: (stratum, correct) pairs. Population estimate and its standard error."""
+    by = defaultdict(list)
+    for s, ok in graded:
+        by[s].append(ok)
+    est = se2 = 0.0
+    for s, oks in by.items():
+        W, p = weight[s] * len(oks) / N, sum(oks) / len(oks)   # W = stratum share of traffic
+        est += W * p
+        se2 += W * W * p * (1 - p) / len(oks)
+    return est, math.sqrt(se2)
 
 logs = ([{"intent": "billing"}] * 9000 + [{"intent": "cancel"}] * 800
         + [{"intent": "legal"}] * 200)
@@ -110,12 +135,15 @@ print(n)            # {'billing': 168, 'cancel': 70, 'legal': 62}
 true_acc = {"billing": 0.95, "cancel": 0.85, "legal": 0.60}   # pretend grading results
 graded = [(s, i < round(true_acc[s] * n[s])) for s in n for i in range(n[s])]
 raw = sum(ok for _, ok in graded) / len(graded)
-print(f"unweighted {raw:.3f}  weighted {weighted_accuracy(graded, w):.3f}")
-# unweighted 0.857  weighted 0.938
+est, se = weighted_estimate(graded, w, len(logs))
+print(f"unweighted {raw:.3f}  weighted {est:.3f} ± {1.96 * se:.3f}")
+# unweighted 0.857  weighted 0.938 ± 0.030
 ```
 
 The unweighted 85.7% understates production quality because legal threats are 21% of the set but 2% of
-traffic; the weighted 93.8% is the population estimate. The per-stratum view is the actionable one: at
+traffic; the weighted 93.8% is the population estimate. The floors cost little on the headline: ±3.0
+points against about ±2.7 for a simple random sample of 300 at the same accuracy, because the legal and
+cancel strata carry tiny weights. What they buy is the per-stratum view, which is the actionable one: at
 62 items, legal accuracy near 60% carries roughly ±12 points of uncertainty, enough to know it is far
 below billing and must be fixed before launch. A proportional 300-item sample would have held about six
 legal tickets.
@@ -139,6 +167,8 @@ legal tickets.
   for that template swinging the score far more than their production impact.
 - Mixing targeted adversarial cases into the population metric; the symptom is a headline number that
   drops every time someone adds a new red-team case.
+- Treating the log as the population when part of the traffic bypasses it; the symptom is post-launch
+  complaints about a case type that never appeared in the eval set at all.
 - Sampling from a period before a policy or product change; the symptom is SMEs relabelling many items
   as "no longer how we do it".
 

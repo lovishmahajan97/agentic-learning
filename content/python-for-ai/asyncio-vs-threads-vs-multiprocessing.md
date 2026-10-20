@@ -5,7 +5,7 @@ name: asyncio vs threads vs multiprocessing
 kind: decision
 difficulty: core
 est_minutes: 17
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/asyncio
   - python-for-ai/gil
@@ -70,7 +70,21 @@ number of workers. The start method matters. `fork` copies the parent quickly bu
 parent has threads or CUDA state; `spawn`, the default on macOS and Windows, starts clean but
 re-imports your modules (since 3.14 the Linux default is `forkserver`, which has the same import
 requirements), so worker entry points must be importable and guarded by
-`if __name__ == "__main__":`.
+`if __name__ == "__main__":`. Heavy per-worker state (a tokenizer, a parser model) belongs in the
+pool's `initializer=` function, which runs once per worker, *because* passing it with every task would
+pickle it every time. The test for whether a process pool pays off is a ratio: per-task compute time
+against the time to pickle the arguments and result (`len(pickle.dumps(arg))` and a quick timing tell
+you). Batch small items into chunks (`chunksize=` on `map`) until compute dominates.
+
+### A decision procedure
+1. Measure first: wall time, process CPU time and per-core utilisation for a representative run.
+2. CPU well below one core while latency is high: you are waiting. Use asyncio if the libraries are
+   async; threads if they are blocking. Either way, bound concurrency to what the dependency allows.
+3. One core pinned and adding threads changes nothing: pure-Python CPU work under the GIL. Use
+   processes, or move the hot loop into native code (NumPy, Polars, a compiled library).
+4. Several cores busy with threads: the hot path is in GIL-releasing native code, and threads are the
+   cheapest parallelism you have, sharing memory and model weights.
+5. The work mixes both: keep one async core and push each kind of work to the executor that matches it.
 
 ### Bridges between them
 `await asyncio.to_thread(fn, *args)` (3.9+) runs a blocking call in the default thread pool without
@@ -149,14 +163,21 @@ choice from the bottleneck, not from preference.
   cannot speed up their parser, and fixes it in their codebase.
 
 ## Check yourself
-**Q:** A FastAPI service with async endpoints calls a synchronous vendor SDK for each request. Under load,
-latency rises for every endpoint, including a trivial health check. Why, and what are the options?
-**A:** The synchronous call blocks the event loop thread, so while one request waits on the vendor, no
-other coroutine on that worker can run; even the health check queues behind it. CPU stays low because
-the thread is waiting, not computing. Options in order of preference: switch to the vendor's async client
-if one exists; wrap the call in `await asyncio.to_thread(...)` so it runs in a thread pool and the loop
-stays free, sizing the pool deliberately; or declare the endpoint with plain `def` so FastAPI runs it in
-its threadpool. Adding processes only hides the problem by multiplying blocked loops.
+**Q:** A team's chunking step (pure-Python regex and string splitting, about 2 ms per document) is too slow.
+They wrap it in a 16-thread pool: no change, and `top` shows the process at about 100% CPU. They switch to a
+`ProcessPoolExecutor(16)` submitting one document per task, and it gets slower. Explain both results and
+what you would do.
+**A:** The threads changed nothing because the work is pure-Python bytecode: under the GIL only one thread
+runs at a time, and "100% CPU" means one core, the fingerprint of GIL-bound work. The process pool removed
+the GIL limit but introduced a per-task cost paid serially in the parent: it pickles every document,
+pushes it through a pipe, tracks a future per task, and unpickles every list of chunks that comes back.
+Sixteen workers each finishing a task every 2 ms demand thousands of tasks per second from that one
+parent thread, so the parent becomes the bottleneck, and when documents are large the per-task
+serialisation alone can exceed the 2 ms of work it is shipping. The fix keeps
+processes but changes the grain: send batches of a few hundred documents per task (`map` with
+`chunksize`, or explicit batches) so compute dominates, initialise any heavy objects once per worker,
+and size the pool to physical cores. Then measure throughput against batch size, because the optimum is
+empirical. If the hot loop can be expressed as vectorised Polars string operations, that may beat both.
 
 ## Quiz
 ### Q: Which workload is the best fit for a `ProcessPoolExecutor` rather than threads or asyncio?

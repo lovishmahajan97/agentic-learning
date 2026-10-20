@@ -4,8 +4,8 @@ module: data-architecture
 name: Feature stores (hybrid ML only)
 kind: concept
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 15
+status: reviewed
 related:
   - ml-fundamentals/train-test-leakage
   - data-architecture/training-data-pipelines
@@ -70,6 +70,25 @@ row, selecting from each feature view the latest value with `event_timestamp <= 
 honest answer: at that time the model would not have known it. This "as-of" join is the core algorithm
 and is the reason the offline store keeps history. Feast exposes it as `get_historical_features`.
 
+### The boundary must match what serving sees
+The `<=` in the join is a decision, not a detail. Suppose the feature is "transactions by this card in
+the last hour" and the label is attached to a transaction at 14:00:00. If the feature pipeline has
+already counted that transaction in a value stamped 14:00:00, an inclusive join hands the model a count
+that includes the very event being scored. At serving time the scorer runs *before* the transaction is
+recorded, so it never sees itself in the count. The training and serving views then differ by exactly
+one, systematically, which is leakage that looks like a rounding error. Choose strict or inclusive
+comparison, and any allowance for ingestion delay, to reproduce what the online path can know at
+decision time.
+
+### Backfills
+A new feature is useless for training until it has history. A *backfill* runs the feature's
+transformation over historical source data to populate the offline store as if the feature had always
+existed, which is possible only if the sources are themselves historical (an event log or a snapshot
+table). If the feature reads a mutable production table that keeps only current state, history cannot be
+reconstructed; the only honest options are to start logging the feature now and wait until enough
+labelled history accumulates, or to accept a training set where the feature is null before its launch
+date. This is why feature sources should be append-only events wherever possible.
+
 ### The online store
 A low-latency key-value store (Redis, DynamoDB, Bigtable and similar) holding only the latest value per
 entity per feature view. Serving reads it with a single lookup per entity. It is populated by
@@ -97,7 +116,10 @@ distributions) computed at materialization are what drift monitoring compares ag
 Typical hybrid shapes: a classical ranking or routing model decides which documents or which LLM an
 agent should use; a fraud or risk score gates whether an LLM-generated action executes; a churn model
 decides which users get an LLM-drafted outreach. The features for those models come from a feature store;
-the LLM gets the score or the decision, not the features. If your system has none of these models, the
+the LLM gets the score or the decision, not the features. Embeddings also appear as features in these
+models (a user or item embedding fed to a ranker); the embedding model's version is then part of the
+feature view's definition, so changing it is a new feature version and a retrain, for the same reason it
+forces a re-index in retrieval. If your system has none of these models, the
 analogous concerns (consistent metadata between ingestion and query time, versioned transformations)
 are handled by the ingestion contract and embedding versioning, not by a feature store.
 
@@ -178,6 +200,9 @@ metrics overstate production performance.
   document metadata that the ingestion pipeline already handled.
 - Not recording feature view versions in the model's provenance; the symptom is being unable to tell
   why model v12 and v13 disagree after a feature definition changed.
+- An inclusive as-of join on a feature that counts the label event itself; the symptom is a feature that
+  is suspiciously predictive offline and whose logged serving values sit consistently one below the
+  training values.
 
 ## When to use
 Reach for a feature store when the system trains and serves more than a couple of classical models that

@@ -4,8 +4,8 @@ module: customer-data-evaluation
 name: Per-customer guardrails
 kind: pattern
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 15
+status: reviewed
 related:
   - safety-security/input-output-guardrails
   - safety-security/content-moderation
@@ -79,6 +79,24 @@ trade-off between false blocks and misses. That trade-off depends on the custome
 appetite, so thresholds are calibrated on each customer's labelled sample (from their SMEs), and the
 false-positive rate is monitored in production. A threshold copied from another customer is a guess.
 
+The calibration procedure is ordinary operating-point selection. Score the customer's labelled sample,
+then pick the lowest threshold that meets their stated tolerance on the side they care about most,
+usually misses: "catch at least 95% of real investment-advice responses". Read off the false-block rate
+that threshold implies and show it to the customer, because that number is the cost they are accepting.
+Two cautions. Violations are rare, so a 1,000-case sample may hold only 20 positives, and a recall
+estimate from 20 positives moves 5 points per case; enrich the sample with known violations before
+trusting it. And the operating point drifts when the customer's traffic changes, so re-check it on fresh
+labelled samples rather than treating it as set-and-forget.
+
+### Fail-open or fail-closed
+Guards are services that time out and fail. What happens then is itself per-customer policy: a
+regulated tenant's output check fails closed (return a safe refusal or route to a human), while a
+low-risk internal tool may fail open with the event logged and alerted. Leaving it to whatever the
+exception handler happens to do means the guardrail is silently off during exactly the incidents when
+load is highest. Streaming output raises the same question at a finer grain: either buffer and check
+before release (safer, adds latency to the first visible token) or check chunk by chunk and retract,
+which only works for rules a partial answer cannot already violate.
+
 ### Change control and audit
 Policies are versioned config validated against a schema. A change is diffed, run against that
 customer's guardrail test cases (which belong in their regression suite), and rolled out in stages.
@@ -86,8 +104,9 @@ Every block or redaction logs the policy version and rule id, so "why was this a
 answer and the customer's auditors can see the rule fired.
 
 ## Example
-A tighten-only merge of platform, customer and deployment layers, plus a tool-call check that uses the
-resolved policy.
+A tighten-only merge of platform, customer and deployment layers. Relaxations are *requested* by a
+layer but only take effect if the platform's approval registry lists them for that tenant, so the review
+gate is in the code path, not in a wiki.
 
 ```python
 from dataclasses import dataclass
@@ -99,38 +118,39 @@ class Policy:
     redact_pii: frozenset = frozenset()
     allowed_tools: Optional[frozenset] = None     # None = no restriction at this layer
     max_refund: float = float("inf")
-    exceptions: frozenset = frozenset()         # platform-approved relaxations, e.g. {"dosage"}
+    requested_exceptions: frozenset = frozenset() # e.g. {"dosage"}; inert until approved
 
-def merge(*layers: Policy) -> Policy:
+APPROVED = {"pharma-co": frozenset({"dosage"})}   # owned by platform policy, change-controlled
+
+def merge(tenant: str, *layers: Policy) -> Policy:
     tools = [l.allowed_tools for l in layers if l.allowed_tools is not None]
-    excs = frozenset().union(*(l.exceptions for l in layers))
-    topics = frozenset().union(*(l.blocked_topics for l in layers))
+    asked = frozenset().union(*(l.requested_exceptions for l in layers))
+    granted = asked & APPROVED.get(tenant, frozenset())          # unapproved asks are ignored
     return Policy(
-        blocked_topics=topics - excs,                         # only approved exceptions relax
-        redact_pii=frozenset().union(*(l.redact_pii for l in layers)),
-        allowed_tools=frozenset.intersection(*tools) if tools else None,
-        max_refund=min(l.max_refund for l in layers),
-        exceptions=excs,
+        blocked_topics=frozenset().union(*(l.blocked_topics for l in layers)) - granted,
+        redact_pii=frozenset().union(*(l.redact_pii for l in layers)),   # blocklists union
+        allowed_tools=frozenset.intersection(*tools) if tools else None,  # allowlists intersect
+        max_refund=min(l.max_refund for l in layers),                     # limits take the min
     )
 
 PLATFORM = Policy(blocked_topics=frozenset({"weapons", "dosage"}), redact_pii=frozenset({"ssn"}))
 ACME     = Policy(redact_pii=frozenset({"iban"}), max_refund=50.0,
-                  allowed_tools=frozenset({"lookup_order", "issue_refund"}))
-ACME_FAQ = Policy(allowed_tools=frozenset({"lookup_order"}))      # FAQ bot: no refunds
+                  allowed_tools=frozenset({"lookup_order", "issue_refund"}),
+                  requested_exceptions=frozenset({"dosage"}))   # asks, but is not approved
+ACME_FAQ = Policy(allowed_tools=frozenset({"lookup_order"}), max_refund=100.0)
 
-def check_tool(policy: Policy, name: str, args: dict) -> None:
-    if policy.allowed_tools is not None and name not in policy.allowed_tools:
-        raise PermissionError(f"tool {name} not allowed for this deployment")
-    if name == "issue_refund" and args["amount"] > policy.max_refund:
-        raise PermissionError("refund exceeds tenant limit")
-
-p = merge(PLATFORM, ACME, ACME_FAQ)
-check_tool(p, "lookup_order", {"id": "A-17"})        # ok
-# check_tool(p, "issue_refund", {"amount": 20})     # PermissionError: FAQ deployment cannot refund
+p = merge("acme", PLATFORM, ACME, ACME_FAQ)
+print(sorted(p.blocked_topics), p.allowed_tools, p.max_refund)
+# ['dosage', 'weapons'] frozenset({'lookup_order'}) 50.0
+print(sorted(merge("pharma-co", PLATFORM, Policy(requested_exceptions=frozenset({"dosage"}))).blocked_topics))
+# ['weapons']
 ```
 
-In real systems, exceptions would only be accepted from an approved list at the platform layer; here the
-customer layer could add one, which is the review gate you must build around this merge.
+Read the output against the rules. Acme asked to unblock dosage, but no approval exists, so the request
+is inert. The FAQ deployment tried to raise the refund ceiling to 100 and got 50, because limits take the
+minimum. Its tool allowlist intersected Acme's down to `lookup_order`, so a refund call is rejected in the
+tool adapter before it runs. Only the pharma tenant, with a recorded approval, has the floor relaxed, and
+only for the one topic approved.
 
 ## Trade-offs
 - Per-tenant policy lets one platform serve customers with opposite rules, but every customer now has a
@@ -149,6 +169,8 @@ customer layer could add one, which is the review gate you must build around thi
   field gives a caller another tenant's looser policy.
 - Copying classifier thresholds between customers; the symptom is one tenant reporting constant false
   blocks while another reports misses, on the same model and policy.
+- Leaving guard timeouts unhandled so the request proceeds unchecked; the symptom is violations that
+  cluster in high-load windows, when the classifier service was timing out and nobody noticed.
 - Not logging which rule and policy version fired; the symptom is support spending hours unable to
   explain why a specific answer was blocked or redacted.
 - Letting a customer layer silently relax the platform floor; the symptom is an audit finding that a

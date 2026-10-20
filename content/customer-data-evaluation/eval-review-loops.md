@@ -4,8 +4,8 @@ module: customer-data-evaluation
 name: Eval review loops
 kind: pattern
 difficulty: core
-est_minutes: 15
-status: fact-checked
+est_minutes: 17
+status: reviewed
 related:
   - evals/error-analysis
   - evals/eval-driven-development
@@ -64,9 +64,29 @@ acceptance.
 7. **Report.** A short note to the customer: score with interval, top failure clusters, decisions taken,
    what changed in labels or guideline (so score movement is explainable).
 
+### How much to read, and in what order
+Read failures until new cause categories stop appearing; in practice the first few dozen failures
+usually reveal the main clusters, and reading hundreds more mostly adds counts, not categories. Then
+rank clusters by frequency × cost of the error in this customer's process, *because* a rare error that
+sends money to the wrong bank account outranks a common formatting slip.
+
+### Reading the score through the review
+The review sample also corrects the headline. If the judge passes a share p_judge of items, SMEs find
+that a fraction f_pass of judge-passes are actually wrong, and a fraction r_fail of judge-fails are
+actually right (label or grader errors), then the SME-equivalent pass rate is approximately
+
+```
+p_true ≈ p_judge × (1 − f_pass) + (1 − p_judge) × r_fail
+```
+
+Both fractions come from small samples, so the corrected number carries a wide band; its value is in
+showing which direction the grader errs and by how much.
+
 ### Keeping the grader honest
 Each cycle, have SMEs grade a fixed-size sample that the judge also graded, and track judge-to-SME
-agreement over time. A drop means the judge prompt or the guideline it encodes has fallen behind.
+agreement over time. A drop means the judge prompt or the guideline it encodes has fallen behind. The
+sample must be random rather than drawn from failures, or it measures the judge only where it is
+already suspected.
 
 ### Avoiding overfitting
 The loop repeatedly exposes the iteration set. Keep a holdout that nobody reads, and evaluate on it only
@@ -88,6 +108,12 @@ gaps (is a workaround an acceptable answer when a fix exists?) and 12 are judge 
 marked wrong because they were shorter than the reference). Among the 30 passes, 4 are actually wrong,
 judged lenient because they sounded confident.
 
+Reading the score through the review: f_pass ≈ 4/30 ≈ 0.13, and r_fail = 26/66 ≈ 0.39 (the label and
+judge errors, where the system was right). So p_true ≈ 0.78 × 0.87 + 0.22 × 0.39 ≈ 0.76, before the 9
+guideline gaps are ruled on. The headline was roughly right by accident: about 30 false passes and 26
+false fails nearly cancel. A grader whose errors cancel on this mix will not cancel on the next one, so
+the judge is fixed anyway.
+
 Decisions: filter retrieval by release version; relabel 14 items; product owner rules "a workaround is
 acceptable only if the answer also states the fix version"; judge prompt updated to grade content not
 length and to check stated version numbers.
@@ -102,8 +128,9 @@ filter is relaxed for those queries.
 
 **Week 3.** 89% on the iteration set and 86% on the holdout, a small gap and well inside the roughly
 ±7-point 95% interval a 100-item holdout carries. Judge-to-SME agreement on a fresh random 40-item
-sample is 36 of 40, up from 31 of 40 on the equivalent random sample in week 1. The customer now trusts the number enough
-to use it in the acceptance test.
+sample is 36 of 40, up from 31 of 40 on the equivalent random sample in week 1. Forty items is a small
+sample, so the team treats this as consistent with the fixes rather than proof, and keeps sampling
+weekly. The customer now trusts the number enough to use it in the acceptance test.
 
 ## Trade-offs
 - Deep SME review of every failure gives accurate attribution, but consumes expert time; once judge and

@@ -5,7 +5,7 @@ name: pydantic-settings
 kind: tool
 difficulty: core
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/pydantic
   - python-for-ai/python-dotenv
@@ -61,6 +61,18 @@ The ordering is deliberate: the platform's environment beats a local file, which
 default and means a stale `.env` cannot override production. You can reorder or add sources (a vault,
 a YAML file) by overriding the `settings_customise_sources` classmethod.
 
+Mechanically, each source is just a callable that returns a dict of raw values for the fields it knows
+about. pydantic-settings calls them, deep-merges the dicts so a higher-priority source overwrites a
+lower one key by key, and then runs one ordinary Pydantic validation over the merged dict. That design
+is why everything Pydantic can do (coercion, validators, nested models, aliases) works unchanged for
+config, and why a custom source only has to produce a dict. Note the asymmetry with python-dotenv:
+within `env_file=(".env", ".env.local")` the *later* file wins, whereas repeated `load_dotenv` calls
+keep the first value.
+
+When a variable's name is fixed by someone else (the OpenAI SDK's `OPENAI_API_KEY`, a platform's
+`DATABASE_URL`), give the field `validation_alias="OPENAI_API_KEY"` (or `AliasChoices` for several
+accepted names) instead of bending your prefix convention.
+
 ### Parsing beyond strings
 Simple types are coerced with Pydantic's normal rules, so `"30"` becomes `30.0` for a `float` field and
 `"false"` becomes `False` for a `bool`. Complex fields (`list`, `dict`, nested models) are parsed from a
@@ -115,7 +127,8 @@ print(s.retrieval)          # top_k=20 rerank=True   (nested override, default k
 print(s.openai_api_key)     # **********             (masked)
 client_key = s.openai_api_key.get_secret_value()
 
-# In a test, ignore the developer's .env entirely:
+# In a test, ignore the developer's .env (real env vars still apply, so
+# kwargs or monkeypatch.delenv must cover anything the shell might set):
 t = Settings(_env_file=None, openai_api_key="test", env="dev")
 ```
 
@@ -139,8 +152,9 @@ timeout.
   import because a required key is missing, fixed by constructing lazily or in the entry point.
 - Forgetting `env_prefix` and naming a field `path` or `home`; the symptom is the field mysteriously
   filled from the system's own `PATH` or `HOME` variable.
-- Leaving `extra` at its default when sharing a `.env` with other tools; the symptom is a validation
-  error about unexpected keys from the dotenv file, fixed with `extra="ignore"`.
+- Leaving `extra` at its default (`"forbid"`) when sharing a `.env` with other tools; the symptom is a
+  validation error about unexpected keys from the dotenv file (environment variables never trigger
+  it), fixed with `extra="ignore"`.
 - Expecting a nested override without setting `env_nested_delimiter`; the symptom is
   `APP_RETRIEVAL__TOP_K` being silently ignored and the default used.
 - Caching settings with `lru_cache` and then changing env vars in a test; the symptom is old values,
@@ -163,14 +177,17 @@ In interviews, explain the source precedence and why secrets are typed as `Secre
   `ValidationError` to diagnose their environment in minutes.
 
 ## Check yourself
-**Q:** A colleague argues pydantic-settings is overkill: "we have ten env vars and `os.getenv` works".
-When are they right, and what would change your answer?
-**A:** For a short script run by one person, they are right; the cost of a class is not repaid. The
-answer changes when the code is a deployed service: values need types (timeouts, top-k, booleans),
-missing or malformed values must fail at startup rather than on the first request that touches them,
-secrets must not leak through logged config, and new environments need one place listing every
-required variable. Those needs grow with environments and team size, not with the number of variables,
-and pydantic-settings delivers all of them using validation the team already knows from Pydantic.
+**Q:** Your platform team rotated the API key by updating a Kubernetes secret mounted as a file in
+`secrets_dir`. The pods restarted, but they still call the provider with the old key. An old ConfigMap
+also sets `APP_OPENAI_API_KEY`. Explain what happened and two ways to fix it.
+**A:** Sources are merged by priority: init kwargs, environment, dotenv, secret files, defaults. The
+stale ConfigMap value arrives as an environment variable, which outranks the mounted secret file, so the
+rotation was silently shadowed; the restart re-read both and the env var won again. Fix one: delete the
+variable from the ConfigMap so the secret file is the only source. Fix two, if the team wants files to
+be authoritative by design: override `settings_customise_sources` to return the file-secret source
+ahead of the environment source. Either way, add a startup log of *which source* supplied each secret
+(never the value), so the next shadowing is visible, and remember a running process never re-reads its
+settings without a restart.
 
 ## Quiz
 ### Q: `APP_MODEL` is set in the environment, `.env` sets `APP_MODEL` differently, and the field has a default. Which value wins?

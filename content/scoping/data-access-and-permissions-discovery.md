@@ -5,7 +5,7 @@ name: Data access & permissions discovery
 kind: practice
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - rag-retrieval/acl-aware-retrieval
   - enterprise-integration/rbac-abac-mapping-to-customer-identity
@@ -73,24 +73,34 @@ The main options:
   an OAuth token-exchange or on-behalf-of flow), so the source enforces its own rules. Most faithful, but slower and bound by
   per-user rate limits.
 - **Index with ACL metadata**: ingest content with its permission principals attached, and filter every
-  retrieval by the requesting user's resolved groups. Fast, but you must sync permission changes and
-  resolve nested groups correctly.
+  retrieval by the requesting user's resolved groups. Fast, but you must sync permission changes,
+  resolve nested groups correctly, and honour explicit deny entries where the source has them. Apply the
+  filter inside the search (pre-filtering), not to the top-k results afterwards, *because* post-filtering
+  a top-10 list for a user who can see a small share of the corpus often leaves zero results, which looks
+  like a retrieval bug rather than a permission rule.
 - **Partitioned indexes**: one index per audience (per department or tenant). Simple and robust, but
   only works when permissions are coarse.
 Each choice depends on what step 3 found, *because* a source that does not expose ACLs through its API
 forces delegated access or coarse partitioning.
 
-### 6. Apply least privilege to actions
+### 6. Treat derived data as carrying its sources' permissions
+Embeddings, chunk stores, cached answers, conversation memory, summaries, prompt and trace logs, and
+evaluation datasets all contain or reveal source content. Each derived item should be visible only to
+users who could see every source it was built from, *because* a summary of an HR file and a public memo
+is as sensitive as the HR file. List where derived data lands (including the observability tool and the
+model provider's logs) and who can read each of those stores.
+
+### 7. Apply least privilege to actions
 For agents that write (create tickets, update records, send email), list each action, the scope it
 needs, and whether it acts as the user or as a service. Request read-only scopes where reading suffices
 and gate write actions behind approval.
 
-### 7. Map the approval path and lead times
+### 8. Map the approval path and lead times
 For each source, list who must approve access (data owner, security, privacy, legal, the platform team
 that issues credentials) and their typical turnaround. Start the slowest first and track them as project
 dependencies with owners and dates.
 
-### 8. Write permission tests early
+### 9. Write permission tests early
 Before launch, and ideally in the prototype, test that a user without access to a document cannot
 retrieve, quote or summarise it, including through indirect questions. Use real test identities with
 differing access.
@@ -139,6 +149,8 @@ asks "summarise the indemnity terms in the Acme agreement" and must get no conte
   content for hours or days after the change, until the next full re-index.
 - Naming a team instead of a person as data owner; the symptom is access requests that sit unanswered
   for weeks because nobody feels entitled to approve them.
+- Securing retrieval but not the traces; the symptom is a developer or vendor support engineer able to
+  read restricted document text in the prompt logs of the observability tool.
 - Treating "the data exists" as "the data is usable"; the symptom is a pipeline that connects
   successfully and returns scanned images, empty fields or a schema nobody can explain.
 

@@ -5,7 +5,7 @@ name: GPU sizing (VRAM math)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - model-internals/kv-cache
   - serving-inference/kv-cache-memory-estimation
@@ -107,8 +107,19 @@ block-wise scales, cutting the optimizer term from 8 bytes per parameter to abou
 ### Multi-GPU arithmetic
 Tensor parallelism divides both weights and KV cache by the TP degree, while each card keeps its own
 overhead; the head count must divide evenly (8 KV heads means TP up to 8 without replication).
-Pipeline parallelism divides layers instead and is used when cards lack NVLink. Either way, "fits on
-N cards" means the per-card sum, not the total, is under budget.
+Pipeline parallelism divides layers instead and is used when cards lack NVLink or the model spans
+nodes; each stage holds the KV cache only for its own layers. Either way, "fits on N cards" means the
+per-card sum, not the total, is under budget.
+
+### Mixture-of-experts: size by total, not active, parameters
+An MoE model routes each token through a few experts, so its *compute* per token follows the active
+parameter count while its *memory* follows the total, *because* every expert must be resident for
+whichever token picks it. Mixtral-8x7B has about 46.7B total and 12.9B active parameters: in bf16 it
+needs ~93 GB for weights, like a dense 47B model, even though each token does the arithmetic of a 13B
+one. Its KV cache follows the attention shape (32 layers, 8 KV heads, head_dim 128), so 128 KB per token,
+the same as Llama-3-8B. Bandwidth sits between the two: at batch 1 a decode step reads only the active
+experts, but at serving batch sizes different tokens hit different experts and the step reads close to
+all of them. Size the card by total parameters; estimate latency with the batch you will run.
 
 ### Order of decisions
 Precision first (it halves or quarters the dominant term), then card and count (capacity), then
@@ -164,6 +175,8 @@ plan("70B int4 / 1xH100",      70.6, 80, 8, 128, 80, bytes_w=0.55)            # 
   step after the forward pass succeeded, because Adam state is allocated lazily.
 - Dividing total memory across cards instead of checking per-card budgets with TP; symptom is one
   rank OOMing while the others wait on NCCL.
+- Sizing an MoE model by its active parameter count; symptom is an OOM at weight load on a card the
+  "13B-class" label said was ample.
 - Treating int4 as "half of fp16"; symptom is a card that fits the weights but throughput below the
   fp16 figure because dequantisation dominates at the batch sizes used.
 

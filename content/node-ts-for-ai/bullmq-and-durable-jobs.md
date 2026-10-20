@@ -4,8 +4,8 @@ module: node-ts-for-ai
 name: BullMQ & durable jobs
 kind: tool
 difficulty: core
-est_minutes: 15
-status: fact-checked
+est_minutes: 16
+status: reviewed
 related:
   - node-ts-for-ai/redis
   - node-ts-for-ai/graceful-shutdown
@@ -58,11 +58,24 @@ persistence or an LRU eviction policy means lost jobs.
   timestamps. A custom `jobId` deduplicates: adding a job whose id already exists in the queue is a
   no-op while the earlier job is still stored, which is the simplest exactly-once-enqueue tool you have.
   Custom ids must not be plain integers or contain `:` (BullMQ uses it as its key separator and throws
-  on `add`), so use `embed-<docId>`, not `embed:<docId>`.
+  on `add`), so use `embed-<docId>`, not `embed:<docId>`. The dedup window is exactly the job's
+  lifetime in Redis: once `removeOnComplete` deletes the job, the same id can be added again, and while
+  a completed job is still retained, a deliberate re-run with that id is silently ignored. BullMQ 5
+  also offers a `deduplication` option with its own id and TTL when you want that window explicit.
 - **QueueEvents**: a Redis-streams-based listener for `completed`, `failed` and `progress`, so an API
   replica can stream progress to a client without being the worker.
 - **FlowProducer**: adds a parent job with children; the parent runs only after all children complete,
   which models "embed 500 chunks, then write the document summary".
+
+### Job lifecycle
+A job is always in exactly one state, and each state is a Redis structure: `waiting` (a list),
+`prioritized` and `delayed` (sorted sets ordered by priority or due time), `active` (a list plus a
+per-job lock key), `waiting-children` (a parent blocked on its flow), and the terminal `completed` and
+`failed` sets. Every transition (claim, complete, fail and reschedule, promote a delayed job) is one Lua
+script *because* it touches several keys at once, and a crash between "remove from waiting" and "add to
+active" would otherwise lose or duplicate the job. Reading the queue's health is therefore reading the
+sizes of these sets: a growing `waiting` means too few workers or a limiter that is too tight; a growing
+`failed` means a bug or a dependency that is down; a non-empty `active` with nobody working means stalls.
 
 ### Retries, backoff, delays
 `opts.attempts` with `opts.backoff: { type: 'exponential', delay: 1000 }` re-schedules a failed job
@@ -70,7 +83,10 @@ after 1 s, 2 s, 4 s and so on until `attempts` is exhausted, then leaves it in t
 inspection or manual retry. Delayed jobs sit in a sorted set keyed by timestamp and are promoted when
 due *because* polling a list for "is it time yet" would waste Redis round trips. `priority` orders
 waiting jobs; `removeOnComplete` and `removeOnFail` with a count or an age keep Redis from filling with
-history.
+history. Recurring work (nightly evals, hourly re-index) uses a job scheduler
+(`queue.upsertJobScheduler(id, { pattern: cron } or { every: ms }, template)` in recent BullMQ 5
+releases, which supersedes the older repeatable-job API): the scheduler keeps one upcoming delayed job
+per schedule, so running several producer replicas does not multiply the runs.
 
 ### Locks and stalled jobs
 When a worker claims a job it sets a lock with `lockDuration` and renews it on an interval while the
@@ -153,6 +169,7 @@ events.on("progress", ({ jobId, data }) => notifyClient(jobId, data));
 - A processor that blocks the event loop (large synchronous JSON parse, vector math): the symptom is `stalled` events and jobs processed twice because the lock renewal timer could not fire. Move CPU work to a sandboxed processor or a worker thread.
 - Non-idempotent side effects (send email, charge budget, append message) keyed on nothing: the symptom is duplicates after a deploy or a stall, with every attempt logging success.
 - An ioredis connection with `maxRetriesPerRequest` left at its default (20): the symptom is a Worker throwing at construction when handed that instance (BullMQ only warns and overrides it when given plain options), or blocking waits erroring out during a Redis reconnect.
+- Relying on `jobId` for dedup while also using `removeOnComplete`: the symptom is the "duplicate" document being embedded again a few minutes after the first job finished, because the completed job (and its id) had already been deleted.
 - `removeOnComplete` left off in a high-volume queue: the symptom is Redis memory growing until eviction or out-of-memory, weeks after launch.
 - Treating `queue.add` as part of a database transaction: the symptom is jobs for rows that rolled back, or committed rows with no job; use an outbox table and a relay worker.
 - Exiting with `process.exit()` instead of `await worker.close()`: the symptom is active jobs re-run after every deploy once the stall checker catches them.

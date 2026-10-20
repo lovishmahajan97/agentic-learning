@@ -4,7 +4,8 @@ module: security-governance-compliance
 name: AI risk management
 kind: practice
 difficulty: core
-est_minutes: 16
+est_minutes: 17
+status: reviewed
 related:
   - security-governance-compliance/ai-inventory-and-use-case-risk-classification
   - security-governance-compliance/threat-modeling
@@ -59,7 +60,11 @@ The AI RMF organizes the work into four functions:
 - **Manage**: prioritize, treat (mitigate, transfer, avoid or accept), monitor, and respond to incidents.
 
 NIST's Generative AI Profile extends this with risks specific to generative systems, such as
-confabulation, harmful content, information integrity and data privacy.
+confabulation, harmful content, information integrity and data privacy. ISO/IEC 23894 takes the other
+route: it adapts the generic ISO 31000 process (establish context, identify, analyse, evaluate, treat,
+monitor and review, communicate) to AI. The two map onto each other closely, and either gives an auditor a
+recognizable structure; the EU AI Act's risk management system for high-risk systems asks for the same
+loop, run across the system's whole lifecycle.
 
 ### The risk register
 The working artifact is a register per system (rolled up across the portfolio). Each entry has:
@@ -74,6 +79,15 @@ The working artifact is a register per system (rolled up across the portfolio). 
 6. **Key risk indicators**: live metrics that warn the risk is materializing (groundedness rate, override
    rate, injection detections, complaint volume).
 7. **Review trigger and date**.
+
+### Why likelihood × impact needs a guard rail
+The product of two ordinal 1–5 scales is convenient but lossy. A near-certain nuisance (5 × 1) and a rare
+catastrophe (1 × 5) both score 5, yet no one would treat them alike, and the gaps between ratings are not
+real distances. So most mature registers add rules on top of the score: any risk with maximum impact
+(serious harm to people, regulatory breach) needs a named owner's sign-off regardless of its product, and
+likelihood is anchored to observable frequencies ("more than once a month in comparable systems")
+rather than adjectives. Appetite is also usually stated per category, because an organization may accept
+moderate reliability risk while accepting almost no privacy or safety risk.
 
 ### Treatment options
 Mitigate (guardrails, human review, evaluation gates), transfer (contract terms, insurance, vendor
@@ -91,7 +105,8 @@ A customer-support assistant with retrieval and a refund tool. Scores use a 1 to
 illustrative judgements, not measurements.
 
 ```python
-APPETITE = 8   # residual scores above this need treatment or formal acceptance
+APPETITE = 8      # residual scores above this need treatment or formal acceptance
+IMPACT_FLOOR = 5  # any residual impact this high needs named sign-off, whatever the product
 
 register = [
     # risk, inherent (likelihood, impact), controls, residual (likelihood, impact), KRI
@@ -103,18 +118,25 @@ register = [
      ["zero-retention contract terms", "PII redaction"], (2, 4), "redaction misses in samples"),
     ("Provider model update changes tone and refusals", (3, 2),
      ["pinned model version", "regression suite on upgrade"], (2, 2), "eval score delta"),
+    ("Refund paid to the wrong customer after an ID mix-up", (2, 5),
+     ["account ID must match authenticated session"], (1, 5), "refund-to-session mismatch count"),
 ]
 
 for risk, (li, ii), controls, (lr, ir), kri in register:
     inherent, residual = li * ii, lr * ir
-    status = "OK" if residual <= APPETITE else "TREAT OR ACCEPT"
+    status = ("TREAT OR ACCEPT" if residual > APPETITE
+              else "OWNER SIGN-OFF" if ir >= IMPACT_FLOOR else "OK")
     print(f"{inherent:>2} -> {residual:>2}  {status:<15} {risk}  [KRI: {kri}]")
 ```
 
 The PII risk lands exactly at the appetite line with residual 8, which prompts the useful conversation:
 is redaction measured (the KRI) and good enough, or should the team avoid sending free-text history at all?
-The injection risk shows the value of avoidance-style controls: requiring human approval for refunds cuts
-impact more than any detector could.
+The wrong-customer refund scores only 5, below the stale-policy and PII risks, yet it is the one
+the floor rule escalates: a residual impact of 5 means real money to the wrong person, and a low product
+should not let it slip past an accountable owner. The injection risk shows the value of
+capability-limiting controls: with human approval on refunds, a
+successful injection can at most *propose* a refund, so the likelihood that harm completes drops far more
+than any detector could achieve against an adaptive attacker.
 
 ## Trade-offs
 - Quantified likelihood-impact scoring makes risks comparable and prioritizable, but scores are judgement

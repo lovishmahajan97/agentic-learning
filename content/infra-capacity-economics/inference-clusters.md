@@ -5,7 +5,7 @@ name: Inference clusters
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - infra-capacity-economics/gpu-infrastructure
   - infra-capacity-economics/ray-kuberay
@@ -111,6 +111,21 @@ have the right card, because a 70B replica scheduled onto an L4 node simply fail
 replicas of a pool across nodes and zones limits blast radius from a node failure; packing them
 raises the chance that a single node loss removes a whole pool. Both are deliberate choices.
 
+### Admission control, failure and rollout
+When every replica in a pool is at its concurrency cap, something must say no, and it should be the
+gateway, not the engine. Engines queue internally without bound by default, so an overloaded pool
+looks like slowly rising TTFT until clients time out and retry, which adds load. A gateway that
+bounds the wait (reject with 429 and a `Retry-After` once the expected queue time exceeds the TTFT
+budget, or shed low-priority traffic first) turns overload into a fast, explicit signal *because*
+a request that will miss its deadline is cheaper to refuse than to serve late.
+
+Rollouts are a capacity event. A rolling update of a pool sized with no spare removes one replica
+per step, and the new replica arrives with a cold prefix cache, so the pool is both smaller and
+slower until it warms. That is why the N+1 spare doubles as rollout surge capacity, and why a model
+*version* change (new weights, new behaviour) is usually done blue/green as a separate pool with
+traffic shifted by weight, so that rollback is a routing change rather than a redeploy that has to
+pull tens of GB of weights again.
+
 ## Example
 Sizing a pool and routing inside it. The capacity numbers are illustrative placeholders you would
 replace with your own load-test results.
@@ -148,6 +163,9 @@ def route(prompt: str, prefix_chars: int = 2048) -> Replica:
         raise RuntimeError("pool saturated: shed or queue at the gateway")
     best = min(cands, key=lambda r: r.running); best.running += 1
     return best
+
+def finished(r: Replica):             # call when the stream ends, or slots leak and the pool "fills"
+    r.running -= 1
 ```
 
 The sizing function makes the two hidden assumptions explicit: a replica's capacity is the

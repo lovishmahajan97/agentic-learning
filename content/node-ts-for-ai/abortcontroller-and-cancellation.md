@@ -5,7 +5,7 @@ name: AbortController & cancellation
 kind: concept
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - node-ts-for-ai/promises-and-async-error-propagation
   - node-ts-for-ai/streams-and-backpressure
@@ -74,7 +74,12 @@ when the client disconnects *or* after 30 s *or* when the parent agent step is c
 Three idioms cover nearly everything:
 
 1. **Check at loop boundaries**: `signal.throwIfAborted()` at the top of each iteration of an agent
-   loop or chunk-processing loop, so a long computation stops at the next safe point.
+   loop or chunk-processing loop, so a long computation stops at the next safe point. This only works
+   if the loop *yields* between iterations (an `await` on real I/O, or `setImmediate`). `abort()` is
+   itself called from a callback — the socket `'close'` handler, the timeout's timer — and no callback
+   can run while a synchronous loop holds the thread, so a loop that never awaits sees
+   `signal.aborted === false` until it finishes. CPU-bound work that must be cancellable either yields
+   in slices or runs in a worker that can be terminated.
 2. **Subscribe for cleanup**: `signal.addEventListener('abort', () => conn.release(), { once: true })`
    when you hold a resource with no signal-aware API. Remove the listener when the work finishes
    normally, otherwise a long-lived signal accumulates listeners for every call made with it and leaks.
@@ -89,6 +94,15 @@ an `AbortError`-named `DOMException`: `fetch` and streams reject with whatever r
 be retried, a client disconnect must not be, and a timeout may be retried against a different provider.
 Code that treats every rejection as a failure will retry cancelled calls and bill tokens for a user
 who already left. Check `signal.aborted` (or `error.name`) before classifying.
+
+### Deadlines across hops
+A timeout is really a *deadline*: the request must finish by time T. When a handler calls a tool
+service that calls a model, each hop should get the time remaining, not its own fresh 30 s, or the
+inner call keeps working (and billing) after the outer caller has already given up. Compute
+`remaining = deadline - Date.now()` at each hop, create `AbortSignal.timeout(remaining - margin)`
+combined with the parent signal, and pass the deadline to downstream services explicitly (a header
+or a field such as gRPC's deadline), because a signal does not cross a process boundary — only the
+closed connection does.
 
 ### Where the request-level controller comes from
 In an HTTP server, the root signal comes from the connection: `res.on('close')` (or the framework's
@@ -181,6 +195,9 @@ void sleep;                                                  // sleep(ms, undefi
   `ERR_STREAM_PREMATURE_CLOSE` errors reported as failures rather than expected cancellations.
 - Forgetting that `AbortSignal.timeout` starts counting at creation; the symptom is a timeout that
   fires early because the signal was created long before the request it guards.
+- Checking `throwIfAborted()` inside a synchronous loop that never awaits; the symptom is cancellation
+  that "works" in tests with I/O but does nothing for a CPU-heavy step, which runs to completion after
+  the client has left.
 
 ## When to use
 Create one controller per inbound request and pass its signal into every model call, tool call,

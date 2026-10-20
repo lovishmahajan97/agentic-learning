@@ -5,6 +5,7 @@ name: Hypercare
 kind: practice
 difficulty: core
 est_minutes: 13
+status: reviewed
 related:
   - deployment/runbooks
   - deployment/deployment-readiness-reviews
@@ -48,7 +49,10 @@ Hypercare is agreed in the readiness review: its duration, staffing, hours of co
 what counts as an incident versus a request, and the exit criteria. A duration of a few weeks is common,
 scaled to risk and user count; it is a planning choice, not a standard. Planning it in advance matters
 *because* the customer's support organisation, the vendor team and the sponsor all need to know who
-answers what before the first problem arrives.
+answers what before the first problem arrives. The plan also fixes the mechanics: a single intake channel
+so issues are not scattered across email and chat, severity definitions with an agreed response time for
+each, coverage hours that match when users actually work (including other time zones), and who on each
+side is reachable out of hours for a severity-1.
 
 ### Heightened monitoring
 Dashboards and alert thresholds are tightened for the period, and someone actively watches them rather
@@ -73,9 +77,17 @@ and every real failure becomes a new regression case, *because* a prompt change 
 complaint can quietly break a case UAT had already accepted. Fixes ship through the same rollout criteria,
 with shorter stages, not around them.
 
+The complement of fast fixes is a freeze on everything else. Unrelated changes (a model upgrade, a new
+feature, an index rebuild for another team) wait until hypercare ends, *because* the feedback signals are
+already noisy and two changes shipped in the same week make it impossible to say which one moved the
+thumbs-down rate. Batching fixes into one or two predictable releases a week, each with a written note of
+what changed, keeps every movement in the metrics attributable.
+
 ### Exit criteria and handoff
 Hypercare ends when written criteria hold for a sustained period, for example: no open severity-1 or
-severity-2 issues; incident and ticket volume stable or falling over consecutive weeks; quality metrics
+severity-2 issues; incident and ticket volume stable or falling over consecutive weeks, normalised by
+active users (because volume also falls when people stop using the system) and read alongside usage
+retention; quality metrics
 at or above the UAT baseline on real traffic; the customer's support team has resolved issues using the
 runbooks without escalating; and the known-issues list and backlog are handed over with owners. The
 handoff is explicit: a meeting, a signed-off document and a named date when the support model changes.
@@ -92,11 +104,13 @@ indexed content), 5 training, 2 change requests. Thumbs-down rate 11%. The team 
 HR content owner uploads the missing policy, and the 14 quality failures become regression cases; a
 retrieval fix passes the suite and ships behind a flag.
 
-**Week 2.** 2,600 users, 18 issues, thumbs-down 7%, service desk resolves 65% unaided. One sev-2: a prompt
-change improved answer tone but dropped citations on long answers, caught by the regression suite in
-staging and never shipped.
+**Week 2.** 2,600 users, 18 issues, thumbs-down 7%, service desk resolves 65% unaided. One near miss: a
+prompt change improved answer tone but dropped citations on long answers; the regression suite caught it
+in staging, so it never shipped and never became a production incident.
 
-**Week 3.** 2,900 users, 9 issues, thumbs-down 5.8%, service desk at 78%. Volume is below 10 but only for
+**Week 3.** 2,900 users, 9 issues, thumbs-down 5.8%, service desk at 78%. Per active user, issues fell
+from about 2.2 per 100 users in week 1 to about 0.3, while the user count kept rising, so the drop is
+real improvement rather than people giving up. Volume is below 10 but only for
 one week and desk resolution is below 80%, so exit criteria are not met. Rather than letting hypercare
 drift on, the team extends it by one week with a single focus: a runbook session with the service desk
 on the three ticket types they still escalate. Week 4 meets all criteria and support is handed over.
@@ -160,7 +174,7 @@ incident counts alone would hide the real failure.
 > Hypercare is bounded by criteria, not the calendar or staffing. A single quiet week can be noise or
 > reflect falling usage, and calendar-based exits hand over a system the customer cannot yet run.
 
-### Q: Users report that the assistant cannot answer questions about one country's leave policy. The documents were never ingested. How should this be classified in triage?
+### Q: Users report that the assistant cannot answer questions about one country's leave policy. The ingestion pipeline works, but the customer's HR team never supplied that policy for indexing. How should this be classified in triage?
 - [ ] As a model quality defect needing prompt changes
 - [ ] As a user training issue
 - [x] As a knowledge gap owned by the customer's content owners

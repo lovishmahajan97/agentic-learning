@@ -5,7 +5,7 @@ name: Structured logging
 kind: practice
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - fastapi-for-ai/middleware-ordering
   - fastapi-for-ai/opentelemetry-instrumentation
@@ -64,6 +64,14 @@ structured fields, then render JSON. Configure the standard library `logging` to
 `merge_contextvars` in its pre-chain) so third-party loggers (httpx, SQLAlchemy, Uvicorn errors) come out as JSON with the same fields rather
 than as stray plain-text lines.
 
+### Where context does not follow
+Context is copied into new asyncio tasks and into `asyncio.to_thread` and Starlette's `run_in_threadpool`,
+so most FastAPI code paths inherit the request's fields. It is *not* copied by `loop.run_in_executor` or a
+raw `ThreadPoolExecutor.submit`, and it obviously does not cross into a job queue worker, so a Celery or
+ARQ job must receive `request_id` in its payload and bind it on arrival. Also remember that stdlib handlers
+write synchronously: at high volume a slow sink stalls the event loop, which is why busy services put a
+`QueueHandler` in front so the actual I/O happens on a listener thread.
+
 ### What to log for LLM calls
 One event per model call with: model and provider, prompt template id and version, input and output
 tokens, latency and time to first token, finish reason, retry count, cache hit, and the error class on
@@ -101,28 +109,34 @@ async def bind_request_context(request: Request, call_next):
     rid = request.headers.get("x-request-id") or uuid.uuid4().hex
     structlog.contextvars.bind_contextvars(request_id=rid,
                                            tenant=request.headers.get("x-tenant", "unknown"))
-    start = time.perf_counter()
-    response = await call_next(request)
-    route = request.scope.get("route")
-    log.info("request_finished", status=response.status_code,
-             route=getattr(route, "path", "unmatched"),
-             duration_ms=round((time.perf_counter() - start) * 1000))
-    response.headers["x-request-id"] = rid
-    return response
+    start, status = time.perf_counter(), 500     # 500 is what the client gets if call_next raises
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        response.headers["x-request-id"] = rid
+        return response
+    except Exception:
+        log.exception("request_failed")            # traceback as a structured field
+        raise
+    finally:
+        route = request.scope.get("route")         # set by the router during call_next
+        log.info("request_finished", status=status, route=getattr(route, "path", "unmatched"),
+                 duration_ms=round((time.perf_counter() - start) * 1000))
 
 @app.post("/v1/chat")
 async def chat(body: dict):
-    t0 = time.perf_counter()
     usage = {"prompt_tokens": 812, "completion_tokens": 240}       # from the provider response
     log.info("llm_call_finished", model="model-a", prompt_version="support-v14",
-             finish_reason="stop", latency_ms=round((time.perf_counter() - t0) * 1000),
-             prompt_chars=sum(len(m.get("content", "")) for m in body.get("messages", [])), **usage)
+             finish_reason="stop", latency_ms=2310, **usage,      # measured around the real call
+             prompt_chars=sum(len(m.get("content", "")) for m in body.get("messages", [])))
     return {"content": "..."}
 ```
 
 One request yields lines like
 `{"request_id": "9f2c...", "tenant": "acme", "model": "model-a", "prompt_tokens": 812, "event": "llm_call_finished", ...}`.
 A query grouping `llm_call_finished` by `tenant` and summing tokens is now a one-liner in any log platform.
+The `try/finally` matters: without it, a handler that raises skips the `request_finished` line, so the
+requests you most need to see (the 500s) are exactly the ones missing from the logs.
 For a `StreamingResponse`, `request_finished` fires when headers are sent, so log stream completion and
 token counts from inside the generator instead.
 
@@ -145,6 +159,8 @@ token counts from inside the generator instead.
   carrying the previous request's `request_id` or tenant, which misattributes incidents and costs.
 - Logging full prompts by default; the symptom is personal data or API keys showing up in a log search
   months later, outside any retention or access policy.
+- Offloading work with `run_in_executor` or a background job without carrying context; the symptom is
+  log lines from that work with no `request_id` or tenant, so they cannot be joined to the request.
 - Logging the route's raw path instead of its template; the symptom is per-path aggregations with one row
   per document id and a log index that grows without bound.
 

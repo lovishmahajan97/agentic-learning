@@ -5,7 +5,7 @@ name: Streams & backpressure
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - node-ts-for-ai/abortcontroller-and-cancellation
   - node-ts-for-ai/event-loop-and-microtask-queue
@@ -40,9 +40,13 @@ down.
 Streaming alone is not enough, though, because the two ends rarely run at the same speed. A model API
 pushes tokens faster than a phone on a poor connection can acknowledge them; a file reader can produce
 64 KiB chunks far faster than an embedding call can consume them. Without a rule for the mismatch, the
-fast side's output piles up in buffers in your process. For one request that is a few megabytes; for
-a thousand concurrent streams to slow clients it is the whole heap, and the process dies of memory
-pressure while every request looks healthy. The naive fix, "make the consumer faster", does not exist
+fast side's output piles up in buffers in your process. Size it honestly: a chat answer is small (800
+tokens is a few KB of text, perhaps tens of KB once each token is wrapped in an SSE JSON event), so
+for text chat the unbounded buffer is a latent bug more than an outage. Bulk payloads are different.
+Raw 24 kHz 16-bit mono speech is 48,000 bytes per second; a 60-second synthesized answer is about
+2.9 MB, and a thousand stalled mobile clients is about 2.9 GB of heap, and the process dies of memory
+pressure while every request looks healthy. The same arithmetic applies to file downloads, exports and
+proxied uploads. The naive fix, "make the consumer faster", does not exist
 for a network you do not control. Backpressure is the actual fix: the consumer's capacity propagates
 backwards to the producer, which stops reading from its own source until there is room. Node's stream
 abstractions exist to make that propagation automatic, and to make errors and early termination
@@ -56,8 +60,11 @@ propagate along the same path.
 - **Transform** — a Duplex where output is computed from input (gzip, a line splitter, an SSE parser).
 
 Each has an internal buffer bounded by `highWaterMark` (bytes for byte streams, item count in
-`objectMode`). It is a *threshold*, not a hard cap: the stream will accept a write beyond it, but
-reports that it would rather you stopped.
+`objectMode`, where the default is 16 objects; the byte default is tens of KiB and was raised in recent
+Node versions, so set it explicitly when it matters). It is a *threshold*, not a hard cap: the stream
+will accept a write beyond it, but reports that it would rather you stopped. Worst-case memory per
+stream is therefore roughly the sum of the `highWaterMark`s along the chain plus one chunk per stage,
+which is what makes per-process memory budgetable: that figure times maximum concurrency.
 
 ### The backpressure protocol
 `writable.write(chunk)` returns `false` when the internal buffer has reached `highWaterMark`. The
@@ -89,7 +96,10 @@ awaits `drain` when needed.
 `fetch` in Node returns `response.body` as a WHATWG `ReadableStream`, the same API as browsers and the
 one many AI SDKs expose. It has the same ideas with different names: a queuing strategy with a
 `highWaterMark`, `pipeThrough(transformStream)`, `pipeTo(writable)` with error and abort propagation,
-and `reader.read()` for manual pulling. `Readable.fromWeb()` and `Readable.toWeb()` convert between the
+and `reader.read()` for manual pulling. Backpressure is pull-based: a `ReadableStream`'s source
+`pull()` is called only while the queue's `desiredSize` (high-water mark minus queued size) is
+positive, and a writer exposes `writer.ready`, a promise that resolves when there is room, as the
+equivalent of waiting for `'drain'`. `Readable.fromWeb()` and `Readable.toWeb()` convert between the
 two worlds, which you need when a provider SDK hands you a Web stream and your HTTP framework wants a
 Node stream (or the reverse). Both kinds are async-iterable, so `for await` works on either.
 
@@ -115,6 +125,7 @@ vendor-specific.
 import { Transform, Readable, type TransformCallback } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { StringDecoder } from "node:string_decoder";
+import type { ReadableStream as WebStream } from "node:stream/web";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 class SseToNdjson extends Transform {
@@ -136,6 +147,10 @@ class SseToNdjson extends Transform {
     } catch (e) { return cb(e as Error); }  // report parse errors to pipeline instead of throwing
     cb();                                    // Transform waits for the reader before the next chunk
   }
+  override _flush(cb: TransformCallback) {  // upstream ended: anything left is an incomplete event
+    this.buf += this.dec.end();
+    cb(this.buf.trim() ? new Error("stream ended mid-event") : null);
+  }
 }
 
 export async function proxy(req: IncomingMessage, res: ServerResponse) {
@@ -147,7 +162,8 @@ export async function proxy(req: IncomingMessage, res: ServerResponse) {
   if (!upstream.ok || !upstream.body) { res.statusCode = 502; return res.end(); }
   res.writeHead(200, { "content-type": "application/x-ndjson", "x-accel-buffering": "no" });
   try {
-    await pipeline(Readable.fromWeb(upstream.body as any), new SseToNdjson(), res, { signal: ac.signal });
+    const body = upstream.body as unknown as WebStream<Uint8Array>; // DOM vs node:stream/web typing only
+    await pipeline(Readable.fromWeb(body), new SseToNdjson(), res, { signal: ac.signal });
   } catch (e) {
     if (!ac.signal.aborted) console.error("stream failed", e);   // disconnect is normal
   }
@@ -159,8 +175,9 @@ export async function proxy(req: IncomingMessage, res: ServerResponse) {
   moderate the complete output before the user sees it; add a trailing check or stream through a
   guard stage when the use case demands it.
 - Backpressure protects memory, but it also means a slow client slows the upstream read, holding a
-  provider connection open longer; for very slow clients a bounded buffer plus disconnect may be better
-  than perfect flow control.
+  provider connection open longer; when the whole response is small (a text chat answer of tens of KB),
+  draining upstream promptly into a bounded per-stream buffer and disconnecting clients that exceed it
+  is often better than perfect flow control. For audio and files, strict backpressure wins.
 - `objectMode` streams of parsed events are convenient and let the `highWaterMark` count events, but
   each object is a heap allocation; for bulk byte processing stay in `Buffer` mode.
 - Web Streams are portable across runtimes (Node, browsers, edge) and match the AI SDK surfaces, while
@@ -206,18 +223,22 @@ means, why `pipeline` beats `pipe`, and how a slow browser ends up throttling a 
   or compression layer, and explains why their memory alerts correlate with slow mobile clients.
 
 ## Check yourself
-**Q:** A chat gateway's memory climbs steadily during peak hours and the process is eventually killed.
-Model latency is normal and request counts are flat. Walk through how streams could cause this and how
-you would prove and fix it.
+**Q:** A voice assistant gateway streams synthesized speech (raw 24 kHz 16-bit PCM) from a TTS provider
+to mobile clients. Memory climbs steadily during the evening commute and the process is eventually
+killed. Provider latency is normal and request counts are flat. Walk through how streams could cause
+this and how you would prove and fix it.
 **A:** The likely cause is missing backpressure between the provider stream and slow clients: the
-handler reads tokens as fast as the provider sends them and writes them to each response, ignoring
+handler reads audio as fast as the provider sends it and writes it to each response, ignoring
 `write()` returning `false`, so bytes for slow connections accumulate in the response's internal buffer.
-Memory then scales with the number of slow clients, not with request count. Prove it with a heap
+At 48 KB per second of audio, a minute-long answer to a client on a stalled cellular link buffers about
+2.9 MB, so memory scales with the number of slow clients (commuters in tunnels), not with request
+count. The same bug in a text chat gateway would barely show, because the whole answer is tens of KB;
+that is why it survived testing. Prove it with a heap
 snapshot showing large `Writable` buffers, or by correlating memory with the count of long-lived
 responses. Fix by replacing manual wiring with `pipeline` (or `pipeTo`), which pauses the upstream read
 when the response buffer is full, and by aborting the upstream request on client `'close'` so abandoned
-streams stop consuming memory and tokens. Add a per-stream buffered-bytes metric so a regression is
-visible.
+streams stop consuming memory and tokens. Add a per-stream buffered-bytes metric (`res.writableLength`
+sampled across open responses) so a regression is visible.
 
 ## Quiz
 ### Q: What does `writable.write(chunk)` returning `false` mean?

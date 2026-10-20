@@ -5,7 +5,7 @@ name: Hugging Face (transformers, datasets, tokenizers, accelerate, PEFT, TRL)
 kind: tool
 difficulty: core
 est_minutes: 22
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/pytorch
   - python-for-ai/safetensors
@@ -38,8 +38,10 @@ generated garbage with no error.
 
 Training adds a second layer of glue. Datasets of tens of gigabytes do not fit in RAM as Python lists;
 multi-GPU training needs process launching, gradient synchronisation and mixed precision; full fine-tuning
-of a 7B model needs memory for weights, gradients and optimizer states (with AdamW that is several times
-the weights alone), which rules out most single GPUs. And preference tuning (DPO, PPO-style RLHF) needs
+of a 7B model needs memory for weights, gradients and optimizer states. In the usual mixed-precision
+AdamW accounting that is about 16 bytes per parameter (bf16 weights and gradients, plus fp32 master
+weights and two fp32 moment estimates), so roughly 112 GB for 7B before a single activation is stored,
+more than an 80 GB GPU holds. And preference tuning (DPO, PPO-style RLHF) needs
 paired data handling, a frozen reference model and specific loss functions that are easy to get subtly
 wrong.
 
@@ -59,12 +61,24 @@ accepted as a deprecated alias) selects precision at load time, for example `tor
 use the dtype stored in the checkpoint, so you do not materialise an fp32 copy first. `generate()` implements the decoding loop with the KV cache, sampling
 and stopping criteria. `pipeline()` wraps tokenise-model-decode for quick experiments.
 
+### The Hub and the local cache
+Every `from_pretrained` call resolves a repository name plus a `revision` (branch, tag or commit hash)
+to files, downloads them once into a content-addressed cache (under `HF_HOME`), and reuses them after.
+Pinning `revision` to a commit hash is what makes a load reproducible, because a branch such as `main`
+can be rewritten by the repository owner. Setting `HF_HUB_OFFLINE=1` makes loads resolve only from the
+cache, which is how air-gapped deployments work once the cache has been pre-populated.
+
 ### tokenizers
 The fast tokenizers are written in Rust and exposed to Python, because tokenising a large corpus in pure
 Python is a bottleneck. `AutoTokenizer` loads the vocabulary and merges for that exact model, returns
 offsets for span alignment, and provides `apply_chat_template`, which renders a list of messages into the
 model's expected prompt format, using the Jinja template stored with the tokenizer. Using it, rather than
-hand-concatenating `"User: ...\nAssistant:"`, is what keeps a chat model on-distribution.
+hand-concatenating `"User: ...\nAssistant:"`, is what keeps a chat model on-distribution. The same
+library also trains new tokenizers (BPE, WordPiece or Unigram) from a corpus, which matters only when
+you pre-train or adapt a vocabulary; for fine-tuning you always reuse the base model's tokenizer.
+For batched generation with decoder-only models, pad on the left (`padding_side="left"`), because
+generation appends to the right end of each row and right padding would put pad tokens between the
+prompt and the new tokens.
 
 ### datasets
 `load_dataset` stores data as Apache Arrow files on disk and memory-maps them, so a 50 GB dataset costs
@@ -81,14 +95,23 @@ topology.
 ### PEFT
 PEFT freezes the base model and injects small trainable modules. With LoRA, a frozen weight `W` gets an
 update `ΔW = B·A`, where `A` is r×k and `B` is d×r with rank r much smaller than d or k, so trainable
-parameters drop from d·k to r·(d+k) per adapted matrix. Optimizer state shrinks proportionally, the
-saved adapter is megabytes instead of gigabytes, and one base model can serve many adapters. QLoRA
+parameters drop from d·k to r·(d+k) per adapted matrix. The forward pass computes
+`h = W·x + (α/r)·B·A·x`; `B` starts at zero, so at step 0 the adapted model is exactly the base model and
+training begins from known-good behaviour, and the `α/r` scale keeps the update's magnitude roughly
+stable when you change r. Optimizer state shrinks proportionally, the saved adapter is megabytes instead
+of gigabytes, and one base model can serve many adapters. For deployment you either merge,
+`W' = W + (α/r)·B·A`, which removes any extra inference cost but fixes one adapter into the weights, or
+keep adapters separate so a server can swap them per request. LoRA is one of several PEFT methods
+(prompt/prefix tuning and IA³ are others), but it is the default because it adds no inference latency
+once merged. QLoRA
 combines this with a 4-bit quantized frozen base (via bitsandbytes) to fit larger models on one GPU.
 
 ### TRL
 TRL provides trainers built on the `transformers` Trainer: `SFTTrainer` for supervised fine-tuning on
 chat or instruction data (applying the chat template and, optionally, computing loss only on assistant
-tokens), `DPOTrainer` for preference pairs, and trainers for reward modelling and online RL methods such
+tokens), `DPOTrainer` for preference pairs (it needs a frozen reference model to measure how far the
+policy has moved; with a PEFT adapter, TRL can use the base model with the adapter disabled as that
+reference instead of loading a second copy), and trainers for reward modelling and online RL methods such
 as PPO and GRPO. They accept a `peft_config`, so adapters and preference tuning compose. TRL's API has
 changed frequently across releases, so pin the version and read the docs for the one you install.
 
@@ -126,7 +149,11 @@ trainer.save_model()   # writes only adapter weights (adapter_model.safetensors)
 ```
 
 Parameter arithmetic for one 4096×4096 projection with r=16: full update is 16.8M parameters; LoRA
-trains 16×(4096+4096) = 131,072, under 1% of that matrix.
+trains 16×(4096+4096) = 131,072, under 1% of that matrix, and with α=32 the learned update is scaled by
+α/r = 2. The effective batch is per-device batch × accumulation steps × number of GPUs, so the same
+config on 4 GPUs trains with batch 64, which is why learning rates must be revisited when the topology
+changes. `trainer.save_model()` writes megabytes of adapter weights; to serve without PEFT at runtime,
+load the base, attach the adapter and call `merge_and_unload()`.
 
 ## Trade-offs
 - `from_pretrained` by name gives instant access to thousands of models, but it fetches weights at
@@ -151,6 +178,9 @@ trains 16×(4096+4096) = 131,072, under 1% of that matrix.
   time; the symptom may be nothing visible at all, which is the danger.
 - Unpinned library versions: TRL or transformers upgrades rename arguments or change defaults, and a
   training script that worked last month fails or silently trains differently.
+- Right-padding batched prompts for a decoder-only model in `generate()`: outputs for shorter prompts
+  are degraded or nonsensical, and transformers warns that right-padding was detected; set
+  `tokenizer.padding_side = "left"` for generation.
 - Mismatched tokenizer and model (for example after adding special tokens without resizing embeddings):
   index errors on new token ids, or generations that never emit the end-of-turn token.
 

@@ -5,7 +5,7 @@ name: LiteLLM
 kind: tool
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/openai-sdk
   - python-for-ai/anthropic-sdk
@@ -53,6 +53,18 @@ translates the response back into an OpenAI-format object: `choices[0].message`,
 support raise an error by default; `drop_params=True` silently drops them instead, which is convenient
 and dangerous in equal measure.
 
+### What translation actually does
+Take one OpenAI-format request sent to `anthropic/...`. The `system` message is pulled out of `messages`
+into Anthropic's top-level `system` field; a `max_tokens` value is supplied if you omitted one, because
+Anthropic requires it; each OpenAI `tools[].function` becomes a `name`/`description`/`input_schema`
+tool; an assistant message's `tool_calls` become `tool_use` blocks, and each `role: "tool"` message
+becomes a `tool_result` block inside a user message. On the way back, `tool_use` blocks become
+`tool_calls` with `arguments` re-serialised as a JSON string, `stop_reason` maps to `finish_reason`
+(`end_turn` to `stop`, `tool_use` to `tool_calls`, `max_tokens` to `length`), and `input_tokens` /
+`output_tokens` become `prompt_tokens` / `completion_tokens`. Every one of these mappings is a place where
+a provider feature with no OpenAI equivalent (thinking blocks, cache breakpoints, citations) has to be
+carried in an extra field or is lost, which is why translation fidelity is the thing to test.
+
 ### Errors
 Provider errors are mapped onto OpenAI-style exception types (rate limit, context window exceeded,
 authentication, bad request), so retry and fallback logic can be written once against one hierarchy.
@@ -60,12 +72,20 @@ authentication, bad request), so retry and fallback logic can be written once ag
 ### Router
 `litellm.Router` takes a `model_list` where several deployments can share one logical `model_name`
 (for example two Azure regions plus OpenAI direct). It load-balances across them with a configurable
-strategy, tracks failures and cools down unhealthy deployments, retries with `num_retries`, and applies
-`fallbacks` that map one logical model to others, plus specialised fallbacks such as context-window
-overflow to a longer-context model. Callers ask for the logical name; topology lives in config.
+`routing_strategy` (random `simple-shuffle` by default, or options that prefer the least busy, lowest
+latency or least used deployment), tracks failures and puts a deployment in cooldown once it exceeds
+`allowed_fails` (for `cooldown_time` seconds), retries with `num_retries`, and applies `fallbacks` that
+map one logical model to others, plus specialised `context_window_fallbacks` (overflow to a
+longer-context model) and `content_policy_fallbacks`. Callers ask for the logical name; topology lives
+in config. The order matters: retries happen within the group first, and fallback to another group only
+when the group as a whole has failed, because a different model is a bigger behavioural change than a
+different deployment of the same one.
 
 ### Cost and callbacks
-LiteLLM maintains a model price map and computes per-call cost from usage (`completion_cost`).
+LiteLLM maintains a model price map and computes per-call cost from usage (`completion_cost`), as
+prompt tokens × input price + completion tokens × output price, looked up by model name. A custom
+deployment name (an Azure deployment called `my-gpt4o-mini-eu`) is not in that map, so you declare its
+`base_model` in the deployment's `model_info` for the lookup to work.
 Callbacks send each call's inputs, outputs, latency and cost to logging and observability backends.
 
 ### Proxy (gateway) mode
@@ -130,6 +150,11 @@ OpenAI-shaped response.
   accuracy, and support tickets spike with no error in the logs.
 - Unpinned versions of a fast-moving dependency on every LLM call: an upgrade changes defaults or
   pricing data, and the symptom is a behaviour or cost change nobody deployed deliberately.
+- Stacking retry layers: application retries × router `num_retries` × any retries the underlying
+  client performs × each fallback group; the symptom is a single user request turning into a dozen upstream
+  calls during an incident, amplifying the provider's rate limiting. Own retries in exactly one layer.
+- Cost reports showing zero or raising for some deployments: the custom deployment name is not in the
+  price map; declare `base_model` so spend attribution is not silently undercounted.
 - Running the proxy as a single instance: it becomes the single point of failure for every AI feature,
   and one restart takes them all down.
 

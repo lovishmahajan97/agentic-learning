@@ -5,7 +5,7 @@ name: HTTPException handling
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - fastapi-for-ai/middleware-ordering
   - fastapi-for-ai/pydantic-request-response-models
@@ -60,6 +60,14 @@ Starlette builds a middleware stack: `ServerErrorMiddleware` (outermost), then y
 Because `ExceptionMiddleware` sits *inside* your middleware, an `HTTPException` raised from a
 middleware is not converted by those handlers and becomes a 500. Middleware should return responses
 directly.
+
+### Why raise rather than return
+A dependency three levels deep cannot `return` a response to the client; it can only return a value
+to its caller. Raising unwinds the whole stack in one step, which is why auth and quota checks live in
+dependencies that raise. It also lets cleanup see the failure: a `yield` dependency (a DB session, a
+lock) receives the exception at its `yield` and can roll back, whereas a handler that catches the
+error and returns `JSONResponse(status_code=409)` leaves that dependency believing the request
+succeeded, so its commit-on-exit logic runs.
 
 ### fastapi.HTTPException versus Starlette's
 FastAPI's `HTTPException` subclasses Starlette's, and its `detail` may be any JSON-serialisable value,
@@ -132,7 +140,8 @@ async def http_error(req: Request, e: StarletteHTTPException):
 
 @app.exception_handler(RequestValidationError)
 async def invalid(req: Request, e: RequestValidationError):
-    return problem(req, 422, "invalid_request", jsonable_encoder(e.errors()))
+    errs = [{k: v for k, v in err.items() if k != "input"} for err in e.errors()]  # no echoed prompt
+    return problem(req, 422, "invalid_request", jsonable_encoder(errs))
 
 @app.exception_handler(Exception)                   # runs in ServerErrorMiddleware
 async def unhandled(req: Request, e: Exception):
@@ -171,6 +180,9 @@ support can find the trace from the ID. Nothing from the provider's raw error re
   returning the default `{"detail": "Not Found"}` shape while every other error uses your envelope.
 - Raising after a `StreamingResponse` has started. The symptom is clients receiving a 200 with a
   truncated answer and no error, which surfaces as "the bot just stops mid-sentence".
+- Returning Pydantic's raw validation errors on a prompt endpoint. Pydantic v2 errors carry the
+  offending `input`, so the symptom is 422 bodies that echo a 100k-token prompt (or a pasted secret)
+  back to the client and into any logging proxy. Keep `loc`, `msg` and `type`, drop or truncate `input`.
 - Mapping every upstream failure to 500. The symptom is client SDKs that never retry transient
   provider outages, or retry permanent errors forever, because the codes carry no meaning.
 

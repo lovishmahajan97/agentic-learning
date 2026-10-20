@@ -5,7 +5,7 @@ name: UploadFile
 kind: tool
 difficulty: intro
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - fastapi-for-ai/request-size-limits-and-upload-security
   - fastapi-for-ai/backgroundtasks
@@ -57,6 +57,15 @@ FastAPI raises an error at startup that names it if it is missing.
 - `await read(n)`, `await write(data)`, `await seek(offset)` and `await close()` are async wrappers
   that run the underlying sync file operation in a thread pool when the data is on disk. That way a
   disk read never blocks the event loop.
+
+### async def or def
+The choice of handler type decides which API is safe. In an `async def` handler, use the awaited
+methods; touching `file.file` directly does blocking disk I/O on the event loop. In a plain `def`
+handler, FastAPI already runs your code in a thread pool, so the sync object is the natural tool and
+`shutil.copyfileobj(upload.file, dest)` copies a spooled file to its destination in bounded-size
+chunks without any `await`. A `def` handler is often the simpler choice when everything it does with
+the file (hashing, local copies, a sync storage SDK) is blocking anyway; the cost is one thread-pool
+slot per in-flight upload, and that pool is small by default.
 
 ### When the bytes arrive
 The whole multipart body is parsed **before** your handler runs. By the time your code sees
@@ -122,9 +131,14 @@ async def transcribe(audio: UploadFile, meta: str = Form("{}")):
             "original_name": audio.filename}
 ```
 
-A client sends it with `curl -F "audio=@call.m4a;type=audio/mp4" -F 'meta={"language":"de"}'`. A
-150 MiB recording is spooled to temp disk by the parser, then copied in 150 one-MiB reads, so the
-handler's memory stays around a megabyte. The SHA-256 lets you deduplicate repeat uploads. The real
+A client sends it with `curl -F "audio=@call.m4a;type=audio/mp4" -F 'meta={"language":"de"}'`. Follow
+the bytes of a 150 MiB recording. While the request is still arriving, Starlette's parser writes the
+part into a `SpooledTemporaryFile`; after the first 1 MiB it rolls over to a file in the temp
+directory, so peak memory for the part stays around a megabyte while 150 MiB lands on temp disk. Only
+then does the handler start. It copies the file in 150 one-MiB reads, so its own memory also stays
+around a megabyte, but the upload has now been written to disk twice (temp file and destination),
+which is the cost a presigned direct upload avoids. With `bytes = File()` instead, the same request
+would hold all 150 MiB in a single `bytes` object for the life of the handler. The SHA-256 lets you deduplicate repeat uploads. The real
 file write uses a sync `open`, which in production should be async object-storage I/O or run in a
 thread.
 

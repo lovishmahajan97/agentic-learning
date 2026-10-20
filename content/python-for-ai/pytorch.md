@@ -5,7 +5,7 @@ name: PyTorch (tensors, autograd, nn.Module, DataLoader, device)
 kind: tool
 difficulty: core
 est_minutes: 20
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/numpy
   - python-for-ai/hugging-face
@@ -66,6 +66,25 @@ gradient accumulation across micro-batches work for free, and it is why you must
 activations is the main memory cost of training; `torch.no_grad()` (or `torch.inference_mode()`) stops
 recording entirely, which is why inference should run inside it: no activations are saved for a backward
 pass that will never happen.
+
+Mechanically, backward never builds a full Jacobian. Starting from d(loss)/d(loss) = 1, each node
+receives the gradient of the loss with respect to its output, multiplies it by its local derivative
+(a vector-Jacobian product) and hands the result to its inputs. That is why the cost is a small multiple
+of the forward pass, and why `backward()` with no argument only works on a scalar: for a vector output
+you must supply the vector to multiply by. Three lines make it concrete:
+
+```python
+w = torch.tensor(3.0, requires_grad=True)
+y = 2 * w**2; y.backward(); print(w.grad)   # tensor(12.)  since dy/dw = 4w
+y = 2 * w**2; y.backward(); print(w.grad)   # tensor(24.)  accumulated, not replaced
+```
+
+Only leaf tensors (ones you created, such as parameters) keep `.grad`; intermediate gradients are freed
+unless you call `retain_grad()`. `.detach()` returns a tensor that shares storage but is cut from the
+graph, which is how you stop gradients flowing into, say, a frozen target. Because backward reuses the
+inputs each op saved, modifying a saved tensor in place before `backward()` would silently corrupt the
+gradient; autograd keeps a version counter per tensor and raises "modified by an inplace operation"
+instead.
 
 ### nn.Module
 A module is a class whose attributes that are `nn.Parameter`s or other modules get registered
@@ -148,6 +167,12 @@ which forces a sync, so in a real loop you log it every N steps rather than ever
   outputs and validation metrics look noisy and worse than expected.
 - Accumulating `total += loss` instead of `loss.item()`: you keep every step's graph referenced, and the
   symptom is steadily rising GPU memory across an epoch.
+- Creating tensors inside `forward` with `torch.zeros(n)` after moving the model to GPU: the new tensor
+  lands on the CPU, and the symptom is "Expected all tensors to be on the same device"; pass
+  `device=x.device` or use `torch.zeros_like(x)`.
+- Holding a large dataset as Python lists of strings or dicts with many DataLoader workers: reference
+  counting touches every object, so copy-on-write pages get copied into each worker, and the symptom is
+  host RAM growing per worker until the machine OOMs; store data as NumPy arrays or Arrow instead.
 - Timing GPU code without `torch.cuda.synchronize()`: kernels are asynchronous, so measurements look
   impossibly fast and then the cost appears at the next `.item()` or `.cpu()` call.
 

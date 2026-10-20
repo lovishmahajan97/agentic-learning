@@ -5,6 +5,7 @@ name: SCIM provisioning
 kind: concept
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - enterprise-integration/sso-iam-integration
   - enterprise-integration/saml-sso
@@ -51,20 +52,37 @@ A User carries `id` (yours, server-assigned), `externalId` (the IdP's identifier
 A Group carries `displayName` and `members`.
 
 ### The operations
-- `POST /Users` creates. Return 201 with your `id`; return 409 if `userName` already exists, *because* the
-  IdP will then search and link rather than create a duplicate.
+- `POST /Users` creates. Return 201 with your `id`; return 409 (`scimType: uniqueness`) if `userName`
+  already exists, *because* a repeated or retried create must not produce a second account; IdPs normally
+  query by filter first and link to an existing match.
 - `GET /Users?filter=userName eq "ana@acme.com"` lets the IdP look up a user before creating or matching.
   You must support at least the `eq` filter on `userName` and `externalId` that IdPs use.
 - `PATCH /Users/{id}` with a `PatchOp` body of `add`/`replace`/`remove` operations updates attributes.
   Deprovisioning commonly arrives as `replace active=false`, not as `DELETE`, *because* customers want the
   account recoverable and its history retained.
 - `DELETE /Users/{id}` hard-removes; some IdPs send it, often later than deactivation, if at all.
-- `PATCH /Groups/{id}` adds or removes `members`; this is how group-based permissions stay current.
+- `PATCH /Groups/{id}` adds or removes `members`; this is how group-based permissions stay current. The
+  shapes are `{"op":"add","path":"members","value":[{"value":"<user id>"}]}` and
+  `{"op":"remove","path":"members[value eq \"<user id>\"]"}`. Prefer these incremental operations to a
+  `replace` of the whole member list, *because* a 5,000-member group replaced on every change is a
+  5,000-element write each time, and a replace that races with another change can drop members.
+- List and filter responses are a `ListResponse` with `totalResults`, `startIndex` (1-based) and
+  `itemsPerPage`; IdPs page through `/Users` and `/Groups` during an initial sync, so pagination must work
+  before the first big customer turns provisioning on.
 
 ### Authentication and tenancy
 The IdP authenticates with a bearer token (or OAuth client credentials) that you issue per tenant. The
 token, not the request body, determines the tenant, *because* a SCIM endpoint that trusts a tenant field in
 the payload lets one customer's IdP write into another's directory.
+
+### Joining SCIM identities to SSO identities
+SCIM and SSO are two channels describing the same person, and they must land on one account. Agree the join
+key with the customer's admin when configuring provisioning: ideally the same immutable identifier the SSO
+token carries (for example the Entra object ID or the Okta user ID) sent as `externalId` or a mapped
+attribute, so a SCIM-created user and the first SSO login resolve to the same row. Joining on email or
+`userName` works until someone's address changes, and then SCIM updates one account while login creates
+another, *because* the two channels no longer agree on who the person is. If JIT provisioning stays enabled
+alongside SCIM, it must look up by the same key before creating.
 
 ### What deactivation must do
 Setting `active=false` should immediately revoke sessions and API tokens, pause the user's scheduled jobs
@@ -138,14 +156,17 @@ membership patches; the point here is that deactivation is a security event with
   retries a create.
 - Strict parsing of PATCH bodies; the symptom is provisioning working with one IdP and failing with another
   with 400 errors in the IdP's provisioning log.
+- Joining SCIM users to SSO logins by email; the symptom is duplicate accounts for one person after an
+  email change, with permissions on one and history on the other.
 - Forgetting to propagate group removals to retrieval ACL caches; the symptom is a user who changed teams
   still getting answers from the old team's documents.
 
 ## When to use
 Implement SCIM once you sell to organizations with an IAM team, compliance requirements, or more than a few
 dozen users; many enterprise security reviews ask about it explicitly. Pair it with SSO, and make
-deactivation revoke everything. Measure time from IdP change to effect in your app, provisioning error rate
-per tenant and IdP, and the count of active users who have not been seen in the IdP feed. In interviews,
+deactivation revoke everything. Measure time from IdP change to effect in your app (test it end to end with a canary user), provisioning
+error rate per tenant and IdP from your logs and the IdP's provisioning log, accounts with no SCIM link
+(created only by JIT), and the count of active users who have not been seen in the IdP feed. In interviews,
 explaining why SSO alone does not deprovision, and what deactivation must trigger, is the core signal.
 
 ## Role lens
@@ -160,7 +181,9 @@ explaining why SSO alone does not deprovision, and what deactivation must trigge
 **Q:** A customer's security team asks: "If we terminate someone at 9:00, when do they lose access to your AI
 assistant and the documents it indexed?" How do you answer, given SSO and SCIM are both in place?
 **A:** At 9:00 the IdP blocks new sign-ins and sends a SCIM `active=false` on its next provisioning cycle, which
-can be immediate or periodic depending on IdP and configuration. On receipt we revoke all sessions and API
+can be near-immediate or periodic depending on IdP and configuration (Okta pushes on the change event; Entra's
+provisioning service documents incremental cycles on the order of tens of minutes, so state the bound for
+the customer's IdP). On receipt we revoke all sessions and API
 tokens, pause their scheduled agents and invalidate permission caches, so access ends within that delay plus
 seconds. Retrieval filters are evaluated per request against current memberships, so no indexed content is
 reachable afterwards. Their data is retained or deleted per the contract's retention policy. We would verify

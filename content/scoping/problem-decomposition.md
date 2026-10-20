@@ -5,7 +5,7 @@ name: Problem decomposition
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - scoping/workflow-analysis
   - scoping/domain-modeling
@@ -68,6 +68,10 @@ technique choice is the heart of the exercise:
 Push work toward the top of this list wherever it suffices, *because* every probabilistic node needs an
 evaluation set and contributes compounding error.
 
+Stop splitting a node when it has exactly one technique, one owner and an acceptance test you could
+write today. Splitting further adds interfaces without adding testability; a node that still needs two
+techniques, or whose test you cannot state, is not finished.
+
 ### 5. Check coverage and independence
 The sub-problems should cover the goal with no gaps and little overlap (the MECE test from consulting:
 mutually exclusive, collectively exhaustive). Gaps show up as "and then somehow" in the walkthrough;
@@ -78,6 +82,15 @@ Give each probabilistic node a rough expected accuracy, multiply along the chain
 dominates the loss. Add mitigations where they are cheapest: a human review on one node, a deterministic
 validator after an extraction (does the amount equal the sum of line items?), or a confidence threshold
 that routes uncertain cases to a person.
+
+Mitigations change *what* you multiply. Separate a node's outcomes into correct, **escalated** (caught
+and sent to a person) and **silent error** (wrong and passed on). If a node is wrong with rate *q* and a
+validator catches a fraction *c* of those errors, its silent-error rate falls to `q·(1 − c)` and its
+escalation rate is `q·c` (plus any correct items the check flags by mistake). Silent errors are what
+compound and reach users; escalations cost reviewer time and lower the automation rate. So report two
+end-to-end numbers, the share of items fully automated and correct, and the share that went wrong
+silently, *because* a design that trades silent errors for escalations can be a large improvement even
+though its "automation rate" goes down.
 
 ### 7. Prototype the riskiest node first
 The node with the most uncertainty, usually the one with the messiest input, gets a spike before
@@ -141,6 +154,9 @@ extraction), and a validator that catches an error before it propagates breaks t
   component while users see a large share of cases go wrong.
 - Leaving node outputs unstructured; the symptom is downstream code parsing free text with regexes and
   failing whenever the model rephrases.
+- Reporting a single success rate that mixes escalations and silent errors; the symptom is a
+  stakeholder dispute where operations say "too many items reach the queue" and risk says "too many
+  errors reach customers", and neither can be traded off because they were never measured separately.
 - Building the easy nodes first; the symptom is a mostly finished pipeline blocked for weeks on the one
   hard extraction that should have been spiked on day one.
 

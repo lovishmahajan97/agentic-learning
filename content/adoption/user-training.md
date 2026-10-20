@@ -4,8 +4,8 @@ module: adoption
 name: User training
 kind: practice
 difficulty: core
-est_minutes: 13
-status: fact-checked
+est_minutes: 15
+status: reviewed
 related:
   - adoption/change-management
   - adoption/workshops
@@ -61,6 +61,23 @@ outputs, some of which contain realistic seeded errors, and asks them to accept,
 builds the skill that matters most and produces a measurable score. Role-specific tracks matter here:
 the reviewer, the frontline user and the team lead need different drills.
 
+Score the drill on *two* numbers, not one, *because* there are two ways to be miscalibrated:
+- **Catch rate** = seeded errors caught ÷ seeded errors. Low catch rate means over-trust.
+- **False-reject rate** = correct outputs rejected or rewritten ÷ correct outputs. High false-reject rate
+  means under-trust: the user is doing the task twice and will eventually decide the tool is useless.
+
+A user who rejects everything scores 100% on catch rate, so catch rate alone rewards the wrong behavior.
+The goal is high catch with low false-reject, plus a verification time per item that fits in the real
+workflow.
+
+Seed realistic errors, not obvious ones. An invented refund window that looks like a real policy teaches
+something; a garbled sentence does not, because the model rarely fails that way. Draw the error types
+from the eval set's actual failure modes. Be aware of the base rate, too: a drill might be 25% wrong to
+give enough practice, but production may be wrong a few times in a hundred, and people checking rarely
+wrong output stop looking (vigilance falls when errors are rare). So teach verification as a fixed,
+cheap habit attached to specific claim types ("always check numbers, dates and policy terms against the
+citation") rather than as a judgment about whether this draft "feels off".
+
 ### 4. Cover data handling and escalation explicitly
 State what data may and may not go into the tool, why, and what to do on a bad output: the feedback
 button, what to write, and when to escalate to a human expert. *Because* these rules carry compliance
@@ -69,7 +86,10 @@ risk, they deserve a dedicated, short, testable segment rather than a slide buri
 ### 5. Deliver in the workflow, then reinforce
 Short sessions close to go-live, followed by job aids inside the tool (tooltips, a one-page "when to
 trust, when to check" card), office hours, and champions in each team. Spaced reinforcement beats one long
-session, *because* skills not used soon after training fade quickly. Train-the-trainer lets the customer's
+session, *because* skills not used soon after training fade quickly (the spacing effect is one of the
+more robust findings in learning research). Training also cannot fix a slow check: if verifying a claim
+takes three clicks and a second window, people skip it under time pressure, so the cheapest training
+improvement is often an inline citation the engineer adds. Train-the-trainer lets the customer's
 own staff carry the program after handoff.
 
 ### 6. Measure with the four levels, and retrain on change
@@ -90,7 +110,11 @@ Training is three 45-minute sessions in the go-live week, by team. Session one e
 failures. Session two is a verification drill: 20 drafts, 5 with seeded errors (an invented refund window,
 a wrong plan name, a missing caveat). Before coaching, agents catch on average 2 of the 5; after a
 walk-through of "click the citation, check every number and policy claim", a second drill set gets an
-average of 4 of 5. Session three covers what customer data may be pasted into free-text fields, the
+average of 4 of 5. The drill also tracks the other error: before coaching, agents rewrote on average 4
+of the 15 correct drafts "to be safe", which is the under-trust that makes the tool feel slower than
+typing; after coaching, with an explicit rule for what to check and what to leave alone, that falls to
+1 of 15. Both numbers are reported, because improving catch rate by making people rewrite everything
+would be a regression. Session three covers what customer data may be pasted into free-text fields, the
 feedback button, and when to hand off to a tier-2 specialist.
 
 Reinforcement follows: a pinned checklist in the drafting panel, two champions per team, and office hours
@@ -112,6 +136,8 @@ a 15-minute refresher shows what changed. (All figures are illustrative.)
 - Never retraining after model or prompt changes, revealed by a sudden rise in overrides or complaints after an update.
 - Treating data-handling rules as an aside, discovered later when sensitive data shows up in prompts or logs.
 - Training once at launch with no reinforcement, shown by usage and drill scores sliding over the following weeks.
+- Seeding drills with obvious errors, revealed by near-perfect drill scores alongside QA still finding unchecked policy mistakes in production.
+- Scoring only the catch rate, which shows up as heavy editing of correct drafts and handle time rising instead of falling.
 
 ## When to use
 Run structured training whenever users are expected to rely on AI output in work that matters, and
@@ -119,7 +145,10 @@ especially when they are the last check before the output reaches a customer, a 
 Scale the effort with the cost of errors and the number of users: a low-risk internal summarizer may need
 a job aid and a short video; a drafting tool used for regulated customer communication needs drills,
 data-handling rules and measured verification skill. Measure at behavior and results level, not just
-reaction. In interviews, a strong answer explains why AI training must teach verification and failure
+reaction: drill catch rate and false-reject rate (learning), citation-open rate and edit rate on
+high-risk claim types in the logs (behavior), and QA error rate and handle time (results). If the
+behavior metrics do not move after training, check the UI cost of verifying before adding more
+sessions. In interviews, a strong answer explains why AI training must teach verification and failure
 modes, and how you would tell whether it worked.
 
 ## Role lens
@@ -129,7 +158,8 @@ modes, and how you would tell whether it worked.
 
 ## Check yourself
 **Q:** Training satisfaction scores are high, yet QA finds agents are sending AI drafts with policy errors. What is wrong with the program, and how would you change it?
-**A:** The program is probably measuring reaction, not learning or behavior, and teaching what the tool does rather than how it fails. I would add a verification drill with seeded, realistic policy errors to measure whether agents can catch them, teach a concrete checking method (open the citation, check every policy claim and number), and show real failures from the eval set. Then I would track behavior in logs, such as edit rates on undocumented topics, and the QA error rate as the result. I would also check whether the UI makes verification fast, because a slow check gets skipped regardless of training.
+**A:** The program is probably measuring reaction, not learning or behavior, and teaching what the tool does rather than how it fails. I would add a verification drill with seeded, realistic policy errors to measure whether agents can catch them, teach a concrete checking method (open the citation, check every policy claim and number), and show real failures from the eval set. Then I would track behavior in logs, such as edit rates on undocumented topics, and the QA error rate as the result. I would watch the false-reject rate too, so the fix does not swing
+agents into rewriting every draft. I would also check whether the UI makes verification fast, because a slow check gets skipped regardless of training.
 
 ## Quiz
 ### Q: Which Kirkpatrick level is shown by usage logs where agents now open citations before sending drafts?

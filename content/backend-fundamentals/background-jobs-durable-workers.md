@@ -5,7 +5,7 @@ name: Background jobs / durable workers
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: fact-checked
+status: reviewed
 related:
   - backend-fundamentals/message-queues
   - backend-fundamentals/redis
@@ -114,6 +114,22 @@ with RabbitMQ, SQS consumers) are the message-queue lesson from the consumer's c
 losing a job costs and by throughput; a few hundred jobs per second (illustrative) is well within a
 Postgres table on modest hardware.
 
+### Sizing, fairness and shutdown
+Worker count follows from Little's law: jobs in progress = arrival rate × average duration. If uploads
+arrive at 0.5 per second and an embedding job averages 4 minutes, 0.5 × 240 = 120 jobs are running at
+steady state, so fewer than 120 worker slots means the backlog grows without bound, however fast each
+worker is. Size for the peak arrival rate you must absorb within your latency target, and remember that
+the model provider's rate limit, not your worker count, may be the real ceiling.
+
+A single shared queue in run order is unfair: one tenant that enqueues 10,000 jobs puts every other
+tenant's job behind them. The usual fixes are a per-tenant concurrency cap enforced in the claim (skip
+tenants already at their limit), a claim that rotates across tenants rather than taking the globally
+oldest row, or separate queues per priority class so interactive work is never behind bulk backfills.
+
+Deploys are the most frequent "crash". A worker that receives SIGTERM should stop claiming, finish or
+checkpoint the current job within the platform's grace period, and exit; anything it cannot finish is
+recovered by lease expiry, which is why the lease, not the shutdown handler, is the correctness mechanism.
+
 ### What to measure
 Queue depth, age of the oldest queued job, run duration per type, attempts histogram, and dead count.
 The first two detect a stalled worker fleet; the last two detect a failing dependency.
@@ -209,6 +225,8 @@ forever, and a small periodic sweeper should move such rows to `dead`.
   and `attempts` climbing with no recorded failure.
 - No maximum attempts or dead state; the symptom is one poison job retried forever, a worker permanently
   busy and a backlog growing behind it.
+- One shared run-order queue for all tenants; the symptom is a bulk import by one customer turning every
+  other customer's two-second job into a two-hour wait, with workers fully busy and no errors.
 - Storing large payloads in the job row; the symptom is a bloated table, slow claims and a database that
   has become a blob store.
 - Never archiving finished rows and no partial index; the symptom is a claim query that gets slower every

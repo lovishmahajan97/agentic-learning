@@ -5,7 +5,7 @@ name: ROI model
 kind: practice
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - scoping/success-metrics-kpis
   - scoping/baseline-measurement-before-deployment
@@ -67,6 +67,14 @@ a pilot measurement:
 Divide recurring cost by *successful* tasks, not attempted ones. Retries and failed attempts consume
 tokens but produce nothing, and the review time on a bad draft is a cost, not a saving.
 
+### Compare against the next-best alternative
+The counterfactual is rarely "do nothing". A macro library, a form redesign, a rules engine or a
+process change might capture part of the same benefit at a fraction of the cost and risk, and a sharp
+finance reviewer will ask about it. State the AI case as incremental value over the next-best
+alternative. If better templates would remove half of the handle time the assistant targets, the AI
+project's return is computed on the other half, and its build cost is compared with the template
+project's cost, not with zero.
+
 ### Horizon, ramp and summary measures
 Model month by month over a horizon the sponsor uses, often 24 or 36 months, with an adoption ramp
 taken from comparable rollouts or the pilot. Report three numbers, because they answer different
@@ -80,6 +88,11 @@ Vary one input at a time across its plausible range and rank the inputs by how f
 This is a tornado analysis. Then solve for the break-even value of the most uncertain input. The model
 exists to answer this question. If break-even needs 2 minutes saved and the pilot measures 4, the
 case is robust. If it needs 3.8, the pilot has to be designed to measure that one number precisely.
+
+One-at-a-time sensitivity assumes the inputs move independently, and in AI rollouts they often do not.
+Low minutes saved and low adoption tend to arrive together, because people abandon a tool that saves
+them little. So also run a joint pessimistic scenario, or a simple Monte Carlo over the input ranges,
+and report the chance that NPV is negative alongside the tornado chart.
 
 ## Example
 A drafting assistant for a 40,000-ticket-per-month support team. All inputs are illustrative. A real
@@ -128,7 +141,10 @@ The base case looks strong. The sensitivity run shows that halving the capture r
 return entirely, while doubling engineering upkeep roughly halves it but leaves it clearly positive. So the most valuable scoping
 conversation is with finance about what happens to freed time, not with engineering about tokens.
 The pilot must also measure minutes saved precisely, because the case survives anything above about
-2 minutes.
+2 minutes. Finally, the one-at-a-time view flatters the case. A joint scenario that is only mildly
+pessimistic on each input (capture 0.45, adoption 0.5, 3 minutes saved, each milder than its
+single-input stress above) gives an ROI of about −17% and no payback within 24 months. Three modest
+disappointments together sink a case that survives each one alone.
 
 ## Trade-offs
 - Ranges and sensitivity analysis are more honest than a point estimate, but sponsors often want one
@@ -151,6 +167,8 @@ The pilot must also measure minutes saved precisely, because the case survives a
   usage sits on a plateau far below the modelled figure.
 - Forgetting the human review cost. The symptom is "time saved" shrinking in the pilot because
   reviewers spend minutes checking each output.
+- Comparing the AI case against doing nothing. The symptom is a finance reviewer asking why a cheaper
+  process or template fix was not costed, and the model having no answer.
 - Building the model before the baseline exists. The symptom is ROI inputs that the customer's own
   data contradicts when the pilot report is reviewed.
 

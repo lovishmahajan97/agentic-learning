@@ -4,8 +4,8 @@ module: python-for-ai
 name: Security scanning & dependency auditing (pip-audit, Bandit)
 kind: practice
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 15
+status: reviewed
 related:
   - python-for-ai/lockfiles-and-dependency-pinning
   - python-for-ai/uv-poetry-pip
@@ -56,6 +56,21 @@ why auditing a lockfile or exported pinned requirements is meaningful, while aud
 `pyproject.toml` is not: the answer depends on what would be installed. Auditing a lockfile is also how you
 find vulnerable transitive packages you never chose directly.
 
+### Triage: what to do with a finding
+A finding is the start of a decision, not the decision. A useful order:
+1. **Is a fixed version available?** If yes, upgrade *through the lock*: `uv lock --upgrade-package jinja2`
+   (or the Poetry or pip-compile equivalent), then sync. `pip-audit --fix` upgrades the environment it
+   is pointed at, which in a locked project just creates drift that the next sync erases.
+2. **Is it transitive?** If the vulnerable package is pulled in by another dependency whose declared range
+   excludes the fixed version, the real fix is upgrading the parent. If that is not yet possible, a
+   constraint or override that forces the fixed version is a stopgap you must test, *because* you are
+   now running the parent against a version it did not declare support for.
+3. **Is the vulnerable path reachable?** Read the advisory: a flaw in a template sandbox does not matter if
+   you never render untrusted templates, while one in the HTTP parser of your public endpoint does.
+   Unreachable is a reason to *defer* with a written justification, not to ignore forever.
+4. **Record the exception.** `--ignore-vuln ID` with the reason and an expiry or review date next to it, so
+   the suppression is visible in review and revisited when a fix ships.
+
 ### Bandit: risky patterns in your code
 Bandit parses each Python file into an abstract syntax tree and runs plugins that match known-dangerous
 constructs, each with a test ID, severity and confidence. Examples: `B101` assert used (asserts vanish under
@@ -105,8 +120,8 @@ def save(db: sqlite3.Connection, user: str, answer: str) -> None:
 # Safer versions
 ALLOWED = {"ls", "wc"}
 def run_tool_safe(cmd_from_llm: str) -> str:
-    argv = shlex.split(cmd_from_llm)
-    if not argv or argv[0] not in ALLOWED:
+    argv = shlex.split(cmd_from_llm)                     # no shell: no ;, |, $(...) expansion
+    if not argv or argv[0] not in ALLOWED:               # arguments (paths) still need validating
         raise PermissionError(f"tool not allowed: {argv[:1]}")
     return subprocess.run(argv, capture_output=True, text=True, timeout=10).stdout
 
@@ -142,6 +157,8 @@ cfg_safe = yaml.safe_load(open("agent.yaml"))
   lookalike package with no CVE is found in the dependency tree.
 - Assuming Bandit understands context; the symptom is the team learning to ignore its output because findings
   in tests and constant strings drown real ones, which a config excluding tests and a severity floor prevents.
+- Running `pip-audit --fix` in a project managed by a lockfile; the symptom is a green local audit
+  followed by the same finding in CI, because the fix changed the environment but never reached the lock.
 - Loading pickle-based model files from a public hub because "it is just weights"; the symptom is arbitrary
   code execution on the inference host, which no dependency scanner would report.
 

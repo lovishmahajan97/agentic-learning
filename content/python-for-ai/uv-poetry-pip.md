@@ -4,8 +4,8 @@ module: python-for-ai
 name: uv / poetry / pip
 kind: tool
 difficulty: intro
-est_minutes: 13
-status: fact-checked
+est_minutes: 15
+status: reviewed
 related:
   - python-for-ai/lockfiles-and-dependency-pinning
   - python-for-ai/security-scanning-and-dependency-auditing
@@ -44,6 +44,25 @@ uv exist to separate *intent* (ranges in `pyproject.toml`) from *resolution* (an
 recreating the environment one deterministic command.
 
 ## How it works
+### What every tool is doing underneath
+All three run the same pipeline, and knowing it explains most failures:
+1. **Collect constraints.** Your direct requirements (`openai>=1.40`) plus, recursively, each candidate
+   version's own declared dependencies and environment markers (`; sys_platform == "linux"`).
+2. **Resolve.** Choose one version per package so every constraint holds at once. This is a search
+   problem, NP-hard in general, so resolvers backtrack: pick the newest candidate, follow its
+   dependencies, and on a conflict undo choices and try older versions. pip uses the `resolvelib`
+   backtracking resolver; Poetry and uv both use PubGrub-style solvers, which record *why* a conflict
+   happened so they can skip whole families of doomed versions and print an explanation chain.
+3. **Pick artifacts.** For each chosen version, find a wheel whose tags match the interpreter and platform
+   (a filename such as `...-cp312-cp312-manylinux_2_17_x86_64.whl` encodes Python ABI and OS), else fall
+   back to the source distribution and build it locally.
+4. **Install.** Unpack into the environment's `site-packages` and write the record of what was installed.
+
+Two consequences follow. Resolution is slow when metadata is expensive to get: an sdist with a dynamic
+`setup.py` has to be *built* just to learn its dependencies, which is why a resolve can stall on one old
+package. And the answer depends on the platform, *because* markers and available wheels differ between a
+Mac laptop and a Linux container, which is the root of "the lock works for me but not in CI".
+
 ### pip (+ venv, + pip-tools)
 `python -m venv .venv` creates an isolated interpreter environment; `pip install -r requirements.txt` resolves
 and installs into it from PyPI or another index. pip prefers wheels (pre-built archives) and falls back to
@@ -93,14 +112,34 @@ The same project, three ways. The scenario: a FastAPI RAG service that needs `op
 - **Poetry:** `poetry add openai httpx torch` and `poetry add --group dev pytest`; commit `pyproject.toml` and
   `poetry.lock`; CI runs `poetry install`. Pointing torch at the PyTorch CPU index needs a configured source
   and an explicit source on that dependency.
-- **uv:** `uv init`, `uv add openai httpx torch`, `uv add --dev pytest`, an index entry for the PyTorch CPU
-  wheel index marked `explicit = true`, with `torch` mapped to it in `[tool.uv.sources]`; commit
-  `pyproject.toml` and `uv.lock`. CI runs `uv sync --locked` then `uv run pytest`. The Docker build copies the
+- **uv:** `uv init`, `uv add openai httpx torch`, `uv add --dev pytest`, then route only `torch` to the
+  PyTorch CPU index:
+
+  ```toml
+  [[tool.uv.index]]
+  name = "pytorch-cpu"
+  url = "https://download.pytorch.org/whl/cpu"
+  explicit = true            # used only by packages that name it, never as a general fallback
+
+  [tool.uv.sources]
+  torch = { index = "pytorch-cpu" }
+  ```
+
+  `explicit = true` matters *because* an index that is searched for every package lets a same-named
+  package on it shadow the PyPI one, the dependency-confusion pattern. Commit `pyproject.toml` and
+  `uv.lock`. CI runs `uv sync --locked` then `uv run pytest`. The Docker build copies the
   two files first and runs `uv sync --locked --no-dev`, so the dependency layer is cached until the lock
   changes.
 
 In all three, the rule is the same: humans edit ranges, a tool writes the exact lock, and CI and production
 install only from the lock.
+
+When resolution fails, read the explanation rather than loosening pins at random. An illustrative case:
+the service needs `pydantic>=2`, and an older internal helper library declares `pydantic<2`. No version
+assignment satisfies both, so a PubGrub-style resolver reports the chain ("because helper==0.3 depends on
+pydantic<2 and you require pydantic>=2, helper==0.3 cannot be used..."). The fixes are, in order of
+preference: upgrade the helper to a release that supports pydantic 2, drop it, or, as a last resort, use
+an override and own the risk of running it against a version it never declared support for.
 
 ## Trade-offs
 - pip with pip-tools is the most portable and universally understood option, but you assemble venv, pinning,
@@ -110,6 +149,9 @@ install only from the lock.
   adds its own conventions; it remains a reasonable choice for teams already standardized on it.
 - uv is dramatically faster and replaces several tools, but is younger, and new features have evolved
   quickly; pin the uv version in CI so a tool upgrade does not change lock behaviour under you.
+- Resolving to the newest allowed versions is right for applications, but a library's declared lower
+  bounds are then never tested; for libraries, run CI once with uv's `--resolution lowest-direct` so
+  `httpx>=0.23` means what it claims.
 - A universal lockfile serves every platform from one file, but resolves for platforms you may never deploy
   to, which can surface conflicts (often around CUDA wheels) that a single-platform lock would never hit.
 
@@ -121,6 +163,9 @@ install only from the lock.
   resolving newer transitive versions than developers tested.
 - Mixing tools in one project (running `pip install` inside a uv- or Poetry-managed venv); the symptom is an
   environment that drifts from the lock and gets silently reset or reports a different set on the next sync.
+- Adding an extra index with pip's `--extra-index-url` for one private package; the symptom is the
+  public index and the private one being treated as equals, so a public package with the same name (and a
+  higher version) can be installed in place of yours.
 - Letting the default index provide `torch`; the symptom is a multi-gigabyte CUDA wheel in a CPU-only image,
   or a CPU-only build on a GPU host, discovered as slow images or `torch.cuda.is_available()` being False.
 

@@ -5,7 +5,7 @@ name: Decorators
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/tenacity
   - python-for-ai/async-await
@@ -75,6 +75,21 @@ measures how long it took to *create* the coroutine (microseconds) and its `try/
 real errors, which happen later at `await`. A decorator meant for both must check
 `inspect.iscoroutinefunction(fn)` and return an `async def` wrapper that awaits the call.
 
+### Typing: runtime metadata is not static types
+`wraps` fixes what `inspect` sees at runtime, but a type checker only sees the wrapper's declared
+type. Annotate a decorator as `Callable[..., Any] -> Callable[..., Any]` and every decorated function
+loses its parameter types in mypy and the IDE. `ParamSpec` (PEP 612, 3.10+) carries them through:
+`def deco(fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]`, with the wrapper taking
+`*args: P.args, **kwargs: P.kwargs`. A decorator that changes the signature (injecting a client
+argument, say) needs `Concatenate` to say so.
+
+### Class-based decorators and methods
+Any callable works as a decorator, including a class whose `__call__` wraps the function; that is
+convenient when the decorator holds state such as counters or a cache. The catch is method binding.
+Plain functions are descriptors, so `obj.method` binds `self` automatically; an instance of your class
+is not, so decorating a method with it silently drops `self` unless the class implements `__get__`.
+Function-based wrappers avoid this because the wrapper is itself a function.
+
 ### Stacking order
 ```
 @traced
@@ -83,21 +98,28 @@ def call(): ...
 ```
 equals `call = traced(retry(attempts=3)(call))`. Decorators apply bottom-up, so at call time the
 outermost one, `traced`, runs first: here one span covers all three attempts. Swap them and each attempt
-gets its own span. Order is a design decision, not style.
+gets its own span. Order is a design decision, not style. Registration decorators make this sharper:
+`@mcp.tool()` or `@app.get(...)` registers whatever object it receives, so it must sit on top. Put it
+below `@retry` and the framework registers the un-retried function, while the retrying wrapper is bound
+to a module name nobody calls.
 
 ## Example
 ```python
 import asyncio, functools, inspect, random, time
+from collections.abc import Awaitable, Callable
+from typing import ParamSpec, TypeVar
+
+P, R = ParamSpec("P"), TypeVar("R")
 
 class Transient(Exception): ...
 
 def retry(attempts: int = 3, base_delay: float = 0.5):
-    def decorator(fn):
+    def decorator(fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
         if not inspect.iscoroutinefunction(fn):
             raise TypeError("retry() here supports async functions only")
 
         @functools.wraps(fn)
-        async def wrapper(*args, **kwargs):
+        async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
             for attempt in range(1, attempts + 1):
                 start = time.perf_counter()
                 try:
@@ -125,7 +147,12 @@ print(asyncio.run(complete("hi")))
 ```
 With 4 attempts and a 0.1 s base delay, the waits between failures are about 0.1, 0.2 and 0.4 s with
 ±50% jitter, so a call that never succeeds gives up after roughly 0.7 s of backoff plus four call
-durations. In production you would usually use `tenacity` rather than hand-roll this.
+durations (0.2 s here). With a 50% failure rate, all four attempts fail with probability 0.5⁴ = 1/16,
+so about 6% of calls still raise; retries change the error rate, they do not remove it. Trace what ran
+when: `retry(...)` executed once at import and returned `decorator`; `decorator(complete)` also ran once
+at import and rebound the name `complete` to `wrapper`; only `wrapper`'s body runs per call. The jitter
+matters because many clients failing on the same 429 would otherwise retry in lockstep and hit the
+provider together again. In production you would usually use `tenacity` rather than hand-roll this.
 
 ## Trade-offs
 - Decorators remove duplicated cross-cutting code and make it visible at the definition, but hide control
@@ -148,6 +175,10 @@ durations. In production you would usually use `tenacity` rather than hand-roll 
   one timeout killing all retries or retries continuing far past the deadline.
 - Doing expensive work in the decorator body rather than in the wrapper; it runs once at import, which
   slows startup or freezes a value that should be read per call.
+- Placing a framework's registration decorator below your own wrappers; the framework registers the
+  bare function, and the symptom is tools or routes that work but never retry, trace or check auth.
+- Retrying non-idempotent calls (a tool that sends an email or writes a CRM row) with a generic retry
+  decorator; a timeout after the side effect happened shows up as duplicate emails or rows.
 
 ## When to use
 Use a decorator when the same behaviour wraps many functions and does not depend on their internals:

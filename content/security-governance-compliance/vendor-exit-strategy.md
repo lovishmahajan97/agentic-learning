@@ -4,7 +4,8 @@ module: security-governance-compliance
 name: Vendor exit strategy
 kind: decision
 difficulty: advanced
-est_minutes: 15
+est_minutes: 16
+status: reviewed
 related:
   - system-design/ai-gateway
   - system-design/build-vs-buy
@@ -75,7 +76,25 @@ Deprecation notice periods for models, data export in usable formats, deletion w
 transition assistance, price-change notice, and continued service during a wind-down. These cost little to
 ask for at signing and a lot afterwards.
 
-### 4. Write and test the plan
+### 4. Plan two exits, not one
+A **planned exit** (price rise, better model, renewal) runs on your timeline: weeks to months, with the
+old vendor still serving while you migrate. A **stressed exit** (vendor outage, insolvency, sanctions,
+a security incident, a model pulled with no notice) runs on nobody's timeline, and the old vendor may
+already be gone. They need different preparation, *because* steps that are fine in a planned exit, such
+as five days of re-embedding or two weeks of prompt rework, are an outage in a stressed one. For a
+stressed exit you pre-build what cannot be built quickly: a secondary model already passing the eval
+suite for the critical workflows, a degraded mode that does not need the vendor at all (keyword search,
+templated answers, a human queue), and, if retrieval is critical, a standby index built with another
+embedding model.
+
+### 5. Decide how ready to be
+Exit readiness is insurance, so price it like insurance. Roughly, readiness is worth buying when
+P(exit within horizon) × (cost of exiting unprepared − cost of exiting prepared) exceeds the cost of
+staying prepared, where "cost" includes the business impact of the time to exit, not just engineering
+hours. That is why a prototype needs only owned data and prompts, while a revenue-critical workflow
+justifies a warm second provider: the probability may be similar, but the cost of a slow exit is not.
+
+### 6. Write and test the plan
 Define exit triggers, a target time-to-exit, the alternative vendor or self-hosted option per component,
 and the steps. Test it: periodically run the eval suite against the alternative, and do at least a partial
 migration (one workflow, one index shard) so the estimate is measured, not guessed.
@@ -101,7 +120,13 @@ in about a week, including evaluation.
 **State.** Conversation history is stored in their own database, not the vendor's thread API: nothing to
 migrate.
 
-**Result.** Measured time-to-exit about 4 weeks, dominated by prompt rework and parallel indexing. The
+**Result.** Measured planned time-to-exit about 4 weeks, dominated by prompt rework and parallel
+indexing. The board's real question, though, is the stressed case: if the vendor were unavailable
+tomorrow, claims intake would stop for at least the 5.6 days of re-embedding. The team therefore keeps a
+small standby index of the 50,000 most-retrieved documents built with a second embedding model (about
+200 million tokens, a few hours of embedding), routes the 5 highest-volume prompts through the
+alternative model in a weekly eval run, and defines a degraded mode where adjusters get keyword search
+and no generated summaries. Stressed time-to-degraded-service drops from about a week to hours. The
 team records this in the exit plan, adds model deprecation notice and data deletion confirmation to the
 renewal negotiation, and schedules a quarterly run of the eval suite against the alternative so the
 estimate stays current.
@@ -127,6 +152,8 @@ estimate stays current.
   handful of demo prompts.
 - Ignoring model deprecation schedules; the symptom is a forced migration on the vendor's timeline with no
   tested alternative.
+- Planning only the orderly exit; the symptom is an exit plan whose first step assumes the old vendor is
+  still answering requests during a vendor outage.
 
 ## When to use
 Write an exit plan for any vendor on the critical path of a production AI system, before signing or

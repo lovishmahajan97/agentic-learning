@@ -5,7 +5,7 @@ name: OpenAI SDK
 kind: tool
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/anthropic-sdk
   - python-for-ai/litellm
@@ -62,6 +62,11 @@ reached with the plain client and a `base_url`; check which one your deployment 
   tools. The convenience property `response.output_text` concatenates text output.
 New OpenAI-specific features tend to arrive in Responses first; portability favours Chat Completions.
 
+Server-side state (`previous_response_id`, or a conversation object) saves you from resending history
+over the wire, but it does not make history free: the model still reads the earlier turns, and they are
+billed as input tokens on each call. It also moves the transcript into the provider's storage, which
+matters for retention policies; `store=False` opts out, at the cost of managing history yourself.
+
 ### Typed responses and structured output
 Responses are Pydantic models, so `resp.usage.prompt_tokens` is checked attribute access, not a dict
 lookup. For structured output, the `parse` helpers accept a Pydantic class, convert it to a strict JSON
@@ -86,10 +91,22 @@ end: Chat Completions includes them in a final chunk only if you pass
 Exceptions subclass `openai.APIError`: `APIConnectionError` and `APITimeoutError` for transport,
 `APIStatusError` subclasses such as `RateLimitError` (429), `BadRequestError` (400) and
 `AuthenticationError` (401). By default the client retries connection errors, 408, 409, 429 and 5xx
-responses a small number of times with exponential backoff, because those are plausibly transient;
-4xx errors like 400 are not retried, because resending the same bad request cannot succeed. Configure
-`max_retries` and `timeout` per client or per call with `with_options`. The default timeout is long
-(minutes), so interactive services should set their own.
+responses twice (`max_retries=2`) with exponential backoff and jitter, honouring a `retry-after` header
+when the server sends one, because those failures are plausibly transient; 4xx errors like 400 are not
+retried, because resending the same bad request cannot succeed. The default timeout is 600 seconds, far
+too long for an interactive path, so set your own per client or per call with `with_options`.
+
+Two consequences follow. Worst-case wall-clock time is roughly `timeout × (max_retries + 1)` plus
+backoff. And a generation request is not idempotent: if a timeout fires after the server started work,
+the retry is a second, separately billed generation, so aggressive timeouts on long outputs can raise
+cost as well as latency.
+
+### Raw responses and headers
+Typed objects hide the HTTP layer, which is usually what you want, except for the headers.
+`client.with_raw_response.chat.completions.create(...)` returns the raw response, whose headers include
+the request ID and rate-limit state (`x-ratelimit-remaining-requests`, `x-ratelimit-remaining-tokens`),
+and `.parse()` on it gives you the usual typed object. Reading remaining-token headers lets a batch
+worker slow down before it hits 429s instead of after.
 
 ## Example
 A support classifier with structured output, a tight timeout and explicit error handling. Model names
@@ -103,7 +120,7 @@ import openai
 from openai import OpenAI
 
 MODEL = os.environ.get("CLASSIFIER_MODEL", "gpt-4o-mini")
-client = OpenAI(timeout=20.0, max_retries=3)        # one client per process
+client = OpenAI(timeout=20.0, max_retries=3)        # one client per process; worst case ~4 × 20 s + backoff
 
 class Triage(BaseModel):
     category: Literal["billing", "bug", "how_to", "other"]
@@ -128,6 +145,12 @@ def triage(ticket: str) -> Triage | None:
 
 print(triage("I was charged twice this month and need it fixed today."))
 ```
+
+What happens on the wire: `parse` converts `Triage` into a JSON Schema (an enum for `category`, a
+boolean, a string, every field required, no extra properties), sends it as a strict text format, and the
+server constrains decoding so the reply can only be JSON matching that schema; the SDK then validates it
+back into a `Triage`. A 429 is retried up to three times before `RateLimitError` reaches the `except`, so
+re-raising there hands the failure to an outer queue rather than retrying a fourth time in-process.
 
 Pointing the same code at a local vLLM server is `OpenAI(base_url="http://localhost:8000/v1",
 api_key="unused")`, provided that server implements the endpoint you call.

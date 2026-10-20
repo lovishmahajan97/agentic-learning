@@ -5,7 +5,7 @@ name: Technical documentation
 kind: practice
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - system-design/adrs
   - deployment/runbooks
@@ -40,7 +40,10 @@ does it that way, what was rejected, or what to do when it breaks. One giant wik
 tutorial, a configuration reference and design rationale serves nobody: the newcomer drowns in
 reference tables and the on-call engineer cannot find the one command they need. And documentation
 written once at the end of a project decays immediately, because the system keeps changing and nothing
-forces the docs to follow. A stale doc is worse than none: it is trusted, and it is wrong.
+forces the docs to follow. The cause is structural, not laziness: the author pays the cost of updating a
+document and a different person, later, pays the cost of it being wrong, so without a mechanism that
+puts the update at the moment of change, drift is the default. A stale doc is worse than none: it is
+trusted, and it is wrong.
 
 AI systems sharpen this. Behaviour depends on artefacts that are not obviously code: the model version,
 the prompt, the retrieval index, the evaluation set. When output changes, the first question is which of
@@ -65,7 +68,10 @@ For a system handed to a customer or another team, the minimum set usually maps 
   dependencies. Security review starts here, so draw the data flow, not just the boxes.
 - **Architecture decision records** (explanation): one short record per significant decision with
   context, options and consequences, *because* six months later "why not just use X?" is the question.
-- **Runbooks** (how-to): one per alert, starting with symptom, impact and the first safe action.
+- **Runbooks** (how-to): one per alert, in a fixed order: symptom and how to confirm it, user impact,
+  the first safe action (usually rollback or failover, *because* it stabilises before anyone
+  understands the cause), diagnosis steps with expected output, and a "stop and escalate if" line
+  naming who to call.
 - **API and configuration reference**, generated where possible.
 - **AI system card** (explanation plus reference): model and version, prompt versions, retrieval sources,
   evaluation sets and latest results, intended use, out-of-scope uses and known failure modes. This
@@ -78,6 +84,20 @@ it. *Because* review is where staleness is cheapest to catch, the pull-request t
 "which docs does this change invalidate?". Add CI checks: broken links, executable code samples,
 generated reference rebuilt on each build, and freshness rules mapping docs to the code they cover. Give
 every document an owner and a review date; an unowned document is a stale document waiting to happen.
+
+### Versioned with what is deployed
+Documentation must describe the version the reader is running. If a customer runs release 2.3 and the
+docs describe 2.5, the runbook's commands may not exist yet. Tag docs with the release that built them,
+publish per-version reference, and put the deployed model, prompt and index versions in the system card
+by pulling them from the registry or deployment manifest rather than typing them, *because* typed
+version strings are the first thing to go stale.
+
+### Testing documentation
+A document is only verified when someone other than its author uses it to do the job. Have a new team
+member follow the tutorial from a clean machine and record each place they stalled; run a tabletop
+incident where responders may use only the runbooks; ask the customer's operator to perform a rollback
+from the operations guide before handoff. Each stall is a bug in the doc. This is the documentation
+equivalent of a failover drill, and for the same reason: an unexercised path should be presumed broken.
 
 ### Writing so it gets used
 Lead with the answer, then the detail. Make commands copy-pasteable and state what success looks like.
@@ -137,6 +157,8 @@ merge base) in the job that runs it.
   prompt instruction that existed to work around a specific provider failure.
 - Omitting model and prompt versions from system documentation; the symptom is a behaviour change nobody
   can attribute because no one knows what was running last month.
+- Only ever reviewing docs by reading them; the symptom is the first real use revealing that a runbook
+  assumes access, tools or tribal context the customer's operator does not have.
 - Leaving documents without owners; the symptom is a wiki where every page has a "this may be out of date"
   banner and nobody trusts any of it.
 

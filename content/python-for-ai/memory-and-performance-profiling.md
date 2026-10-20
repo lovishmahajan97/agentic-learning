@@ -4,8 +4,8 @@ module: python-for-ai
 name: Memory & performance profiling
 kind: practice
 difficulty: advanced
-est_minutes: 16
-status: fact-checked
+est_minutes: 17
+status: reviewed
 related:
   - python-for-ai/gil
   - python-for-ai/asyncio-vs-threads-vs-multiprocessing
@@ -70,7 +70,12 @@ per-line timings for one function once you know which function matters.
 ### Python heap memory: tracemalloc
 `tracemalloc` (stdlib) records a traceback for every allocation made through Python's allocator. Take a
 snapshot, run the workload, take another, and `compare_to` shows which source lines' live allocations grew.
-That is the right tool for leaks in Python objects: growing lists, dicts, caches and closures. It slows the
+That is the right tool for leaks in Python objects: growing lists, dicts, caches and closures. Note what it
+answers: *where* the surviving bytes were allocated, not *who is keeping them alive*. The second question is
+the one you fix. Take one leaked object (say, a string from the growing line) and walk its referrers with
+`gc.get_referrers(obj)`, or draw the chain back to a module global with `objgraph.show_backrefs`; the
+retainer is typically a module-level list, a cache, a closure, or a bound-method callback registered on a
+long-lived object. tracemalloc itself slows the
 program, and it cannot see allocations that native libraries make with their own allocators unless the
 library reports them explicitly. NumPy is the notable exception: it registers its array data buffers with
 tracemalloc (via `PyTraceMalloc_Track`), so large arrays do show up; PyTorch CPU tensors, Hugging Face
@@ -82,7 +87,16 @@ allocations as well (C extensions, PyTorch CPU tensors, tokenizers), records to 
 produces flame graphs of what was live at peak (`memray run`, then `memray flamegraph`). For PyTorch on GPU,
 use `torch.cuda.memory_allocated()`, `max_memory_allocated()` and `memory_summary()`; RSS and tracemalloc
 know nothing about VRAM, and the caching allocator keeps freed blocks reserved, so `nvidia-smi` shows more
-than tensors actually use.
+than tensors actually use. Timing GPU work has its own trap: CUDA kernels launch asynchronously, so
+`perf_counter()` around `model(x)` measures how long it took to *queue* the work. Call
+`torch.cuda.synchronize()` before reading the clock (or use `torch.cuda.Event` timers or `torch.profiler`),
+otherwise the cost shows up later, at whatever line first needs a result on the CPU, such as `.item()`.
+
+### Measuring a fix
+A profile tells you where to look; a benchmark tells you whether the change helped. For a function, use
+`timeit` with several repeats and compare the minimum, *because* noise from the OS and other processes only
+ever adds time. For a service, compare latency percentiles (p50 and p95) and throughput under the same load
+script before and after, with the process warmed up, since a single request mixes in one-off costs.
 
 ### Why RSS may not go down
 CPython's small-object allocator groups objects into arenas and can only return an arena to the OS when
@@ -147,6 +161,11 @@ pstats.Stats(prof).sort_stats("cumulative").print_stats(5)
   climbing, which points to fragmentation or a cache, not unbounded growth.
 - Measuring once, on a cold process; the symptom is profiles dominated by imports, model loading and JIT or
   CUDA initialization that never recur in steady state.
+- Timing GPU code without `torch.cuda.synchronize()`; the symptom is a forward pass that "takes 0.2 ms"
+  while an innocent `.item()` or `.cpu()` call a few lines later appears to take hundreds of milliseconds.
+- Stopping at tracemalloc's allocation line and never finding the retainer; the symptom is a fix to the
+  allocating code (a smaller string, a copy avoided) that shrinks each leaked object but leaves memory
+  climbing at the same slope.
 - Reading `nvidia-smi` as tensor usage; the symptom is apparent "GPU leaks" that are actually the PyTorch
   caching allocator holding reserved but free blocks.
 - Leaving tracemalloc or a deterministic profiler enabled in a production build; the symptom is a large,

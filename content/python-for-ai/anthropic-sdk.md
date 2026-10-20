@@ -5,7 +5,7 @@ name: Anthropic SDK
 kind: tool
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/openai-sdk
   - python-for-ai/litellm
@@ -73,6 +73,13 @@ next: `end_turn` (done), `tool_use` (run tools and continue), `max_tokens` (trun
 `pause_turn` (a long server-side tool turn to resume) and `refusal` (declined; check it before reading
 content).
 
+Thinking blocks carry a cryptographic `signature`. Echo them back unchanged on the next turn with the
+same model, because the server verifies them and uses them to continue the reasoning across tool
+calls. The practical rule this produces: treat conversation history as append-only. Rewriting or
+trimming earlier assistant turns can invalidate the thinking attached to them, and on recent models
+the exact enforcement varies by model and account, so check the current docs before building a harness
+that edits history.
+
 ### Tool loop
 You declare tools as `name`, `description`, `input_schema` (JSON Schema). When `stop_reason` is
 `tool_use`, append the assistant's full `response.content` as an assistant message, run each requested
@@ -80,6 +87,18 @@ tool, and send one user message containing a `tool_result` block per call, each 
 `tool_use_id` (set `is_error: True` for failures rather than dropping them). All results for one turn go
 in a single message; splitting them across messages breaks the parallel-call pattern. The SDK's beta
 tool runner can drive this loop for decorated Python functions.
+
+`tool_choice` controls whether the model may or must call tools (`auto`, `none`, and on some models
+forced `any` or a named tool). Forcing is not supported on every current model, so the portable way to
+guarantee a well-formed call is `auto` plus a clear instruction, with `strict: true` on the tool
+definition so `input` always validates against `input_schema`.
+
+### Structured output
+When you want JSON rather than a tool call, `output_config={"format": ...}` with a JSON Schema constrains
+the response to that schema, and `client.messages.parse(...)` accepts a Pydantic model and returns the
+validated object. This replaces the older trick of defining a fake tool just to get structured
+arguments back. You still check `stop_reason`: a refusal or a `max_tokens` cut-off means there is no
+complete object to parse.
 
 ### Prompt caching
 Mark a block with `cache_control={"type": "ephemeral"}` (or use top-level automatic caching). The API
@@ -91,7 +110,9 @@ earlier in the prefix (a timestamp in the system prompt, reordered tools) invali
 ### Streaming, counting, batches
 `with client.messages.stream(...) as s:` yields events and `s.text_stream`, and `s.get_final_message()`
 returns the assembled message, so you never hand-merge deltas. Streaming is recommended for long
-outputs and large `max_tokens`, where a non-streaming request can hit HTTP timeouts.
+outputs and large `max_tokens`, where a non-streaming request can hit HTTP timeouts; the Python SDK
+refuses a non-streaming request whose `max_tokens` implies an expected duration beyond its timeout and
+tells you to stream instead.
 `client.messages.count_tokens(...)` returns the exact input token count for a request, the right tool
 for Claude because local OpenAI tokenizers do not match. `client.messages.batches` submits many
 requests for asynchronous processing at a discount, with results keyed by your `custom_id`.
@@ -133,6 +154,13 @@ if resp.stop_reason == "refusal" or resp.stop_reason == "max_tokens":
     print("did not finish normally:", resp.stop_reason)
 print("".join(b.text for b in resp.content if b.type == "text"))
 ```
+
+Trace of a typical run: call 1 returns `stop_reason="tool_use"` with content such as
+`[thinking, tool_use(id="toolu_…", name="get_order", input={"order_id": "A-1042"})]`. History becomes
+three messages: the user question, the assistant turn with every block intact, and a user turn holding
+one `tool_result` whose `tool_use_id` matches. Call 2 resends all three, the model reads the result and
+returns `stop_reason="end_turn"` with a text block. Each call re-reads the whole history, so input tokens
+grow every iteration, which is exactly the cost that caching the stable prefix attacks.
 
 This toy system prompt is far shorter than the minimum cacheable prefix (model-dependent, from a few
 hundred to a few thousand tokens), so here `cache_read_input_tokens` stays at zero; with a realistic

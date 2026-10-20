@@ -4,8 +4,8 @@ module: customer-data-evaluation
 name: Fine-tuning pipelines on client data
 kind: practice
 difficulty: advanced
-est_minutes: 16
-status: fact-checked
+est_minutes: 17
+status: reviewed
 related:
   - training-adaptation/fine-tune-vs-rag-vs-prompt-decision
   - training-adaptation/supervised-fine-tuning
@@ -69,7 +69,11 @@ often removes a large share of the raw records, which is normal.
 ### 4. Split without leakage
 Split by **group** (customer account, case, document, or time period), not by row. Tickets from one
 case share wording; if they land on both sides, the test set measures memorisation. A time-based split
-also matches the deployment reality: train on the past, predict the future.
+also matches the deployment reality: train on the past, predict the future. Grouping does not catch
+everything (the same template email can open many unrelated cases), so after splitting run a
+near-duplicate check *across* the boundary (MinHash or embedding similarity above a high threshold) and
+move or drop test items that have a near-twin in train. Report how many you removed; a large number
+means the dataset is more repetitive than it looked.
 
 ### 5. Format and train
 Render examples in the base model's exact chat template, with the same system prompt the production
@@ -77,11 +81,26 @@ system will use. Prefer a **per-customer adapter** (LoRA or another PEFT method)
 adapters are small, cheap to retrain, isolate each customer's data in its own artifact, and can be
 deleted when the contract ends. Never pool customers' data unless every customer has agreed.
 
+Where training runs is a separate decision with its own consequences. A provider's hosted fine-tuning
+API is the least engineering, but the customer's data goes to that provider (which their data agreement
+must allow), the tuned model typically lives only on that provider and cannot be exported, and when the
+provider retires the base model you retrain on whatever replaces it. Self-hosted training on an open
+model keeps data in the customer's boundary and gives you a portable adapter, at the cost of owning GPUs,
+the training stack and serving. If the training targets are outputs of a large prompted model
+(distillation), check that model's terms as well: some providers restrict using outputs to train other
+models.
+
 ### 6. Evaluate against the baseline
 Compare the tuned model with the prompted baseline on the customer's held-out golden set and regression
 suite, and run general capability and safety checks to catch catastrophic forgetting or loosened refusal
 behaviour. Add **memorisation probes**: prompt with prefixes of training records and check whether
 redacted-class strings (or planted canary strings) come back.
+
+Also train on nested subsets (say 25%, 50% and 100% of the training groups) and plot the golden-set score
+against size. If the curve is still climbing at 100%, more labelled data is the cheapest next gain; if it
+flattened at 50%, more data will not help and the ceiling is in the labels, the task definition or the
+base model. This one plot answers the customer's most common question, "should we label more?", with
+evidence instead of opinion.
 
 ### 7. Register with lineage
 Register the artifact with the dataset snapshot hash, the record-id manifest, code version, base model
@@ -91,7 +110,9 @@ answer "was record X used?" and rerun the pipeline when needed.
 ### Deletion is retraining
 Removing a record's influence from trained weights is not reliably possible today (machine unlearning is
 an active research area, not a guarantee). The practical answer to a deletion request is to drop the
-record and retrain, which is only cheap if the pipeline is automated and adapters are small.
+record and retrain, which is only cheap if the pipeline is automated and adapters are small. Deletion
+also has to reach everything derived from the snapshot: cached tokenised datasets, the golden set if the
+record was in it, eval logs that quote it, and old adapter versions still in the registry.
 
 ## Example
 The leakage-safe split and the manifest step, the two parts most often done wrong. Records are grouped by
@@ -122,10 +143,21 @@ def split_and_manifest(records, tenant, snapshot_id, permission_ref, test_frac=0
     return train, test, manifest
 ```
 
-Illustrative scenario: 40,000 raw support tickets become 26,000 after deduplication and quality filters.
-Grouped by 9,000 cases, about 15% of cases go to test. A LoRA adapter on a mid-size open model is
-compared with the prompted large-model baseline: if it matches the baseline on the golden set at a
-fraction of the per-request cost, and passes the memorisation probes, it moves on to shadow mode.
+Illustrative scenario (numbers chosen for the walkthrough, not a benchmark): 40,000 raw support tickets
+become 26,000 after deduplication and quality filters. They belong to 9,000 cases, so the 15% bucket puts
+roughly 1,350 cases (around 3,900 tickets, since cases vary in size) in test. The cross-boundary
+near-duplicate check then finds 210 test tickets with a near-twin in train, mostly auto-generated
+"password reset" requests, and drops them. A LoRA adapter on a mid-size open model is compared with the
+prompted large-model baseline on the customer's golden set:
+
+- Baseline: 86% label accuracy. Adapter at 25%, 50%, 100% of training cases: 81%, 85%, 87%. The curve is
+  still rising, so more labels would likely help.
+- The adapter is within noise of the baseline at a fraction of the per-request cost, general capability
+  and refusal checks are unchanged, and no canary string comes back in 500 prefix probes.
+
+That combination, not the accuracy number alone, is what moves it to shadow mode. Had the row-split
+version been run instead, the same adapter would have scored higher offline, because near-identical
+tickets from the same case would sit on both sides, and the gap would have surfaced only in production.
 
 ## Trade-offs
 - Per-customer adapters isolate data and make deletion and retraining cheap, but cap how much the model
@@ -139,6 +171,8 @@ fraction of the per-request cost, and passes the memorisation probes, it moves o
   because it is the one production will show.
 
 ## Pitfalls
+- Changing the split salt or re-extracting a live table between runs; the symptom is a "rerun" whose
+  test ids differ from the original manifest, so before-and-after scores are not comparable.
 - Splitting by row; the symptom is an excellent offline score followed by a much worse production result
   on new cases.
 - Training without a recorded permission basis; the symptom is a legal review that orders the model

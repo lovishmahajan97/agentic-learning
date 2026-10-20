@@ -4,8 +4,8 @@ module: customer-data-evaluation
 name: Acceptance testing against customer KPIs
 kind: practice
 difficulty: advanced
-est_minutes: 16
-status: fact-checked
+est_minutes: 18
+status: reviewed
 related:
   - scoping/success-metrics-kpis
   - scoping/baseline-measurement-before-deployment
@@ -66,6 +66,24 @@ and size the sample accordingly. For proportions near 0 or 1, use an interval th
 such as the Wilson interval; the simple normal approximation can produce bounds below zero. Sample
 size must be agreed with this in mind *because* some criteria are unprovable at small n.
 
+Three decisions hide inside "no worse than today":
+- **Non-inferiority margin.** Requiring the system's upper bound to sit at or below the baseline's
+  point estimate demands near-proof that it is *better*. The usual form is non-inferiority: upper bound
+  ≤ baseline + δ, where δ is the largest degradation the sponsor would accept. Choosing δ is a business
+  decision, not a statistical one, so it is the sponsor's to sign.
+- **Baseline uncertainty.** The baseline is itself a sample. If it was measured on a few hundred cases,
+  its own interval may be wider than the margin; either measure it on more cases or acknowledge that the
+  comparison is approximate.
+- **Power.** To show an upper bound at or below threshold t when the true rate is p, with z_α for the
+  bound and z_β for the chance of passing, roughly
+  n ≈ [z_α·√(t(1−t)) + z_β·√(p(1−p))]² / (t − p)². The (t − p)² in the denominator is the lesson: halving
+  the gap between expected performance and threshold quadruples the sample.
+
+Finally, if acceptance requires *every* criterion to pass, the chances multiply: three independent
+criteria each passed with 90% probability by a system that truly meets them are all passed only about
+73% of the time (0.9³). That is a reason to keep the signed list short and to power each criterion
+generously.
+
 ### 5. Sign before measuring
 Put metrics, data, thresholds, sample sizes and the decision rule in the statement of work or an
 acceptance annex, signed by the sponsor. Freeze the acceptance dataset version and the holdout.
@@ -112,9 +130,13 @@ for name, k, n, rule, t in CRITERIA:
 The point estimate of 1.5% beats the 2% baseline, but 400 invoices cannot show it with confidence; with
 a true rate of 1.5%, about 3,000 invoices are needed just for the upper bound at the expected error
 count to reach 2%, and at that size the test still passes only about half the time; roughly 8,000
-invoices are needed for around a 90% chance of passing. The
+invoices are needed for around a 90% chance of passing. The criterion was also stricter than its
+label: the baseline was 10 errors in 500, whose own Wilson interval is roughly 1.1% to 3.6%, so "upper
+bound ≤ 2.0%" asked for proof of improvement over a noisy number. A non-inferiority version, upper bound
+≤ 2.5% (a 0.5-point margin the AP manager signs as tolerable), needs only about 2,000 to 2,500 invoices
+for a roughly 90% chance of passing at a true 1.5%, a volume pilot traffic can often supply. The
 segment floor is worse: even zero errors in 80 invoices gives an upper bound near 4.6%, so that
-criterion could never pass at that size. Both problems should have surfaced when the annex was written.
+criterion could never pass at that size. All of this should have surfaced when the annex was written.
 The fix is a renegotiation *before* testing: either larger samples (pilot traffic can supply them), or a
 point-estimate rule backed by a downstream control such as human review of all high-value invoices.
 
@@ -123,6 +145,9 @@ point-estimate rule backed by a downstream control such as human review of all h
   when labelled data is scarce, use point estimates plus a production guardrail that triggers rollback.
 - Concurrent control groups give a clean causal estimate of time saved, but cost the customer capacity
   running two processes; a before-and-after comparison is cheaper when volume and mix are stable.
+- A wider non-inferiority margin makes the test passable at realistic sample sizes, but admits a
+  system that is somewhat worse than today; when errors are costly or regulated, keep δ small and pay
+  for the larger sample instead.
 - Many criteria cover more risks, but each extra criterion raises the chance of failing on noise;
   keep a handful of primary metrics and guardrails, and report the rest as diagnostics.
 - Strict segment floors protect high-stakes cases, but can block launch on tiny segments; when a segment
@@ -162,8 +187,8 @@ acceptance test you can actually pass or fail fairly?
 **A:** I would ask what business outcome 99% stands for, then decompose it: which errors matter (a wrong
 bank account is not a misspelled supplier name), what the current human error rate is, and which KPI
 the sponsor is buying, such as time or cost per item. I would propose a primary metric tied to that KPI,
-guardrails on critical-field errors relative to the measured baseline, and floors on high-stakes
-segments. For each I would state whether the threshold applies to a point estimate or a confidence bound
+guardrails on critical-field errors framed as non-inferiority against the measured baseline, with a
+margin the sponsor signs, and floors on high-stakes segments. For each I would state whether the threshold applies to a point estimate or a confidence bound
 and size the sample so it is provable. Then everything goes into a signed annex with a frozen dataset.
 
 ## Quiz

@@ -5,7 +5,7 @@ name: TCO (total cost of ownership)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - infra-capacity-economics/break-even-analysis
   - infra-capacity-economics/cost-modeling
@@ -47,16 +47,18 @@ of those on one timeline, so the comparison is honest and the assumptions can be
 Options are only comparable if they deliver the same thing: the same task, at the same quality bar on your
 evals, at the same latency and availability target. If the cheaper option scores lower, either add the
 cost of closing the gap (fine-tuning, a reranker, human review) or express both in cost per successful
-task. The horizon is usually three years: long enough that one-off build costs amortize, and the common
-longest committed-use term (hardware is often depreciated over three to five or more years). For a hosted-API product, a horizon
-longer than the model generation you are building on is fiction, so keep it short and model the migration.
+task. The horizon is usually three years: long enough that one-off build costs amortize, and it matches
+the longest common committed-use term (hardware itself is often depreciated over three to five years). For
+a hosted-API product, a horizon longer than the model generation you are building on is fiction, so keep
+it short and model the migration as a cost inside it.
 
 ### 2. Enumerate costs in four buckets
 - **Acquire (one-off):** build effort, integration with identity, data and logging systems, procurement
   and security review, building the eval set, initial data preparation and indexing, hardware purchase.
 - **Operate (recurring):** tokens or GPU hours, licences, vector database and storage, observability,
   network egress, support contracts, and the fractional people who run it, carry the pager and answer
-  user tickets.
+  user tickets. On-prem adds power and cooling (facility power is roughly IT power times the site's
+  PUE, power usage effectiveness), space, spares and hardware refresh.
 - **Change (recurring but lumpy):** forced model migrations and the re-evaluation they need, prompt
   re-tuning, re-embedding a corpus when the embedding model changes (the old vectors are unusable with the
   new model), serving-stack upgrades, price changes at renewal.
@@ -69,13 +71,21 @@ cloud bill. Use a loaded cost per engineer-year (salary plus benefits, overhead,
 fractions of FTE per activity. Include opportunity cost when the same engineers would otherwise ship
 product: an option that consumes a platform team is not free because the team is already on payroll.
 
-### 4. Put it on a timeline and discount it
+### 4. Count only what the decision changes
+TCO for a decision is *incremental*: include a cost only if it differs between the options from today
+onward. Money already spent, such as GPUs bought last year or a prototype already built, is sunk and
+belongs in neither column, *because* it is gone whichever option you pick; "we already paid for the
+cluster" is an argument for using it only through its resale or opportunity value. Conversely, shared
+costs that exist either way (the identity system, the data warehouse) cancel out and can be left out of
+both, which keeps the model small. What remains is the money and people the choice actually commits.
+
+### 5. Put it on a timeline and discount it
 Lay costs out by period. Capital purchases are depreciated over their useful life for accounting, but for
 a decision compare cash flows. Discount future cash at a rate your finance team provides:
 `NPV = Σ_t cost_t / (1 + r)^t`. Discounting matters *because* options differ in timing: a build is
 front-loaded, a growing subscription is back-loaded, and undiscounted totals overstate the back-loaded one.
 
-### 5. Model uncertainty as scenarios
+### 6. Model uncertainty as scenarios
 Volume, adoption, provider price moves and model deprecation dates are all uncertain. Rather than one
 number, run a base case plus the two or three assumptions that move the answer most (adoption, price,
 team size), and attach expected costs to risk events as probability times impact. The output is a range
@@ -149,6 +159,8 @@ second feature, then say which one the recommendation depends on.
   re-embedding job or migration sprint arriving on the provider's schedule rather than yours.
 - Presenting one number with false precision; when one assumption, usually adoption, turns out wrong,
   stakeholders lose trust in the whole analysis instead of updating the input that moved.
+- Counting sunk costs, such as hardware already bought, as a reason to keep using it; the symptom is a business
+  case for keeping an underused cluster that only works if its purchase price is counted as a saving.
 - Never revisiting the model after launch; without FinOps actuals to compare against, the next TCO repeats
   the same blind spots.
 
@@ -172,9 +184,12 @@ recommendation.
 ## Check yourself
 **Q:** A team proposes self-hosting an open-weight model because GPU cost per token is a third of the API
 price. What would you ask before agreeing, in terms of total cost of ownership?
-**A:** I would ask whether the comparison is at equal quality on our evals, and if not what closing the gap
-costs. Then the operate costs beyond GPUs: fractional platform and on-call engineers at loaded cost,
-serving-stack upgrades, observability and achieved utilization rather than benchmark throughput. Then
+**A:** First, where "a third" came from. If it is the GPU hourly price divided by benchmark throughput, it
+assumes the GPU is busy every second; bursty interactive traffic provisioned for peak with headroom often
+runs near a third utilization, which alone turns a third of the price into roughly the same price, before
+anything else is added. Then whether the comparison is at equal quality on our evals, and if not what
+closing the gap costs. Then the operate costs beyond GPUs: fractional platform and on-call engineers at
+loaded cost, serving-stack upgrades and observability. Then
 change costs: how often we will swap models and what each re-evaluation costs. Then exit and commitment
 risk: reserved capacity we may not fill. I would want this over a two-to-three-year horizon with
 scenarios for volume and API price cuts, and the assumption that flips the answer named explicitly.

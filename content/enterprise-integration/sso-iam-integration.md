@@ -5,6 +5,7 @@ name: SSO / IAM integration (Okta, Entra ID)
 kind: practice
 difficulty: core
 est_minutes: 17
+status: reviewed
 related:
   - enterprise-integration/saml-sso
   - enterprise-integration/scim-provisioning
@@ -48,19 +49,43 @@ The customer's IdP authenticates the user; your application is the relying party
 provider (SAML). OIDC returns a signed JWT ID token and is the default for new integrations; SAML is
 XML-based and still required by many enterprises (see the SAML lesson). Both Okta and Entra ID support both.
 
+### The login flow (OIDC authorization code with PKCE)
+1. Your app redirects the browser to the tenant's authorization endpoint with `client_id`, `redirect_uri`,
+   `scope=openid profile email`, a random `state`, a random `nonce`, and a PKCE `code_challenge`. Store
+   `state`, `nonce` and the PKCE verifier in the user's pre-login session, *because* each must later be
+   matched against *this* browser: `state` defeats login CSRF, `nonce` ties the ID token to this request,
+   PKCE stops a stolen authorization code from being redeemed by someone else.
+2. The IdP authenticates the user and applies its policies (MFA, device compliance, conditional access),
+   then redirects back with a short-lived `code`.
+3. Your server exchanges the code at the token endpoint, authenticating as the client (secret or, better,
+   a certificate or private-key JWT), and receives an ID token (and an access token if you asked for API scopes).
+4. You validate the ID token (below), resolve the user, and issue **your own** session. The IdP's tokens
+   are not your session, *because* their lifetime and revocation are controlled elsewhere and you still
+   need your own idle and absolute timeouts.
+
+If a tenant requires stronger authentication for some actions, the ID token's `acr`/`amr` claims say how
+the user authenticated, and you can send them back to the IdP for step-up rather than trusting a stale login.
+
 ### Per-tenant configuration
 Store, per customer tenant: protocol, issuer (or SAML entity ID), client ID, discovery or metadata URL,
 allowed email domains, and claim mappings. *Because* each customer brings its own IdP, the login flow starts
 with home realm discovery: the user types an email or picks a workspace, and you route them to that tenant's
 IdP. In Entra ID, a SaaS app is typically registered once as multi-tenant and each customer's admin grants
 consent; in Okta, each customer org adds your app (often from the Okta Integration Network) and you receive
-an org-specific issuer.
+an org-specific issuer. Okta also distinguishes the org authorization server (issuer
+`https://<org>.okta.com`) from custom authorization servers (issuer `https://<org>.okta.com/oauth2/<id>`,
+`default` being the common one); they have different issuers and keys, so record which one the customer
+configured rather than assuming.
 
 ### Validating the token
 For every ID token: verify the signature against the issuer's JWKS, check `iss` equals the configured issuer
 for *this* tenant, `aud` equals your client ID, `exp`/`nbf` with small clock skew, and the `nonce` you sent.
 For Entra multi-tenant apps the issuer contains the tenant ID (`tid`), so you must check that `tid` belongs
-to a customer you onboarded; signature validity alone proves only that *some* Entra tenant issued it.
+to a customer you onboarded; signature validity alone proves only that *some* Entra tenant issued it. This
+is a common hole, *because* the multi-tenant discovery document (`/organizations` or `/common`) advertises
+an issuer containing a `{tenantid}` placeholder, generic libraries cannot compare against it literally, and
+the tempting fix is to switch issuer validation off. The correct fix is to substitute the onboarded tenant's
+ID and compare exactly.
 
 ### Stable identity
 Key users by issuer plus `sub`, or in Entra by `tid` plus `oid`, *because* those are immutable for the
@@ -68,12 +93,17 @@ account; email and UPN are display attributes that change.
 
 ### Authorization inputs
 Prefer app roles (Entra) or a filtered groups claim (Okta) that the customer's admin assigns, over raw
-group lists. Entra can omit groups and instead signal an overage when a user belongs to many groups, in
-which case you must fetch membership from Microsoft Graph. Map group or role *IDs*, not display names.
+group lists. Entra caps the groups it puts in a token (its documentation gives 200 for JWTs and 150 for
+SAML assertions); above the cap it omits them and signals an overage (`_claim_names`/`_claim_sources` in a
+JWT), in which case you must fetch membership from Microsoft Graph. Configuring the app to emit only groups
+assigned to it avoids most overage, *because* users rarely hold more than a few of those. Map group or role *IDs*, not display names.
 
 ### Lifecycle and delegation
 SSO controls sign-in, not existence. Pair it with SCIM so deactivation reaches you, and keep your session
-lifetime short enough that a disabled user cannot ride an old cookie for days. When an agent calls downstream
+lifetime short enough that a disabled user cannot ride an old cookie for days. The worst-case exposure after
+termination is roughly the time for SCIM deactivation to arrive plus whatever your app does not revoke on
+receipt; if you revoke sessions on SCIM events, session length matters only as a backstop. Where the IdP
+supports OIDC back-channel logout, it can also tell you to end a session directly. When an agent calls downstream
 APIs as the user, use a delegation flow such as Entra's on-behalf-of or OAuth token exchange, so the
 downstream system sees the user's identity and scopes rather than a god-mode service account.
 
@@ -126,7 +156,8 @@ Globex's Okta presented to Acme's workspace fails validation instead of logging 
   sessions are smoother and acceptable only when SCIM revocation kills sessions immediately.
 
 ## Pitfalls
-- Accepting any Entra tenant's token in a multi-tenant app; the symptom is a user from an unrelated company
+- Accepting any Entra tenant's token in a multi-tenant app, often by disabling issuer validation to get
+  past the `{tenantid}` placeholder; the symptom is a user from an unrelated company
   successfully reaching a customer workspace in a penetration test.
 - Using email as the primary key; the symptom is a rehired or renamed employee getting a second account, or
   a new hire inheriting a predecessor's history.

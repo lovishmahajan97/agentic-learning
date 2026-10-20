@@ -5,7 +5,7 @@ name: Cost modeling (cost per request, token economics)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - infra-capacity-economics/unit-economics-per-successful-task
   - infra-capacity-economics/cost-optimization
@@ -20,11 +20,11 @@ sources:
 ---
 
 ## TL;DR
-A cost model turns a request's shape into dollars: tokens in (fresh and cached), tokens out (including
-hidden reasoning tokens), times their prices, plus the non-model calls around them. Token economics
-explains the shape of those prices: output tokens cost more because decode is sequential, and in agents
-and chats the whole history is re-sent every turn, so cost grows roughly quadratically with turns. You
-model the distribution per request, not the average, because the tail sets the bill.
+A cost model turns a request's shape into dollars: fresh, cached and output tokens (including hidden
+reasoning) times their prices, plus the non-model calls around them. Token economics explains the
+prices: output costs more because decode is sequential, and agents re-send the whole history every
+turn, so cost grows roughly quadratically with turns. Model the logged distribution, not a typical
+request, because costs are heavy-tailed and the tail sets the bill.
 
 ## Why it exists
 LLM spend is metered per token, so cost is set by the shape of each request, not by servers running.
@@ -71,7 +71,12 @@ per-word estimate built on one model is wrong on another; measure with the targe
 In a chat or agent loop, turn t sends the system prompt, tool schemas and every earlier message. If each
 turn adds d tokens, the total input over T turns is about T·prefix + d·T²/2. The quadratic term dominates
 long sessions. Two levers attack it: prompt (prefix) caching, which bills repeated prefixes at a
-discount, and context compaction, which shrinks the history itself.
+discount, and context compaction, which shrinks the history itself. They act differently: caching
+leaves the T² shape intact but multiplies its coefficient by the cached-to-fresh price ratio (0.1 in the
+example below), while compaction caps how large the history can grow, turning the quadratic back into
+roughly linear growth once the cap is reached. Caching also only helps if the next turn arrives within
+the cache lifetime; human think time between turns can exceed it, so measure the cached-token share
+rather than assuming it.
 
 ### Self-hosted token cost
 For your own GPUs, the "price" is derived: cost per token = (GPU $/hour) / (tokens produced per hour at
@@ -81,7 +86,10 @@ of the time pays three times as much per token as the same fleet kept full.
 ### Model the distribution
 Build the model from logged traces: for each feature, the distribution of input, cached and output
 tokens and of turns per session. Report p50, p95 and p99 cost per request and the share of spend from the
-top 1% of requests. The mean alone hides the runaway sessions that budgets and step caps must bound.
+top 1% of requests. For the monthly forecast the right statistic is the true mean from that distribution
+(forecast = Σ over features of volume × mean cost per request), and it is usually well above the cost of
+the "typical" request people reason from. For risk, the mean alone hides the runaway sessions that
+budgets and step caps must bound, so the forecast should state how much of it comes from the tail.
 
 ## Example
 Illustrative prices: $3 per million input tokens, $15 per million output, $0.30 per million cached input
@@ -128,7 +136,7 @@ whether owning hardware is cheap.
   expensive than an API when traffic is low or spiky.
 
 ## Pitfalls
-- Estimating with average tokens per request; the symptom is an invoice several times the forecast,
+- Estimating from a typical or hand-picked request instead of the logged distribution; the symptom is an invoice several times the forecast,
   driven by a long tail of large documents or long agent sessions.
 - Forgetting hidden reasoning tokens or tool-schema tokens in the prompt; visible as billed input or
   output counts far above what the visible text suggests.

@@ -5,7 +5,7 @@ name: Success metrics / KPIs
 kind: metric
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - scoping/baseline-measurement-before-deployment
   - scoping/roi-model
@@ -84,6 +84,18 @@ Auto-approval rate pairs with the error rate on auto-approved items, audited by 
 assume bad faith. Optimisation pressure, including the team's own prompt iteration against the metric, finds the
 cheap path by default.
 
+### Check the target is attributable and detectable
+A target is only useful if the pilot can tell whether it was hit, and that takes two more decisions
+made now, not at the review. **Attribution:** what would the KPI have done without the system?
+Outcome KPIs drift with seasonality, staffing and pricing, so agree the comparison up front: a
+concurrent holdout group, a staggered rollout, or at minimum a before/after read against a comparison
+queue (the baseline lesson covers these designs). **Detectability:** a rule of thumb from online
+experimentation is n ≈ 16σ²/δ² cases per group for about 80% power at a two-sided 5% significance
+level, where δ is the smallest change that matters and, for a rate, σ² = p(1−p). Guardrails are where
+this bites, because they are rare-event rates. Detecting a misrouting rise from 1.5% to 2.5% needs about
+16 × 0.015 × 0.985 / 0.01² ≈ 2,400 cases per group. If the pilot will not see that volume, lengthen the
+window, accept a wider tolerance, or back the guardrail with targeted audits instead of the raw rate.
+
 ## Example
 Here is a worked scenario with illustrative numbers. An insurer wants an assistant that reads
 first-notice-of-loss (FNOL) emails, extracts policy number, loss date, loss type and description, and
@@ -99,7 +111,9 @@ pre-fills the claim record for an adjuster to confirm.
   1.5% baseline, and no claim is set up against the wrong policy number, with weekly audits.
 
 In week 3 the driver reads 78%, ahead of target, and cycle time has fallen to 11 hours. The guardrail
-shows misrouting at 3.1%. A drill-down finds that adjusters are accepting pre-filled loss types without
+shows misrouting at 3.1%. Is that noise? With about 700 FNOLs that week (illustrative), 3.1% is roughly
+22 misroutes against about 10 expected at the 1.5% baseline, and a count of 10 varies by only about ±3
+week to week, so this is a real shift, not a bad draw. A drill-down finds that adjusters are accepting pre-filled loss types without
 reading them on the busiest queue, and that the extractor confuses "escape of water" with "flood" in
 one region's phrasing. Without the guardrail, the dashboard would have said "success" while claims
 went to the wrong handlers. The team disables auto-accept for the water categories, adds 40

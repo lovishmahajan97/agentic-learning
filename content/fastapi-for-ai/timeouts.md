@@ -4,8 +4,8 @@ module: fastapi-for-ai
 name: Timeouts
 kind: practice
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 16
+status: reviewed
 related:
   - fastapi-for-ai/shared-httpx-asyncclient
   - fastapi-for-ai/cancellation-on-client-disconnect
@@ -79,8 +79,9 @@ Because read is per chunk, no httpx setting caps the *total* duration. That is t
 application deadline.
 
 ### Deadlines and cancellation
-`async with asyncio.timeout(t):` cancels the enclosed task when `t` elapses and raises `TimeoutError`
-at the `async with`. Cancellation propagates into httpx, which closes the connection. For a plain
+`async with asyncio.timeout(t):` cancels the current task when `t` elapses, which raises
+`CancelledError` at whatever `await` the task is parked on, and converts it into `TimeoutError` as it
+leaves the `async with`. Cancellation propagates into httpx, which closes the connection. For a plain
 HTTP completion call, closing the connection is usually the only stop signal you can send. Whether the
 provider actually halts generation on disconnect, and whether tokens generated before the close are
 billed, depends on the provider (self-hosted servers such as vLLM abort on disconnect; some hosted APIs
@@ -93,7 +94,32 @@ the minimum of its own limit and what remains, so a retry can't overrun the requ
 A timeout tells you *you* stopped waiting. It does not tell you whether the server did the work. A
 non-streamed completion that timed out on read may have finished and been billed. Retrying is safe
 only for calls that are idempotent or carry an idempotency key, and retries must fit within the
-remaining deadline, with backoff.
+remaining deadline, with backoff. Watch for retries you did not write: provider SDKs often retry
+internally (the OpenAI and Anthropic Python SDKs default to two retries, with a timeout measured in
+minutes; check the version you run). The real worst case for one call is roughly
+`(retries + 1) × per-attempt timeout + total backoff`, so either pass the SDK a timeout derived from
+the remaining budget and `max_retries=0` and retry yourself, or make sure that product still fits.
+
+### Streaming needs three limits, not one
+A streamed completion has three distinct ways to be slow, and each needs its own bound:
+1. **Time to first token**: the provider accepted the request but is queueing or thinking. Bound it by
+   timing the wait for the first chunk (an `asyncio.timeout` around the first `anext`), because the
+   right number (seconds) is very different from the inter-token gap (sub-second normally).
+2. **Gap between chunks**: httpx's `read` timeout, which catches a stalled stream.
+3. **Total duration**: an application deadline, because neither of the above caps it.
+
+Once your own `StreamingResponse` has sent its 200, a timeout can no longer become a 504. It has to be
+emitted as an in-band error event and the stream closed, which is why everything that can time out
+cheaply (retrieval, opening the upstream stream) should happen before the response starts.
+
+### The timeouts people forget
+The HTTP client is the obvious one. The same reasoning applies to every other wait: a Postgres
+`statement_timeout` (or the driver's command timeout) so a bad query plan can't hold a pool connection
+for minutes, a socket timeout on the Redis client, a timeout on acquiring a pool connection or a
+semaphore slot, and a deadline on queue `get` calls. When one service calls another, pass the
+remaining budget along (gRPC does this natively with deadlines; over HTTP a header carrying the
+remaining milliseconds works, relative so that clock skew between hosts doesn't matter) so the
+downstream service doesn't start work its caller has already abandoned.
 
 ## Example
 A chat endpoint with an 8-second request budget on a 10-second proxy, split between retrieval and
@@ -169,6 +195,11 @@ timeout sees.
   `ReadTimeout` errors on longer completions, plus connection churn in TLS-handshake latency.
 - Retrying in a loop without checking the remaining budget. The symptom is a p99 latency that is a
   multiple of the configured timeout.
+- Wrapping a provider SDK in your own retry loop while the SDK still retries internally. The symptom
+  is upstream request counts several times your own request count during a provider incident, and
+  latencies that cluster at multiples of the SDK timeout.
+- Timing out the HTTP call but not the database. The symptom is pool-exhaustion errors on unrelated
+  endpoints while slow queries hold connections far past any request deadline.
 
 ## When to use
 Always. Every outbound call in a FastAPI service needs explicit timeouts, and every request needs a

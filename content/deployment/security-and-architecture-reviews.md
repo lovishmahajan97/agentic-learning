@@ -4,7 +4,8 @@ module: deployment
 name: Security & architecture reviews
 kind: practice
 difficulty: core
-est_minutes: 16
+est_minutes: 18
+status: reviewed
 related:
   - deployment/security-questionnaires
   - deployment/compliance-constraints
@@ -72,8 +73,33 @@ unprompted earns trust that a slide deck cannot.
 - **Logging and monitoring:** what is logged, where, for how long, whether prompts or outputs are included.
 - **Threat model:** for example STRIDE per boundary, plus AI-specific threats from the OWASP LLM list:
   prompt injection (direct and via retrieved documents), sensitive information disclosure, excessive
-  agency of tools, insecure output handling, supply chain of models and datasets.
+  agency of tools, improper output handling (called insecure output handling in the 2023 list), vector
+  and embedding weaknesses, and supply chain of models and datasets.
 - **Evidence:** penetration test summary, vulnerability scanning, SBOM, SOC 2 or ISO reports.
+
+### Applying STRIDE at a boundary
+A threat model is not a list of scary words; it is the same six questions asked at every place data or
+control crosses a trust boundary. STRIDE names them: **S**poofing (can someone pretend to be a
+legitimate caller?), **T**ampering (can data be altered in transit or at rest?), **R**epudiation (could
+an actor deny an action because nothing recorded it?), **I**nformation disclosure (can data reach
+someone not entitled to it?), **D**enial of service (can the path be exhausted?) and **E**levation of
+privilege (can a caller gain rights it was not given?). Take one boundary in a RAG agent, "retrieved
+document text enters the model prompt": tampering is a planted instruction in a document (indirect
+prompt injection); information disclosure is the model quoting a passage the user may not see;
+elevation of privilege is the injected instruction causing a tool call with the agent's broader
+credentials; repudiation is an action with no log tying it to a user and a source document. Each
+answer points to a control, which is exactly what the reviewer wants to see written down. The method
+works *because* boundaries are finite and enumerable, while "think of attacks" is not.
+
+### The architecture half
+An architecture review board asks questions a security reviewer may not: does the design use approved
+technologies and integration patterns, or does it introduce a new database the customer's operations
+team has never run? What are the availability target and the recovery point and time objectives, and
+does the design meet them? Who operates it, and does its monitoring land in their tooling? What does it
+cost at expected volume, and how does that scale? How would they leave: can data and indexes be
+exported if the vendor is replaced? These questions exist *because* the customer will live with the
+system long after the project team moves on, so fit with their estate matters as much as its
+internal elegance.
 
 ### AI-specific questions to prepare for
 Reviewers increasingly ask: can a document in the index instruct the model to leak other documents? Does
@@ -94,8 +120,10 @@ SharePoint and can draft, but not send, emails. The pre-read has a container dia
 diagrams (indexing and query), an access matrix and a threat model. The review produces five findings:
 
 1. **High:** the indexing service account can read all SharePoint sites, so retrieval would ignore
-   per-user permissions. Fix before go-live: retrieval filters by the user's group memberships synced from
-   the identity provider, and the indexer's scope is reduced to the approved site collections.
+   per-user permissions. Fix before go-live: each chunk carries the source document's access list captured at
+   index time, retrieval filters by the user's group memberships synced from the identity provider, and the indexer's scope is reduced to the approved site collections. The residual risk,
+   noted in the finding, is staleness: a permission revoked in SharePoint still applies in the index
+   until the next sync, so the sync interval becomes a documented, agreed number.
 2. **High:** full prompts and retrieved passages are written to the vendor-hosted trace store. Fix before
    go-live: traces stay in the bank's log platform; vendor telemetry receives only metadata.
 3. **Medium:** indirect prompt injection through a malicious document could make the assistant produce
@@ -103,8 +131,9 @@ diagrams (indexing and query), an access matrix and a threat model. The review p
    red-team results on injection are attached as evidence.
 4. **Medium:** no documented response if the model provider changes the model version. Fix by date:
    pin the model version and add a regression eval gate before upgrades.
-5. **Low:** TLS 1.2 is allowed on the internal ingress. Risk accepted by the bank's security lead with a
-   review in six months.
+5. **Low:** the internal ingress still accepts TLS 1.2 with legacy CBC-mode cipher suites, while the
+   bank's standard requires AEAD-only suites. Risk accepted by the bank's security lead with a review in
+   six months.
 
 Two highs are closed within two weeks, with evidence (a permission-filter test showing user A cannot
 retrieve user B's restricted file, and a log-flow screenshot). The board approves with conditions on

@@ -5,6 +5,7 @@ name: SAML SSO
 kind: concept
 difficulty: advanced
 est_minutes: 17
+status: reviewed
 related:
   - enterprise-integration/sso-iam-integration
   - enterprise-integration/scim-provisioning
@@ -71,9 +72,30 @@ Each check exists *because* skipping it enables a known attack:
 - `Issuer` matches the tenant's IdP, preventing one customer's IdP from asserting into another's workspace.
 - `Audience` equals your entity ID, so an assertion minted for another SP cannot be replayed at you.
 - `Recipient` equals your ACS URL and the time window holds with small clock skew.
-- `InResponseTo` matches a pending request ID, and assertion IDs are recorded until expiry to reject replays.
+- `InResponseTo` matches a request ID that *this browser session* started, and assertion IDs are recorded
+  until expiry to reject replays. Binding to the session, not to a global set of pending IDs, matters
+  *because* otherwise an attacker can start a login, then feed their own valid response into a victim's
+  browser and sign the victim in as the attacker (login CSRF).
 - If you accept IdP-initiated SSO (no `AuthnRequest`, so no `InResponseTo`), you lose request correlation;
   many teams disable it or accept it only with strict replay caching.
+
+### Parsing, encryption, RelayState and logout
+- **Parse defensively.** The response is attacker-controlled bytes until the signature checks out, and it is
+  parsed *before* that check. Disable DTDs and external entity resolution, *because* otherwise an XXE payload
+  can make your server read local files or call internal URLs during parsing.
+- **Read text nodes carefully.** In 2018 several SAML libraries were found to read only the first text node
+  of an element. An attacker who legitimately held `ana@acme.com.evil.com` at the IdP could insert a comment
+  into their own signed assertion, `<NameID>ana@acme.com<!---->.evil.com</NameID>`; the signature still
+  verified (canonicalization drops comments) but the SP read the user as `ana@acme.com`. Use a library version that has fixed this,
+  and read the full canonicalized text.
+- **Encrypted assertions.** The IdP can encrypt the assertion to the SP's public key so the browser cannot read
+  the attributes. You decrypt, then verify the signature on the decrypted assertion; encryption hides data but
+  does not authenticate it, so it never replaces the signature checks.
+- **RelayState.** The opaque value the SP sends with the request and gets back with the response, usually the
+  page to return to. Treat it as untrusted and accept only relative paths or an allow-list, *because*
+  redirecting to whatever it contains turns your login into an open redirect.
+- **Logout.** SAML Single Logout exists but depends on every party's front-channel redirects succeeding, and
+  is unreliable in practice. Do not rely on it for revocation; use short sessions and SCIM deactivation.
 
 ### Certificates
 IdP signing certificates expire and rotate. Support two active certificates per tenant during rotation,
@@ -96,6 +118,7 @@ def ts(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 def consume(xml: bytes, tenant: dict, pending_ids: set, seen_ids: set) -> dict:
+    # pending_ids: request IDs started by THIS browser session; seen_ids: shared, kept until expiry
     signed = XMLVerifier().verify(xml, x509_cert=tenant["idp_cert_pem"]).signed_xml
     a = signed if etree.QName(signed).localname == "Assertion" else signed.find("saml:Assertion", NS)
     if a is None:
@@ -104,13 +127,16 @@ def consume(xml: bytes, tenant: dict, pending_ids: set, seen_ids: set) -> dict:
     if a.findtext("saml:Issuer", namespaces=NS) != tenant["idp_entity_id"]:
         raise PermissionError("wrong issuer")
     cond = a.find("saml:Conditions", NS)
-    if not (ts(cond.get("NotBefore")) - SKEW <= now < ts(cond.get("NotOnOrAfter")) + SKEW):
+    nb = cond.get("NotBefore")                                # optional; NotOnOrAfter missing fails closed
+    if (nb and now < ts(nb) - SKEW) or now >= ts(cond.get("NotOnOrAfter")) + SKEW:
         raise PermissionError("outside validity window")
     if tenant["sp_entity_id"] not in [x.text for x in cond.iterfind(".//saml:Audience", NS)]:
         raise PermissionError("wrong audience")
     scd = a.find("saml:Subject/saml:SubjectConfirmation/saml:SubjectConfirmationData", NS)
     if scd.get("Recipient") != tenant["acs_url"] or scd.get("InResponseTo") not in pending_ids:
         raise PermissionError("wrong recipient or unsolicited response")
+    if now >= ts(scd.get("NotOnOrAfter")) + SKEW:             # bearer confirmation has its own expiry
+        raise PermissionError("subject confirmation expired")
     if a.get("ID") in seen_ids:
         raise PermissionError("replayed assertion")
     seen_ids.add(a.get("ID")); pending_ids.discard(scd.get("InResponseTo"))
@@ -141,6 +167,10 @@ metadata), but this checklist is what you should be able to point to in its conf
   rotates its signing certificate.
 - Skipping replay protection; the symptom is a captured `SAMLResponse` from browser history granting a new
   session hours later within a lax validity window.
+- Parsing the response with DTDs and external entities enabled; the symptom is a pen-test finding that the
+  ACS endpoint fetched an attacker-supplied URL or echoed local file contents in an error.
+- Following `RelayState` to any URL; the symptom is phishing links that pass through your genuine login page
+  and land on an attacker's site.
 - Server clock drift; the symptom is intermittent "assertion not yet valid" errors that appear only on some
   application nodes.
 

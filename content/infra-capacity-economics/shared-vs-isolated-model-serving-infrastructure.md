@@ -5,7 +5,7 @@ name: Shared vs isolated model-serving infrastructure
 kind: decision
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - infra-capacity-economics/inference-clusters
   - infra-capacity-economics/cost-allocation-by-tenant-and-feature
@@ -72,6 +72,24 @@ From cheapest to most isolated, each level buys a specific guarantee:
    the strongest compliance story (data residency, no shared control plane, independent blast
    radius) and the highest operating cost, because every platform component is duplicated.
 
+### The multiplexing arithmetic
+The saving from sharing has a precise form. With tenant loads Lᵢ(t) measured in concurrent
+sequences and a replica holding C sequences within the latency budget:
+
+```
+isolated replicas = Σᵢ ( ceil(max_t Lᵢ(t) / C) + spareᵢ )
+shared replicas   = ceil( max_t Σᵢ Lᵢ(t) / C ) + spare
+```
+
+Two effects separate them. Rounding: every isolated tenant pays for at least one whole replica (and
+its own spare) even if it peaks at a tenth of one. Multiplexing: the peak of the sum is lower than
+the sum of the peaks whenever tenants peak at different times; for many independent tenants, the
+aggregate's relative fluctuation shrinks roughly as 1/√N, so a large pool needs proportionally
+less headroom. The second effect is the one that flips. When tenants' peaks are correlated (all
+in one time zone, all driven by the same month-end process or the same upstream event), the peak
+of the sum approaches the sum of the peaks and sharing saves little beyond rounding and spares. So
+the input to this decision is a per-tenant load time series, not a per-tenant average.
+
 ### What is actually shared at each level
 Sharing a *replica* means sharing GPU memory: tenants' KV caches sit in the same pool of blocks,
 and the batch holds their sequences side by side. Within a correct engine, one sequence cannot read
@@ -104,8 +122,11 @@ Without attribution you cannot even argue about whether a tenant deserves dedica
 Score each tenant on four questions. Does their traffic shape threaten others (long contexts,
 bursty batch jobs)? Do they need guarantees others would violate (latency SLO, data separation,
 region)? Do they need a different model configuration? Would their dedicated capacity sit idle most
-of the day? Tenants with "yes" on the first three and "no" on the last get dedicated capacity; the
-rest live in the shared pool behind logical isolation. The platform ends up with a shared pool plus
+of the day? A "yes" to any of the first three is a reason for separation; a "no" to the last means
+that separation will be expensive. A contractual or regulatory requirement wins regardless of
+cost (and the cost goes on the contract); a traffic-shape problem is first attacked with logical
+isolation or a separate low-priority pool, and becomes dedicated capacity only when the tenant can
+fill it. Everyone else lives in the shared pool behind logical isolation. The platform ends up with a shared pool plus
 a short list of exceptions, each with a documented reason.
 
 ## Example
@@ -126,11 +147,15 @@ sequences within the latency budget.
 - **Hybrid:** one team runs nightly document batches with 60k-token prompts. In the shared pool
   those jobs would fill the KV cache during the batch window. Give that team a dedicated replica
   for batch (or route their batch traffic to a low-priority pool), keep their interactive traffic
-  in the shared pool. Total: 4 replicas, fairness preserved, the regulated team that asked for
-  "no shared GPU" is still not satisfied and needs level 4 or 5 with a cost line attached.
+  in the shared pool. Total: 4 replicas, fairness preserved. If one of the ten teams handles
+  regulated data and its compliance rule says "no shared GPU", none of this satisfies it: that
+  team needs level 4 or 5, at least two replicas of its own for N+1, and a cost line attached.
 
 The arithmetic that matters is peak-of-sum versus sum-of-peaks, and whether a tenant's shape
 breaks the shared pool. Whenever the second is true, the first stops mattering for that tenant.
+Run the same numbers with all ten teams peaking in the same hour: the combined peak is then close
+to 200 sequences, ceil(200 / 48) = 5 replicas plus a spare, and sharing saves 40% instead of 70%,
+almost all of it from rounding and shared spares rather than multiplexing.
 
 ## Trade-offs
 - Sharing raises utilization and lowers cost per token, but it removes latency isolation; the

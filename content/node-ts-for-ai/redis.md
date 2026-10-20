@@ -4,8 +4,8 @@ module: node-ts-for-ai
 name: Redis
 kind: tool
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 15
+status: reviewed
 related:
   - backend-fundamentals/redis
   - fastapi-for-ai/redis-caching
@@ -39,7 +39,10 @@ Redis sits in the gap: a network-attached data-structure library where `INCR`, `
 and `XADD` are single atomic operations measured in microseconds server-side, keys expire on their own,
 and memory is the only limit. The design choice that makes it work is single-threaded command
 execution: no locks, no partial updates, and a Lua script or `MULTI` block runs as one unit *because*
-nothing else can interleave. The cost of that choice is equally clear: one slow command (a `KEYS *`, a
+nothing else can interleave. One thread is enough *because* the data is in RAM, almost every command is
+O(1) or O(log n), and an event loop multiplexes thousands of client sockets, so the server spends its
+time executing commands rather than waiting; Redis 6 added optional I/O threads for reading and writing
+sockets, but command execution itself stays serial. The cost of that choice is equally clear: one slow command (a `KEYS *`, a
 huge `SMEMBERS`, a long script) stalls every client, and data that must survive a crash needs
 persistence configured deliberately rather than assumed.
 
@@ -85,7 +88,9 @@ and support Lua scripts, Cluster and Sentinel. Node-specific rules:
   `enableOfflineQueue` decide whether a command waits for reconnection or fails fast. On a request path
   you usually want fail-fast *because* a hung Redis should degrade the cache, not take down the API.
 - Namespace keys per tenant and per purpose (`t:{tenantId}:cache:{hash}`); hash tags in braces keep
-  related keys on one Cluster slot.
+  related keys on one Cluster slot. That matters for atomicity, not just locality: in Redis Cluster a
+  `MULTI` block or Lua script may only touch keys in a single slot and fails with `CROSSSLOT`
+  otherwise, which is also why BullMQ asks you to wrap a queue prefix in braces on Cluster.
 - Never block the event loop building huge payloads; values beyond a few hundred kilobytes belong in
   object storage with a Redis pointer.
 
@@ -95,6 +100,12 @@ and support Lua scripts, Cluster and Sentinel. Node-specific rules:
   explicitly marked cacheable; note that temperature 0 is not bit-for-bit deterministic on hosted APIs,
   so the cache *chooses* an answer rather than reproducing one) and store usage alongside so cost
   dashboards stay honest.
+- **Stampede protection**: when a hot cache entry expires, or after a deploy with a cold cache, many
+  identical requests miss at once and every one calls the model, so a single expiry can cost N paid
+  completions. The fix is single-flight: the first miss takes `SET llm:fill:{hash} 1 NX PX 30000` and
+  calls the model, the others poll the cache key briefly (or wait on a pub/sub message) before falling
+  back to their own call. Add random jitter to TTLs so entries written together do not expire
+  together; within one replica, a `Map` of in-flight promises keyed by hash deduplicates for free.
 - **Provider rate limit / semaphore**: a token bucket in Lua keyed by provider and model so N replicas
   together stay under the vendor's requests-per-minute and tokens-per-minute limits.
 - **Run state and locks**: `SET run:{id}:lock token NX PX 30000` to ensure one worker per run, released
@@ -160,6 +171,7 @@ export async function cachedComplete(req: { model: string; system: string; messa
 - Sharing one connection between pub/sub or blocking commands and normal commands; the symptom is an error that only subscriber commands may be used, or requests that hang behind a `BLPOP`.
 - No `error` listener on the client; the symptom is the whole Node process exiting on the first network blip with an unhandled `'error'` event.
 - Caching non-deterministic completions or hashing a request object with unstable key order; the symptom is stale or wrong answers served as hits, or a hit rate far below what the traffic suggests.
+- No stampede protection on an expensive cache: the symptom is a burst of identical provider calls (and a token-cost spike) at the moment a popular entry expires or right after a cache flush, even though the steady-state hit rate looks healthy.
 - Using `KEYS pattern` in production to find a tenant's keys; the symptom is latency spikes on every client while the scan runs. Use `SCAN` with a cursor or maintain an index set.
 - Lock release with a plain `DEL`; the symptom is worker A, whose lock expired during a long LLM call, deleting the lock worker B now holds, so two workers process one run.
 - BullMQ or locks on an instance configured with `allkeys-lru`; the symptom is jobs that vanish under memory pressure with no error anywhere.

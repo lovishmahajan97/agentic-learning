@@ -63,7 +63,9 @@ producing a fleet of workers that 500 on every request. At shutdown (for example
 server stops accepting new connections, waits for in-flight requests to finish (Uvicorn waits
 indefinitely unless `--timeout-graceful-shutdown` bounds it), then sends `lifespan.shutdown`, and
 the code after `yield` runs. Teardown therefore normally happens after
-requests have drained, which is why closing the shared client there is safe.
+requests have drained, which is why closing the shared client there is safe. A forced exit (a second
+Ctrl+C or signal) skips the lifespan shutdown, so teardown is best-effort: anything that must survive a
+crash, such as usage records, should be written as you go, not flushed only at shutdown.
 
 ### Writing it
 ```

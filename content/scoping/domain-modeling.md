@@ -5,7 +5,7 @@ name: Domain modeling
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - system-design/domain-driven-design-and-bounded-contexts
   - enterprise-integration/data-mapping-and-canonical-schemas
@@ -57,6 +57,12 @@ A **value object** is defined only by its attributes (an address, a money amount
 distinction matters for AI *because* extraction must resolve entities to an existing identifier (which
 customer is this email about?), while value objects only need to be parsed correctly.
 
+Identity resolution deserves its own design, because it is where extraction most often silently fails.
+Resolve in order of reliability: an exact key found in the text (a claim number matching the agreed
+pattern), then a deterministic lookup on strong attributes (policy number plus loss date), then fuzzy
+matching on weak ones (a name and a postcode), and finally ask a person. Record which rule matched,
+*because* a record linked by a fuzzy name match should be treated with less trust than one linked by key.
+
 ### 3. Map relationships and cardinality
 Record how entities relate: a policy has many claims, a claim has many coverage lines, a customer can
 hold several policies. Cardinality decides retrieval and reasoning: a question about "the customer's
@@ -72,6 +78,12 @@ Invariants always hold (a loss date is never after the report date; the payment 
 approved amount). Rules guide decisions (claims above a threshold need a second approver). Enforce
 invariants in code as validators, *because* a model can be asked to respect them but cannot be trusted
 to always do so.
+
+Some invariants span several entities: "the sum of payments across a claim's coverage lines never exceeds
+its approved amount" cannot be checked by looking at one line. DDD groups such entities into an
+**aggregate** with one root (the claim) through which all changes go, so the root can check the rule on
+every change. For an agent this defines the unit a tool should act on: expose `add_payment(claim_id, …)`
+on the claim, not a raw "update coverage line" tool that can break the total.
 
 ### 6. Draw bounded contexts
 Where the same word means different things in different parts of the organisation, do not force one
@@ -162,6 +174,9 @@ exact; binary floats cannot represent most decimal amounts and accumulate roundi
   outputs that are right for one department and wrong for another.
 - Enforcing invariants only through prompt instructions; the symptom is a rare but recurring output that
   violates a rule the business considers impossible, discovered by an auditor.
+- Giving an agent write tools on individual records inside an aggregate; the symptom is each update
+  passing its own validation while the combination violates a cross-record rule, such as payments
+  exceeding the approved total.
 - Modelling entities without identity resolution; the symptom is extracted records that name a customer
   or policy but cannot be linked to the system of record, so downstream steps fail.
 

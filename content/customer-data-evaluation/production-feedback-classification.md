@@ -4,8 +4,8 @@ module: customer-data-evaluation
 name: Production feedback classification
 kind: practice
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 15
+status: reviewed
 related:
   - evals/error-analysis
   - evals/llm-as-a-judge
@@ -73,6 +73,13 @@ any taxonomy, prompt or model change.
 High-confidence labels flow straight to dashboards and owners' queues. Low-confidence or high-severity
 items go to a human review queue, because those are where a wrong label is most costly.
 
+Be careful where "confidence" comes from. A number an LLM writes into its own JSON is a weak signal and
+is often poorly calibrated, so do not trust the 0.7 cut-off because it looks like a probability. Either
+calibrate it (on the SME-labelled sample, find the score above which labels are, say, 90% correct, and
+use that as the threshold) or derive confidence from agreement: classify each item two or three times,
+or with two different models, and send disagreements to humans. Agreement costs more tokens but is
+measurable.
+
 ### 6. Watch for taxonomy drift
 Track the share of "other" and of low-confidence items. When it rises, a new failure mode has appeared
 (a new document type, a new user population): do another round of open coding and revise the taxonomy,
@@ -82,6 +89,14 @@ with a version number so trends across versions are interpretable.
 Feedback comes from users who bother to give it, skewed negative and toward heavy users. Use it to find
 and rank failure modes, then estimate their true prevalence on a random sample of traffic before claiming
 "12% of answers have retrieval misses".
+
+Even on a random sample, the classifier's own errors distort the rate. For one category, with recall
+(true-positive rate) *r* and false-positive rate *f* measured against SME labels, the observed share
+*p_obs* relates to the true share *p* by `p_obs = r·p + f·(1 − p)`, so `p ≈ (p_obs − f) / (r − f)`.
+If the classifier flags 3% of a random sample as "unsupported claim" but only catches half of the real
+ones (*r* = 0.5) with a 1% false-positive rate, the true share is about (0.03 − 0.01) / 0.49 ≈ 4%: the
+dashboard understates the category by a quarter. The correction is only as good as the *r* and *f*
+estimates, which is one more reason to keep a labelled calibration sample per customer.
 
 ### Handle it as customer data
 Comments and traces contain personal and confidential information. Classification runs under the same
@@ -122,10 +137,19 @@ def classify(trace: dict, codebook: str, llm_json) -> dict:
             "owner": OWNER[label.category.value], "queue": "human" if needs_human else "auto"}
 ```
 
-Illustrative week: 1,400 negative signals for one customer. Classified, the largest groups are
-retrieval misses and outdated sources, and two-thirds of the outdated-source items cite one policy
-document the customer replaced last month. That is not a model fix at all: it is an ingestion and
-customer-content fix, found in a day instead of a month of anecdotes.
+The routing rule is deliberately asymmetric: severity 3 and above goes to a human whatever the
+confidence, because a confidently wrong label on a compliance failure costs far more than a reviewer's
+minute.
+
+Illustrative week (numbers invented for the walkthrough): 1,400 negative signals for one customer. About
+150 are not model failures at all (login problems, feature requests) and route straight to product or
+support. Of the rest, retrieval misses and outdated sources are the largest groups, and roughly
+two-thirds of the outdated-source items cite one policy document the customer replaced last month.
+Ranking by count alone would put that first anyway, but rank by count × severity and a smaller group of
+40 "unsupported claim" items about refund eligibility (severity 3: users acted on them) jumps the queue,
+and every one of them was sent to human review by the severity rule. Two fixes follow: re-ingest the
+replaced policy (an ingestion and customer-content fix, not a model fix) and add the 40 refund cases to
+the customer's regression suite before changing the prompt.
 
 ## Trade-offs
 - An LLM classifier handles free text and full traces with little setup, but costs tokens per item and
@@ -144,6 +168,8 @@ customer-content fix, found in a day instead of a month of anecdotes.
   any team's backlog.
 - Reporting overall classifier accuracy only; the symptom is a dashboard where a rare but critical class
   never appears because the classifier almost never predicts it.
+- Trusting the classifier's self-reported confidence as a probability; the symptom is a human-review
+  queue that rarely catches errors while confidently mislabelled items flow into owners' backlogs.
 - Treating feedback rates as prevalence; the symptom is alarming numbers that a random-sample audit of
   traffic does not reproduce.
 - Changing the taxonomy without versioning; the symptom is a trend chart with a sudden jump that is a

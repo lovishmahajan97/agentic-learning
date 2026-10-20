@@ -4,8 +4,8 @@ module: node-ts-for-ai
 name: Graceful shutdown
 kind: practice
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 15
+status: reviewed
 related:
   - fastapi-for-ai/graceful-shutdown-and-worker-draining
   - deployment/health-checks
@@ -50,8 +50,9 @@ of that against a deadline.
 
 ## How it works
 ### What the orchestrator does
-1. The pod is marked terminating; endpoint removal propagates to kube-proxy and ingress controllers
-   with a delay.
+1. The pod is marked terminating and is taken out of the Service's ready endpoints straight away,
+   whatever its readiness probe says; that removal then propagates to kube-proxy rules and ingress
+   controllers with a delay of typically a few seconds, during which they still route to the pod.
 2. The container's `preStop` hook runs, if any; a common one is `sleep 5` to let endpoint removal
    propagate before the signal arrives (the exec form needs a `sleep` binary in the image; recent
    Kubernetes versions also offer a built-in `sleep` preStop action). The hook's time counts against
@@ -66,12 +67,19 @@ deadline must be shorter than the grace period minus the `preStop` sleep, *becau
 wins and the work is lost anyway.
 
 ### The sequence inside Node
-1. **Flip readiness.** Make `/ready` return 503 immediately so any health-checked balancer stops
-   routing; keep `/live` healthy, *because* a failing liveness probe during shutdown would make the
-   orchestrator restart the container mid-drain.
+1. **Flip readiness, then keep serving briefly.** Make `/ready` return 503 immediately so any balancer
+   that health-checks the pod directly stops routing; keep `/live` healthy, *because* a failing liveness
+   probe during shutdown would make the orchestrator restart the container mid-drain. In Kubernetes the
+   readiness flip is not what removes the pod from rotation (termination already did); what closes the
+   502 window is continuing to accept requests for a few seconds while the endpoint removal propagates.
+   Do that with a `preStop` sleep, or, if you cannot change the manifest, an in-app delay before
+   `server.close()`, but not both, since each costs grace period.
 2. **Stop intake.** `server.close()` stops accepting connections. Since Node 19, `close()` also closes
    idle keep-alive connections; on older versions call `server.closeIdleConnections()` yourself. Keep
-   `keepAliveTimeout` short so balancers reconnect elsewhere. For BullMQ, `await worker.close()` stops
+   `keepAliveTimeout` short so balancers reconnect elsewhere. `close()` still waits for *active*
+   connections, and an SSE stream is never idle, so a server with open streams will not finish closing
+   until every stream ends; track open streams so the drain step can end them deliberately, and use
+   `server.closeAllConnections()` as the last resort when the deadline is near. For BullMQ, `await worker.close()` stops
    taking new jobs and waits for active ones; `worker.pause()` is the softer form. Cancel scheduled
    timers and polling loops.
 3. **Drain in flight.** Requests complete naturally. Streaming responses need a product decision:
@@ -132,6 +140,7 @@ let shuttingDown = false;
 async function shutdown(signal: string, code = 0) {
   if (shuttingDown) { console.warn("second signal, forcing exit"); process.exit(1); }
   shuttingDown = true; ready = false;               // 1. fail readiness first
+  await new Promise((r) => setTimeout(r, Number(process.env.DRAIN_DELAY_MS ?? 0)));  // keep serving while endpoints update; 0 if preStop sleeps
   const deadline = setTimeout(() => { console.error("drain timeout"); process.exit(1); }, 20_000).unref();
   console.log(`${signal}: draining`);
   try {
@@ -155,7 +164,7 @@ process.on("unhandledRejection", (e) => { console.error(e); void shutdown("unhan
 
 ## Trade-offs
 - Draining in-flight work avoids lost requests and duplicate jobs, but every second of drain delays the rollout; with long LLM streams the deadline has to be a product decision (finish, or cut with a resume token), not just a timeout value.
-- Failing readiness before closing the server gives balancers time to stop routing, but only if they probe frequently; where endpoint removal is slower than the probe interval, a `preStop` sleep is the cruder but more reliable fix.
+- Keeping the listener open for a few seconds after SIGTERM (a `preStop` sleep or an in-app delay) removes the propagation-window 502s, but those seconds come out of the grace period and slow every rollout; size the delay from how long your ingress or proxy actually takes to drop an endpoint, and drop it where the balancer deregisters targets before the signal arrives.
 - A hard internal deadline guarantees the process exits before SIGKILL and reports a non-zero code, but it cuts whatever is still running; keep it comfortably below the grace period and raise the grace period for worker pods rather than removing the deadline.
 - Closing BullMQ workers gracefully prevents stalls on every deploy, but with `concurrency: 10` and ten-minute jobs no sensible grace period suffices; the fix is per-chunk checkpoints so a re-run resumes, not a longer wait.
 - Flushing telemetry on shutdown preserves the most interesting spans, but a slow or unreachable collector can eat the whole deadline; give the flush its own short timeout.
@@ -188,23 +197,25 @@ timeline and the ordering of readiness, intake, drain, flush, close, exit.
 handful of stalled jobs, even though you added `process.on('SIGTERM', () => server.close(() =>
 process.exit(0)))`. Explain both symptoms and the full fix.
 **A:** The 502s come from the window between SIGTERM and the balancer learning the pod is gone: the
-server stopped accepting instantly while traffic was still routed to it, so fail readiness first and
-either wait for probes to notice or add a short `preStop` sleep, and keep the liveness probe passing.
+server stopped accepting instantly while proxies were still routing to it. Kubernetes has already
+removed the pod from the endpoints, so the fix is to keep serving for a few seconds while that
+propagates (a short `preStop` sleep, or an in-app delay before `server.close()`); fail readiness too
+for any balancer that probes the pod directly, and keep the liveness probe passing.
 The stalled jobs come from the worker never being closed: `server.close` only drains HTTP, so
 `process.exit` killed active jobs whose locks then expired and were re-run by the stall checker. The
-full sequence is: readiness to 503, `server.close()` (closing idle keep-alive connections) in parallel
+full sequence is: readiness to 503, a short delay, `server.close()` (closing idle keep-alive connections) in parallel
 with `await worker.close()`, `redis.quit()`, `pool.end()`, flush OpenTelemetry, then `process.exit(0)`,
 all under a deadline below the grace period, with a non-zero exit if the deadline fires. Verify the
 signal reaches Node at all: exec-form `CMD` so Node (or a forwarding init such as `tini`) is PID 1,
 not a shell.
 
 ## Quiz
-### Q: Why should readiness be failed before calling `server.close()` rather than relying on `close()` alone?
-- [ ] Because `server.close()` is synchronous and blocks the event loop
-- [x] Endpoint removal propagates asynchronously, so new connections may still arrive after the server stops accepting them, producing balancer errors
-- [ ] Because Kubernetes only sends SIGTERM after readiness fails
-- [ ] Because `server.close()` cannot be called while the readiness probe is passing
-> There is a window where traffic is still routed to a terminating pod; signalling not-ready (and optionally a `preStop` sleep) lets routing catch up before the listener closes, which is what removes the 502 burst.
+### Q: A Kubernetes pod calls `server.close()` the instant it receives SIGTERM and the load balancer logs a burst of 502s on every deploy. What removes the burst?
+- [ ] Making `server.close()` asynchronous so it does not block the event loop
+- [x] Continuing to serve for a few seconds, via a `preStop` sleep or an in-app delay, while endpoint removal propagates to the proxies
+- [ ] Failing the readiness probe first, because Kubernetes only removes a pod from endpoints after readiness fails
+- [ ] Calling `process.exit(0)` immediately so the pod disappears from endpoints faster
+> A terminating pod is removed from endpoints regardless of readiness, but proxies and ingress learn that asynchronously, so traffic keeps arriving for a few seconds; staying up through that window is the fix. Failing readiness helps only balancers that probe the pod directly.
 
 ### Q: Once you register a `process.on('SIGTERM', ...)` handler in Node, what changes?
 - [ ] Node forwards the signal to child processes automatically

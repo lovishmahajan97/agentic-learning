@@ -5,6 +5,7 @@ name: Data residency
 kind: concept
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - security-governance-compliance/data-classification
   - security-governance-compliance/pii-protection-dlp
@@ -33,8 +34,10 @@ EU's GDPR does not, in general, require data to stay in the EU; it restricts *tr
 European Economic Area unless the destination has an adequacy decision or safeguards such as standard
 contractual clauses are in place, with supplementary measures where the destination's law undermines
 them. The Schrems II judgment in 2020 invalidated the EU-US Privacy Shield on exactly that ground, which
-showed organisations that a transfer mechanism can disappear overnight. Other jurisdictions go further
-with localisation rules that require certain data to stay in-country, and sectors such as banking,
+showed organisations that a transfer mechanism can disappear overnight. Its successor, the EU-US Data
+Privacy Framework, received an adequacy decision in 2023 and has faced legal challenges of its own, so
+designs that depend on any single mechanism stay exposed. Other jurisdictions go further with
+localisation rules that require certain data to stay in-country, and sectors such as banking,
 health and public administration often add their own requirements. Many enterprise contracts simply say
 "customer data stays in region X" regardless of what the law allows.
 
@@ -87,7 +90,20 @@ For an LLM feature, list data at rest and in processing:
 
 ### Evidence
 Auditors and customers ask for a data-flow map, sub-processor list with locations, and proof that
-routing and retention settings are enforced. Generate this from configuration, not from a slide.
+routing and retention settings are enforced. Generate this from configuration, not from a slide. Where
+a transfer outside the EEA does happen under standard contractual clauses, the exporter is expected to
+assess whether the destination's law lets the clauses actually be honoured (a transfer impact
+assessment, in the spirit of the EDPB recommendations) and to record any supplementary measures. The
+data-flow map is the input to that assessment, so the two should be maintained together.
+
+### Why fail closed is the core engineering rule
+Most residency controls are configuration; the one that is genuinely an engineering decision is what
+happens under pressure. Capacity incidents, provider outages and new-model launches all create a reason
+to route somewhere else "just for now". A residency guarantee is only as strong as the weakest path a
+request can take, so the gateway must treat region as a hard constraint in routing (an ineligible
+endpoint is invisible, not a lower-priority option) and alert on any attempt to cross it. Testing this
+means deliberately making the in-region endpoint unavailable in staging and checking that requests
+fail or queue rather than succeed somewhere else.
 
 ## Example
 A German health-insurance customer requires that member data be stored and processed only in the EU, and
@@ -103,13 +119,13 @@ that the provider not retain prompts. The vendor's first draft architecture:
 | On-call engineers | India and US | production log access is a transfer |
 | Backups | cross-region to US | replicas of everything |
 
-Fixes, one per row: switch to the provider's EU-processing endpoint under a contract with zero data
+Fixes for the problem rows: switch to the provider's EU-processing endpoint under a contract with zero data
 retention, or self-host an open-weight model in the EU region if no such option is available; move
 tracing to an EU instance and redact member identifiers before export; restrict production data access
 to EU-based staff, with others seeing only redacted telemetry; change backups to a second EU region.
 Then make the gateway fail closed: if the EU endpoint is throttled, return an error or queue the request
 instead of falling back to the global endpoint. That last rule matters in practice, because a fallback
-added during an incident is the most common way a compliant design silently stops being compliant.
+added during an incident is a common way for a compliant design to silently stop being compliant.
 
 ## Trade-offs
 - Regional cells give clean residency guarantees but multiply operational cost and split capacity, which

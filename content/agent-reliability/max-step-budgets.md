@@ -4,7 +4,7 @@ module: agent-reliability
 name: Max-step budgets
 kind: pattern
 difficulty: core
-est_minutes: 12
+est_minutes: 15
 status: reviewed
 related:
   - agent-reliability/stopping-conditions-termination

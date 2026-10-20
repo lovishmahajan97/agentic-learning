@@ -5,6 +5,7 @@ name: Sandbox vs production environments
 kind: practice
 difficulty: core
 est_minutes: 13
+status: reviewed
 related:
   - enterprise-integration/enterprise-connectors
   - enterprise-integration/tenant-specific-configuration-and-feature-flags
@@ -40,8 +41,10 @@ The failures are specific. An agent that creates cases or sends emails cannot be
 production, because every test run would have real side effects on real customers, so you build against
 the sandbox. But the sandbox's data is a copy from weeks ago, may be a subset, and may be masked;
 prompts, retrieval settings and extraction rules tuned on it meet a different distribution in
-production. Record ids differ between the copy and the original, so an id you hard-coded in a prompt or
-a filter points at nothing in production. Integrations the customer disabled in the sandbox (outbound
+production. Ids drift apart: some platforms keep record ids when they copy production (Salesforce full
+and partial copies do), but anything created afterwards on either side, and every record in a developer
+sandbox, gets its own id, so an id you hard-coded in a prompt or a filter may work in UAT by coincidence
+and point at nothing, or at the wrong record, in production. Integrations the customer disabled in the sandbox (outbound
 email, callouts to other systems) silently work in production. The sandbox's API quota and performance
 are not production's.
 
@@ -57,7 +60,7 @@ merely discouraged.
 ### The environment matrix
 List your environments on one axis and the customer's on the other and fill in exactly one binding per
 row: development → developer sandbox, staging or UAT → the customer's UAT or full-copy sandbox,
-production → production. Never a diagonal. A binding is a versioned configuration artefact: base URL,
+production → production. No row ever points at two of theirs, and no two rows share one. A binding is a versioned configuration artefact: base URL,
 the *name* of the credential in the secret store (never the credential itself), whether writes are
 allowed, which index namespace ingested data lands in, and which identity provider issues tokens.
 Credentials are per binding *because* a customer's sandbox typically has its own connected app, API
@@ -70,8 +73,9 @@ store is the cross-wiring waiting to happen.
   tune prompts or thresholds on masked data alone: a name replaced by `Contact 00123` changes what an
   extraction prompt sees. Evaluate on a sample of real data under the customer's data agreement, or in
   shadow mode in production.
-- **Identifiers.** Record ids, picklist ids, user ids and object ids differ between a sandbox and
-  production. Reference everything by stable business keys or external ids, and resolve ids at runtime
+- **Identifiers.** Record ids, picklist ids, user ids and object ids cannot be assumed equal between a
+  sandbox and production: even where a copy preserves the ids that existed at copy time, records and
+  metadata created later on either side diverge. Reference everything by stable business keys or external ids, and resolve ids at runtime
   through metadata or lookups, never in configuration.
 - **Configuration drift.** Custom fields, validation rules and workflows move through the customer's
   own change process (change sets, transports, update sets), so a sandbox may be ahead of or behind
@@ -95,13 +99,22 @@ production secrets; production bindings reject sandbox hosts, so sandbox data ca
 production index. Ingested records are tagged with the binding they came from, which is what lets you
 prove later that no sandbox fixture sits behind a production answer.
 
+The inbound direction needs its own guard, because the customer's side can cross-wire too. A sandbox
+cloned from production inherits production's configuration, and that includes any webhook
+subscription, outbound message or notification rule that points at *your production receiver*. After
+the next refresh, sandbox test edits start arriving at your production ingestion endpoint looking like
+real events. An outbound host allow-list cannot see this. The fix is to authenticate the sender per
+binding: a separate webhook signing secret or receiver URL per customer environment, plus a check of the
+source instance identifier that most platforms put in the payload or headers, so that events from an
+unbound instance are rejected and counted rather than indexed.
+
 ### The promotion path
 Your changes (prompts, mappings, flags, connector settings) move development → staging → production as
 the same artefact with different bindings, aligned with the customer's release calendar. Sandbox
 refreshes are events to plan for: a refresh replaces the sandbox's data and typically invalidates
 credentials and seeded fixtures, so the staging integration breaks on the customer's schedule unless
-re-seeding is automated. Full-copy sandboxes can only be refreshed on a cadence measured in weeks, so a
-refresh is negotiated, not assumed.
+re-seeding is automated. Full copies are refreshed rarely (a Salesforce full sandbox, for example, can be
+refreshed at most once every 29 days), so a refresh is negotiated, not assumed.
 
 ### What only production can show
 Behaviour on the real data distribution, real volume, real permissions and real integrations. The
@@ -112,7 +125,7 @@ advance. The sandbox proves the integration is *correct*; these prove it is *rig
 ## Example
 A binding per environment, resolved from a single environment variable with no default, and a guard
 that fails loudly on any mismatch between the binding and the host it points at. `http` and `secrets`
-stand for your HTTP client and secret-store client.
+and `index` stand for your HTTP client, secret-store client and retrieval index.
 
 ```python
 import os
@@ -147,7 +160,7 @@ def request(method: str, path: str, body=None):
     if method != "GET" and not b.writes_allowed:
         raise PermissionError(f"writes are disabled in {b.ours}")
     return http(method, b.base_url + path, token=secrets.get(b.secret_ref), json=body,
-                headers={"X-Env-Pair": f"{b.ours}->{b.theirs}"})   # the pair appears in both sides' logs
+                headers={"X-Env-Pair": f"{b.ours}->{b.theirs}"})   # tags your logs (and theirs, if logged)
 
 def ingest(record: dict):
     b = binding()
@@ -174,11 +187,14 @@ when the two facts it knows (which binding, which host) disagree.
   production returns empty results or "record not found" on the first real request.
 - Defaulting the environment to production when the variable is unset; symptom: a developer's laptop or
   a misconfigured CI job writes into the customer's live system.
-- Forgetting that a sandbox refresh wipes seeded data and rotates credentials; symptom: staging tests fail
+- Forgetting that a sandbox refresh wipes seeded data and sandbox-only credentials; symptom: staging tests fail
   the morning after the customer's scheduled refresh with authentication errors that nobody's change
   explains.
 - Letting sandbox-ingested documents into the production index namespace; symptom: a production answer
   cites a test fixture or a months-old version of a policy.
+- Sharing one webhook receiver and signing secret across the customer's environments; symptom: after a
+  sandbox refresh, records with test names or obviously fake values appear in the production index,
+  and their source instance id is the sandbox's.
 - Treating "works in sandbox" as the release gate; symptom: the first production run hits a validation
   rule, an email trigger or an API limit that the sandbox did not have.
 
@@ -216,11 +232,12 @@ ensuring the development binding can never reach the production host.
 ## Quiz
 ### Q: Why must record ids captured in a sandbox never be hard-coded into prompts, filters or configuration?
 - [ ] Because sandbox ids are encrypted and cannot be read by the integration
-- [x] Because a sandbox is a separate copy whose ids differ from production, so the hard-coded value points at nothing after promotion
+- [x] Because ids of records and metadata created independently in each environment diverge, so a hard-coded value can resolve in UAT and point at nothing, or at the wrong record, after promotion
 - [ ] Because ids change every time the sandbox is queried through the API
 - [ ] Because production ids are longer and would overflow the prompt
-> A sandbox is a point-in-time copy with its own identifiers. Anything resolved by id must be looked up
-> at runtime through stable business keys or metadata, otherwise it breaks on the first production call.
+> Even where a copy preserves the ids that existed at copy time, anything created later on either side
+> gets its own id. Anything resolved by id must be looked up at runtime through stable business keys or
+> metadata, otherwise it can break on the first production call.
 
 ### Q: Which measure most reliably prevents a non-production deployment from writing to a customer's production system?
 - [ ] A code review checklist item reminding engineers to check the environment variable

@@ -5,7 +5,7 @@ name: OpenAPI contract testing
 kind: practice
 difficulty: core
 est_minutes: 14
-status: fact-checked
+status: reviewed
 related:
   - fastapi-for-ai/openapi-docs
   - fastapi-for-ai/testclient-plus-pytest-asyncio
@@ -49,9 +49,13 @@ as breaking or not, and fuzzes the implementation against its own declared contr
    the snapshot is updated in the same pull request, which forces the change to be visible in review.
 3. Classify the diff with a breaking-change tool (oasdiff and openapi-diff are common choices) against the
    last *released* schema, not just the previous commit. The rules follow from what an existing client
-   can tolerate:
-   - **Breaking for requests:** a new required field, a removed optional field the client sends, a
-     narrowed type or enum, a tighter constraint (`max_length` from 4096 to 1024).
+   can tolerate, and they are asymmetric: a server may *accept more* than before (a looser request schema)
+   and *promise more* than before (extra response fields, tighter guarantees), but never accept less or
+   promise less. Every rule below is that one principle applied to a direction:
+   - **Breaking for requests:** a new required field, a narrowed type or enum, a tighter constraint
+     (`max_length` from 4096 to 1024), and removing an optional field clients send. That last one is
+     sneaky: with Pydantic's default `extra="ignore"` the request still succeeds and the field is silently
+     dropped, so the client believes it set `temperature` when it did not, which is worse than a 422.
    - **Breaking for responses:** a removed field, a field becoming nullable or optional, a changed type.
    - **Usually safe:** a new optional request field, a new response field (if clients ignore unknown
      fields, the "tolerant reader" rule).
@@ -135,6 +139,9 @@ alongside the new name with a deprecation, or cut a new version.
   and flaky contract tests that fail differently on every run.
 - Accepting a red snapshot test by regenerating the file without reading the diff; the symptom is a
   breaking change that reaches clients with a green, "reviewed" pipeline behind it.
+- Installing a custom `RequestValidationError` handler that returns your own error envelope while the
+  schema still advertises FastAPI's automatic 422 `HTTPValidationError`; the symptom is the fuzzer flagging
+  a schema-conformance failure on nearly every invalid-input case.
 - Ignoring undocumented status codes the fuzzer reports, such as 401s or 403s raised by an auth
   dependency (FastAPI documents its own 422 automatically, but not these) or 500s on empty lists; the symptom is client SDKs that throw on responses their types say cannot happen.
 

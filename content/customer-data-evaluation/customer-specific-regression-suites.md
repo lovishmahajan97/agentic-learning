@@ -4,8 +4,8 @@ module: customer-data-evaluation
 name: Customer-specific regression suites
 kind: practice
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 15
+status: reviewed
 related:
   - evals/regression-tests
   - evals/golden-dataset
@@ -78,6 +78,16 @@ rates, because case difficulty cancels out. The gate has two parts:
   running production against itself a few times; cases that flip between identical runs are flaky and
   should be fixed or repeated, not gated on.
 
+### Power and many customers
+Two statistical facts shape the gate. First, McNemar only sees discordant pairs, so a small suite has
+little power: with 3 flips against and 0 for, the exact two-sided p is 0.25, so a pure significance gate
+waves through a change that broke three of a customer's cases and fixed none. That is why the blocking
+tier exists and why many teams add a practical floor ("no more than N net pass-to-fail flips") alongside
+the test. Second, a 40-customer fleet tested at p < 0.05 each will, on a harmless change, falsely block
+at least one customer on most releases (if the tests were independent, 1 − 0.95⁴⁰ ≈ 0.87). Either
+correct for it (a Holm or false-discovery-rate adjustment across customers) or treat a significant-but-
+small flip count as "inspect", not "block", and reserve hard blocks for blocking cases.
+
 ### Cost and cadence
 Cost is customers × cases × repetitions, so suites are tiered: a small smoke subset per customer on every
 pull request, the full suite nightly and before release. A failing customer can be held on the old
@@ -142,6 +152,9 @@ re-run before promoting.
   longer holds, and engineers learning to ignore failures as "probably stale".
 - Adding the incident case before the fix is verified, or with the wrong expected output; the symptom is
   a blocking case that fails on every candidate and gets silently downgraded to tracked.
+- Applying an uncorrected p < 0.05 gate to every customer in a large fleet; the symptom is that nearly
+  every release blocks some customer whose failing flips, on inspection, share no cause and vanish on
+  re-run, until the team stops trusting the gate.
 - Treating customer suites as shared fixtures; the symptom is one customer's documents appearing in
   another customer's test logs or in a training set, which is a data-handling breach.
 

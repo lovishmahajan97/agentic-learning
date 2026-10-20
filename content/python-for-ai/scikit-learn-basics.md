@@ -5,7 +5,7 @@ name: scikit-learn basics
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - ml-fundamentals/train-test-leakage
   - ml-fundamentals/classification
@@ -72,6 +72,24 @@ Grouped splitters (`GroupKFold`) keep all rows of one customer or conversation o
 prevents near-duplicate leakage. The concepts themselves (leakage, splits, imbalance) are covered in
 depth in the ML fundamentals module; here the point is that the library encodes them.
 
+### What the standard text baseline computes
+Knowing the math tells you what the baseline can and cannot learn. `TfidfVectorizer` turns each
+document into a sparse vector with one dimension per vocabulary term (and n-gram). The weight of term
+*t* in document *d* is `tf(t, d) × idf(t)`, where with the default `smooth_idf=True`,
+`idf(t) = ln((1 + n) / (1 + df(t))) + 1`, *n* is the number of training documents and *df(t)* the number
+containing *t*. Rare terms get large weights because they discriminate; terms in every document get
+weight near 1. `sublinear_tf=True` replaces raw counts with `1 + ln(tf)` so a word repeated ten times
+does not count ten times, and each row is then L2-normalized so long tickets do not dominate. Both the
+vocabulary and *df* are learned state, which is exactly why fitting the vectorizer on test documents
+leaks.
+
+`LogisticRegression` then learns one weight per (class, feature) and scores a document as
+`z_k = w_k · x + b_k`; for multiclass it applies a softmax, `p_k = exp(z_k) / Σ_j exp(z_j)`, and
+`predict` returns the argmax. Fitting minimizes log-loss plus an L2 penalty whose strength is `1/C`, so
+a smaller `C` means stronger regularization, which matters when there are far more n-gram features
+than tickets. The model is linear in word evidence: it cannot represent negation or word order beyond
+the n-grams you gave it, which is the boundary where embeddings or an LLM start to earn their cost.
+
 ### Metrics and baselines
 `sklearn.metrics` provides `classification_report`, `confusion_matrix`, `f1_score`, `roc_auc_score`,
 `precision_recall_curve` and regression metrics, and many LLM eval harnesses call them underneath
@@ -79,7 +97,8 @@ rather than reimplementing them. `DummyClassifier` gives the majority-class base
 
 ### What it is not
 It runs on CPU, mostly in memory, with no GPU deep learning. Persisting a model with `joblib` or pickle
-ties it to the library version that saved it, and loading untrusted pickles executes code.
+ties it to the library version that saved it, and loading untrusted pickles executes code; the `skops`
+format exists to load models without arbitrary code execution when artifacts cross a trust boundary.
 
 ## Example
 An intent classifier for support tickets, the kind of baseline you build before deciding an LLM router

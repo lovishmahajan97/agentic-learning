@@ -5,6 +5,7 @@ name: Deployment readiness reviews
 kind: practice
 difficulty: core
 est_minutes: 14
+status: reviewed
 related:
   - deployment/security-and-architecture-reviews
   - deployment/uat
@@ -67,6 +68,13 @@ result, a screenshot of an alert firing in staging, the ticket where security si
 *because* "done" is the cheapest word to say and the most expensive to be wrong about. An item without
 evidence is treated as not done.
 
+For AI systems, evidence must also be pinned to the configuration that is actually deploying. Record a
+fingerprint of the release (model identifier, prompt version or hash, retrieval config, index build,
+tool list) and attach it to every eval and load-test result, *because* an eval run on last week's prompt
+is evidence about a different system. If the fingerprint on the evidence does not match the release
+candidate, the item reverts to not done, which is exactly how the "passed, but on last month's index" gap
+from above gets caught mechanically instead of by luck.
+
 ### 3. Classify every item
 Items are **blocking** (no launch without them, e.g. rollback works, PII is not logged) or
 **non-blocking** (launch can proceed if a gap is accepted). A non-blocking gap becomes a **waiver**: a
@@ -74,6 +82,12 @@ named risk owner, a compensating control, and an expiry date. Waivers expire *be
 exceptions without dates become permanent.
 
 ### 4. Decide and record
+Decision rights are fixed before the meeting: who chairs, who decides, and which owners hold a veto on
+their blocking items (security on data handling, the operating team on operability). Writing this down
+matters *because* a review where the most senior person present decides everything collapses back into
+the "tech lead decides" failure, just with more attendees. The people who will carry the consequences,
+usually the team taking the pager and the business owner, must be among the deciders, not the audience.
+
 The meeting is short when the prep is good: walk the open items, not the green ones. Outcomes are *go*,
 *conditional go* (launch with listed waivers), or *no-go* with the specific items that must change. The
 decision and its waivers are written down, because when an incident happens in week two, the first

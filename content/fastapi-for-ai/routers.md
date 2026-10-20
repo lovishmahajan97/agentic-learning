@@ -5,7 +5,7 @@ name: Routers (APIRouter)
 kind: pattern
 difficulty: intro
 est_minutes: 11
-status: fact-checked
+status: reviewed
 related:
   - fastapi-for-ai/dependency-injection
   - fastapi-for-ai/middleware-ordering
@@ -56,7 +56,11 @@ app factory).
 Dependencies are the important one: `dependencies=[Depends(require_api_key)]` on the router runs that
 dependency for every route in the group, before the endpoint, so authorization is a property of the
 group rather than of each author's memory. Order of resolution is app-level dependencies, then router
-dependencies (outer router first, then nested), then the route's own.
+dependencies (outer router first, then nested), then the route's own. Values returned by dependencies in a
+`dependencies=[...]` list are discarded, because there is no parameter to bind them to: they exist for side
+effects (raise 401, record a rate-limit hit). If a handler also needs the value, such as the current user,
+declare the same dependency as a parameter; FastAPI caches each dependency once per request, so it still
+runs once.
 
 ### Nesting
 A router can include another router: `v1.include_router(chat.router, prefix="/chat")` then
@@ -77,7 +81,9 @@ The app's route table is checked in insertion order and the first path that matc
 matching happens before parameter validation, so `/models/{model_id}` declared before `/models/latest`
 captures `latest` as an id and then fails validation (422) or looks up a model called "latest".
 Literal paths must be registered before parameterised siblings, including across routers, which makes
-the order of `include_router` calls part of your API's behaviour.
+the order of `include_router` calls part of your API's behaviour. A second defence is a Starlette path
+convertor: `/models/{model_id:int}` only matches digits, so `latest` fails the *match* rather than the
+validation, and routing moves on to the next route instead of returning 422.
 
 ## Example
 A small AI service split into feature routers, with versioning by prefix and an admin group protected

@@ -4,8 +4,8 @@ module: scoping
 name: Pilot → production plan
 kind: practice
 difficulty: advanced
-est_minutes: 14
-status: fact-checked
+est_minutes: 16
+status: reviewed
 related:
   - scoping/rapid-prototyping-poc
   - scoping/productionization
@@ -48,15 +48,42 @@ A common progression is PoC → pilot → limited rollout → general availabili
 and answers a different question: feasibility; real-workflow impact; operability at scale; full adoption.
 Name the question for each stage *because* a stage without a question has no natural end.
 
+AI systems usually need a second axis besides exposure: *autonomy*. A system can run in **shadow mode**
+(it produces outputs that are logged and scored but never shown or used), then **assist** (a human sees
+the suggestion and decides), then **act with review** (it acts and a human samples or can reverse), and
+only then **act alone** on the subset of cases where the evidence supports it. Each step up removes a
+human safety net, so each needs its own evidence. Shadow mode is the cheapest way to measure accuracy on
+live traffic with zero user impact; it cannot measure adoption or workflow effect, because nobody is
+using the output.
+
 ### 2. Measure the baseline before the pilot starts
 Capture the current metric (handle time, error rate, cycle time) for the pilot cohort and a comparison
 group *before* switching anything on. Without a baseline, any post-pilot number is uninterpretable,
 *because* you cannot separate the system's effect from seasonality or the attention of being piloted.
+With both groups measured before and during, the estimate is a difference-in-differences:
+
+```
+effect = (pilot_during − pilot_before) − (comparison_during − comparison_before)
+```
+
+The second term removes whatever moved both groups at once (a quiet season, a policy change, a new
+ticket mix), which a plain before/after comparison silently credits to the system.
 
 ### 3. Choose the cohort deliberately
 Pilot cohorts tend to be enthusiastic volunteers, which inflates results. Include at least some typical
 users, and if possible keep a comparable group without the tool. Size the cohort so the metric can move
-detectably within the pilot's duration.
+detectably within the pilot's duration. A common rule of thumb for comparing two group means at 95%
+confidence and 80% power is
+
+```
+n per group ≈ 16 × σ² / δ²      (σ = per-unit standard deviation, δ = effect you must detect)
+```
+
+Two corrections matter in practice. The unit is whatever you assign the tool to: if whole teams get it,
+outcomes within a team are correlated and the effective sample is much closer to the number of teams
+than the number of tickets, so a two-team pilot can show a large effect that is partly just "team A is
+faster". And early weeks carry a novelty effect, as users try the tool eagerly or slowly at first, so
+plan enough duration to see the weekly trend settle rather than reading the first fortnight.
 
 ### 4. Write success, guardrail and exit criteria
 - **Success metrics:** the business outcome the system is meant to move.
@@ -100,8 +127,12 @@ A support-ticket drafting assistant for an insurer's customer service team. All 
 - **Production-gap list, run in parallel:** SSO and role mapping (IT, 3 weeks), privacy review of
   prompt logging (legal, 4 weeks), monitoring dashboards and alerts (platform team), runbook and on-call
   rota (support engineering), training for 400 agents (enablement), cost centre for inference (finance).
-- **Week 6 result:** handle time 9.1 minutes vs. 10.8 in the comparison teams (−16%); audit pass rate
-  91%; CSAT 4.2. Go decision. Rollout to 25%, then 100% over six weeks, with rollback if the audit pass
+- **Week 6 result:** handle time 9.1 minutes vs. 10.8 in the comparison teams; audit pass rate 91%; CSAT
+  4.2. The naive before/after reading is 11.0 → 9.1, a 17% cut. The difference-in-differences is
+  (9.1 − 11.0) − (10.8 − 11.0) = −1.7 minutes, about −15.5% of the baseline: the comparison teams also
+  got 0.2 minutes faster without the tool, and that part is not the system's doing. It clears the 15%
+  bar narrowly, and the weekly trend held steady across weeks 4–6, so it is not a fading novelty spike.
+  Go decision. Rollout to 25%, then 100% over six weeks, with rollback if the audit pass
   rate pooled over two consecutive weeks (400 tickets) drops below 88%. The rollback line sits below the
   90% exit bar on purpose: with a true rate of 91% and ±4-point weekly noise, a 90% trigger on a single
   week's sample would fire spuriously roughly a third of the time, while 88% on 400 pooled tickets is a
@@ -131,6 +162,11 @@ Because the gap list ran in parallel, production started two weeks after the dec
   handle times alongside rising escalations or complaints.
 - No named post-launch owner or budget, so the builders keep running it informally; the symptom is the
   pilot engineer still answering production questions six months later.
+- Reading the result in the first weeks while novelty is high; the symptom is a metric that improves
+  sharply in week one and then decays week over week toward the baseline.
+- Jumping straight from assist to autonomous action because the pilot accuracy looked good; the symptom
+  is errors reaching customers that a reviewer used to catch silently, visible as rising complaints with
+  no change in measured model accuracy.
 
 ## When to use
 Write the plan when a PoC has passed and before the pilot starts, because baseline measurement and

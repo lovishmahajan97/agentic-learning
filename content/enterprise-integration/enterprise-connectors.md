@@ -5,6 +5,7 @@ name: Enterprise connectors (Salesforce, SAP, ServiceNow, SharePoint, Confluence
 kind: pattern
 difficulty: core
 est_minutes: 18
+status: reviewed
 related:
   - enterprise-integration/incremental-synchronization-and-cdc
   - enterprise-integration/webhooks
@@ -79,8 +80,35 @@ pipeline (chunking, embedding, ACL-aware retrieval, tool calling) should not car
   Confluence combines space permissions with page restrictions that inherit down the page tree; Jira uses
   project permission schemes plus optional issue security levels.
 - **Slack.** The Web API (`conversations.history`, `conversations.replies`) for backfill, the Events API for
-  live changes, with method-specific rate-limit tiers. Visibility is channel membership, which changes often,
-  and private channels and DMs are only visible to apps that have been added or granted the right scopes.
+  live changes, with method-specific rate-limit tiers. Slack has tightened history-read limits for some
+  classes of apps (the 2025 changes for apps not distributed through its Marketplace), so check the
+  current limits for your app type before sizing a backfill. Visibility is channel membership, which changes
+  often, and private channels and DMs are only visible to apps that have been added or granted the right scopes.
+
+### From source principals to people
+The ACL a connector captures is written in the source's own vocabulary: SharePoint and Teams use Entra
+object IDs plus SharePoint site groups, Confluence and Jira use Atlassian account IDs and groups, Slack uses
+its own user IDs and channel membership, Salesforce uses user IDs, roles and public groups. None of these is
+the identity the user signs in with. The connector therefore also maintains a **principal crosswalk**:
+source principal ID to the IdP's immutable user or group ID, built from each source's user directory API
+and joined on the IdP object ID where the source records it (Microsoft sources do) or on a verified email
+where it does not. Source-local groups are expanded to members, nested groups recursively, *because* the
+retrieval filter can only test identities it knows. Two special cases need explicit modelling rather than
+dropping: sharing links ("anyone in the organization with the link", anonymous links), which grant access
+to a scope rather than to a listed principal, and guest or external users with no IdP account. A principal
+that resolves to nobody must fail closed (it grants nothing), not be ignored in a way that widens access.
+
+### Sizing the first crawl
+The initial backfill, not the steady state, decides the project plan. Take an illustrative SharePoint
+tenant with 2 million files: one content download plus one permissions call per file is about 4 million
+requests. At a sustained 10 requests per second (an illustrative rate; the real one depends on the
+source's throttling for your app and tenant) that is 400,000 seconds, roughly four and a half days, and
+every retry after a 429 extends it. The levers follow from the arithmetic: batch requests where the API
+allows it (Graph JSON batching groups up to 20 requests per call, though throttling still counts the
+individual requests), read permissions once per folder whose inheritance is intact instead of once per
+file, crawl the highest-value containers first so the pilot is useful before the crawl finishes, and make
+the crawl resumable by checkpointing per container. After the backfill, cost scales with the change rate,
+which is typically a small fraction of the corpus per day.
 
 ### Build, buy or use MCP
 Unified-API vendors and the AI platforms' own connector catalogues cover the common sources; building
@@ -120,7 +148,9 @@ def sync_drive(token: str, drive_id: str, saved_delta: str | None, index) -> str
                     "title": item["name"],
                     "url": item["webUrl"],
                     "modified": item["lastModifiedDateTime"],
-                    "acl": [p.get("grantedToV2") or p.get("grantedToIdentitiesV2") for p in perms],
+                    # sharing links carry a "link" facet with a scope instead of a named principal
+                    "acl": [p.get("grantedToV2") or p.get("grantedToIdentitiesV2")
+                            or {"link": p.get("link", {}).get("scope")} for p in perms],
                 })                                     # content download + parsing happens downstream
         if "@odata.nextLink" in page:
             url = page["@odata.nextLink"]              # more pages in this round
@@ -129,15 +159,23 @@ def sync_drive(token: str, drive_id: str, saved_delta: str | None, index) -> str
 ```
 
 Note what the code commits to: one permissions call per changed file (fine for incremental runs, expensive
-for a 2-million-file initial crawl, which is where batching and a separate permission-sync job come in).
+for a 2-million-file initial crawl, which is where batching and a separate permission-sync job come in;
+the permissions call also needs the same 429 handling as the delta call, omitted here for length).
+The ordering matters too: the `deltaLink` is persisted only after the last page is processed, so a crash
+mid-round replays the round from the previous token, and the upserts and deletes are idempotent by key,
+so replaying them is harmless.
+It also only re-reads permissions for items the delta reports: by default a delta round surfaces content and
+metadata changes, and a sharing change on a folder does not list every descendant whose effective access
+changed. Graph has request options for reporting sharing changes on business drives; without them, or in
+addition to them, run a periodic permission resync.
 
 ## Trade-offs
 - Copying content into your own index gives fast, rankable retrieval, but creates a second copy whose
   permissions and freshness you must keep in sync; federated live search through source APIs avoids that
   copy and flips the cost to latency and per-query rate limits.
 - Application-level service accounts make crawling simple, but they see more than any user, so you must
-  replicate ACLs; delegated user tokens enforce source permissions natively but only work while that user
-  has an active session.
+  replicate ACLs; delegated user tokens enforce source permissions natively but see only that one user's
+  slice and stop working when the user's refresh token or consent is revoked.
 - Buying a connector platform gets twenty sources quickly, but you inherit its permission fidelity and sync
   cadence; building wins when one source is business-critical and needs field-level control.
 - Syncing permissions at index time makes queries cheap, but permission changes lag by one sync cycle;
@@ -152,6 +190,10 @@ for a 2-million-file initial crawl, which is where batching and a separate permi
   show "access denied" in the source.
 - Treating broken permission inheritance as rare in SharePoint or Confluence; the symptom is a few
   sensitive folders indexed with their parent site's wider audience.
+- Joining source users to IdP users by display name or an unverified email; the symptom is ACL entries
+  that resolve to nobody (users see less than in the source) or to the wrong person after a name collision.
+- Dropping sharing-link permissions because they name no principal; the symptom is documents shared
+  "with the organization" being invisible to everyone, or, if mapped carelessly, visible to guests.
 - Promising a source (Teams messages, Slack DMs, a SAP module) before checking the API scope, approval or
   licence it needs; the symptom is a blocked project week three.
 
@@ -159,8 +201,10 @@ for a 2-million-file initial crawl, which is where batching and a separate permi
 Build or adopt a connector whenever an AI feature must read or act on a customer system more than once.
 For a one-off pilot, an export file may be enough; for production, insist on delta sync, deletion handling
 and permission capture from day one, because retrofitting ACLs onto a populated index means re-crawling it.
-Measure sync lag (source change to searchable), API calls per sync, permission-mismatch rate from spot checks,
-and items in error. In interviews, the expected depth is naming the five responsibilities and explaining
+Before committing to a timeline, size the backfill: item count times calls per item divided by the
+sustained rate the source will actually give you. Measure sync lag (source change to searchable), API calls
+per sync and share of the customer's quota, 429 rate, permission-mismatch rate from spot checks as
+restricted test users, unresolved-principal count, and items in error. In interviews, the expected depth is naming the five responsibilities and explaining
 how one specific source models permissions and change.
 
 ## Role lens

@@ -4,7 +4,7 @@ module: agent-reliability
 name: State persistence & conversation recovery
 kind: pattern
 difficulty: core
-est_minutes: 13
+est_minutes: 16
 status: reviewed
 related:
   - agent-reliability/durable-execution-and-checkpointing

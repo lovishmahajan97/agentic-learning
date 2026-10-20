@@ -5,6 +5,7 @@ name: Legacy system integration
 kind: pattern
 difficulty: core
 est_minutes: 16
+status: reviewed
 related:
   - enterprise-integration/enterprise-connectors
   - enterprise-integration/incremental-synchronization-and-cdc
@@ -62,14 +63,31 @@ named states, normalizes dates and time zones, and hides access-path details beh
 as `get_claim(id)`. Consumers, including LLM tools, see only that interface, *because* when the legacy
 system is eventually replaced, only this layer changes.
 
+Two encoding traps account for most "the numbers are wrong" incidents. Signed numeric fields stored as
+display digits (`PIC S9(5)V99` without `COMP-3`) carry the sign in the zone half of the last byte, so the
+final character looks like a letter or brace after conversion rather than a digit. And mixed records,
+text fields beside packed binary fields, must be transferred as binary and decoded field by field from
+the copybook, *because* a file-transfer step that converts the whole file from EBCDIC to ASCII rewrites the
+packed bytes as if they were characters and destroys them without any error.
+
 ### 3. Protect the legacy system
 Put a cache or replica in front of reads, a queue in front of writes, and explicit concurrency limits
-everywhere. Respect batch windows: schedule bulk extracts when the system says, and make agent tools return
+everywhere. Size the limit with Little's law: concurrent calls = arrival rate × call latency. If an agent
+feature generates an illustrative 20 lookups per second and each legacy transaction takes 1.5 seconds,
+about 30 calls are in flight at once; if the operations team will allow 10 concurrent sessions, you must
+cache, batch, or shed load, *because* the gateway will otherwise queue requests until user-facing
+timeouts fire and retries make it worse. Respect batch windows: schedule bulk extracts when the system says, and make agent tools return
 "system unavailable, try after 06:00" rather than hammering it.
 
 ### 4. Make writes safe
-Legacy transactions are rarely idempotent. Attach a client reference to every write, record it before
-sending, and check for it before retrying, so a timeout followed by a retry does not create two orders.
+Legacy transactions are rarely idempotent, and a timeout has three possible meanings: the request never
+arrived, it ran and the reply was lost, or it is still running. Retrying blindly is only safe in the first
+case. So attach a client reference to every write, record it in your own store before sending, and put it
+in a field the legacy system persists and can be queried by (a customer reference or batch reference
+field, agreed with the system's owners). After a timeout, look the reference up before retrying; if it
+exists, the write happened. If the system offers no queryable field, route writes through a single queue
+consumer and confirm them against the next extract, *because* only reconciliation can then tell you which
+in-doubt writes landed.
 
 ### 5. Migrate incrementally if replacing
 The strangler fig pattern routes one capability at a time from the legacy system to the new one behind a
@@ -96,10 +114,10 @@ def unpack_comp3(raw: bytes, scale: int) -> Decimal:
     for b in raw:
         nibbles += [b >> 4, b & 0x0F]
     sign = nibbles.pop()                       # final nibble
-    if any(n > 9 for n in nibbles):
+    if sign < 0x0A or any(n > 9 for n in nibbles):   # A-F are signs, 0-9 digits
         raise ValueError(f"corrupt packed field {raw.hex()}")
     value = int("".join(map(str, nibbles)))
-    if sign == 0x0D:
+    if sign in (0x0B, 0x0D):                   # D preferred negative, B alternate
         value = -value
     return Decimal(value).scaleb(-scale)
 
@@ -116,7 +134,8 @@ assert unpack_comp3(bytes.fromhex("1234567C"), 2) == Decimal("12345.67")
 assert unpack_comp3(bytes.fromhex("0000150D"), 2) == Decimal("-1.50")
 ```
 
-Reading the file as UTF-8 would produce garbage names and, worse, treating the packed bytes as text would
+Reading the file as UTF-8 would raise decode errors or produce garbage names and, worse, treating the packed
+bytes as text (or decoding them with `cp037`, which maps every byte to some character) would
 silently produce plausible-looking wrong balances, which is why the layout (the COBOL copybook) is the first
 artifact to request from the customer.
 
@@ -139,6 +158,8 @@ artifact to request from the customer.
   discovered at reconciliation.
 - Exposing raw legacy codes to the LLM as tool output; the symptom is the model guessing what status
   `07` means and confidently telling a customer the wrong thing.
+- Transferring mixed text-and-packed files in text mode, or letting a gateway convert code pages for the
+  whole record; the symptom is names that look fine while numeric fields are garbage or fail validation.
 - Assuming 24/7 availability; the symptom is agent tools failing every night during maintenance with
   unhelpful error messages.
 
@@ -146,8 +167,9 @@ artifact to request from the customer.
 Use these patterns whenever an AI feature must read from or write to a system you cannot change. Start by
 asking for the existing interfaces, the batch schedule, the record layouts and the capacity constraints,
 before writing code. Prefer read-only integration for a first release; add writes only through a path that
-runs the system's own business rules, with idempotency references. Measure data freshness, load placed on
-the legacy system and reconciliation mismatches. In interviews, explaining why you would not point an agent
+runs the system's own business rules, with idempotency references. Measure data freshness against the batch schedule, load placed on the legacy system (calls, concurrency,
+CPU where the owners can report it), in-doubt writes and how they resolved, parse rejects per extract, and
+reconciliation mismatches. In interviews, explaining why you would not point an agent
 at the mainframe database directly, and what you would do instead, is the core signal.
 
 ## Role lens
@@ -165,7 +187,8 @@ with no API, a nightly batch and a green-screen UI. How do you approach it?
 gateway, or a batch update file the system already ingests. Any of these runs the system's own validation.
 Prefer them over direct table writes, which bypass rules, and over screen automation, which is brittle.
 Wrap the chosen path in an anti-corruption layer with a domain operation like `update_contact(claim_id,
-address, ref)`, record the reference before sending so retries are idempotent, and queue requests so the
+address, ref)`, record the reference before sending and, after a timeout, look it up in the claims system before
+retrying, so an in-doubt write is never applied twice, and queue requests so the
 agent never overloads the system or calls during batch. If only a nightly file exists, make the agent say
 the change is scheduled, not done.
 

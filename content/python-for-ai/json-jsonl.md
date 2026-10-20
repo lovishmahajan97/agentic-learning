@@ -5,7 +5,7 @@ name: JSON / JSONL
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - prompting/structured-outputs-json-mode
   - python-for-ai/pydantic
@@ -74,6 +74,19 @@ append-only and flush per record or per batch; readers should report errors with
 record can be located, and decide explicitly whether to skip or stop. Compression composes cleanly:
 `gzip.open(path, "wt")` gives `.jsonl.gz` with the same line semantics.
 
+Three details decide whether the crash-isolation promise actually holds:
+- **What counts as a line.** Iterating a text file splits only on `\n` (and `\r\n`), which is what
+  JSONL means. `str.splitlines()` also splits on characters such as U+2028 and U+0085, which
+  `json.dumps(..., ensure_ascii=False)` leaves unescaped inside strings, so reading a file via
+  `text.splitlines()` can cut a valid record in half. Iterate the file, or split on `"\n"` explicitly.
+- **The torn last line.** A writer killed mid-write leaves a final line with no trailing newline that
+  usually fails to parse. A reader resuming a job should tolerate exactly that case (drop it, then
+  truncate or rewrite the file) and treat a bad line anywhere else as real corruption.
+- **One writer per file.** Several processes appending to the same file can interleave their bytes
+  when records are large or the file lives on network storage, producing lines that are two half
+  records. Give each worker its own shard (`results-00.jsonl`, `results-01.jsonl`) or funnel writes
+  through one process.
+
 ### Where you meet it
 OpenAI-style fine-tuning datasets are JSONL with one `{"messages": [...]}` object per line; the OpenAI
 Batch API takes a JSONL file of requests, each with a `custom_id` so results can be matched back; eval
@@ -141,6 +154,8 @@ refuses to parse.
 - Calling `f.readlines()` or building `[json.loads(l) for l in f]` on a multi-gigabyte JSONL file; the
   symptom is memory climbing to several times the file size (parsed Python objects are far larger than
   their text) and the process being OOM-killed. (`json.load` on JSONL fails outright with "Extra data".)
+- Reading with `path.read_text().splitlines()`; the symptom is a `JSONDecodeError` ("Unterminated
+  string") on a handful of records that contain U+2028 or similar characters, often scraped web text.
 - Opening files without `encoding="utf-8"`; the symptom is `UnicodeDecodeError` or mojibake on
   Windows or in containers with a non-UTF-8 locale.
 - Passing numpy types into `json.dumps`; the symptom is `TypeError: Object of type float32 is not JSON

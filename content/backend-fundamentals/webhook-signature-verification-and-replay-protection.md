@@ -5,7 +5,7 @@ name: Webhook signature verification & replay protection
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - backend-fundamentals/api-and-sdk-integration
   - backend-fundamentals/message-queues
@@ -87,10 +87,10 @@ many parties verify without any of them being able to forge.
 The timestamp only helps *because* it is inside the signed content: an attacker who edits it breaks
 the MAC. A timestamp sent in an unsigned header, or no timestamp at all (GitHub's scheme), gives no
 replay bound, so for those senders deduplication by delivery id is the only replay defence and its
-retention has to be long. The timestamp window turns "valid forever" into "valid for five minutes", which is still plenty for a
-double credit. So deduplicate by event id: `SET webhook:seen:{id} 1 NX EX <ttl>` in Redis, or an insert
-into a `processed_events(event_id UNIQUE)` table. Retention must cover the provider's retry horizon
-(often days), not just the tolerance window, *because* legitimate retries arrive later with the same
+retention has to be long. Where the timestamp is signed, the window turns "valid forever" into
+"valid for five minutes", which is still plenty for a double credit. So deduplicate by event id:
+`SET webhook:seen:{id} 1 NX EX <ttl>` in Redis, or an insert into a
+`processed_events(event_id UNIQUE)` table. Retention must cover the provider's retry horizon (often days), not just the tolerance window, *because* legitimate retries arrive later with the same
 id. Check whether your provider re-signs retries with a fresh timestamp; if it does not, the tolerance
 has to cover its retry schedule as well. The robust version puts the uniqueness insert in the same
 database transaction as the side effect, so either both commit or neither, and a crash between "marked

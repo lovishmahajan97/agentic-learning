@@ -4,8 +4,8 @@ module: adoption
 name: Exec communication
 kind: practice
 difficulty: core
-est_minutes: 12
-status: fact-checked
+est_minutes: 14
+status: reviewed
 related:
   - adoption/stakeholder-management
   - adoption/adoption-and-value-realization-measurement
@@ -54,13 +54,27 @@ needed: what is true, what changed, what question that raises, what you recommen
 Translate model metrics into the KPI the executive owns, against the baseline measured before deployment:
 "average handling time on long claims is down from 42 to 31 minutes" rather than "summary ROUGE improved".
 *Because* the executive's question is always "is this worth it", every number should connect to value,
-cost or risk.
+cost or risk. The translation is usually one line of arithmetic, and showing it makes the number
+checkable:
+
+```
+value per month   = volume × time saved per item × loaded cost per hour
+escaped errors    = volume × error rate × (1 − catch rate at review)
+```
+
+A per-item saving means little to an executive; "about 220 adjuster-hours a month" lets them compare it
+with the cost of the system and with their other options.
 
 ### 3. Make uncertainty and error rates concrete
 Express quality per volume and with consequence: "about 3 in 100 drafts need a material correction; all
 are caught at human review; zero reached customers this month". Give ranges when the sample is small,
 and say what would change the estimate. *Because* executives make risk decisions, they need to know the
-size and containment of the failure, not just the average.
+size and containment of the failure, not just the average. "3% error rate" sounds small; at 20,000
+drafts a month it is 600 corrections, and if review catches 95% of them, about 30 a month reach
+customers. Whether 30 is acceptable is the executive's decision, and they cannot make it from "97%
+accurate". Be explicit about the sample, too: zero failures in 50 cases is still consistent with a true
+failure rate as high as about 6% (the "rule of three" gives roughly 3/n as the upper 95% bound when no
+failures are seen), so say "no failures yet in 50 cases" rather than "no failures".
 
 ### 4. Ask for a decision explicitly
 When you need something, state the decision, the options, your recommendation, the cost of each, and the
@@ -72,10 +86,23 @@ Report risks while they are still yellow, with a mitigation. Before a steering m
 deliver difficult news, brief the sponsor one-to-one, *because* executives react badly to learning
 something in front of peers that they could have known earlier.
 
-### 6. Fix the format and cadence
+### 6. Fix the format, the cadence and the status rules
 A one-page update with a stable structure (headline, status with trend, KPI versus baseline and target,
 top risks, decisions needed) lets the reader compare week to week. Keep the detail in an appendix for
 those who want it.
+
+Define what each status colour means at the start, in terms the sponsor agreed: for example, green is
+"on track for the target date and KPI with no unmitigated risk", amber is "at risk, mitigation in
+place, no decision needed yet", red is "will miss without a decision from you". *Because* an undefined
+colour is chosen by the author's optimism, undefined status drifts toward green until it jumps to red,
+which is how watermelon reporting happens without anyone intending to mislead. Amber with a mitigation
+is a normal, healthy state for a pilot; reporting it is what earns belief in your greens.
+
+### 7. Match the channel to the decision
+A written pre-read works when the reader needs to think before deciding; a live discussion works when
+options must be negotiated; a two-line message works for a yes/no that is already pre-wired. Send
+pre-reads early enough to be read, and open the meeting with the decision, not a recap of the
+document.
 
 ## Example
 A hypothetical engineer drafts a steering update for the VP of Operations about an AI claims-summary
@@ -91,7 +118,8 @@ rewrite, using the pyramid structure:
 "**Bottom line:** the pilot is on track to hit its target, and I need a decision on OCR budget by 3
 November.
 **Value:** handling time on long claims is down from 42 to 31 minutes against a 30-minute target, across
-the 40 adjusters in the pilot.
+the 40 adjusters in the pilot. At about 1,200 long claims a month that is roughly 220 adjuster-hours a
+month (1,200 × 11 minutes).
 **Quality:** about 3 in 100 summaries need a material correction; all were caught at adjuster review and
 none reached a claimant.
 **Risk:** about one file in eight contains handwritten notes, which the system cannot read today, so
@@ -115,12 +143,16 @@ The technical details move to an appendix. (All figures are illustrative.)
 - Watermelon status (green outside, red inside) that hides problems until they explode, destroying trust in later updates.
 - Updates without an explicit ask, so blockers wait weeks because nobody realized a decision was needed.
 - Quoting a single accuracy number without volume, consequence or uncertainty, leading to over-confidence or panic.
+- Leaving status colours undefined, which shows up as a project reported green for weeks that turns red in a single update.
+- Claiming "no errors" from a small sample, revealed when the first production failures arrive and the executive feels misled.
 
 ## When to use
 Use this structure for any communication with someone who decides about funding, scope or risk but does
 not do the work: steering updates, escalations, go/no-go recommendations and quarterly value reviews. With
 peers who need detail, lead with the conclusion but include the technical depth. Measure success by
-whether decisions arrive on time and whether executives' understanding of status matches reality. In
+whether decisions arrive on time, whether executives can restate the status and the ask after reading
+(ask the sponsor to play it back), and whether their understanding of status matches reality: a red
+that was never preceded by an amber is a reporting failure, not just a project one. In
 interviews, you may be asked to explain a technical result to an executive; lead with the outcome and the
 ask, give one number tied to value, and state the main risk.
 

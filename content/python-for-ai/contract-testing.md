@@ -5,7 +5,7 @@ name: Contract testing
 kind: practice
 difficulty: advanced
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/test-doubles-mocks-fixtures
   - python-for-ai/integration-and-end-to-end-testing
@@ -63,7 +63,24 @@ then fails the provider's CI, in the commit that caused it, naming the consumer 
    "can I deploy" check blocks releasing a version that breaks a live consumer.
 
 The design choice that matters is direction: the consumer states only what it uses, so the provider
-learns exactly which fields are load-bearing and is free to change everything else.
+learns exactly which fields are load-bearing and is free to change everything else. The same
+mechanism covers asynchronous messages, where there is no request to replay: the consumer records the
+event payload it expects (a `document.indexed` event on a queue), and the provider's verification
+calls the producing code and checks the message it would publish.
+
+### Evolving a contract without a flag day
+Contracts make breaking changes visible; they do not make them free. Renaming `text` to `content`
+safely is an expand-and-contract sequence, and the broker's version matrix is what tells you when
+each step is allowed:
+1. **Expand.** The provider returns both `text` and `content`. Every existing contract still passes,
+   because extra fields are allowed.
+2. **Migrate.** Each consumer switches to `content` and publishes a new contract that no longer
+   mentions `text`.
+3. **Contract.** The provider removes `text`. Verification now passes only if *every deployed*
+   consumer version has stopped relying on it, so the "can I deploy" check blocks the removal until
+   the last old consumer has actually been redeployed, not merely merged.
+The order matters because services deploy independently: at any moment several versions of each are
+live, and the contract that must hold is the one between the versions actually running together.
 
 ### Provider-driven, schema-based contracts
 The alternative is that the provider publishes a schema (OpenAPI, JSON Schema, protobuf) and both
@@ -123,7 +140,11 @@ def test_retrieval_honours_agent_contract():
         assert body.hits, "provider state promised at least one hit"
 ```
 
-If the retrieval team renames `text` to `content`, this test fails in their pull request, while adding
+On the consumer side, the matching test runs the agent's real retrieval adapter against a stub
+server that returns a response built from the same interaction, so the contract cannot list a field
+the adapter does not parse, or omit one it does. That pairing is what Pact's mock provider automates.
+
+If the retrieval team renames `text` to `content`, the provider test fails in their pull request, while adding
 a new `chunk_id` field passes because the consumer ignores extras. `strict=True` matters: Pydantic's
 default lax mode would coerce a `score` that became the string `"0.9"` back into a float, and the
 retype would pass verification while breaking any consumer that does not coerce. In a real setup the
@@ -148,6 +169,8 @@ consumer publishes the JSON Schema (or Pact matchers) rather than a Python class
   only ever verify the "no results" path while the populated path breaks unnoticed.
 - Treating a vendor LLM API as stable because your mocks are; the symptom is a production parse error
   after an SDK or response-format change that no test of yours could have seen.
+- Removing a field as soon as consumers' main branches stop using it; the symptom is an outage in
+  the window before the last consumer is redeployed, which a deploy gate on deployed versions prevents.
 - Verifying against the main-branch contract instead of the deployed one; the symptom is a provider
   release that passes CI and still breaks the consumer version currently running in production.
 

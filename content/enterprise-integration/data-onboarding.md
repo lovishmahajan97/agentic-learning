@@ -5,6 +5,7 @@ name: Data onboarding
 kind: practice
 difficulty: core
 est_minutes: 14
+status: reviewed
 related:
   - scoping/data-access-and-permissions-discovery
   - enterprise-integration/data-ingestion-from-client-systems
@@ -51,7 +52,11 @@ List the sources the use case needs (from discovery), and for each: owner, syste
 change rate, sensitivity classification, and how it can be reached. Agree which subset is in scope
 first, usually the slice that serves the pilot use case, *because* onboarding everything before proving
 value multiplies cost and approval work. Confirm the legal basis: data processing agreement, residency
-constraints, whether PII may leave the customer boundary, retention rules.
+constraints, whether PII may leave the customer boundary, retention rules. Record each source's
+**permission model** too (document ACLs, sharing groups, record-level visibility rules), because an
+assistant that ingests content without its permissions will show a user what the source would have
+hidden from them, and permissions are much harder to retrofit than to ingest alongside the content from
+the first load.
 
 ### 2. Access and a representative sample
 Get read access with a dedicated, least-privilege service identity, ideally against a sandbox or replica
@@ -73,13 +78,23 @@ questions, because only they know what `STATUS=7` means.
 Load the sample end to end (parse, map, chunk, embed or index) into a non-production tenant and have
 the customer's subject-matter experts check it: are these records right, are these answers grounded in
 the right documents, is anything missing. This is where a small golden set often starts, *because* the
-same experts who validate the data can write the first evaluation questions.
+same experts who validate the data can write the first evaluation questions. Validate permissions in the
+same pass: log in as two or three seeded users with different roles and confirm each sees only what the
+source shows them.
 
 ### 6. Backfill, then incremental sync
 Run the full historical load in batches with throttling (the source is someone's production system),
-checkpointing so a failure resumes rather than restarts, and reconciling counts per batch. Then switch
-to incremental synchronization, and keep a periodic reconciliation running, because the backfill is a
-snapshot and the source keeps changing.
+checkpointing so a failure resumes rather than restarts, and reconciling counts per batch.
+
+The order of the hand-over to incremental sync matters, because a large backfill takes days and the
+source keeps changing while it runs. If you start the change feed only after the backfill finishes,
+every record edited during the backfill, after its batch was read, is lost: the backfill saw the old
+version, and the feed starts too late to see the new one. So record the change-feed position first (a
+CDC log position, or a `modified_at` watermark taken *before* the first batch), run the backfill, then
+replay changes from that recorded position. Records touched in both arrive twice; that is safe as long as
+the apply step is idempotent and keeps the higher source version. Keep a periodic reconciliation running
+afterwards, because the backfill is a snapshot and the change feed can still miss deletes and lost
+events.
 
 ### 7. Sign-off and handover
 Exit with an agreed acceptance record: coverage (records and documents loaded versus in scope), reject
@@ -109,10 +124,14 @@ OCR. Protected files are reported back, because only the customer can supply pas
 summaries and 40 question-answer pairs; they find that adjuster notes are attached to the wrong claim
 for one region, traced to a join on a non-unique key. Fixed and re-run.
 
-**Weeks 5 to 6, backfill and sync:** the full in-scope set loads in nightly batches, throttled to stay
-off peak hours, with per-batch count reconciliation; then CDC replaces the batches. The sign-off record
-lists coverage of 99.1% of in-scope records, the 6% of protected files as excluded with a named owner,
-and a nightly reconciliation job.
+**Weeks 5 to 6, backfill and sync:** the CDC connector is started and its log position recorded before
+the first batch runs. The full in-scope set then loads in nightly batches, throttled to stay off peak
+hours, with per-batch count reconciliation. Over those two weeks handlers keep editing claims, so when
+the backfill ends the CDC changes since the recorded position are applied; claims edited during the
+backfill arrive in both paths, and the version check keeps the later edit. The sign-off record
+lists coverage of 99.1% of in-scope claim records, the password-protected files (counted on the full
+library, not extrapolated from the sample's 6%) as excluded with a named owner, and a nightly
+reconciliation job.
 
 ## Trade-offs
 - Staged onboarding finds problems on a sample when they are cheap, but takes more calendar time before
@@ -136,6 +155,10 @@ and a nightly reconciliation job.
   customer judging success by individual bad answers.
 - Running the backfill without throttling against the customer's production database; the symptom is a
   call from their operations team about slow screens during business hours.
+- Starting the incremental feed only after the backfill completes; the symptom is a set of records whose
+  indexed version is older than the source's, all with source edit times inside the backfill window.
+- Ingesting content without its permissions; the symptom is a pilot user seeing a document or record in
+  an answer that the source system would not have shown them.
 - Treating onboarding as finished at backfill; the symptom is a slowly diverging index because deletes
   and late updates after the snapshot were never reconciled.
 
@@ -164,7 +187,9 @@ the sample comes from. Loading it all first means finding unusable fields, unmap
 duplicates at full volume, after weeks of work, with no agreed definition of correct. I would accept the
 dump if legal and residency allow it, but pull a stratified sample from it, profile and map that, run a
 pilot load reviewed by their experts, and only then backfill the rest. I would also note a dump is a
-snapshot: we still need an incremental sync and reconciliation, or the system drifts from the source.
+snapshot: I would ask exactly when it was taken (ideally a log position or transaction timestamp), start
+incremental sync from that point rather than from the day we finish loading, and keep reconciliation
+running, or every change made in between is silently missing and the system drifts from the source.
 
 ## Quiz
 ### Q: Why should the onboarding sample be stratified rather than the first N rows of each table?

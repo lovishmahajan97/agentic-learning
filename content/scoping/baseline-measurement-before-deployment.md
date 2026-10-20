@@ -5,7 +5,7 @@ name: Baseline measurement before deployment
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - scoping/success-metrics-kpis
   - scoping/workflow-analysis
@@ -92,6 +92,17 @@ because it absorbs seasonality and any concurrent change. A concurrent holdout (
 without the tool) controls for time. A staggered rollout gives you both. Shadow mode gives paired
 comparisons on identical cases, but it measures quality, not the behavioural effect on humans.
 
+With a holdout, the estimate is a difference-in-differences:
+
+```
+effect = (pilot_after − pilot_before) − (holdout_after − holdout_before)
+```
+
+The second bracket subtracts whatever happened to everyone during the pilot, such as a seasonal dip, a
+policy change or a new-hire cohort. That is why the holdout needs its own baseline over the same window,
+not just a post-launch reading. The design assumes both groups would have moved in parallel without the
+tool, so check that their pre-period trends really do look parallel before trusting the number.
+
 ## Example
 A support team will pilot an AI drafting assistant. This script computes the per-category baseline
 from an 8-week ticket export, including a confidence interval on the human error rate from an SME audit
@@ -157,7 +168,11 @@ arm. If billing only gets 80 tickets a week, a two-week pilot cannot answer the 
 - Changing the metric definition after launch, for example by excluding a newly "out of scope" case type.
   The symptom is an improvement that appears exactly when the definition changed.
 - Announcing the measurement to the team being measured, then using that period as the baseline. The
-  symptom is unusually good baseline numbers that regress once observation ends.
+  symptom is unusually good baseline numbers (an observer, or Hawthorne, effect) that regress once
+  observation ends, which makes the AI look worse than it is.
+- Picking the pilot team or queue because its recent numbers are the worst. The symptom is a large
+  "improvement" that the holdout, or the same team's longer history, shows would have happened anyway,
+  because an unusually bad period tends to be followed by a more ordinary one (regression to the mean).
 
 ## When to use
 Measure a baseline for every metric in the success spec before any pilot user sees the system,

@@ -5,7 +5,7 @@ name: numpy
 kind: tool
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/pandas
   - python-for-ai/pytorch
@@ -58,6 +58,17 @@ strides). This is a design choice for speed: slicing a 307 MB array costs nothin
 that writing into a view writes into the original. Fancy indexing with integer arrays or boolean masks
 (`a[[1, 5, 9]]`, `a[a > 0]`) must gather scattered elements, so it returns a copy.
 
+### Contiguity and layout
+Views are free because they change strides, not bytes, and that leaves many arrays *non-contiguous*:
+`a.T` of a C-ordered matrix is Fortran-ordered, `a[:, ::2]` skips every other element. NumPy's own
+operations accept any strides, but walking memory with a large stride wastes cache lines, so reducing
+along the contiguous axis is faster than along the strided one. More importantly, compiled extensions
+that take a raw pointer (FAISS, many C/CUDA kernels, some serialization paths) expect C-contiguous
+memory of a specific dtype. Check `a.flags["C_CONTIGUOUS"]` and convert once with
+`np.ascontiguousarray(a, dtype=np.float32)` at the boundary; that is the one place a copy is the
+correct choice. `reshape` returns a view only when the existing strides can express the new shape;
+otherwise it silently copies, so after a transpose a reshape may cost a full copy.
+
 ### Vectorization and ufuncs
 Element-wise operations (`+`, `np.exp`, comparisons) are *ufuncs*: compiled loops applied over every
 element. Reductions (`sum`, `max`, `argmax`) take an `axis`, the dimension that collapses: `a.sum(axis=1)`
@@ -76,6 +87,13 @@ Integer arrays have fixed width and wrap on overflow without an exception (a `ui
 becomes 4). Float32 has about 7 significant decimal digits, enough for similarity scores but risky for
 long accumulations. NumPy's `float32` scalars are not Python floats, so they do not serialize to JSON
 until you call `.item()` or `.tolist()`.
+
+Mixed dtypes promote to the wider one: `float32_array * float64_array` produces float64, so one
+float64 array (a weights vector built with `np.array([...])`, a result loaded from an older file) can
+silently double the memory of everything downstream. A plain Python scalar does not force the upcast
+(`emb * 0.5` stays float32). A NumPy `float64` scalar, such as a value pulled out of another array,
+does under NumPy 2's promotion rules, whereas NumPy 1.x let it slide, so upgrades can change dtypes.
+Check `result.dtype` at stage boundaries rather than assuming.
 
 ### Randomness
 Use `rng = np.random.default_rng(seed)` and pass `rng` around rather than seeding a global state, because
@@ -133,8 +151,11 @@ replaced by an approximate index.
   "by themselves" after an unrelated function ran.
 - Integer overflow in fixed-width dtypes; the symptom is negative counts or wrapped pixel values with
   no warning raised.
-- Default float64 from `np.array(list_of_floats)` for embeddings; the symptom is double the expected
-  memory and slower matrix products.
+- Default float64 from `np.array(list_of_floats)` for embeddings, or one float64 operand promoting a
+  float32 pipeline; the symptom is double the expected memory and slower matrix products, visible in
+  `arr.dtype` and `arr.nbytes`.
+- Passing a transposed or sliced array to a C extension that assumes C-contiguous float32; the symptom
+  is an explicit "array is not C-contiguous" error or, with careless bindings, garbage results.
 
 ## When to use
 Use NumPy for anything numerical that fits in memory on one machine: embedding similarity, metric

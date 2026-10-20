@@ -5,6 +5,7 @@ name: Retry / deduplication / reconciliation
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - enterprise-integration/webhooks
   - enterprise-integration/incremental-synchronization-and-cdc
@@ -77,6 +78,13 @@ the next mechanism. The serving module's retry lesson covers the backoff arithme
 which calls are safe to retry at all.
 
 ### Deduplication: make at-least-once look like once
+Why deduplication is unavoidable: a sender that gets no acknowledgement cannot tell "the request was
+lost" from "the request was applied and the reply was lost". It must either resend (at-least-once, with
+possible duplicates) or give up (at-most-once, with possible loss). No protocol removes that ambiguity
+over an unreliable network, so "exactly once" is never a property of delivery; it is an *effect* you
+build from at-least-once delivery plus a receiver that recognises repeats. Every reliable feed therefore
+duplicates, and the only design question is where the repeat is detected.
+
 Duplicates arrive from two directions.
 
 **Inbound events** (webhooks, CDC, polled changes) are delivered at least once by every reliable
@@ -87,6 +95,13 @@ as the effect (the inbox pattern) and rejects anything whose version it has alre
 Keying on the version rather than the delivery id handles both redelivery and reordering: a stale update
 that arrives after a newer one is dropped instead of overwriting it. Keys are scoped per tenant because
 two customers' systems can legitimately produce the same record id.
+
+The choice of key also decides how long the dedupe state must live. A store of seen *delivery ids* only
+works if it remembers each id for longer than the sender's redelivery window (the source's retry
+schedule, plus any manual "replay events" button an admin can press), so it needs a TTL chosen from that
+window and grows with traffic; a redelivery after the TTL is applied twice. A *last-applied version per
+record* is bounded by the number of records, never expires, and rejects an arbitrarily late replay,
+which is another reason to prefer it whenever the source provides a version.
 
 **Outbound writes** need the target to recognise a repeat. In order of preference: an idempotency key
 header where the API supports one (payment and messaging APIs usually do; most enterprise SaaS APIs do
@@ -145,11 +160,12 @@ def call_with_retry(fn, max_attempts=5, base=0.5, cap=30.0):
     for attempt in range(1, max_attempts + 1):
         try:
             return fn()
-        except ApiError as e:
-            if e.status not in RETRYABLE or attempt == max_attempts:
+        except (ApiError, TimeoutError, ConnectionError) as e:
+            status = getattr(e, "status", None)         # None: timeout/reset, outcome unknown
+            if (status is not None and status not in RETRYABLE) or attempt == max_attempts:
                 raise                                   # 4xx: wrong request, do not loop on it
             delay = min(cap, base * 2 ** (attempt - 1)) * random.uniform(0.5, 1.5)
-            time.sleep(e.retry_after or delay)          # honour Retry-After when the platform sends it
+            time.sleep(getattr(e, "retry_after", None) or delay)  # honour Retry-After if sent
 
 def apply_event(db, tenant, event):
     """Inbound: idempotent by (tenant, record id, source version); version committed with the write."""
@@ -163,9 +179,11 @@ def apply_event(db, tenant, event):
 
 def write_with_ledger(db, client, tenant, op_id, payload):
     """Outbound: never issue a write the ledger does not know about."""
-    if db.ledger.get(op_id) not in (None, "unknown"):
+    if db.ledger.get(op_id) not in (None, "unknown", "needs-replay"):
         return db.ledger[op_id]                         # retry of a completed op returns the saved result
     db.ledger[op_id] = "unknown"                        # claimed before the call; survives a crash mid-call
+    # Re-issuing an "unknown" op is safe only because upsert-by-external-id turns a repeat into an update.
+    # Against an insert-only API, resolve "unknown" by lookup (as reconcile does) before any re-issue.
     remote_id = call_with_retry(lambda: client.upsert(external_id=op_id, body=payload))
     db.ledger[op_id] = remote_id
     return remote_id
@@ -189,8 +207,9 @@ sweep (or the platform's deleted-records endpoint) is what produces the "extra i
 
 ## Trade-offs
 - Aggressive retries raise the chance that a transient failure heals itself, but they consume the
-  customer's shared API quota; once retries exceed a few percent of calls they do more harm than giving
-  up, which is why a retry budget exists.
+  customer's shared API quota; past a modest fraction of calls (the Google SRE book's example per-client
+  budget is retries below 10% of requests) extra retries mostly add load to an instance that is already
+  struggling, which is why a retry budget exists.
 - Version-based dedupe handles reordering and redelivery, but it needs a trustworthy version from the
   source; when the source only offers a timestamp with second resolution, two edits in the same second
   collapse and you must fall back to comparing content hashes.
@@ -212,6 +231,9 @@ sweep (or the platform's deleted-records endpoint) is what produces the "extra i
   dependency.
 - Treating the reconciliation output as a log nobody reads; symptom: the repair count has climbed for
   weeks because a webhook subscription expired, and no alert was ever set on it.
+- Giving a delivery-id dedupe store a TTL shorter than the source's redelivery window; symptom: duplicate
+  notes or double-applied updates that cluster after a source outage or an admin's bulk "resend
+  events", exactly when redeliveries arrive late.
 - Comparing source timestamps with timestamps generated on your side (different clocks, different time
   zones); symptom: records are perpetually judged stale and re-fetched every run, so the repair count
   never reaches zero.
@@ -266,11 +288,11 @@ move the webhook acknowledgement to after the durable write.
 > A timeout is ambiguous, so the retry must be recognisable as a repeat by the target. A read-then-write
 > check still has a race window between the read and the write; a ledger plus reconciliation closes it.
 
-### Q: Every nightly reconciliation run reports the same 40 records as missing in the target. What is the most likely cause?
-- [ ] The customer's API is rate-limiting the reconciliation job
+### Q: Every nightly reconciliation run reports the same 40 records as stale in the target, and each run "repairs" them. What is the most likely cause?
+- [ ] The customer's API is rate-limiting the reconciliation job, so it cannot read the source
 - [ ] The dedupe store's TTL is too short, so old events are being re-applied
-- [x] The repair step is not taking effect, for example the apply path rejects the fetched records as stale because versions are compared across different clocks
+- [x] The repair is not converging, for example the diff compares source versions against timestamps generated on your side, or the apply path rejects the re-fetched records
 - [ ] The 40 records are duplicates in the source system
 > A healthy job's repair set changes between runs and trends to zero. The same set recurring means the
-> diff is detected but the repair does not persist; the job's own repair outcome must be monitored, not
-> just its diff.
+> diff is detected but the repair never makes source and target compare equal, typically because the
+> two sides are not compared like for like; monitor the job's repair outcome, not just its diff.

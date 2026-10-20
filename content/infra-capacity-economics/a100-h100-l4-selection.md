@@ -5,7 +5,7 @@ name: A100 / H100 / L4 selection
 kind: decision
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - infra-capacity-economics/gpu-sizing
   - infra-capacity-economics/gpu-utilization-and-memory-bandwidth
@@ -122,9 +122,14 @@ tool.
 ($20/h) or one H100 at ~60% of ceiling ($4/h), and the H100 users also get several times faster
 per-stream decode (the batch-1 bandwidth ratio is ~11×; at these batch sizes the gap is smaller).
 
-The crossover is wherever the H100's higher hourly price is covered by the tokens it actually serves:
-here, somewhere around 500 tokens/s of sustained demand. Below it buy L4s; above it buy H100s; and
-if the demand is bursty, read the serverless lesson before buying either.
+The crossover is wherever the H100's higher hourly price is covered by the tokens it actually serves.
+One H100 costs the same as five L4s, which together top out near 600 tokens/s, so here the crossover is
+roughly 500–600 tokens/s of sustained demand. Two corrections move it in practice. Redundancy: a
+production service needs at least two replicas, and two H100s ($8/h) cost as much as ten L4s, pushing
+the crossover toward ~1,200 tokens/s unless the second replica can be shared with other models. Latency:
+L4s at batch 8 deliver ~15 tokens/s per user; if the product SLO is higher, the L4 is out at any demand
+and the comparison is H100 against A100. If the demand is bursty, read the serverless lesson before
+buying either.
 
 ## Trade-offs
 - H100 delivers the lowest cost per token and fastest decode, but only when load keeps it busy; at
@@ -173,8 +178,11 @@ A100s or H100s. Reason it through.
 int4 (~7 GB), which needs a quality evaluation. Both 80 GB cards fit it with tens of gigabytes of KV
 headroom. Latency next: decode on the A100 is bounded near 26 GB ÷ 2 TB/s ≈ 13 ms per step, around
 75 tokens/s per stream, comfortably interactive; the H100 would be ~1.7× faster. Load: 200 daily
-users is likely a few requests per second at peak, well inside one A100's ceiling, so an H100's extra
-throughput would sit idle. Recommendation: one A100 80 GB (two for redundancy), or an int4 L4 pair if
+users rarely produce more than a handful of concurrent requests even at peak, well inside one A100's
+ceiling, so an H100's extra throughput would sit idle. The int4 L4 route also needs its own latency and
+KV check: ~7 GB ÷ 300 GB/s ≈ 23 ms per step, under ~40 tokens/s per stream before batching, and if the
+13B model uses full multi-head attention rather than GQA its per-token cache is several times larger,
+so the remaining ~13 GB holds only a few long contexts. Recommendation: one A100 80 GB (two for redundancy), or an int4 L4 pair if
 the quality evaluation passes and budget dominates; revisit if traffic grows past the A100's ceiling
 or fp8 becomes necessary.
 

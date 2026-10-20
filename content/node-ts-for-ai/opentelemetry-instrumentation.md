@@ -4,8 +4,8 @@ module: node-ts-for-ai
 name: OpenTelemetry instrumentation
 kind: practice
 difficulty: core
-est_minutes: 15
-status: fact-checked
+est_minutes: 17
+status: reviewed
 related:
   - observability/opentelemetry
   - observability/tracing
@@ -64,9 +64,27 @@ loader hook (`module.register("@opentelemetry/instrumentation/hook.mjs", ...)`),
 entry point `@opentelemetry/auto-instrumentations-node/register` does for you. Importing it from
 `app.ts` after your framework is a classic silent failure: no error, no spans.
 
+### Spans, kinds and the tree
+A span is a named, timed operation with a trace id (shared by the whole request), its own span id, a
+parent span id, attributes, events (timestamped points such as "first token") and a status. The tree
+is reconstructed by the backend from parent ids alone, which is why a missing parent link produces an
+orphan root rather than an error. Each span has a kind: `SERVER` for handling an inbound request,
+`CLIENT` for an outbound call, `PRODUCER` and `CONSUMER` for the two ends of a queue, `INTERNAL` for
+in-process work such as an agent step. Kinds matter *because* backends derive service maps and
+latency breakdowns from them: a `CLIENT` span with no matching `SERVER` child is time spent waiting on
+something you do not instrument, such as a model provider.
+
 ### Context propagation
 Within a process the SDK installs an `AsyncLocalStorage`-based context manager so the active span
-follows `await`, promises, timers and callbacks. Across HTTP it injects and extracts `traceparent` and
+follows `await`, promises, timers and callbacks. `AsyncLocalStorage` works by capturing the current
+store whenever Node creates an async resource (a promise, a timer, a socket callback) and restoring it
+when that resource's continuation runs, so "the active span" is whatever was active when the
+continuation was *scheduled*. That rule explains where context gets lost: a library that collects
+callbacks in its own queue and invokes them later from a different continuation (a hand-rolled
+connection pool, a batching client) runs them in the wrong context, and an `EventEmitter` listener runs
+in the context of whoever called `emit()`, not whoever registered it. The fix is to bind explicitly with
+`context.bind(context.active(), fn)` (or `AsyncResource.bind`) at the point the callback is handed
+over. Across HTTP it injects and extracts `traceparent` and
 `tracestate` (W3C Trace Context); the `http` and `fetch` instrumentations do this for every outbound
 and inbound request. Across a queue nothing is automatic unless the library supports it (BullMQ 5 has an opt-in `telemetry`
 option, provided by the `bullmq-otel` package, that does this): otherwise serialise the
@@ -107,9 +125,17 @@ where traces are sampled. Pino or Winston with the OTel log instrumentation gets
 
 ### Export, sampling, cost
 Spans go through a `BatchSpanProcessor` to an OTLP exporter (HTTP or gRPC), usually to an OpenTelemetry
-Collector sidecar or gateway that fans out to backends, redacts, and does tail sampling. Head sampling
-in the SDK (`parentbased_traceidratio` at, say, 10%) cuts cost but decides before anything has gone
-wrong, so it throws away 90% of the rare slow or failed traces along with the boring ones; tail
+Collector sidecar or gateway that fans out to backends, redacts, and does tail sampling. The batch
+processor exists *because* exporting each span synchronously would put a network call on every
+operation: ended spans go into an in-memory queue (2,048 spans by default) and are exported in batches
+of up to 512 every 5 seconds or when a batch fills. When the exporter cannot keep up, the queue fills
+and new spans are dropped, not blocked, which protects request latency at the cost of silently missing
+data; tune `OTEL_BSP_MAX_QUEUE_SIZE` and watch the dropped count. Use the `SimpleSpanProcessor`
+(export on end) only in tests. Head sampling
+in the SDK (`parentbased_traceidratio` at, say, 10%) cuts cost; the `parentbased` part means a service
+follows the sampled flag in the incoming `traceparent` and only applies its own ratio at the root,
+*because* independent coin flips per service would produce traces with random holes. Head sampling
+decides before anything has gone wrong, so it throws away 90% of the rare slow or failed traces along with the boring ones; tail
 sampling in the collector keeps errors and slow traces *because* it decides after seeing the whole
 trace. Configuration is environment-driven: `OTEL_SERVICE_NAME`, `OTEL_EXPORTER_OTLP_ENDPOINT`,
 `OTEL_TRACES_SAMPLER`, `OTEL_RESOURCE_ATTRIBUTES`. On shutdown call `sdk.shutdown()` so the batch
@@ -175,6 +201,7 @@ export async function plan(tenant: string, runId: string, prompt: string) {
 - Spans never ended on an error path (missing `finally`), or a streaming response abandoned without closing it: the symptom is traces that look incomplete or never export, and memory growing with open spans.
 - No `sdk.shutdown()` on SIGTERM: the symptom is the last few seconds of spans missing before every deploy, which is exactly when errors happen.
 - Both the vendor SDK's built-in tracing and a third-party instrumentation of that SDK active: the symptom is every model call appearing twice in the trace with identical timing.
+- Context lost across a callback queue or an `EventEmitter`: the symptom is DB or tool spans that attach to the wrong request's trace, or start new root traces, only under concurrency, because the callback ran in whichever context was active when it was invoked.
 - Trace context not propagated into BullMQ jobs: the symptom is worker spans that form their own root traces, unlinked from the API request that caused them.
 
 ## When to use

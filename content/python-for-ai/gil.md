@@ -5,7 +5,7 @@ name: GIL (Global Interpreter Lock)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/asyncio-vs-threads-vs-multiprocessing
   - python-for-ai/race-conditions-and-synchronization-primitives
@@ -56,9 +56,19 @@ flag, and the running thread drops the GIL at its next check point in the eval l
 run. That forced handover is what keeps threads fair, and it is also why CPU-bound threads add
 switching overhead rather than speed.
 
+### The hidden cost: CPU threads slow down I/O threads
+The handover rule has a consequence that bites async services. When an I/O thread's socket becomes
+ready, the kernel wakes it, but it still has to reacquire the GIL before it can run any Python. If a
+CPU-bound thread holds the GIL, the I/O thread waits until the running thread reaches a check point
+and yields, which is bounded by roughly the switch interval each time it needs the lock back. An
+event-loop thread needs the GIL for every task step, so running pure-Python CPU work in
+`asyncio.to_thread` beside the loop keeps the loop *unblocked* but not *unaffected*: each step can be
+delayed by milliseconds, and streaming responses get visibly jittery. The work belongs in a process.
+
 ### Native code can opt out
 C, C++ and Rust extensions can release the GIL while working on their own memory, as long as they
-touch no Python objects. NumPy does this for many operations on large arrays, PyTorch for most tensor
+touch no Python objects. In C this is the `Py_BEGIN_ALLOW_THREADS` / `Py_END_ALLOW_THREADS` pair around
+the native work, and the extension must reacquire the GIL before it builds the Python result. NumPy does this for many operations on large arrays, PyTorch for most tensor
 ops, `hashlib` for large inputs, and compression libraries for large buffers. So "Python is
 single-core" is wrong for these libraries: a thread pool running NumPy-heavy or PyTorch CPU work can
 use several cores. Whether a given call releases the GIL is a property of that library and function,
@@ -69,6 +79,12 @@ The GIL protects the interpreter's integrity, not your invariants. `counter += 1
 several bytecodes (load, add, store), and a switch can occur between them, so two threads can lose an
 update. Check-then-act on a dict across threads needs a `threading.Lock`. Whether you can reproduce
 the race depends on the Python version and timing, which makes it more dangerous, not less.
+
+The GIL does make some single operations on built-in types atomic as a side effect: one
+`list.append` or one `d[key] = value` cannot be torn. Code that relies on this "works" by accident of
+implementation. It is why `queue.Queue` and explicit locks are the documented tools, and why the
+free-threaded build had to add per-object locking inside built-in containers to keep such single
+operations safe.
 
 ### Ways around it, and its future
 Processes (`multiprocessing`, `ProcessPoolExecutor`) each have their own interpreter and GIL. PEP 684
@@ -135,13 +151,18 @@ process startup), and four threads hashing large buffers run about 4× faster th
   waiting or blocking calls, and the GIL is not the bottleneck.
 - Assuming a library releases the GIL because it is written in C; some hold it for the whole call, and
   profiling shows threads queuing instead of running in parallel.
+- Installing a free-threaded build and importing an extension not marked compatible with it; CPython
+  then re-enables the GIL at runtime (with a warning), threads stop scaling, and
+  `sys._is_gil_enabled()` (3.13+) returns `True` where you expected `False`.
 
 ## When to use
 You do not use the GIL; you design around it. When a Python service is slow, first ask whether it is
 waiting (I/O) or computing (CPU). For I/O, threads or asyncio are fine and the GIL is irrelevant. For
 CPU-bound pure Python, use processes, vectorise with NumPy or Polars, or move the hot loop to native
 code. For CPU work inside NumPy or PyTorch, threads can work, and you can measure it with a quick timing
-like the example. Track the free-threaded build's status if you run CPU-heavy Python at scale. In
+like the example. The quickest diagnostic is the ratio of process CPU time to wall time with N threads:
+about 1.0 means the GIL is serialising you, close to N means the work releases it. A sampling profiler
+such as py-spy shows which thread holds the GIL when that ratio surprises you. Track the free-threaded build's status if you run CPU-heavy Python at scale. In
 interviews, explain why the GIL exists (refcounting), when it bites (CPU-bound bytecode), and why it does
 not make code thread-safe.
 

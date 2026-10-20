@@ -4,8 +4,8 @@ module: customer-data-evaluation
 name: Shadow-mode validation
 kind: pattern
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 15
+status: reviewed
 related:
   - llmops-platform/canary-shadow-deployments
   - evals/offline-vs-online-evaluation
@@ -78,6 +78,18 @@ a data transfer.
 Focus human review on disagreements, because that is where the information is; where both systems agree,
 both are usually right (or both wrong in ways the regression suite should cover).
 
+Calibrate agreement against a **self-agreement baseline**: shadow production against itself (same model,
+prompt and inputs, a second call) for a slice of traffic. LLM outputs are not perfectly repeatable, so if
+production agrees with itself on 96% of routing decisions, a candidate at 94% is only about two points
+worse than "the same system again", not six. Without the baseline, nondeterminism is misread as
+regression.
+
+Then convert the adjudicated sample back into traffic terms, because that is what the customer feels:
+`share of traffic made worse ≈ disagreement rate × (production-better ÷ adjudicated)`. A candidate can
+win the disagreements overall and still make a few percent of requests worse; whether that is
+acceptable depends on *which* requests, so break the production-better cases down by severity and
+segment before deciding.
+
 ### 5. Know the blind spots
 Users never see shadow output, so there is no click, edit or thumbs signal for the candidate. Shadow
 cannot tell you whether users would have completed their task with it. In multi-turn conversations the
@@ -130,8 +142,16 @@ async def shadow_one(event, candidate, real_tools, store, timeout_s=30):
 
 Suppose two weeks of shadow on one customer yields 18,000 requests (illustrative). Triage category agrees
 on 94%; of 1,080 disagreements, 300 sampled and SME-adjudicated split 140 candidate-better, 90
-production-better, 70 equivalent. That ratio, plus a clean write-call comparison and p95 latency inside
-budget, is the case for moving to a 5% canary, not for a full switch.
+production-better, 70 equivalent. Read it in three steps:
+1. **Is the win real?** Of the 230 non-tied cases, 140 (61%) favour the candidate. A rough 95% interval
+   is ±1.96 × √(0.61 × 0.39 / 230) ≈ ±6 points, so 55–67%: clearly above 50%.
+2. **What does it cost in traffic?** 6% disagree × 90/300 production-better ≈ 1.8% of all requests get a
+   worse answer, about 320 of the 18,000. If those cluster in the "urgent injury" category, the net win
+   is irrelevant and the candidate needs work on that segment first.
+3. **Is it safe operationally?** Intended writes match production's on the agreed cases, and p95 latency
+   is inside budget.
+
+That evidence is the case for moving to a 5% canary, not for a full switch.
 
 ## Trade-offs
 - Zero user exposure in exchange for no user-outcome signal; when task completion is the KPI, shadow
@@ -152,6 +172,8 @@ budget, is the case for moving to a 5% canary, not for a full switch.
   says nothing about quality because paraphrases count as disagreements.
 - Running shadow for a few days and declaring victory; the symptom is a regression in month-end or Monday
   traffic patterns that the short window never contained.
+- Reading raw agreement without a production-versus-production baseline; the symptom is a candidate
+  rejected for "6% disagreement" when a second production run would have disagreed nearly as often.
 - Letting the shadow call share the production rate-limit quota; the symptom is production 429 errors that
   begin exactly when shadow mode is switched on.
 

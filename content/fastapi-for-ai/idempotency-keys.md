@@ -5,7 +5,7 @@ name: Idempotency keys
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - fastapi-for-ai/timeouts
   - fastapi-for-ai/redis-caching
@@ -69,6 +69,8 @@ For each key the server stores a record: `{fingerprint, state, status_code, resp
    `409 Conflict` (optionally with `Retry-After`) instead of waiting or running it twice.
 5. **If the fingerprint differs**, the client reused a key for a different request, which is a client
    bug. Reject it (the draft suggests `422`) instead of replaying an unrelated response.
+6. **If the endpoint requires a key and none was sent**, reject with `400` rather than silently
+   running unprotected; the draft suggests this too.
 
 ### Design choices and their reasons
 - **Fingerprint** = hash of method, path and canonicalised body. Without it a reused key silently
@@ -81,6 +83,12 @@ For each key the server stores a record: `{fingerprint, state, status_code, resp
   work can take (say a couple of minutes for a generation), and only the completed record gets the long
   retention TTL. If the claim carried the 24-hour TTL, a worker that crashed or was killed mid-request
   would leave the key stuck in `in_progress`, and every retry would get 409 for a day.
+- **The lease must outlast the work, and the finisher must still own it.** If a generation runs past
+  its lease, the claim expires, a retry claims the key afresh and runs the work a second time. Bound
+  the work with a request deadline shorter than the lease (see timeouts), or renew the lease while
+  working. Store an owner token in the claim and write the completed record only if the token still
+  matches (a compare-and-set, via a Lua script in Redis or `UPDATE ... WHERE owner = $1` in Postgres),
+  so a stale worker cannot overwrite the record of the attempt that superseded it.
 - **What to store on failure.** Store deterministic outcomes, including 4xx validation errors and
   successful 2xx results. For 5xx or crashes mid-work, delete the claim (or let it expire) so the
   retry can run. If the work had partly happened, the work itself must be resumable or transactional.
@@ -130,8 +138,8 @@ async def create(payload: dict, claim=Depends(idem)):
     k, fp = claim
     try:
         result = {"id": "gen_123", "text": "..."}       # call the model, charge tokens
-    except Exception:
-        await r.delete(k); raise                        # let a retry run again
+    except Exception:                                   # transient failure: free the key so a retry
+        await r.delete(k); raise                        # runs again (deterministic 4xx could be stored)
     await r.set(k, json.dumps({"fp": fp, "state": "done", "status": 201, "body": result}), ex=TTL)
     return result
 ```
@@ -167,6 +175,8 @@ principal, or a caller can scope keys into someone else's namespace.
   replayed error even after the provider has recovered.
 - Giving the in-progress claim the same long TTL as completed records. The symptom is that after a
   crash or deploy, retries for the interrupted keys return 409 for hours instead of re-running.
+- Making the lease shorter than the slowest request. The symptom is duplicates that appear only for
+  long generations, with two completed attempts per key whose start times are one lease apart.
 - Re-running generation on replay instead of returning the stored body. The symptom is users seeing
   two different answers for one question and token bills that don't match request counts.
 

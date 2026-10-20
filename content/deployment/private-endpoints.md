@@ -5,6 +5,7 @@ name: Private endpoints
 kind: pattern
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - deployment/customer-vpc-on-prem-air-gapped
   - deployment/vpn
@@ -82,13 +83,29 @@ an endpoint policy (which principals and actions may use this endpoint) and, on 
 resource policy or network rule saying "only accept requests arriving via endpoint X". The combination
 is what makes stolen credentials useless off-network.
 
+### Following one request
+Put the four parts together for a call from a pod to a model API:
+1. The SDK asks the VPC resolver for `bedrock-runtime.<region>.amazonaws.com`; the private zone
+   answers with the endpoint interfaces' private IPs (say 10.20.1.15 and 10.20.2.15, one per zone).
+2. The pod opens TCP 443 to 10.20.1.15. The **security group on the endpoint interface** must allow
+   443 from the pod's subnet; it is a separate control from the pod's own egress rules, and forgetting
+   it is the classic "DNS is right but it still times out" failure.
+3. The provider network carries the flow to the service's load balancer. The service never sees a
+   route into your VPC; it sees a connection tagged with the endpoint it came through, which is what
+   resource policies such as "only via endpoint X" match on. (For your own SaaS on AWS, enabling
+   Proxy Protocol v2 on the NLB is how your application learns which customer endpoint a connection
+   came from, *because* the source IP alone is not a reliable customer identifier.)
+4. TLS is negotiated against the ordinary hostname, so the provider's public certificate validates,
+   then the API key or IAM signature is checked as usual.
+
 Note the direction: connections are initiated by the consumer toward the service. The provider cannot
 open connections back into the consumer network through the endpoint, which is why security teams
 find it easier to approve than a VPN or peering link.
 
-Gateway-style endpoints are a different, older mechanism used for some storage services: they add a
-route-table entry instead of an interface, cost nothing extra, but only work from inside that VPC and
-not from on-prem.
+On AWS, gateway endpoints are a different, older mechanism available only for S3 and DynamoDB: they
+add a route-table entry (a prefix list) instead of an interface, cost nothing extra, but only work from
+inside that VPC and not from on-prem or peered networks. Azure and Google Cloud have no direct equivalent;
+their closest analogues are service endpoints and Private Google Access respectively.
 
 ## Example
 A team runs a RAG service in a private subnet with no NAT. They created an interface endpoint for the
@@ -145,6 +162,9 @@ check the route table for those.
   out in a no-egress subnet, or flow logs showing traffic still leaving through the NAT gateway.
 - Forgetting on-prem and peered-VPC callers need DNS forwarding to the cloud resolver; the symptom is
   "works from the cluster, fails from the data center" with the hostname resolving to a public IP there.
+- Leaving the endpoint interface's security group at a default that does not admit 443 from the
+  workload subnet; the symptom is that the hostname correctly resolves to a private IP but every
+  connection times out, which teams misdiagnose as a DNS or provider outage.
 - Endpointing the main API but not its dependencies, such as the identity provider, token service or a
   separate file-upload host; the symptom is authentication or uploads hanging while plain calls succeed.
 - Deploying the interface in one availability zone; the symptom is a full outage of model calls during a
@@ -178,7 +198,7 @@ how do you make the setup fail closed?
 because private DNS was not enabled on the endpoint, the private zone is not associated with that VPC,
 or the workload uses a custom resolver that does not forward to the cloud resolver. Fix the resolution,
 verify with a lookup from inside the pod, then make it fail closed: remove the NAT route from that
-subnet so public resolution breaks loudly, set the service's resource policy to accept only requests via
+subnet so a call that resolves publicly fails loudly, set the service's resource policy to accept only requests via
 this endpoint, and turn off public network access where the service supports it. Finally add the DNS
 check to deployment so a regression is caught before traffic flows.
 

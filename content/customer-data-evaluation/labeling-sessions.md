@@ -4,8 +4,8 @@ module: customer-data-evaluation
 name: Labeling sessions
 kind: practice
 difficulty: intro
-est_minutes: 12
-status: fact-checked
+est_minutes: 14
+status: reviewed
 related:
   - customer-data-evaluation/golden-dataset-creation-with-client-smes
   - customer-data-evaluation/sme-review-and-annotation-guidelines
@@ -41,8 +41,13 @@ leaves no room to fix the guideline between rounds.
 
 ## How it works
 ### Before the session
-1. **Prepare the batch.** Select items from the sampled pool, sized to the time available with buffer,
-   and include a few previously adjudicated "gold check" items to detect drift in individual reviewers.
+1. **Prepare the batch.** Select items from the sampled pool and size it from capacity, not ambition.
+   Label capacity is reviewers × labelling minutes ÷ minutes per label; every reviewer also labels the
+   gold checks, and a double-label fraction d costs d extra labels per item, so
+   `items ≈ (capacity − reviewers × gold_checks) / (1 + d)`. Measure minutes per label in the first
+   session rather than guessing, and shuffle strata through the batch so fatigue late in the session does
+   not fall on one segment. Include a few previously adjudicated "gold check" items to detect drift in
+   individual reviewers.
 2. **Pre-load the tool.** Whatever the tool (Label Studio, Argilla, the customer's own platform or a
    controlled spreadsheet), it must open on the item, show the guideline beside it and capture label,
    rationale and reviewer. Fiddling with access during the session wastes the scarcest time.
@@ -65,7 +70,11 @@ leaves no room to fix the guideline between rounds.
 ### After the session
 Adjudicate remaining splits, relabel items affected by guideline changes, recompute agreement, and send
 the sponsor a short note: items labelled, agreement, decisions made, open questions. That note is what
-keeps the next session on the calendar.
+keeps the next session on the calendar. Read one session's agreement with care: on 30 doubles, 80%
+agreement carries roughly ±14 points (√(0.8·0.2/30) ≈ 0.073), so a drop from 83% to 77% between
+sessions is noise. Track agreement pooled over a rolling window of sessions, and per reviewer pair,
+before concluding that a guideline or a reviewer has drifted. The same logic applies to gold checks:
+one miss in three is weak evidence on its own and becomes a signal only when it repeats.
 
 ### Facilitation choices
 Keep sessions to about 60–90 minutes, *because* label quality decays with fatigue. Have an engineer
@@ -87,18 +96,20 @@ carve-out omitted". The guideline did not say whether carve-outs are part of the
 (present for this slot) rules that carve-outs must be extracted, and the facilitator adds rule L4 and an
 example.
 
-**15–65 min, independent labelling:** at a little under a minute per item per lawyer, each completes
-about 53 items, which covers the 150 assignments (120 items plus 30 doubles) and the 3 gold-check items
-every lawyer labels, with no slack.
+**15–65 min, independent labelling:** last week's session measured a little under a minute per label,
+so capacity is 3 lawyers × 50 minutes ≈ 159 labels. Taking off 3 gold checks per lawyer leaves 150,
+and with a 25% double-label fraction that is 150 / 1.25 = 120 items: 90 labelled once and 30 labelled
+twice. Each lawyer completes about 53 labels, with no slack, which is why the batch was not padded.
 
 **65–85 min, disagreement review:** 6 of the 30 double-labelled items split. Four trace to the meaning of
 "auto-renewal" when notice periods differ; this becomes an escalation for the general counsel, due before
-next week. Two are slips by the same lawyer, who also missed one of the three gold-check items, so
-that lawyer's batch gets a second look.
+next week. Two are slips by the same lawyer, who also missed one of the three gold-check items; any one of those
+signals alone would be weak, but together they justify a second look at that lawyer's batch.
 
 **85–90 min, wrap:** the facilitator reads back two decisions and one open question. The follow-up note
-reports 120 items labelled, 24 of 30 doubles in agreement, rule L4 added, 9 earlier items flagged for
-relabel under L4.
+reports 120 items labelled, 24 of 30 doubles in agreement (80%, a wide interval at this size, so it
+is reported next to the four-week pooled figure), rule L4 added, 9 earlier items flagged for relabel
+under L4.
 
 ## Trade-offs
 - Live sessions get decisions and throughput, but demand synchronous calendars; when SMEs are across
@@ -141,7 +152,9 @@ labels independent while still extracting rules from disagreement.
 ## Check yourself
 **Q:** Your sessions label plenty of items but agreement on double-labelled items keeps falling week over
 week. What might be wrong and what would you change?
-**A:** Falling agreement with steady throughput suggests drift rather than a bad guideline: reviewers'
+**A:** First I would confirm the fall is real: with about 30 doubles per session, single-session
+agreement swings by over ten points on noise alone, so I would compare pooled multi-session windows. If
+it holds, falling agreement with steady throughput suggests drift rather than a bad guideline: reviewers'
 private standards diverging, new item types in the batches that the guideline does not cover, or fatigue.
 I would check gold-check accuracy per reviewer to find an individual drifting, look at which guideline
 sections are cited in recent disagreements to find uncovered cases, and compare agreement in the first

@@ -5,7 +5,7 @@ name: Health / readiness endpoints
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - fastapi-for-ai/lifespan
   - fastapi-for-ai/graceful-shutdown-and-worker-draining
@@ -45,7 +45,13 @@ semantics prevent all three.
 - **Liveness (`/livez`):** can this process make progress? It should check only things that a restart
   would fix: the event loop is responsive, the worker is not deadlocked. A trivial `async def` that
   returns 200 is a good liveness check, because if the event loop is blocked it cannot answer, which is
-  exactly the condition you want to detect. Failure means: restart the container.
+  exactly the condition you want to detect. Keep it `async def`: a plain `def` endpoint runs in the
+  thread pool (AnyIO's default limit is 40 threads), so it can fail when blocking work has exhausted the
+  pool even though the loop is fine, restarting a process that only needed to shed load. Failure means: restart the container.
+  With several workers in one pod, each probe reaches whichever worker accepts the connection, so one
+  wedged worker out of four fails only some probes and rarely produces the consecutive failures that
+  trigger a restart. Per-worker hangs are better caught by Gunicorn's heartbeat timeout, which is one more
+  reason to prefer one worker per pod under Kubernetes.
 - **Readiness (`/readyz`):** should traffic come here now? It reflects local state the instance needs to
   serve: lifespan finished, model loaded, connection pools created, not draining for shutdown. Failure
   means: stop routing new requests, but leave the process running so it can recover.
@@ -118,7 +124,9 @@ Probe configuration to match: `startupProbe` on `/livez` with `periodSeconds: 5,
 (150 s for model load), `livenessProbe` on `/livez` with defaults, `readinessProbe` on `/readyz` with
 `periodSeconds: 5`. Note the model is loaded inside lifespan, and Uvicorn runs lifespan startup before it
 even binds the port, so every probe gets connection refused until the load finishes; that is why the
-startup probe must cover the whole load. (The `model` check in `/readyz` matters if you later switch to
+startup probe must cover the whole load. Under Gunicorn or `uvicorn --workers` the parent has already bound
+the socket, so the kernel completes the TCP handshake and the probe instead waits out its `timeoutSeconds`:
+the failure looks like a timeout rather than a refusal, but it counts the same. (The `model` check in `/readyz` matters if you later switch to
 loading in a background task after startup.) The `draining` flag lives in one process's memory: with
 several workers per pod, a preStop `POST` reaches only one of them, so use one worker per pod or a shared
 signal such as a file.

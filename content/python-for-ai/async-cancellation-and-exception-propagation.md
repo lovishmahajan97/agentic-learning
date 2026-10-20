@@ -5,7 +5,7 @@ name: Async cancellation & exception propagation
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/asyncio
   - python-for-ai/async-await
@@ -49,8 +49,16 @@ structured concurrency (`TaskGroup`) supplies.
 
 ## How it works
 ### Cancellation is a request, delivered at an await
-`task.cancel()` sets a flag and, when the task is next resumed, throws `CancelledError` into it at
-the `await` where it is suspended. Code between awaits runs to completion; a CPU loop with no await
+Step by step, `task.cancel()` does three things:
+1. If the task is suspended on a future, it cancels *that* future. If the task was awaiting another
+   task (`await other_task`), the inner task is cancelled too, so the request travels **down** the
+   await chain to whatever is actually waiting on I/O.
+2. Cancelling the future wakes the task on the next loop iteration, exactly as a result would.
+3. When the task resumes, it throws `CancelledError` into the coroutine at the suspended `await`, and
+   the exception then travels **up** the call stack.
+
+If the task is running or ready rather than suspended, only a flag is set, and the throw happens at
+its next suspension point. Code between awaits runs to completion; a CPU loop with no await
 cannot be cancelled at all. The exception unwinds the coroutine like any other: `finally` blocks run,
 `async with` exits run (the `httpx` client closes the stream, the lock is released). Since Python 3.8
 `CancelledError` subclasses `BaseException`, not `Exception`, *because* the common
@@ -70,6 +78,15 @@ cancellation inside a timeout block makes the deadline silently not fire. Python
 `Task.cancelling()` and `Task.uncancel()` so these constructs can tell their own cancellation apart
 from one requested from outside.
 
+### Where a task's exception goes
+An exception raised inside a task is stored on the task, not raised anywhere. It surfaces only when
+someone awaits the task (the exception is re-raised in the awaiter, with its original traceback) or
+calls `task.result()` / `task.exception()`. If nobody ever does, the loop logs "Task exception was
+never retrieved" when the task object is garbage-collected, which may be minutes later or never. So
+every task needs an owner: something that awaits it, a TaskGroup, or a done-callback that logs the
+error. `asyncio.wait` follows the same rule: it never raises the children's exceptions, it hands you
+`done` tasks whose results you must still check.
+
 ### Propagation: gather versus TaskGroup
 `asyncio.gather(*aws)` with the default `return_exceptions=False` propagates the *first* exception
 to the awaiting caller, but does not cancel the other children: they keep running, orphaned. With
@@ -77,14 +94,19 @@ to the awaiting caller, but does not cancel the other children: they keep runnin
 Cancelling the gather itself does cancel all children.
 
 `asyncio.TaskGroup` (3.11+) implements structured concurrency: no child outlives the `async with`
-block. When any child raises a non-cancellation exception, the group cancels all remaining children,
-waits for them to finish unwinding, then raises an `ExceptionGroup` holding every child failure.
+block. When any child raises a non-cancellation exception, the group cancels all remaining children
+(and the body of the `async with`, if it is still running), waits for them to finish unwinding, then
+raises an `ExceptionGroup` holding every child failure. Children that ended by cancellation are not
+reported as failures, *because* the group itself caused them.
 You handle those with `except*`, which matches by type inside the group, *because* concurrent code
 can genuinely fail in several ways at once and a single exception would hide the others.
 
 ### Shielding
-`asyncio.shield(aw)` protects an inner awaitable from a cancellation aimed at the outer task. The
-outer `await` still raises `CancelledError`; the inner work continues. Use it narrowly, for work that
+`asyncio.shield(aw)` protects an inner awaitable from a cancellation aimed at the outer task. It is
+needed precisely because of step 1 above: without it, cancelling the outer task would cancel the inner
+one it awaits. `shield` inserts a separate future between them, so the outer `await` still raises
+`CancelledError` while the inner work continues. Keep a reference to the inner task, or it can be
+garbage-collected once nobody awaits it. Use it narrowly, for work that
 must complete even when the requester is gone, such as committing an audit record.
 
 ## Example

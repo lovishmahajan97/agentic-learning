@@ -5,7 +5,7 @@ name: Integration and end-to-end testing
 kind: practice
 difficulty: core
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/pytest
   - python-for-ai/test-doubles-mocks-fixtures
@@ -60,7 +60,9 @@ duration of a fixture, waits until it is ready, and gives you its connection URL
 same engine and extensions as production rather than SQLite or an in-memory imitation, because dialect,
 indexing and extension behaviour are exactly what you are trying to verify. Docker Compose does the same
 for a multi-service stack. Container startup is the expensive part, so scope the container per session
-and make each test isolated within it.
+and make each test isolated within it. Under pytest-xdist, "per session" means per worker process,
+so eight workers start eight databases; that is usually fine, and it is also why tests must not
+assume they share rows with any other test.
 
 ### Isolation inside a shared dependency
 Options, each with its own failure mode: wrap each test in a transaction and roll back (fast, but breaks if
@@ -78,6 +80,21 @@ rate-limited. Choices for integration and e2e tests:
 3. **Live calls**, kept few, run on a schedule or before release, asserting structure and invariants
    (valid JSON, cited document IDs exist) rather than exact text. Judging answer *quality* belongs in the
    eval suite, not the test suite.
+
+### End-to-end tests that are not flaky
+Most e2e flakiness is self-inflicted, and each cause has a mechanical fix:
+- **Starting before the system is ready.** Wait on a readiness endpoint that checks dependencies, not
+  on a fixed sleep, because startup time varies with the CI machine.
+- **Racing asynchronous work.** Ingestion in a RAG system is usually a background job, so "upload,
+  then immediately ask" sometimes runs before indexing finishes. Poll for the observable outcome (the
+  document's status is `indexed`) with a deadline, and fail with the last status seen, rather than
+  sleeping a guessed number of seconds that is either too short on a slow day or wasteful on every run.
+- **Shared data.** Create uniquely named tenants, users and documents per run, so concurrent runs and
+  leftovers from crashed runs cannot collide; clean up best-effort, but never depend on cleanup.
+- **Undiagnosable failures.** Attach the request IDs or trace IDs of every call the test made to the
+  failure message, so a red run points at the logs of the service that misbehaved.
+A test written this way fails only when the system is broken or genuinely slower than its budget,
+which is the only kind of failure worth paging a developer about.
 
 ### Running them
 Mark slow tests (`@pytest.mark.integration`, `@pytest.mark.e2e`), register the markers, and select them
@@ -153,6 +170,8 @@ Postgres: a bare `pg16` tag moves when pgvector releases.
   prompt change even though the system still works, until the tests are disabled.
 - Unpinned container image tags such as `latest`; the symptom is a suite that breaks overnight with no
   code change because the database or extension version moved.
+- Fixed `sleep` calls waiting for background ingestion or deployment; the symptom is a test that fails
+  on busy CI runners and passes on rerun, while the suite's wall time grows by the sum of every guess.
 - Retrying flaky e2e tests until green; the symptom is a real intermittent bug (a race, a timeout too
   close to p99 latency) that the retry hides and production users then hit.
 
@@ -161,7 +180,8 @@ Write an integration test at every boundary where your code meets something you 
 cannot fully fake: databases and vector stores, queues, caches, the web framework's request handling,
 and the HTTP layer to model providers via a fake server. Keep end-to-end tests to the handful of journeys
 that would be a severity-one incident if broken, and run them on merge or deploy rather than on every
-save. Measure suite time and flake rate, and fix or delete flaky tests quickly. In interviews, "how would
+save. Measure suite time per lane and flake rate (the share of runs that fail and then pass on rerun with
+no code change), and fix or delete flaky tests quickly, because each one teaches the team to ignore red. In interviews, "how would
 you test a RAG service?" expects this layering, plus a clear separation from evals that measure quality.
 
 ## Role lens

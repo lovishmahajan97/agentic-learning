@@ -5,7 +5,7 @@ name: Dependency & risk management
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - scoping/statement-of-work
   - scoping/data-access-and-permissions-discovery
@@ -76,6 +76,12 @@ not "high". The expected delay, probability × impact, can be compared directly 
 affected path. A 50% chance of a 15-day slip on the critical path is 7.5 expected days, which outranks
 a 90% chance of a 2-day slip on a path with 10 days of slack.
 
+Expected delay ranks risks, but it is not the whole story. A 10% chance of a 60-day slip has the same
+6 expected days as a near-certain 6-day slip, yet only the first can end the engagement. For risks
+whose impact would be fatal, such as the pilot being unable to run at all or a budget window closing,
+plan by impact rather than by expected value: buy them down early or prepare a contingency whatever
+their expected days say.
+
 ### Choose a response and a trigger
 For each significant risk, choose one of four responses. **Avoid** it by changing the plan. **Reduce**
 it with a spike, a fallback or an earlier start. **Transfer** it to the party best placed to own it,
@@ -138,8 +144,10 @@ instead of the 20 it would have cost unplanned.
 Start the dependency map and RAID log during scoping, before the SOW is signed, because dated customer
 dependencies and known risks belong in the SOW itself. Then review the log weekly for the life of the
 engagement. Even a two-week internal PoC benefits from a ten-line version naming the data, access and
-people it depends on. Measure how the log is working: count dependencies past their need-by date and
-the expected delay against slack on the critical path. In interviews and on site, expect "what could
+people it depends on. Measure how the log is working: count dependencies past their need-by date, compare the expected
+delay with slack on the critical path, and track total exposure (the sum of expected days on the
+critical path) week by week. Exposure should fall as spikes retire unknowns. A flat or rising curve
+means the work is not attacking the risks. In interviews and on site, expect "what could
 stop this project?" The strong answer names specific, owned dependencies and the spike that would
 retire the biggest unknown first.
 

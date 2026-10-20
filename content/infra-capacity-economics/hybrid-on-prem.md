@@ -5,7 +5,7 @@ name: Hybrid / on-prem
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - infra-capacity-economics/cloud-ai-architecture
   - infra-capacity-economics/gpu-infrastructure
@@ -101,8 +101,11 @@ growing.
 ### Operating the owned side
 A fixed pool is only cheaper when busy, so on-prem capacity should not be sized for the peak of all
 traffic. The sizing has two parts: restricted work has nowhere else to go, so its *peak* (plus a
-spare for a node failure) must fit on-prem; burst-eligible work is sized only at its steady base,
-filling the gaps the restricted peak leaves, and its peaks go to the cloud. The owned side needs a hardware lifecycle
+spare for a node failure) must fit on-prem; burst-eligible work first fills the gaps the restricted
+load leaves (nights, weekends, the spare's idle hours), and its peaks go to the cloud. GPUs beyond
+the restricted requirement are justified only by eligible load that is present nearly all the
+time, *because* only load that is always there keeps an extra GPU above break-even utilization;
+eligible load that comes and goes is cheaper rented. The owned side needs a hardware lifecycle
 (procurement lead time, spares, replacement cadence, typically a three-to-five-year amortisation
 for the TCO model), a serving-stack lifecycle (engine upgrades, CVE patching, driver and CUDA
 compatibility), monitoring unified with the cloud side, and a model lifecycle (which open-weight
@@ -150,7 +153,8 @@ def route(r: Request) -> str:
     if r.needs_frontier:
         return "cloud:eu-region"                         # private endpoint, approved region
     if ONPREM_QUEUE_WAIT_MS["central"] > BURST_THRESHOLD_MS and r.latency_budget_ms < 5_000:
-        return "cloud:eu-region"                         # eligible burst: internal/public data only
+        return "cloud:eu-region"                         # interactive eligible burst only;
+                                                         # deferrable work waits for owned GPUs
     return "onprem:central"                              # owned capacity is sunk cost: keep it busy
 
 print(route(Request(DataClass.RESTRICTED, False, 2000)))        # onprem:central
@@ -160,7 +164,19 @@ print(route(Request(DataClass.PUBLIC, False, 2000)))            # cloud:eu-regio
 ```
 
 The policy refuses rather than degrades when restricted data needs a capability only the cloud
-has; that refusal is the signal to procure a better on-prem model, not a bug to route around.
+has; that refusal is the signal to procure a better on-prem model, not a bug to route around. The
+order of the checks is the policy: classification first, so no later rule (latency, capability,
+burst) can move restricted data.
+
+Sizing the owned pool, with illustrative numbers in replicas of one model: restricted traffic
+peaks at 3 replicas on weekday afternoons and falls to 1 overnight; eligible interactive traffic
+runs at 2 replicas during the day and peaks at 6; an overnight batch could use 4 replicas for 8
+hours. Own 3 + 1 spare = 4 for the restricted peak. During the day, the spare and any restricted
+slack take eligible interactive work and the rest of its peak bursts to the cloud. Overnight,
+restricted needs 1 and the batch takes the other 3, so the pool stays busy around the clock.
+Buying 2 more replicas for the daytime eligible base would make sense only if those 2 also stayed
+busy overnight and at weekends; if not, they sit idle for over half the week and the cloud is
+cheaper for that load.
 
 ## Trade-offs
 - Owned GPUs lower cost per token at high utilization, but they are a fixed quantity with months of
@@ -199,13 +215,13 @@ burst volume and its cost, per-route quality on shared evals, and the number of 
 which tells you where the on-prem model is falling short. In day-to-day work this shows up as the
 gateway's policy table and the quarterly review of what each side costs; in interviews, expect to
 defend why classification is enforced at the gateway and why on-prem is sized for the restricted
-peak plus the base of eligible work rather than for total peak.
+peak plus only the always-present base of eligible work rather than for total peak.
 
 ## Role lens
 - **Engineer:** Builds the gateway policy and burst logic, runs OpenAI-compatible engines on the
   owned side, and maintains per-route prompts and evals so either side passes the same test suite.
 - **Architect:** Defines the data classes and their permitted targets, sizes the owned pool to the
-  base load, owns the TCO and break-even model, and signs off on the connectivity and secrets design.
+  restricted peak plus the always-present eligible base, owns the TCO and break-even model, and signs off on the connectivity and secrets design.
 - **FDE:** Deploys the on-prem or customer-VPC side inside the customer's environment, maps their
   data classifications to routes, and sets up burst eligibility and monitoring that the customer's
   security team accepts.
@@ -239,7 +255,7 @@ insufficient.
 
 ### Q: Which sizing rule keeps owned GPUs economical in a hybrid design?
 - [ ] Size on-prem for peak so the cloud is never needed
-- [x] Fit the restricted workload's peak, add the steady base of cloud-eligible work, and send eligible peaks to the cloud
+- [x] Fit the restricted workload's peak, add capacity only for eligible load present nearly all the time, and send eligible peaks to the cloud
 - [ ] Size on-prem for the restricted workload's average load and send everything else to the cloud
 - [ ] Size on-prem to match the cloud quota in the approved region
 > Owned cost per token falls with utilization, so the pool must be busy, but restricted work cannot

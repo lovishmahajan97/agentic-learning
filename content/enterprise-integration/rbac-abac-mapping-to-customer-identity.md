@@ -5,6 +5,7 @@ name: RBAC / ABAC mapping to customer identity
 kind: pattern
 difficulty: advanced
 est_minutes: 17
+status: reviewed
 related:
   - enterprise-integration/sso-iam-integration
   - enterprise-integration/scim-provisioning
@@ -37,8 +38,10 @@ The naive approaches fail in predictable ways. Hard-coding group names in code (
 works for one customer and is wrong for the next, and breaks on rename. Granting everyone in the tenant the
 same access ignores the fact that their source systems already restrict HR, M&A and legal content.
 Re-implementing their whole permission model inside your product creates a second source of truth that
-drifts. Pure RBAC also struggles with rules like "regional managers see deals in their region" without an
-explosion of roles (one per region per function). And AI adds a new principal: an agent acting for a user
+drifts. Pure RBAC also struggles with rules like "regional managers see deals in their region": with six
+functions, five regions and three seniority levels, encoding each combination as a role gives 90 roles,
+and adding one region adds 18 more, each of which a customer admin must bind and review. ABAC states the
+rule once, `subject.region == resource.region`, and adding a region adds no policy. And AI adds a new principal: an agent acting for a user
 must not exceed that user's rights, nor be granted broader rights because it runs as a service. A mapping
 layer gives each customer a reviewable, testable statement of who can do what.
 
@@ -59,13 +62,30 @@ layer gives each customer a reviewable, testable statement of who can do what.
   "confidential" requires subject.clearance >= 2`.
 - `default`: what an authenticated user with no matching binding gets, usually nothing beyond basic access.
 
+### Translating source ACLs into the customer's identities
+Carried ACLs name principals in each source's vocabulary (SharePoint site groups, Confluence groups, Slack
+channels, Salesforce public groups), not the IdP groups your role bindings use. There are two ways to join
+them, and the choice is a real design decision:
+- **Expand at index time.** Resolve each document's ACL to user IDs and store those. Queries are a simple
+  membership test, but one person joining a 10,000-member group rewrites the ACL of every document that group
+  can see, so membership churn becomes index churn.
+- **Resolve at query time.** Store source principal IDs on documents, and compute for each user the set of
+  source principals they hold (from a crosswalk of source identities to IdP IDs plus synced source-group
+  membership). Documents change only when their own ACL changes; the cost moves to keeping the per-user
+  principal set current and fast to look up. It is the more common choice once groups are large.
+Either way, a source principal the crosswalk cannot resolve grants nothing, *because* guessing (by display
+name, say) is how one person's access lands on another.
+
 ### Resolving a principal
 At login (OIDC/SAML) and on SCIM updates, build the principal: stable user key, group IDs (including nested
 groups resolved by the IdP or Graph), mapped roles and attributes. Cache with a short TTL and invalidate on
 SCIM events.
 
 ### Enforcing
-Evaluate in one policy decision point, *because* scattered `if` statements cannot be audited. Options range
+Evaluate in one policy decision point, *because* scattered `if` statements cannot be audited. Fix the
+combining rules explicitly: deny by default, an explicit deny overrides any allow, and a policy whose
+attribute is missing evaluates to deny (fail closed), with the missing-attribute rate monitored so that
+fail-closed shows up as a data-quality alert rather than as silent lockouts. Options range
 from a small in-process function to a policy engine (OPA/Rego, Cedar) or a relationship-based system
 (Zanzibar-style, e.g. OpenFGA or SpiceDB) when permissions follow object graphs like folders and shares.
 
@@ -140,6 +160,8 @@ on her behalf.
   appearing in answers, paraphrased.
 - Running agents with a service identity broader than the user; the symptom is an agent completing an action
   the user could not perform directly in the UI.
+- Expanding document ACLs to individual users at index time for large groups; the symptom is index write
+  volume and permission lag that spike whenever HR moves people between big groups.
 - Ignoring nested groups; the symptom is users whose access comes through a parent group seeing nothing.
 
 ## When to use

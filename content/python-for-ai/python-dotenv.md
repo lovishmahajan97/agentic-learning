@@ -5,7 +5,7 @@ name: python-dotenv
 kind: tool
 difficulty: intro
 est_minutes: 9
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/pydantic-settings
   - backend-fundamentals/secrets-management
@@ -49,7 +49,11 @@ module (or the current directory in an interactive session) and walks up parent 
 finds a `.env`. It walks *up* because scripts are often run from a subfolder (`scripts/`, `notebooks/`)
 while the file sits at the project root. You can pass an explicit path instead, and
 `find_dotenv(usecwd=True)` searches from the working directory. If nothing is found, `load_dotenv()`
-returns `False` rather than raising, because "no file" is the normal production case.
+returns `False` rather than raising, because "no file" is the normal production case. The walk is a
+convenience with two sharp corners: it stops at the *first* `.env` going up, so in a monorepo a parent
+directory's file can be picked up by a child project; and when the calling code lives in an installed
+package (under `site-packages`), the walk starts there and never reaches your project. Passing an
+explicit path in the entry point removes both ambiguities.
 
 ### Parsing
 Each line is `KEY=value`, optionally prefixed with `export ` so the same file can be `source`d by a
@@ -64,6 +68,18 @@ the process environment wins over the file. This is *because* the file is meant 
 the laptop. In CI or production, the platform-injected value is authoritative, and a stray `.env` baked
 into an image must not silently replace it. Pass `override=True` only when you deliberately want the
 file to win.
+
+A consequence people miss: with `override=False`, *the first source to set a key wins*. If you load
+several files, load the most specific one first (`load_dotenv(".env.local")` then
+`load_dotenv(".env")`), the opposite of the "later overrides earlier" order most config systems use.
+Interpolation follows the same precedence, and `${VAR:-default}` supplies a fallback when neither the
+environment nor the file defines `VAR`.
+
+### Lifecycle
+Loading is a one-time copy into the process environment, not a live binding. Editing `.env` changes
+nothing in a running process; you must restart it. Anything that captured a value before
+`load_dotenv()` ran (a module-level `client = OpenAI()`, a `settings` object built at import) keeps
+what it saw at that moment, which is why the load belongs on the first lines of the entry point.
 
 ### Two ways to use the values
 - `load_dotenv()` mutates `os.environ`, so every library that reads env vars (the OpenAI SDK reads
@@ -133,6 +149,9 @@ before `load_dotenv()` ran and `override` defaults to `False`.
 - Treating `"false"` or `"0"` as falsy; the symptom is debug mode or a feature flag stuck on.
 - Copying `.env` into a Docker image with `COPY . .`; the symptom is real keys visible in a pulled
   image layer, prevented with `.dockerignore`.
+- Relying on the upward search from a script in a nested repo or an installed package; the symptom is
+  values that come from the wrong project's `.env` or `load_dotenv()` returning `False` on a machine
+  where the file plainly exists. Log the return value and pass an explicit path.
 
 ## When to use
 Use python-dotenv for local development, notebooks, demos and small scripts where the alternative is

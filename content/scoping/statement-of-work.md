@@ -5,7 +5,7 @@ name: Statement of work
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - scoping/success-metrics-kpis
   - scoping/requirements-traceability
@@ -43,7 +43,8 @@ these questions before work starts, while each side can still walk away.
 ### Where it sits
 Commercial engagements usually have a master services agreement (MSA) holding the legal terms, such
 as liability, confidentiality, IP defaults and payment. Each project then gets an SOW under it with the
-specifics. Internal projects often have a charter or project brief that does the same job. The
+specifics. An order-of-precedence clause says which document wins when they conflict. Internal projects often
+have a charter or project brief that does the same job. The
 structure below applies to both. The legal terms are for counsel, and this lesson is not legal advice.
 
 ### Core sections
@@ -80,6 +81,14 @@ structure below applies to both. The legal terms are for counsel, and this lesso
   pricing mid-project, and that re-validation counts as a change.
 - **Phase-based commitment.** Commit to quality targets only after a discovery or PoC phase has
   measured feasibility on real data. Before that, commit to effort and learning, not outcomes.
+- **Sampling noise in thresholds.** A rate measured on N cases has an error bar, so say whether the
+  threshold applies to the point estimate or to a confidence bound, and size N to match. Zero-tolerance
+  lines need the same care. Zero failures in N cases shows, at 95% confidence, only that the true rate
+  is below about 3/N (the "rule of three"). If a failure type truly must never happen, the clause should
+  also require a deterministic control, such as a validator or a hard filter, not just a clean eval run.
+- **Post-acceptance performance.** Acceptance certifies behaviour on a frozen set at one date, and
+  production inputs drift afterwards. State the warranty period, who monitors which metrics after
+  go-live, the threshold that triggers remediation, and whether remediation is in scope or a change.
 - **Data handling.** State where customer data goes, retention, use (or no use) for training, and
   deletion at the end. This often references the data processing agreement.
 
@@ -110,7 +119,11 @@ STRONG
 All thresholds and dates here are illustrative. Notice what the strong version achieves. Acceptance
 is a computation anyone can re-run, not an opinion. The sample is stratified so that long-tail
 suppliers, where extraction usually breaks, cannot be quietly excluded. The one catastrophic error
-type gets its own zero-tolerance line, separate from the averages. And the data dependency has a date
+type gets its own zero-tolerance line, separate from the averages. The numbers are also honest about
+their resolution. On 600 invoices, 98% allows at most 12 misses per field, and a clean run on the
+currency line bounds the true wrong-currency rate below about 0.5% (3/600), not at zero. So the team
+also builds a deterministic check that the extracted currency is one the vendor master allows for
+that supplier, and that check is what makes "zero" credible. And the data dependency has a date
 and a consequence, so a late extract moves the schedule instead of eating the team's time. In week 4
 the customer asks for posting to the ERP. Clause 6.3 makes that a change request with its own estimate
 rather than an argument.

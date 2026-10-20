@@ -5,7 +5,7 @@ name: KEDA autoscaling
 kind: tool
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - infra-capacity-economics/serverless-gpus
   - infra-capacity-economics/inference-clusters
@@ -81,6 +81,15 @@ several minutes. A controller acting on that signal over-reacts and oscillates. 
 requests is a leading, roughly linear signal: by Little's law, concurrency = arrival rate × time in
 system, so it rises the moment traffic does, and dividing it by a measured per-replica capacity gives a
 replica count directly.
+
+Request count has one weakness: it treats a 200-token chat and a 30k-token RAG prompt as equal load.
+The engine's KV-cache usage gauge measures the real resource, but it is a poor *primary* trigger
+*because* it saturates: it sits near 100% whenever the server is full, whether one more request is
+waiting or a thousand, so `ceil(metric / threshold)` cannot size the fleet from it. Two common fixes:
+keep waiting requests as the proportional trigger and add KV usage as a second trigger (the HPA takes
+the maximum), or scale on a token-weighted signal such as prompt plus generation tokens in flight when
+your gateway exports one. Whichever you pick, re-measure per-replica capacity whenever the prompt-length
+distribution changes.
 
 ### What KEDA does not do
 KEDA changes a number in a Deployment. If the new pod requests `nvidia.com/gpu: 1` and no node has a free

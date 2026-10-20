@@ -5,7 +5,7 @@ name: pytest-asyncio
 kind: tool
 difficulty: core
 est_minutes: 13
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/pytest
   - python-for-ai/asyncio
@@ -67,6 +67,19 @@ the pool was created on. Recent versions express this with `loop_scope` argument
 on `pytest_asyncio.fixture`, plus a default-fixture-loop-scope config key; older versions used an
 overridable `event_loop` fixture, which has been deprecated and removed. Check the docs for the
 version you have pinned, because this API changed more than once.
+
+### What it does not do
+Three misconceptions are worth killing early. First, async tests do not run concurrently with each
+other: pytest still executes one test at a time, and the plugin runs each test's coroutine to
+completion before the next starts, so a slow async suite is not sped up by being async (use
+pytest-xdist for that). Concurrency exists only *inside* a test, among the tasks that test creates.
+Second, the plugin gives you no fake clock: `asyncio.sleep(10)` really waits ten seconds, which is
+why timeout and retry tests either use tiny delays or inject the delay or clock as a parameter.
+Third, it does not clean up after you: tasks a test spawned and never awaited are still pending when
+the loop closes, which surfaces as warnings or as errors attributed to a later test. To run on uvloop
+or another loop implementation, use the plugin's documented mechanism for your pinned version (an
+event-loop policy fixture in recent releases; Python 3.14 deprecates loop policies, so expect this to
+move again) rather than constructing and swapping loop objects yourself.
 
 ### The alternative
 anyio ships its own pytest plugin (`@pytest.mark.anyio`) that can run the same test under asyncio and
@@ -136,7 +149,11 @@ The suite runs in well under a second because the delays are tiny; a real limit 
 - Real `asyncio.sleep` delays keep tests faithful to production timing, but make suites slow and
   timing-sensitive; injecting a clock or tiny delays flips that once the suite grows past a few minutes.
 - Testing through the real event loop catches scheduling bugs that sync wrappers hide, at the price
-  of tests that are harder to read and debug than plain function calls.
+  of tests that are harder to read and debug; if the property under test does not depend on
+  scheduling (a prompt builder that happens to be `async`), extract it and test it synchronously.
+- Session-scoped loops let one connection pool serve the whole suite, but one test's leaked task or
+  closed client now poisons every later test; that trade flips to function scope as soon as failures
+  start appearing only in particular test orders.
 
 ## Pitfalls
 - A session-scoped async fixture (pool, client) used by function-loop tests; the symptom is

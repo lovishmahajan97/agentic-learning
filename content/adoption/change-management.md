@@ -4,8 +4,8 @@ module: adoption
 name: Change management
 kind: practice
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 16
+status: reviewed
 related:
   - adoption/user-training
   - adoption/stakeholder-management
@@ -56,8 +56,9 @@ for a group and work there, *because* training (Knowledge) cannot fix a Desire p
 create urgency, build a guiding coalition, form a vision, communicate it, remove obstacles, generate
 short-term wins, consolidate gains, and anchor the new way in culture. The older
 unfreeze-change-refreeze framing, traditionally attributed to Kurt Lewin (historians note the tidy
-three-step version was largely popularized by later writers), makes the same point compactly: the old habit has to be loosened before
-the new one can form, and then deliberately locked in.
+three-step version was largely popularized by later writers), makes the same point compactly: the old
+habit has to be loosened before the new one can form, and then deliberately locked in. None of these is
+an algorithm; use them to ask "what is missing for this group?", not as a sequence of ceremonies.
 
 ### 1. Define the change as behavior
 "Adopt the AI assistant" cannot be managed or measured. "Claims adjusters start every file over 30 pages
@@ -70,6 +71,17 @@ For each group, list what changes: tasks, skills, metrics, tools, approvals, and
 or roles. Be explicit about job impact, *because* silence is filled with rumor. Groups differ: the end
 users, their team leads, QA reviewers, IT support and compliance each experience a different change.
 
+Treat resistance as data about which stage is blocked, not as an attitude problem. "It's slower" is an
+Ability or incentive problem; "it got the prior-injury note wrong" is a trust problem; "why would I train
+my replacement?" is a Desire problem rooted in job security; a senior expert's "I don't need it" is often
+about losing the status of being the person who knows. Each needs a different fix, which is why the
+diagnosis has to be per group.
+
+The incentive question can usually be made arithmetic. A user adopts the new path when, on the metric
+they are judged by, it beats the old one *including* the cost of verifying the output:
+`t_ai = t_review_output + t_verify + t_fix_errors` versus `t_manual`. If verification is slow or the
+task is short, `t_ai > t_manual` and non-adoption is the rational choice, not a training gap.
+
 ### 3. Build sponsorship and a change network
 An executive sponsor who visibly uses the tool and explains the why creates legitimacy. Champions inside
 each team, usually the early adopters in Rogers' diffusion model, create proof, *because* people copy
@@ -81,8 +93,15 @@ Update the SOPs, QA checklists and KPIs so the new way is the measured way. Deci
 retired and what the fallback is when the AI is down or wrong. *Because* people follow incentives, an
 unchanged scorecard quietly pulls them back to the old process.
 
-### 5. Roll out in phases and close the feedback loop
-Start with a pilot cohort, fix what they hit, then expand. Publish a "you said, we did" list, *because*
+### 5. Roll out in phases, and plan for the dip
+Start with a pilot cohort, fix what they hit, then expand. Expect performance to *fall* before it rises
+(often called the J-curve): people are learning a new habit, running old and new paths side by side, and
+hitting first-version bugs. Tell the sponsor in advance, temporarily protect the pilot cohort's
+productivity targets, and judge the change on the trend after the learning period rather than on week
+two, *because* a dip that nobody predicted reads as failure and gets the project cancelled at its
+lowest point.
+
+Close the feedback loop. Publish a "you said, we did" list, *because*
 visible responsiveness is the cheapest way to build desire. Show the measured error rate honestly and
 teach how to verify (citations, confidence cues), which calibrates trust instead of inflating it.
 
@@ -104,17 +123,26 @@ takes longer than reading the file. Two team leads tell their teams not to rely 
 about a summary that missed a prior-injury note. Ability is also weak: the summary opens in a separate tab,
 so verification means switching windows.
 
+The incentive problem is worth doing as arithmetic (illustrative figures from the interviews): reading a
+file by hand takes about 0.6 minutes per page; the AI path costs about 10 minutes of fixed overhead
+(read the summary, open and check each cited section) plus about 0.25 minutes per page for the spot
+reading that remains. Break-even is where 0.6p = 10 + 0.25p, so p ≈ 29 pages. On a 12-page file the AI
+path costs 13 minutes against 7 by hand; on an 80-page file it costs 30 against 48. Adjusters who
+abandoned the tool were, on average, handling shorter files: they were right.
+
 Interventions follow the diagnosis. The tool is enabled only for files over 30 pages, where it saves time.
 The missed-note bug is reproduced, fixed and announced, and the team publishes its golden-set result
 (say, a material omission in 1 of 25 long files) alongside the instruction to check cited sections for
 medical history. The two skeptical leads join the pilot review and become champions. The QA checklist is
-updated to accept "summary verified" as a valid review step. Citations are moved inline. Usage on eligible
-files recovers and stays, and cycle time on long files becomes the metric reported to the sponsor.
+updated to accept "summary verified" as a valid review step. Citations are moved inline, which cuts the fixed verification overhead and lowers the break-even
+further. Usage on eligible files recovers and stays, and cycle time on long files becomes the metric
+reported to the sponsor, rather than the share of all adjusters using the tool, which would have
+pressured people to use it on short files where it costs time.
 
 ## Trade-offs
 - A phased pilot surfaces workflow problems cheaply, but it delays org-wide value; skip it only when the change is small and reversible.
 - Retiring the old path forces adoption and ends dual running, but removes the fallback; keep it while the AI's error rate is still being established.
-- Heavy executive sponsorship speeds legitimacy, but a sponsor seen as imposing cuts can turn the change into a headcount fight.
+- Heavy executive sponsorship speeds legitimacy, but a sponsor seen as imposing cuts can turn the change into a headcount fight; it flips back to an asset once the sponsor has stated plainly what happens to roles.
 - Mandating usage gets the numbers up quickly, but produces compliance theatre unless incentives and workflow change first.
 - Investing in a champion network costs people's time, which pays off at scale and is overkill for a ten-person team.
 
@@ -124,6 +152,8 @@ files recovers and stays, and cycle time on long files becomes the metric report
 - Leaving old KPIs in place, which shows up as users reverting to the manual path whenever they are busy.
 - Ignoring team leads and middle managers; usage varies sharply team by team with no technical explanation.
 - Overselling accuracy at launch, so the first visible error triggers a trust collapse and a spike in overrides.
+- Setting an adoption target of "everyone uses it for everything"; the symptom is usage on tasks where the tool is slower, flat or worse outcomes, and resentment.
+- Reviewing results during the learning dip, which shows up as a sponsor wanting to cancel in week three when the trend was about to turn.
 - Staying silent on job impact, revealed by rumors, union or works-council questions, and slow passive resistance.
 
 ## When to use
@@ -131,7 +161,11 @@ Plan change management whenever an AI system changes how a group of people does 
 almost every enterprise deployment beyond a developer tool. The size of the effort scales with the number
 of people affected, how much their metrics and roles change, and how costly mistakes are. Start it during
 scoping, not after launch: the behavior statement and impact assessment belong next to the success
-metrics. Measure the target behavior and the business outcome, not logins. In interviews, the signal is
+metrics. Measure the target behavior and the business outcome, not logins: share of *eligible* tasks done
+the new way, override and edit rates, time per task on the new path versus the old, and usage segmented
+by team (team-by-team variance with no technical cause points at leads or local incentives). If you
+cannot write the behavior sentence or show the new path beats the old on the user's own metric, fix that
+before planning communications. In interviews, the signal is
 whether you treat low adoption as a diagnosis problem (which ADKAR stage is blocked, for whom) rather than
 as a call for more training or a better model.
 

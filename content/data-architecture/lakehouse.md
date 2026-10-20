@@ -4,8 +4,8 @@ module: data-architecture
 name: Lakehouse
 kind: concept
 difficulty: core
-est_minutes: 14
-status: fact-checked
+est_minutes: 15
+status: reviewed
 related:
   - data-architecture/etl-elt-for-rag
   - data-architecture/training-data-pipelines
@@ -67,6 +67,18 @@ a put-if-absent write in the object store (which S3 lacked until it added condit
 long relied on a single writer or an external lock table), or an atomic pointer swap in the catalog, which
 is how Iceberg commits.
 
+Here is one commit with a conflict. The table is at version 41. Writer A appends chunks for new
+documents. Writer B runs a GDPR delete that rewrites three files. Both read version 41, write their new
+Parquet files (which no reader can see yet, because no log entry references them), and try to publish
+version 42. A's put-if-absent of entry 42 succeeds. B's fails, so B reads entry 42 and checks whether
+A's changes conflict with what B read and rewrote. A only added files, and if those files cannot hold
+rows matching B's delete predicate (judged by partition values or file statistics, so the check can be
+conservative), there is no conflict and B publishes the same change as version 43. If A had instead
+rewritten one of the files B removed, B would have to abort and re-run against the new state. This is
+optimistic concurrency. It is cheap when writers touch disjoint data and degrades into retry storms when
+many writers rewrite the same partitions, and that is the condition under which you serialize writers
+through one job instead.
+
 The same log gives you:
 
 - **Snapshot isolation and time travel.** A reader pins a version; a training job can record the
@@ -83,6 +95,18 @@ The same log gives you:
 - **Partitioning and clustering.** Rows are laid out by a partition value (date, tenant) and optionally
   clustered within partitions so that statistics-based skipping works. Iceberg's hidden partitioning
   derives the partition from a column transform so queries need not know the layout.
+
+### Delta, Iceberg and Hudi: what actually differs
+All three implement the same idea, and they differ mainly in where they came from. Delta Lake came out of
+Databricks and Spark: a linear log of JSON commits with Parquet checkpoints, most mature inside that
+ecosystem. Iceberg came out of Netflix as an engine-neutral specification: snapshots point to manifest
+lists, which point to manifests, which point to data files, so planning a query reads a small
+metadata tree instead of listing directories. It also offers hidden partitioning and partition
+evolution, meaning the layout can change without rewriting old data or changing queries. Hudi came out
+of Uber for upsert-heavy, CDC-fed tables. It offers explicit copy-on-write and merge-on-read table types
+and record-level indexes that locate the file holding a key, which makes frequent upserts cheaper.
+Interoperability layers such as Delta UniForm and Apache XTable write one format's metadata for another
+format's data, which is why the choice is less permanent than it used to be.
 
 ### Layer 3: the catalog
 A catalog maps table names to the current metadata location and is where access control, discovery and
@@ -141,6 +165,15 @@ print(eval_version, frozen.num_rows)
 dt.optimize.compact()
 dt.vacuum(retention_hours=168, dry_run=False)
 ```
+
+What the log looks like afterwards shows the mechanism. Version 0 is the append: one `add` action per
+new Parquet file. Version 1 is the merge. Because these rows already exist, it rewrites the matched file:
+a `remove` for the old file and an `add` for its replacement, both in one atomic entry. Version 2 is the
+compaction: `remove` actions for the small files and an `add` for the large one, with no change to the
+rows. (On this two-row toy table compaction may find nothing to merge and commit nothing; on a real table
+fed by streaming appends it is a large commit.) A reader pinned to version 0 still resolves the original file, because `remove` only drops a file
+from later versions and does not delete it from storage. Vacuum is the step that deletes files no
+retained version references.
 
 Every training or evaluation run that reads this table records `eval_version`; a later audit re-reads the
 same rows even after the table has moved on, provided the retention policy keeps that version. Note that

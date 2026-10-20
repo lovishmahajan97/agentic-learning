@@ -5,7 +5,7 @@ name: OpenTelemetry instrumentation
 kind: tool
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - fastapi-for-ai/structured-logging
   - fastapi-for-ai/shared-httpx-asyncclient
@@ -66,13 +66,31 @@ span lives in a `contextvars`-based context, so async code keeps correct parenta
   on a specific model with 812 input tokens. Wrap model calls, retrieval, reranking and tool execution in
   your own spans and set attributes. OTel's GenAI semantic conventions define names such as
   `gen_ai.request.model` and `gen_ai.usage.input_tokens`; they are still marked as in development, so pin
-  the version you follow.
+  the version you follow. `start_as_current_span` records an exception raised inside it as a span event and
+  sets the span status to error by default, so a failed provider call shows up red without extra code.
 
 ### Sampling
 Recording every span of every request is expensive at volume. A `ParentBased(TraceIdRatioBased(0.1))`
 sampler keeps about 10% of new traces and follows the caller's decision for propagated ones, so a trace is
 never half-sampled across services. Tail-based sampling (keep all errors and slow traces) happens in the
 collector, because only after a trace ends do you know whether it was interesting.
+
+### The collector
+The application usually exports OTLP to an OpenTelemetry Collector (conventionally port 4317 for gRPC,
+4318 for HTTP), running as a sidecar, a node agent or a central gateway, rather than straight to a vendor.
+The collector is a pipeline of receivers, processors and exporters: it batches and retries, can delete or
+hash attributes (a last line of defence against prompt text leaking into telemetry), performs tail
+sampling, and fans out to one or several backends. Keeping those decisions there means changing backends
+or sampling policy is a config change to one deployment, not a redeploy of every service.
+
+### Metrics and logs
+Traces are sampled, so they are the wrong source for totals. Request counts, latency histograms and token
+usage belong in metrics: a `MeterProvider` with a periodic exporting reader aggregates in process and
+exports every interval, and every request is counted regardless of trace sampling. The GenAI conventions
+define metrics such as `gen_ai.client.token.usage` and `gen_ai.client.operation.duration` for this. For
+logs, the cheap win is correlation: put the current span's trace id (32 hex characters) and span id on
+every log record, either with the stdlib `LoggingInstrumentor` or a structlog processor that reads
+`trace.get_current_span().get_span_context()`, so a log line links straight to its trace.
 
 ### Process model
 Threads do not survive `fork`, and SDK state created before a fork is not safe to inherit. Recent SDK
@@ -147,6 +165,8 @@ the generator: a span ended when the handler returns would close before the firs
   on reload; the symptom is duplicated nested server spans for every request.
 - Leaving health probes instrumented; the symptom is traces dominated by `/livez` every few seconds per pod
   and a tracing bill driven by probes.
+- Computing token spend or request counts from traces under head sampling; the symptom is totals that are
+  roughly the sampling ratio of the provider's bill (about a tenth at 10%), or that drift as sampling changes.
 - Putting user ids or raw prompts in span names instead of attributes; the symptom is an explosion of
   unique span names that breaks grouping and latency aggregation in the backend.
 

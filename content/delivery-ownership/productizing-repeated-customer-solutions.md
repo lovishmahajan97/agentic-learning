@@ -5,7 +5,7 @@ name: Productizing repeated customer solutions
 kind: practice
 difficulty: advanced
 est_minutes: 16
-status: fact-checked
+status: reviewed
 related:
   - customer-data-evaluation/feedback-loops-to-product
   - adoption/feature-request-triage
@@ -50,6 +50,14 @@ three: build the first, copy the second while recording every difference, extrac
 usually shows what genuinely varies and what was coincidence. Three is a heuristic, not a law: a
 well-understood domain can justify extracting at two, and a very heterogeneous one may need more.
 
+Count alone does not decide it; the economics do. Each recurring change (model upgrade, security fix,
+shared bug fix) costs roughly `N × c_fork` across N forks and `c_core + N × c_tenant` on a product,
+where `c_tenant` is running and reviewing one customer's regression suite. Extraction pays back when
+the per-change saving, `N × (c_fork − c_tenant) − c_core`, summed over the changes you expect in your
+planning horizon, exceeds the one-time cost of building the core and migrating the forks. The formula
+makes two things visible: the saving grows linearly with customer count, and it is negative for small N
+if the core is expensive to change, which is the quantitative form of "too early".
+
 ### 2. Classify every difference
 Diff the instances component by component and put each difference in one bucket:
 - **Configuration**: differences in data, not logic. Field lists, thresholds, clause taxonomies, prompt
@@ -66,14 +74,21 @@ evaluation harness, observability, security controls. Prompts become one templat
 N forked prompts, so a model upgrade is tuned once. Evaluation splits into a shared core suite plus a
 per-customer regression suite, *because* the core must prove it did not break anyone in particular.
 
+Configuration is now code that ships. A tenant's config is validated against the schema on load (bad
+config fails at deploy, not at 2 a.m. on the first document), versioned, reviewed, and gated by that
+tenant's regression suite, *because* changing a clause description changes prompt text, and prompt text
+changes behaviour as surely as a code change does.
+
 ### 4. Migrate the forks
 Move existing customers onto the product, least-divergent first, each gated by their regression suite
 showing parity with the fork's behaviour. Stopping halfway is the worst state: you now maintain a product
 and forks. Set a date after which forks receive security fixes only.
 
 ### 5. Transfer ownership
-A product team owns the core's roadmap, versioning and deprecation; field engineers consume it, contribute
-extensions, and file evidence-backed requests. Track time to onboard a new customer, the share of each
+A product team owns the core's roadmap, versioning and deprecation, including an upgrade policy: every
+tenant moves to a new core release within a stated window, *because* letting each customer pin a
+version indefinitely recreates the forks in time instead of in code. Field engineers
+consume the core, contribute extensions, and file evidence-backed requests. Track time to onboard a new customer, the share of each
 deployment that is configuration rather than custom code, and engineering hours per customer per month.
 
 ## Example
@@ -108,8 +123,11 @@ class CustomerConfig(BaseModel):           # configuration: data, validated, ver
 The economics, with illustrative effort figures: if a model upgrade costs about 40 engineer-hours per
 fork to re-tune and re-evaluate, three forks cost 120 hours and ten cost 400. On the product, the same
 upgrade might cost 50 hours on the core plus 4 hours per customer to run and review its regression suite:
-62 hours at three customers, 90 at ten. The fourth customer then needs a connector and a config file,
-not a new codebase.
+62 hours at three customers, 90 at ten. The per-upgrade saving is 58 hours at three customers and 310
+at ten. If building the core and migrating the forks costs 600 hours (also illustrative), upgrades alone
+take about ten cycles to pay it back at three customers and two at ten; security and bug fixes shorten
+both, which is why the honest case is made with all recurring changes, not one. The fourth customer then
+needs a connector and a config file, not a new codebase.
 
 ## Trade-offs
 - Productizing early avoids fork divergence, but with fewer than three examples you will likely abstract
@@ -130,6 +148,8 @@ not a new codebase.
   forks, with fixes landing in one and not the others.
 - Forking the shared prompt per customer "just for now"; the symptom is a model upgrade that passes core
   evals but regresses two customers whose prompt copies nobody re-tested.
+- Letting tenants pin core versions with no upgrade window; the symptom is production running several
+  core releases at once, with each fix backported by hand, which is the fork problem again.
 - Productizing without per-customer regression suites; the symptom is a core release that silently breaks
   one customer's edge cases, discovered from their support ticket.
 
@@ -137,7 +157,8 @@ not a new codebase.
 Start productizing when the same solution shape appears for the third customer, when onboarding time per
 customer has stopped falling, or when a model upgrade or security fix has to be applied in several places.
 Hold off while the domain is still being discovered and each customer teaches you something new about the
-shape. Measure onboarding time, custom code per deployment and maintenance hours per customer before and
+shape. Before committing, run the break-even arithmetic with your own hour estimates for recurring
+changes and for the extraction itself. Measure onboarding time, custom code per deployment and maintenance hours per customer before and
 after. In day-to-day field work, the habit that makes this possible is recording every difference you
 introduce when copying a solution. In interviews, describe how you decided what became configuration,
 what became an extension, and what you refused.

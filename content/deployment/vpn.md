@@ -5,6 +5,7 @@ name: VPN
 kind: concept
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - deployment/private-endpoints
   - deployment/customer-vpc-on-prem-air-gapped
@@ -53,7 +54,8 @@ negotiated by IKEv2. Two phases:
    derive shared keys, then authenticate each other with a pre-shared key or certificates. Certificates
    are preferable at scale because a leaked PSK compromises every tunnel that shares it. The result is an
    encrypted control channel, usually over UDP 500, moving to UDP 4500 when NAT is detected (NAT
-   traversal), which is why firewalls on both sides must open those ports.
+   traversal), which is why firewalls on both sides must open those ports. Without NAT, the data
+   packets travel as raw ESP (IP protocol 50, not TCP or UDP), which firewalls must permit as well.
 2. **Child SAs (the data plane).** Inside that channel the peers agree keys and traffic selectors for ESP,
    the protocol that encrypts and authenticates each packet. Keys are rekeyed on a timer so a single
    compromised key exposes only a bounded window.
@@ -70,7 +72,11 @@ different endpoints, precisely so that the provider can maintain one without an 
 Each packet gains ESP headers, padding and an authentication tag plus an outer IP header, tens of bytes
 in total. A full-size 1,500-byte packet no longer fits, so either it is fragmented or, if the
 "don't fragment" bit is set and ICMP is blocked, silently dropped. Gateways therefore clamp the TCP
-maximum segment size so endpoints send smaller segments. Throughput per tunnel is also bounded by the
+maximum segment size (MSS) in the SYN handshake so endpoints send smaller segments; cloud VPN docs
+typically recommend a clamp somewhere in the 1,350–1,400-byte range, but use your provider's figure.
+Clamping happens at the gateway *because* you cannot rely on every host's path-MTU discovery when
+firewalls drop the ICMP messages it depends on. It fixes TCP only; UDP traffic must be sized by the
+application. Throughput per tunnel is also bounded by the
 gateway's crypto capacity and the internet path, typically gigabit-class rather than the tens of gigabits
 a dedicated circuit offers (check your provider's documented limits).
 
@@ -80,6 +86,15 @@ a newer, deliberately small protocol: fixed modern cryptography, peers identifie
 configuration of a few lines. Its simplicity makes it easy to audit and fast, but many enterprises
 standardize on IPsec appliances, so you meet WireGuard more in your own infrastructure than in a
 bank's.
+
+### When address spaces overlap
+Routing only works if each side can tell local addresses from remote ones, so overlapping CIDRs are
+the first thing to check, not the last. Three ways out, in rough order of preference: terminate in a
+fresh network whose range neither side uses (cheap when you control one end, as a vendor usually
+does); NAT on the gateway, so the customer sees your traffic arriving from an agreed non-overlapping
+range and you reach their hosts through translated addresses (works, but every log and firewall rule
+now speaks two address vocabularies); or re-address one side, which is correct and almost never
+quick inside an enterprise.
 
 ### Narrowing the blast radius
 Because a tunnel joins networks, scope it: advertise only the specific subnets needed, put firewall rules
@@ -92,7 +107,8 @@ file server, with case metadata in a SQL Server instance. The plan is a site-to-
 data center to a dedicated "customer-integration" VPC in the vendor's cloud account.
 
 Addressing first: the firm uses 10.0.0.0/8 broadly and the vendor's VPC is 10.20.0.0/16, which overlaps.
-Rather than re-IP anything, the vendor creates the integration VPC as 172.31.240.0/22 and the firm
+Rather than re-IP anything, the vendor confirms the firm uses nothing in 172.16.0.0/12, creates the
+integration VPC as 172.31.240.0/22, and the firm
 advertises only two /32 host routes (the file server and the database) over BGP. Firewall rules on the
 firm's side allow only SMB and the SQL Server port, from the ingestion workers' subnet, to those two hosts.
 
@@ -111,8 +127,13 @@ during a sync and confirming BGP shifts traffic without dropping the job.
   with the internet path; once traffic is large and permanent, a dedicated circuit pays for itself.
 - Joining networks enables any protocol in either direction, which helps legacy integrations, but it
   widens the attack surface compared with a one-way private endpoint to a single service.
-- Static routes are simple to reason about for one or two subnets, but they do not fail over; BGP adds
-  configuration and debugging skill in return for automatic failover and fewer manual edits.
+- A dedicated circuit gives predictable bandwidth and latency, but it is private rather than
+  encrypted by default, so regulated customers often still run IPsec (or MACsec where offered) over
+  it; the choice flips back to VPN alone when volumes are modest and lead time matters.
+- Static routes are simple to reason about for one or two subnets, but they carry no liveness signal of
+  their own, so failover depends on vendor-specific tunnel monitoring (dead-peer detection, route
+  tracking) or manual edits; BGP adds configuration and debugging skill in return for standard,
+  automatic failover and fewer manual edits.
 - Remote-access VPN gives engineers broad network access easily, but identity-aware zero-trust access
   per application is safer when many people need narrow access to a few internal tools.
 
@@ -153,7 +174,7 @@ tunnel shows "up". What is happening and how do you confirm and fix it?
 **A:** That size-dependent pattern points to MTU. IPsec encapsulation adds tens of bytes, so full-size
 packets exceed the tunnel MTU; if "don't fragment" is set and ICMP "fragmentation needed" messages are
 blocked by a firewall, those packets are silently dropped while small ones pass. Confirm by sending pings
-with the don't-fragment flag at decreasing sizes to find the largest packet that passes, or by capturing
+with the don't-fragment flag (on Linux, `ping -M do -s 1400 <host>`) at decreasing sizes to find the largest packet that passes, or by capturing
 traffic and seeing retransmissions of large segments. Fix it by enabling TCP MSS clamping on the VPN
 gateway to a value that fits the tunnel overhead, or by allowing the relevant ICMP messages so path MTU
 discovery works. Then retest with a large result set.
@@ -164,8 +185,8 @@ discovery works. Then retest with a large result set.
 - [x] BGP advertises and withdraws prefixes dynamically, so traffic fails over to the redundant tunnel automatically
 - [ ] Static routes cannot be used with IPsec
 - [ ] BGP removes the need for non-overlapping address ranges
-> Static routes stay in place even when their tunnel is down, so failover needs manual action. BGP
-> withdraws routes from a failed tunnel. Encryption is ESP's job, and overlapping ranges remain a problem
+> A static route says nothing about whether its tunnel is alive, so failover relies on vendor-specific
+> tunnel monitoring or manual action. BGP withdraws routes from a failed tunnel as part of the protocol. Encryption is ESP's job, and overlapping ranges remain a problem
 > with either routing method.
 
 ### Q: A customer asks for a VPN so your SaaS can call their single internal REST API. Their network team worries about exposure. What is the strongest scoping you can offer?

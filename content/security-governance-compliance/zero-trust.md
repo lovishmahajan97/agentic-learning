@@ -5,6 +5,7 @@ name: Zero trust
 kind: concept
 difficulty: core
 est_minutes: 15
+status: reviewed
 related:
   - security-governance-compliance/ai-security
   - security-governance-compliance/prompt-injection-defense
@@ -51,8 +52,9 @@ scope, so that a misled agent can only do what the current user was allowed to d
 NIST SP 800-207 frames zero trust around a few tenets, paraphrased here: treat all data sources and
 services as resources; secure all communication regardless of network location; grant access per
 session, per resource; decide access by dynamic policy using identity, device or workload posture and
-other signals; continuously monitor assets; and enforce authentication and authorisation strictly before
-access. "Assume breach" summarises the attitude: design so that any one compromised component has a
+other signals; monitor the integrity and security posture of all assets; enforce authentication and
+authorisation dynamically and strictly before access; and collect telemetry to improve policy over
+time. "Assume breach" summarises the attitude: design so that any one compromised component has a
 small blast radius.
 
 ### The architecture: PDP and PEP
@@ -72,6 +74,13 @@ than a key valid for a year.
   OAuth token exchange (RFC 8693), so a downstream API sees both the agent and the user and can apply the
   user's permissions. A shared service account that can read every customer's data turns any injection
   into a cross-tenant breach.
+  The flow, step by step: the user signs in and the agent runtime holds the user's token (audience: the
+  agent). Before a tool call, the runtime sends it to the token service as `subject_token`, with the
+  agent's own workload credential as `actor_token`, and asks for audience `tool:crm` and scope
+  `crm:read`. The token service checks that this agent may act for this user on that tool and returns
+  a token valid for minutes whose `sub` is the user and whose `act` claim names the agent. The tool
+  never sees the user's original token, *because* a token valid at every service is a token any
+  compromised service can replay everywhere.
 - **Scope per task.** Mint tokens with the narrowest scopes and audiences the current tool call needs,
   rather than one token with every scope for the whole session.
 - **Authorise every tool call at the PEP.** The model proposing a call is not authorisation; the PEP
@@ -86,17 +95,24 @@ than a key valid for a year.
 
 ### Continuous verification
 Decisions are re-evaluated per request, so revoking a user, quarantining a workload or raising a risk
-signal takes effect on the next call rather than at the next login. Every decision is logged with
-principal, delegator, resource and outcome, which is what makes incident reconstruction possible.
+signal takes effect on the next call rather than at the next login. One caveat: if a PEP only validates
+self-contained tokens (such as JWTs) locally, a revocation lands when the token expires unless the PEP
+also checks revocation or introspects the token, which is one more reason to keep lifetimes short.
+Every decision is logged with principal, delegator, resource and outcome, which is what makes incident
+reconstruction possible.
 
 ## Example
-A PEP in front of tools. The agent presents a delegated token; the PEP checks audience, expiry, scope
-and the *user's* rights to the specific record before attaching the real backend credential.
+A PEP in front of tools. The agent presents a delegated token whose signature the PEP has already
+verified; the PEP checks audience, expiry, scope and the *user's* tenant against the specific record
+before attaching the real backend credential. Session state that changes during the conversation, such
+as whether untrusted content has been read, is passed as separate runtime context rather than baked into
+the token, *because* the token was minted before that state existed. A real PDP would also check
+record-level rights.
 
 ```python
 import time
 
-def pdp_decide(claims: dict, tool: str, resource: dict) -> tuple[bool, str]:
+def pdp_decide(claims: dict, ctx: dict, tool: str, resource: dict) -> tuple[bool, str]:
     if claims["exp"] < time.time():
         return False, "token expired"
     if claims["aud"] != f"tool:{tool}":
@@ -105,26 +121,29 @@ def pdp_decide(claims: dict, tool: str, resource: dict) -> tuple[bool, str]:
         return False, "scope missing"
     if resource["tenant"] != claims["tenant"]:
         return False, "cross-tenant access"
-    if resource["action"] == "write" and claims.get("session_tainted"):
+    if resource["action"] == "write" and ctx.get("session_tainted"):
         return False, "writes blocked after untrusted content"
     return True, "ok"
 
-def pep_call(token_claims, tool, resource, backend):
-    ok, why = pdp_decide(token_claims, tool, resource)
+def pep_call(token_claims, ctx, tool, resource, backend):
+    ok, why = pdp_decide(token_claims, ctx, tool, resource)
     audit = {"sub": token_claims["sub"], "act": token_claims["act"]["sub"], "tool": tool,
              "res": resource["id"], "decision": why}
     print(audit)                                   # ship to the audit log
     return backend(resource) if ok else None       # backend secret added here, never in the prompt
 
 claims = {"sub": "user:ana", "act": {"sub": "agent:support-bot"}, "tenant": "t-42",
-          "aud": "tool:crm", "scope": "crm:read", "exp": time.time() + 300,
-          "session_tainted": True}
-read_ok = pep_call(claims, "crm", {"id": "acct-9", "tenant": "t-42", "action": "read"}, lambda r: "row")
-other   = pep_call(claims, "crm", {"id": "acct-1", "tenant": "t-7", "action": "read"}, lambda r: "row")
+          "aud": "tool:crm", "scope": "crm:read", "exp": time.time() + 300}
+ctx = {"session_tainted": True}                  # set by the runtime when untrusted content is read
+read_ok = pep_call(claims, ctx, "crm", {"id": "acct-9", "tenant": "t-42", "action": "read"}, lambda r: "row")
+other   = pep_call(claims, ctx, "crm", {"id": "acct-1", "tenant": "t-7", "action": "read"}, lambda r: "row")
 ```
 
-The `act` claim is how RFC 8693 records the actor in a delegated token. The second call fails even if an injected instruction convinced the model to fetch another tenant's
-account, because the decision uses the delegated user's tenant, not the agent's network position.
+The `act` claim is how RFC 8693 records the actor in a delegated token. The second call fails even if an
+injected instruction convinced the model to fetch another tenant's account, because the decision uses the
+delegated user's tenant, not the agent's network position. A write would fail on scope alone here, and
+even with a write scope the tainted context would block it, so two independent checks stand between an
+injected instruction and a state change.
 
 ## Trade-offs
 - Per-request authorisation shrinks blast radius but adds latency and a PDP dependency; caching

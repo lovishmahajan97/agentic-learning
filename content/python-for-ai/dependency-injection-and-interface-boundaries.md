@@ -4,7 +4,7 @@ module: python-for-ai
 name: Dependency injection & interface boundaries
 kind: pattern
 difficulty: core
-est_minutes: 15
+est_minutes: 16
 status: reviewed
 related:
   - python-for-ai/protocols-generics-structural-typing

@@ -5,7 +5,7 @@ name: Property-based testing (Hypothesis)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/pytest
   - python-for-ai/pydantic
@@ -78,12 +78,28 @@ Failing examples are saved in a local database (the `.hypothesis/` directory) an
 next run, so a bug, once found, is checked every time until fixed. `@example(...)` pins a specific input
 permanently, which is how you turn a found counterexample into a documented regression case.
 `assume(cond)` discards inputs that do not meet a precondition; use it sparingly, because heavy
-filtering makes generation slow and Hypothesis will report a health-check failure.
+filtering makes generation slow and Hypothesis will report a health-check failure. The cheaper fix is
+almost always to construct valid inputs directly (draw `size` first, then `overlap` below it) rather
+than generate freely and throw most away.
+
+### Profiles: different budgets for different lanes
+The example count is a dial between thoroughness and suite time, so set it per environment rather
+than per test. `settings.register_profile("ci", max_examples=1000)` and
+`settings.register_profile("dev", max_examples=50)` in `conftest.py`, then select one with
+`--hypothesis-profile=ci` or `settings.load_profile(...)` from an environment variable. A CI profile
+can also set `derandomize=True`, which makes the generated examples a fixed function of the test, so
+a red build is reproducible and never caused by an unlucky draw; the price is that CI explores the
+same inputs every run, which is why some teams keep a randomised nightly job alongside it.
 
 ### Stateful testing
-For objects with operations (a cache, a conversation memory, a rate limiter), `RuleBasedStateMachine`
-generates sequences of operations and checks invariants after each step against a simple model, which
-finds bugs that only appear after a specific order of calls.
+For objects with operations (a cache, a conversation memory, a rate limiter), the bug is often in a
+*sequence* of calls rather than in any single input. `RuleBasedStateMachine` lets you declare each
+operation as a `@rule` with its own argument strategies and each invariant as an `@invariant`.
+Hypothesis then generates random programs (put, put, evict, get, ...), runs each against the real
+object and a deliberately trivial model (a plain `dict` standing in for an LRU cache), and checks
+after every step that the two agree. When they diverge, it shrinks the *program*, so a 40-step
+failure is typically reported as the three or four calls that actually matter, such as "insert at
+capacity, read the oldest key, insert again".
 
 ## Example
 A chunker for retrieval with overlap. A few properties pin down its contract: no chunk exceeds `size`,
@@ -149,6 +165,10 @@ decide explicitly.
   health-check errors about too much data being filtered out.
 - Generating floats for equality-based properties without thinking about NaN, infinities and rounding;
   the symptom is spurious failures on `nan != nan` or tiny representation differences.
+- Using a function-scoped pytest fixture (such as `tmp_path`) inside a `@given` test and expecting it
+  fresh per example; it is created once per *test function* and shared by all generated examples, so
+  state written by one example leaks into the next. Hypothesis raises a health-check error for this;
+  create the resource inside the test body instead.
 - Calling a real LLM or network service inside `@given`; the symptom is a test that makes a hundred
   paid, slow, non-deterministic calls per run and fails on flaky responses, not on bugs.
 - Deleting the `.hypothesis/` database in CI without pinning found failures; the symptom is a bug that

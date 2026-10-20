@@ -5,7 +5,7 @@ name: CORS
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: fact-checked
+status: reviewed
 related:
   - fastapi-for-ai/middleware-ordering
   - fastapi-for-ai/api-keys-oauth2-jwt
@@ -74,6 +74,15 @@ browser sends cookies. It then requires an exact `Access-Control-Allow-Origin` (
 origin's headers to another. Bearer tokens in an `Authorization` header aren't "credentials" in this
 sense, but the header still triggers preflight and must appear in `Allow-Headers`.
 
+### Streaming endpoints
+Chat UIs stream, and the streaming client changes the CORS picture. The browser's `EventSource` API
+cannot set request headers, so it cannot send `Authorization: Bearer`. Teams then either switch to
+cookies (which means credentialed CORS, exact origins and CSRF defences), put the token in the query
+string (where it lands in proxy and access logs, so use a short-lived, single-purpose token if you do),
+or read the SSE stream with `fetch` and a stream reader, which can send any header and is the usual
+choice for POST-based chat endpoints. Either way the CORS headers must be on the streaming response
+itself, which `CORSMiddleware` handles because it adds them to the response start.
+
 ### Reading response headers
 Scripts can read only safelisted response headers unless you list others in
 `Access-Control-Expose-Headers`. If your UI needs `X-Request-ID`, `Retry-After` or a token-usage
@@ -82,10 +91,15 @@ header, you must expose it.
 ### In FastAPI
 `CORSMiddleware` (from Starlette) answers preflights itself and adds headers to normal responses.
 Its defaults are restrictive: no origins, only GET, no extra headers, no credentials. You have to
-opt in to each one. One sharp edge: with `allow_origins=["*"]` *and* `allow_credentials=True`,
+opt in to each one. A preflight from an origin, method or header that isn't allowed gets a 400
+("Disallowed CORS ...") with no `Access-Control-Allow-Origin`, and the browser then refuses to send the
+real request; that 400 in the network tab is the fastest clue to which list is missing an entry. One
+sharp edge: with `allow_origins=["*"]` *and* `allow_credentials=True`,
 Starlette does not send a literal `*` (which browsers would reject). It echoes back whatever `Origin`
 arrived, so every website is allowed to make credentialed calls. The combination that browsers refuse
-on the wire is silently turned into "reflect any origin" by the middleware. Because middleware wraps the app in order, it must sit outside anything that might
+on the wire is silently turned into "reflect any origin" by the middleware.
+
+Because middleware wraps the app in order, it must sit outside anything that might
 short-circuit a request (auth middleware returning 401, rate limiters returning 429). Otherwise
 those responses lack CORS headers and the browser reports a CORS error instead of the real status.
 
@@ -122,8 +136,11 @@ async def chat(body: dict):
 What the browser does: `fetch("https://api.acme.com/v1/chat", {method: "POST", headers:
 {Authorization: "Bearer ...", "Content-Type": "application/json"}})` first sends `OPTIONS` from origin
 `https://chat.acme.com`. The middleware replies 200 with the allowed methods and headers, and the
-browser then sends the POST. A page at `https://evil.example` gets a preflight with no
-`Allow-Origin`, so its script never sends the POST. `curl` from anywhere still reaches `/v1/chat`,
+browser then sends the POST. A page at `https://evil.example` gets a 400 preflight response with no
+`Allow-Origin`, so its script never sends the POST. Had the page instead sent a form-encoded POST
+with no custom headers (a simple request), it *would* reach your server and run whatever that route
+does; the browser would only hide the response. That is why state-changing routes must reject
+requests that lack a credential the attacker's page cannot obtain, such as the bearer token here. `curl` from anywhere still reaches `/v1/chat`,
 which is why the bearer token must be validated.
 
 ## Trade-offs
@@ -150,6 +167,9 @@ which is why the bearer token must be validated.
   `allow_credentials=True`, which Starlette implements as reflection. The symptom only shows up in a
   security review or pentest: any website can read logged-in users' conversations (where the session
   cookie is `SameSite=None`, so the browser attaches it to cross-site requests).
+- Using `EventSource` for an authenticated stream and then "fixing" it by putting a long-lived API
+  token in the URL. The symptom is working streams in the browser and full credentials visible in
+  proxy access logs and browser history.
 - Expecting a trailing slash or a different port to match. The symptom is that the allowlist works
   in staging and fails in prod because `https://chat.acme.com/` was listed with a slash.
 

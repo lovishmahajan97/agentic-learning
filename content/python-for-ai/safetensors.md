@@ -5,7 +5,7 @@ name: safetensors
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: fact-checked
+status: reviewed
 related:
   - python-for-ai/pytorch
   - python-for-ai/hugging-face
@@ -30,7 +30,18 @@ is not a data format; it is a small program that the unpickler executes to rebui
 program can call any importable function, including `os.system`. So a `.bin` or `.pt` checkpoint
 downloaded from the internet is executable code. Once model hubs made it routine to pull weights from
 strangers, "load a model" became "run an untrusted program", and malicious pickles were found in the
-wild.
+wild. The mechanism fits in four lines: any object can tell pickle how to rebuild it via `__reduce__`,
+and the rebuild recipe is "call this function with these arguments".
+
+```python
+import pickle
+class Payload:
+    def __reduce__(self):
+        return (print, ("this ran during load",))   # an attacker would return (os.system, ("...",))
+pickle.loads(pickle.dumps(Payload()))               # prints: the call happens inside loads()
+```
+
+Nothing in a checkpoint file distinguishes "rebuild a tensor" from "call os.system"; both are calls.
 
 There was also a performance problem. Unpickling builds tensors by copying data into freshly allocated
 memory, so loading a large model needs the bytes read and copied, sometimes twice when moving to GPU,
@@ -51,6 +62,8 @@ to restrict.
 2. **N bytes:** a UTF-8 JSON object. Each key is a tensor name mapping to
    `{"dtype": "BF16", "shape": [4096, 4096], "data_offsets": [begin, end]}`; an optional
    `"__metadata__"` key holds string-to-string metadata such as the format or training info.
+   The reference writer pads the header with spaces so the data buffer starts 8-byte aligned, which
+   lets loaders view tensors in place without an alignment copy.
 3. **The rest:** one contiguous byte buffer; each tensor occupies `[begin, end)` relative to the start
    of this buffer, stored row-major with no padding inside a tensor.
 
@@ -61,7 +74,9 @@ out-of-bounds reads.
 
 ### Zero-copy and lazy loading
 Because each tensor sits at a known offset in raw form, the file can be memory-mapped: the operating
-system maps it into the address space and pages in only the bytes actually read. `safe_open` returns a
+system maps it into the address space and pages in only the bytes actually read. Locating a slice is
+pure arithmetic: for a row-major `[rows, cols]` tensor of element size `b` starting at `begin`, row `i`
+lives at bytes `begin + i·cols·b` to `begin + (i+1)·cols·b`, so no parsing of the payload is needed. `safe_open` returns a
 handle where `get_tensor(name)` materialises one tensor and `get_slice(name)[a:b]` reads only a slice,
 which is how tensor-parallel loaders give each GPU just its shard of a weight matrix without reading the
 rest.
@@ -109,6 +124,10 @@ full = load_file("model.safetensors")                  # dict[str, Tensor]
 
 The embedding is 32,000 × 512 × 2 bytes = 32,768,000 bytes, exactly `end - begin` in its
 `data_offsets`; where each tensor starts depends on the writer's ordering, so read offsets, never assume them.
+The 1,000-row slice touches 1,000 × 512 × 2 = 1,024,000 bytes, about 3% of the tensor, which is the
+whole argument for lazy loading when each of eight tensor-parallel ranks needs only an eighth of every
+matrix. Note the header is readable with `json` and `struct` alone: an auditor can list every tensor,
+dtype and shape in a file without installing any ML library or trusting any code.
 
 ## Trade-offs
 - No code execution on load removes a whole class of supply-chain attacks, but the format can only
