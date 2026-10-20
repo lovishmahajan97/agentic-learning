@@ -1,0 +1,3263 @@
+{
+ "generated_from": "AI Roles Skills Taxonomy, Oct 20 2026, Nugen IT Services",
+ "tiers": {
+  "1": {
+   "title": "Tier 1 — Shared core (AI Engineer base)",
+   "blurb": "Everything in this tier is assumed by Tiers 2 and 3. It is the AI Engineer baseline."
+  },
+  "2": {
+   "title": "Tier 2 — AI Architect (adds)",
+   "blurb": "The Architect owns the decisions and boundaries; Tier 1 is implemented by engineers under them."
+  },
+  "3": {
+   "title": "Tier 3 — Forward Deployed Engineer (adds)",
+   "blurb": "The FDE takes Tier 1 into a specific customer's systems, data, security posture and people."
+  }
+ },
+ "role_paths": {
+  "all": {
+   "title": "Everything",
+   "desc": "All three tiers, no trimming.",
+   "rules": {}
+  },
+  "llm-app": {
+   "title": "LLM-app AI Engineer",
+   "desc": "Tier 1 minus ML-fundamentals depth; distributed training and feature stores dropped.",
+   "rules": {
+    "tier2": "skip",
+    "tier3": "skip",
+    "ml-fundamentals": "background",
+    "caveat": "skip"
+   }
+  },
+  "ml-heavy": {
+   "title": "ML-heavy AI Engineer",
+   "desc": "Tier 1 in full.",
+   "rules": {
+    "tier2": "skip",
+    "tier3": "skip"
+   }
+  },
+  "architect": {
+   "title": "AI Architect",
+   "desc": "Tier 1 breadth + Tier 2.",
+   "rules": {
+    "tier3": "skip"
+   }
+  },
+  "fde": {
+   "title": "Forward Deployed Engineer",
+   "desc": "Tier 1 + Tier 3, with Tier 2 Reliability and Security as background reading.",
+   "rules": {
+    "tier2": "skip",
+    "reliability": "background",
+    "security-governance-compliance": "background"
+   }
+  }
+ },
+ "modules": [
+  {
+   "id": "ml-fundamentals",
+   "tier": 1,
+   "order": 0,
+   "title": "ML fundamentals",
+   "topics": [
+    {
+     "id": "supervised-vs-unsupervised-vs-self-supervised-learning",
+     "key": "ml-fundamentals/supervised-vs-unsupervised-vs-self-supervised-learning",
+     "name": "supervised vs unsupervised vs self-supervised learning"
+    },
+    {
+     "id": "classification",
+     "key": "ml-fundamentals/classification",
+     "name": "classification"
+    },
+    {
+     "id": "regression",
+     "key": "ml-fundamentals/regression",
+     "name": "regression"
+    },
+    {
+     "id": "clustering",
+     "key": "ml-fundamentals/clustering",
+     "name": "clustering"
+    },
+    {
+     "id": "loss-functions",
+     "key": "ml-fundamentals/loss-functions",
+     "name": "loss functions (cross-entropy, contrastive)"
+    },
+    {
+     "id": "gradient-descent",
+     "key": "ml-fundamentals/gradient-descent",
+     "name": "gradient descent"
+    },
+    {
+     "id": "backpropagation",
+     "key": "ml-fundamentals/backpropagation",
+     "name": "backpropagation"
+    },
+    {
+     "id": "optimizers",
+     "key": "ml-fundamentals/optimizers",
+     "name": "optimizers (Adam, AdamW)"
+    },
+    {
+     "id": "learning-rate-schedulers",
+     "key": "ml-fundamentals/learning-rate-schedulers",
+     "name": "learning-rate schedulers"
+    },
+    {
+     "id": "warmup",
+     "key": "ml-fundamentals/warmup",
+     "name": "warmup"
+    },
+    {
+     "id": "gradient-clipping",
+     "key": "ml-fundamentals/gradient-clipping",
+     "name": "gradient clipping"
+    },
+    {
+     "id": "batch-size",
+     "key": "ml-fundamentals/batch-size",
+     "name": "batch size"
+    },
+    {
+     "id": "gradient-accumulation",
+     "key": "ml-fundamentals/gradient-accumulation",
+     "name": "gradient accumulation"
+    },
+    {
+     "id": "mixed-precision",
+     "key": "ml-fundamentals/mixed-precision",
+     "name": "mixed precision"
+    },
+    {
+     "id": "normalization",
+     "key": "ml-fundamentals/normalization",
+     "name": "normalization (LayerNorm, RMSNorm)"
+    },
+    {
+     "id": "residual-connections",
+     "key": "ml-fundamentals/residual-connections",
+     "name": "residual connections"
+    },
+    {
+     "id": "dropout-regularization",
+     "key": "ml-fundamentals/dropout-regularization",
+     "name": "dropout / regularization"
+    },
+    {
+     "id": "train-test-leakage",
+     "key": "ml-fundamentals/train-test-leakage",
+     "name": "train/test leakage"
+    },
+    {
+     "id": "class-imbalance",
+     "key": "ml-fundamentals/class-imbalance",
+     "name": "class imbalance"
+    },
+    {
+     "id": "calibration",
+     "key": "ml-fundamentals/calibration",
+     "name": "calibration"
+    },
+    {
+     "id": "precision-recall-f1",
+     "key": "ml-fundamentals/precision-recall-f1",
+     "name": "precision / recall / F1"
+    },
+    {
+     "id": "roc-auc",
+     "key": "ml-fundamentals/roc-auc",
+     "name": "ROC-AUC"
+    },
+    {
+     "id": "confusion-matrix",
+     "key": "ml-fundamentals/confusion-matrix",
+     "name": "confusion matrix"
+    }
+   ]
+  },
+  {
+   "id": "model-internals",
+   "tier": 1,
+   "order": 1,
+   "title": "Model internals",
+   "topics": [
+    {
+     "id": "transformer",
+     "key": "model-internals/transformer",
+     "name": "transformer"
+    },
+    {
+     "id": "attention-mechanism",
+     "key": "model-internals/attention-mechanism",
+     "name": "attention mechanism"
+    },
+    {
+     "id": "self-attention",
+     "key": "model-internals/self-attention",
+     "name": "self-attention"
+    },
+    {
+     "id": "multi-head-attention",
+     "key": "model-internals/multi-head-attention",
+     "name": "multi-head attention"
+    },
+    {
+     "id": "grouped-query-attention",
+     "key": "model-internals/grouped-query-attention",
+     "name": "grouped-query attention (GQA)"
+    },
+    {
+     "id": "flashattention",
+     "key": "model-internals/flashattention",
+     "name": "FlashAttention"
+    },
+    {
+     "id": "positional-encoding",
+     "key": "model-internals/positional-encoding",
+     "name": "positional encoding (RoPE)"
+    },
+    {
+     "id": "tokenization",
+     "key": "model-internals/tokenization",
+     "name": "tokenization (BPE, SentencePiece)"
+    },
+    {
+     "id": "embeddings",
+     "key": "model-internals/embeddings",
+     "name": "embeddings"
+    },
+    {
+     "id": "llm-architecture",
+     "key": "model-internals/llm-architecture",
+     "name": "LLM architecture (encoder–decoder vs decoder-only)"
+    },
+    {
+     "id": "context-window",
+     "key": "model-internals/context-window",
+     "name": "context window"
+    },
+    {
+     "id": "kv-cache",
+     "key": "model-internals/kv-cache",
+     "name": "KV cache"
+    },
+    {
+     "id": "logits",
+     "key": "model-internals/logits",
+     "name": "logits"
+    },
+    {
+     "id": "softmax",
+     "key": "model-internals/softmax",
+     "name": "softmax"
+    },
+    {
+     "id": "sampling-strategies",
+     "key": "model-internals/sampling-strategies",
+     "name": "sampling strategies (temperature, top-k / top-p, greedy vs beam)"
+    },
+    {
+     "id": "speculative-decoding",
+     "key": "model-internals/speculative-decoding",
+     "name": "speculative decoding"
+    },
+    {
+     "id": "mixture-of-experts",
+     "key": "model-internals/mixture-of-experts",
+     "name": "mixture of experts (MoE)"
+    },
+    {
+     "id": "small-language-models",
+     "key": "model-internals/small-language-models",
+     "name": "small language models (SLMs)"
+    },
+    {
+     "id": "scaling-laws",
+     "key": "model-internals/scaling-laws",
+     "name": "scaling laws"
+    },
+    {
+     "id": "perplexity",
+     "key": "model-internals/perplexity",
+     "name": "perplexity"
+    },
+    {
+     "id": "hallucination",
+     "key": "model-internals/hallucination",
+     "name": "hallucination"
+    },
+    {
+     "id": "reasoning-models-test-time-compute",
+     "key": "model-internals/reasoning-models-test-time-compute",
+     "name": "reasoning models / test-time compute"
+    }
+   ]
+  },
+  {
+   "id": "training-adaptation",
+   "tier": 1,
+   "order": 2,
+   "title": "Training & adaptation",
+   "topics": [
+    {
+     "id": "pre-training",
+     "key": "training-adaptation/pre-training",
+     "name": "pre-training"
+    },
+    {
+     "id": "post-training",
+     "key": "training-adaptation/post-training",
+     "name": "post-training"
+    },
+    {
+     "id": "supervised-fine-tuning",
+     "key": "training-adaptation/supervised-fine-tuning",
+     "name": "supervised fine-tuning (SFT)"
+    },
+    {
+     "id": "instruction-tuning",
+     "key": "training-adaptation/instruction-tuning",
+     "name": "instruction tuning"
+    },
+    {
+     "id": "rlhf",
+     "key": "training-adaptation/rlhf",
+     "name": "RLHF"
+    },
+    {
+     "id": "dpo",
+     "key": "training-adaptation/dpo",
+     "name": "DPO"
+    },
+    {
+     "id": "grpo",
+     "key": "training-adaptation/grpo",
+     "name": "GRPO"
+    },
+    {
+     "id": "peft",
+     "key": "training-adaptation/peft",
+     "name": "PEFT (LoRA, QLoRA)"
+    },
+    {
+     "id": "knowledge-distillation",
+     "key": "training-adaptation/knowledge-distillation",
+     "name": "knowledge distillation"
+    },
+    {
+     "id": "quantization",
+     "key": "training-adaptation/quantization",
+     "name": "quantization (INT8/INT4, GPTQ, AWQ, GGUF)"
+    },
+    {
+     "id": "pruning",
+     "key": "training-adaptation/pruning",
+     "name": "pruning"
+    },
+    {
+     "id": "model-merging",
+     "key": "training-adaptation/model-merging",
+     "name": "model merging"
+    },
+    {
+     "id": "data-curation",
+     "key": "training-adaptation/data-curation",
+     "name": "data curation"
+    },
+    {
+     "id": "synthetic-data-generation",
+     "key": "training-adaptation/synthetic-data-generation",
+     "name": "synthetic data generation"
+    },
+    {
+     "id": "data-labeling",
+     "key": "training-adaptation/data-labeling",
+     "name": "data labeling"
+    },
+    {
+     "id": "train-val-test-split",
+     "key": "training-adaptation/train-val-test-split",
+     "name": "train/val/test split"
+    },
+    {
+     "id": "epochs",
+     "key": "training-adaptation/epochs",
+     "name": "epochs"
+    },
+    {
+     "id": "learning-rate",
+     "key": "training-adaptation/learning-rate",
+     "name": "learning rate"
+    },
+    {
+     "id": "overfitting",
+     "key": "training-adaptation/overfitting",
+     "name": "overfitting"
+    },
+    {
+     "id": "catastrophic-forgetting",
+     "key": "training-adaptation/catastrophic-forgetting",
+     "name": "catastrophic forgetting"
+    },
+    {
+     "id": "checkpointing",
+     "key": "training-adaptation/checkpointing",
+     "name": "checkpointing"
+    },
+    {
+     "id": "gradient-checkpointing",
+     "key": "training-adaptation/gradient-checkpointing",
+     "name": "gradient checkpointing"
+    },
+    {
+     "id": "fine-tune-vs-rag-vs-prompt-decision",
+     "key": "training-adaptation/fine-tune-vs-rag-vs-prompt-decision",
+     "name": "fine-tune vs RAG vs prompt decision"
+    },
+    {
+     "id": "tooling",
+     "key": "training-adaptation/tooling",
+     "name": "tooling (Unsloth, Axolotl, TRL)",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "distributed-training",
+     "key": "training-adaptation/distributed-training",
+     "name": "distributed training (data / tensor / pipeline parallelism, FSDP, DeepSpeed)",
+     "caveat": "only if the JD is training-heavy; drop for LLM-app roles"
+    }
+   ]
+  },
+  {
+   "id": "prompting",
+   "tier": 1,
+   "order": 3,
+   "title": "Prompting",
+   "topics": [
+    {
+     "id": "prompt-engineering",
+     "key": "prompting/prompt-engineering",
+     "name": "prompt engineering"
+    },
+    {
+     "id": "system-prompt",
+     "key": "prompting/system-prompt",
+     "name": "system prompt"
+    },
+    {
+     "id": "zero-shot",
+     "key": "prompting/zero-shot",
+     "name": "zero-shot"
+    },
+    {
+     "id": "few-shot",
+     "key": "prompting/few-shot",
+     "name": "few-shot"
+    },
+    {
+     "id": "chain-of-thought",
+     "key": "prompting/chain-of-thought",
+     "name": "chain-of-thought"
+    },
+    {
+     "id": "react",
+     "key": "prompting/react",
+     "name": "ReAct"
+    },
+    {
+     "id": "prompt-templates",
+     "key": "prompting/prompt-templates",
+     "name": "prompt templates"
+    },
+    {
+     "id": "prompt-versioning",
+     "key": "prompting/prompt-versioning",
+     "name": "prompt versioning"
+    },
+    {
+     "id": "prompt-caching",
+     "key": "prompting/prompt-caching",
+     "name": "prompt caching"
+    },
+    {
+     "id": "structured-outputs-json-mode",
+     "key": "prompting/structured-outputs-json-mode",
+     "name": "structured outputs / JSON mode"
+    },
+    {
+     "id": "function-tool-calling",
+     "key": "prompting/function-tool-calling",
+     "name": "function / tool calling"
+    },
+    {
+     "id": "context-engineering",
+     "key": "prompting/context-engineering",
+     "name": "context engineering"
+    },
+    {
+     "id": "prompt-injection",
+     "key": "prompting/prompt-injection",
+     "name": "prompt injection"
+    },
+    {
+     "id": "jailbreaks",
+     "key": "prompting/jailbreaks",
+     "name": "jailbreaks"
+    }
+   ]
+  },
+  {
+   "id": "rag-retrieval",
+   "tier": 1,
+   "order": 4,
+   "title": "RAG & retrieval",
+   "topics": [
+    {
+     "id": "chunking-strategies",
+     "key": "rag-retrieval/chunking-strategies",
+     "name": "chunking strategies (fixed, recursive, semantic)"
+    },
+    {
+     "id": "chunk-overlap",
+     "key": "rag-retrieval/chunk-overlap",
+     "name": "chunk overlap"
+    },
+    {
+     "id": "retrieval-granularity",
+     "key": "rag-retrieval/retrieval-granularity",
+     "name": "retrieval granularity"
+    },
+    {
+     "id": "embedding-models",
+     "key": "rag-retrieval/embedding-models",
+     "name": "embedding models"
+    },
+    {
+     "id": "embedding-dimension-and-normalization",
+     "key": "rag-retrieval/embedding-dimension-and-normalization",
+     "name": "embedding dimension & normalization"
+    },
+    {
+     "id": "embedding-pipelines",
+     "key": "rag-retrieval/embedding-pipelines",
+     "name": "embedding pipelines"
+    },
+    {
+     "id": "vector-databases",
+     "key": "rag-retrieval/vector-databases",
+     "name": "vector databases (pgvector, Qdrant, Pinecone, Weaviate, Milvus, Chroma)",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "similarity-search",
+     "key": "rag-retrieval/similarity-search",
+     "name": "similarity search (cosine, dot product)"
+    },
+    {
+     "id": "ann-indexes",
+     "key": "rag-retrieval/ann-indexes",
+     "name": "ANN indexes (HNSW, IVF)"
+    },
+    {
+     "id": "dense-vs-sparse-retrieval",
+     "key": "rag-retrieval/dense-vs-sparse-retrieval",
+     "name": "dense vs sparse retrieval"
+    },
+    {
+     "id": "bm25-internals",
+     "key": "rag-retrieval/bm25-internals",
+     "name": "BM25 internals"
+    },
+    {
+     "id": "inverted-indexes",
+     "key": "rag-retrieval/inverted-indexes",
+     "name": "inverted indexes"
+    },
+    {
+     "id": "hybrid-search",
+     "key": "rag-retrieval/hybrid-search",
+     "name": "hybrid search (BM25 + dense)"
+    },
+    {
+     "id": "reranking",
+     "key": "rag-retrieval/reranking",
+     "name": "reranking (cross-encoder)"
+    },
+    {
+     "id": "recall-vs-precision-trade-off",
+     "key": "rag-retrieval/recall-vs-precision-trade-off",
+     "name": "recall vs precision trade-off"
+    },
+    {
+     "id": "query-rewriting",
+     "key": "rag-retrieval/query-rewriting",
+     "name": "query rewriting"
+    },
+    {
+     "id": "query-decomposition",
+     "key": "rag-retrieval/query-decomposition",
+     "name": "query decomposition"
+    },
+    {
+     "id": "multi-hop-retrieval",
+     "key": "rag-retrieval/multi-hop-retrieval",
+     "name": "multi-hop retrieval"
+    },
+    {
+     "id": "hyde",
+     "key": "rag-retrieval/hyde",
+     "name": "HyDE"
+    },
+    {
+     "id": "parent-document-retrieval",
+     "key": "rag-retrieval/parent-document-retrieval",
+     "name": "parent-document retrieval"
+    },
+    {
+     "id": "contextual-retrieval",
+     "key": "rag-retrieval/contextual-retrieval",
+     "name": "contextual retrieval"
+    },
+    {
+     "id": "metadata-filtering",
+     "key": "rag-retrieval/metadata-filtering",
+     "name": "metadata filtering"
+    },
+    {
+     "id": "acl-aware-retrieval",
+     "key": "rag-retrieval/acl-aware-retrieval",
+     "name": "ACL-aware retrieval"
+    },
+    {
+     "id": "lost-in-the-middle",
+     "key": "rag-retrieval/lost-in-the-middle",
+     "name": "lost-in-the-middle"
+    },
+    {
+     "id": "citations-grounding",
+     "key": "rag-retrieval/citations-grounding",
+     "name": "citations / grounding"
+    },
+    {
+     "id": "citation-correctness",
+     "key": "rag-retrieval/citation-correctness",
+     "name": "citation correctness"
+    },
+    {
+     "id": "graphrag",
+     "key": "rag-retrieval/graphrag",
+     "name": "GraphRAG"
+    },
+    {
+     "id": "knowledge-graphs",
+     "key": "rag-retrieval/knowledge-graphs",
+     "name": "knowledge graphs"
+    },
+    {
+     "id": "freshness-document-deletion-index-consistency",
+     "key": "rag-retrieval/freshness-document-deletion-index-consistency",
+     "name": "freshness / document deletion / index consistency"
+    },
+    {
+     "id": "retrieval-failure-diagnosis",
+     "key": "rag-retrieval/retrieval-failure-diagnosis",
+     "name": "retrieval failure diagnosis"
+    },
+    {
+     "id": "long-context-vs-rag",
+     "key": "rag-retrieval/long-context-vs-rag",
+     "name": "long-context vs RAG"
+    },
+    {
+     "id": "agentic-rag",
+     "key": "rag-retrieval/agentic-rag",
+     "name": "agentic RAG"
+    },
+    {
+     "id": "document-parsing",
+     "key": "rag-retrieval/document-parsing",
+     "name": "document parsing (OCR, layout, tables)"
+    }
+   ]
+  },
+  {
+   "id": "agents",
+   "tier": 1,
+   "order": 5,
+   "title": "Agents",
+   "topics": [
+    {
+     "id": "agent-loop",
+     "key": "agents/agent-loop",
+     "name": "agent loop"
+    },
+    {
+     "id": "tool-calling",
+     "key": "agents/tool-calling",
+     "name": "tool calling"
+    },
+    {
+     "id": "tool-schemas-and-argument-validation",
+     "key": "agents/tool-schemas-and-argument-validation",
+     "name": "tool schemas & argument validation"
+    },
+    {
+     "id": "typed-tool-contracts",
+     "key": "agents/typed-tool-contracts",
+     "name": "typed tool contracts"
+    },
+    {
+     "id": "tool-selection-accuracy",
+     "key": "agents/tool-selection-accuracy",
+     "name": "tool selection accuracy"
+    },
+    {
+     "id": "tool-result-interpretation",
+     "key": "agents/tool-result-interpretation",
+     "name": "tool-result interpretation"
+    },
+    {
+     "id": "parallel-tool-calls",
+     "key": "agents/parallel-tool-calls",
+     "name": "parallel tool calls"
+    },
+    {
+     "id": "model-context-protocol",
+     "key": "agents/model-context-protocol",
+     "name": "Model Context Protocol (MCP)"
+    },
+    {
+     "id": "mcp-authentication-authorization-transport-security",
+     "key": "agents/mcp-authentication-authorization-transport-security",
+     "name": "MCP authentication / authorization / transport security"
+    },
+    {
+     "id": "a2a-protocol",
+     "key": "agents/a2a-protocol",
+     "name": "A2A protocol"
+    },
+    {
+     "id": "planning",
+     "key": "agents/planning",
+     "name": "planning"
+    },
+    {
+     "id": "task-decomposition",
+     "key": "agents/task-decomposition",
+     "name": "task decomposition"
+    },
+    {
+     "id": "reflection-self-critique",
+     "key": "agents/reflection-self-critique",
+     "name": "reflection / self-critique"
+    },
+    {
+     "id": "multi-agent-patterns",
+     "key": "agents/multi-agent-patterns",
+     "name": "multi-agent patterns (orchestrator-worker, handoffs)"
+    },
+    {
+     "id": "agent-memory",
+     "key": "agents/agent-memory",
+     "name": "agent memory (short-term, long-term, episodic)"
+    },
+    {
+     "id": "memory-retrieval-update-deletion-policies",
+     "key": "agents/memory-retrieval-update-deletion-policies",
+     "name": "memory retrieval / update / deletion policies"
+    },
+    {
+     "id": "context-compaction-summarization",
+     "key": "agents/context-compaction-summarization",
+     "name": "context compaction / summarization"
+    },
+    {
+     "id": "state-machines",
+     "key": "agents/state-machines",
+     "name": "state machines"
+    },
+    {
+     "id": "human-in-the-loop",
+     "key": "agents/human-in-the-loop",
+     "name": "human-in-the-loop"
+    },
+    {
+     "id": "approval-gates-for-consequential-actions",
+     "key": "agents/approval-gates-for-consequential-actions",
+     "name": "approval gates for consequential actions"
+    },
+    {
+     "id": "sandboxing",
+     "key": "agents/sandboxing",
+     "name": "sandboxing"
+    },
+    {
+     "id": "computer-use",
+     "key": "agents/computer-use",
+     "name": "computer use"
+    },
+    {
+     "id": "workflows-vs-agents",
+     "key": "agents/workflows-vs-agents",
+     "name": "workflows vs agents"
+    },
+    {
+     "id": "frameworks",
+     "key": "agents/frameworks",
+     "name": "frameworks (LangGraph, LangChain, LlamaIndex, Pydantic AI, DSPy)",
+     "kind_hint": "tool"
+    }
+   ]
+  },
+  {
+   "id": "agent-reliability",
+   "tier": 1,
+   "order": 6,
+   "title": "Agent reliability & runtime",
+   "topics": [
+    {
+     "id": "stopping-conditions-termination",
+     "key": "agent-reliability/stopping-conditions-termination",
+     "name": "stopping conditions / termination"
+    },
+    {
+     "id": "max-step-budgets",
+     "key": "agent-reliability/max-step-budgets",
+     "name": "max-step budgets"
+    },
+    {
+     "id": "loop-detection",
+     "key": "agent-reliability/loop-detection",
+     "name": "loop detection"
+    },
+    {
+     "id": "durable-execution-and-checkpointing",
+     "key": "agent-reliability/durable-execution-and-checkpointing",
+     "name": "durable execution & checkpointing"
+    },
+    {
+     "id": "state-persistence-and-conversation-recovery",
+     "key": "agent-reliability/state-persistence-and-conversation-recovery",
+     "name": "state persistence & conversation recovery"
+    },
+    {
+     "id": "state-and-checkpoint-stores",
+     "key": "agent-reliability/state-and-checkpoint-stores",
+     "name": "state & checkpoint stores"
+    },
+    {
+     "id": "conversation-execution-identifiers",
+     "key": "agent-reliability/conversation-execution-identifiers",
+     "name": "conversation / execution identifiers"
+    },
+    {
+     "id": "idempotent-tool-execution",
+     "key": "agent-reliability/idempotent-tool-execution",
+     "name": "idempotent tool execution"
+    },
+    {
+     "id": "tool-permissions-and-least-privilege",
+     "key": "agent-reliability/tool-permissions-and-least-privilege",
+     "name": "tool permissions & least privilege"
+    },
+    {
+     "id": "tool-adapters-service-interfaces",
+     "key": "agent-reliability/tool-adapters-service-interfaces",
+     "name": "tool adapters / service interfaces"
+    },
+    {
+     "id": "structured-event-streams",
+     "key": "agent-reliability/structured-event-streams",
+     "name": "structured event streams"
+    },
+    {
+     "id": "audit-logs-execution-traces",
+     "key": "agent-reliability/audit-logs-execution-traces",
+     "name": "audit logs / execution traces"
+    },
+    {
+     "id": "deterministic-replay-and-reproducibility",
+     "key": "agent-reliability/deterministic-replay-and-reproducibility",
+     "name": "deterministic replay & reproducibility"
+    },
+    {
+     "id": "agent-trajectory-evaluation",
+     "key": "agent-reliability/agent-trajectory-evaluation",
+     "name": "agent trajectory evaluation"
+    },
+    {
+     "id": "task-completion-rate",
+     "key": "agent-reliability/task-completion-rate",
+     "name": "task completion rate"
+    },
+    {
+     "id": "tool-call-success-rate",
+     "key": "agent-reliability/tool-call-success-rate",
+     "name": "tool-call success rate"
+    }
+   ]
+  },
+  {
+   "id": "evals",
+   "tier": 1,
+   "order": 7,
+   "title": "Evals",
+   "topics": [
+    {
+     "id": "model-evaluation",
+     "key": "evals/model-evaluation",
+     "name": "model evaluation"
+    },
+    {
+     "id": "golden-dataset",
+     "key": "evals/golden-dataset",
+     "name": "golden dataset (eval dataset)"
+    },
+    {
+     "id": "eval-harness",
+     "key": "evals/eval-harness",
+     "name": "eval harness"
+    },
+    {
+     "id": "task-specific-acceptance-criteria",
+     "key": "evals/task-specific-acceptance-criteria",
+     "name": "task-specific acceptance criteria"
+    },
+    {
+     "id": "benchmarking",
+     "key": "evals/benchmarking",
+     "name": "benchmarking (MMLU, HumanEval, SWE-bench, GPQA)"
+    },
+    {
+     "id": "dataset-contamination",
+     "key": "evals/dataset-contamination",
+     "name": "dataset contamination"
+    },
+    {
+     "id": "llm-as-a-judge",
+     "key": "evals/llm-as-a-judge",
+     "name": "LLM-as-a-judge"
+    },
+    {
+     "id": "judge-calibration-and-bias",
+     "key": "evals/judge-calibration-and-bias",
+     "name": "judge calibration & bias"
+    },
+    {
+     "id": "rubrics",
+     "key": "evals/rubrics",
+     "name": "rubrics"
+    },
+    {
+     "id": "pairwise-comparison",
+     "key": "evals/pairwise-comparison",
+     "name": "pairwise comparison"
+    },
+    {
+     "id": "inter-annotator-agreement",
+     "key": "evals/inter-annotator-agreement",
+     "name": "inter-annotator agreement"
+    },
+    {
+     "id": "pass-k",
+     "key": "evals/pass-k",
+     "name": "pass@k"
+    },
+    {
+     "id": "retrieval-evaluation",
+     "key": "evals/retrieval-evaluation",
+     "name": "retrieval evaluation (recall@k, MRR, NDCG)"
+    },
+    {
+     "id": "faithfulness-groundedness",
+     "key": "evals/faithfulness-groundedness",
+     "name": "faithfulness / groundedness"
+    },
+    {
+     "id": "hallucination-evaluation",
+     "key": "evals/hallucination-evaluation",
+     "name": "hallucination evaluation"
+    },
+    {
+     "id": "regression-tests",
+     "key": "evals/regression-tests",
+     "name": "regression tests"
+    },
+    {
+     "id": "metamorphic-testing",
+     "key": "evals/metamorphic-testing",
+     "name": "metamorphic testing"
+    },
+    {
+     "id": "property-based-testing",
+     "key": "evals/property-based-testing",
+     "name": "property-based testing"
+    },
+    {
+     "id": "adversarial-evaluation",
+     "key": "evals/adversarial-evaluation",
+     "name": "adversarial evaluation"
+    },
+    {
+     "id": "offline-vs-online-evaluation",
+     "key": "evals/offline-vs-online-evaluation",
+     "name": "offline vs online evaluation"
+    },
+    {
+     "id": "a-b-testing",
+     "key": "evals/a-b-testing",
+     "name": "A/B testing"
+    },
+    {
+     "id": "error-analysis",
+     "key": "evals/error-analysis",
+     "name": "error analysis"
+    },
+    {
+     "id": "red-teaming",
+     "key": "evals/red-teaming",
+     "name": "red teaming"
+    },
+    {
+     "id": "eval-driven-development",
+     "key": "evals/eval-driven-development",
+     "name": "eval-driven development"
+    },
+    {
+     "id": "tooling",
+     "key": "evals/tooling",
+     "name": "tooling (Promptfoo, RAGAS, DeepEval, Braintrust, LangSmith, Langfuse)",
+     "kind_hint": "tool"
+    }
+   ]
+  },
+  {
+   "id": "serving-inference",
+   "tier": 1,
+   "order": 8,
+   "title": "Serving & inference",
+   "topics": [
+    {
+     "id": "model-serving",
+     "key": "serving-inference/model-serving",
+     "name": "model serving"
+    },
+    {
+     "id": "inference-optimization",
+     "key": "serving-inference/inference-optimization",
+     "name": "inference optimization"
+    },
+    {
+     "id": "prefill-vs-decode",
+     "key": "serving-inference/prefill-vs-decode",
+     "name": "prefill vs decode"
+    },
+    {
+     "id": "kv-cache-memory-estimation",
+     "key": "serving-inference/kv-cache-memory-estimation",
+     "name": "KV-cache memory estimation"
+    },
+    {
+     "id": "kv-cache-paging-and-eviction",
+     "key": "serving-inference/kv-cache-paging-and-eviction",
+     "name": "KV-cache paging & eviction"
+    },
+    {
+     "id": "prefix-caching",
+     "key": "serving-inference/prefix-caching",
+     "name": "prefix caching"
+    },
+    {
+     "id": "continuous-batching",
+     "key": "serving-inference/continuous-batching",
+     "name": "continuous batching"
+    },
+    {
+     "id": "pagedattention",
+     "key": "serving-inference/pagedattention",
+     "name": "PagedAttention"
+    },
+    {
+     "id": "batching-and-concurrency-limits",
+     "key": "serving-inference/batching-and-concurrency-limits",
+     "name": "batching & concurrency limits"
+    },
+    {
+     "id": "tensor-parallelism-at-inference",
+     "key": "serving-inference/tensor-parallelism-at-inference",
+     "name": "tensor parallelism at inference"
+    },
+    {
+     "id": "cpu-offloading",
+     "key": "serving-inference/cpu-offloading",
+     "name": "CPU offloading"
+    },
+    {
+     "id": "quantization-quality-evaluation",
+     "key": "serving-inference/quantization-quality-evaluation",
+     "name": "quantization quality evaluation"
+    },
+    {
+     "id": "structured-constrained-generation",
+     "key": "serving-inference/structured-constrained-generation",
+     "name": "structured / constrained generation"
+    },
+    {
+     "id": "gpu-memory-optimization",
+     "key": "serving-inference/gpu-memory-optimization",
+     "name": "GPU memory optimization (VRAM math)"
+    },
+    {
+     "id": "streaming",
+     "key": "serving-inference/streaming",
+     "name": "streaming (SSE)"
+    },
+    {
+     "id": "ttft",
+     "key": "serving-inference/ttft",
+     "name": "TTFT"
+    },
+    {
+     "id": "tpot",
+     "key": "serving-inference/tpot",
+     "name": "TPOT"
+    },
+    {
+     "id": "tokens-sec",
+     "key": "serving-inference/tokens-sec",
+     "name": "tokens/sec"
+    },
+    {
+     "id": "throughput-vs-latency",
+     "key": "serving-inference/throughput-vs-latency",
+     "name": "throughput vs latency"
+    },
+    {
+     "id": "timeouts",
+     "key": "serving-inference/timeouts",
+     "name": "timeouts"
+    },
+    {
+     "id": "cancellation",
+     "key": "serving-inference/cancellation",
+     "name": "cancellation"
+    },
+    {
+     "id": "backpressure",
+     "key": "serving-inference/backpressure",
+     "name": "backpressure"
+    },
+    {
+     "id": "fallbacks",
+     "key": "serving-inference/fallbacks",
+     "name": "fallbacks"
+    },
+    {
+     "id": "retry-strategies",
+     "key": "serving-inference/retry-strategies",
+     "name": "retry strategies"
+    },
+    {
+     "id": "rate-limiting",
+     "key": "serving-inference/rate-limiting",
+     "name": "rate limiting"
+    },
+    {
+     "id": "idempotency",
+     "key": "serving-inference/idempotency",
+     "name": "idempotency"
+    },
+    {
+     "id": "caching",
+     "key": "serving-inference/caching",
+     "name": "caching (semantic, prompt)"
+    },
+    {
+     "id": "engines",
+     "key": "serving-inference/engines",
+     "name": "engines (vLLM, SGLang, TGI, TensorRT-LLM, Ollama, llama.cpp)",
+     "kind_hint": "tool"
+    }
+   ]
+  },
+  {
+   "id": "observability",
+   "tier": 1,
+   "order": 9,
+   "title": "Observability",
+   "topics": [
+    {
+     "id": "tracing",
+     "key": "observability/tracing",
+     "name": "tracing"
+    },
+    {
+     "id": "spans",
+     "key": "observability/spans",
+     "name": "spans"
+    },
+    {
+     "id": "distributed-tracing-across-services",
+     "key": "observability/distributed-tracing-across-services",
+     "name": "distributed tracing across services"
+    },
+    {
+     "id": "logging",
+     "key": "observability/logging",
+     "name": "logging"
+    },
+    {
+     "id": "monitoring",
+     "key": "observability/monitoring",
+     "name": "monitoring"
+    },
+    {
+     "id": "token-cost-tracking",
+     "key": "observability/token-cost-tracking",
+     "name": "token / cost tracking"
+    },
+    {
+     "id": "latency-percentiles",
+     "key": "observability/latency-percentiles",
+     "name": "latency percentiles (p50/p95/p99)"
+    },
+    {
+     "id": "opentelemetry",
+     "key": "observability/opentelemetry",
+     "name": "OpenTelemetry",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "langfuse",
+     "key": "observability/langfuse",
+     "name": "Langfuse",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "langsmith",
+     "key": "observability/langsmith",
+     "name": "LangSmith",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "arize-phoenix",
+     "key": "observability/arize-phoenix",
+     "name": "Arize Phoenix",
+     "kind_hint": "tool"
+    }
+   ]
+  },
+  {
+   "id": "safety-security",
+   "tier": 1,
+   "order": 10,
+   "title": "Safety & security",
+   "topics": [
+    {
+     "id": "input-output-guardrails",
+     "key": "safety-security/input-output-guardrails",
+     "name": "input / output guardrails"
+    },
+    {
+     "id": "output-validation",
+     "key": "safety-security/output-validation",
+     "name": "output validation (Pydantic, Instructor, Outlines)"
+    },
+    {
+     "id": "pii-redaction",
+     "key": "safety-security/pii-redaction",
+     "name": "PII redaction"
+    },
+    {
+     "id": "content-moderation",
+     "key": "safety-security/content-moderation",
+     "name": "content moderation"
+    },
+    {
+     "id": "prompt-injection",
+     "key": "safety-security/prompt-injection",
+     "name": "prompt injection (direct, indirect)"
+    },
+    {
+     "id": "rag-poisoning",
+     "key": "safety-security/rag-poisoning",
+     "name": "RAG poisoning"
+    },
+    {
+     "id": "excessive-agency",
+     "key": "safety-security/excessive-agency",
+     "name": "excessive agency"
+    },
+    {
+     "id": "tool-privilege-escalation",
+     "key": "safety-security/tool-privilege-escalation",
+     "name": "tool privilege escalation"
+    },
+    {
+     "id": "cross-tenant-data-leakage",
+     "key": "safety-security/cross-tenant-data-leakage",
+     "name": "cross-tenant data leakage"
+    },
+    {
+     "id": "data-leakage",
+     "key": "safety-security/data-leakage",
+     "name": "data leakage"
+    },
+    {
+     "id": "supply-chain-security-for-models-and-datasets",
+     "key": "safety-security/supply-chain-security-for-models-and-datasets",
+     "name": "supply-chain security for models & datasets"
+    },
+    {
+     "id": "owasp-top-10-for-llms",
+     "key": "safety-security/owasp-top-10-for-llms",
+     "name": "OWASP Top 10 for LLMs"
+    },
+    {
+     "id": "llama-guard",
+     "key": "safety-security/llama-guard",
+     "name": "Llama Guard",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "nemo-guardrails",
+     "key": "safety-security/nemo-guardrails",
+     "name": "NeMo Guardrails",
+     "kind_hint": "tool"
+    }
+   ]
+  },
+  {
+   "id": "multimodal",
+   "tier": 1,
+   "order": 11,
+   "title": "Multimodal",
+   "topics": [
+    {
+     "id": "vision-language-models",
+     "key": "multimodal/vision-language-models",
+     "name": "vision-language models"
+    },
+    {
+     "id": "clip",
+     "key": "multimodal/clip",
+     "name": "CLIP"
+    },
+    {
+     "id": "image-embeddings",
+     "key": "multimodal/image-embeddings",
+     "name": "image embeddings"
+    },
+    {
+     "id": "ocr",
+     "key": "multimodal/ocr",
+     "name": "OCR"
+    },
+    {
+     "id": "speech-to-text",
+     "key": "multimodal/speech-to-text",
+     "name": "speech-to-text (Whisper)"
+    },
+    {
+     "id": "tts",
+     "key": "multimodal/tts",
+     "name": "TTS"
+    },
+    {
+     "id": "document-understanding",
+     "key": "multimodal/document-understanding",
+     "name": "document understanding"
+    }
+   ]
+  },
+  {
+   "id": "backend-fundamentals",
+   "tier": 1,
+   "order": 12,
+   "title": "Backend fundamentals",
+   "topics": [
+    {
+     "id": "python",
+     "key": "backend-fundamentals/python",
+     "name": "Python",
+     "note": "Python as the AI backend language; deep dive lives in the python-for-ai module"
+    },
+    {
+     "id": "fastapi",
+     "key": "backend-fundamentals/fastapi",
+     "name": "FastAPI",
+     "note": "why FastAPI for AI services; deep dive lives in the fastapi-for-ai module"
+    },
+    {
+     "id": "node-js-typescript",
+     "key": "backend-fundamentals/node-js-typescript",
+     "name": "Node.js / TypeScript",
+     "note": "where Node/TS fits in AI systems; deep dive lives in node-ts-for-ai"
+    },
+    {
+     "id": "rest-graphql-api-design",
+     "key": "backend-fundamentals/rest-graphql-api-design",
+     "name": "REST / GraphQL API design"
+    },
+    {
+     "id": "api-and-sdk-integration",
+     "key": "backend-fundamentals/api-and-sdk-integration",
+     "name": "API & SDK integration"
+    },
+    {
+     "id": "api-versioning-and-backward-compatibility",
+     "key": "backend-fundamentals/api-versioning-and-backward-compatibility",
+     "name": "API versioning & backward compatibility"
+    },
+    {
+     "id": "pagination-rate-limits-api-quotas",
+     "key": "backend-fundamentals/pagination-rate-limits-api-quotas",
+     "name": "pagination / rate limits / API quotas"
+    },
+    {
+     "id": "webhook-signature-verification-and-replay-protection",
+     "key": "backend-fundamentals/webhook-signature-verification-and-replay-protection",
+     "name": "webhook signature verification & replay protection"
+    },
+    {
+     "id": "database-design",
+     "key": "backend-fundamentals/database-design",
+     "name": "database design"
+    },
+    {
+     "id": "sql",
+     "key": "backend-fundamentals/sql",
+     "name": "SQL"
+    },
+    {
+     "id": "nosql",
+     "key": "backend-fundamentals/nosql",
+     "name": "NoSQL"
+    },
+    {
+     "id": "redis",
+     "key": "backend-fundamentals/redis",
+     "name": "Redis"
+    },
+    {
+     "id": "postgresql-transactions-and-isolation-levels",
+     "key": "backend-fundamentals/postgresql-transactions-and-isolation-levels",
+     "name": "PostgreSQL transactions & isolation levels"
+    },
+    {
+     "id": "message-queues",
+     "key": "backend-fundamentals/message-queues",
+     "name": "message queues (Kafka, SQS, RabbitMQ)"
+    },
+    {
+     "id": "background-jobs-durable-workers",
+     "key": "backend-fundamentals/background-jobs-durable-workers",
+     "name": "background jobs / durable workers"
+    },
+    {
+     "id": "authentication-vs-authorization",
+     "key": "backend-fundamentals/authentication-vs-authorization",
+     "name": "authentication vs authorization"
+    },
+    {
+     "id": "oauth-2-0-oidc",
+     "key": "backend-fundamentals/oauth-2-0-oidc",
+     "name": "OAuth 2.0 / OIDC"
+    },
+    {
+     "id": "rbac",
+     "key": "backend-fundamentals/rbac",
+     "name": "RBAC"
+    },
+    {
+     "id": "secrets-management",
+     "key": "backend-fundamentals/secrets-management",
+     "name": "secrets management"
+    },
+    {
+     "id": "docker",
+     "key": "backend-fundamentals/docker",
+     "name": "Docker"
+    },
+    {
+     "id": "kubernetes",
+     "key": "backend-fundamentals/kubernetes",
+     "name": "Kubernetes"
+    },
+    {
+     "id": "ci-cd",
+     "key": "backend-fundamentals/ci-cd",
+     "name": "CI/CD"
+    }
+   ]
+  },
+  {
+   "id": "python-for-ai",
+   "tier": 1,
+   "order": 13,
+   "title": "Python for AI",
+   "topics": [
+    {
+     "id": "type-hints",
+     "key": "python-for-ai/type-hints",
+     "name": "type hints"
+    },
+    {
+     "id": "protocols-generics-structural-typing",
+     "key": "python-for-ai/protocols-generics-structural-typing",
+     "name": "Protocols / generics / structural typing"
+    },
+    {
+     "id": "typeddict-literal-enum",
+     "key": "python-for-ai/typeddict-literal-enum",
+     "name": "TypedDict / Literal / Enum"
+    },
+    {
+     "id": "pydantic",
+     "key": "python-for-ai/pydantic",
+     "name": "Pydantic",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "dataclasses",
+     "key": "python-for-ai/dataclasses",
+     "name": "dataclasses"
+    },
+    {
+     "id": "object-model-and-mutability",
+     "key": "python-for-ai/object-model-and-mutability",
+     "name": "object model & mutability"
+    },
+    {
+     "id": "exceptions-and-custom-exception-hierarchies",
+     "key": "python-for-ai/exceptions-and-custom-exception-hierarchies",
+     "name": "exceptions & custom exception hierarchies"
+    },
+    {
+     "id": "async-await",
+     "key": "python-for-ai/async-await",
+     "name": "async / await"
+    },
+    {
+     "id": "asyncio",
+     "key": "python-for-ai/asyncio",
+     "name": "asyncio"
+    },
+    {
+     "id": "async-cancellation-and-exception-propagation",
+     "key": "python-for-ai/async-cancellation-and-exception-propagation",
+     "name": "async cancellation & exception propagation"
+    },
+    {
+     "id": "race-conditions-and-synchronization-primitives",
+     "key": "python-for-ai/race-conditions-and-synchronization-primitives",
+     "name": "race conditions & synchronization primitives (asyncio.Lock, Semaphore)"
+    },
+    {
+     "id": "asyncio-vs-threads-vs-multiprocessing",
+     "key": "python-for-ai/asyncio-vs-threads-vs-multiprocessing",
+     "name": "asyncio vs threads vs multiprocessing"
+    },
+    {
+     "id": "gil",
+     "key": "python-for-ai/gil",
+     "name": "GIL"
+    },
+    {
+     "id": "generators",
+     "key": "python-for-ai/generators",
+     "name": "generators"
+    },
+    {
+     "id": "decorators",
+     "key": "python-for-ai/decorators",
+     "name": "decorators"
+    },
+    {
+     "id": "context-managers-resource-cleanup",
+     "key": "python-for-ai/context-managers-resource-cleanup",
+     "name": "context managers / resource cleanup"
+    },
+    {
+     "id": "dependency-injection-and-interface-boundaries",
+     "key": "python-for-ai/dependency-injection-and-interface-boundaries",
+     "name": "dependency injection & interface boundaries"
+    },
+    {
+     "id": "package-structure-and-import-design",
+     "key": "python-for-ai/package-structure-and-import-design",
+     "name": "package structure & import design"
+    },
+    {
+     "id": "tenacity",
+     "key": "python-for-ai/tenacity",
+     "name": "tenacity",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "logging-structlog",
+     "key": "python-for-ai/logging-structlog",
+     "name": "logging / structlog"
+    },
+    {
+     "id": "memory-and-performance-profiling",
+     "key": "python-for-ai/memory-and-performance-profiling",
+     "name": "memory & performance profiling"
+    },
+    {
+     "id": "uv-poetry-pip",
+     "key": "python-for-ai/uv-poetry-pip",
+     "name": "uv / poetry / pip",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "lockfiles-and-dependency-pinning",
+     "key": "python-for-ai/lockfiles-and-dependency-pinning",
+     "name": "lockfiles & dependency pinning"
+    },
+    {
+     "id": "security-scanning-and-dependency-auditing",
+     "key": "python-for-ai/security-scanning-and-dependency-auditing",
+     "name": "security scanning & dependency auditing (pip-audit, Bandit)"
+    },
+    {
+     "id": "pytest",
+     "key": "python-for-ai/pytest",
+     "name": "pytest",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "pytest-asyncio",
+     "key": "python-for-ai/pytest-asyncio",
+     "name": "pytest-asyncio",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "test-doubles-mocks-fixtures",
+     "key": "python-for-ai/test-doubles-mocks-fixtures",
+     "name": "test doubles / mocks / fixtures"
+    },
+    {
+     "id": "property-based-testing",
+     "key": "python-for-ai/property-based-testing",
+     "name": "property-based testing (Hypothesis)"
+    },
+    {
+     "id": "contract-testing",
+     "key": "python-for-ai/contract-testing",
+     "name": "contract testing"
+    },
+    {
+     "id": "integration-and-end-to-end-testing",
+     "key": "python-for-ai/integration-and-end-to-end-testing",
+     "name": "integration & end-to-end testing"
+    },
+    {
+     "id": "mypy",
+     "key": "python-for-ai/mypy",
+     "name": "mypy",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "ruff",
+     "key": "python-for-ai/ruff",
+     "name": "ruff",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "python-dotenv",
+     "key": "python-for-ai/python-dotenv",
+     "name": "python-dotenv",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "pydantic-settings",
+     "key": "python-for-ai/pydantic-settings",
+     "name": "pydantic-settings",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "json-jsonl",
+     "key": "python-for-ai/json-jsonl",
+     "name": "JSON / JSONL"
+    },
+    {
+     "id": "numpy",
+     "key": "python-for-ai/numpy",
+     "name": "numpy",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "pandas",
+     "key": "python-for-ai/pandas",
+     "name": "pandas",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "polars",
+     "key": "python-for-ai/polars",
+     "name": "polars",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "pyarrow",
+     "key": "python-for-ai/pyarrow",
+     "name": "pyarrow",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "scikit-learn-basics",
+     "key": "python-for-ai/scikit-learn-basics",
+     "name": "scikit-learn basics"
+    },
+    {
+     "id": "pytorch",
+     "key": "python-for-ai/pytorch",
+     "name": "PyTorch (tensors, autograd, nn.Module, DataLoader, device)"
+    },
+    {
+     "id": "hugging-face",
+     "key": "python-for-ai/hugging-face",
+     "name": "Hugging Face (transformers, datasets, tokenizers, accelerate, PEFT, TRL)"
+    },
+    {
+     "id": "sentence-transformers",
+     "key": "python-for-ai/sentence-transformers",
+     "name": "sentence-transformers",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "tiktoken",
+     "key": "python-for-ai/tiktoken",
+     "name": "tiktoken",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "safetensors",
+     "key": "python-for-ai/safetensors",
+     "name": "safetensors",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "openai-sdk",
+     "key": "python-for-ai/openai-sdk",
+     "name": "OpenAI SDK",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "anthropic-sdk",
+     "key": "python-for-ai/anthropic-sdk",
+     "name": "Anthropic SDK",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "litellm",
+     "key": "python-for-ai/litellm",
+     "name": "LiteLLM",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "instructor",
+     "key": "python-for-ai/instructor",
+     "name": "Instructor",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "outlines",
+     "key": "python-for-ai/outlines",
+     "name": "Outlines",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "mcp-python-sdk",
+     "key": "python-for-ai/mcp-python-sdk",
+     "name": "MCP Python SDK",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "httpx",
+     "key": "python-for-ai/httpx",
+     "name": "httpx",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "jupyter",
+     "key": "python-for-ai/jupyter",
+     "name": "Jupyter",
+     "kind_hint": "tool"
+    }
+   ]
+  },
+  {
+   "id": "fastapi-for-ai",
+   "tier": 1,
+   "order": 14,
+   "title": "FastAPI for AI",
+   "topics": [
+    {
+     "id": "asgi-lifecycle",
+     "key": "fastapi-for-ai/asgi-lifecycle",
+     "name": "ASGI lifecycle"
+    },
+    {
+     "id": "middleware-ordering",
+     "key": "fastapi-for-ai/middleware-ordering",
+     "name": "middleware ordering"
+    },
+    {
+     "id": "async-endpoints",
+     "key": "fastapi-for-ai/async-endpoints",
+     "name": "async endpoints"
+    },
+    {
+     "id": "pydantic-request-response-models",
+     "key": "fastapi-for-ai/pydantic-request-response-models",
+     "name": "Pydantic request / response models"
+    },
+    {
+     "id": "response-model",
+     "key": "fastapi-for-ai/response-model",
+     "name": "response_model"
+    },
+    {
+     "id": "dependency-injection",
+     "key": "fastapi-for-ai/dependency-injection",
+     "name": "dependency injection (Depends)"
+    },
+    {
+     "id": "request-scoped-vs-application-scoped-resources",
+     "key": "fastapi-for-ai/request-scoped-vs-application-scoped-resources",
+     "name": "request-scoped vs application-scoped resources"
+    },
+    {
+     "id": "lifespan",
+     "key": "fastapi-for-ai/lifespan",
+     "name": "lifespan (load model / client once)"
+    },
+    {
+     "id": "streamingresponse",
+     "key": "fastapi-for-ai/streamingresponse",
+     "name": "StreamingResponse"
+    },
+    {
+     "id": "server-sent-events",
+     "key": "fastapi-for-ai/server-sent-events",
+     "name": "Server-Sent Events"
+    },
+    {
+     "id": "websockets",
+     "key": "fastapi-for-ai/websockets",
+     "name": "WebSockets"
+    },
+    {
+     "id": "backgroundtasks",
+     "key": "fastapi-for-ai/backgroundtasks",
+     "name": "BackgroundTasks"
+    },
+    {
+     "id": "job-queues-and-durable-workers",
+     "key": "fastapi-for-ai/job-queues-and-durable-workers",
+     "name": "job queues & durable workers (Celery / ARQ + job-status endpoint)"
+    },
+    {
+     "id": "async-database-access-and-connection-pooling",
+     "key": "fastapi-for-ai/async-database-access-and-connection-pooling",
+     "name": "async database access & connection pooling"
+    },
+    {
+     "id": "sqlalchemy-sqlmodel",
+     "key": "fastapi-for-ai/sqlalchemy-sqlmodel",
+     "name": "SQLAlchemy / SQLModel"
+    },
+    {
+     "id": "alembic-migrations",
+     "key": "fastapi-for-ai/alembic-migrations",
+     "name": "Alembic migrations"
+    },
+    {
+     "id": "timeouts",
+     "key": "fastapi-for-ai/timeouts",
+     "name": "timeouts"
+    },
+    {
+     "id": "idempotency-keys",
+     "key": "fastapi-for-ai/idempotency-keys",
+     "name": "idempotency keys"
+    },
+    {
+     "id": "cors",
+     "key": "fastapi-for-ai/cors",
+     "name": "CORS"
+    },
+    {
+     "id": "api-keys-oauth2-jwt",
+     "key": "fastapi-for-ai/api-keys-oauth2-jwt",
+     "name": "API keys / OAuth2 / JWT"
+    },
+    {
+     "id": "rate-limiting",
+     "key": "fastapi-for-ai/rate-limiting",
+     "name": "rate limiting (slowapi)"
+    },
+    {
+     "id": "request-size-limits-and-upload-security",
+     "key": "fastapi-for-ai/request-size-limits-and-upload-security",
+     "name": "request-size limits & upload security"
+    },
+    {
+     "id": "uploadfile",
+     "key": "fastapi-for-ai/uploadfile",
+     "name": "UploadFile"
+    },
+    {
+     "id": "httpexception-handling",
+     "key": "fastapi-for-ai/httpexception-handling",
+     "name": "HTTPException handling"
+    },
+    {
+     "id": "routers",
+     "key": "fastapi-for-ai/routers",
+     "name": "routers"
+    },
+    {
+     "id": "openapi-docs",
+     "key": "fastapi-for-ai/openapi-docs",
+     "name": "OpenAPI docs"
+    },
+    {
+     "id": "openapi-contract-testing",
+     "key": "fastapi-for-ai/openapi-contract-testing",
+     "name": "OpenAPI contract testing"
+    },
+    {
+     "id": "uvicorn-gunicorn-workers",
+     "key": "fastapi-for-ai/uvicorn-gunicorn-workers",
+     "name": "uvicorn / gunicorn workers"
+    },
+    {
+     "id": "graceful-shutdown-and-worker-draining",
+     "key": "fastapi-for-ai/graceful-shutdown-and-worker-draining",
+     "name": "graceful shutdown & worker draining"
+    },
+    {
+     "id": "health-readiness-endpoints",
+     "key": "fastapi-for-ai/health-readiness-endpoints",
+     "name": "health / readiness endpoints"
+    },
+    {
+     "id": "structured-logging",
+     "key": "fastapi-for-ai/structured-logging",
+     "name": "structured logging"
+    },
+    {
+     "id": "opentelemetry-instrumentation",
+     "key": "fastapi-for-ai/opentelemetry-instrumentation",
+     "name": "OpenTelemetry instrumentation"
+    },
+    {
+     "id": "redis-caching",
+     "key": "fastapi-for-ai/redis-caching",
+     "name": "Redis caching"
+    },
+    {
+     "id": "shared-httpx-asyncclient",
+     "key": "fastapi-for-ai/shared-httpx-asyncclient",
+     "name": "shared httpx AsyncClient"
+    },
+    {
+     "id": "testclient-plus-pytest-asyncio",
+     "key": "fastapi-for-ai/testclient-plus-pytest-asyncio",
+     "name": "TestClient + pytest-asyncio"
+    },
+    {
+     "id": "integration-tests-with-real-dependencies",
+     "key": "fastapi-for-ai/integration-tests-with-real-dependencies",
+     "name": "integration tests with real dependencies"
+    },
+    {
+     "id": "concurrency-limits",
+     "key": "fastapi-for-ai/concurrency-limits",
+     "name": "concurrency limits (semaphores)"
+    },
+    {
+     "id": "backpressure",
+     "key": "fastapi-for-ai/backpressure",
+     "name": "backpressure"
+    },
+    {
+     "id": "cancellation-on-client-disconnect",
+     "key": "fastapi-for-ai/cancellation-on-client-disconnect",
+     "name": "cancellation on client disconnect"
+    }
+   ]
+  },
+  {
+   "id": "node-ts-for-ai",
+   "tier": 1,
+   "order": 15,
+   "title": "Node.js / TypeScript for AI",
+   "topics": [
+    {
+     "id": "typescript-strict-mode-and-advanced-types",
+     "key": "node-ts-for-ai/typescript-strict-mode-and-advanced-types",
+     "name": "TypeScript strict mode & advanced types"
+    },
+    {
+     "id": "event-loop-and-microtask-queue",
+     "key": "node-ts-for-ai/event-loop-and-microtask-queue",
+     "name": "event loop & microtask queue"
+    },
+    {
+     "id": "promises-and-async-error-propagation",
+     "key": "node-ts-for-ai/promises-and-async-error-propagation",
+     "name": "promises & async error propagation"
+    },
+    {
+     "id": "streams-and-backpressure",
+     "key": "node-ts-for-ai/streams-and-backpressure",
+     "name": "streams & backpressure"
+    },
+    {
+     "id": "worker-threads-for-cpu-bound-tasks",
+     "key": "node-ts-for-ai/worker-threads-for-cpu-bound-tasks",
+     "name": "worker threads for CPU-bound tasks"
+    },
+    {
+     "id": "abortcontroller-and-cancellation",
+     "key": "node-ts-for-ai/abortcontroller-and-cancellation",
+     "name": "AbortController & cancellation"
+    },
+    {
+     "id": "runtime-schema-validation",
+     "key": "node-ts-for-ai/runtime-schema-validation",
+     "name": "runtime schema validation (Zod)"
+    },
+    {
+     "id": "dependency-injection",
+     "key": "node-ts-for-ai/dependency-injection",
+     "name": "dependency injection"
+    },
+    {
+     "id": "postgresql-transactions-and-migrations",
+     "key": "node-ts-for-ai/postgresql-transactions-and-migrations",
+     "name": "PostgreSQL transactions & migrations"
+    },
+    {
+     "id": "redis",
+     "key": "node-ts-for-ai/redis",
+     "name": "Redis"
+    },
+    {
+     "id": "bullmq-and-durable-jobs",
+     "key": "node-ts-for-ai/bullmq-and-durable-jobs",
+     "name": "BullMQ & durable jobs"
+    },
+    {
+     "id": "api-clients-with-retries-and-circuit-breakers",
+     "key": "node-ts-for-ai/api-clients-with-retries-and-circuit-breakers",
+     "name": "API clients with retries & circuit breakers"
+    },
+    {
+     "id": "opentelemetry-instrumentation",
+     "key": "node-ts-for-ai/opentelemetry-instrumentation",
+     "name": "OpenTelemetry instrumentation"
+    },
+    {
+     "id": "graceful-shutdown",
+     "key": "node-ts-for-ai/graceful-shutdown",
+     "name": "graceful shutdown"
+    },
+    {
+     "id": "vitest-jest-and-integration-testing",
+     "key": "node-ts-for-ai/vitest-jest-and-integration-testing",
+     "name": "Vitest / Jest & integration testing"
+    },
+    {
+     "id": "docker-ci-cd-deployment",
+     "key": "node-ts-for-ai/docker-ci-cd-deployment",
+     "name": "Docker / CI/CD deployment"
+    },
+    {
+     "id": "vercel-ai-sdk",
+     "key": "node-ts-for-ai/vercel-ai-sdk",
+     "name": "Vercel AI SDK",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "openai-anthropic-node-sdks",
+     "key": "node-ts-for-ai/openai-anthropic-node-sdks",
+     "name": "OpenAI / Anthropic Node SDKs",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "mcp-typescript-sdk",
+     "key": "node-ts-for-ai/mcp-typescript-sdk",
+     "name": "MCP TypeScript SDK",
+     "kind_hint": "tool"
+    }
+   ]
+  },
+  {
+   "id": "system-design",
+   "tier": 2,
+   "order": 16,
+   "title": "System design",
+   "topics": [
+    {
+     "id": "ai-solution-architecture",
+     "key": "system-design/ai-solution-architecture",
+     "name": "AI / solution architecture"
+    },
+    {
+     "id": "reference-architectures",
+     "key": "system-design/reference-architectures",
+     "name": "reference architectures"
+    },
+    {
+     "id": "model-selection",
+     "key": "system-design/model-selection",
+     "name": "model selection"
+    },
+    {
+     "id": "model-portfolio",
+     "key": "system-design/model-portfolio",
+     "name": "model portfolio"
+    },
+    {
+     "id": "slm-vs-llm-trade-offs",
+     "key": "system-design/slm-vs-llm-trade-offs",
+     "name": "SLM vs LLM trade-offs"
+    },
+    {
+     "id": "build-vs-buy",
+     "key": "system-design/build-vs-buy",
+     "name": "build vs buy"
+    },
+    {
+     "id": "open-weight-vs-proprietary",
+     "key": "system-design/open-weight-vs-proprietary",
+     "name": "open-weight vs proprietary"
+    },
+    {
+     "id": "self-host-vs-api",
+     "key": "system-design/self-host-vs-api",
+     "name": "self-host vs API"
+    },
+    {
+     "id": "model-routing-cascading",
+     "key": "system-design/model-routing-cascading",
+     "name": "model routing / cascading"
+    },
+    {
+     "id": "multi-model-architecture",
+     "key": "system-design/multi-model-architecture",
+     "name": "multi-model architecture"
+    },
+    {
+     "id": "ai-gateway",
+     "key": "system-design/ai-gateway",
+     "name": "AI gateway (LiteLLM proxy, Portkey)"
+    },
+    {
+     "id": "model-fallback-strategies",
+     "key": "system-design/model-fallback-strategies",
+     "name": "model fallback strategies"
+    },
+    {
+     "id": "graceful-degradation",
+     "key": "system-design/graceful-degradation",
+     "name": "graceful degradation"
+    },
+    {
+     "id": "caching-strategy-and-cache-invalidation",
+     "key": "system-design/caching-strategy-and-cache-invalidation",
+     "name": "caching strategy & cache invalidation"
+    },
+    {
+     "id": "rag-architecture",
+     "key": "system-design/rag-architecture",
+     "name": "RAG architecture"
+    },
+    {
+     "id": "agentic-architecture",
+     "key": "system-design/agentic-architecture",
+     "name": "agentic architecture"
+    },
+    {
+     "id": "multi-agent-systems",
+     "key": "system-design/multi-agent-systems",
+     "name": "multi-agent systems"
+    },
+    {
+     "id": "agent-orchestration",
+     "key": "system-design/agent-orchestration",
+     "name": "agent orchestration"
+    },
+    {
+     "id": "workflow-orchestration",
+     "key": "system-design/workflow-orchestration",
+     "name": "workflow orchestration (Temporal, Prefect, Airflow)"
+    },
+    {
+     "id": "memory-architecture",
+     "key": "system-design/memory-architecture",
+     "name": "memory architecture"
+    },
+    {
+     "id": "domain-driven-design-and-bounded-contexts",
+     "key": "system-design/domain-driven-design-and-bounded-contexts",
+     "name": "domain-driven design & bounded contexts"
+    },
+    {
+     "id": "event-driven-architecture",
+     "key": "system-design/event-driven-architecture",
+     "name": "event-driven architecture"
+    },
+    {
+     "id": "synchronous-vs-asynchronous-execution",
+     "key": "system-design/synchronous-vs-asynchronous-execution",
+     "name": "synchronous vs asynchronous execution"
+    },
+    {
+     "id": "saga-pattern-and-distributed-transactions",
+     "key": "system-design/saga-pattern-and-distributed-transactions",
+     "name": "saga pattern & distributed transactions"
+    },
+    {
+     "id": "outbox-inbox-patterns",
+     "key": "system-design/outbox-inbox-patterns",
+     "name": "outbox / inbox patterns"
+    },
+    {
+     "id": "exactly-once-processing-limitations",
+     "key": "system-design/exactly-once-processing-limitations",
+     "name": "exactly-once processing limitations"
+    },
+    {
+     "id": "distributed-systems",
+     "key": "system-design/distributed-systems",
+     "name": "distributed systems"
+    },
+    {
+     "id": "data-consistency",
+     "key": "system-design/data-consistency",
+     "name": "data consistency"
+    },
+    {
+     "id": "modular-monolith-vs-microservices",
+     "key": "system-design/modular-monolith-vs-microservices",
+     "name": "modular monolith vs microservices"
+    },
+    {
+     "id": "multi-tenancy",
+     "key": "system-design/multi-tenancy",
+     "name": "multi-tenancy"
+    },
+    {
+     "id": "tenant-isolation",
+     "key": "system-design/tenant-isolation",
+     "name": "tenant isolation"
+    },
+    {
+     "id": "c4-diagrams",
+     "key": "system-design/c4-diagrams",
+     "name": "C4 diagrams"
+    },
+    {
+     "id": "adrs",
+     "key": "system-design/adrs",
+     "name": "ADRs"
+    },
+    {
+     "id": "nfrs",
+     "key": "system-design/nfrs",
+     "name": "NFRs"
+    },
+    {
+     "id": "trade-off-analysis",
+     "key": "system-design/trade-off-analysis",
+     "name": "trade-off analysis"
+    }
+   ]
+  },
+  {
+   "id": "reliability",
+   "tier": 2,
+   "order": 17,
+   "title": "Reliability",
+   "topics": [
+    {
+     "id": "high-availability",
+     "key": "reliability/high-availability",
+     "name": "high availability"
+    },
+    {
+     "id": "fault-tolerance",
+     "key": "reliability/fault-tolerance",
+     "name": "fault tolerance"
+    },
+    {
+     "id": "multi-region-architecture",
+     "key": "reliability/multi-region-architecture",
+     "name": "multi-region architecture"
+    },
+    {
+     "id": "disaster-recovery",
+     "key": "reliability/disaster-recovery",
+     "name": "disaster recovery (RPO / RTO)"
+    },
+    {
+     "id": "business-continuity",
+     "key": "reliability/business-continuity",
+     "name": "business continuity"
+    },
+    {
+     "id": "durable-workflow-execution",
+     "key": "reliability/durable-workflow-execution",
+     "name": "durable workflow execution"
+    },
+    {
+     "id": "backpressure-and-load-shedding",
+     "key": "reliability/backpressure-and-load-shedding",
+     "name": "backpressure & load shedding"
+    },
+    {
+     "id": "tenant-level-quotas-and-noisy-neighbor-isolation",
+     "key": "reliability/tenant-level-quotas-and-noisy-neighbor-isolation",
+     "name": "tenant-level quotas & noisy-neighbor isolation"
+    },
+    {
+     "id": "circuit-breakers",
+     "key": "reliability/circuit-breakers",
+     "name": "circuit breakers"
+    },
+    {
+     "id": "bulkheads",
+     "key": "reliability/bulkheads",
+     "name": "bulkheads"
+    },
+    {
+     "id": "fmea",
+     "key": "reliability/fmea",
+     "name": "FMEA"
+    },
+    {
+     "id": "chaos-engineering-and-resilience-testing",
+     "key": "reliability/chaos-engineering-and-resilience-testing",
+     "name": "chaos engineering & resilience testing"
+    },
+    {
+     "id": "slas-slos",
+     "key": "reliability/slas-slos",
+     "name": "SLAs / SLOs"
+    }
+   ]
+  },
+  {
+   "id": "agent-runtime-architecture",
+   "tier": 2,
+   "order": 18,
+   "title": "Agent runtime architecture",
+   "topics": [
+    {
+     "id": "agent-runtime-and-orchestration-layer",
+     "key": "agent-runtime-architecture/agent-runtime-and-orchestration-layer",
+     "name": "agent runtime & orchestration layer"
+    },
+    {
+     "id": "approval-and-authorization-boundaries",
+     "key": "agent-runtime-architecture/approval-and-authorization-boundaries",
+     "name": "approval & authorization boundaries"
+    },
+    {
+     "id": "policy-enforcement-across-agents-and-tools",
+     "key": "agent-runtime-architecture/policy-enforcement-across-agents-and-tools",
+     "name": "policy enforcement across agents & tools"
+    },
+    {
+     "id": "multi-tenant-state-isolation",
+     "key": "agent-runtime-architecture/multi-tenant-state-isolation",
+     "name": "multi-tenant state isolation"
+    },
+    {
+     "id": "secrets-and-credential-isolation",
+     "key": "agent-runtime-architecture/secrets-and-credential-isolation",
+     "name": "secrets & credential isolation"
+    },
+    {
+     "id": "cross-language-api-contracts",
+     "key": "agent-runtime-architecture/cross-language-api-contracts",
+     "name": "cross-language API contracts"
+    }
+   ]
+  },
+  {
+   "id": "data-architecture",
+   "tier": 2,
+   "order": 19,
+   "title": "Data architecture",
+   "topics": [
+    {
+     "id": "ingestion-pipelines",
+     "key": "data-architecture/ingestion-pipelines",
+     "name": "ingestion pipelines"
+    },
+    {
+     "id": "etl-elt-for-rag",
+     "key": "data-architecture/etl-elt-for-rag",
+     "name": "ETL / ELT for RAG"
+    },
+    {
+     "id": "training-data-pipelines",
+     "key": "data-architecture/training-data-pipelines",
+     "name": "training data pipelines"
+    },
+    {
+     "id": "lakehouse",
+     "key": "data-architecture/lakehouse",
+     "name": "lakehouse"
+    },
+    {
+     "id": "document-processing-pipelines",
+     "key": "data-architecture/document-processing-pipelines",
+     "name": "document processing pipelines"
+    },
+    {
+     "id": "vector-database-architecture",
+     "key": "data-architecture/vector-database-architecture",
+     "name": "vector database architecture"
+    },
+    {
+     "id": "vector-store-sizing",
+     "key": "data-architecture/vector-store-sizing",
+     "name": "vector store sizing"
+    },
+    {
+     "id": "embedding-versioning-re-indexing-strategy",
+     "key": "data-architecture/embedding-versioning-re-indexing-strategy",
+     "name": "embedding versioning / re-indexing strategy"
+    },
+    {
+     "id": "knowledge-management",
+     "key": "data-architecture/knowledge-management",
+     "name": "knowledge management"
+    },
+    {
+     "id": "data-lineage",
+     "key": "data-architecture/data-lineage",
+     "name": "data lineage"
+    },
+    {
+     "id": "data-contracts",
+     "key": "data-architecture/data-contracts",
+     "name": "data contracts"
+    },
+    {
+     "id": "model-and-dataset-provenance",
+     "key": "data-architecture/model-and-dataset-provenance",
+     "name": "model & dataset provenance"
+    },
+    {
+     "id": "data-retention-and-deletion-architecture",
+     "key": "data-architecture/data-retention-and-deletion-architecture",
+     "name": "data retention & deletion architecture"
+    },
+    {
+     "id": "feature-stores",
+     "key": "data-architecture/feature-stores",
+     "name": "feature stores (hybrid ML only)",
+     "caveat": "hybrid ML only; drop for LLM-app roles"
+    }
+   ]
+  },
+  {
+   "id": "infra-capacity-economics",
+   "tier": 2,
+   "order": 20,
+   "title": "Infra, capacity & economics",
+   "topics": [
+    {
+     "id": "gpu-infrastructure",
+     "key": "infra-capacity-economics/gpu-infrastructure",
+     "name": "GPU infrastructure"
+    },
+    {
+     "id": "gpu-sizing",
+     "key": "infra-capacity-economics/gpu-sizing",
+     "name": "GPU sizing (VRAM math)"
+    },
+    {
+     "id": "gpu-utilization-and-memory-bandwidth",
+     "key": "infra-capacity-economics/gpu-utilization-and-memory-bandwidth",
+     "name": "GPU utilization & memory bandwidth"
+    },
+    {
+     "id": "a100-h100-l4-selection",
+     "key": "infra-capacity-economics/a100-h100-l4-selection",
+     "name": "A100 / H100 / L4 selection"
+    },
+    {
+     "id": "serverless-gpus",
+     "key": "infra-capacity-economics/serverless-gpus",
+     "name": "serverless GPUs"
+    },
+    {
+     "id": "keda-autoscaling",
+     "key": "infra-capacity-economics/keda-autoscaling",
+     "name": "KEDA autoscaling"
+    },
+    {
+     "id": "ray-kuberay",
+     "key": "infra-capacity-economics/ray-kuberay",
+     "name": "Ray / KubeRay"
+    },
+    {
+     "id": "inference-clusters",
+     "key": "infra-capacity-economics/inference-clusters",
+     "name": "inference clusters"
+    },
+    {
+     "id": "shared-vs-isolated-model-serving-infrastructure",
+     "key": "infra-capacity-economics/shared-vs-isolated-model-serving-infrastructure",
+     "name": "shared vs isolated model-serving infrastructure"
+    },
+    {
+     "id": "cloud-ai-architecture",
+     "key": "infra-capacity-economics/cloud-ai-architecture",
+     "name": "cloud AI architecture (AWS Bedrock, Azure OpenAI, Vertex AI)"
+    },
+    {
+     "id": "api-provider-quotas-and-regional-limits",
+     "key": "infra-capacity-economics/api-provider-quotas-and-regional-limits",
+     "name": "API provider quotas & regional limits"
+    },
+    {
+     "id": "hybrid-on-prem",
+     "key": "infra-capacity-economics/hybrid-on-prem",
+     "name": "hybrid / on-prem"
+    },
+    {
+     "id": "edge-ai-deployment",
+     "key": "infra-capacity-economics/edge-ai-deployment",
+     "name": "edge AI deployment"
+    },
+    {
+     "id": "capacity-planning",
+     "key": "infra-capacity-economics/capacity-planning",
+     "name": "capacity planning (tokens/sec, requests/sec, concurrent sessions)"
+    },
+    {
+     "id": "queueing-theory",
+     "key": "infra-capacity-economics/queueing-theory",
+     "name": "queueing theory"
+    },
+    {
+     "id": "latency-budgets",
+     "key": "infra-capacity-economics/latency-budgets",
+     "name": "latency budgets"
+    },
+    {
+     "id": "scalability",
+     "key": "infra-capacity-economics/scalability",
+     "name": "scalability"
+    },
+    {
+     "id": "cost-optimization",
+     "key": "infra-capacity-economics/cost-optimization",
+     "name": "cost optimization"
+    },
+    {
+     "id": "cost-modeling",
+     "key": "infra-capacity-economics/cost-modeling",
+     "name": "cost modeling (cost per request, token economics)"
+    },
+    {
+     "id": "unit-economics-per-successful-task",
+     "key": "infra-capacity-economics/unit-economics-per-successful-task",
+     "name": "unit economics per successful task"
+    },
+    {
+     "id": "cost-allocation-by-tenant-and-feature",
+     "key": "infra-capacity-economics/cost-allocation-by-tenant-and-feature",
+     "name": "cost allocation by tenant & feature"
+    },
+    {
+     "id": "quality-latency-cost-optimization",
+     "key": "infra-capacity-economics/quality-latency-cost-optimization",
+     "name": "quality–latency–cost optimization"
+    },
+    {
+     "id": "break-even-analysis",
+     "key": "infra-capacity-economics/break-even-analysis",
+     "name": "break-even analysis (hosted API vs self-hosting)"
+    },
+    {
+     "id": "finops",
+     "key": "infra-capacity-economics/finops",
+     "name": "FinOps"
+    },
+    {
+     "id": "tco",
+     "key": "infra-capacity-economics/tco",
+     "name": "TCO"
+    }
+   ]
+  },
+  {
+   "id": "llmops-platform",
+   "tier": 2,
+   "order": 21,
+   "title": "LLMOps & AI platform",
+   "topics": [
+    {
+     "id": "ci-cd-for-prompts-and-models",
+     "key": "llmops-platform/ci-cd-for-prompts-and-models",
+     "name": "CI/CD for prompts and models"
+    },
+    {
+     "id": "prompt-registry",
+     "key": "llmops-platform/prompt-registry",
+     "name": "prompt registry"
+    },
+    {
+     "id": "model-registry",
+     "key": "llmops-platform/model-registry",
+     "name": "model registry"
+    },
+    {
+     "id": "experiment-tracking",
+     "key": "llmops-platform/experiment-tracking",
+     "name": "experiment tracking (MLflow, W&B)"
+    },
+    {
+     "id": "evaluation-frameworks",
+     "key": "llmops-platform/evaluation-frameworks",
+     "name": "evaluation frameworks"
+    },
+    {
+     "id": "golden-dataset-strategy",
+     "key": "llmops-platform/golden-dataset-strategy",
+     "name": "golden dataset strategy"
+    },
+    {
+     "id": "reproducible-evaluations",
+     "key": "llmops-platform/reproducible-evaluations",
+     "name": "reproducible evaluations"
+    },
+    {
+     "id": "evaluation-gates-for-production-releases",
+     "key": "llmops-platform/evaluation-gates-for-production-releases",
+     "name": "evaluation gates for production releases"
+    },
+    {
+     "id": "canary-shadow-deployments",
+     "key": "llmops-platform/canary-shadow-deployments",
+     "name": "canary / shadow deployments"
+    },
+    {
+     "id": "rollback",
+     "key": "llmops-platform/rollback",
+     "name": "rollback"
+    },
+    {
+     "id": "model-monitoring",
+     "key": "llmops-platform/model-monitoring",
+     "name": "model monitoring"
+    },
+    {
+     "id": "drift",
+     "key": "llmops-platform/drift",
+     "name": "drift"
+    },
+    {
+     "id": "model-lifecycle-and-deprecation-policy",
+     "key": "llmops-platform/model-lifecycle-and-deprecation-policy",
+     "name": "model lifecycle & deprecation policy"
+    },
+    {
+     "id": "observability-stack",
+     "key": "llmops-platform/observability-stack",
+     "name": "observability stack"
+    },
+    {
+     "id": "ai-control-plane-vs-data-plane",
+     "key": "llmops-platform/ai-control-plane-vs-data-plane",
+     "name": "AI control plane vs data plane"
+    },
+    {
+     "id": "centralized-vs-federated-ai-platform",
+     "key": "llmops-platform/centralized-vs-federated-ai-platform",
+     "name": "centralized vs federated AI platform"
+    }
+   ]
+  },
+  {
+   "id": "security-governance-compliance",
+   "tier": 2,
+   "order": 22,
+   "title": "Security, governance & compliance",
+   "topics": [
+    {
+     "id": "ai-security",
+     "key": "security-governance-compliance/ai-security",
+     "name": "AI security"
+    },
+    {
+     "id": "threat-modeling",
+     "key": "security-governance-compliance/threat-modeling",
+     "name": "threat modeling"
+    },
+    {
+     "id": "prompt-injection-defense",
+     "key": "security-governance-compliance/prompt-injection-defense",
+     "name": "prompt injection defense"
+    },
+    {
+     "id": "pii-protection-dlp",
+     "key": "security-governance-compliance/pii-protection-dlp",
+     "name": "PII protection / DLP"
+    },
+    {
+     "id": "data-classification",
+     "key": "security-governance-compliance/data-classification",
+     "name": "data classification"
+    },
+    {
+     "id": "zero-trust",
+     "key": "security-governance-compliance/zero-trust",
+     "name": "zero trust"
+    },
+    {
+     "id": "data-residency",
+     "key": "security-governance-compliance/data-residency",
+     "name": "data residency"
+    },
+    {
+     "id": "model-governance",
+     "key": "security-governance-compliance/model-governance",
+     "name": "model governance"
+    },
+    {
+     "id": "model-cards",
+     "key": "security-governance-compliance/model-cards",
+     "name": "model cards"
+    },
+    {
+     "id": "audit-trails",
+     "key": "security-governance-compliance/audit-trails",
+     "name": "audit trails"
+    },
+    {
+     "id": "ai-inventory-and-use-case-risk-classification",
+     "key": "security-governance-compliance/ai-inventory-and-use-case-risk-classification",
+     "name": "AI inventory & use-case risk classification"
+    },
+    {
+     "id": "responsible-ai",
+     "key": "security-governance-compliance/responsible-ai",
+     "name": "responsible AI"
+    },
+    {
+     "id": "ai-risk-management",
+     "key": "security-governance-compliance/ai-risk-management",
+     "name": "AI risk management"
+    },
+    {
+     "id": "ai-incident-response",
+     "key": "security-governance-compliance/ai-incident-response",
+     "name": "AI incident response"
+    },
+    {
+     "id": "vendor-exit-strategy",
+     "key": "security-governance-compliance/vendor-exit-strategy",
+     "name": "vendor exit strategy"
+    },
+    {
+     "id": "compliance-architecture",
+     "key": "security-governance-compliance/compliance-architecture",
+     "name": "compliance architecture (GDPR, SOC 2, HIPAA, ISO 42001, EU AI Act, DPDP Act)"
+    }
+   ]
+  },
+  {
+   "id": "strategy",
+   "tier": 2,
+   "order": 23,
+   "title": "Strategy",
+   "topics": [
+    {
+     "id": "ai-roadmap",
+     "key": "strategy/ai-roadmap",
+     "name": "AI roadmap"
+    },
+    {
+     "id": "platform-strategy",
+     "key": "strategy/platform-strategy",
+     "name": "platform strategy"
+    },
+    {
+     "id": "vendor-evaluation",
+     "key": "strategy/vendor-evaluation",
+     "name": "vendor evaluation"
+    },
+    {
+     "id": "technical-due-diligence",
+     "key": "strategy/technical-due-diligence",
+     "name": "technical due diligence"
+    },
+    {
+     "id": "stakeholder-alignment",
+     "key": "strategy/stakeholder-alignment",
+     "name": "stakeholder alignment"
+    }
+   ]
+  },
+  {
+   "id": "scoping",
+   "tier": 3,
+   "order": 24,
+   "title": "Scoping",
+   "topics": [
+    {
+     "id": "customer-discovery",
+     "key": "scoping/customer-discovery",
+     "name": "customer discovery"
+    },
+    {
+     "id": "ai-use-case-discovery",
+     "key": "scoping/ai-use-case-discovery",
+     "name": "AI use-case discovery"
+    },
+    {
+     "id": "problem-decomposition",
+     "key": "scoping/problem-decomposition",
+     "name": "problem decomposition"
+    },
+    {
+     "id": "workflow-analysis",
+     "key": "scoping/workflow-analysis",
+     "name": "workflow analysis"
+    },
+    {
+     "id": "domain-modeling",
+     "key": "scoping/domain-modeling",
+     "name": "domain modeling"
+    },
+    {
+     "id": "data-access-and-permissions-discovery",
+     "key": "scoping/data-access-and-permissions-discovery",
+     "name": "data access & permissions discovery"
+    },
+    {
+     "id": "success-metrics-kpis",
+     "key": "scoping/success-metrics-kpis",
+     "name": "success metrics / KPIs"
+    },
+    {
+     "id": "baseline-measurement-before-deployment",
+     "key": "scoping/baseline-measurement-before-deployment",
+     "name": "baseline measurement before deployment"
+    },
+    {
+     "id": "roi-model",
+     "key": "scoping/roi-model",
+     "name": "ROI model"
+    },
+    {
+     "id": "statement-of-work",
+     "key": "scoping/statement-of-work",
+     "name": "statement of work"
+    },
+    {
+     "id": "requirements-traceability",
+     "key": "scoping/requirements-traceability",
+     "name": "requirements traceability"
+    },
+    {
+     "id": "dependency-and-risk-management",
+     "key": "scoping/dependency-and-risk-management",
+     "name": "dependency & risk management"
+    },
+    {
+     "id": "timeboxing",
+     "key": "scoping/timeboxing",
+     "name": "timeboxing"
+    },
+    {
+     "id": "demos",
+     "key": "scoping/demos",
+     "name": "demos"
+    },
+    {
+     "id": "rapid-prototyping-poc",
+     "key": "scoping/rapid-prototyping-poc",
+     "name": "rapid prototyping / PoC"
+    },
+    {
+     "id": "pilot-to-production-plan",
+     "key": "scoping/pilot-to-production-plan",
+     "name": "pilot → production plan"
+    },
+    {
+     "id": "productionization",
+     "key": "scoping/productionization",
+     "name": "productionization"
+    }
+   ]
+  },
+  {
+   "id": "enterprise-integration",
+   "tier": 3,
+   "order": 25,
+   "title": "Enterprise integration",
+   "topics": [
+    {
+     "id": "enterprise-connectors",
+     "key": "enterprise-integration/enterprise-connectors",
+     "name": "enterprise connectors (Salesforce, SAP, ServiceNow, SharePoint, Confluence, Jira, Slack, Teams)"
+    },
+    {
+     "id": "legacy-system-integration",
+     "key": "enterprise-integration/legacy-system-integration",
+     "name": "legacy system integration"
+    },
+    {
+     "id": "sso-iam-integration",
+     "key": "enterprise-integration/sso-iam-integration",
+     "name": "SSO / IAM integration (Okta, Entra ID)"
+    },
+    {
+     "id": "saml-sso",
+     "key": "enterprise-integration/saml-sso",
+     "name": "SAML SSO"
+    },
+    {
+     "id": "scim-provisioning",
+     "key": "enterprise-integration/scim-provisioning",
+     "name": "SCIM provisioning"
+    },
+    {
+     "id": "rbac-abac-mapping-to-customer-identity",
+     "key": "enterprise-integration/rbac-abac-mapping-to-customer-identity",
+     "name": "RBAC / ABAC mapping to customer identity"
+    },
+    {
+     "id": "webhooks",
+     "key": "enterprise-integration/webhooks",
+     "name": "webhooks"
+    },
+    {
+     "id": "incremental-synchronization-and-cdc",
+     "key": "enterprise-integration/incremental-synchronization-and-cdc",
+     "name": "incremental synchronization & CDC"
+    },
+    {
+     "id": "retry-deduplication-reconciliation",
+     "key": "enterprise-integration/retry-deduplication-reconciliation",
+     "name": "retry / deduplication / reconciliation"
+    },
+    {
+     "id": "sandbox-vs-production-environments",
+     "key": "enterprise-integration/sandbox-vs-production-environments",
+     "name": "sandbox vs production environments"
+    },
+    {
+     "id": "tenant-specific-configuration-and-feature-flags",
+     "key": "enterprise-integration/tenant-specific-configuration-and-feature-flags",
+     "name": "tenant-specific configuration & feature flags"
+    },
+    {
+     "id": "data-onboarding",
+     "key": "enterprise-integration/data-onboarding",
+     "name": "data onboarding"
+    },
+    {
+     "id": "data-ingestion-from-client-systems",
+     "key": "enterprise-integration/data-ingestion-from-client-systems",
+     "name": "data ingestion from client systems"
+    },
+    {
+     "id": "data-mapping-and-canonical-schemas",
+     "key": "enterprise-integration/data-mapping-and-canonical-schemas",
+     "name": "data mapping & canonical schemas (schema mapping)"
+    },
+    {
+     "id": "data-profiling-and-quality-assessment",
+     "key": "enterprise-integration/data-profiling-and-quality-assessment",
+     "name": "data profiling & quality assessment"
+    },
+    {
+     "id": "client-document-parsing",
+     "key": "enterprise-integration/client-document-parsing",
+     "name": "client document parsing (PDF, scans, OCR)"
+    }
+   ]
+  },
+  {
+   "id": "customer-data-evaluation",
+   "tier": 3,
+   "order": 26,
+   "title": "Customer data & evaluation",
+   "topics": [
+    {
+     "id": "domain-prompt-engineering",
+     "key": "customer-data-evaluation/domain-prompt-engineering",
+     "name": "domain prompt engineering"
+    },
+    {
+     "id": "golden-dataset-creation-with-client-smes",
+     "key": "customer-data-evaluation/golden-dataset-creation-with-client-smes",
+     "name": "golden dataset creation with client SMEs"
+    },
+    {
+     "id": "representative-test-case-sampling",
+     "key": "customer-data-evaluation/representative-test-case-sampling",
+     "name": "representative test-case sampling"
+    },
+    {
+     "id": "sme-review-and-annotation-guidelines",
+     "key": "customer-data-evaluation/sme-review-and-annotation-guidelines",
+     "name": "SME review & annotation guidelines"
+    },
+    {
+     "id": "labeling-sessions",
+     "key": "customer-data-evaluation/labeling-sessions",
+     "name": "labeling sessions"
+    },
+    {
+     "id": "eval-review-loops",
+     "key": "customer-data-evaluation/eval-review-loops",
+     "name": "eval review loops"
+    },
+    {
+     "id": "acceptance-testing-against-customer-kpis",
+     "key": "customer-data-evaluation/acceptance-testing-against-customer-kpis",
+     "name": "acceptance testing against customer KPIs"
+    },
+    {
+     "id": "customer-specific-regression-suites",
+     "key": "customer-data-evaluation/customer-specific-regression-suites",
+     "name": "customer-specific regression suites"
+    },
+    {
+     "id": "shadow-mode-validation",
+     "key": "customer-data-evaluation/shadow-mode-validation",
+     "name": "shadow-mode validation"
+    },
+    {
+     "id": "per-customer-guardrails",
+     "key": "customer-data-evaluation/per-customer-guardrails",
+     "name": "per-customer guardrails"
+    },
+    {
+     "id": "fine-tuning-pipelines-on-client-data",
+     "key": "customer-data-evaluation/fine-tuning-pipelines-on-client-data",
+     "name": "fine-tuning pipelines on client data"
+    },
+    {
+     "id": "model-integration",
+     "key": "customer-data-evaluation/model-integration",
+     "name": "model integration"
+    },
+    {
+     "id": "production-feedback-classification",
+     "key": "customer-data-evaluation/production-feedback-classification",
+     "name": "production feedback classification"
+    },
+    {
+     "id": "feedback-loops-to-product",
+     "key": "customer-data-evaluation/feedback-loops-to-product",
+     "name": "feedback loops to product"
+    }
+   ]
+  },
+  {
+   "id": "deployment",
+   "tier": 3,
+   "order": 27,
+   "title": "Deployment",
+   "topics": [
+    {
+     "id": "customer-vpc-on-prem-air-gapped",
+     "key": "deployment/customer-vpc-on-prem-air-gapped",
+     "name": "customer VPC / on-prem / air-gapped"
+    },
+    {
+     "id": "private-endpoints",
+     "key": "deployment/private-endpoints",
+     "name": "private endpoints"
+    },
+    {
+     "id": "vpn",
+     "key": "deployment/vpn",
+     "name": "VPN"
+    },
+    {
+     "id": "terraform",
+     "key": "deployment/terraform",
+     "name": "Terraform (IaC)"
+    },
+    {
+     "id": "security-questionnaires",
+     "key": "deployment/security-questionnaires",
+     "name": "security questionnaires"
+    },
+    {
+     "id": "security-and-architecture-reviews",
+     "key": "deployment/security-and-architecture-reviews",
+     "name": "security & architecture reviews"
+    },
+    {
+     "id": "compliance-constraints",
+     "key": "deployment/compliance-constraints",
+     "name": "compliance constraints"
+    },
+    {
+     "id": "deployment-readiness-reviews",
+     "key": "deployment/deployment-readiness-reviews",
+     "name": "deployment readiness reviews"
+    },
+    {
+     "id": "uat",
+     "key": "deployment/uat",
+     "name": "UAT"
+    },
+    {
+     "id": "rollout-criteria-and-rollback-triggers",
+     "key": "deployment/rollout-criteria-and-rollback-triggers",
+     "name": "rollout criteria & rollback triggers"
+    },
+    {
+     "id": "runbooks",
+     "key": "deployment/runbooks",
+     "name": "runbooks"
+    },
+    {
+     "id": "health-checks",
+     "key": "deployment/health-checks",
+     "name": "health checks"
+    },
+    {
+     "id": "hypercare",
+     "key": "deployment/hypercare",
+     "name": "hypercare"
+    }
+   ]
+  },
+  {
+   "id": "delivery-ownership",
+   "tier": 3,
+   "order": 28,
+   "title": "Delivery & ownership",
+   "topics": [
+    {
+     "id": "production-debugging",
+     "key": "delivery-ownership/production-debugging",
+     "name": "production debugging"
+    },
+    {
+     "id": "failure-analysis",
+     "key": "delivery-ownership/failure-analysis",
+     "name": "failure analysis"
+    },
+    {
+     "id": "incident-severity-and-escalation",
+     "key": "delivery-ownership/incident-severity-and-escalation",
+     "name": "incident severity & escalation"
+    },
+    {
+     "id": "root-cause-analysis-and-postmortems",
+     "key": "delivery-ownership/root-cause-analysis-and-postmortems",
+     "name": "root-cause analysis & postmortems"
+    },
+    {
+     "id": "operational-ownership-and-support-boundaries",
+     "key": "delivery-ownership/operational-ownership-and-support-boundaries",
+     "name": "operational ownership & support boundaries"
+    },
+    {
+     "id": "slas",
+     "key": "delivery-ownership/slas",
+     "name": "SLAs"
+    },
+    {
+     "id": "system-reliability",
+     "key": "delivery-ownership/system-reliability",
+     "name": "system reliability"
+    },
+    {
+     "id": "technical-documentation",
+     "key": "delivery-ownership/technical-documentation",
+     "name": "technical documentation"
+    },
+    {
+     "id": "productizing-repeated-customer-solutions",
+     "key": "delivery-ownership/productizing-repeated-customer-solutions",
+     "name": "productizing repeated customer solutions"
+    }
+   ]
+  },
+  {
+   "id": "adoption",
+   "tier": 3,
+   "order": 29,
+   "title": "Adoption",
+   "topics": [
+    {
+     "id": "change-management",
+     "key": "adoption/change-management",
+     "name": "change management"
+    },
+    {
+     "id": "user-training",
+     "key": "adoption/user-training",
+     "name": "user training"
+    },
+    {
+     "id": "workshops",
+     "key": "adoption/workshops",
+     "name": "workshops"
+    },
+    {
+     "id": "stakeholder-management",
+     "key": "adoption/stakeholder-management",
+     "name": "stakeholder management"
+    },
+    {
+     "id": "exec-communication",
+     "key": "adoption/exec-communication",
+     "name": "exec communication"
+    },
+    {
+     "id": "usage-analytics",
+     "key": "adoption/usage-analytics",
+     "name": "usage analytics"
+    },
+    {
+     "id": "adoption-and-value-realization-measurement",
+     "key": "adoption/adoption-and-value-realization-measurement",
+     "name": "adoption & value-realization measurement"
+    },
+    {
+     "id": "continuous-improvement",
+     "key": "adoption/continuous-improvement",
+     "name": "continuous improvement"
+    },
+    {
+     "id": "handoff-to-customer-teams",
+     "key": "adoption/handoff-to-customer-teams",
+     "name": "handoff to customer teams"
+    },
+    {
+     "id": "feature-request-triage",
+     "key": "adoption/feature-request-triage",
+     "name": "feature-request triage"
+    }
+   ]
+  }
+ ]
+}

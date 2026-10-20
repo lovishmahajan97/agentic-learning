@@ -1,0 +1,6 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    { "name": "lms", "runtimeExecutable": "node", "runtimeArgs": ["scripts/serve.js", "8765", "site"], "port": 8765 }
+  ]
+}
