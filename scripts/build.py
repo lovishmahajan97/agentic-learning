@@ -22,6 +22,9 @@ DIFFS = {"intro", "core", "advanced"}
 TOPIC_SECTIONS = ["TL;DR", "Why it exists", "How it works", "Example", "Trade-offs", "Pitfalls",
                   "When to use", "Role lens", "Check yourself", "Quiz"]
 RELEVANCE = {"core", "useful", "background"}
+MASTERY = {"understand", "implement", "evaluate"}
+CODE_TESTED = {"yes", "partial", "no"}
+V4_FORCE = False          # set by --v4: check against the mastery format (SPEC v4)
 V3_FORCE = False          # set by --v3: check against the agent-builder format (SPEC v3)
 TOPIC_SECTIONS_V2 = ["TL;DR", "Why it exists", "How it works", "Diagram", "Example", "Production patterns",
                      "Trade-offs", "Pitfalls", "When to use", "Role lens", "Check yourself",
@@ -43,6 +46,8 @@ def norm_heading(h):
                "trade-offs": "Trade-offs", "tradeoffs": "Trade-offs", "trade offs": "Trade-offs",
                "pitfalls": "Pitfalls", "common pitfalls": "Pitfalls",
                "production patterns": "Production patterns", "in production": "Production patterns",
+               "exercise": "Exercise", "hands-on exercise": "Exercise",
+               "mastery test": "Mastery test",
                "use cases & projects": "Use cases & projects", "use cases and projects": "Use cases & projects",
                "for agent builders": "For agent builders", "agent builder's take": "For agent builders",
                "diagram": "Diagram", "flowchart": "Diagram", "flow": "Diagram",
@@ -174,6 +179,41 @@ def diagram(md, errs):
     if words(caption) < 8: errs.append("'Diagram' needs a one or two sentence caption saying what to look at")
     return {"code": code, "caption": caption}
 
+def mastery_block(fm, got, errs):
+    lvl = str(fm.get("mastery", "")).lower()
+    if lvl not in MASTERY: errs.append(f"front matter mastery must be one of {sorted(MASTERY)} (the level this lesson should take you to)")
+    ct = str(fm.get("code_tested", "")).lower()
+    if ct not in CODE_TESTED: errs.append(f"front matter code_tested must be one of {sorted(CODE_TESTED)}")
+    pre = fm.get("prerequisites", [])
+    if isinstance(pre, str): pre = [pre]
+    badp = [x for x in pre if x not in ALL_KEYS]
+    if badp: errs.append(f"prerequisites not in taxonomy: {badp}")
+    if len(pre) > 5: errs.append("prerequisites: at most 5 keys")
+    ex = got["Exercise"]
+    if words(ex) < 80: errs.append(f"'Exercise' too thin ({words(ex)} words, min 80)")
+    for lab in ("**Goal", "**Acceptance"):
+        if lab.lower() not in ex.lower(): errs.append(f"'Exercise' needs a bold {lab.strip('*')} line")
+    if "```" in ex and ex.count("```") >= 2 and words(re.sub(r"```.*?```", "", ex, flags=re.S)) < 60:
+        errs.append("'Exercise' must not be a worked solution: describe the task and checks, give at most a starter stub")
+    mt = got["Mastery test"]
+    if words(mt) < 60: errs.append(f"'Mastery test' too thin ({words(mt)} words, min 60)")
+    for lab in ("**Problem", "**A strong answer"):
+        if lab.lower() not in mt.lower(): errs.append(f"'Mastery test' needs a bold {lab.strip('*')} part")
+    diag = [b for b in bullets(got["Pitfalls"]) if "diagnos" in b.lower()]
+    if len(diag) < 3: errs.append(f"'Pitfalls' (failure modes): at least 3 bullets must say how to diagnose (found {len(diag)})")
+    for sec in ("Exercise", "Mastery test"):
+        for kind_, w, head in long_blocks(got[sec]):
+            errs.append(f"'{sec}': {kind_} of {w} words; split it: {head!r}")
+    ms = fm.get("milestones", [])
+    if isinstance(ms, str): ms = [ms]
+    out_ms = []
+    for x in ms:
+        mid_, _, title = x.partition(":")
+        if mid_.strip() not in MODULES: errs.append(f"milestone '{x}' must start with a module id and a colon")
+        else: out_ms.append({"after": mid_.strip(), "title": title.strip()})
+    return {"level": lvl, "code_tested": ct, "prerequisites": [x for x in pre if x in ALL_KEYS],
+            "exercise": ex, "test": mt, "milestones": out_ms}
+
 def projects(md, errs):
     secs, order, _ = split_sections(md, level=3)
     by = {re.sub(r"\s+", " ", h.strip().lower()): secs[h] for h in order}
@@ -295,15 +335,16 @@ def parse_topic(path: Path):
         elif nh in got: errs.append(f"duplicate section '{nh}'")
         else: got[nh] = c
     st_ = str(fm.get("status", "")).lower()
-    v3 = V3_FORCE or st_.startswith("agentic")
+    v4 = V4_FORCE or st_.startswith("mastery")
+    v3 = v4 or V3_FORCE or st_.startswith("agentic")
     v2 = v3 or V2_FORCE or st_.startswith("crisp") or "Production patterns" in got
-    need = (["For agent builders"] + TOPIC_SECTIONS_V2 + ["Use cases & projects"]) if v3 else (TOPIC_SECTIONS_V2 if v2 else TOPIC_SECTIONS)
+    need = (["For agent builders"] + TOPIC_SECTIONS_V2 + (["Exercise", "Mastery test"] if v4 else []) + ["Use cases & projects"]) if v3 else (TOPIC_SECTIONS_V2 if v2 else TOPIC_SECTIONS)
     for s in need:
         if s not in got: errs.append(f"missing section '## {s}'")
     if any(s not in got for s in need):
         return None, errs, warns
     is_tool = kind == "tool"
-    patterns, dia, ivq, proj = [], None, [], None
+    patterns, dia, ivq, proj, mastery = [], None, [], None, None
     if not v2:
         mins = {"TL;DR": 15, "Why it exists": 120, "How it works": 150 if is_tool else 250,
                 "When to use": 60}
@@ -338,6 +379,8 @@ def parse_topic(path: Path):
             rel = str(fm.get("agent_relevance", "")).lower()
             if rel not in RELEVANCE: errs.append(f"front matter agent_relevance must be one of {sorted(RELEVANCE)}")
             proj = projects(got["Use cases & projects"], errs)
+            if v4:
+                mastery = mastery_block(fm, got, errs)
             fb = bullets(got["For agent builders"])
             if len(fb) < 3: errs.append("'For agent builders' needs 3-5 bold-led bullets (why it matters for agents, where it shows up in an agent stack, what you can skip)")
             if words(got["For agent builders"]) < 50: errs.append("'For agent builders' too thin (min 50 words)")
@@ -361,7 +404,9 @@ def parse_topic(path: Path):
          "related": [r for r in related if r in ALL_KEYS], "sources": sources,
          "tldr": got["TL;DR"], "why": got["Why it exists"], "how": got["How it works"],
          "example": got["Example"], "patterns": patterns, "agent": got.get("For agent builders") if v3 else None,
-         "agent_relevance": str(fm.get("agent_relevance", "")).lower() or None, "projects": proj, "diagram": dia, "interview": ivq, "format": "crisp" if v2 else "long", "tradeoffs": tr, "pitfalls": pf, "when": got["When to use"],
+         "agent_relevance": str(fm.get("agent_relevance", "")).lower() or None, "projects": proj,
+         "mastery": {k: v for k, v in mastery.items() if k not in ("exercise", "test")} if mastery else None,
+         "exercise": mastery["exercise"] if mastery else None, "mastery_test": mastery["test"] if mastery else None, "diagram": dia, "interview": ivq, "format": "crisp" if v2 else "long", "tradeoffs": tr, "pitfalls": pf, "when": got["When to use"],
          "role_lens": role_lens(got["Role lens"], errs, "Role lens"),
          "check": check_yourself(got["Check yourself"], errs), "quiz": quiz(got["Quiz"], errs)}
     if "caveat" in tax_t: t["caveat"] = tax_t["caveat"]
@@ -407,7 +452,7 @@ def parse_module(path: Path):
         if s not in capn: errs.append(f"Capstone needs '### {s}'")
     if any(s not in capn for s in ("Brief", "Deliverables", "Rubric")): return None, errs
     if words(capn["Brief"]) < 120: errs.append("Capstone brief too short (min 120 words)")
-    if V2_FORCE or str(fm.get("status", "")).lower().startswith(("crisp", "agentic")):
+    if V2_FORCE or str(fm.get("status", "")).lower().startswith(("crisp", "agentic", "mastery")):
         for sec, md_ in (("Overview", got["Overview"]), ("Mental model", got["Mental model"]),
                          ("Capstone brief", capn["Brief"])):
             for kind_, w, head in long_blocks(md_):
@@ -475,7 +520,7 @@ def build(report_only=False):
         for k, v in list(report["invalid"].items())[:40]:
             print(f"  ✗ {k}: {v[0]}")
         return
-    HEAVY = ("agent", "projects", "why", "how", "example", "patterns", "diagram", "interview", "tradeoffs", "pitfalls", "when", "role_lens", "check", "quiz", "sources")
+    HEAVY = ("agent", "projects", "exercise", "mastery_test", "why", "how", "example", "patterns", "diagram", "interview", "tradeoffs", "pitfalls", "when", "role_lens", "check", "quiz", "sources")
     built = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     (ROOT / "site" / "data").mkdir(exist_ok=True)
     light_modules, total_bytes = [], 0
@@ -515,6 +560,8 @@ if __name__ == "__main__":
         a.remove("--v2"); V2_FORCE = True
     if "--v3" in a:
         a.remove("--v3"); V3_FORCE = True; V2_FORCE = True
+    if "--v4" in a:
+        a.remove("--v4"); V4_FORCE = True; V3_FORCE = True; V2_FORCE = True
     if a[:1] == ["--check"]:
         sys.exit(1 if check_files(a[1:]) else 0)
     if a[:1] == ["--check-module"]:

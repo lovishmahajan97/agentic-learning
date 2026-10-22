@@ -298,6 +298,29 @@ TAXONOMY = [
   ("enterprise agent with SSO, RBAC tools and audit logs", "project"),
   ("MCP tool hub for a team", "project"),
  ]),
+ ("engineering-fundamentals", 1, "Engineering fundamentals", [
+  ("HTTP from first principles (requests, status codes, headers, connections, TLS)", ""),
+  ("debugging method (reproduce, isolate, hypothesise, verify)", ""),
+  ("testing fundamentals (what to test, unit vs integration, test doubles, flaky tests)", ""),
+  ("git and code review workflow (branches, commits, rebasing, reviewing AI code)", ""),
+  ("reading errors, logs and stack traces", ""),
+  ("command line and environment basics (shell, env vars, processes, ports)", ""),
+ ]),
+ ("math-for-ai", 1, "Math and statistics for AI", [
+  ("probability for AI engineers (distributions, conditional probability, Bayes)", ""),
+  ("statistics for evaluation (sampling, confidence intervals, significance, sample size)", ""),
+  ("linear algebra intuition (vectors, dot products, matrices, norms)", ""),
+  ("calculus intuition for gradients (derivatives, chain rule)", ""),
+  ("information theory basics (entropy, cross-entropy, KL divergence)", ""),
+  ("numerical precision (floating point, fp16, bf16, overflow)", ""),
+ ]),
+ ("cumulative-projects", 1, "Cumulative projects", [
+  ("Project 1: reliable RAG application", "project"),
+  ("Project 2: tool-using agent with guardrails", "project"),
+  ("Project 3: production AI service", "project"),
+  ("Project 4: SLM feasibility study", "project"),
+  ("Project 5: end-to-end business solution", "project"),
+ ]),
 ]
 
 TIER_INFO = {

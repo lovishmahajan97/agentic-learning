@@ -3498,5 +3498,102 @@
     "kind_hint": "project"
    }
   ]
+ },
+ {
+  "module": "engineering-fundamentals",
+  "module_title": "Engineering fundamentals",
+  "tier": 1,
+  "index": 0,
+  "topics": [
+   {
+    "id": "http-from-first-principles",
+    "name": "HTTP from first principles (requests, status codes, headers, connections, TLS)"
+   },
+   {
+    "id": "debugging-method",
+    "name": "debugging method (reproduce, isolate, hypothesise, verify)"
+   },
+   {
+    "id": "testing-fundamentals",
+    "name": "testing fundamentals (what to test, unit vs integration, test doubles, flaky tests)"
+   },
+   {
+    "id": "git-and-code-review-workflow",
+    "name": "git and code review workflow (branches, commits, rebasing, reviewing AI code)"
+   },
+   {
+    "id": "reading-errors-logs-and-stack-traces",
+    "name": "reading errors, logs and stack traces"
+   },
+   {
+    "id": "command-line-and-environment-basics",
+    "name": "command line and environment basics (shell, env vars, processes, ports)"
+   }
+  ]
+ },
+ {
+  "module": "math-for-ai",
+  "module_title": "Math and statistics for AI",
+  "tier": 1,
+  "index": 0,
+  "topics": [
+   {
+    "id": "probability-for-ai-engineers",
+    "name": "probability for AI engineers (distributions, conditional probability, Bayes)"
+   },
+   {
+    "id": "statistics-for-evaluation",
+    "name": "statistics for evaluation (sampling, confidence intervals, significance, sample size)"
+   },
+   {
+    "id": "linear-algebra-intuition",
+    "name": "linear algebra intuition (vectors, dot products, matrices, norms)"
+   },
+   {
+    "id": "calculus-intuition-for-gradients",
+    "name": "calculus intuition for gradients (derivatives, chain rule)"
+   },
+   {
+    "id": "information-theory-basics",
+    "name": "information theory basics (entropy, cross-entropy, KL divergence)"
+   },
+   {
+    "id": "numerical-precision",
+    "name": "numerical precision (floating point, fp16, bf16, overflow)"
+   }
+  ]
+ },
+ {
+  "module": "cumulative-projects",
+  "module_title": "Cumulative projects",
+  "tier": 1,
+  "index": 0,
+  "topics": [
+   {
+    "id": "project-1-reliable-rag-application",
+    "name": "Project 1: reliable RAG application",
+    "kind_hint": "project"
+   },
+   {
+    "id": "project-2-tool-using-agent-with-guardrails",
+    "name": "Project 2: tool-using agent with guardrails",
+    "kind_hint": "project"
+   },
+   {
+    "id": "project-3-production-ai-service",
+    "name": "Project 3: production AI service",
+    "kind_hint": "project"
+   },
+   {
+    "id": "project-4-slm-feasibility-study",
+    "name": "Project 4: SLM feasibility study",
+    "kind_hint": "project"
+   },
+   {
+    "id": "project-5-end-to-end-business-solution",
+    "name": "Project 5: end-to-end business solution",
+    "kind_hint": "project"
+   }
+  ]
  }
 ]

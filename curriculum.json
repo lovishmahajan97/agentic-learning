@@ -7,6 +7,7 @@
    "blurb": "The Python, backend and service skills every later module builds on.",
    "modules": [
     "python-for-ai",
+    "engineering-fundamentals",
     "backend-fundamentals",
     "fastapi-for-ai",
     "node-ts-for-ai"
@@ -17,6 +18,7 @@
    "title": "ML and model foundations",
    "blurb": "How models learn, how transformers work inside, and how they are adapted.",
    "modules": [
+    "math-for-ai",
     "ml-fundamentals",
     "model-internals",
     "training-adaptation"
@@ -80,6 +82,7 @@
    "title": "Practice lab",
    "blurb": "Agent use cases to practise, mini project ideas, small language models and portfolio projects.",
    "modules": [
+    "cumulative-projects",
     "practice-use-cases",
     "mini-project-ideas",
     "slm-for-agents",

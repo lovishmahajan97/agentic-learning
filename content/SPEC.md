@@ -1,4 +1,32 @@
-# Lesson authoring spec (v3: agent-builder framing on the crisp format)
+# Lesson authoring spec (v4: mastery format, on top of v3)
+
+**Why v4.** Reading and passing a quiz is not competence. v4 lessons are built so a learner can show they
+can explain, implement and evaluate the topic independently. v4 applies to high-value lessons and all new
+lessons; others stay v3.
+
+**v4 adds to v3:**
+- front matter: `mastery: understand | implement | evaluate` (the level this lesson should take you to),
+  `prerequisites:` (0-5 lesson keys you must know first; only real gaps, not every related lesson),
+  `code_tested: yes | partial | no` (whether the code examples were actually executed), and for project
+  lessons `milestones:` entries of the form `<module-id>: <milestone title>` placing each milestone after
+  the module that unlocks it. `status: mastery` once both checks pass (`mastery-verified` after review).
+- `## Exercise` (after When to use): a solution-free task of 30-120 minutes. **Goal:**, inputs or
+  constraints, what to deliver, and **Acceptance:** checks the learner can run. At most a starter stub;
+  never the solution.
+- `## Mastery test` (after the Quiz): a NEW problem that requires applying the concept in an unfamiliar
+  situation. **Problem:** then **A strong answer:** as bullets the learner compares against after trying.
+- `## Pitfalls` become failure modes: each bullet gives the symptom, why it happens, how to **Diagnose**
+  it (what to look at, measure or log), and the fix. At least 3 bullets name the diagnosis.
+- Do not make lessons longer: total prose (code excluded) may grow at most 5% versus tag `pre-mastery`;
+  pay for the new sections by cutting repetition, not facts. One strong runnable example beats several
+  superficial ones. Mark version-sensitive tool details with the version they were checked against.
+- Check with `python3 scripts/build.py --check --v4 <file>` and `python3 scripts/compare_lesson.py <file>`.
+
+The v4 exemplar is `content/model-internals/kv-cache.md` (compare with `git show pre-mastery:<path>`).
+
+---
+
+# v3: agent-builder framing on the crisp format
 
 **Who this is for.** The learner is preparing to BUILD AGENTS: LLM apps that plan, call tools, retrieve,
 remember, run in production and get evaluated. Every lesson is written from that seat. General theory

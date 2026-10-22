@@ -3723,6 +3723,120 @@
      "kind_hint": "project"
     }
    ]
+  },
+  {
+   "id": "engineering-fundamentals",
+   "tier": 1,
+   "order": 36,
+   "title": "Engineering fundamentals",
+   "topics": [
+    {
+     "id": "http-from-first-principles",
+     "key": "engineering-fundamentals/http-from-first-principles",
+     "name": "HTTP from first principles (requests, status codes, headers, connections, TLS)"
+    },
+    {
+     "id": "debugging-method",
+     "key": "engineering-fundamentals/debugging-method",
+     "name": "debugging method (reproduce, isolate, hypothesise, verify)"
+    },
+    {
+     "id": "testing-fundamentals",
+     "key": "engineering-fundamentals/testing-fundamentals",
+     "name": "testing fundamentals (what to test, unit vs integration, test doubles, flaky tests)"
+    },
+    {
+     "id": "git-and-code-review-workflow",
+     "key": "engineering-fundamentals/git-and-code-review-workflow",
+     "name": "git and code review workflow (branches, commits, rebasing, reviewing AI code)"
+    },
+    {
+     "id": "reading-errors-logs-and-stack-traces",
+     "key": "engineering-fundamentals/reading-errors-logs-and-stack-traces",
+     "name": "reading errors, logs and stack traces"
+    },
+    {
+     "id": "command-line-and-environment-basics",
+     "key": "engineering-fundamentals/command-line-and-environment-basics",
+     "name": "command line and environment basics (shell, env vars, processes, ports)"
+    }
+   ]
+  },
+  {
+   "id": "math-for-ai",
+   "tier": 1,
+   "order": 37,
+   "title": "Math and statistics for AI",
+   "topics": [
+    {
+     "id": "probability-for-ai-engineers",
+     "key": "math-for-ai/probability-for-ai-engineers",
+     "name": "probability for AI engineers (distributions, conditional probability, Bayes)"
+    },
+    {
+     "id": "statistics-for-evaluation",
+     "key": "math-for-ai/statistics-for-evaluation",
+     "name": "statistics for evaluation (sampling, confidence intervals, significance, sample size)"
+    },
+    {
+     "id": "linear-algebra-intuition",
+     "key": "math-for-ai/linear-algebra-intuition",
+     "name": "linear algebra intuition (vectors, dot products, matrices, norms)"
+    },
+    {
+     "id": "calculus-intuition-for-gradients",
+     "key": "math-for-ai/calculus-intuition-for-gradients",
+     "name": "calculus intuition for gradients (derivatives, chain rule)"
+    },
+    {
+     "id": "information-theory-basics",
+     "key": "math-for-ai/information-theory-basics",
+     "name": "information theory basics (entropy, cross-entropy, KL divergence)"
+    },
+    {
+     "id": "numerical-precision",
+     "key": "math-for-ai/numerical-precision",
+     "name": "numerical precision (floating point, fp16, bf16, overflow)"
+    }
+   ]
+  },
+  {
+   "id": "cumulative-projects",
+   "tier": 1,
+   "order": 38,
+   "title": "Cumulative projects",
+   "topics": [
+    {
+     "id": "project-1-reliable-rag-application",
+     "key": "cumulative-projects/project-1-reliable-rag-application",
+     "name": "Project 1: reliable RAG application",
+     "kind_hint": "project"
+    },
+    {
+     "id": "project-2-tool-using-agent-with-guardrails",
+     "key": "cumulative-projects/project-2-tool-using-agent-with-guardrails",
+     "name": "Project 2: tool-using agent with guardrails",
+     "kind_hint": "project"
+    },
+    {
+     "id": "project-3-production-ai-service",
+     "key": "cumulative-projects/project-3-production-ai-service",
+     "name": "Project 3: production AI service",
+     "kind_hint": "project"
+    },
+    {
+     "id": "project-4-slm-feasibility-study",
+     "key": "cumulative-projects/project-4-slm-feasibility-study",
+     "name": "Project 4: SLM feasibility study",
+     "kind_hint": "project"
+    },
+    {
+     "id": "project-5-end-to-end-business-solution",
+     "key": "cumulative-projects/project-5-end-to-end-business-solution",
+     "name": "Project 5: end-to-end business solution",
+     "kind_hint": "project"
+    }
+   ]
   }
  ]
 }

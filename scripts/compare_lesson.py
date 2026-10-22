@@ -67,9 +67,11 @@ def compare(old_text, new_text):
         return ["new file has no valid front matter"] + e
     if ofm is None:
         return []
-    agentic = str(nfm.get("status", "")).lower().startswith("agentic")
+    nst = str(nfm.get("status", "")).lower()
+    mastery = nst.startswith("mastery")
+    agentic = nst.startswith("agentic") or mastery
     for k in sorted(set(ofm) | set(nfm)):
-        if k == "status" or (agentic and k == "agent_relevance"):
+        if k == "status" or (agentic and k == "agent_relevance") or (mastery and k in ("mastery", "prerequisites", "code_tested", "milestones", "est_minutes")):
             continue
         if ofm.get(k) != nfm.get(k):
             problems.append(f"front matter '{k}' changed: {ofm.get(k)!r} -> {nfm.get(k)!r}")
@@ -95,6 +97,12 @@ def compare(old_text, new_text):
     lost_ic = sorted(x for x in inline_code(old_rest) - new_inline if squash(x) not in new_sq)
     if lost_ic:
         problems.append(f"inline code lost: {', '.join(repr(x) for x in lost_ic[:10])}")
+    if mastery:
+        # The upgrade adds an Exercise and a Mastery test but must not make the lesson longer overall:
+        # prose (code excluded) may grow by at most 5%.
+        ow, nw = len(prose(obody).split()), len(prose(nbody).split())
+        if nw > ow * 1.05:
+            problems.append(f"lesson grew from {ow} to {nw} prose words; trim to at most {int(ow * 1.05)}")
     return problems
 
 
@@ -108,7 +116,9 @@ def main(argv):
                              capture_output=True).returncode == 0
     has_agentic = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "-q", "--verify", "refs/tags/pre-agentic"],
                                  capture_output=True).returncode == 0
-    ref, files, all_mode = ("pre-agentic" if has_agentic else "pre-crisp" if has_tag else "HEAD"), [], False
+    has_mastery = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "-q", "--verify", "refs/tags/pre-mastery"],
+                                 capture_output=True).returncode == 0
+    ref, files, all_mode = ("pre-mastery" if has_mastery else "pre-agentic" if has_agentic else "pre-crisp" if has_tag else "HEAD"), [], False
     i = 0
     while i < len(argv):
         if argv[i] == "--ref":
@@ -121,7 +131,7 @@ def main(argv):
         for p in sorted((ROOT / "content").glob("*/*.md")):
             if p.name.startswith("_"):
                 continue
-            if re.search(r"^status:\s*(crisp|agentic)(-verified)?\s*$", p.read_text(encoding="utf-8")[:2000], re.M):
+            if re.search(r"^status:\s*(crisp|agentic|mastery)(-verified)?\s*$", p.read_text(encoding="utf-8")[:2000], re.M):
                 files.append(str(p.relative_to(ROOT)))
     bad = 0
     for f in files:

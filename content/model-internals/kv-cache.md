@@ -5,8 +5,13 @@ name: KV cache
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: partial
+prerequisites:
+  - model-internals/self-attention
+  - model-internals/context-window
 related:
   - model-internals/self-attention
   - model-internals/grouped-query-attention
@@ -241,15 +246,19 @@ long-running agents need GQA models, FP8 caches or context compaction.
 
 ## Pitfalls
 - **Sizing capacity from weights alone.** Symptom: out-of-memory errors or heavy preemption once traffic
-  has long contexts. Fix: add the cache formula to the capacity model.
+  has long contexts. Diagnose: compare engine KV utilization and preemption counts with the p95 context
+  length. Fix: add the cache formula to the capacity model.
 - **Expecting a faster GPU to speed decode proportionally.** Decode is bandwidth-bound, so tokens/second
-  tracks memory bandwidth more than peak FLOPs. Compare GPUs on bandwidth.
+  tracks memory bandwidth more than peak FLOPs. Diagnose: GPU compute utilization stays low while time per
+  output token is flat. Fix: compare GPUs on bandwidth.
 - **Reusing a cache after editing history.** Cached keys carry their position (RoPE is applied to them)
-  and every entry depends on all earlier content. Any change before position *i* invalidates everything
-  from *i* onward. Symptom: garbled or off-topic output after a history edit. Fix: truncate the cache at
-  the first changed position and re-prefill from there, or rebuild it.
-- **Extrapolating single-request benchmarks.** With batching, every concurrent request's cache competes
-  for the same memory bandwidth. Benchmark at the concurrency you will run.
+  and every entry depends on all earlier content, so any change before position *i* invalidates everything
+  from *i* onward. Symptom: garbled output or no cache hits after a history edit. Diagnose: diff the
+  prompt prefix between steps and find the first changed token. Fix: truncate at that position and
+  re-prefill, or rebuild.
+- **Extrapolating single-request benchmarks.** Every concurrent request's cache competes for the same
+  memory bandwidth. Diagnose: plot time per output token against concurrency. Fix: benchmark at the
+  concurrency you will run.
 
 ## When to use
 Every production inference engine uses a KV cache; your choices are about living within its budget.
@@ -260,8 +269,17 @@ Every production inference engine uses a KV cache; your choices are about living
 - **Measure:** KV-cache utilization, preemption or swap counts, and time per output token as concurrency
   rises. A cache pinned near 100% with climbing preemptions means you are over-admitting, not
   under-provisioned on compute.
-- **Interviews:** derive bytes-per-token and connect it to GQA, PagedAttention and the prefill/decode
-  split; that is the expected depth for an AI engineer.
+
+
+## Exercise
+**Goal:** find the real concurrency limit for an agent workload on a model you can run or read the
+config of. No solution is given.
+- **Inputs:** the model config (layers, KV heads, head dim, dtype) and your workload: prefix length,
+  tokens per step, steps per run.
+- **Deliver:** bytes per token, peak tokens per run, and concurrent runs that fit with 10% headroom,
+  with and without an FP8 cache.
+- **Acceptance:** one row reproduced by hand; if you can run vLLM, observed KV utilization at your
+  predicted concurrency lands within about 15% and you can explain the gap.
 
 ## Role lens
 - **Engineer:** Sets `max_model_len`, batch limits and prefix-caching flags in vLLM or SGLang, and debugs
@@ -304,11 +322,6 @@ answer also notes decode is bandwidth-bound, so higher concurrency raises per-re
 - **So** put stable content (system prompt, tool definitions) first and variable content last, and never
   edit earlier conversation turns if you want cache hits.
 
-### How do MQA, GQA and MLA differ in what they save?
-- **MQA** shares one K/V head across all query heads: the biggest saving, often some quality cost.
-- **GQA** shares each K/V head across a group (for example 8 KV heads instead of 32), a 4x saving.
-- **MLA** caches a compressed latent per token and reconstructs K and V from it.
-
 ### Your agent's latency grows with every step even though each tool result is small. What do you check?
 - **Is the prefix stable?** Timestamps, random IDs or reordered tool schemas at the top of the prompt
   break prefix reuse, so every step re-prefills the whole transcript.
@@ -341,6 +354,15 @@ answer also notes decode is bandwidth-bound, so higher concurrency raises per-re
 > Cache size is proportional to the number of KV heads; GQA shares each K/V head across several query
 > heads, so Llama-3-8B's 8 KV heads need a quarter of the cache of a 32-head layout. Speculative decoding
 > changes compute per step, not cache per token.
+
+## Mastery test
+**Problem:** a research agent moves to a 70B GQA model (80 layers, 8 KV heads, head dim 128, fp16) on
+two 80 GB GPUs. Runs average 40k tokens and product wants 50 concurrent runs. Possible? What changes?
+
+**A strong answer:**
+- computes about 0.3 MB per token, about 13 GB per run and about 650 GB for 50 runs;
+- notes fp16 weights alone take about 140 GB, so two GPUs cannot even hold them;
+- proposes more GPUs, FP8 weights and cache, compaction below 40k, or fewer runs, and what to measure.
 
 ## Use cases & projects
 ### Use cases
