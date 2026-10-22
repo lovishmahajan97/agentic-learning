@@ -140,10 +140,10 @@
             <span class="mod-num">${pad2(m.num)}</span><span class="mod-title">${esc(m.title)}</span>
             <span class="mod-count">${p.done}/${p.total}</span></button>
           <div class="mod-bar"><i style="width:${p.pct}%"></i></div>
-          <ul class="mod-items">${items.map(t => `<li><a href="#t.${m.id}.${t.id}" data-key="${t.key}" class="${t.status !== 'ok' ? 'missing' : ''}"><span class="dot ${topicDot(t)}"></span><span>${esc(t.name)}</span></a></li>`).join('')}</ul></div>`;
+          <ul class="mod-items">${items.map(t => `<li><a href="#t.${m.id}.${t.id}" data-key="${t.key}" class="${t.status !== 'ok' ? 'missing' : ''}"><span class="dot ${topicDot(t)}"></span><span>${esc(t.name)}</span>${t.agent_relevance === 'core' ? '<i class="core-dot" title="Core for agents"></i>' : ''}</a></li>`).join('')}</ul></div>`;
       });
       if (!inner) return;
-      html += `<div class="tier-group"><div class="tier-label stage-label"><span class="stage-n">${stg.n}</span>${esc(stg.title)}</div>${inner}</div>`;
+      html += `<div class="tier-group" style="--st: var(--s${stg.n}); --st2: var(--s${stg.n}b)"><div class="tier-label stage-label"><span class="stage-n">${stg.n}</span>${esc(stg.title)}</div>${inner}</div>`;
     });
     tree.innerHTML = html || '<div class="tree-empty">No lessons match.</div>';
     tree.querySelectorAll('[data-toggle]').forEach(b => b.onclick = () => { const id = b.dataset.toggle; S.open[id] = !S.open[id]; save(); b.closest('.mod').classList.toggle('open', S.open[id]); b.setAttribute('aria-expanded', !!S.open[id]); });
@@ -184,6 +184,9 @@
   });
 
   /* ---------------- views ---------------- */
+  const stv = m => `--st: var(--s${stageOf(m).n}); --st2: var(--s${stageOf(m).n}b)`;
+  const REL = { core: 'Core for agents', useful: 'Useful for agents', background: 'Background' };
+  function pillRel(r) { return r && REL[r] ? `<span class="pill rel rel-${r}">${REL[r]}</span>` : ''; }
   function pillTier(tier) { return `<span class="pill tier-${tier}">Tier ${tier}</span>`; }
   function pillStatus(st) { return st === 'background' ? '<span class="pill">Background reading</span>' : ''; }
 
@@ -197,9 +200,9 @@
     let html = `<div class="page">
       <div class="hero">
         <div class="eyebrow">AI Roles Skills Taxonomy · ${TOTAL} lessons · ${modules.length} modules · ${STAGES.length} stages</div>
-        <h1>Learn the whole map, one reasoned lesson at a time.</h1>
-        <p class="lede">Every item in the taxonomy is a lesson that explains why it exists, how it works, where it breaks, and how each role meets it. Work through the track in order, from Python to customer delivery, and let the review queue bring back what you are about to forget.</p>
-        <ol class="stage-strip">${STAGES.map(s => `<li><a href="#stage-${s.id}"><span class="stage-n">${s.n}</span>${esc(s.title)}</a></li>`).join('')}</ol>
+        <h1>Learn to build AI agents, one reasoned lesson at a time.</h1>
+        <p class="lede">Every lesson is written from the agent builder's seat: why it matters when you build agents, how it works, the tools and production patterns teams use, and the interview questions you will face. Work through the track from Python to customer delivery; lessons tagged <b>Core for agents</b> are the ones to never skip.</p>
+        <ol class="stage-strip">${STAGES.map(s => `<li style="--st: var(--s${s.n}); --st2: var(--s${s.n}b)"><a href="#stage-${s.id}"><span class="stage-n">${s.n}</span>${esc(s.title)}</a></li>`).join('')}</ol>
       </div>
       <div class="stats">
         <div class="stat"><div class="label">Learned</div><div class="value">${learned}<span class="muted" style="font-size:16px;font-weight:400"> / ${ts.length}</span></div><div class="sub">${fmtMin(minutesLeft(ts))} of reading left · at <select id="pace" class="pace">${[1, 2, 3, 5, 8].map(n => `<option value="${n}" ${(S.pace || 3) == n ? 'selected' : ''}>${n}</option>`).join('')}</select>/day, done by <b>${paceDate(ts.length - learned)}</b></div><div class="bar"><i style="width:${ts.length ? 100 * learned / ts.length : 0}%"></i></div></div>
@@ -225,12 +228,12 @@
     STAGES.forEach(stg => {
       const ms = stg.mods;
       const tts = ms.flatMap(m => m.topics); const tl = tts.filter(isLearned).length;
-      html += `<section class="tier-section" id="stage-${stg.id}">
+      html += `<section class="tier-section" id="stage-${stg.id}" style="--st: var(--s${stg.n}); --st2: var(--s${stg.n}b)">
         <div class="tier-head"><div><h2><span class="stage-n big">${stg.n}</span>${esc(stg.title)}</h2><div class="muted" style="margin-top:4px;font-size:14px">${esc(stg.blurb || '')}</div></div>
         <div class="tier-prog"><span>${tl} / ${tts.length} learned</span><div class="bar"><i style="width:${tts.length ? 100 * tl / tts.length : 0}%"></i></div></div></div>
-        <div class="mod-grid">${ms.map(m => { const p = modProgress(m); return `<a class="mod-card" href="#m.${m.id}" style="--tier: var(--t${m.tier})">
+        <div class="mod-grid">${ms.map(m => { const p = modProgress(m); return `<a class="mod-card" href="#m.${m.id}" style="--tier: var(--t${m.tier}); ${stv(m)}">
             <span class="pct">${p.pct}%</span><div class="mod-card-num">Module ${pad2(m.num)}</div><h3>${esc(m.title)}</h3>
-            <div class="meta"><span>${p.total} lessons</span><span>·</span><span>${fmtMin(minutesLeft(m.topics))} left</span></div>
+            <div class="meta"><span>${p.total} lessons</span><span>·</span><span>${fmtMin(minutesLeft(m.topics))} left</span>${m.topics.filter(t => t.agent_relevance === 'core').length ? `<span>·</span><span class="core-count">${m.topics.filter(t => t.agent_relevance === 'core').length} core for agents</span>` : ''}</div>
             <div class="topic-meta">${pillTier(m.tier)}<span class="pill">${ROLE_FOR_TIER[m.tier]}</span></div>
             <div class="bar tier-${m.tier}"><i style="width:${p.pct}%"></i></div></a>`; }).join('')}</div></section>`;
     });
@@ -257,7 +260,7 @@
     const reasons = {}; // suggested-order reasons are not stored separately; order list carries the sequence
     let html = `<div class="page-narrow">
       <div class="crumbs"><a href="#dashboard">Home</a><i>›</i><span>Stage ${stageOf(m).n}: ${esc(stageOf(m).title)}</span><i>›</i><span>Module ${pad2(m.num)}</span></div>
-      <div class="mod-hero" style="--tier: var(--t${m.tier})">
+      <div class="mod-hero band" style="--tier: var(--t${m.tier}); ${stv(m)}">
         <div class="topic-meta">${pillTier(m.tier)}<span class="pill">${ROLE_FOR_TIER[m.tier]}</span><span class="pill">${m.topics.length} lessons</span><span class="pill">${fmtMin(m.topics.reduce((a, t) => a + (t.est_minutes || 12), 0))} total</span></div>
         <h1>${esc(m.title)}</h1>
         <div class="bar tier-${m.tier}"><i style="width:${p.pct}%"></i></div>
@@ -273,7 +276,7 @@
     }
     html += `<section class="section"><h2>Lessons <span class="num">${intro ? 'suggested order' : 'taxonomy order'}</span></h2><ol class="topic-list">${m.ordered.map((t, i) => {
       const ts = topicStatus(t); return `<li><a href="#t.${m.id}.${t.id}" class="${t.status !== 'ok' ? 'missing' : ''}"><span class="n">${String(i + 1).padStart(2, '0')}</span>
-        <span class="name"><span class="dot ${topicDot(t)}"></span>${esc(t.name)}${t.caveat ? '<span class="pill caveat">caveat</span>' : ''}${ts === 'skip' ? '<span class="pill">not on path</span>' : ''}${t.status !== 'ok' ? '<span class="pill">not generated</span>' : ''}</span>
+        <span class="name"><span class="dot ${topicDot(t)}"></span>${esc(t.name)}${pillRel(t.agent_relevance)}${t.caveat ? '<span class="pill caveat">caveat</span>' : ''}${ts === 'skip' ? '<span class="pill">not on path</span>' : ''}${t.status !== 'ok' ? '<span class="pill">not generated</span>' : ''}</span>
         <span class="meta">${t.kind ? `<span class="pill">${esc(t.kind)}</span>` : ''}<span>${t.est_minutes || 12} min</span></span>${intro && intro.order_reasons && intro.order_reasons[t.id] ? `<span class="reason">${mdi(intro.order_reasons[t.id])}</span>` : ''}</a></li>`; }).join('')}</ol></section>`;
     if (intro && intro.capstone) {
       const cs = S.capstone[mid] || {};
@@ -296,8 +299,8 @@
     const nextMod = modules[modules.indexOf(m) + 1];
     const learned = isLearned(t), st = topicStatus(t), rec = reviewRec(key);
     const head = `<div class="crumbs"><a href="#dashboard">Home</a><i>›</i><a href="#m.${m.id}">${esc(m.title)}</a><i>›</i><span>${idx + 1} of ${m.ordered.length}</span></div>
-      <div class="topic-head">
-        <div class="topic-meta">${pillTier(m.tier)}${t.kind ? `<span class="pill">${esc(t.kind)}</span>` : ''}${t.difficulty ? `<span class="pill">${esc(t.difficulty)}</span>` : ''}<span class="pill">${t.est_minutes || 12} min</span>${t.caveat ? `<span class="pill caveat" title="${esc(t.caveat)}">caveated</span>` : ''}${pillStatus(st)}${st === 'skip' ? '<span class="pill">not on your path</span>' : ''}</div>
+      <div class="topic-head band" style="${stv(m)}">
+        <div class="topic-meta">${pillRel(t.agent_relevance)}${pillTier(m.tier)}${t.kind ? `<span class="pill">${esc(t.kind)}</span>` : ''}${t.difficulty ? `<span class="pill">${esc(t.difficulty)}</span>` : ''}<span class="pill">${t.est_minutes || 12} min</span>${t.caveat ? `<span class="pill caveat" title="${esc(t.caveat)}">caveated</span>` : ''}${pillStatus(st)}${st === 'skip' ? '<span class="pill">not on your path</span>' : ''}</div>
         <h1>${esc(t.name)}</h1>
         <div class="topic-actions">
           <button class="btn ${learned ? 'good' : 'primary'}" id="learnBtn">${learned ? '✓ Learned' : 'Mark as learned'}</button>
@@ -325,6 +328,7 @@
       ${t.status === 'invalid' ? `<div class="banner">This lesson failed validation and may be incomplete.<pre style="font-size:12px;white-space:pre-wrap">${esc((t.errors || []).join('\n'))}</pre></div>` : ''}
       ${t.caveat ? `<div class="banner">Caveat: ${esc(t.caveat)}.</div>` : ''}
       <div class="tldr"><div class="eyebrow">In one breath</div><div class="prose">${md(t.tldr)}</div></div>
+      ${t.agent ? `<div class="agent-box"><div class="agent-box-head"><span class="agent-glyph" aria-hidden="true"></span><span>For agent builders</span>${pillRel(t.agent_relevance)}</div><div class="prose">${md(t.agent)}</div></div>` : ''}
       ${secs.map(([id, title, body], i) => `<section class="section" id="s-${id}"><h2><span class="num">${String(i + 1).padStart(2, '0')}</span>${title}</h2>${body.startsWith('<ul') || body.startsWith('<div') ? body : `<div class="prose">${body}</div>`}</section>`).join('')}
       ${related.length ? `<section class="section" id="s-related"><h2><span class="num">${pad2(secs.length + 1)}</span>Related lessons</h2><div class="chips">${related.map(r => `<a class="chip" href="#t.${r.module}.${r.id}"><span class="dot ${topicDot(r)}"></span>${esc(r.name)}<span class="sub">${esc(r.moduleTitle)}</span></a>`).join('')}</div></section>` : ''}
       <section class="section" id="s-check"><h2><span class="num">${pad2(secs.length + 2)}</span>Check yourself</h2>
@@ -531,6 +535,7 @@
   window.addEventListener('hashchange', route);
 
   /* ---------------- boot ---------------- */
+  search.placeholder = `Search ${TOTAL} lessons  ( / )`;
   applyTheme(); buildPathSelect(); renderTree(); route();
   setTimeout(prefetchAll, 800);
 })();
