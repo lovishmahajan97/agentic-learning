@@ -1,5 +1,12 @@
 # Continuing the lesson build (handoff)
 
+## Status 2026-10-22 (update): Practice lab added
+
+- Stage 7 "Practice lab" after Customer delivery: Agent use cases to practice (12), Mini project ideas
+  (15), Small language models for agents (10), Portfolio projects (6). Now 656 lessons, 36 modules.
+- All 656 lessons agentic-verified; 36/36 guides; build ok=656/656; 0 lost data; 692/692 diagrams parse.
+- Diagrams use a custom mermaid theme with fit-to-width and an Expand view.
+
 ## Status 2026-10-22: agent-builder edition complete
 
 - 613 lessons in 32 modules, 6 stages (`curriculum.json`); new modules: Agent frameworks & tooling (18)
