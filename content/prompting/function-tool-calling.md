@@ -5,7 +5,8 @@ name: Function / tool calling
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - prompting/structured-outputs-json-mode
   - prompting/react
@@ -22,9 +23,19 @@ sources:
 ---
 
 ## TL;DR
-Tool calling is a trained protocol: you describe functions with a name, description and JSON schema; the
-model emits a structured call; your code executes it and returns the result. The model never runs
-anything, so execution, permissions and errors are yours.
+Tool calling is the protocol every agent loop runs on: you describe tools with a name, description and
+JSON schema, the model emits a structured call, your code executes it and returns the result. The model
+runs nothing, so execution, permissions and errors are yours.
+
+## For agent builders
+- **Why it matters for agents.** An agent is this round trip in a loop. Selection accuracy, argument
+  validity and how errors flow back decide whether the agent finishes a task or burns its step budget.
+- **Where it shows up in your stack.** `tools`, `tool_choice` and `tool_use` / `tool_result` blocks in
+  the provider API, the tool layer of frameworks, and MCP servers that expose tools to many clients.
+- **What you control.** Tool names and trigger-stating descriptions, strict schemas, the executor
+  (validation, policy, idempotency, approval gates), the step budget, and parallel-call settings.
+- **What you can skip.** How providers fine-tune models to emit calls. Know the wire format, the stop
+  reasons and that the definitions are rendered into the prompt and cost tokens every step.
 
 ## Why it exists
 - **A model can only emit tokens.** From weights alone it has a knowledge cutoff, no access to your
@@ -378,3 +389,23 @@ logged, and tool results are treated as untrusted text.
 - [ ] In the user message, restated on every turn
 > Prompt text can be overridden by injection or jailbreaks. A rule that must hold is enforced where
 > execution happens; the prompt may repeat it so the model explains the refusal gracefully.
+
+## Use cases & projects
+### Use cases
+- **Support and operations agents.** Read tools (orders, accounts) plus gated write tools (refunds,
+  tickets) with policy enforced in the executor.
+- **Coding agents.** File read, search, edit and test-run tools, where argument validation and a step
+  budget keep the loop from thrashing.
+- **Research agents.** Search and fetch tools whose results are untrusted input, so the tool boundary is
+  where injection defences sit.
+- **Internal API wrapping.** Forward-deployed teams expose a customer's APIs as tools or an MCP server,
+  then tune descriptions from mis-selections in traces.
+
+### Mini project
+**A two-tool support agent with a hardened executor (2-3 hours).**
+- **Goal:** build the round trip end to end and measure its three failure classes.
+- **Steps:** implement `get_order` and `issue_refund` over an in-memory store; use the loop and hardened
+  executor above; write 20 test conversations (including a missing id, an over-limit amount and a
+  duplicate request); log every call as a span with name, arguments, `is_error` and latency.
+- **Done when:** no conversation issues two refunds for one order or one above the limit, and a small
+  table reports should-have-called, wrong-tool and wrong-argument rates.

@@ -433,3 +433,25 @@ trigger on a leak.
 > Two high, close losses are under-fitting: the model lacks effective capacity, and dropout removes
 > more. A lower validation loss is a normal artifact of measuring training loss with dropout on, and a
 > rising validation loss is overfitting, the case where dropout helps.
+
+## Use cases & projects
+### Use cases
+- **LoRA fine-tunes on agent traces.** Picking epochs, `lora_dropout` and weight decay so a model learns
+  when to call which tool instead of memorizing the argument values of a few thousand traces.
+- **Checkpoint selection for a tool-calling model.** Shipping the checkpoint with the best held-out task
+  success, not the lowest training loss, because loss keeps falling long after behaviour stops improving.
+- **Debugging non-deterministic self-hosted agents.** An eval path that forgot `model.eval()` keeps
+  dropout on and returns different tool calls for identical prompts at temperature 0.
+- **Small-data classifiers in the agent stack.** Routers and guardrail heads trained on a few hundred
+  labels overfit fast; decay and early stopping keep them usable on new traffic.
+
+### Mini project
+**Find the overfitting point of a tiny agent fine-tune (2-3 hours).**
+- **Goal:** show that the checkpoint with the lowest training loss is not the one with the best agent
+  behaviour on held-out tasks.
+- **Steps:** take a few hundred tool-calling traces (synthetic is fine) and split them by task, not by
+  turn; fine-tune a small open model with LoRA for several epochs, saving a checkpoint per epoch; run
+  each checkpoint in `eval()` mode on the held-out tasks and score tool-name and argument accuracy; then
+  repeat with a higher `lora_dropout` or weight decay.
+- **Done when:** you have a table of train loss, validation loss and held-out tool accuracy per epoch for
+  both settings, and a short note naming the checkpoint you would ship and why.

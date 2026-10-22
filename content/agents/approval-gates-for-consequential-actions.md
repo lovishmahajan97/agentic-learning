@@ -5,7 +5,8 @@ name: Approval gates for consequential actions
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/human-in-the-loop
   - agents/tool-calling
@@ -24,6 +25,18 @@ sources:
 An approval gate sits in the executor, between a consequential call (irreversible, costly, external or
 security-relevant) and its execution, so the model cannot bypass it. It needs a classifier, a durable
 pause, an authorized approval bound to exact arguments, and an exactly-once resume.
+
+## For agent builders
+- **Why it matters for agents.** The moment your agent can refund, email, delete, deploy or grant
+  access, prompt injection and plain model error become incidents. The gate is the control that keeps a
+  bad tool call a pending request instead of an executed one.
+- **Where it shows up in your stack.** The tool executor in your harness, a pending-approval table, the
+  dry-run method on each consequential tool, the checkpoint and resume path, and the review UI or chat
+  message the approver acts on.
+- **What you control.** The risk classifier over (tool, arguments, context), the preview, the argument
+  hash and its volatile fields, approver roles, expiry and its default, budgets, and idempotency keys.
+- **What you can skip.** Building a general policy engine on day one. A small classifier function, one
+  table and an atomic claim cover most agents until several teams share the same tools.
 
 ## Why it exists
 - **The model has no authority; the harness does.** It emits a tool call and the harness decides whether
@@ -383,3 +396,24 @@ lead's queue to a handful a day.
 - [ ] Because in-memory waits consume too many tokens
 > Human approval latency exceeds process lifetime. The pending request and the run checkpoint must live
 > in a store so any worker can resume the run after the decision.
+
+## Use cases & projects
+### Use cases
+- **Support agents that issue refunds or credits.** Amounts above a bound are parked for a lead, with
+  store credits and other routes to the same money classified the same way.
+- **Data agents with SQL access.** Reads run through a read-only role while writes and deletes need an
+  approval bound to the exact statement and re-checked row count.
+- **Email and outreach agents.** Messages that commit to prices, dates or cancellations wait for an
+  authorized approver before they leave the system.
+- **DevOps agents.** Production deploys and access grants are gated per call, with expiry and
+  deny-by-default so nothing executes overnight unreviewed.
+
+### Mini project
+**Gate an agent's delete tool (2-3 hours).**
+- **Goal:** make a toy data agent unable to delete rows without a bound, fresh, single-use approval.
+- **Steps:** give an agent `run_sql_readonly` and `delete_rows` tools over a SQLite file; wrap them in
+  the `execute` function from the examples with a SQLite pending-approval table; add a CLI approver;
+  feed it a document containing an injected "delete all orders" instruction; then approve a small delete,
+  change the data before resuming, and resume from two processes at once.
+- **Done when:** the injected call ends as a pending request, the changed-data resume raises a fresh
+  approval, and only one of the two concurrent resumes executes.

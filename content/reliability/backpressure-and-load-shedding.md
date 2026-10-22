@@ -5,7 +5,8 @@ name: Backpressure & load shedding
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - fastapi-for-ai/backpressure
   - serving-inference/backpressure
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-Overload grows queues until latency beats every timeout and throughput collapses. **Backpressure**
-pushes "slow down" upstream via bounded queues and 429/503; **load shedding** rejects some work early
-and cheaply so the rest meets its budget. Serving everyone means serving no one.
+One agent run fans out into many model and tool calls, so overload arrives fast. **Backpressure**
+pushes "slow down" upstream via bounded queues and 429/503; **load shedding** rejects whole runs early
+and cheaply so admitted runs finish within budget.
+
+## For agent builders
+- **Why it matters for agents.** An agent multiplies load: one user request becomes 10 to 50 model calls,
+  parallel tool calls and retries. Shedding individual steps wastes the tokens already spent on a run, so
+  agents need admission at the run level and honest handling of the provider's 429s.
+- **Where it shows up in your stack.** The provider's 429 and `Retry-After`, SDK `max_retries`, a
+  semaphore or token budget in front of your model client, vLLM's `max_num_seqs` when self-hosting, the
+  workflow engine's per-queue concurrency limits, and fan-out limits on parallel tool calls.
+- **What you control.** Run admission by priority and estimated token cost, the concurrency cap per
+  tenant and per tool, how the loop reacts to 429 (back off, do not retry harder), and cancelling runs
+  whose user left.
+- **What you can skip.** Queueing-theory proofs. Keep Little's law, the M/M/1 shape and
+  `max_queue ≈ service_rate × max_acceptable_wait`; they size every limit you will set.
 
 ## Why it exists
 - **Little's law makes overload arithmetic.** `L = λ × W`: requests inside equal arrival rate times time
@@ -132,6 +146,18 @@ Bronson et al. describe outages where a temporary trigger pushes the system into
 - **Long generations hold their slot for the whole duration,** so a few multi-minute requests can starve
   interactive ones unless they are in a separate pool.
 
+### Agents as load amplifiers
+- **Admit runs, not steps.** A run that is rejected at step 9 of 12 has already spent eight steps of
+  tokens for nothing. Decide at the front door whether the whole run fits the budget, using an estimate
+  of steps and tokens per run type.
+- **Cap fan-out.** Parallel tool calls and sub-agents multiply concurrency inside one run; bound them with
+  a per-run semaphore so one ambitious plan cannot take every slot.
+- **Back off inside the loop.** When the provider returns 429, the agent step waits per `Retry-After`
+  with jitter; immediate retries from hundreds of concurrent runs are the retry storm that sustains a
+  metastable collapse.
+- **Cancel abandoned runs.** If the user closed the tab or the caller's deadline passed, stop the run
+  between steps instead of finishing work nobody will read.
+
 ## Diagram
 The admission path for one request: every rejection happens before the GPU is touched, and the slot is
 released if the client left while queued.
@@ -225,6 +251,44 @@ print(max_queue(50, 2.0))                             # 100
 | 50 | 500 | 10 s | at the limit |
 | 60 | 600 | 12 s | dead on arrival, and its retry adds load |
 
+### Worked scenario: shedding steps versus shedding runs
+An agent averages 12 model calls per run and the provider quota is 600 requests per minute, enough for
+50 runs per minute. A spike brings 80 runs per minute (960 calls). Treat rejections as independent and
+ignore retries, which makes the step-level case optimistic.
+
+| Policy | What happens | Runs completed per minute |
+|---|---|---|
+| Shed individual calls (provider 429s at random) | each call succeeds 600/960 = 62.5% of the time; a run needs all 12 | 80 × 0.625^12 ≈ 0.3 |
+| Admit runs at the door, reject the rest with `Retry-After` | 50 runs admitted and given their 12 calls | 50 |
+
+- **Step-level shedding burns the whole quota on runs that never finish,** which is goodput near zero
+  while the provider dashboard shows full utilisation.
+- **Run-level admission turns the same quota into 50 finished runs** and 30 clean, fast rejections the
+  client can retry later.
+
+```python
+import asyncio
+
+class RunAdmission:
+    """Admit an agent run only if its estimated calls fit the per-minute model-call budget."""
+    def __init__(self, calls_per_min: int):
+        self.budget, self.used = calls_per_min, 0
+
+    def try_admit(self, est_calls: int) -> bool:
+        if self.used + est_calls > self.budget:
+            return False                  # reject the whole run now: 503 with Retry-After
+        self.used += est_calls
+        return True
+
+    async def refill_every_minute(self):
+        while True:
+            await asyncio.sleep(60)
+            self.used = 0
+
+gate = RunAdmission(calls_per_min=600)
+print(sum(gate.try_admit(12) for _ in range(80)))   # 50 runs admitted, 30 rejected up front
+```
+
 ## Production patterns
 - **Semaphore plus wait timeout in front of every model client.** Size in-flight slots from measured
   capacity (for vLLM, the engine's own `max_num_seqs` caps batched sequences) and the queue from
@@ -241,6 +305,12 @@ print(max_queue(50, 2.0))                             # 100
 - **Cancel on disconnect for streams.** Check for client disconnect while generating and abort the
   request in the engine, with a bounded per-connection buffer. Monitor tokens generated for disconnected
   clients.
+- **Run-level admission with a token budget.** Estimate calls and tokens per agent run type, admit runs
+  against the provider quota and your own capacity, and reject the rest before step one. Monitor
+  completed runs per minute (agent goodput) and runs abandoned mid-way.
+- **Per-run fan-out limit.** Bound parallel tool calls and sub-agents per run with a small semaphore,
+  and per-tool concurrency for slow internal APIs. Monitor peak concurrent calls per run and tool queue
+  wait.
 
 ## Trade-offs
 - **Shedding vs queueing.** Shedding sacrifices some requests to keep latency bounded for the rest, which
@@ -256,6 +326,9 @@ print(max_queue(50, 2.0))                             # 100
   fairness; use it only during overload and return to FIFO when the queue drains.
 - **Priority shedding vs honest classification.** It protects the work that matters most, but once every
   team marks its traffic "critical", the mechanism degrades to random drops.
+- **Run-level vs step-level admission.** Admitting whole runs protects goodput but needs a cost estimate
+  that can be wrong for open-ended agents; it flips toward step-level limits plus a per-run step budget
+  when run length varies widely.
 
 ## Pitfalls
 - **Unbounded queues anywhere in the path** (an async job queue, an executor pool, a channel), visible as
@@ -271,6 +344,9 @@ print(max_queue(50, 2.0))                             # 100
   sheds hard or disables retries.
 - **Health checks sharing the shed queue.** Under load the load balancer marks healthy nodes dead and
   removes capacity exactly when it is needed, turning overload into an outage.
+- **Agents that retry 429s inside the loop at full speed.** Hundreds of concurrent runs each retry their
+  failed step immediately; the symptom is the provider's rejection rate climbing while completed runs
+  fall. Fix: honour `Retry-After` with jitter and admit fewer runs.
 
 ## When to use
 - **Every service with finite capacity needs both:** bounded buffers with a defined full behaviour at
@@ -282,6 +358,7 @@ print(max_queue(50, 2.0))                             # 100
 - **Measure** goodput, queue wait percentiles and rejection rate by priority; if rejections never happen,
   the limits are either generous or missing.
 - **Day to day:** the semaphore in front of the model client and the `Retry-After` handling in the SDK.
+- **For agents:** admit at the run level, cap fan-out per run, and measure completed runs, not calls.
 - **Interviews:** derive queue size from Little's law and explain why early rejection raises goodput.
 
 ## Role lens
@@ -332,6 +409,14 @@ else notices.
   below normal before reopening.
 - **Prevent recurrence** with retry budgets, jittered backoff and goodput alerts.
 
+### Your agent platform hits the provider's rate limit at peak and almost no runs finish. How do you fix it?
+- **Diagnose step-level shedding:** 429s land randomly on steps, so most runs fail mid-way after spending
+  tokens; at 62.5% per-call success a 12-call run almost never completes.
+- **Admit whole runs** against the quota with an estimated call count, reject the excess up front with
+  `Retry-After`, and put batch agents in a lower-priority pool.
+- **Stop the storm:** back off on 429 with jitter inside the loop, cap SDK retries, and track completed
+  runs per minute.
+
 ### Why not just autoscale instead of shedding?
 - **Scaling is too slow for GPU services:** a replica takes minutes to pull weights and warm up, while the
   queue grows every second.
@@ -343,6 +428,8 @@ else notices.
   waited, are what users feel.
 - **CPU is meaningless** for GPU-bound work, and throughput stays high during collapse while nearly every
   response arrives after the client gave up.
+- **For agents, goodput is completed runs per minute,** because a run that dies at step 9 spent tokens and
+  delivered nothing.
 
 ## Quiz
 ### Q: Why does adding a larger queue not fix an overloaded service?
@@ -368,3 +455,23 @@ else notices.
 - [ ] Number of open TCP connections
 > Queue wait is what users experience and tracks real capacity regardless of model size or prompt
 > length. CPU is irrelevant for GPU-bound work, and request counts ignore how expensive each request is.
+
+## Use cases & projects
+### Use cases
+- **Agent platforms on a shared provider quota.** Run-level admission turns a fixed requests-per-minute
+  limit into the maximum number of finished runs instead of many half-finished ones.
+- **Self-hosted model servers behind agents.** A semaphore plus queue-wait timeout in front of vLLM keeps
+  interactive agent steps inside their latency budget during batch surges.
+- **Agents with parallel tool calls or sub-agents.** Per-run fan-out limits stop one plan from taking
+  every slot and every internal API connection.
+- **Streaming assistants.** Cancelling generation on disconnect stops spending GPU time on answers no one
+  will read.
+
+### Mini project
+**Load-test an agent with and without run-level admission (2-3 hours).**
+- **Goal:** show that admitting whole runs raises completed agent runs per minute under overload.
+- **Steps:** write a fake provider that allows N calls per minute and returns 429 with `Retry-After`
+  beyond it; run a 12-step fake agent at 1.6× the sustainable run rate, first with no admission control,
+  then with the `RunAdmission` gate and jittered backoff on 429.
+- **Done when:** a table shows calls made, runs completed and tokens wasted on unfinished runs for both
+  policies, and the admitted policy completes close to the sustainable run rate.

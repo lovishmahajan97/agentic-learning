@@ -425,3 +425,24 @@ artefacts.
 > The loss rewards a growing difference, which can be achieved by lowering both responses' probability
 > as long as the rejected one falls faster. Falling chosen log-probability means mass is moving to
 > sequences the loss never sees.
+
+## Use cases & projects
+### Use cases
+- **Shorter agent trajectories.** Pairs where the direct three-step path is chosen and the detour is
+  rejected teach the agent to stop wandering.
+- **Fewer needless clarifying questions.** Pairs with the same history, one answering and one asking an
+  unneeded question, shift the agent toward acting.
+- **Learning from product feedback.** Thumbs-up and thumbs-down on agent answers feed KTO, or become pairs
+  when two answers to the same prompt exist.
+- **Tone and policy alignment.** Expert-labelled pairs move a support agent toward the company's
+  escalation and refusal style without a reward model.
+
+### Mini project
+**Build on-policy DPO pairs from agent rollouts (2-3 hours).**
+- **Goal:** produce a clean preference dataset for one agent behaviour you want to change.
+- **Steps:** pick one behaviour (for example, asking unneeded clarifying questions); sample 4 next steps
+  from your current agent model for 50 shared histories; label the best and worst step with a rubric or a
+  calibrated judge; write conversational prompt, chosen and rejected records; hold out 10 pairs and note
+  the β you would start with.
+- **Done when:** you have a pairs file, a held-out set, a labelling agreement check on 10 pairs, and a
+  short plan for the metrics you would watch, including chosen log-probability.

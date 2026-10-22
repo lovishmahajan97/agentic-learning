@@ -402,3 +402,23 @@ if not, the benchmark number is irrelevant.
 > An end-to-end failure alone does not say whether retrieval, the prompt or the model is at fault.
 > Component evals attribute the drop; they do not replace the end-to-end check, which is what users
 > experience.
+
+## Use cases & projects
+### Use cases
+- **Swapping the model behind an agent.** A paired run of old and new model on the same task set shows
+  whether the cheaper model holds the pass rate, slice by slice, before any traffic moves.
+- **Editing a tool description or system prompt.** Small wording changes shift which tool gets picked;
+  an eval run on every pull request catches the regression before users do.
+- **Debugging a RAG agent that got worse.** Component evals on retrieval and on the answer step say
+  whether the drop came from search, the prompt or the model.
+- **Release sign-off for an agent that takes actions.** A pass rate with its noise band and per-slice
+  results turns "it seems fine" into a ship or block decision stakeholders can audit.
+
+### Mini project
+**Run a paired eval on a small tool-calling agent (2-3 hours).**
+- **Goal:** decide, with evidence, whether a prompt change to a two-tool agent is an improvement or noise.
+- **Steps:** build a tiny agent with two fake tools (for example order lookup and refund); write 30 tasks
+  with an expected final state each; grade final state with code; run the baseline and the changed prompt
+  over the same tasks several times; compute per-task pass rates and the paired difference.
+- **Done when:** you have a table of per-task results for both versions, the overall difference with a
+  rough interval, and a one-paragraph verdict on whether the change should ship.

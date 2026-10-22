@@ -304,8 +304,8 @@ Illustrative token counts for one 20k-token contract that fails validation on ev
 - **In practice** the same hard contracts fail repeatedly, so a few inputs dominate spend; cap retries and
   escalate them.
 - **Per agent run** (illustrative): a run with 10 structured steps at ~1.11 expected calls each makes about
-  11 calls rather than 10, but one stubborn step at three attempts can cost more tokens than all the
-  others together once the transcript is long.
+  11 calls rather than 10. But one stubborn late step at three attempts re-sends the longest transcript
+  three times, so it can cost as much as several early steps combined.
 
 ## Production patterns
 - **Cap retries per agent step with an explicit policy.** For long inputs pass a small integer or a
@@ -466,3 +466,24 @@ human-review path for records that still fail validation.
 - [ ] That every required field is present
 > Types, enums and required fields are expressible in JSON Schema and strict mode enforces them.
 > A cross-field arithmetic rule needs code, which lives in a Pydantic validator that drives the reask.
+
+## Use cases & projects
+### Use cases
+- **Intent routers.** A support agent classifies each message into a `Literal` label and a confidence,
+  then branches to the billing, refund or human-handoff sub-agent on a checked value.
+- **Planner steps.** A planner returns a typed list of next actions whose tool names a validator checks
+  against the live tool registry, so an invented tool triggers a reask instead of a crash.
+- **Document extraction tools.** An invoice or contract agent extracts line items with validators that
+  enforce totals and date order before anything is written to a database.
+- **LLM-as-judge evals.** Judges return a typed verdict with a score and a reason, so eval pipelines
+  aggregate clean rows instead of parsing prose.
+
+### Mini project
+**Typed router and planner for a small agent (2-3 hours).**
+- **Goal:** replace free-text routing and planning in a toy agent with Instructor models and measure how
+  often reasks fire.
+- **Steps:** define a `Route` model with a `Literal` intent and a `Plan` model whose steps name a tool;
+  add a validator that rejects tool names missing from your registry; wrap your SDK client with
+  Instructor and set `max_retries`; run 30 varied user messages and log attempts and tokens per step.
+- **Done when:** every run returns a validated route and plan or a handled failure, and you have a table
+  of reask rate and extra tokens per step with one note on which schema change cut reasks most.

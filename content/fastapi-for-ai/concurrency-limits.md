@@ -439,3 +439,24 @@ max tokens), caching, or routing some traffic to another model.
 - [ ] 8
 > Each worker process has its own semaphore, so the fleet total is workers times per-worker limit.
 > 120 / 8 = 15 per worker; setting 120 each would allow 960 concurrent calls.
+
+## Use cases & projects
+### Use cases
+- **Staying inside a provider quota.** A per-worker semaphore sized from the account's concurrency limit
+  keeps agent traffic from turning into 429 storms.
+- **Parallel tool fan-out.** A per-run cap on `asyncio.gather` tool calls stops one agent run from taking
+  every slot a shared dependency has.
+- **Self-hosted model servers.** A cap matched to what a vLLM server can batch keeps latency usable
+  instead of letting its internal queue grow.
+- **Sync SDKs in async services.** Sizing the thread-pool limiter stops blocking SDK calls from queueing
+  silently behind each other.
+
+### Mini project
+**Cap an agent's model and tool calls (1-2 hours).**
+- **Goal:** keep a fan-out agent within a fixed downstream budget and fail fast when it is full.
+- **Steps:** build a FastAPI agent endpoint whose run makes two fake model calls and fans out three
+  parallel tool calls with `asyncio.gather`; put one `asyncio.Semaphore` per dependency on `app.state`,
+  sized as budget divided by workers; acquire per call, not per run, with a bounded wait that returns 503;
+  load-test with a script sending 100 concurrent runs.
+- **Done when:** a counter shows in-flight calls per dependency never exceed the cap, excess runs get fast
+  503s rather than timeouts, and you can explain the numbers with Little's law.

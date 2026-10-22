@@ -473,3 +473,24 @@ documents as present arriving as null, which only runtime validation catches.
 - [ ] That the else branch is executed at least once in tests
 > After narrowing, x in the final branch should have no remaining type; if a new Literal value is added
 > and not handled, mypy reports an error at the assert_never call.
+
+## Use cases & projects
+### Use cases
+- **Optional model content.** mypy forces a check before `.strip()` on a reply whose content may be
+  `None`, the classic crash after a tool-call-only response.
+- **Typed tool arguments.** `TypedDict` or Pydantic models for tool arguments turn a misspelled key into
+  a type error instead of a silent `KeyError` at runtime.
+- **Exhaustive step handling.** A union of step types with `assert_never` makes adding a new step type
+  fail type checking until the agent loop handles it.
+- **Swappable model clients.** A `Protocol` for the model client lets the fake used in tests and the
+  real SDK wrapper both type-check against one interface.
+
+### Mini project
+**Type-harden an agent loop with mypy (1-2 hours).**
+- **Goal:** make mypy catch the three common agent crashes: `None` content, a wrong tool-argument key,
+  and an unhandled step type.
+- **Steps:** take a small untyped agent loop; add a `Protocol` for the model client, `TypedDict` models
+  for two tools' arguments and a union of step types; run mypy in strict mode on the agent package;
+  stop `Any` from `json.loads` leaking by validating at the boundary; add an `assert_never` branch.
+- **Done when:** mypy passes, and each of three deliberate bugs (removing a `None` check, misspelling an
+  argument key, adding a new step type) produces a mypy error at the right line.

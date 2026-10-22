@@ -385,3 +385,23 @@ more KV memory headroom fix it with no hardware change.
 > In continuous batching, a long prompt entering the batch makes that step expensive and every other
 > stream waits for it; preemption when KV memory is exhausted causes the same signature. Chunked
 > prefill and more memory headroom are the fixes, not network or sampling changes.
+
+## Use cases & projects
+### Use cases
+- **Reasoning-heavy agents.** Every reasoning token costs TPOT, so teams set reasoning or output budgets
+  per step to keep run time predictable.
+- **Model routing inside an agent.** Cheap, fast models handle routing and tool-selection steps; the
+  larger model writes only the final answer.
+- **Streaming final answers.** TPOT sets how fast text appears once it starts; ITL p99 shows the stalls
+  users report as a "frozen" stream.
+- **Self-hosted agent fleets.** Concurrency and quantisation settings trade per-stream TPOT for how many
+  agent sessions one replica can serve.
+
+### Mini project
+**Cut output-token time in an agent loop (1-2 hours).**
+- **Goal:** measure how much of an agent run is spent decoding and reduce it without hurting task success.
+- **Steps:** run a small tool-calling agent on 10 tasks and log output tokens, TTFT and total time per
+  step; compute decode time as total minus TTFT; then tighten `max_tokens` and ask for terse tool calls
+  (or route tool-selection steps to a smaller model) and rerun.
+- **Done when:** you have a before and after table of output tokens and decode time per run, and the
+  task success count is unchanged or any drop is explained.

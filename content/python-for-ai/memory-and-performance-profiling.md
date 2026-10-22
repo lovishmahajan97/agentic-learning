@@ -446,3 +446,24 @@ unbounded (a real leak). Then fix, rerun the same workload, and confirm RSS stay
 - [x] Memory is allocated by native code or the allocator is fragmented, outside what tracemalloc traces
 > tracemalloc sees allocations through Python's allocator. Native libraries using their own allocators,
 > mmaps and fragmentation all raise RSS invisibly to it, which is when a native-aware tool like memray helps.
+
+## Use cases & projects
+### Use cases
+- **"The agent is slow" tickets.** A trace waterfall shows whether time goes to sequential tool calls,
+  model latency or Python work before anyone rewrites code.
+- **OOM-killed agent servers.** `tracemalloc` snapshots or `memray` show whether growth comes from
+  unbounded transcripts, caches or native libraries in a long-lived worker.
+- **Parallelising independent tool calls.** Profiling before and after running independent calls
+  concurrently gives a measured latency win instead of a guess.
+- **Self-hosted embedders and rerankers.** The `torch.cuda` memory APIs show whether a batch size fits on
+  the GPU next to other models.
+
+### Mini project
+**Profile a slow, leaky agent worker (2-3 hours).**
+- **Goal:** find and fix one latency problem and one memory problem in a small agent service.
+- **Steps:** build an agent with three independent fake tools that each sleep, called one after another,
+  and a session store that keeps every transcript forever; time 50 runs; attach `py-spy` to confirm where
+  the worker waits; take `tracemalloc` snapshots before and after 500 sessions and compare top allocations;
+  run the independent tools concurrently and cap or evict session history.
+- **Done when:** you have a before/after table of p50 run latency and process memory, the snapshot diff
+  points at the session store, and memory stays flat after the fix.

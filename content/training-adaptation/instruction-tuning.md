@@ -366,3 +366,23 @@ tend to overfit seen tasks.
 > Whatever is absent from the mixture drifts away. Without reasoning traces in the data the model learns
 > that outputs are short answers, which suppresses the step-by-step behaviour the base model would show
 > when prompted.
+
+## Use cases & projects
+### Use cases
+- **Choosing the right checkpoint.** Agent teams start from the instruct or chat variant because the
+  agent must follow a system prompt and tool descriptions it has never seen.
+- **Extending an instruct model for agents.** A mixture of tool-calling task families with varied
+  schemas keeps zero-shot instruction following while adding agent skills.
+- **Guarding against narrow fine-tunes.** A general replay slice in the mixture stops an agent model from
+  forgetting how to handle requests outside its traces.
+- **Testing generalisation to new tools.** Held-out task families show whether the agent will cope when
+  a new tool is added next week.
+
+### Mini project
+**Test zero-shot generalisation to unseen tools (1-2 hours).**
+- **Goal:** measure whether an instruct model follows tool descriptions it was never tuned on.
+- **Steps:** write 5 tool schemas the model is unlikely to have seen; phrase 4 requests per tool in
+  different styles; run a base and an instruct checkpoint of the same model with the same prompt; score
+  whether each output picks the right tool and produces arguments that validate against the schema.
+- **Done when:** you have a table of tool choice accuracy and schema-valid rate per checkpoint and per
+  phrasing, plus a note on which phrasings broke each model.

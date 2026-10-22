@@ -492,3 +492,25 @@ cheap. Also budget memory for one model copy per worker.
 > Code after `yield` never runs when startup fails before reaching it. An exit stack unwinds only what
 > was actually acquired, in reverse order, on both failure and normal shutdown; on_event handlers are
 > ignored when lifespan is set.
+
+## Use cases & projects
+### Use cases
+- **Booting an agent server.** Provider clients, tool API clients, the checkpointer pool and the compiled
+  agent are built once per worker before traffic arrives.
+- **Failing deploys on bad config.** A missing provider key or an invalid tool schema stops startup, so
+  the rollout halts instead of the first user hitting an error.
+- **Connecting to tool servers.** Long-lived sessions to tool servers, such as MCP clients, open at
+  startup and close cleanly at shutdown.
+- **Graceful shutdown during a deploy.** Shutdown code drains or checkpoints in-flight runs so a rolling
+  restart does not lose agent progress.
+
+### Mini project
+**Build a fail-fast agent server boot (1-2 hours).**
+- **Goal:** a lifespan that builds every agent dependency once, refuses to start on bad config and
+  releases everything on exit.
+- **Steps:** in `FastAPI(lifespan=...)`, use an `AsyncExitStack` to open an `httpx.AsyncClient`, a fake
+  checkpoint store and a tool registry whose schemas you validate; store them on `app.state`; add a
+  readiness route; start once with valid config, once with a missing API key and once with a broken tool
+  schema.
+- **Done when:** the bad-config starts exit with a clear error before serving, the good start logs each
+  resource opened once per worker, and shutdown logs each one closed in reverse order.

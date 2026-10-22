@@ -409,3 +409,22 @@ would move volatile data after the last breakpoint and watch the read counter ri
 - [ ] It limits the number of tool calls per turn
 > Requiring an output ceiling makes cost and latency bounds explicit. When the model hits it, the response
 > is incomplete, so treating that stop reason as success produces cut-off answers and broken JSON.
+
+## Use cases & projects
+### Use cases
+- **Claude tool-calling agents.** The loop runs on `stop_reason`: on `tool_use`, echo the assistant blocks,
+  run every tool and return all results in one user message.
+- **Long agent sessions at lower cost.** `cache_control` on a stable tools-then-system prefix keeps later
+  steps cheap when history is append-only.
+- **Batch agent evals.** Message batches run many eval prompts without blocking an interactive budget.
+- **Cloud-hosted Claude.** The same SDK reaches Claude on Bedrock, Vertex AI or Microsoft Foundry through
+  its platform clients.
+
+### Mini project
+**Build a cached Claude agent loop (2-3 hours).**
+- **Goal:** a Claude agent with two tools whose later steps reuse the prompt cache.
+- **Steps:** define two tools; write the `stop_reason` loop, handling `tool_use`, `end_turn` and
+  `max_tokens`; put `cache_control` on the end of the system prompt; keep history append-only; run a
+  10-step task and log input, cache-read and output tokens per step from `usage`.
+- **Done when:** the loop handles parallel tool calls, treats `max_tokens` as truncation, and your log
+  shows cache reads climbing after step 1.

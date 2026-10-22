@@ -400,3 +400,24 @@ first principles alone.
 - [ ] CPU offloading half the layers to free memory for a larger batch
 > Replicas double throughput with no communication overhead and keep latency unchanged. TP would lower
 > per-token latency but spends bandwidth and time on all-reduces, so throughput per GPU is lower.
+
+## Use cases & projects
+### Use cases
+- **Self-hosting a 70B-class agent model.** TP inside one NVLink node is how the model fits at all and
+  how each agent step stays fast enough for interactive use.
+- **Latency-bound agent loops.** When a run is 15 sequential calls, cutting TPOT with a higher TP degree
+  shortens the whole run, which replicas cannot do.
+- **Throughput versus latency planning.** Choosing TP = 2 with two replicas or TP = 4 with one decides
+  whether you serve more parallel agents or faster individual ones.
+- **Debugging slow endpoints.** A TP group spanning a PCIe-only link or two nodes explains a TPOT far worse
+  than the GPU count suggests.
+
+### Mini project
+**Compare TP degree against replicas for an agent run (2-3 hours, needs a multi-GPU node).**
+- **Goal:** measure how tensor parallelism changes end-to-end agent run time versus how replicas change
+  runs per minute.
+- **Steps:** serve one model with `--tensor-parallel-size` 1 and 2 (or 2 and 4); run the same 10-step
+  scripted agent loop against each and record TPOT and total run time; then run 8 agents concurrently
+  against each setup; check the GPU topology with `nvidia-smi topo -m` before you start.
+- **Done when:** you have a table of TPOT, single-run time and runs per minute per setup, and a one-line
+  recommendation for an interactive agent versus a batch agent workload.

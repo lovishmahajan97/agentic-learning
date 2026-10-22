@@ -5,7 +5,8 @@ name: Dependency injection
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - node-ts-for-ai/vitest-jest-and-integration-testing
   - node-ts-for-ai/typescript-strict-mode-and-advanced-types
@@ -20,44 +21,57 @@ sources:
 ---
 
 ## TL;DR
-A module receives its collaborators (LLM client, database pool, cache, clock, config) from the caller
-instead of constructing them. In TypeScript a typed `Deps` object and one composition root make AI
-services testable offline, per-tenant and provider-swappable, with no framework.
+An agent loop should receive its model client, tools, memory store, clock and config from the caller
+instead of constructing them. A typed `Deps` object and one composition root let you test agents offline
+with scripted models, swap providers and isolate tenants.
+
+## For agent builders
+- **Why it matters for agents.** An agent is a loop of model calls and tool calls, all slow, paid,
+  non-deterministic and credentialed. Injecting the model and the tool registry is what lets you replay a
+  20-step run deterministically in CI with a scripted fake model instead of paying for real calls.
+- **Where it shows up in your stack.** The `LLM` interface your loop calls, the tool registry handed to
+  the loop, per-tenant credentials for tools, and the decorators (cache, fallback, breaker) wrapped around
+  the model at the root. Frameworks like the Vercel AI SDK take the model as a parameter for the same reason.
+- **What you control.** Which capabilities the loop sees (a narrow `LLM` and `Tool` shape, not vendor
+  types), where credentials live (only the root), and which objects are request-scoped (tenant, trace,
+  remaining token budget).
+- **What you can skip.** Deep container theory. A hand-written root plus a `Deps` type covers most agent
+  services; learn NestJS or Awilix scopes only if your team already uses them.
 
 ## Why it exists
-- **AI handlers are glue around external calls.** A typical handler does five things: load a tenant's
-  config, fetch context from Postgres and a vector store, call an LLM through an SDK client, write the
-  result plus usage numbers, and emit a trace. Those calls are expensive, non-deterministic and
-  credentialed.
+- **Agent handlers are glue around external calls.** A typical agent step does five things: load a
+  tenant's config, fetch context from Postgres and a vector store, call an LLM through an SDK client,
+  write the result plus usage numbers, and emit a trace. Those calls are expensive, non-deterministic and
+  credentialed, and an agent repeats them every step.
 - **The obvious wiring hurts by day ten.** `import { openai } from './clients'`, where `clients.ts` does
   `export const openai = new OpenAI()`, works on day one. Then tests either call the real API (slow,
   paid, flaky, secrets in CI) or use module mocking (`vi.mock('./clients')`), which couples tests to
   file paths and silently diverges from the real wiring.
 - **Singletons cannot vary.** An enterprise customer wants an Azure endpoint with their own key, but a
   module-level singleton has exactly one key. "Use Anthropic when OpenAI keeps returning 429 or 5xx"
-  cannot be expressed when the dependency is a fixed import. The singleton is also built at import
-  time, before config is validated or the process knows it is a server, worker or script, so startup
-  order becomes accidental.
-- **The naive fix is global mutable state.** "Export a `setClient()` setter" lets concurrent requests
-  from different tenants race on it.
-- **DI makes the dependency an explicit parameter.** It is decided once at the edge of the program, so
-  core logic is pure with respect to its collaborators. The key word is *explicit*: a function's
-  signature tells you everything it touches.
+  cannot be expressed when the dependency is a fixed import.
+- **Import-time construction makes startup order accidental.** The singleton is built at import time,
+  before config is validated or the process knows it is a server, worker or script.
+- **The naive fix is global mutable state.** "Export a `setClient()` setter" lets concurrent agent runs
+  from different tenants race on it. DI instead makes the dependency an explicit parameter, decided once
+  at the edge of the program, so a function's signature tells you everything it touches.
 
 ## How it works
 ### The shape of the pattern
 1. **Define the dependency by capability, not library.** An interface
-   `LLM { complete(req): Promise<Completion> }` is far narrower than the OpenAI SDK's surface. The
-   handler depends on it *because* then a fake, a caching wrapper or another vendor can satisfy it.
+   `LLM { complete(req): Promise<Completion> }` is far narrower than the OpenAI SDK's surface. The agent
+   loop depends on it *because* then a scripted fake, a caching wrapper or another vendor can satisfy it.
    Structural typing means no `implements` keyword is required: any object with the right shape works.
 2. **Inject through the constructor or a factory argument.** `createChatService({ llm, db, clock })` or
    `class ChatService { constructor(private deps: Deps) {} }`. Setter and field injection are avoided
    *because* an object that can exist half-wired is a bug waiting for a code path.
-3. **Compose at one root.** A `main.ts` (or `createApp()`) reads env, constructs the pool, the Redis
+3. **Inject tools the same way.** The loop takes a registry of tools (name, schema, `run`), so a test can
+   hand it fakes and a tenant can get a smaller tool set without code changes.
+4. **Compose at one root.** A `main.ts` (or `createApp()`) reads env, constructs the pool, the Redis
    client and the SDK client, then the services, then the HTTP routes. All `new` calls for
    infrastructure live here and nowhere else.
-4. **Let the root own lifecycle.** It starts things in dependency order and shuts them down in reverse.
-5. **Tests build a different graph.** `createChatService({ llm: fakeLLM, db: testDb, clock: fixed })`.
+5. **Let the root own lifecycle.** It starts things in dependency order and shuts them down in reverse.
+6. **Tests build a different graph.** `createChatService({ llm: fakeLLM, db: testDb, clock: fixed })`.
    No module mocks, no monkey-patching, no environment variables.
 
 ### Composing behaviour at the root
@@ -77,15 +91,15 @@ llm = withCache(redis,                       // outermost: a hit skips everythin
 | Breaker | wraps exactly one provider | its state describes that provider's health |
 | Vendor SDK retries | innermost | a fallback is taken only after a provider has genuinely failed |
 
-- **The handler sees none of it.** It still calls `llm.complete()`.
+- **The agent loop sees none of it.** It still calls `llm.complete()`.
 - **Tests can prove the fallback.** Wire the same stack around a fake that fails on demand.
-- **Without injection** each of these behaviours ends up as an `if` inside business logic.
+- **Without injection** each of these behaviours ends up as an `if` inside the loop.
 
 ### Scopes
 | Scope | Examples | Why |
 |---|---|---|
 | Singleton | pool, Redis, SDK client | expensive to construct and they own sockets |
-| Request | tenant id, trace context, remaining budget, per-tenant model routing | built per request from singletons plus the request |
+| Request (one agent run) | tenant id, trace context, remaining budget, per-tenant model routing, tool credentials | built per run from singletons plus the request |
 
 - **Request context in Node.** Create a `RequestContext` in middleware and pass it down, or use
   `AsyncLocalStorage` for ambient values such as the trace id.
@@ -94,8 +108,9 @@ llm = withCache(redis,                       // outermost: a hit skips everythin
   dependencies recreate the testability problem DI solves.
 - **Containers differ on scope mismatches.** NestJS "bubbles" request scope up the chain: a provider
   that injects a request-scoped one silently becomes request-scoped itself (correct, but rebuilt on
-  every request). A hand-wired root, or a container without that rule, lets a singleton capture the
-  first request's object and keep it.
+  every request).
+- **A hand-wired root has no such rule.** Neither does a container without it, so a singleton can
+  capture the first request's object and keep it.
 
 ### Containers and decorators
 - **NestJS** uses class decorators (`@Injectable()`) and constructor parameter types, resolved through
@@ -113,13 +128,14 @@ llm = withCache(redis,                       // outermost: a hit skips everythin
   request scopes, a container pays for itself.
 
 ### What it is not
-- **Not "make everything an interface".** Pure functions and value types are not injected.
-- **Inject what is slow, stateful, non-deterministic or credentialed:** network clients, databases,
-  caches, clocks, randomness, the file system.
+- **Not "make everything an interface".** Pure functions and value types (a prompt formatter, a tool
+  argument parser) are not injected.
+- **Inject what is slow, stateful, non-deterministic or credentialed:** model clients, tool backends,
+  databases, caches, clocks, randomness, the file system.
 
 ## Diagram
-Only the composition root knows vendors and env; services see interfaces, requests add scoped context,
-and tests build a different graph around the same service.
+Only the composition root knows vendors and env; the agent loop sees interfaces, each run adds scoped
+context, and tests build a different graph around the same loop.
 
 ```mermaid
 flowchart TD
@@ -128,15 +144,57 @@ flowchart TD
     ROOT --> SDK["Vendor SDK clients"]
     SDK --> AD["LLM adapters"]
     AD --> DEC["Cache, fallback, breaker wrappers"]
-    DEC -->|"LLM interface"| SVC["ChatService(Deps)"]
+    DEC -->|"LLM interface"| SVC["Agent loop (Deps)"]
+    ROOT -->|"tool registry"| SVC
     POOL -->|"db interface"| SVC
     MW["Request middleware"] -->|"tenant, trace"| CTX["RequestContext"]
     CTX --> SVC
-    SVC --> R["HTTP routes"]
-    T["Unit test"] -.->|"fake LLM, fixed clock"| SVC
+    T["Unit test"] -.->|"scripted LLM, fake tools"| SVC
 ```
 
 ## Examples
+### Agent scenario: a tool-calling loop tested with a scripted model
+The loop takes the model and the tools as parameters. The test scripts the model's two turns (call a
+tool, then answer), so the whole run is deterministic, free and offline.
+
+```ts
+// agent.ts — depends only on capabilities
+type ToolCall = { name: string; args: unknown };
+type Turn = { text?: string; toolCalls: ToolCall[]; inputTokens: number; outputTokens: number };
+export interface AgentLLM { next(messages: unknown[]): Promise<Turn> }
+export interface Tool { name: string; run(args: unknown): Promise<string> }
+export interface AgentDeps { llm: AgentLLM; tools: Map<string, Tool>; now: () => Date; maxSteps: number }
+
+export async function runAgent({ llm, tools, now, maxSteps }: AgentDeps, task: string) {
+  const messages: unknown[] = [{ role: "system", content: `Today is ${now().toISOString()}` }, { role: "user", content: task }];
+  for (let step = 0; step < maxSteps; step++) {
+    const turn = await llm.next(messages);
+    if (turn.toolCalls.length === 0) return { answer: turn.text ?? "", steps: step + 1 };
+    for (const c of turn.toolCalls) {
+      const tool = tools.get(c.name);
+      const result = tool ? await tool.run(c.args) : `unknown tool ${c.name}`;
+      messages.push({ role: "tool", name: c.name, content: result });
+    }
+  }
+  throw new Error("step budget exhausted");
+}
+
+// agent.test.ts — scripted model, fake tool, fixed clock
+const script: Turn[] = [
+  { toolCalls: [{ name: "lookup_order", args: { id: "A1" } }], inputTokens: 120, outputTokens: 12 },
+  { text: "Order A1 shipped.", toolCalls: [], inputTokens: 160, outputTokens: 6 },
+];
+const seen: unknown[] = [];
+const deps: AgentDeps = {
+  llm: { next: async () => script.shift()! },
+  tools: new Map([["lookup_order", { name: "lookup_order", run: async (a) => { seen.push(a); return "shipped" } }]]),
+  now: () => new Date("2026-01-01T00:00:00Z"),
+  maxSteps: 5,
+};
+// expect(await runAgent(deps, "where is A1?")).toEqual({ answer: "Order A1 shipped.", steps: 2 });
+// expect(seen).toEqual([{ id: "A1" }]);
+```
+
 ### Interface, service, root and test
 Three files compressed into one listing: a capability interface, a service that depends only on it, the
 composition root that knows about vendors, and a test that swaps in a fake. The service never imports a
@@ -184,10 +242,11 @@ const svc = createChatService({
 ```
 
 ### A fallback decorator and the test that proves it
-The decorator satisfies `LLM`, so the service cannot tell it apart from a single provider. Only
-rate limits and server errors fall back; a 400 is the caller's bug and must surface. SDK connection
-errors and timeouts carry no `.status`, so this predicate does not fall back on them; extend it if an
-unreachable provider should also trigger the secondary.
+The decorator satisfies `LLM`, so the agent cannot tell it apart from a single provider. Only rate limits
+and server errors fall back; a 400 is the caller's bug and must surface.
+
+- **Caveat on network errors.** SDK connection errors and timeouts carry no `.status`, so this predicate
+  does not fall back on them; extend it if an unreachable provider should also trigger the secondary.
 
 ```ts
 // with-fallback.ts — composes two LLMs behind one interface
@@ -220,18 +279,24 @@ const req = { system: "", user: "hi", maxTokens: 16 };
 // await expect(withFallback(badRequest, backup).complete(req)).rejects.toThrow("bad");
 ```
 
-### Worked scenario: one enterprise tenant needs Azure
+### Worked scenario: one enterprise tenant needs Azure for its agent
 The same change request, with and without injection.
 
 | Step | Module singleton | Injected `LLM` |
 |---|---|---|
-| Add Azure endpoint and key for tenant `acme` | a second global client plus an `if (tenant === "acme")` in the handler | a new adapter built in the root |
+| Add Azure endpoint and key for tenant `acme` | a second global client plus an `if (tenant === "acme")` in the agent loop | a new adapter built in the root |
 | Route per tenant | branch inside business logic | a router chosen from tenant config at request time |
 | Test the routing | mock `./clients` by path, hope it matches real wiring | pass two fakes, assert which one was called |
 | Add Anthropic fallback | another `try/catch` in every handler | wrap adapters with `withFallback` once |
 | Files touched in business code | every handler that calls the LLM | none |
 
 ## Production patterns
+- **Record-and-replay agent tests.** Capture a real run's model turns once, then replay them through a
+  scripted `AgentLLM` in CI so loop logic, tool dispatch and step limits are tested on every commit.
+  Monitor how often recordings go stale after prompt or tool-schema changes.
+- **Per-run tool registry.** Build the tool map per agent run from tenant config and permissions, so one
+  tenant's agent cannot see another's tools or credentials. Monitor tools exposed per run and denied
+  tool calls.
 - **Validate config before building the graph.** When the root starts, parse env with a schema (for
   example zod) before constructing any client, so a missing key fails boot with a clear message
   instead of on the first request. Monitor boot failures in deploys.
@@ -241,12 +306,10 @@ The same change request, with and without injection.
 - **One contract suite for fakes and real adapters.** Run the same interface tests against the fake on
   every commit and against the real SDK (sandbox key or recorded responses) nightly, so the fake cannot
   drift. Monitor the nightly job; a red run means the fake lies.
-- **Reverse-order shutdown from the root.** The root keeps a list of disposers registered as it builds
-  the graph; on `SIGTERM` it closes the HTTP server, then workers, then `pool.end()` and the Redis
-  client. Monitor shutdown duration against the orchestrator's grace period.
-- **Ban infrastructure imports outside the root.** An ESLint `no-restricted-imports` rule that
-  forbids `openai`, `@anthropic-ai/sdk` and `pg` in service folders keeps the seam honest. Monitor CI
-  lint failures.
+- **Reverse-order shutdown and import bans.** The root keeps disposers; on `SIGTERM` it closes the HTTP
+  server, then workers, then `pool.end()` and the Redis client. An ESLint `no-restricted-imports` rule
+  that forbids `openai`, `@anthropic-ai/sdk` and `pg` in service folders keeps the seam honest. Monitor
+  shutdown duration and CI lint failures.
 
 ## Trade-offs
 - **Explicit wiring vs boilerplate.** Every dependency is visible and testable, but signatures and the
@@ -257,11 +320,11 @@ The same change request, with and without injection.
   dependency" errors from the compiler to boot time. In small services and libraries the trade flips
   back to manual wiring.
 - **Narrow interfaces vs vendor features.** You can swap vendors and wrap caching or retry decorators
-  around them, but every vendor feature you need (tool calls, streaming, prompt caching) must be
+  around them, but every vendor feature your agent needs (tool calls, streaming, prompt caching) must be
   surfaced through the interface, so over-abstracting early costs real functionality.
-- **Fakes vs realism.** Fakes in unit tests are fast and deterministic, but only prove the service calls
-  the interface correctly; a thin layer of integration tests against the real SDK (recorded or
-  sandboxed) is still needed or the fake drifts from reality.
+- **Fakes vs realism.** Scripted fakes make agent tests fast and deterministic, but only prove the loop
+  calls the interface correctly; a thin layer of integration tests against the real SDK (recorded or
+  sandboxed) is still needed or the fake drifts from how real models emit tool calls.
 
 ## Pitfalls
 - **Module-level singletons created at import time** (`export const openai = new OpenAI()`). Symptom:
@@ -270,26 +333,27 @@ The same change request, with and without injection.
 - **Service locator in disguise.** Passing one giant `container` object and calling
   `container.get('llm')` inside business logic. Symptom: a signature no longer tells you what a
   function touches, and every test must build the whole container.
-- **Mixing scopes.** Injecting a request-scoped object (tenant config, trace span) into a singleton.
-  Symptom: one tenant's model or API key leaking into another tenant's request under concurrency.
+- **Mixing scopes.** Injecting a request-scoped object (tenant config, trace span, tool credentials) into
+  a singleton. Symptom: one tenant's model, API key or tool token leaking into another tenant's agent run
+  under concurrency.
 - **Mocking by file path** (`vi.mock('../clients')`) instead of injecting. Symptom: tests that break
   when files move, and mocks that stay green after the real wiring changed.
 - **Leaky capability interfaces** that return vendor types (`OpenAI.ChatCompletion`,
   `Anthropic.Message`). Symptom: fakes must construct vendor objects, and adding a second provider
-  still forces edits in business code. Fix: return your own small result type.
+  still forces edits in the agent loop. Fix: return your own small result type, including tool calls.
 - **Circular dependencies between services.** Some containers paper over them with lazy proxies
   (NestJS `forwardRef`); hand-wiring cannot construct them at all. Symptom: `undefined` at runtime or a
   NestJS circular-dependency boot error. Fix: usually split an interface.
 
 ## When to use
-- **Use when:** a service talks to an LLM, a database or a queue, which is nearly all AI backend code.
-  Ask "would I want to replace this in a test or per tenant?" If yes, inject it.
+- **Use when:** an agent talks to an LLM, a tool backend, a database or a queue, which is nearly all agent
+  code. Ask "would I want to replace this in a test or per tenant?" If yes, inject it.
 - **Avoid when:** it is a pure function or value type; injecting it only adds indirection.
 - **Start simple:** a hand-written composition root and a `Deps` type. Move to a container when
   request-scoped lifetimes and the number of services make the root hard to read, or when the team has
   standardised on NestJS.
-- **Measure:** unit tests run with no network and no env vars, and adding a second LLM provider touches
-  only the root.
+- **Measure:** unit tests run with no network and no env vars, a full agent run replays offline, and
+  adding a second LLM provider touches only the root.
 - **Interviews:** explain why module singletons break tests and multi-tenancy, how interface erasure
   affects containers, and where request scope lives.
 
@@ -313,14 +377,22 @@ request-scoped, and the fallback policy is a decorator around the interface, whi
 circuit-breaker logic out of the handler.
 
 ## Interview questions
-### What is dependency injection, and why does it matter more in AI services than in CRUD apps?
+### What is dependency injection, and why does it matter more in agent services than in CRUD apps?
 - **Definition:** a unit receives its collaborators as parameters instead of importing or constructing
   them, and one composition root builds the real graph.
-- **Why AI makes it urgent:** most of the work is slow, paid, non-deterministic, credentialed calls.
-  Hard-wired clients mean tests hit the network, tenants cannot get their own endpoint, and provider
-  fallback needs a rewrite.
+- **Why agents make it urgent:** most of the work is slow, paid, non-deterministic, credentialed calls,
+  repeated every step. Hard-wired clients mean tests hit the network, tenants cannot get their own
+  endpoint, and provider fallback needs a rewrite.
 
-### Tests pass locally but one tenant's requests occasionally use another tenant's model. How do you debug it?
+### How would you test a 15-step tool-calling agent deterministically in CI?
+- **Inject the model and tools:** the loop takes an `AgentLLM` and a tool registry, so a test passes a
+  scripted model that returns recorded turns and fake tools that return fixed results.
+- **Assert on behaviour:** which tools were called with which arguments, the step count, and that the
+  step budget stops a looping script.
+- **Keep it honest:** re-record turns from the real model when prompts or tool schemas change, and run a
+  small nightly suite against the real provider.
+
+### Tests pass locally but one tenant's agent runs occasionally use another tenant's model. How do you debug it?
 - **Suspect a scope mismatch first:** a request-scoped object (tenant config, API key, span) captured
   by a singleton at first use, which only shows up under concurrency.
 - **Confirm:** log tenant id alongside the adapter or config identity per request, and replay two
@@ -370,3 +442,25 @@ circuit-breaker logic out of the handler.
 - [x] Under concurrent traffic, one tenant's model routing or API key is used for another tenant's request
 - [ ] The container refuses to start and logs a circular-dependency error
 > A singleton is constructed once and shared, so it captures whichever request-scoped object it was first given; later requests from other tenants reuse that state, a correctness and security failure that only appears under concurrency. (NestJS avoids this by making the consumer request-scoped too, which trades the leak for per-request construction.)
+
+## Use cases & projects
+### Use cases
+- **Offline agent regression tests.** A scripted model and fake tools let CI replay full agent runs on
+  every commit without API keys or spend.
+- **Bring-your-own-model tenants.** Enterprise customers point the same agent at their Azure or on-prem
+  endpoint through a per-tenant adapter built at the root.
+- **Provider fallback for agent loops.** A fallback decorator moves an agent to a second provider on 429
+  or 5xx without any change to the loop.
+- **Per-tenant tool permissions.** The registry handed to each run decides which tools and credentials an
+  agent can use.
+
+### Mini project
+**Make an agent loop fully injectable (1-2 hours).**
+- **Goal:** refactor a small tool-calling agent so every model, tool and clock dependency is injected,
+  then test it offline.
+- **Steps:** define `AgentLLM`, `Tool` and `AgentDeps`; write `runAgent(deps, task)`; build a composition
+  root that wires a real provider and two real tools; write tests with a scripted model covering a
+  two-step success, an unknown tool name and an exhausted step budget; wrap the real model in a
+  `withFallback` decorator.
+- **Done when:** the tests pass with no network and no env vars, and swapping the provider changes only
+  the root file.

@@ -485,3 +485,25 @@ HTTP status, so dashboards reflect mid-stream failures.
 - [ ] @app.exception_handler(404) is impossible; 404s cannot be customised
 > Routing raises Starlette's HTTPException, and FastAPI's is a subclass of it. Registering for the
 > Starlette base class covers both, while registering only the subclass misses router-generated errors.
+
+## Use cases & projects
+### Use cases
+- **Agent APIs with a stable error contract.** `POST /runs` returns one envelope with a `retryable` flag,
+  so UIs and SDKs know when to retry and when to show the user a fix.
+- **Tool servers built for models.** Clear statuses and short, safe messages let an agent recover from a
+  bad argument instead of looping on a bare 500.
+- **Provider failure mapping.** A wrapper turns provider 429s, timeouts and outages into 503 or 504
+  responses with no leaked hostnames or prompt fragments.
+- **Executors that keep runs alive.** Recoverable tool failures become observations for the model, while
+  auth and budget failures end the run cleanly.
+
+### Mini project
+**One error contract from tool server to agent (1-2 hours).**
+- **Goal:** every failure in a small agent stack reaches the client or the model in one safe, predictable
+  shape.
+- **Steps:** build a FastAPI tool server with a domain exception hierarchy and a single handler that emits
+  Problem Details with `retryable`; register the handler for Starlette's `HTTPException`; wrap a fake LLM
+  client that raises provider errors; have the agent executor turn tool errors into observations.
+- **Done when:** tests cover a routing 404, a validation error, a provider 429 and an unexpected crash,
+  all in the same envelope, none leaking internals, and a trace shows the model retrying after a
+  retryable tool error.

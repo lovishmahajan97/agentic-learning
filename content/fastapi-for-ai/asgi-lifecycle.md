@@ -455,3 +455,25 @@ forwards the client close upstream, and race long provider calls against the dis
 - [ ] Twice: once at bind time and once at first request
 > Each worker is a separate process with its own event loop and app instance, so a model loaded in
 > lifespan is loaded four times and occupies four times the memory.
+
+## Use cases & projects
+### Use cases
+- **Streaming agent step events to a chat UI.** SSE over `StreamingResponse` sends "thinking", tool-call
+  and token events as they happen, so users see progress during a minute-long run.
+- **Stopping runs when the user leaves.** Checking for `http.disconnect` between agent steps stops paid
+  LLM and tool calls for a closed tab instead of finishing a run nobody will read.
+- **Voice and interactive agents over WebSockets.** Two-way messages let the user interrupt or redirect
+  an agent mid-run, which a plain request-response route cannot do.
+- **Debugging buffered or truncated streams.** Knowing the message sequence explains why a proxy or
+  middleware delivers all events at the end, or why a 200 ends mid-step.
+
+### Mini project
+**Build a cancellable streaming agent endpoint (1-2 hours).**
+- **Goal:** stream step events from a fake multi-step agent and stop work as soon as the client
+  disconnects.
+- **Steps:** write a FastAPI route that runs a loop of five fake steps (each an `asyncio.sleep` standing in
+  for an LLM or tool call) and yields one SSE event per step; check `await request.is_disconnected()`
+  before each step; log every step started and every cancellation; hit it with `curl -N` and kill curl
+  after the second event.
+- **Done when:** the log shows steps stopping right after the disconnect instead of running all five,
+  and you can explain which ASGI message told the server the client left.

@@ -5,7 +5,8 @@ name: Mixture of experts (MoE)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - model-internals/transformer
   - model-internals/llm-architecture
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-An MoE transformer swaps each dense FFN for many expert FFNs plus a router that sends each token to a
-few. Compute tracks active parameters, quality lands between dense models of active and total size, and
-every expert must sit in memory.
+Many open-weight models you might run an agent on are MoE: a router sends each token to a few expert
+FFNs. Per-step speed tracks active parameters, but every expert must sit in memory, and the speed edge
+shrinks as concurrent agent loops grow.
+
+## For agent builders
+- **Why it matters for agents.** Agents make many sequential model calls, so per-token decode speed
+  multiplies by step count. An MoE gives near-large-model quality at small-model speed for a single loop,
+  but GPU memory is sized by total parameters, not the active count on the datasheet.
+- **Where it shows up in your stack.** Model cards that list "total" and "active" parameters (Mixtral,
+  DeepSeek-V3), vLLM or SGLang flags for tensor and expert parallelism, and the GPU count your self-hosted
+  agent tier needs.
+- **What you control.** Which model backs which agent role, how many GPUs and which quantisation you deploy,
+  and the concurrency you load-test at. You almost never train or re-route an MoE yourself.
+- **What you can skip.** Balancing-loss maths, router z-loss and expert-choice routing, unless you
+  fine-tune or continue pre-training an MoE. Know active versus total and the batch-size effect.
 
 ## Why it exists
 - **Dense models pay for every parameter on every token.** Scaling laws say loss keeps falling as
@@ -46,6 +59,13 @@ every expert must sit in memory.
   DeepSeek-V3 made it the default for the largest open-weight systems.
 
 ## How it works
+### What the agent builder needs from this section
+- **Two numbers per model.** Total parameters set memory and GPU count; active parameters set per-token
+  compute and, at low concurrency, decode speed for each agent step.
+- **One curve.** As more agent loops share a server, the batch touches more experts until weight traffic
+  approaches the dense total (see "The batch-size effect" below).
+- **The rest is background** for when you fine-tune or debug an MoE: routing, load balancing, capacity.
+
 ### The layer
 1. **Attention is unchanged** and shared by all tokens.
 2. **The FFN becomes N experts** E₁ … E_N, each shaped like an ordinary FFN (or narrower).
@@ -228,7 +248,25 @@ for b in (1, 4, 8, 16):
 - **Reading.** By a batch of about 8 the step reads most of the model, so the comparison with a dense
   model shifts from bandwidth to FLOPs, where the MoE still does only active-size arithmetic per token.
 
+### Agent scenario: one coding agent versus a shared agent platform
+A team self-hosts Mixtral 8x7B in fp16 on two 80 GB GPUs for a 20-step agent that emits ~300 tokens per
+step (6,000 decode tokens per task). Latency floors below assume a conservative ~2 TB/s of usable
+bandwidth and ignore KV-cache reads: illustrative orders of magnitude, not a benchmark.
+
+| Deployment | Agent loops in flight | Weights read per step | Floor per token | Decode floor per 20-step task |
+|---|---|---|---|---|
+| Developer's private agent | 1 | ~26 GB | ~13 ms | ~78 s |
+| Team platform | 16 | ~93 GB | ~47 ms | ~280 s, shared by 16 loops |
+
+- **Reading.** For one loop the MoE behaves like a 13B model; at 16 loops each step costs about what a
+  dense 47B model would, though aggregate throughput is still far higher than serving 16 loops one at a time.
+- **Decision.** Benchmark at the platform's real concurrency before promising "13B-speed" agents, and put
+  latency-sensitive single-user agents on their own replica if the platform is busy.
+
 ## Production patterns
+- **Pick agent models on your agent eval, not the parameter count.** Run candidate MoE and dense models
+  through the same tool-calling eval (valid calls, task success, steps per task) and compare cost per
+  successful task at your concurrency. Monitor tool-call validity per model version after every upgrade.
 - **Size memory from total parameters.** Before promising hardware, compute weights as total parameters ×
   bytes per weight, add the KV cache at target concurrency, and keep headroom. For Mixtral in fp16 that
   means two 80 GB GPUs, for example `--tensor-parallel-size 2` in vLLM. Monitor peak GPU memory and
@@ -237,8 +275,8 @@ for b in (1, 4, 8, 16):
   plain PyTorch loop; on multi-GPU nodes try expert parallelism (vLLM has an `--enable-expert-parallel`
   option) and compare it with tensor parallelism. Monitor tokens per second and interconnect utilisation.
 - **Benchmark at production concurrency.** Load-test at the batch sizes you will really run, not batch 1,
-  because weight traffic per step rises until all experts are read. Track time per output token and
-  throughput as concurrency rises.
+  because weight traffic per step rises until all experts are read. For agents, load-test with realistic
+  concurrent loops and track p95 wall-clock per task, plus time per output token and throughput.
 - **Quantise weights to fit fewer cards.** 8-bit roughly halves the 94 GB fp16 footprint and 4-bit
   roughly quarters it. Accept only after running your own eval set, and keep room for the KV cache.
 - **Watch the router when fine-tuning.** Log expert-utilisation histograms per layer, keep the balancing
@@ -246,6 +284,9 @@ for b in (1, 4, 8, 16):
   router weights on small datasets. Alert on a few hot experts and many near zero.
 
 ## Trade-offs
+- **Fast single agent vs busy shared platform.** One agent loop gets near-large-model quality at
+  active-size speed, but as many loops share the server the per-step cost climbs toward a dense model of
+  total size; it flips once concurrency touches every expert.
 - **Quality per training FLOP vs weight memory.** Capacity grows without proportional compute, but memory
   grows with total parameters. When a single GPU's VRAM is the binding constraint, a dense model with the
   same memory footprint can be the better choice.
@@ -263,6 +304,9 @@ for b in (1, 4, 8, 16):
   more routing overhead, which GPUs handle efficiently only with fused kernels.
 
 ## Pitfalls
+- **Promising agent latency from a single-user demo.** Symptom: the agent felt fast in the pilot, then each
+  task takes several times longer once a team shares the server. Fix: load-test with the real number of
+  concurrent agent loops and quote per-task p95.
 - **Sizing serving hardware from active parameters.** Symptom: an out-of-memory error at model load,
   because all experts must be resident regardless of how few run per token. Fix: size from total.
 - **Reading "8x7B" as a 56B model.** Benchmarking it against dense 56B models is wrong too: shared attention
@@ -281,7 +325,9 @@ for b in (1, 4, 8, 16):
   experts are read, so the dense-versus-MoE comparison can invert. Fix: benchmark at real concurrency.
 
 ## When to use
-You rarely decide to train an MoE; you decide whether to deploy one.
+You rarely decide to train an MoE; you decide whether to deploy one behind your agents.
+- **Use for agents when:** a self-hosted agent needs top open-weight quality for planning and tool calls,
+  and step latency matters more than squeezing onto one card.
 - **Use when:** you need top-tier quality from open weights, you have a multi-GPU node or enough host
   memory, and your traffic leaves a bandwidth advantage at the batch sizes you run.
 - **Prefer dense when:** you are on a single card, you fine-tune often on small data, or your serving stack
@@ -314,6 +360,21 @@ recommendation if they have a multi-GPU box with fast interconnect, or if their 
 they accept quantised weights.
 
 ## Interview questions
+### You self-host an MoE for an internal agent platform. Pilots felt fast, production tasks are slow. What happened?
+- **The batch-size effect.** One pilot user meant each decode step read only the active experts; many
+  concurrent agent loops touch every expert, so weight traffic per step approaches the dense total.
+- **Agents amplify it.** A 20-step task pays the slower per-token cost on every step, so per-task latency
+  grows far more than a single chat would.
+- **Fix:** load-test at real loop counts, add replicas or a dedicated low-latency replica, and quote p95
+  per task rather than batch-1 tokens per second.
+
+### How would you choose between an MoE and a dense model to back a tool-calling agent?
+- **Start from the eval.** Run both on your agent tasks and score tool-call validity, task success and
+  steps per task; parameter counts do not predict tool use.
+- **Then the hardware.** Size memory from total parameters plus the KV cache for long agent transcripts,
+  and check whether one card is enough for the dense option.
+- **Then cost per successful task** at the concurrency you will run, since the MoE speed edge depends on it.
+
 ### Why is Mixtral 8x7B about 47B parameters rather than 56B, and what do the active and total counts each govern?
 - **Shared parts are counted once.** Only the FFNs are replicated into 8 experts; attention, embeddings
   and norms are shared, so the total is about 47B, not 8 × 7.
@@ -337,13 +398,6 @@ they accept quantised weights.
   cancel the compute savings.
 - **Without fused kernels or on one card.** A Python loop over experts is slow, and a dense model that fits
   the same VRAM may beat an MoE squeezed in by heavy quantisation.
-
-### Why do open decoder LLMs use token-choice routing rather than expert choice?
-- **Expert choice balances by construction** because each expert takes its top-scoring tokens up to a
-  fixed capacity.
-- **But routing then depends on the batch.** A token may get zero or many experts depending on unrelated
-  requests sharing the batch, which is awkward for autoregressive decoding with a handful of sequences.
-- **Token choice keeps each token's path its own,** at the price of needing a balancing loss or bias.
 
 ### What does the capacity factor control, and what happens if you set it too low?
 - **It caps tokens per expert** at `capacity_factor × tokens / N` per batch, because experts run as
@@ -378,3 +432,24 @@ they accept quantised weights.
 > Without a balancing term, early winners attract more tokens and the rest of the experts stop learning,
 > so the model behaves like a much smaller dense network. Capacity overflow is a related but separate
 > mechanism handled by the capacity factor, and it drops tokens rather than producing NaNs.
+
+## Use cases & projects
+### Use cases
+- **Self-hosted agents with data-residency rules.** Teams that cannot call a hosted API pick an open MoE to
+  get frontier-adjacent planning and tool use on their own GPUs.
+- **Capacity planning for an agent platform.** Total parameters set the GPU count; the batch-size curve
+  sets how many concurrent agent loops each replica can carry within the per-task latency budget.
+- **Model upgrades behind an agent.** Swapping a dense model for an MoE (or back) is decided by the agent
+  eval plus a load test, not by the headline parameter count.
+- **Choosing a model per agent role.** A large MoE for the planner and a small dense model for cheap
+  sub-steps such as summarising tool output.
+
+### Mini project
+**Measure the MoE batch-size effect on an agent loop (2-3 hours).**
+- **Goal:** show how per-task latency of a multi-step agent changes as concurrent loops grow on an MoE
+  versus a dense model of similar active size.
+- **Steps:** serve a small open MoE and a dense model with vLLM (or use the `experts_touched` script above
+  if you have no GPU); write a 10-step agent with two fake tools; run 1, 4, 8 and 16 loops concurrently and
+  log time per step and per task.
+- **Done when:** you have a table of p50 and p95 per-task latency by concurrency for both models, and a
+  short note stating at what loop count the MoE stops looking like its active size.

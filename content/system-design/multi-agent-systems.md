@@ -386,3 +386,23 @@ data, five agents will lack it too.
 > Sequential stages multiply: 0.95 to the fifth power is roughly 0.77, because a later stage cannot
 > usually detect an earlier stage's fluent error. Compounding is why pipelines need validation between
 > stages, and why independent parallel workers, retried alone and joined by quorum, fare better.
+
+## Use cases & projects
+### Use cases
+- **Parallel research.** A lead agent splits a broad question into independent sub-questions, workers
+  search in parallel with their own context, and the lead merges cited findings.
+- **Generator and reviewer pairs.** One agent drafts code or a report and a second, with a different
+  prompt and rubric, checks it before anything ships.
+- **Specialists behind a router.** Billing, technical and account agents each hold a small tool set, so no
+  single agent carries every tool and instruction.
+- **Long pipelines with validation gates.** Extraction, enrichment and summarization stages pass
+  structured outputs and are checked between hand-offs to stop errors compounding.
+
+### Mini project
+**Compare one agent with a lead-and-workers system (2-3 hours).**
+- **Goal:** measure whether splitting a research task across agents pays for its extra cost.
+- **Steps:** pick 10 research questions that each need 3-4 independent facts; run a single agent with a
+  search tool; then run a lead agent that spawns parallel workers, each returning a structured finding
+  the lead validates and merges; record tokens, wall-clock time and answer quality for both.
+- **Done when:** you have a table of cost, latency and graded accuracy per setup, plus a short note on
+  which questions justified multiple agents and which did not.

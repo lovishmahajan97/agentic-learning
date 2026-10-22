@@ -5,7 +5,8 @@ name: Task completion rate
 kind: metric
 difficulty: core
 est_minutes: 12
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - agent-reliability/agent-trajectory-evaluation
   - agent-reliability/tool-call-success-rate
@@ -24,6 +25,18 @@ sources:
 Task completion rate is the fraction of tasks an agent verifiably finishes, not claims to. It is only as
 good as three definitions: task, success and denominator. Report it with an interval,
 segmented by task type, beside pass^k for unattended use.
+
+## For agent builders
+- **Why it matters for agents.** It is the number your stakeholders will ask for, and the easiest one
+  to fool yourself with: count the agent's own "done", drop declined tasks or mix in human-assisted runs,
+  and the rate rises with no change to the agent.
+- **Where it shows up in your stack.** Offline eval suites with success predicates, post-run verifiers
+  that query the system of record, release dashboards, and cost-per-successful-task calculations.
+- **What you control.** The task grain, the success method (end state over judge over self-report), the
+  denominator policy for declines, abandonment, budgets and assisted runs, the interval method and the
+  segments you report.
+- **What you can skip.** Elaborate partial-credit scores as the headline. Keep success binary per task
+  and track partial progress as a diagnostic.
 
 ## Why it exists
 - **It is the output metric.** An agent product lives or dies on whether it actually finishes the job.
@@ -351,3 +364,24 @@ a secondary line for their support organisation.
 - [ ] Include only tasks the agent marked as complete
 > Removing declined and abandoned tasks keeps the rate about agent execution, and reporting those rates
 > separately stops an agent from looking better by declining more.
+
+## Use cases & projects
+### Use cases
+- **Release gates.** The Wilson lower bound per segment, plus pass^k for unattended segments, decides
+  whether a new agent version ships.
+- **Support containment reporting.** Unassisted and assisted completion are reported separately, so
+  autonomy and containment are both visible.
+- **Investigating a drop with no deploy.** Segmenting by task type separates a real regression from a
+  shift in the task mix.
+- **Unit economics.** Cost per verified completed task, not per run, is the number that justifies an
+  agent against the human workflow it replaces.
+
+### Mini project
+**A completion-rate report for an agent (1-2 hours).**
+- **Goal:** compute an honest completion rate from a set of agent runs.
+- **Steps:** take 50 or more recorded runs (from your own agent or a trajectory suite); label each with a
+  verified end-state outcome and a case (completed, failed, declined, abandoned, assisted); write one
+  shared bucketing function; compute the unassisted rate with a Wilson interval per task type, plus scope,
+  abandonment and assisted rates; compare with the self-reported rate.
+- **Done when:** one table shows each segment's rate and interval, the claimed-versus-verified gap is
+  quantified, and every number comes from the same function.

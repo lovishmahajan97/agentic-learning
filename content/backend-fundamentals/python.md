@@ -449,3 +449,28 @@ when the model, eval and SDK ecosystem is Python-first.
 - [ ] Automatic retries when validation fails
 > Type hints are inert annotations checked only by tools like mypy. Pydantic validates data at runtime,
 > which is what an HTTP body or a model's JSON output needs, and emits the schema you give the LLM.
+
+## Use cases & projects
+### Use cases
+- **Parallel tool calls in one agent step.** When the model requests three independent lookups, an
+  `asyncio.gather` with a semaphore runs them together, so the step takes as long as the slowest tool.
+- **Typed tool definitions.** One Pydantic model per tool produces the JSON Schema the model sees and
+  validates the arguments it sends back before the tool runs.
+- **CPU-heavy tools beside an async loop.** PDF parsing or chunking runs in a process pool so the event
+  loop keeps serving other agent runs.
+- **MCP tool servers and eval scripts.** Python SDKs make it the quickest language for a tool server or
+  a script that replays agent traces against an eval set.
+
+### Mini project
+**Concurrent, validated tool calls in a small agent loop (1-2 hours).**
+- **Goal:** show the latency gain of running independent tool calls concurrently and catching bad model
+  arguments before execution.
+- **Steps:** write three fake async tools that each sleep about one second, each with a Pydantic
+  argument model; run one step sequentially, then with `asyncio.gather` under a semaphore of 2; feed one
+  deliberately malformed argument dict and return the validation error to the model as a tool result.
+- **Done when:** a log shows the sequential step near three seconds and the concurrent step near two, and
+  the malformed call produces a readable validation message instead of a crash.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): the DocBrief service and its worker are
+written in Python, with async model calls, Pydantic contracts and CPU work kept off the event loop.

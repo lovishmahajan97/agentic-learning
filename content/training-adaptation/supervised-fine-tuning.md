@@ -413,3 +413,24 @@ consistent with both problems, which is why a held-out task metric, not loss, sh
 > Imitation learning has no notion of a worse alternative. Expressing "A is better than B" needs
 > comparison data consumed by RLHF or DPO; SFT can set the format, but the quality ranking comes from
 > preference optimisation.
+
+## Use cases & projects
+### Use cases
+- **Teaching a custom tool-call format.** An open-weight agent that keeps emitting slightly wrong
+  arguments is fine-tuned on verified traces in the serving chat template.
+- **Distilling a large agent into a small one.** Successful traces from a strong hosted model become SFT
+  data for a cheaper model that runs the same tools.
+- **Per-tenant LoRA adapters.** One base model serves several agents, each with a small adapter trained
+  on that team's tools and tone.
+- **Hardening stop behaviour.** Traces that end cleanly after a tool call teach the model to hand control
+  back to the runtime instead of inventing tool results.
+
+### Mini project
+**Build a masked SFT dataset from agent traces (2-3 hours).**
+- **Goal:** turn raw agent logs into training examples where only the agent's own turns carry loss.
+- **Steps:** export 100 agent transcripts; keep only runs whose final answer passed a check; render each
+  with the tokenizer's `apply_chat_template` and the same `tools` list used at serving time; build a
+  label mask that covers assistant tool calls and answers but not system, user or tool-result tokens;
+  print one example with masked tokens greyed out.
+- **Done when:** a script outputs a JSONL file, a count of kept versus dropped traces, and a check that
+  the training render matches the serving render byte for byte on five samples.

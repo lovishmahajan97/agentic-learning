@@ -496,3 +496,23 @@ may fit.
 > Pydantic AI generates tool schemas from type hints, validates the output type and retries by showing
 > the model the validation error, with nothing hidden. The others solve different problems or carry
 > more abstraction.
+
+## Use cases & projects
+### Use cases
+- **Choosing a stack for a new agent team.** Map each hard part (retrieval, resumable control flow,
+  typed outputs, prompt tuning) to the thinnest framework layer that owns it, and write the choice down.
+- **Adding human approval to an existing agent.** Teams move the loop onto LangGraph so a checkpointer can
+  pause the run at an interrupt and resume it after review without re-running earlier tools.
+- **Document Q&A agents.** LlamaIndex handles parsing, chunking and query engines, while the agent loop
+  stays in plain code or a thin orchestration layer.
+- **Hardening a fragile multi-step prompt pipeline.** DSPy replaces hand-tuned prompts with modules and a
+  metric, so prompt changes are driven by an eval set instead of guesswork.
+
+### Mini project
+**Same agent, two framework layers (2-3 hours).**
+- **Goal:** see what a framework buys and hides by building one small tool-calling agent twice.
+- **Steps:** write two framework-neutral tools (a fake order lookup and a fake refund) as plain typed
+  functions; build the agent once as a hand-rolled loop and once with LangGraph or Pydantic AI importing
+  the same tools; run the same five test tasks through both and log tool calls and token usage per run.
+- **Done when:** both versions pass the five tasks, the tools module is shared unchanged, and you have a
+  short table comparing lines of code, visible prompts and what each version needed for retries.

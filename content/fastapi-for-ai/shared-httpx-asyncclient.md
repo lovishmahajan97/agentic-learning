@@ -418,3 +418,25 @@ example in Redis) if replicas scale dynamically.
 - [ ] Unlimited, because limits apply per request
 > Lifespan runs once per worker process, so there are six independent pools. Shared means shared within
 > a process. Fleet-wide budgets need per-worker sizing or a distributed limiter.
+
+## Use cases & projects
+### Use cases
+- **Multi-step tool-calling agents.** A loop alternating model and tool calls reuses warm keep-alive
+  connections, so later steps skip DNS, TCP and TLS setup.
+- **Streaming chat relays.** One shared client streams model tokens to many users at once, with the pool
+  limits actually capping connections to the provider.
+- **Agents calling several internal APIs.** One client per upstream (search, CRM, vector store) gives
+  each its own limits and timeouts, so one slow tool cannot starve the others' connections.
+- **Serving behind several workers.** Per-worker pools sized from the provider's concurrency budget keep
+  the fleet inside its quota.
+
+### Mini project
+**Measure connection reuse in an agent loop (1-2 hours).**
+- **Goal:** show the latency difference between a per-request client and a lifespan client across a
+  10-call agent loop.
+- **Steps:** write a FastAPI endpoint that makes ten sequential calls to an HTTPS upstream (a mock tool
+  API or a cheap model endpoint); implement it once with `async with httpx.AsyncClient()` per request
+  and once with one client created in the lifespan and stored on `app.state`; set `httpx.Limits` and
+  `httpx.Timeout` explicitly; time each call.
+- **Done when:** you have a per-call latency table showing the first call paying setup and later calls
+  not, in the shared version only, and the client is closed cleanly on shutdown.

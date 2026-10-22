@@ -5,7 +5,8 @@ name: Bulkheads
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - reliability/circuit-breakers
   - reliability/tenant-level-quotas-and-noisy-neighbor-isolation
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-A bulkhead partitions a shared resource (workers, connections, queues, pods) per dependency, workload
-class or tenant, so one exhausted compartment cannot drain the others. It bounds damage in advance, unlike
-a breaker; the price is capacity that cannot be borrowed.
+A bulkhead gives each tool, model endpoint, workload class or tenant its own capped share of workers,
+connections or pods, so one hung tool cannot stall every agent run. It bounds damage before anything
+detects failure; the price is capacity that cannot be borrowed.
+
+## For agent builders
+- **Why it matters for agents.** An agent service calls many dependencies per turn: the model, a vector
+  store, and several tools, often in parallel. One hung tool can hold every worker, and then even runs that
+  never touch it, and your health checks, fail.
+- **Where it shows up in your stack.** An `asyncio.Semaphore` per tool in the tool executor, one HTTP client
+  per upstream, separate queues for background agents and interactive chat, Kubernetes namespaces with a
+  `ResourceQuota`, and Resilience4j bulkheads on the JVM.
+- **What you control.** The compartment boundaries (per tool, per model, interactive versus batch agents),
+  each cap (sized with Little's law from p99 latency), how long a caller waits for a permit, and what the
+  agent does when a compartment is full.
+- **What you can skip.** Queueing theory beyond Little's law. Concurrency = rate × time in system is enough
+  to size every cap in this lesson.
 
 ## Why it exists
 - **One slow dependency becomes a full outage.** A service with one pool of 200 workers calls an LLM, a
@@ -32,16 +46,18 @@ a breaker; the price is capacity that cannot be borrowed.
   three quarters of the pool, reached within half a minute.
 - **Healthy paths die with it.** Add LLM traffic and the pool is full; requests that need only the
   healthy LLM and vector store are rejected, health checks share the pool and fail, and pods restart.
-  Workload mixing does the same with no failure at all: a batch summarization job that is merely slow and
-  plentiful fills the pool, interactive users wait behind it, and nothing is broken.
+- **Workload mixing does the same with no failure at all.** A batch summarization agent that is merely slow
+  and plentiful fills the pool, interactive users wait behind it, and nothing is broken.
 - **The usual fixes do not cap the aggregate.** A bigger pool only raises the threshold: occupancy under a
   hang is rate × timeout, set by the caller's traffic, and retries push that rate up until any fixed pool
-  fills. A shorter timeout only shrinks the number, it does not cap it. A circuit breaker needs a minimum
-  number of observed failures first, and a hung dependency that never errors can take minutes to register.
+  fills. A shorter timeout only shrinks the number, it does not cap it.
+- **Breakers react too late here.** A circuit breaker needs a minimum number of observed failures first,
+  and a hung dependency that never errors can take minutes to register.
 - **The missing property is a hard ceiling per compartment.** A ship's hull is divided into watertight
   compartments so one breach floods one section, not the vessel; a software bulkhead does the same for
-  worker threads, connections, semaphores, queues and pods. Where a circuit breaker reacts after it
-  detects failure, a bulkhead bounds the damage whether or not anything detects it.
+  worker threads, connections, semaphores, queues and pods.
+- **Static, not reactive.** Where a circuit breaker reacts after it detects failure, a bulkhead bounds the
+  damage whether or not anything detects it.
 
 ## How it works
 ### Size with Little's law
@@ -49,7 +65,8 @@ a breaker; the price is capacity that cannot be borrowed.
 cap ≈ peak rate × p99 latency + burst headroom     (and a small fraction of the total pool)
 tolerated average latency = cap ÷ rate
 ```
-- **Use a high percentile, not the mean,** because LLM latency has a long tail and the cap must absorb it.
+- **Use a high percentile, not the mean,** because LLM and tool latency has a long tail and the cap must
+  absorb it.
 - **In the failure case latency equals the timeout,** so occupancy can never exceed the cap no matter how
   slow the dependency gets. The formula tells you both how large a cap is safe and the worst damage the
   dependency can do.
@@ -58,6 +75,8 @@ tolerated average latency = cap ÷ rate
   latency averages 4 seconds, about thirteen times its normal 300 ms; beyond that the bulkhead sheds.
 - **That number is the real design choice:** how much slowdown you will absorb before you would rather
   degrade.
+- **Agents multiply the rate.** The rate a tool sees is runs per second × calls of that tool per run, and
+  parallel tool calls arrive together, so size from tool-call rate, not request rate.
 
 ### Oversubscription is fine; check the right condition
 - **Caps do not have to sum to the pool,** because dependencies rarely all hang at once.
@@ -69,10 +88,10 @@ tolerated average latency = cap ÷ rate
 ### Five forms, from cheapest to strongest
 | Form | Mechanism | Use when | Cost |
 |---|---|---|---|
-| 1. Semaphore | counting semaphore per dependency; acquire before the call, release after; fail immediately or wait a very short bounded time | non-blocking clients; the default in async services | nearly free |
+| 1. Semaphore | counting semaphore per dependency; acquire before the call, release after; fail immediately or wait a very short bounded time | non-blocking clients; the default in async agent services | nearly free |
 | 2. Thread pool | separate executor per dependency | blocking clients and CPU-bound work (a synchronous SDK, a tokenizer, PDF parsing) that would stall the event loop or each other | threads and context switches |
 | 3. Connection pool | separate HTTP client with its own connection limits per upstream | always, *in addition to* a semaphore | a client object per upstream |
-| 4. Queue | separate queues and consumer groups per workload class (interactive versus batch, per tenant tier) | batch and interactive share a fleet | more queues and consumers |
+| 4. Queue | separate queues and consumer groups per workload class (interactive versus batch agents, per tenant tier) | batch and interactive share a fleet | more queues and consumers |
 | 5. Deployment | separate pods, node pools, namespaces with resource quotas, or clusters; separate provider keys or model deployments | a tenant pays for isolation or a vendor limit must be isolated | highest |
 
 - **Why the connection pool needs its own compartment:** it is itself a shared resource. A hung upstream
@@ -83,8 +102,8 @@ tolerated average latency = cap ÷ rate
 - **Why deployments are strongest:** they are the only form that also isolates vendor-side limits.
 
 ### What to compartment by
-- **By dependency:** the most common, and the baseline.
-- **By workload class:** protects interactive latency from batch volume.
+- **By dependency:** the most common, and the baseline; in an agent, each tool endpoint and each model.
+- **By workload class:** protects interactive agents' latency from batch and background agent volume.
 - **By tenant tier:** how you sell isolation.
 - **By criticality, the one teams forget:** health and readiness endpoints, authentication and the
   admission layer must never share a compartment with LLM calls, or an upstream outage turns into
@@ -96,6 +115,8 @@ tolerated average latency = cap ÷ rate
   are now the stuck resource.
 - **A rejection should enable graceful degradation** (answer without the CRM context, serve from cache,
   enqueue for later) or an honest 503 with `Retry-After`.
+- **In an agent, a rejection is a tool result.** Return "tool busy" to the model so it can continue without
+  that tool, rather than failing the run.
 
 ### How it composes with breakers and load shedding
 | Mechanism | Kind | Role |
@@ -112,14 +133,14 @@ tolerated average latency = cap ÷ rate
 
 ## Diagram
 Each dependency gets its own permits and its own HTTP client, and health checks bypass them all; a full
-compartment degrades its own requests instead of draining the shared pool.
+compartment degrades its own agent steps instead of draining the shared pool.
 
 ```mermaid
 flowchart TD
-    R["Incoming request"] --> W["Worker pool: 200"]
+    R["Agent step"] --> W["Worker pool: 200"]
     H["Health checks"] --> HP["Dedicated health path"]
     W --> V["Vector DB bulkhead: 10"]
-    W --> C{"CRM bulkhead: 20 free?"}
+    W --> C{"CRM tool bulkhead: 20 free?"}
     W --> L["LLM bulkhead: 100"]
     C -->|"yes"| CC["CRM client, 20 connections"]
     C -->|"no, after 50 ms"| D["Degrade: answer without CRM"]
@@ -180,6 +201,34 @@ async def handle(req):
   seconds.
 - **The `finally` matters:** a permit leaked on cancellation is a compartment that slowly fills with ghosts.
 
+### Agent tool executor: parallel tool calls behind per-tool bulkheads
+The model often emits several tool calls in one step. Each runs behind its own tool's bulkhead, and a full
+compartment becomes a tool result instead of an exception. It reuses `Bulkhead` and `BulkheadFull` above.
+
+```python
+TOOL_BULKHEADS = {
+    "search":    Bulkhead("search", 30),
+    "crm":       Bulkhead("crm_api", 20, max_wait=0.05),
+    "run_code":  Bulkhead("sandbox", 8, max_wait=0.1),     # sandboxes are scarce: small cap
+}
+
+async def run_one(call, tools):
+    bh = TOOL_BULKHEADS[call["name"]]
+    try:
+        out = await bh.run(tools[call["name"]], **call["args"])
+        return {"id": call["id"], "ok": True, "content": out}
+    except BulkheadFull:
+        return {"id": call["id"], "ok": False, "error": "tool_busy",
+                "message": f"{call['name']} is at capacity; continue without it or try later"}
+
+async def run_tool_calls(calls, tools):
+    # Parallel tool calls from one model step; each competes only inside its own compartment.
+    return await asyncio.gather(*(run_one(c, tools) for c in calls))
+```
+
+- **A hung sandbox holds at most 8 workers,** however many runs ask for code execution at once.
+- **The model sees `tool_busy`** in the tool results and can finish the answer with the other tools.
+
 ### Sizing calculator with the oversubscription check
 Runnable: computes normal demand, the latency each cap tolerates, and whether the healthy paths still fit
 when one compartment is pinned at its cap.
@@ -217,6 +266,17 @@ for hung, (_, _, cap) in deps.items():   # pin one compartment at its cap
 | CRM-dependent request | hangs 30 s, then fails | `BulkheadFull` in 50 ms, answered without CRM |
 | Health checks | miss, pods restart | own path, stay green |
 
+### Worked scenario: a background agent fleet next to chat
+Illustrative: interactive support agents and a nightly batch of 5,000 document-review agents share one
+fleet of 200 agent workers. Each run holds a worker for its whole duration.
+
+| Quantity | One shared queue | Separate queues and consumer groups |
+|---|---|---|
+| Batch runs in flight | up to 200 (all workers) | capped at 120 by the batch consumer group |
+| Interactive runs (2 per second × 20 s per run) | 40 needed, wait behind batch | 40 served from their own 80 workers |
+| Interactive p95 queue wait | minutes while the batch drains | near zero |
+| Batch completion | fastest possible | slower, but finishes overnight |
+
 ## Production patterns
 - **Resilience4j bulkheads on the JVM.** A semaphore bulkhead per dependency with `maxConcurrentCalls` and a
   short `maxWaitDuration`; a thread-pool bulkhead (`maxThreadPoolSize`, `coreThreadPoolSize`,
@@ -226,9 +286,12 @@ for hung, (_, _, cap) in deps.items():   # pin one compartment at its cap
   hang stalls only that executor. Monitor event-loop lag; spikes mean blocking code leaked in.
 - **One HTTP client per upstream.** Create a separate client with its own connection limits per upstream
   (as with `httpx.Limits` above) and its own timeout. Monitor connection-pool wait time per client.
-- **Separate queues for batch and interactive.** Give batch work its own queue and consumer group with its
-  own concurrency, so batch depth never delays interactive messages. Monitor per-queue depth and age of
-  the oldest message.
+- **Per-tool bulkheads in the tool executor.** Give each tool its own semaphore, with small caps for scarce
+  resources such as code sandboxes or browser sessions, and turn rejections into tool results. Monitor
+  `tool_busy` rate per tool and permits in use.
+- **Separate queues for batch and interactive agents.** Give batch work its own queue and consumer group
+  with its own concurrency, so batch depth never delays interactive messages. Monitor per-queue depth and
+  age of the oldest message.
 - **Namespace quotas for deployment bulkheads.** In Kubernetes, give each workload class or tenant tier its
   own namespace with a `ResourceQuota`, or its own node pool, so one class cannot schedule over another.
   Monitor quota usage and pending pods per namespace.
@@ -246,6 +309,9 @@ for hung, (_, _, cap) in deps.items():   # pin one compartment at its cap
 - **Fine vs coarse compartments.** Many fine compartments give precise isolation and metrics but multiply
   configuration and the chance of mis-sizing one; coarse compartments are simple but share blast radius.
   Partition by failure domain, not by code module.
+- **Degraded answers vs failed runs.** Returning `tool_busy` keeps runs alive but lets the agent answer with
+  less information; failing the run is honest but costs the whole turn. Decide per tool which one is
+  optional.
 
 ## Pitfalls
 - **Sizing the cap from mean latency.** Symptom: steady trickle of `BulkheadFull` rejections on a healthy
@@ -266,14 +332,16 @@ for hung, (_, _, cap) in deps.items():   # pin one compartment at its cap
   without it.
 - **Releasing the permit only on the success path.** Symptom: capacity drifts downward over days; the
   compartment reads full with no real work in flight, and a restart "fixes" it.
+- **Sizing tool caps from request rate.** Symptom: a tool's bulkhead rejects at normal traffic because each
+  agent run calls it several times in parallel. Fix: size from tool calls per second.
 
 ## When to use
 - **Use when** a service talks to more than one dependency with different latency or reliability, or
-  serves more than one workload class.
+  serves more than one workload class; nearly every tool-calling agent service qualifies.
 - **Start with the cheap baseline:** a semaphore per dependency sized from Little's law, a separate HTTP
   client per upstream, and a dedicated path for health checks. Promote to queue-level separation when
-  batch and interactive traffic share a fleet, and to deployment separation when a tenant pays for it or a
-  vendor key limit must be isolated.
+  batch and interactive traffic share a fleet.
+- **Escalate to deployments** when a tenant pays for it or a vendor key limit must be isolated.
 - **Measure** per-compartment in-flight count, rejection rate and wait time; alert on sustained saturation
   of any one compartment, which is an early warning long before the breaker trips.
 - **Interviews:** the question is "one slow dependency took down the whole service, how do you prevent
@@ -316,6 +384,14 @@ breaker on top releases the 20 permits once failures are confirmed.
 - **Check what it tolerates:** 100 ÷ 20 = 5 seconds of average latency before shedding starts.
 - **Check the pool:** with that compartment pinned at 100, the remaining workers must still cover every
   healthy path's demand.
+
+### Your agent's code-execution sandbox started hanging and now chat agents that never run code are timing out. How do you fix the design?
+- **Give the sandbox tool its own bulkhead,** a small semaphore sized from tool calls per second × p99, so a
+  hang can hold only that many workers.
+- **Return `tool_busy` to the model** when the compartment is full, so runs continue without code execution
+  instead of waiting.
+- **Separate its clients and executors** too, and add a breaker so permits free up once the hang is
+  confirmed; monitor permits in use per tool.
 
 ### Every compartment shows free permits, yet the whole service, including health checks, is stalled. What do you suspect?
 - **A blocking call on the event loop,** such as a synchronous SDK inside async code; all semaphores live on
@@ -365,3 +441,24 @@ breaker on top releases the 20 permits once failures are confirmed.
 > A semaphore bounds how many calls your code starts, but a shared client has its own connection limit;
 > sockets held open by a hung dependency are unavailable to the others, so the healthy paths stall while
 > their semaphores show plenty of permits.
+
+## Use cases & projects
+### Use cases
+- **Tool-calling agents with many integrations.** A semaphore per tool keeps one hung CRM, browser or
+  sandbox from stalling every agent run.
+- **Background agents next to interactive chat.** Separate queues and consumer groups keep nightly batch
+  agents from delaying users' sessions.
+- **Scarce agent resources.** Small caps on code sandboxes, headless browsers or GPU-backed tools stop a
+  burst of runs from exhausting them.
+- **Premium tenants on an agent platform.** Deployment-level bulkheads (own namespace, own provider key)
+  isolate a paying customer from everyone else, including vendor limits.
+
+### Mini project
+**Contain a hung tool in a parallel-tool agent (1-2 hours).**
+- **Goal:** show that per-tool bulkheads keep chat-only agent runs fast while one tool hangs.
+- **Steps:** build an async agent executor with three fake tools and a shared pool of 50 workers; make one
+  tool hang for 30 seconds; send a mix of runs that do and do not use it; measure p95 latency of the runs
+  that never call the hung tool, first with one shared pool, then with per-tool `Bulkhead` caps sized by
+  Little's law and a `tool_busy` result.
+- **Done when:** a table shows the unaffected runs' p95 collapsing in the shared-pool version and staying
+  flat with bulkheads, and the hung tool never holds more than its cap.

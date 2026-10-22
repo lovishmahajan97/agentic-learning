@@ -431,3 +431,24 @@ a human review queue for low-confidence outputs, or budget a larger open-weight 
 - [ ] A quantized version of the teacher for comparison
 > Agreement measures how well the student copies the teacher, including its mistakes. Only labels
 > from an independent source show whether either model is actually correct on the task.
+
+## Use cases & projects
+### Use cases
+- **Fast intent routing in front of an agent.** A small model classifies the request and picks the
+  workflow or tool set before the large planner is called.
+- **Per-step guardrail checks.** A PII or policy classifier on a small model runs on every tool result
+  without adding a large-model call each step.
+- **On-premises or on-device agents.** A small model that fits one GPU or a laptop serves the narrow
+  steps where data cannot leave the environment.
+- **Distilling from agent traces.** Logged large-model decisions on a narrow step become training data
+  for a cheaper student, checked against human labels.
+
+### Mini project
+**Build a small-to-large cascade for one agent step (2-3 hours).**
+- **Goal:** move an intent-routing step to a small model and escalate only low-confidence cases.
+- **Steps:** collect 200 labelled routing examples; run a small local model (for example via Ollama)
+  and a large API model on them; record accuracy, latency and cost; derive a confidence score for the
+  small model and pick an escalation threshold on a held-out split.
+- **Done when:** a table shows accuracy, cost and p95 latency for small-only, large-only and the
+  cascade, with the escalation rate at your chosen threshold, all measured on human labels rather than
+  agreement with the large model.

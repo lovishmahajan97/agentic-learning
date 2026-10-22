@@ -5,7 +5,8 @@ name: Node.js / TypeScript
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - node-ts-for-ai/event-loop-and-microtask-queue
   - node-ts-for-ai/runtime-schema-validation
@@ -22,15 +23,29 @@ sources:
 ---
 
 ## TL;DR
-Node.js with TypeScript runs the product edge of an AI system: UI streaming routes, BFFs, serverless
-functions, MCP servers. It proxies many streams cheaply but is a poor home for inference and evals, so
-Python owns the core. (Deep dive: `node-ts-for-ai`.)
+Node.js with TypeScript is where many agents meet users: streaming agent routes, BFFs, serverless
+functions, MCP servers, SDK agent loops. It relays streams cheaply but suits inference and evals poorly,
+so Python owns the core. (Deep dive: `node-ts-for-ai`.)
+
+## For agent builders
+- **Why it matters for agents.** An agent's tool calls arrive as model-produced JSON, its progress streams
+  to a browser, and its runs get cancelled when users leave. Node's event loop, Zod schemas and
+  `AbortController` handle exactly those three jobs at the product edge.
+- **Where it shows up in your stack.** The Vercel AI SDK and the OpenAI and Anthropic TypeScript SDKs for
+  agent loops, the MCP TypeScript SDK for tool servers, Next.js route handlers that stream agent steps,
+  and serverless or edge functions that host lightweight agents.
+- **What you control.** Runtime validation of every tool call, backpressure on streamed steps,
+  cancellation from browser to model, where CPU work runs, and the generated client that keeps the
+  TypeScript edge in sync with a Python agent core.
+- **What you can skip.** libuv internals and V8 tuning. Know what blocks the loop, how `drain` works and
+  why types vanish at runtime; that covers most agent-edge bugs.
 
 ## Why it exists
 - **The web is built in TypeScript.** React, Next.js and the SSR frameworks that render them, the
   serverless and edge platforms that host them, and the Vercel AI SDK that streams model output into
-  components. AI products are mostly chat and streaming interfaces, so a product team cannot avoid it.
-- **Same language as the UI removes overhead.** Putting the model-facing request path next to the UI
+  components. AI products and agent UIs are mostly chat and streaming interfaces, so a product team cannot
+  avoid it.
+- **Same language as the UI removes overhead.** Putting the agent-facing request path next to the UI
   removes a translation layer, a deployment and a second on-call rota.
 - **"Everything in Python" fails at the edge.** The frontend team does not write Python, SSR frameworks are
   TypeScript, and edge runtimes are built around V8; where Python is offered, it runs through WebAssembly
@@ -39,22 +54,23 @@ Python owns the core. (Deep dive: `node-ts-for-ai`.)
   vector and data tooling are Python-first. The honest outcome is two languages; the real question is
   where the boundary sits and how its contract stays honest.
 - **Node fits the edge for a mechanical reason.** Its single-threaded, non-blocking event loop holds
-  thousands of concurrent streams cheaply: open upstream, relay chunks, apply backpressure, close. It is
-  bad at CPU-bound main-thread work, like Python, but has no NumPy or PyTorch to hand that work to.
+  thousands of concurrent agent streams cheaply: open upstream, relay chunks, apply backpressure, close.
+  It is bad at CPU-bound main-thread work, like Python, but has no NumPy or PyTorch to hand that work to.
 
 ## How it works
 ### The event loop
 - **One JavaScript thread.** libuv provides a thread pool for file, DNS and crypto work and a loop that
   dispatches completed I/O callbacks.
-- **Waiting is cheap.** A handler awaiting a network call costs a promise, not a thread.
+- **Waiting is cheap.** A handler awaiting a model or tool call costs a promise, not a thread, so an agent
+  step that awaits three tools in `Promise.all` holds no extra threads.
 - **The corollary.** Synchronous CPU work on the main thread (parsing a 50 MB JSON body, tokenizing a book
-  in pure JavaScript) stops every other request.
+  in pure JavaScript) stops every other request and every other agent run.
 - **Escape hatches.** `worker_threads` for CPU-bound tasks, and heavy compute kept in the Python core,
   *because* nothing on the main thread can preempt a running function.
 
 ### Streams and backpressure
 1. **Read upstream incrementally.** Node 18 and later ship `fetch` and the Web Streams API globally, so a
-   handler reads a model stream chunk by chunk and writes it to the client as it arrives.
+   handler reads a model or agent-step stream chunk by chunk and writes it to the client as it arrives.
 2. **Watch the write signal.** `res.write()` returns `false` once the response's internal buffer passes
    its high-water mark: the client is reading slower than you write.
 3. **Honour it.** Stop pulling from upstream and wait for `drain`. That keeps memory flat when a slow
@@ -64,11 +80,11 @@ Python owns the core. (Deep dive: `node-ts-for-ai`.)
   it for you.
 
 ### Cancellation
-- **The problem.** When the user closes the tab, the upstream model keeps generating tokens you are billed
-  for.
+- **The problem.** When the user closes the tab, the upstream model keeps generating tokens, and an agent
+  loop keeps calling tools, all of which you are billed for.
 - **The signal.** Node reports the hang-up as a `close` event on the response before it finished writing.
 - **The wiring.** Connect that to an `AbortController` whose `signal` was passed to `fetch`, which tears
-  down the upstream connection.
+  down the upstream connection; agent SDKs generally accept an abort signal too.
 - **The caveat.** It saves money only if the upstream in turn stops generating when its client
   disconnects, so check that both hops propagate cancellation.
 
@@ -76,14 +92,15 @@ Python owns the core. (Deep dive: `node-ts-for-ai`.)
 - **Types are erased at compile time.** Inside your code they catch mistakes; at the boundary they
   guarantee nothing, *because* data arrives at runtime from a model, a webhook or an API that never saw
   your types.
-- **Pair a runtime schema with inferred types.** One Zod (or similar) schema validates the LLM's JSON,
-  derives the TypeScript type, and converts to JSON Schema for the model's tool definition.
-- **The other half of the discipline:** `strict` mode and exhaustive switches on discriminated unions.
+- **Pair a runtime schema with inferred types.** One Zod (or similar) schema validates the LLM's tool-call
+  JSON, derives the TypeScript type, and converts to JSON Schema for the model's tool definition.
+- **The other half of the discipline:** `strict` mode and exhaustive switches on discriminated unions,
+  which suit agent events (tool call, tool result, text delta, done).
 
-### Where it fits in an AI system
+### Where it fits in an agent system
 | Node/TypeScript | Python |
 |---|---|
-| chat UI and its streaming route handlers | model serving |
+| chat UI and its streaming agent route handlers | model serving |
 | backend-for-frontend adding auth and rate limits in front of the Python service | RAG pipelines |
 | serverless functions and edge middleware | evals |
 | MCP servers exposing product data as tools | fine-tuning |
@@ -93,30 +110,30 @@ Python owns the core. (Deep dive: `node-ts-for-ai`.)
   service's OpenAPI schema is how the two sides stay in sync.
 
 ## Diagram
-The gateway relays chunks, pauses when the browser falls behind, and aborts the upstream call when the
-browser leaves.
+The gateway relays agent-step chunks, pauses when the browser falls behind, and aborts the upstream run
+when the browser leaves.
 
 ```mermaid
 sequenceDiagram
     participant B as Browser
     participant G as Node gateway
-    participant P as Python core
+    participant P as Python agent core
     B->>G: POST /chat
     G->>P: fetch with AbortController signal
-    P-->>G: stream chunk
+    P-->>G: stream step event
     G-->>B: res.write chunk
     Note over G: write returns false, wait for drain
     B-->>G: reads buffered bytes
     Note over G: drain fires, resume reading upstream
-    P-->>G: next chunk
+    P-->>G: next step event
     B--xG: tab closed, close event
-    G--xP: ac.abort cancels upstream
+    G--xP: ac.abort cancels the run
 ```
 
 ## Examples
 ### Streaming gateway with backpressure, cancellation and Zod
-A minimal Node gateway that relays a streaming response from the Python core, honours backpressure,
-cancels the upstream call when the client disconnects, and validates a model-produced tool call at
+A minimal Node gateway that relays a streaming agent response from the Python core, honours backpressure,
+cancels the upstream run when the client disconnects, and validates a model-produced tool call at
 runtime with a Zod schema that also provides the static type for free.
 
 ```ts
@@ -162,6 +179,38 @@ const parsed = ToolCall.safeParse(JSON.parse('{"name":"lookup_order","arguments"
 if (!parsed.success) console.error(parsed.error.issues);   // never trust model output structurally
 ```
 
+### A tool dispatcher that validates every model tool call
+In a TypeScript agent loop, each tool call the model emits is parsed against its schema before it runs;
+a failure goes back to the model as a tool result instead of throwing.
+
+```ts
+import { z } from "zod";
+
+const tools = {
+  lookup_order: {
+    args: z.object({ orderId: z.string().regex(/^ord_[a-z0-9]+$/) }),
+    run: async (a: { orderId: string }) => ({ status: "shipped", orderId: a.orderId }),
+  },
+  refund: {
+    args: z.object({ orderId: z.string(), amountCents: z.number().int().positive().max(50_000) }),
+    run: async (a: { orderId: string; amountCents: number }) => ({ queued: true, ...a }),
+  },
+} as const;
+
+type ToolName = keyof typeof tools;
+
+export async function dispatch(name: string, rawArgs: string, signal: AbortSignal) {
+  if (!(name in tools)) return { error: `unknown tool ${name}` };       // model invented a tool
+  const tool = tools[name as ToolName];
+  let json: unknown;
+  try { json = JSON.parse(rawArgs); } catch { return { error: "arguments were not valid JSON" }; }
+  const parsed = tool.args.safeParse(json);
+  if (!parsed.success) return { error: parsed.error.issues };           // let the model repair it
+  if (signal.aborted) return { error: "run cancelled" };                // user left: do not act
+  return tool.run(parsed.data as never);
+}
+```
+
 ### Measuring a blocked event loop, and the worker fix
 Runnable with Node alone (`node lag.mjs`). `perf_hooks.monitorEventLoopDelay` records how late the
 loop's timer fires, in nanoseconds.
@@ -193,49 +242,52 @@ await phase("same 500 ms in a worker thread", () => new Promise((resolve) => {
 // idle: ~11 ms   main thread: ~507 ms   worker thread: ~11 ms
 ```
 
-### Worked scenario: why the gateway's memory climbed
-A gateway relays 500 concurrent chats. The model emits ~50 tokens per second; a slow mobile client
+### Worked scenario: why the agent gateway's memory climbed
+A gateway relays 500 concurrent agent chats. The model emits ~50 tokens per second; a slow mobile client
 reads ~10. Figures are illustrative.
 
 | Design | Per slow stream after 60 s | 500 streams |
 |---|---|---|
 | Ignore `res.write()` returning `false` | ~2,400 unsent tokens buffered and growing | memory climbs until the process dies |
 | Wait for `drain` before pulling more | about one high-water mark of buffer | flat; the upstream TCP window throttles the model stream |
-| Plus abort on `close` | buffer freed when the tab closes | upstream connections track client connections |
+| Plus abort on `close` | buffer freed when the tab closes | upstream connections and agent runs track client connections |
 
 ## Production patterns
+- **Validate every tool call before it runs.** Parse each model tool call with Zod `safeParse`, return
+  `error.issues` to the model as the tool result, and log them with the prompt version. Track
+  validation-failure rate per model, prompt and tool; a spike after a prompt change is a regression.
+- **Abort the agent run on disconnect.** Pass an `AbortController` signal to every upstream `fetch` and
+  SDK call, abort on the response `close` event before it finished, and check the signal before
+  side-effecting tools. Monitor token spend against tokens delivered.
 - **Alert on event-loop delay.** Export `monitorEventLoopDelay` percentiles (p99, max) as a metric every
   few seconds and reset the histogram; alert when p99 climbs. Rising lag across all routes points to sync
   CPU work on the main thread.
 - **Move CPU work to a worker pool.** Tokenizing, large JSON transforms or hashing go to
   `worker_threads` (often through a pool library such as Piscina) or to the Python core. Monitor pool
   queue length and task duration.
-- **Abort upstream on disconnect.** Pass an `AbortController` signal to every upstream `fetch` and abort
-  on the response `close` event before it finished. Monitor the ratio of upstream to client
-  connections, and token spend against tokens delivered.
-- **Validate every boundary with a schema.** Parse model output, webhooks and third-party responses with
-  Zod `safeParse` and log `error.issues` with the prompt version. Track validation-failure rate per model
-  and prompt.
 - **Generate the client from OpenAPI.** Run a generator (for example openapi-typescript) over the Python
-  service's schema in CI and fail the build on a diff. That turns a renamed field into a compile error
-  instead of a silent `undefined`.
+  agent service's schema in CI and fail the build on a diff. That turns a renamed field into a compile
+  error instead of a silent `undefined`.
+- **Keep long agent runs off short-lived functions.** Serverless routes start or stream short runs; runs
+  that loop for minutes go to a long-lived server or a queue, because platform timeouts cut them mid-step.
 
 ## Trade-offs
-- **One language vs a split ecosystem.** One language from browser to gateway cuts translation and team
-  overhead, but the model, eval and data ecosystem stays in Python, so you pay for a cross-language
+- **One language vs a split ecosystem.** One language from browser to agent gateway cuts translation and
+  team overhead, but the model, eval and data ecosystem stays in Python, so you pay for a cross-language
   contract instead.
 - **Cheap streaming vs CPU fragility.** The event loop makes streaming proxies cheap, but any CPU-bound
   step on the main thread blocks everyone; it flips when per-request compute grows and you need worker
   threads or Python.
 - **Static safety vs runtime blindness.** Types give refactoring safety but vanish at runtime, so every
-  external boundary needs a schema library and the duplication that comes with it.
+  external boundary, model output included, needs a schema library and the duplication that comes with it.
 - **Frictionless serverless vs platform limits.** Serverless and edge deployment is easy for Node, but
   long-running agent loops and large streaming responses hit platform timeouts and body-size limits a
   long-lived server never sees.
 
 ## Pitfalls
 - **Validating model output with a cast (`as ToolCall`).** Symptom: a runtime
-  `undefined is not a function` far from the boundary that produced the bad data. Fix: `safeParse`.
+  `undefined is not a function` far from the boundary that produced the bad data, or a tool run with
+  wrong arguments. Fix: `safeParse` and return the issues to the model.
 - **Buffering the whole model stream before writing.** Symptom: time-to-first-token equals total
   generation time, and memory spikes under concurrent chats. Fix: relay chunk by chunk and honour `drain`.
 - **Not propagating client disconnects upstream.** Symptom: token spend exceeds what users received, and
@@ -246,9 +298,9 @@ reads ~10. Figures are illustrative.
   surfaces as silent `undefined` on the other. Fix: generate it from OpenAPI.
 
 ## When to use
-- **Use Node/TypeScript** for the layer facing the product: UI streaming routes, a backend-for-frontend,
-  serverless glue, MCP servers for product data, and lightweight agent orchestration where the SDKs are
-  excellent.
+- **Use Node/TypeScript** for the agent layer facing the product: UI streaming routes, a
+  backend-for-frontend, serverless glue, MCP servers for product data, and lightweight agent
+  orchestration where the SDKs are excellent.
 - **Keep in Python:** inference, evaluation, fine-tuning and data pipelines.
 - **TypeScript-only is reasonable** if the team is entirely TypeScript and the AI work is API calls to a
   provider, until evals or custom models appear.
@@ -279,14 +331,15 @@ touches the user is TypeScript", with an OpenAPI-generated client as the contrac
 language costs a build step rather than a translation team.
 
 ## Interview questions
-### Why does a TypeScript service still need runtime validation?
+### Why does a TypeScript agent still need runtime validation of tool calls?
 - **Types are erased at compile time:** the emitted JavaScript has no knowledge of `ToolCall`, so a cast
   only silences the compiler.
-- **Boundary data never saw your types:** model output, webhooks and third-party APIs can send anything.
+- **Boundary data never saw your types:** model output, webhooks and third-party APIs can send anything,
+  and a model can invent a tool name or a malformed argument.
 - **The fix is one schema for both:** Zod validates at runtime, `z.infer` derives the static type, and the
-  same schema can become the model's tool JSON Schema.
+  same schema can become the model's tool JSON Schema; failures go back to the model to repair.
 
-### A Node streaming gateway's memory grows steadily under load until it is OOM-killed. How do you debug it?
+### A Node streaming gateway in front of your agents grows in memory under load until it is OOM-killed. How do you debug it?
 - **Suspect ignored backpressure:** check whether the relay keeps writing after `res.write()` returns
   `false` instead of waiting for `drain`.
 - **Suspect leaked upstreams:** compare upstream and client connection counts; more upstreams means
@@ -303,17 +356,18 @@ language costs a build step rather than a translation team.
 - **Neither, if it is cheap:** measure with `monitorEventLoopDelay` first; work that keeps loop delay to a
   few milliseconds can stay inline.
 
-### How would you keep a TypeScript frontend and a Python AI service in sync as both evolve?
+### How would you keep a TypeScript agent UI and a Python agent service in sync as both evolve?
 - **Single source of truth:** the Python service's Pydantic models generate its OpenAPI schema.
 - **Generated client:** CI generates TypeScript types from that schema and fails on an unreviewed diff,
   so a rename breaks the build, not production.
-- **Compatibility rules:** additive changes only within a version, plus contract tests on the boundary.
+- **Compatibility rules:** additive changes only within a version, plus contract tests on the boundary,
+  including the agent step-event types the UI renders.
 
-### A user closes the tab halfway through a long answer. What should happen, and how do you verify it?
+### A user closes the tab halfway through a long agent run. What should happen, and how do you verify it?
 - **Gateway:** the response `close` event fires before the write finished; abort the `AbortController`
   passed to `fetch`, which closes the upstream connection.
-- **Core:** the Python service must notice the disconnect and stop generation, or the abort saves
-  nothing; both hops must propagate cancellation.
+- **Core:** the Python service must notice the disconnect and stop generation and tool calls, or the
+  abort saves nothing; both hops must propagate cancellation.
 - **Verify:** load-test with clients that disconnect early and compare tokens generated against tokens
   delivered.
 
@@ -341,3 +395,28 @@ language costs a build step rather than a translation team.
 - [ ] An MCP server exposing the product's CRM records as tools
 > Evals, embeddings and anything near model weights depend on Python-first tooling. Routes, middleware
 > and MCP servers for product data are edge concerns where TypeScript's SDKs and team fit win.
+
+## Use cases & projects
+### Use cases
+- **Agent chat UIs in Next.js.** A route handler streams agent steps (tool call, tool result, text) to
+  React components and aborts the run when the user leaves.
+- **MCP servers for product data.** A TypeScript tool server exposes CRM or order records to any MCP
+  client, with a Zod schema per tool.
+- **BFF in front of a Python agent core.** The gateway adds auth, per-user rate limits and a generated
+  typed client, while planning, retrieval and evals stay in Python.
+- **Lightweight provider-only agents.** A support or triage agent built with the Vercel AI SDK or a
+  provider SDK, where all model work is API calls.
+
+### Mini project
+**A validated, cancellable tool-calling route (1-2 hours).**
+- **Goal:** build a Node route that runs a small agent loop with two tools, validates every tool call,
+  streams steps, and stops when the client leaves.
+- **Steps:** define two tools with Zod schemas and a dispatcher like the one above; stream each step as
+  an SSE event; wire `res.on("close")` to an `AbortController` passed to the model call and checked before
+  each tool runs; add a fake model that sometimes emits malformed arguments.
+- **Done when:** malformed calls come back to the model as validation errors, `curl -N` shows steps
+  arriving live, and killing curl mid-run stops further model and tool calls in the logs.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): a TypeScript client generated from
+DocBrief's OpenAPI document, or a Node gateway in front of it, exercises the cross-language contract.

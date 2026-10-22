@@ -5,7 +5,8 @@ name: Engines (vLLM, SGLang, TGI, TensorRT-LLM, Ollama, llama.cpp)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - serving-inference/model-serving
   - serving-inference/continuous-batching
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-An inference engine turns requests into tokens and owns batching, KV memory, kernels and the API.
-Datacenter engines (vLLM, SGLang, TGI, TensorRT-LLM) serve many users; local runtimes (llama.cpp, Ollama)
-favour portability. Choose by hardware, concurrency and ops effort.
+When you self-host an agent's model, the engine decides how many agent loops run at once, whether shared
+prefixes are reused, and whether tool calls parse. vLLM, SGLang, TGI and TensorRT-LLM serve fleets;
+llama.cpp and Ollama run local agents.
+
+## For agent builders
+- **Why it matters for agents.** Agent traffic is many calls per run over long, repeated prefixes with
+  tool calls in the output. The engine's prefix reuse, KV pool and tool-call parser decide step latency,
+  concurrent runs per GPU and whether your loop sees valid tool calls at all.
+- **Where it shows up in your stack.** The `base_url` your agent framework's OpenAI-compatible client
+  points at; `vllm serve` flags; Ollama on a laptop for local agent development; the engine's `/metrics`
+  endpoint behind your agent dashboards.
+- **What you control.** Engine choice per deployment, context ceiling and batch cap from KV arithmetic,
+  prefix caching, the chat template and tool-call parser for the model, and a contract test suite for tool
+  calling and JSON on every engine and model pair.
+- **What you can skip.** Kernel internals and the TensorRT build details unless you run a fixed,
+  high-volume model fleet. Most agent teams use a hosted API or vLLM or SGLang.
 
 ## Why it exists
 - **A plain `model.generate()` loop wastes the GPU.** It serves one request at a time, allocates KV cache
@@ -145,9 +159,22 @@ They differ in emphasis, hardware reach, model format and how much work it takes
 | llama.cpp | laptop, edge, CPU | small-scale batching | CPU, Apple Silicon, consumer GPUs | GGUF |
 | Ollama | developer machine | single-user defaults | as llama.cpp | GGUF via registry |
 
+### What agent traffic asks of an engine
+| Agent need | Engine feature | What to check |
+|---|---|---|
+| Steps re-send a long, stable prefix | prefix caching (vLLM automatic prefix caching, SGLang RadixAttention) | prefix-cache hit rate and TTFT on step 2 onward |
+| Many concurrent runs, each with a growing transcript | KV pool size, `--max-num-seqs`, `--max-model-len` | preemptions as runs get long |
+| Tool calls in the model's output | a tool-call parser and the right chat template per model | parse-error rate on a tool-calling contract suite |
+| Structured arguments and plans | grammar-constrained or guided decoding | invalid-JSON rate with and without it |
+| Fan-out to parallel sub-agents | continuous batching across the parallel calls | step latency at peak fan-out |
+
+- **Tool calling is engine-specific.** In vLLM, tool calls in the OpenAI format need tool-choice support
+  enabled and a parser matching the model family set at startup (see the engine's tool-calling docs);
+  other engines have their own switches. Without them the call arrives as plain text the agent cannot run.
+
 ## Diagram
-Start at the top with where the model runs, then let traffic shape and operational budget pick the
-engine; the leaves are starting points to benchmark, not verdicts.
+Start at the top with where the agent's model runs, then let traffic shape and operational budget pick
+the engine; the leaves are starting points to benchmark on your agent traces, not verdicts.
 
 ```mermaid
 flowchart TD
@@ -240,7 +267,57 @@ for ctx in (8_192, 3_000, 1_000):
 # 8,192 -> 48   3,000 -> 132   1,000 -> 396
 ```
 
+### Tool-calling contract test against any engine
+Run the same agent-shaped request against the hosted API, vLLM and Ollama before switching an agent's
+`base_url`. It asserts the engine returns a structured tool call with parseable arguments, not text.
+
+```python
+import json
+from openai import OpenAI
+
+TOOLS = [{"type": "function", "function": {
+    "name": "get_order_status",
+    "description": "Look up an order by id",
+    "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}},
+                   "required": ["order_id"]}}}]
+
+def check_tool_call(base_url, model):
+    client = OpenAI(base_url=base_url, api_key="not-needed")
+    resp = client.chat.completions.create(
+        model=model, max_tokens=256, tools=TOOLS,
+        messages=[{"role": "user", "content": "Where is order A-1042?"}])
+    calls = resp.choices[0].message.tool_calls or []
+    assert calls, f"{base_url}: no structured tool call, got text: {resp.choices[0].message.content!r}"
+    args = json.loads(calls[0].function.arguments)          # raises if arguments are not valid JSON
+    assert calls[0].function.name == "get_order_status" and args.get("order_id") == "A-1042"
+    return "ok"
+
+for name, (url, model) in ENGINES.items():                  # ENGINES from the example above
+    print(name, check_tool_call(url, model))
+```
+
+### Worked scenario: sizing one GPU for concurrent agent runs
+Same 80 GB GPU and Llama-3.1-8B (128 KiB per token, about 400,000 tokens of KV pool). Agents start at a
+6k-token prefix and grow ~1.5k tokens per step (illustrative).
+
+| Agent run length | Live tokens at the last step | Concurrent runs at that length |
+|---|---|---|
+| 5 steps | ~12,000 | ~33 |
+| 10 steps | ~19,500 | ~20 |
+| 20 steps | ~34,500 | ~11 |
+
+- **Long runs, not users, set capacity:** the same GPU holds three times fewer 20-step runs than 5-step
+  ones, and needs `--max-model-len` above 32k.
+- **Prefix sharing recovers some of it:** with prefix caching, runs sharing the 6k prefix can share its
+  blocks instead of storing it once per run.
+
 ## Production patterns
+- **Develop agents locally, serve them on a GPU engine.** Point the agent framework's OpenAI-compatible
+  client at Ollama during development and at vLLM or SGLang in staging and production, changing only
+  `base_url` and the model name. Monitor tool-call parse errors when you switch.
+- **Benchmark on recorded agent traces.** Replay real multi-step runs, including parallel tool calls, at
+  target concurrency, rather than single prompts, because prefix reuse and long transcripts dominate agent
+  traffic. Monitor step latency p95 and preemptions as runs lengthen.
 - **Size flags from KV arithmetic.** Compute the pool as above, then set `--max-model-len` and
   `--max-num-seqs` so the expected traffic mix fits; confirm against the capacity the vLLM startup log
   reports. Monitor KV-cache usage and preemption counts on the engine's Prometheus `/metrics` endpoint.
@@ -270,6 +347,9 @@ for ctx in (8_192, 3_000, 1_000):
 - **Local portability vs concurrency.** llama.cpp and Ollama run anywhere with no Python stack, but their
   throughput under many concurrent users is far below a GPU engine: right for one user per box, wrong for
   a shared service.
+- **Self-hosted engine vs hosted API for agents.** Self-hosting controls data and per-token cost at volume
+  and lets you serve a fine-tuned agent model, but you take on tool-call parsing, template correctness and
+  capacity; a hosted API wins until volume or data rules force the move.
 - **TGI ecosystem fit vs cadence.** Hub and Inference Endpoints integration saves work, but adopting it
   means accepting Hugging Face's cadence for serving optimisations.
 
@@ -290,6 +370,9 @@ for ctx in (8_192, 3_000, 1_000):
   never-terminating output.
 - **A TensorRT engine built on one GPU type deployed to another.** Symptom: a load failure on the new
   nodes after a hardware refresh.
+- **Serving an agent model without tool-call parsing enabled.** Symptom: the agent loop receives the tool
+  call as plain text in `content` and either stops or answers without acting. Fix: enable the engine's
+  tool-calling support with the right parser and template, and gate the deploy on the contract test.
 
 ## When to use
 - **Where does it run?** Developer laptop or edge: llama.cpp or Ollama. A shared GPU service: one of the
@@ -363,6 +446,14 @@ fixed.
 - **Check the chat template** matches the model (base vs instruct), and run contract tests for tool
   calling and JSON mode on every engine and model pair.
 
+### You are moving a 20-step agent from a hosted API to one GPU. Which engine and settings?
+- **Engine:** SGLang or vLLM with prefix caching on, because every step re-sends the same tools-and-system
+  prefix; benchmark both on recorded agent traces.
+- **Settings from KV arithmetic:** a 20-step run reaches ~34.5k tokens, so `--max-model-len` must exceed
+  that and only about 11 such runs fit on 80 GB with an 8B GQA model; cap concurrent runs to match.
+- **Gate on behaviour:** tool-calling parser and template enabled and a contract suite passing before any
+  traffic moves.
+
 ## Quiz
 ### Q: Which engine's distinctive workflow compiles the model ahead of time for a specific GPU architecture and configuration?
 - [ ] vLLM
@@ -391,3 +482,24 @@ fixed.
 > matches a cached one reuses it without recomputation. vLLM's block-hash prefix caching also reuses
 > shared prefixes, so the gap is one of degree; it is largest in multi-turn and agent traffic, where
 > branching conversations share long, irregular prefixes.
+
+## Use cases & projects
+### Use cases
+- **Local agent development.** Ollama or llama.cpp on a laptop runs the agent loop offline, with the same
+  OpenAI-compatible client code used in production.
+- **Agents on private data.** vLLM or SGLang inside a customer's VPC keeps prompts and tool results on
+  premises.
+- **Serving a fine-tuned agent model.** An engine hosts the model the provider does not, with prefix
+  caching for the agent's stable prompt.
+- **High-volume agent fleets.** A fixed model on a homogeneous NVIDIA fleet can justify TensorRT-LLM's
+  build pipeline for peak throughput.
+
+### Mini project
+**Run one agent on two engines and compare (2-3 hours).**
+- **Goal:** move a small tool-calling agent from Ollama to vLLM or SGLang without code changes beyond
+  `base_url` and model name, and measure the difference.
+- **Steps:** build a 5-step agent with two tools using an OpenAI-compatible client; run the tool-calling
+  contract test on both engines; replay 20 concurrent runs on each; record step latency, prefix-cache hit
+  rate where reported, and tool-call parse failures.
+- **Done when:** you have a table per engine of p50 and p95 step latency, parse failures and completed
+  runs at 20-way concurrency, plus the flags you had to set to make tool calls parse.

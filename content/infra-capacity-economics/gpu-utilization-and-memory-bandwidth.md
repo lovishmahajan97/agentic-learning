@@ -386,3 +386,25 @@ Buy hardware only after per-card tokens/s approaches the bandwidth bound at the 
 > Arithmetic intensity in prefill is roughly the number of tokens in the pass, far above the ridge
 > point; in decode it is roughly the batch size, usually far below it. Writing the KV cache is small
 > relative to the matrix multiplications over thousands of tokens.
+
+## Use cases & projects
+### Use cases
+- **Setting batch limits against an agent latency SLO.** Every step's decode time multiplies by the
+  number of steps, so the batch limit is chosen from end-to-end run latency, not single-request latency.
+- **Picking autoscaling signals for agent model servers.** Queue depth or in-flight requests, not
+  GPU-Util, because a bandwidth-bound card reports high utilisation while its compute sits idle.
+- **Cutting tool-call latency.** Short, structured tool-call outputs and stable prefixes reduce decode
+  and prefill work per step, which shows up directly in run time.
+- **Explaining why a faster GPU did not speed up the agent.** Comparing cards on memory bandwidth rather
+  than peak FLOPs predicts per-step decode speed.
+
+### Mini project
+**Measure the batch-versus-run-latency curve (2-3 hours).**
+- **Goal:** show how raising concurrency on a self-hosted model increases fleet throughput while
+  lengthening each agent run.
+- **Steps:** serve a small model with vLLM on one GPU; write an agent loop of ten sequential model calls
+  with short tool-call outputs; run 1, 4, 16 and 64 agents at once; record tokens per second for the
+  server and wall-clock per run; capture GPU-Util and, if available, DCGM memory-bandwidth activity for
+  each level.
+- **Done when:** you have a table of concurrency versus throughput versus run latency, plus a note on
+  which concurrency meets a chosen run-latency target and why GPU-Util looked "busy" at every level.

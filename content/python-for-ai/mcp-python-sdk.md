@@ -455,3 +455,27 @@ inside a FastMCP tool does not do this, because it is returned to the client as 
 - [x] When one server should be shared by many clients or run remotely as a service
 > stdio spawns a private subprocess per client, which is ideal locally. A shared or remote server needs
 > HTTP, which also brings authentication and network security into scope.
+
+## Use cases & projects
+### Use cases
+- **Internal tools for every assistant.** A team publishes ticketing, search or database lookups once as
+  an MCP server and uses them from IDE assistants, desktop chat apps and in-house agents.
+- **Agents that consume third-party servers.** Your agent loop connects a `ClientSession`, calls
+  `list_tools()` and passes the result to the model as tool definitions, with no bespoke glue per tool.
+- **Local developer agents over stdio.** A desktop host spawns your server as a subprocess for file,
+  git or project-specific actions on the developer's machine.
+- **Shared remote tool services.** One Streamable HTTP server with authentication serves many agents and
+  users, so tool logic and access control live in one place.
+
+### Mini project
+**Build an MCP tool server and call it from your own agent (2-3 hours).**
+- **Goal:** expose two tools with FastMCP and drive them from a minimal agent loop you write.
+- **Steps:** write a `FastMCP` server with two `@mcp.tool()` functions (for example a note search and a
+  note create) with clear docstrings and type hints; run it over stdio, logging to stderr only; write a
+  client with `ClientSession` that lists tools, maps them to your model's tool format, runs a tool-calling
+  loop and returns tool errors to the model; test one call that fails on purpose.
+- **Done when:** the agent completes a two-step task using both tools, recovers from the deliberate tool
+  error, and the same server also works unchanged in one existing MCP host.
+
+The module guide's Capstone is the major project that combines this server with the module's other
+lessons into a working agent.

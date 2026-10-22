@@ -5,7 +5,8 @@ name: Gradient accumulation
 kind: practice
 difficulty: core
 est_minutes: 11
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - ml-fundamentals/batch-size
   - ml-fundamentals/gradient-clipping
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Gradient accumulation sums gradients from several micro-batches before one optimizer step. Because
-gradients are linear in the examples, the optimizer sees the recipe's batch while memory holds one
-micro-batch. It costs no memory but buys no speed: every micro-batch still runs.
+Gradient accumulation sums gradients from several micro-batches before one optimizer step, so a single
+GPU fine-tuning on long agent traces sees the recipe's batch. It costs no memory but buys no speed, and
+variable-length traces need token-weighted loss.
+
+## For agent builders
+- **Why it matters for agents.** Agent traces are long (system prompt, tool schemas, tool results), so
+  often only 1–4 fit per GPU. Accumulation is how a LoRA run on one 24 GB or 80 GB card reaches a sensible
+  effective batch of agent trajectories.
+- **Where it shows up in your stack.** `gradient_accumulation_steps` in the Hugging Face `Trainer` and TRL
+  trainers, `accelerator.accumulate(model)` in Accelerate, `gradient_accumulation_steps` in DeepSpeed
+  configs; hosted fine-tuning services handle it for you.
+- **What you control.** The accumulation count `k`, counting warmup and decay in optimizer steps (not
+  micro-batches), and normalizing loss by the window's trainable-token count when only assistant turns are
+  trained and tool outputs are masked.
+- **What you can skip.** FSDP and ZeRO reduce-scatter tuning unless you train across many GPUs; for a
+  single-card agent fine-tune, the trainer setting plus correct step counting is the whole job.
 
 ## Why it exists
 - **Memory has a fixed part.** Weights, gradients and optimizer moments are set by parameter count: with
@@ -32,7 +46,7 @@ micro-batch. It costs no memory but buys no speed: every micro-batch still runs.
   example is processed.
 - **Only activations shrink.** They scale with micro-batch × sequence length × hidden size × layers, so
   the largest micro-batch that fits is a hardware fact, illustratively 1–8 sequences for a multi-billion
-  parameter model at a few thousand tokens of context.
+  parameter model at a few thousand tokens of context. Long agent traces sit at the low end.
 - **The recipe wants a bigger batch.** It picks the effective batch from the gradient-noise scale and
   tunes the learning rate for it: hundreds of sequences for fine-tuning, millions of tokens for
   pre-training.
@@ -71,6 +85,13 @@ into `k` micro-batches of `b = B/k` examples; micro-batch `j` has mean loss `L_j
 - **Every "step" means optimizer step:** warmup steps, `num_training_steps` and log lines. A run with
   accumulation 8 that processes 80,000 micro-batches has taken 10,000 steps.
 
+### Agent traces make loss normalization the main risk
+- **Only some tokens are trained.** Agent fine-tunes usually set labels to -100 on the system prompt,
+  user turns and tool results, so only assistant turns (tool calls, final answers) count.
+- **Trainable tokens per micro-batch swing widely.** A micro-batch of short routing calls may hold tens of
+  trainable tokens; one with a long final answer, thousands. Per-micro-batch means then over-weight the
+  short ones, as the next subsection explains.
+
 ### Under data parallelism
 - **DDP reduces inside `backward()`,** bucket by bucket. With accumulation that is `k` reductions per
   step, `k − 1` of them wasted, because only the sum matters.
@@ -104,7 +125,8 @@ into `k` micro-batches of `b = B/k` examples; micro-batch `j` has mean loss `L_j
 - **To go faster,** raise the micro-batch until memory is nearly full (or the step is compute-bound);
   accumulation then covers the remaining gap to the target effective batch.
 - **Gradient checkpointing is complementary.** It shrinks per-sequence activation memory at the price of
-  recomputation, so it can make a long sequence fit at all, which accumulation cannot.
+  recomputation, so it can make a long sequence (such as a trace with a huge tool result) fit at all,
+  which accumulation cannot.
 
 ## Diagram
 One optimizer step spans `k` micro-batches; communication, clipping and the scheduler happen once, at the
@@ -124,10 +146,25 @@ flowchart TD
 ```
 
 ## Examples
+### Worked scenario: a tool-calling LoRA on one 24 GB card
+A team tunes an adapter on 4,800 agent traces for 2 epochs. Only micro-batch 2 fits (illustrative), and
+the target effective batch is 32, so `k = 32 / 2 = 16`.
+
+| Quantity | Correct accounting | Counted per micro-batch |
+|---|---|---|
+| Micro-batches over the run | 4,800 | 4,800 |
+| Optimizer steps | 4,800 ÷ 16 = 300 | 4,800 planned |
+| 10% warmup | 30 steps | 480 steps, longer than the 300 that run |
+| Decay progress when data runs out | 100% | the rate never even reaches its peak |
+
+Token weighting, same run: a window mixes a micro-batch of two routing calls with 40 trainable tokens and
+one with a long final answer holding 1,200. With per-micro-batch means, each routing token weighs
+1,200 ÷ 40 = 30× a final-answer token; dividing by the window's total trainable tokens weighs them equally.
+
 ### One optimizer step with token-weighted loss under DDP
 Token-weighted loss normalization, a single all-reduce per window under DDP, and clipping and the
 scheduler applied once to the summed gradient. The model is assumed to be a Hugging Face causal LM; the
-worked numbers show the step accounting schedulers must be given.
+labels already mask non-assistant tokens of each agent trace with -100.
 
 ```python
 import torch
@@ -213,12 +250,15 @@ for mb in mbs:
   Accelerate pass `gradient_accumulation_steps` to `Accelerator` and wrap each micro-batch in
   `accelerator.accumulate(model)`; in DeepSpeed set `gradient_accumulation_steps` in the config. Monitor
   the logged step count: it should equal micro-batches ÷ `k`.
-- **Normalize by window tokens.** For variable-length LM data, compute the window's real-token count
-  before the loop and divide summed token losses by it (recent Trainer versions pass this count to the
-  loss as `num_items_in_batch`). Regression-test that the loss does not shift when `k` changes.
-- **Max the micro-batch, then accumulate.** Raise the micro-batch (with gradient checkpointing if needed)
-  until memory is nearly full, then set `k = target ÷ (micro-batch × world size)`. Monitor tokens per
-  second, step time and peak memory, and log the effective batch explicitly.
+- **Normalize by window tokens on masked agent traces.** Compute the window's trainable-token count (labels
+  not -100) before the loop and divide summed token losses by it (recent Trainer versions pass this count
+  to the loss as `num_items_in_batch`). Regression-test that the loss does not shift when `k` changes.
+- **Max the micro-batch, then accumulate.** Raise the micro-batch (with gradient checkpointing if needed
+  for long tool results) until memory is nearly full, then set `k = target ÷ (micro-batch × world size)`.
+  Monitor tokens per second, step time and peak memory, and log the effective batch explicitly.
+- **Size the schedule from optimizer steps before launch.** For an agent fine-tune, print micro-batches,
+  `k`, optimizer steps and warmup steps, and refuse the run if warmup is a large share of it. Monitor the
+  learning-rate trace in the run logs.
 - **One all-reduce per window.** Under DDP use `no_sync()` for the first `k − 1` micro-batches; under
   FSDP or ZeRO decide per job whether to delay the reduce-scatter, weighing communication saved against
   unsharded-gradient memory. Watch communication time per step.
@@ -231,7 +271,7 @@ for mb in mbs:
   cost, but the forward/backward work runs serially, so time per optimizer step grows linearly with `k`.
 - **Exact vs inexact cases.** Exact for per-token mean losses and per-token normalization layers;
   inexact for BatchNorm-style layers and a naive `loss / k` under variable-length batches, with error
-  growing with the spread in tokens per micro-batch.
+  growing with the spread in tokens per micro-batch (large for masked agent traces).
 - **Fewer all-reduces vs sharded memory.** Skipping the all-reduce until the last micro-batch cuts DDP
   communication `k`-fold, but under FSDP or ZeRO it means holding unsharded gradients for the whole window,
   which can cost the memory accumulation was meant to save.
@@ -246,7 +286,8 @@ for mb in mbs:
 - **Not dividing the loss by `k`** (or by the window's token count). The summed gradient is `k`× too
   large: a `k`× learning rate for SGD, and distorted clipping thresholds and logged norms for Adam.
 - **Stepping the scheduler or counting warmup per micro-batch.** Decay finishes `k`× early; the run spends
-  most of its length at the floor learning rate.
+  most of its length at the floor learning rate. The reverse mistake, sizing the planned schedule in
+  micro-batches, means the run ends before the decay does.
 - **Clipping inside the loop.** Each clip rescales a partial sum, so the final gradient's direction and
   magnitude depend on `k`. Clip once after the last backward.
 - **`zero_grad()` at the top of every micro-batch,** copied from a plain loop. Only the last gradient
@@ -255,19 +296,19 @@ for mb in mbs:
 - **Expecting faster training.** Tokens per second are unchanged or slightly lower; setting
   `gradient_accumulation_steps=16` "for speed" makes each optimizer step 16× slower.
 - **Per-micro-batch means on variable-length data.** The training loss shifts when `k` changes and short
-  sequences are over-weighted. Fix: sum token losses and divide by the window's token count (under DDP, by
-  the global count across ranks if exactness matters).
+  sequences (short tool calls) are over-weighted. Fix: sum token losses and divide by the window's token
+  count (under DDP, by the global count across ranks if exactness matters).
 - **Inconsistent last partial window.** A step from 3 micro-batches divided by `k = 8` is a 3/8-size step;
   drop the remainder or normalize by the actual count.
 
 ## When to use
 - **Use it** whenever the micro-batch that fits is smaller than the recipe's effective batch, which
-  describes most single-GPU and small-cluster fine-tuning.
+  describes most single-GPU and small-cluster fine-tuning, including nearly every agent-trace fine-tune.
 - **Order of operations:** raise the micro-batch until memory is nearly full or the GPU is compute-bound
   (that is what raises throughput), set accumulation to close the gap, then size warmup and total steps in
   optimizer steps.
 - **Avoid** pushing the effective batch past the gradient-noise scale: it costs data for no gain whether
-  the batch comes from GPUs or from accumulation.
+  the batch comes from GPUs or from accumulation. On small agent datasets, also keep enough steps.
 - **Measure:** tokens per optimizer step, step time and peak memory; log the effective batch explicitly.
 - **Interviews:** the linearity argument, the ordering with clipping, loss scaling and the scheduler, the
   `no_sync` communication point, and the plain statement that it saves memory, not time.
@@ -307,18 +348,27 @@ agreement is the bug.
 - **Weights are frozen inside the window,** so every micro-batch sees the same parameters.
 - **PyTorch adds into `.grad`,** so accumulation is just delaying `zero_grad()` and the optimizer step.
 
+### You fine-tune on agent traces with tool outputs masked, and the loss changes when you change k. Why?
+- **Trainable tokens vary per micro-batch:** with tool results, system and user turns masked, some
+  micro-batches hold tens of trainable tokens and others thousands.
+- **Per-micro-batch means over-weight short ones,** so the window loss is not a per-token mean and depends
+  on how traces fall into micro-batches.
+- **Fix:** divide summed token losses by the window's trainable-token count (global across ranks under
+  DDP), and add a test that the loss is stable across `k`.
+
 ### A team set gradient_accumulation_steps to 16 to speed training up. What happened?
 - **No speed-up:** the 16 forward/backward passes run one after another, so tokens per second are
   unchanged or slightly lower and each optimizer step takes about 16× longer.
 - **Memory is flat:** only one micro-batch of activations is alive at a time.
 - **What actually helps:** a larger micro-batch until the GPU is compute-bound, or more GPUs.
 
-### A single 32k-token sequence does not fit even at micro-batch 1. Does accumulation help?
+### A single 32k-token agent trace does not fit even at micro-batch 1. Does accumulation help?
 - **No:** accumulation only splits a batch across sequential passes; the smallest unit it can split down
   to is one sequence, so that sequence's activations must still fit.
 - **Use gradient checkpointing:** it stores only some activations and recomputes the rest in backward,
   roughly one extra forward pass, shrinking per-sequence activation memory.
-- **Combine them:** checkpointing makes one sequence fit, then accumulation reaches the target batch.
+- **Combine them:** checkpointing makes one sequence fit, then accumulation reaches the target batch. Also
+  ask whether the trace should be truncated or its tool result summarised.
 
 ### Under FSDP, should you delay gradient reduction until the end of the window?
 - **Benefit:** fewer reduce-scatters, so less communication per optimizer step.
@@ -359,3 +409,25 @@ agreement is the bug.
 > BatchNorm couples the examples inside a micro-batch, so statistics over 4 examples differ from those
 > over 64. LayerNorm is per-token, `no_sync` only delays communication, and bf16 adds rounding noise but
 > no systematic difference.
+
+## Use cases & projects
+### Use cases
+- **Single-GPU agent fine-tunes.** Long traces fit only 1–4 per card, so accumulation reaches a target
+  effective batch of trajectories without buying more memory.
+- **Assistant-only loss on tool-calling data.** Masking tool results and user turns makes trainable-token
+  counts uneven, which is exactly where window-level token normalization matters.
+- **Reproducing a recipe on smaller hardware.** An FDE runs a customer's 128-sequence recipe on the one
+  card they have by trading micro-batch for accumulation.
+- **Preference or RL phases on agent trajectories.** Long rollouts force small micro-batches, and the same
+  step-counting rules apply to the schedule.
+
+### Mini project
+**Prove your accumulation loop on agent traces (1-2 hours).**
+- **Goal:** show that your fine-tuning loop gives the same loss for `k = 1` and `k = 8` on masked agent
+  traces, and that the naive version does not.
+- **Steps:** build 64 synthetic tool-calling traces of very different lengths with labels masked to
+  assistant turns; on a tiny causal LM in fp32 with dropout off, compute one window's gradient with a true
+  batch, with accumulation and per-micro-batch means, and with accumulation and window-token
+  normalization; print the gradient difference and the loss for each.
+- **Done when:** the token-normalized loop matches the true batch to around 1e-6, the naive loop visibly
+  does not, and the check runs as a test you can keep beside your fine-tuning code.

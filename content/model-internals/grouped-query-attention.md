@@ -5,7 +5,8 @@ name: Grouped-query attention (GQA)
 kind: concept
 difficulty: core
 est_minutes: 12
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - model-internals/multi-head-attention
   - model-internals/kv-cache
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-GQA lets several query heads share one key/value head. Decode is bound by reading the KV cache, which
-scales with KV heads, so going from 32 to 8 shrinks it fourfold at small quality cost; Llama 2 70B,
-Llama 3 and Mistral adopted it.
+GQA lets several query heads share one key/value head, shrinking the KV cache fourfold from 32 to 8 KV
+heads at small quality cost. For agents that means far more long transcripts resident per GPU; Llama 2
+70B, Llama 3 and Mistral adopted it.
+
+## For agent builders
+- **Why it matters for agents.** Agent sessions are long and keep their transcript cached between steps.
+  The KV-head count sets how many of those sessions stay resident on a GPU, and how fast each one
+  decodes its next tool call or answer.
+- **Where it shows up in your stack.** `num_key_value_heads` in the model config, the cache and
+  concurrency limits of your serving engine (for example `max_model_len` and `max_num_seqs` in vLLM),
+  and KV-cache utilization and preemption metrics.
+- **What you control.** Which open model you self-host (GQA layout versus full MHA), the tensor-parallel
+  degree, an FP8 KV cache, and context caps per agent route.
+- **What you can skip.** Uptraining recipes and kernel internals, unless you pre-train. On hosted APIs
+  GQA is invisible; it only matters when you run the model yourself.
 
 ## Why it exists
 - **Decode time is bytes read.** Each decode step processes one new token per sequence. The arithmetic is
@@ -86,7 +99,8 @@ MQA  g = 1  : 2 × 32 ×  1 × 128 × 2 =  16,384 B =  16 KB per token
   multiply-add per cached element loaded, which no GPU can feed from memory; GQA moves it partway toward
   the compute-bound regime.
 - **Prefill is unaffected.** It is compute-bound, and the attention FLOPs are identical because the
-  queries are not shared.
+  queries are not shared. An agent step that ingests a large new tool result is mostly prefill, so GQA
+  does not make that part faster.
 
 ### Uptraining existing checkpoints
 1. Take a multi-head checkpoint.
@@ -113,7 +127,7 @@ simply train with it from the start.
 
 ## Diagram
 Query heads are grouped onto shared KV heads, so only *g* KV heads are ever written to the cache and each
-one loaded serves h/g queries.
+one loaded serves h/g queries. Every agent session's transcript is stored in that smaller cache.
 
 ```mermaid
 flowchart TD
@@ -178,9 +192,24 @@ print(cfg.num_attention_heads, kv_heads, per_token // 1024, "KB/token")
 # 32 8 128 KB/token
 ```
 
+### Agent scenario: resident agent sessions at 32k tokens
+A coding agent's sessions grow to about 32,768 tokens of transcript, and the engine keeps each session's
+cache so the next step reuses its prefix. One 80 GB card with an 8B fp16 model leaves roughly 60 GB for
+cache after weights and headroom (illustrative).
+
+| Layout | Cache per token | Cache per 32k session | Resident sessions in ~60 GB |
+|---|---|---|---|
+| MHA (32 KV heads) | 512 KB | 16 GiB | about 3 |
+| GQA (8 KV heads) | 128 KB | 4 GiB | about 14 |
+| GQA plus FP8 cache | 64 KB | 2 GiB | about 28 |
+
+- **Why it matters:** sessions that do not fit are evicted or preempted, so their next step re-prefills
+  the whole transcript, which is the slow, compute-bound part.
+- **What GQA does not change:** the prefill of each new tool result costs the same on both layouts.
+
 ### Worked scenario: bytes per decode step at batch 64
-An 8B fp16 model, 64 concurrent chats averaging 4k tokens, on a GPU with roughly 2 TB/s of memory
-bandwidth (illustrative orders of magnitude, not a benchmark).
+An 8B fp16 model, 64 concurrent chats or agent sessions averaging 4k tokens, on a GPU with roughly
+2 TB/s of memory bandwidth (illustrative orders of magnitude, not a benchmark).
 
 | Layout | Weights | Cache read per step | Total bytes | Bandwidth floor per step |
 |---|---|---|---|---|
@@ -191,15 +220,16 @@ The MHA case also does not fit on one 80 GB card at all; GQA fits and runs each 
 faster. Time-to-first-token barely changes, because prefill is compute-bound.
 
 ## Production patterns
-- **Plan capacity from `num_key_value_heads`.** Put the KV-head count, not the query-head count, into the
-  cache estimator, then set the engine's context and concurrency limits (for example `max_model_len`
-  and `max_num_seqs` in vLLM) from it. Monitor KV-cache utilization and preemptions.
-- **Prefer GQA models for decode-heavy workloads.** For chat and agents, shortlist models by eval score,
-  then by KV bytes per token. Measure tokens per second per GPU at the target batch, not single-stream
-  latency, because that is where the saving appears.
+- **Plan agent capacity from `num_key_value_heads`.** Put the KV-head count, not the query-head count,
+  into the cache estimator with your p95 transcript length, then set the engine's context and concurrency
+  limits (for example `max_model_len` and `max_num_seqs` in vLLM) from it. Monitor KV-cache utilization
+  and preemptions.
+- **Prefer GQA models for long-lived agent sessions.** Shortlist models by agent eval score, then by KV
+  bytes per token. Measure sessions per GPU and tokens per second per GPU at the target batch, not
+  single-stream latency, because that is where the saving appears.
 - **Stack cache quantization on top.** Enable an FP8 KV cache (for example `kv_cache_dtype="fp8"` in vLLM)
-  after running your eval set; it halves the cache again on any head layout. Monitor eval scores and
-  resident sequences.
+  after running your agent eval set; it halves the cache again on any head layout. Monitor tool-call
+  accuracy and resident sequences.
 - **Align tensor parallelism with KV heads.** Keep the TP degree at or below *g* and dividing it, such as
   8 GPUs for g = 8. Monitor per-GPU cache memory when you add GPUs; if it does not shrink, KV heads are
   being replicated.
@@ -211,6 +241,9 @@ faster. Time-to-first-token barely changes, because prefill is compute-bound.
 - **Cache and decode bytes vs quality.** Both drop by h/g for a small quality loss. The trade moves toward
   MQA when memory is the hard limit (edge devices, extreme batch) and back toward full MHA for small
   models at short context, where the cache was never the constraint.
+- **More resident sessions vs unchanged prefill.** GQA keeps several times more agent transcripts cached,
+  but each step that ingests a large tool result still pays full prefill. For agents dominated by huge
+  tool outputs, prefix caching and shorter results matter as much as head layout.
 - **Fewer K/V parameters vs unchanged attention FLOPs.** A little memory and prefill compute is saved,
   but attention FLOPs are unchanged because queries are not shared. GQA is nearly invisible in
   time-to-first-token and only shows in per-token decode latency and throughput.
@@ -224,6 +257,9 @@ faster. Time-to-first-token barely changes, because prefill is compute-bound.
 - **Using `num_attention_heads` instead of `num_key_value_heads` in a capacity estimate.** Symptom: a
   cache budget four times too large, and a cluster sized or rejected on the wrong number. Fix: read
   `num_key_value_heads`, falling back to the query-head count only when the field is absent.
+- **Sizing for average sessions, not long ones.** Agent transcripts have a long tail. Symptom:
+  preemptions and re-prefills whenever a few sessions grow long. Fix: size on p95 transcript length and
+  cap context per route.
 - **Expecting GQA to cut time-to-first-token.** Symptom: an unchanged TTFT after switching models while
   only throughput and per-token latency improved. Fix: judge GQA on decode throughput and inter-token
   latency; attack TTFT with prefix caching or chunked prefill instead.
@@ -238,11 +274,11 @@ faster. Time-to-first-token barely changes, because prefill is compute-bound.
   extra GPUs for replicas or pipeline stages.
 
 ## When to use
-- **Choosing a model to serve:** at long context or high concurrency, read `num_key_value_heads` before
-  the benchmark table and compute cache-per-token for your sequence lengths. Two models with equal
-  quality on your evaluation can differ by four in how many users one GPU serves.
-- **Prefer GQA** for chat and agent workloads where decode dominates; it matters less for short-prompt
-  classification where prefill dominates.
+- **Choosing a model to serve agents:** at long context or high concurrency, read `num_key_value_heads`
+  before the benchmark table and compute cache-per-token for your sequence lengths. Two models with
+  equal quality on your evaluation can differ by four in how many users one GPU serves.
+- **Prefer GQA** for chat and agent workloads where decode and resident sessions dominate; it matters
+  less for short-prompt classification where prefill dominates.
 - **Training or fine-tuning:** keep the layout the checkpoint was trained with.
 - **Measure:** tokens per second per GPU at your target batch, not single-stream latency, because that is
   where the saving appears.
@@ -276,6 +312,13 @@ evenly.
   heads cuts both memory and bytes read per step.
 - **Queries are not cached.** Only the new token's query exists each step, so sharing queries would save
   nothing in memory and would cut attention capacity.
+
+### Your self-hosted agent platform shows frequent preemptions once sessions pass 30k tokens. How does head layout factor in?
+- **Compute cache per session:** with 32 layers and head_dim 128, MHA holds 512 KB per token (16 GiB at
+  32k) versus 128 KB with 8 KV heads (4 GiB).
+- **Preempted sessions re-prefill** their whole transcript on the next step, so latency spikes.
+- **Levers:** a GQA model, an FP8 cache after an eval, a context cap or compaction per route, or more
+  replicas.
 
 ### After switching to a GQA model, TTFT did not improve but throughput did. Is something broken?
 - **No, that is expected.** Prefill is compute-bound and attention FLOPs are unchanged, because every
@@ -325,3 +368,22 @@ evenly.
 - [ ] Because the output projection dominates prefill time
 > Prefill multiplies large matrices and is limited by arithmetic, not by reading the cache. Sharing K/V
 > heads changes how many bytes decode must read per step, which is where GQA's gain appears.
+
+## Use cases & projects
+### Use cases
+- **Self-hosting a multi-tenant agent platform.** KV-head count and p95 transcript length set how many
+  sessions stay resident per GPU before preemption.
+- **Choosing an open model for long agent runs.** Among models that pass your agent evals, the GQA layout
+  usually serves several times the sessions on the same hardware.
+- **Planning GPU nodes.** A model with 8 KV heads shards cleanly across 8 GPUs; other degrees replicate KV
+  heads and waste cache.
+- **Cutting serving cost further.** An FP8 cache stacks on GQA, checked against tool-call accuracy evals.
+
+### Mini project
+**Compare resident agent sessions across head layouts (2-3 hours).**
+- **Goal:** show, with numbers from configs and one real engine run, how KV heads change agent capacity.
+- **Steps:** read `num_key_value_heads` for an MHA and a GQA model of similar size; compute cache per 32k
+  session; serve the GQA model in vLLM with a fixed memory budget and replay 20 synthetic agent sessions
+  of growing length; record KV-cache utilization and preemptions; repeat with an FP8 cache.
+- **Done when:** you have a table of predicted versus observed resident sessions per configuration and a
+  short note on where the prediction was off and why.

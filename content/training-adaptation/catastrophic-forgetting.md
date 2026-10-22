@@ -413,3 +413,23 @@ prepared.
 - [ ] Use a larger rank for the adapters each month
 > Chained fine-tunes forget a little of every earlier batch per hop; starting from the base on all data
 > removes the compounding, makes runs reproducible, and the suite catches whatever is still lost.
+
+## Use cases & projects
+### Use cases
+- **Domain fine-tunes of an agent's model.** A replay share of tool-calling, instruction and safety
+  examples keeps valid tool calls and refusals intact while the model learns the domain.
+- **Release gates for new model versions.** A before/after suite covering tool-call validity,
+  system-prompt adherence and refusals blocks a fine-tune that quietly lost a skill.
+- **Fine-tune versus retrieval decisions.** When new knowledge changes often, retrieval avoids the
+  forgetting risk entirely, so teams fine-tune for behaviour and retrieve for facts.
+- **Per-task adapters.** Separate LoRA adapters on a frozen base isolate updates, so a new skill for one
+  agent does not erode another.
+
+### Mini project
+**Measure and reduce forgetting in an agent fine-tune (2-3 hours).**
+- **Goal:** quantify how much tool-calling ability a domain fine-tune destroys and how much replay saves.
+- **Steps:** build a small domain dataset with no tool calls and a held-out suite of tool-calling and
+  refusal prompts; score the base model; fine-tune once on domain data alone and once with a replay share
+  of tool-calling examples mixed in; score both on the domain task and on the suite.
+- **Done when:** you have a before/after table for base, domain-only and domain-plus-replay on both the
+  domain task and the tool-call and refusal suite, with a recommendation for the replay share.

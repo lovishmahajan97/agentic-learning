@@ -358,3 +358,21 @@ overcharge the summarizer.
 > Prefill is compute-bound, so doubling FLOPs roughly halves its time and TTFT drops. Decode is
 > bandwidth-bound and gains little; concurrency is set by memory capacity; cache size per token is a model
 > property.
+
+## Use cases & projects
+### Use cases
+- **Explaining agent step latency.** Long prompts and short tool-call outputs make prefill the main cost of
+  each step, so TTFT, not TPOT, is what grows across a run.
+- **Reading provider bills.** Input, cached-input and output tokens are priced differently because the two
+  phases cost differently; agent cost models need all three per step.
+- **Fixing stream stalls on shared replicas.** Chunked prefill keeps one agent's long prompt from freezing
+  every other user's stream.
+- **Deciding what to stream.** Intermediate tool-call steps rarely need streaming; final answers do.
+
+### Mini project
+**Per-step phase profile of an agent run (1-2 hours).**
+- **Goal:** show how prefill and decode time evolve across the steps of one agent task.
+- **Steps:** run a 15-step tool-calling agent; per step, log input tokens, cached input tokens, output
+  tokens, TTFT and total generation time; repeat with tool results trimmed to a fixed size.
+- **Done when:** you have a chart of TTFT and decode time per step for both runs, and a sentence explaining
+  which phase grew and why trimming changed it.

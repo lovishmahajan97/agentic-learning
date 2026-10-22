@@ -487,3 +487,23 @@ alert on fallback share so someone is watching during the outage, not the mornin
 > Sending a second request after the p95 delay helps only the slow tail and costs roughly the fraction
 > of requests that exceed that delay. During provider overload the extra load makes things worse, and
 > duplicated side effects make hedging unsafe for non-idempotent calls.
+
+## Use cases & projects
+### Use cases
+- **Long-running agent runs.** A provider 429 or 5xx at step 18 fails over to a second provider and resumes
+  from the last checkpoint instead of restarting.
+- **Side-effecting tools.** Idempotency keys make a retried step safe when the email or record write may
+  already have happened.
+- **Provider outages.** A circuit breaker stops sending agent traffic to a failing provider and probes it
+  before switching back.
+- **Fallback qualification.** The fallback model runs the same tool-call eval suite as the primary, so a
+  failover does not silently break tool schemas.
+
+### Mini project
+**Make an agent survive a provider failure mid-run (2-3 hours).**
+- **Goal:** fail over without replaying completed tool calls.
+- **Steps:** build a 5-step agent with one write tool that records an idempotency key; checkpoint after
+  each step; wrap the model call in a fallback ladder of primary then secondary; inject a 429 or timeout at
+  step 3; validate the secondary's tool calls against the same schemas.
+- **Done when:** the run finishes on the secondary, the write tool executed exactly once, and the trace
+  shows which step failed over and why.

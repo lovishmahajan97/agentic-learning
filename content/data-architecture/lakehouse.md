@@ -5,7 +5,8 @@ name: Lakehouse
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: background
 related:
   - data-architecture/etl-elt-for-rag
   - data-architecture/training-data-pipelines
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-A lakehouse is a transactional table layer (Delta Lake, Apache Iceberg, Apache Hudi) over open Parquet
-files in object storage. It adds atomic commits, snapshot isolation, schema enforcement, time travel and
-real deletes: the shared home for AI documents, chunks, embeddings, training sets and traces.
+A lakehouse (Delta Lake, Apache Iceberg, Apache Hudi over Parquet in object storage) is where an agent
+platform keeps its documents, chunks, embeddings, traces and eval snapshots, with atomic commits, time
+travel and real deletes behind them.
+
+## For agent builders
+- **Why it matters for agents.** Agent runs produce traces, tool results and memory writes that you later
+  replay, evaluate, fine-tune on or must delete for a user. A lakehouse table gives those a consistent
+  snapshot to evaluate against and a provable delete.
+- **Where it shows up in your stack.** The stage tables behind your retrieval tools, a trace table your
+  observability exports land in, pinned snapshots in eval and fine-tune configs, and the source your vector
+  index is rebuilt from.
+- **What you control.** Partition keys (date, tenant), a `model_id` column on embeddings, which snapshot each
+  agent eval records, and retention so deletes reach physical storage.
+- **What you can skip.** The internals of Iceberg manifests or Hudi indexes, and the choice of format unless
+  you own the platform. Know that commits are atomic, snapshots expire, and the lakehouse never serves the
+  agent's request path.
 
 ## Why it exists
 - **The lake was cheap but was not a table.** Files in S3 or similar held raw and semi-structured data that
@@ -44,6 +58,14 @@ real deletes: the shared home for AI documents, chunks, embeddings, training set
   same data and none should own it.
 
 ## How it works
+### Background
+The agent builder needs one picture; the layer subsections below are reference detail to skim.
+- **Three layers.** Open Parquet files in object storage, a table format whose log says which files form each
+  version, and a catalog that maps table names to the current version for every engine.
+- **One rule.** Writes add invisible files, then atomically publish a new version, so a reader (your agent
+  eval, your index rebuild) sees a whole snapshot or none of it.
+- **One caveat.** Old versions keep deleted rows until expiry and vacuum run.
+
 ### Layer 1: open columnar files in object storage
 - **Parquet on S3, GCS or ADLS.** Columnar and compressed, split into row groups with per-column statistics
   (min, max, null count).
@@ -125,9 +147,20 @@ All three implement the same idea and differ mainly in origin.
 - **Not a serving database.** The lakehouse is an analytical and batch store; point lookups and sub-100 ms
   serving belong to Postgres, a key-value store or the vector database.
 
+### Agent data specifically
+- **Trace tables.** One row per agent step (run id, step, tool name, arguments, result size, latency, outcome),
+  partitioned by date and tenant. They feed failure analysis, cost reports and fine-tuning exports.
+- **Eval snapshots.** An agent eval records the chunk table version it retrieved from, so a score change can be
+  attributed to the index build or to the agent's prompt.
+- **Long-term memory exports.** Memory written by agents can be mirrored here for audit and bulk deletion,
+  while the live memory store stays a low-latency database.
+- **The agent never queries it inline.** A tool that scans object storage on every step adds seconds of
+  latency; build a derived store and point the tool at that.
+
 ## Diagram
 A commit writes invisible data files, then races to publish the next log entry; the loser checks for a
-conflict and either republishes as the next version or re-runs.
+conflict and either republishes as the next version or re-runs. In an agent platform, writer A is the
+trace or chunk append job and writer B a user's deletion request.
 
 ```mermaid
 sequenceDiagram

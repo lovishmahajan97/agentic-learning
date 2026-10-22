@@ -5,7 +5,8 @@ name: Data residency
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - security-governance-compliance/data-classification
   - security-governance-compliance/pii-protection-dlp
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Data residency means data is stored and processed only in approved locations. In AI it covers the whole
-flow: model endpoint, provider logs, caches, vector stores, traces and support staff each have a
-location. Sovereignty differs: whose law can compel access.
+Data residency means data is stored and processed only in approved locations. For an agent that covers
+every hop: model endpoint, provider logs, tool servers, memory, checkpoints, caches, traces and support
+staff. Sovereignty differs: whose law can compel access.
+
+## For agent builders
+- **Why it matters for agents.** An agent multiplies the places data goes. Each step can call a model, a
+  hosted tool, a third-party API or an MCP server, then write memory, a checkpoint and a trace. One hop in
+  the wrong region breaks the promise for every residency customer.
+- **Where it shows up in your stack.** The region-aware AI gateway, the location of every tool and tool
+  server the agent can call, managed memory, checkpoint and vector stores, your tracing exporter, and
+  backup targets.
+- **What you control.** The tenant's home region on every request, which endpoints and tools are eligible
+  per region and data class, fail-closed routing, and in-region telemetry with redaction.
+- **What you can skip.** Interpreting transfer law yourself. Ask the customer whether they mean residency,
+  localisation or sovereignty, let counsel own the legal assessment, and own the data-flow map and the
+  routing rules.
 
 ## Why it exists
 - **Regulators want data within reach of their own law.** Governments, regulators and contracts set the
@@ -182,6 +196,24 @@ print(route("eu", "public", healthy))        # 'provider-global': no residency r
   trade-off in the first bullet below made explicit in config.
 - **Run the drill as a scheduled test,** so a fallback added during an incident is caught before an audit.
 
+### Agent scenario: every tool call is a hop
+The same insurer wants a claims agent. One run of it touches more locations than the whole chat product
+did, because each tool and store has its own home.
+
+| Hop in one agent run | Initial location | Fix |
+|---|---|---|
+| Planner and worker model calls | EU endpoint via the gateway | fine, fail closed as above |
+| `web_search` tool (hosted search API) | provider default, unknown | query carries member details: block member data from it, or use an EU-hosted search option |
+| `lookup_policy` MCP server | EU cell | fine |
+| Document OCR tool | third-party SaaS, US | swap for an in-region OCR service or self-host |
+| Agent memory and checkpoints | managed store, default region | pin to the tenant's EU cell |
+| Traces of every step | tracing SaaS, US default | EU instance, redact before export |
+
+- **Tools need the same eligibility table as models.** The gateway's region rule is useless if the
+  orchestrator can call a tool that ships the same text abroad.
+- **Checkpoints are full copies of the context,** so a durable-execution store in the wrong region holds
+  everything the agent ever read.
+
 ## Production patterns
 - **Tenant home region as a first-class field.** Store each tenant's home region on the tenant record and
   carry it on every request, so the gateway, stores and telemetry exporters all read the same value.
@@ -194,6 +226,9 @@ print(route("eu", "public", healthy))        # 'provider-global': no residency r
 - **Data-flow map generated from config.** Build the map and sub-processor list from infrastructure and
   gateway configuration (regions of stores, telemetry exporters, backup targets, provider endpoints).
   Monitor drift between the generated map and the one given to customers.
+- **Region-tagged tool registry.** Record where each agent tool and tool server processes data, and let the
+  orchestrator offer a residency tenant only tools eligible for its region and data class. Monitor tool
+  calls refused for region and tools registered without a location.
 - **In-region telemetry with redaction.** Point trace and log exporters at an in-region instance and redact
   identifiers before export. Monitor exporter destinations and DLP hits in telemetry.
 
@@ -291,6 +326,13 @@ real concern is sovereignty, since an EU-located service run by a non-EU provide
   in-region endpoints down.
 - **For SCC transfers,** keep the transfer impact assessment alongside the map, since the map is its input.
 
+### A residency customer's agent needs a web-search tool whose provider processes queries in the US. How do you ship it?
+- **Treat the query as data leaving the region.** If it can carry member details, it is a transfer, so the
+  tool is ineligible for that data class.
+- **Options:** an in-region search provider, queries built only from fields known to hold no personal data,
+  or a separate session with no member data that is allowed to search.
+- **Enforce it in the orchestrator's tool list,** not in the prompt, and add it to the data-flow map.
+
 ## Quiz
 ### Q: Under GDPR, what is the accurate characterisation of its rules on data location?
 - [ ] Personal data of EU residents must always be stored inside the EU
@@ -315,3 +357,24 @@ real concern is sovereignty, since an EU-located service run by a non-EU provide
 - [x] A provider may be subject to its home country's laws compelling access regardless of where data sits
 > Sovereignty is about which jurisdiction can compel access. A provider incorporated elsewhere may face
 > its home country's legal orders for data stored in the EU, so location alone does not settle it.
+
+## Use cases & projects
+### Use cases
+- **Selling agents to EU, public-sector or regulated customers.** The data-flow map and fail-closed
+  gateway are usually what the security questionnaire asks for.
+- **Agents with third-party tools.** A region-tagged tool registry keeps a residency tenant's agent from
+  calling a search, OCR or enrichment API abroad.
+- **Long-running agents with durable execution.** Checkpoint and memory stores pinned to the tenant's cell
+  hold full context copies in region.
+- **Capacity incidents during launches.** Fail-closed routing plus scheduled drills stop a "temporary"
+  global fallback from becoming a silent breach.
+
+### Mini project
+**Make an agent residency-aware (2-3 hours).**
+- **Goal:** an agent whose model calls and tool calls both respect the tenant's home region, and fail
+  closed under an outage.
+- **Steps:** extend the `APPROVED` table with tools as well as model endpoints; tag four fake tools with a
+  location; have the orchestrator offer only eligible tools for the tenant's region and data class; route
+  model calls with `route`; write a staging drill that marks every EU endpoint unhealthy.
+- **Done when:** an EU member-data run never calls a non-EU tool or endpoint, the drill produces a
+  `ResidencyError` instead of a fallback, and you can print a data-flow map generated from the tables.

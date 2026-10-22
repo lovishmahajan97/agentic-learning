@@ -421,3 +421,23 @@ collection until the comparison is done.
 > Hosted embedding APIs enforce requests-per-minute and tokens-per-minute limits. Past that limit, extra
 > workers only generate 429 responses and backoff sleeps; throughput is bounded by the quota, so the
 > right fix is a shared concurrency limiter or a higher quota, not more workers.
+
+## Use cases & projects
+### Use cases
+- **Support agents on changing policies.** Incremental re-embedding keeps the refund amount the agent quotes
+  in step with the source page, within a stated freshness SLA.
+- **Deletion and compliance.** Propagating deletes stops an agent citing a page that no longer exists or a
+  document a user asked to remove.
+- **Multi-tenant agent backends.** Tenant and ACL metadata written at ingest is what the agent's search tool
+  filters on later, so the pipeline is where cross-user leaks are prevented.
+- **Agent memory writes.** A `save_note` tool is a small pipeline of its own: chunk, embed with the shared
+  function, upsert with a stable id.
+
+### Mini project
+**Build an idempotent ingest worker for an agent knowledge base (2-3 hours).**
+- **Goal:** keep a vector index in sync with a folder of documents under edits and deletes.
+- **Steps:** give each chunk a stable id from document id and position; hash content to skip unchanged
+  chunks; embed through one shared function with a concurrency limit; upsert, and delete chunks whose
+  document was removed; point a small agent's search tool at the index.
+- **Done when:** re-running the worker with no changes embeds nothing, an edited file updates only its chunks,
+  a deleted file disappears from search results, and a golden-vector test passes.

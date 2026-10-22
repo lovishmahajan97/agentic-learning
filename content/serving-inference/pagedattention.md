@@ -414,3 +414,23 @@ to block sharing under prefix caching?
 - [ ] They share blocks only if both requests arrive in the same batch
 > Blocks are identified by their content and everything before them, so a difference in the first block
 > changes every subsequent hash. Shared content must be a byte-identical prefix to be reused.
+
+## Use cases & projects
+### Use cases
+- **Self-hosted agent platforms.** Paged allocation lets one GPU hold dozens of agent runs of wildly
+  different lengths, because each run is charged only for the blocks it has filled.
+- **Shared system prompts and tool schemas.** Many agents with the same byte-identical prefix share its
+  blocks, so the per-agent memory cost is only the transcript after the shared part.
+- **Parallel sampling and best-of-n planners.** Copy-on-write lets several candidate plans branch from one
+  prompt without duplicating its KV cache.
+- **Capacity debugging.** Preemption counts and KV-usage metrics explain latency spikes when long research
+  agents and short lookups share a server.
+
+### Mini project
+**Watch blocks fill and share under an agent load (2-3 hours).**
+- **Goal:** see how paged allocation and block sharing change how many agent runs fit on one GPU.
+- **Steps:** serve a small instruct model with vLLM; write a script that starts 20 fake agent loops, each
+  appending a tool result per step, all sharing one long system prompt; run it with prefix caching on and
+  off; scrape the engine's metrics endpoint for KV-cache usage and preemptions every second.
+- **Done when:** you have a chart of KV usage and preemptions over time for both runs, and a short note
+  explaining the gap using block counts (prefix tokens divided by the block size).

@@ -433,3 +433,29 @@ exchanged specifically for that upstream, logging the authenticated subject on e
 - [ ] It supports multiple concurrent users sharing one server process
 > With stdio the host spawns the server as a child process, so "who is calling" is already answered by
 > who launched it. The protocol adds no auth there; the risks are supply chain and secrets on disk.
+
+## Use cases & projects
+### Use cases
+- **Exposing an internal API to company agents.** A billing or CRM API wrapped as a remote MCP server
+  behind the company identity provider, so every agent call carries a per-user token with tool scopes.
+- **Local developer tools.** A coding agent spawns filesystem or git servers over stdio, where the OS
+  process boundary is the identity and the review focuses on supply chain and secrets in the environment.
+- **Multi-tenant SaaS connectors.** A vendor hosts one MCP server for many customers, and audience-bound
+  tokens plus tenant checks on every tool call keep one customer's agent out of another's data.
+- **Security review of an agent rollout.** Mapping each tool to a scope, checking token audience
+  validation and confirming tokens never enter the model's context before agents reach production.
+
+### Mini project
+**Put OAuth scopes in front of a small remote MCP server (2-3 hours).**
+- **Goal:** a Streamable HTTP MCP server with two tools, one read and one write, where the write tool
+  needs a separate scope and tokens for any other audience are rejected.
+- **Steps:** build the server with an official MCP SDK; issue test tokens from a local identity provider
+  or a stub authorization server; validate signature, expiry, audience and scope in middleware before any
+  tool runs; return 401 with discovery metadata when no token is sent; connect a host and call both tools.
+- **Done when:** a read-scoped token can list but not write, a token minted for another audience gets
+  401, and the server log attributes every call to a user subject rather than a shared key.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): the billing-dispute agent exposes its
+billing API as a remote MCP server with per-user OAuth scopes and audience binding, and its rubric checks
+that wrong-audience and missing-scope tokens are rejected.

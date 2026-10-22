@@ -413,3 +413,24 @@ bounds still prune most of the common list for a top-10 result.
 > The analyzer is applied at both index and query time, and lookups are exact-key matches on the stored
 > tokens. Documents indexed under the old rules hold old tokens, so the new query tokens do not find
 > them; a full re-index is required.
+
+## Use cases & projects
+### Use cases
+- **Write-then-read agent workflows.** An agent creates a ticket or saves a note and searches for it a
+  step later; refresh behavior decides whether it finds its own write.
+- **Tenant and ACL filtering.** Keyword fields for tenant and permission filters keep an agent's search
+  tool from returning documents the user may not see.
+- **Exact identifier matching.** Analyzer choices decide whether ids copied between tools match the
+  stored tokens at all.
+- **Search-tool cost control.** Asking only for top-k, not exact hit counts, keeps frequent agent search
+  calls cheap.
+
+### Mini project
+**Catch the read-after-write gap in an agent's notes tool (1-2 hours).**
+- **Goal:** reproduce and fix an agent missing a document it just wrote to a Lucene-based engine.
+- **Steps:** run Elasticsearch or OpenSearch locally; build `save_note` and `search_notes` tools; script
+  an agent step that saves a note with a unique id and searches for it immediately; run it 20 times with
+  the default refresh setting, then with a per-write refresh or a wait-for-refresh option; also index an id
+  containing hyphens under two analyzers and check whether it matches.
+- **Done when:** you have the miss rate before and after the refresh change, the latency cost of the fix,
+  and a note on which analyzer kept the id searchable.

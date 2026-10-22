@@ -436,3 +436,23 @@ can wait days, a durable workflow engine is the natural executor.
 - [ ] A single autonomous agent loop
 > Orchestrator–workers places model judgment exactly where it is needed, deciding the decomposition,
 > while the concurrency, limits and aggregation stay deterministic in code.
+
+## Use cases & projects
+### Use cases
+- **Ticket triage and routing.** A cheap classification step routes each request to a specialist prompt
+  or a human queue, keeping the expensive path for the cases that need it.
+- **Document processing chains.** Extract, validate and summarize as a prompt chain with a code check
+  between steps, so a bad extraction stops before it reaches the summary.
+- **Orchestrator-workers for open research.** A model decides the sub-tasks; code runs the fan-out with a
+  concurrency cap and joins the results.
+- **Evaluator-optimizer loops.** A writer drafts, a grader scores against a rubric, and code stops the loop
+  at a pass or a round limit.
+
+### Mini project
+**Build one task with three orchestration patterns (2-3 hours).**
+- **Goal:** see how routing, chaining and orchestrator-workers differ in cost, latency and failure modes.
+- **Steps:** pick a task such as answering a support email; implement a router to two specialist prompts,
+  a three-step chain with a schema check between steps, and an orchestrator that plans sub-tasks run
+  concurrently by code with a cap and a timeout; run each on the same 15 inputs.
+- **Done when:** a table shows tokens, latency and pass rate per pattern, and each failure is traced to
+  the step that caused it.

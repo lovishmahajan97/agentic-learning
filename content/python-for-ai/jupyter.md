@@ -352,3 +352,24 @@ Then I would move the comparison into a script or eval harness so it can be re-r
 - [ ] Storing notebooks only on a shared drive outside version control
 > Outputs cause noisy diffs and can contain sensitive data. Stripping them, and pairing with a text
 > representation such as Jupytext, gives clean diffs while keeping the notebook usable.
+
+## Use cases & projects
+### Use cases
+- **Agent error analysis.** Load a few hundred exported traces into a dataframe once, then slice by
+  failing step, tool and error type in seconds per question.
+- **Prompt and tool-description iteration.** Try several variants of a system prompt or tool docstring
+  against the same 20 hard cases and compare outputs side by side.
+- **First tool-loop prototypes.** Use top-level `await` to call an async model client and tools cell by
+  cell before moving the loop into a tested module.
+- **Eval reports in CI.** A report notebook re-executed from a clean kernel turns eval results into
+  charts and tables reviewers can read.
+
+### Mini project
+**Error-analysis notebook over agent traces (1-2 hours).**
+- **Goal:** find the top failure modes of an agent from its traces, reproducibly.
+- **Steps:** export 50-200 agent runs as JSON lines (or generate them from a toy agent); load them into
+  a dataframe; tag each failed run by step and cause (wrong tool, bad arguments, loop, tool error);
+  chart counts by cause; move the loading and tagging code into a small module the notebook imports;
+  strip outputs before commit.
+- **Done when:** Restart and Run All reproduces the same table and chart, the top two failure modes each
+  have one concrete fix proposed, and the committed notebook holds no outputs or secrets.

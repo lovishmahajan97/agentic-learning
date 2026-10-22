@@ -450,3 +450,25 @@ set covering old documents, run before the cutover.
 - [ ] Immunity to tokenizer changes
 > Both matrices have shape [V, d_model], so sharing one saves a whole table and forces the same vector to
 > serve on the way in and on the way out. It matters most when the table is a large fraction of the model.
+
+## Use cases & projects
+### Use cases
+- **RAG retrieval for a support or docs agent.** Queries and chunks are embedded with the same model, and
+  the agent's retrieval tool returns the nearest chunks by cosine similarity.
+- **Long-term agent memory.** Past facts, decisions and user preferences are embedded and recalled by
+  similarity when a new turn looks related, instead of replaying the whole history.
+- **Tool and skill routing.** With dozens of tools, embedding the tool descriptions and shortlisting the
+  closest few keeps the prompt small and the tool choice sharper.
+- **Semantic caching and deduplication.** Near-duplicate questions or tool results are detected by
+  embedding distance, so the agent can reuse an answer or skip a redundant retrieval.
+
+### Mini project
+**Build and measure an embedding-backed retrieval tool for an agent (2-3 hours).**
+- **Goal:** give a small agent a `search_docs` tool backed by embeddings and measure whether it finds the
+  right chunk.
+- **Steps:** chunk 30-50 pages of documentation; embed the chunks with one embedding model and store the
+  vectors with their model name; write 20 questions with a known correct chunk; expose top-k search as a
+  tool; record recall@5 for the questions; then repeat with a second embedding model or a different chunk
+  size.
+- **Done when:** you have a recall@5 table for both runs, the agent answers at least a few questions using
+  the tool, and you can say which change helped and why.

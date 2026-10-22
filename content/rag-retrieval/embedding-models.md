@@ -376,3 +376,22 @@ error codes, which embeddings handle badly in any language.
 > In-batch negatives are mostly random, unrelated passages and are easy to push away. Hard negatives
 > share vocabulary and topic with the query, so the model must learn finer distinctions, which is what
 > separates a retriever from a topic classifier.
+
+## Use cases & projects
+### Use cases
+- **Knowledge search tools.** The embedding model decides whether "cancel my plan" finds the page titled
+  "terminate the subscription", which keyword search alone misses.
+- **Long-term agent memory.** Recalling past conversations and saved facts is a nearest-neighbour query over
+  embeddings, so the same model, prefixes and version must be used to write and to recall.
+- **Tool selection at scale.** Agents with hundreds of tools embed tool descriptions and retrieve the few
+  relevant ones per step instead of putting every schema in the prompt.
+- **Multilingual agents.** A multilingual embedder lets a German question retrieve English documentation.
+
+### Mini project
+**Run an embedding bake-off for your agent's search tool (2-3 hours).**
+- **Goal:** pick an embedding model on your agent's real queries rather than a public leaderboard.
+- **Steps:** collect 30-50 real or realistic agent queries with the passage that answers each; embed the corpus
+  with two or three candidate models, using each model's documented query and passage prefixes; measure
+  recall at 5 and MRR; then add a reranker on the best one and measure again.
+- **Done when:** a table shows recall at 5, MRR, latency and cost per model, and you have pinned the winning
+  model and version in one shared embed function.

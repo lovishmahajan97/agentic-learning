@@ -5,7 +5,8 @@ name: Monitoring
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - observability/latency-percentiles
   - observability/token-cost-tracking
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-Monitoring compresses requests into aggregate signals (rates, errors, latency, saturation, quality,
-cost), compares them with targets and pages on drift. The LLM difficulty: the worst failures return HTTP
-200, so you monitor proxies and sampled quality scores, not just errors.
+Monitoring compresses agent runs into aggregate signals (latency, errors, saturation, task success, steps,
+cost), compares them with targets and pages on burn. Agents fail with HTTP 200, so you watch behavioural
+proxies and sampled quality scores.
+
+## For agent builders
+- **Why it matters for agents.** A prompt change that makes the agent loop twice as long, a tool that
+  starts returning empty results, a provider rate limit at peak: none raise errors. Metrics per run,
+  step and tool are how you notice within hours instead of from support tickets.
+- **Where it shows up in your stack.** `prometheus_client` or OpenTelemetry metrics in the agent service,
+  Prometheus recording rules and Alertmanager, dashboards in Grafana or your LLM observability tool, and
+  online judge scores emitted as metrics.
+- **What you control.** Which agent signals exist (task success, steps per task, step-budget hits,
+  tool success per tool, cost per task), bounded labels (model, route, prompt version, tool name), the
+  SLOs, and which burns page.
+- **What you can skip.** Time-series database internals and anomaly-detection models. Know metric types,
+  cardinality, SLOs and the burn-rate arithmetic.
 
 ## Why it exists
 - **You cannot read traces faster than users produce them,** and you cannot afford to learn about an
@@ -79,6 +93,22 @@ cost), compares them with targets and pages on drift. The LLM difficulty: the wo
 | **Cost** | tokens and computed cost per request, feature and tenant, with a budget burn rate |
 | **Cache** | prompt-cache and semantic-cache hit rates; a drop shows up as both cost and latency |
 
+### Agent-level signals
+Per-call metrics miss what makes agents different: the loop. Add run-level and tool-level series.
+
+| Signal | Instrument | Why it matters |
+|---|---|---|
+| Task outcome by stopping reason | counter, label `stop_reason` | a rising share of step-budget or loop-detected stops is a silent regression |
+| Steps per task | histogram | a prompt or model change that doubles steps doubles cost and latency |
+| Tool-call success per tool | counter, labels `tool`, `outcome` | one broken tool degrades every agent that uses it |
+| Task duration | histogram | user-facing latency of the whole run, not one call |
+| Cost per task | histogram | catches runaway loops in money before the invoice |
+| Approval wait time | histogram | human-in-the-loop steps can dominate end-to-end time |
+
+- **Tool name is a safe label** because the tool registry is a small, bounded set; task or run ids are not.
+- **A task-success SLO** ("95% of runs end with a final answer and pass the judge, over 7 days") is the
+  agent's top-level symptom, and burn-rate alerting applies to it unchanged.
+
 ### Online quality: sampled evaluation
 - **Sample a small fraction of traces** (a few percent is a common start, plus 100% of flagged ones) and
   score them continuously with an LLM-as-a-judge or task-specific checks, then emit the score as a metric.
@@ -130,7 +160,7 @@ symptom burns page a human.
 
 ```mermaid
 flowchart TD
-    W["Model call wrapper"] --> M["Counters, histograms, gauges"]
+    W["Agent run and model call wrappers"] --> M["Counters, histograms, gauges"]
     W --> S["Spans and logs"]
     S -->|"sampled"| J["Online judge scores"]
     J --> M
@@ -228,6 +258,47 @@ print(f"creep exhausts budget in {PERIOD_H / burn_rate(0.02) / 24:.0f} days")
 | Creeping slow turns | 2% | 2 | ticket | would exhaust the budget in 15 days |
 | Static "p95 above 2 s" | either | n/a | unreliable | ignores duration and budget consumed |
 
+### Agent run metrics alongside the call metrics
+Run-level series for the agent loop, using the same bounded-label rule. `stop_reason` and `tool` are
+small enums; nothing per-run becomes a label.
+
+```python
+from prometheus_client import Counter, Histogram
+
+RUNS = Counter("agent_runs_total", "Agent runs", ["agent", "stop_reason"])
+STEPS = Histogram("agent_steps", "Loop iterations per run", ["agent"],
+                  buckets=(1, 2, 3, 5, 8, 13, 20))
+TOOL_CALLS = Counter("agent_tool_calls_total", "Tool calls", ["agent", "tool", "outcome"])
+RUN_SECONDS = Histogram("agent_run_seconds", "Run duration", ["agent"],
+                        buckets=(1, 2, 5, 10, 20, 30, 60, 120))
+
+def record_run(agent, stop_reason, steps, seconds, tool_results):
+    """tool_results: list of (tool_name, ok) from the run."""
+    RUNS.labels(agent, stop_reason).inc()
+    STEPS.labels(agent).observe(steps)
+    RUN_SECONDS.labels(agent).observe(seconds)
+    for tool, ok in tool_results:
+        TOOL_CALLS.labels(agent, tool, "ok" if ok else "error").inc()
+
+# Share of runs that give up, per agent (alert on its burn against a task-success SLO):
+#   sum by (agent) (rate(agent_runs_total{stop_reason=~"step_budget|loop_detected"}[1h]))
+#     / sum by (agent) (rate(agent_runs_total[1h]))
+```
+
+### Worked scenario: a prompt change that doubled agent steps
+A support agent's dashboard the day after `prompt_version` v14 replaced v13 (illustrative numbers):
+
+| Signal | v13 | v14 | Reading |
+|---|---|---|---|
+| HTTP error rate | 0.3% | 0.3% | flat: nothing "broke" |
+| Steps per task, p50 | 3 | 6 | the agent now re-searches before answering |
+| Step-budget stops | 1% | 7% | 7× more runs give up |
+| Cost per task, p50 | $0.012 | $0.027 | doubles with steps |
+| Failed-task ratio (budget 5% for a 95% SLO) | 5% | 11% | burn rate 1 vs 2.2: a ticket, not a page |
+
+- **Action:** roll back to v13 and add the failing runs to the eval set; only run-level metrics with a
+  prompt-version label made the cause visible the same day.
+
 ## Production patterns
 - **SLO thresholds as bucket edges.** When defining a latency histogram, put the SLO value (here `2`
   seconds for TTFT) in the bucket list so the good-event ratio is an exact count. Monitor the SLO ratio
@@ -244,6 +315,10 @@ print(f"creep exhausts budget in {PERIOD_H / burn_rate(0.02) / 24:.0f} days")
 - **Quota headroom gauges.** Parse the provider's rate-limit response headers into a remaining-requests
   and remaining-tokens gauge per model. Monitor headroom trending to zero at a tenant's peak, before 429s
   appear.
+- **Run-level agent dashboards per prompt version.** Emit runs by stopping reason, steps per task, tool
+  success per tool and cost per task, all labelled with agent and prompt version, and compare versions
+  for a day after each deploy. Monitor the step-budget stop share and steps p95; alert on a task-success
+  SLO burn.
 - **Raise judge sampling after deploys.** Score a higher share of traces for the first day of a new prompt
   version, then return to the baseline. Monitor judge pass rate per prompt version with a rolling-day SLO.
 
@@ -259,6 +334,9 @@ print(f"creep exhausts budget in {PERIOD_H / burn_rate(0.02) / 24:.0f} days")
 - **Synthetic canaries vs cost and realism.** They catch silent provider and model changes early, but cost
   tokens and mislead if the prompt is too easy; keep a handful of realistic prompts per model, not one
   trivial one.
+- **Task-success SLO vs per-call SLOs.** A task-level SLO tracks what users care about in an agent, but
+  needs a judge or outcome signal and lags. Per-call latency and error SLOs are immediate but miss loops
+  and wrong answers; keep both, and page only on the task-level burn and fast per-call burns.
 - **Static thresholds vs anomaly detection.** Static thresholds are explainable and easy to tune; anomaly
   detection adapts to daily cycles but produces alerts nobody can explain, and wins only once traffic is
   too variable for fixed numbers.
@@ -276,6 +354,9 @@ print(f"creep exhausts budget in {PERIOD_H / burn_rate(0.02) / 24:.0f} days")
   being ignored.
 - **Trusting the provider's status page over your own measurements.** Symptom: a tenant-specific rate
   limit or regional degradation that never appears there.
+- **Monitoring agent model calls but not agent runs.** Symptom: per-call latency and errors look healthy
+  while tasks take twice as many steps and cost twice as much. Fix: run-level metrics for steps, stopping
+  reason, duration and cost per task.
 - **No prompt or model version dimension.** Symptom: a step change in output tokens or refusals that
   cannot be tied to the deploy that caused it.
 
@@ -327,7 +408,7 @@ arrives sooner.
   over the last hour, confirmed on the last 5 minutes.
 - **Cost:** 14.4 for one hour spends 14.4 / 720 = 2% of the 30-day budget, regardless of the target.
 
-### The error dashboard is green but customer complaints are rising. How do you find the problem?
+### The error dashboard is green but complaints about your agent are rising. How do you find the problem?
 - **Slice behavioural proxies by version:** refusal rate, output tokens, empty-retrieval rate and tool
   success per prompt version and model often show the step change and the deploy behind it.
 - **Then confirm with quality signals:** judge scores on sampled traces and thumbs-down rates, and pull
@@ -344,6 +425,13 @@ arrives sooner.
   breach, or quota headroom about to reach zero at peak.
 - **Otherwise** causes such as a single 429 or high CPU belong on dashboards, because paging on them
   creates alert fatigue.
+
+### What would you put on the dashboard of a production tool-calling agent?
+- **Run level:** runs by stopping reason, steps per task, task duration and cost per task, labelled by
+  agent and prompt version, plus a task-success SLO with burn-rate alerts.
+- **Tool level:** call count, success rate and latency per tool name, because one degraded tool silently
+  lowers success for every agent that uses it.
+- **Call level:** TTFT, provider error classes, quota headroom and parse failures, as for any LLM feature.
 
 ## Quiz
 ### Q: Why must latency be recorded as a histogram rather than as a running average?
@@ -371,3 +459,23 @@ arrives sooner.
 > Status pages report broad incidents. Rate limits, regional issues and tenant-specific quotas only
 > show up in your own error-class metrics, which is why provider health must be measured from the
 > caller's side.
+
+## Use cases & projects
+### Use cases
+- **Catching prompt regressions in agents.** Steps per task and step-budget stops by prompt version show
+  a worse prompt the day it ships.
+- **Tool health across many agents.** Per-tool success and latency find the one degraded integration
+  that every agent depends on.
+- **Paging on what users feel.** A task-success SLO with burn-rate alerts pages for real impact, not for
+  single 429s.
+- **Spotting quota trouble before peak.** Quota headroom gauges warn before rate limits stall agent runs.
+
+### Mini project
+**Build an agent health dashboard with one burn-rate alert (2-3 hours).**
+- **Goal:** detect a silent agent regression from metrics alone.
+- **Steps:** add the run, step and tool metrics above to a small agent; run Prometheus and Grafana
+  locally (or print the series); drive 200 tasks with prompt v1, then 200 with a v2 that makes the agent
+  search twice before answering; write the step-budget share query and a burn-rate rule against a 95%
+  task-success SLO.
+- **Done when:** the dashboard shows the v1-to-v2 step change and cost rise per prompt version, and your
+  rule fires a ticket-level burn for v2 while staying quiet for v1.

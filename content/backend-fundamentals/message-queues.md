@@ -5,7 +5,8 @@ name: Message queues (Kafka, SQS, RabbitMQ)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - backend-fundamentals/background-jobs-durable-workers
   - backend-fundamentals/redis
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-A message queue is a durable buffer between producers and consumers, so they need not be up or scaled
-together. Reliable delivery is at-least-once, so consumers must be idempotent. Kafka is a replayable log, SQS a
-managed queue, RabbitMQ a routing broker.
+A message queue durably buffers work between producers and consumers: RAG ingestion, long agent tool
+calls, run events. Delivery is at-least-once, so agent consumers must be idempotent. Kafka is a
+replayable log, SQS a managed queue, RabbitMQ a routing broker.
+
+## For agent builders
+- **Why it matters for agents.** Agents trigger work that is slow, bursty or failure-prone: embedding a
+  1,000-page upload, a tool that runs for minutes, fan-out to sub-agents. A queue lets the agent hand that
+  off, survive worker crashes and absorb bursts, as long as every consumer tolerates seeing a message twice.
+- **Where it shows up in your stack.** SQS or RabbitMQ behind Celery and other job frameworks, Kafka
+  carrying run and token events into billing and eval pipelines, document-ingestion queues feeding vector
+  indexes, and webhook buffers for provider batch APIs.
+- **What you control.** The message key (run id, document id, tool-call id), visibility timeout or ack
+  deadline versus real model latency, the DLQ and its owner, outbox publishing, and autoscaling on lag.
+- **What you can skip.** Broker internals such as Raft details and Kafka rebalancing protocols. Know
+  at-least-once, the outbox, partitions and the λ/μ drain arithmetic.
 
 ## Why it exists
 - **Inline fan-out fails.** A request triggering five actions (store the upload, extract text, embed
@@ -153,6 +166,20 @@ managed queue, RabbitMQ a routing broker.
 | Routing rules, per-message priorities, AMQP interop | RabbitMQ |
 | Small job queue, already on PostgreSQL | a table with `SKIP LOCKED`; Redis-backed queues sit between that and a real broker |
 
+### Queues in an agent system
+| Flow | What goes on the queue | Key / dedup id |
+|---|---|---|
+| **RAG ingestion** | "document uploaded" events; workers chunk, embed, index | document id (plus content hash) |
+| **Long tool calls** | the tool call the agent decided on; a worker executes it and emits a result | tool-call id |
+| **Sub-agent fan-out** | one message per sub-task; a joiner waits for all results | parent run id plus sub-task index |
+| **Run events** | run started, tool failed, tokens consumed, for billing, traces and evals | run id |
+
+- **The agent loop pauses, not blocks.** For a tool that takes minutes, the run records "waiting on
+  tool-call X", the worker publishes the result, and a consumer resumes the run; no process sits holding
+  a model context open.
+- **The tool-call id is the idempotency key** end to end, because a redelivered "send invoice" message must
+  not send a second invoice.
+
 ## Diagram
 The full at-least-once path: the outbox closes the producer's dual-write gap, and the ack after the work
 closes the consumer's, so the only remaining risk is a duplicate, which the idempotency check absorbs.
@@ -248,6 +275,32 @@ print(drain_seconds(120_000, 600, 500))      # inf: shed load or slow the produc
 print(consumers_needed(120_000, 400, per_consumer_per_s=50, target_s=300))   # 16
 ```
 
+### Agent scenario: a long tool call handed to a queue
+A research agent decides to call `transcribe_video`, which takes 2-6 minutes. The agent service records
+the call and enqueues it; a tool worker executes it idempotently and publishes the result, which resumes
+the run. `tool_results`, `run_tool` and `publish` are application-supplied.
+
+```python
+def handle_tool_call(msg):
+    call = json.loads(msg["Body"])          # {"tool_call_id", "run_id", "tool", "args"}
+    done = tool_results.get(call["tool_call_id"])
+    if done is None:                        # redelivery after a crash skips straight to publish
+        output = run_tool(call["tool"], call["args"],
+                          idempotency_key=call["tool_call_id"])  # side-effecting tools dedupe too
+        done = tool_results.put(call["tool_call_id"], output)    # keyed by tool-call id
+    publish("agent.tool_result", key=call["run_id"],           # same key keeps one run's events in order
+            body={"run_id": call["run_id"], "tool_call_id": call["tool_call_id"], "result_ref": done})
+```
+
+| Setting | Value | Why |
+|---|---|---|
+| p99 tool duration | ~6 min | sets the timeout floor |
+| Visibility timeout | 60 s, heartbeat every 30 s | short enough to recover a crashed worker fast |
+| `maxReceiveCount` | 5 | a video that always crashes the transcriber goes to the DLQ, and the run is marked failed |
+
+The result event carries a reference, not the transcript, because a long transcript is a claim-check
+payload for object storage.
+
 ### Production SQL: the transactional outbox
 The business row and the event commit together; the relay publishes and marks rows, and several relays
 can run safely because of `SKIP LOCKED`.
@@ -299,6 +352,12 @@ COMMIT;
 - **Timeouts sized to real model latency.** Set the visibility timeout or ack deadline above p99
   processing time and heartbeat for long calls; key every result by message or job id. Monitor
   redelivery rate (SQS `ApproximateReceiveCount` per message) as a timeout-too-short signal.
+- **Separate queues per agent workload class.** Interactive tool calls, bulk ingestion and nightly eval
+  runs get their own queues and consumer pools, so a 50,000-document backfill cannot delay a user's agent
+  waiting on one tool result. Monitor oldest-message age per queue against each class's latency promise.
+- **Failed runs surface from the DLQ.** When a tool-call message dead-letters, a consumer marks the agent
+  run failed with the error, so the user and the agent see a final state instead of waiting forever.
+  Monitor DLQ inflow per tool name.
 
 ## Trade-offs
 - **Decoupling vs visibility.** Producers gain availability and burst tolerance, but the caller no longer
@@ -334,10 +393,14 @@ COMMIT;
   "created" events and intermittent not-found errors.
 - **Multi-megabyte payloads through the broker.** Symptom: size errors, slow brokers, and a broker that has
   become an accidental blob store.
+- **Agent runs waiting on a result that dead-lettered.** Symptom: runs stuck in "waiting on tool" for
+  days. Fix: a DLQ consumer that fails the run, plus a run-level timeout that does the same.
 
 ## When to use
 - **Use when:** work must outlive the request, a downstream is slower or less available than the caller,
   several consumers need the same events, or bursts must be smoothed.
+- **Agent fits:** RAG ingestion, tool calls longer than a request timeout, sub-agent fan-out, and run
+  events for billing and evals; keep the agent's own reasoning loop out of the broker.
 - **Avoid when:** it is a synchronous read the user is waiting on, or a database table with `SKIP LOCKED`
   would carry the load without a new system.
 - **Measure from day one:** lag, oldest-message age, redelivery rate and DLQ depth.
@@ -382,7 +445,7 @@ older than the current state. Add a DLQ so poison messages do not block either p
 - **Fix:** a transactional outbox, writing the event row in the same transaction, with a relay or CDC
   publishing it; consumers deduplicate because the relay is at-least-once too.
 
-### Kafka or SQS for an LLM document-ingestion pipeline?
+### Kafka or SQS for a RAG agent's document-ingestion pipeline?
 - **SQS** if it is a job buffer: per-message retries, a DLQ, visibility timeouts and no brokers to run.
 - **Kafka** if several teams consume the same document events, need replay to rebuild an index, or the
   throughput is very high.
@@ -400,6 +463,13 @@ older than the current state. Add a DLQ so poison messages do not block either p
   arrivals, so 800/s total.
 - **At 50 messages per second per consumer** (an assumed figure), that is 16 consumers, and the
   autoscaler should key on oldest-message age to get there automatically.
+
+### An agent's side-effecting tool sometimes runs twice when executed through a queue. How do you fix it?
+- **Expected under at-least-once:** the worker finished the tool and crashed, or outlived its visibility
+  timeout, before acknowledging, so the message was redelivered.
+- **Fix:** carry the tool-call id as the idempotency key, store the result keyed by it before acking, pass
+  it to the downstream API if it supports idempotency keys, and heartbeat long calls.
+- **Verify:** inject a crash between tool execution and ack in a test and assert one side effect.
 
 ## Quiz
 ### Q: Why is "exactly-once delivery" not something a broker can promise for a consumer that calls an external API?
@@ -427,3 +497,24 @@ older than the current state. Add a DLQ so poison messages do not block either p
 - [ ] Messages must be retained indefinitely as the system of record
 > SQS offers a managed, pay-per-use queue with retries and dead-lettering but deletes messages on
 > acknowledgement and bounds retention. Replay, long retention and many consumer groups are Kafka's strengths.
+
+## Use cases & projects
+### Use cases
+- **RAG ingestion pipelines.** Upload events fan out to chunking, embedding and indexing consumers that
+  scale on backlog age and retry per document.
+- **Long-running agent tools.** Transcription, code execution or report generation runs on tool workers
+  while the agent run waits for a result event.
+- **Sub-agent orchestration.** A planner agent enqueues one task per sub-agent and a joiner resumes the
+  parent run when all results arrive.
+- **Agent telemetry.** Token, cost and tool-outcome events flow to billing, dashboards and eval datasets
+  without slowing the agent loop.
+
+### Mini project
+**Run an agent tool through a queue with exactly-once effects (2-3 hours).**
+- **Goal:** an agent whose slow tool executes on a separate worker via a queue, with no duplicate side
+  effects under crashes.
+- **Steps:** use SQS (or LocalStack, or RabbitMQ in Docker); give a small agent a slow fake tool that
+  appends to a ledger; enqueue tool calls with a tool-call id; write the worker with result storage keyed
+  by that id, a heartbeat and a DLQ after 3 receives; kill the worker randomly during 50 tool calls.
+- **Done when:** the ledger has exactly one entry per tool-call id, every agent run reaches a final state
+  (completed or failed from the DLQ), and you can show the redelivery count from the queue metrics.

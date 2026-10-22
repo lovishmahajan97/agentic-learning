@@ -5,7 +5,8 @@ name: State persistence & conversation recovery
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/state-and-checkpoint-stores
@@ -20,6 +21,19 @@ related:
 Persist conversation state and execution state separately. Keep the transcript as an append-only,
 sequence-numbered event log and derive the model's context from it, so clients catch up by sequence
 number and interrupted turns are repaired, never dangling or duplicated.
+
+## For agent builders
+- **Why it matters for agents.** A tool-using assistant leaves tool calls, streamed deltas and approvals
+  mid-flight whenever a client drops or a worker dies. An unrepaired tool call with no result makes the
+  next model request fail, so the conversation is stuck until you fix the log.
+- **Where it shows up in your stack.** Your conversation events table, the SSE stream (event `id:` as the
+  `seq`, `Last-Event-ID` on reconnect), the context builder that formats provider messages, and a startup
+  scan for turns whose run lease expired.
+- **What you control.** The split between conversation and execution state, the event schema, the turn
+  state machine, client-minted turn ids, how interrupted calls are repaired, how compaction writes summary
+  events, and how edits become branches.
+- **What you can skip.** Using a provider's hosted thread as your record of truth. Derive provider messages
+  from your own log so you can swap models and re-derive any past context.
 
 ## Why it exists
 - **Three timescales get confused.** A multi-turn assistant lives for days or months; the HTTP request
@@ -369,3 +383,25 @@ close any dangling tool call and mark the turn interrupted with a retry affordan
 - [ ] The client waits for the run to finish before retrying
 > A client-generated id lets the server recognise the retry as the same turn regardless of timing or
 > text, which is the standard idempotency approach. Text comparison fails for legitimately repeated messages.
+
+## Use cases & projects
+### Use cases
+- **Support and refund assistants.** A user closes the tab mid-refund and returns on another device; the
+  client catches up from its last `seq` and sees the turn's real state.
+- **Coding assistants with long turns.** Streamed deltas buffered by run id let a reconnect mid-message
+  replay the output instead of starting the turn again.
+- **Assistants after a deploy.** A startup scan marks expired turns `interrupted` and synthesizes
+  "outcome unknown" tool results, so every conversation stays usable.
+- **Assistants with edit and regenerate.** Edits become branches with an active leaf, so the model never
+  sees abandoned replies and audit keeps them all.
+
+### Mini project
+**Build a recoverable chat-agent transcript (2-3 hours).**
+- **Goal:** store an assistant's transcript as a sequence-numbered event log that survives disconnects,
+  duplicate POSTs and a mid-turn crash.
+- **Steps:** create an events table `(conversation_id, seq, type, payload, created_at)` in SQLite; accept
+  turns with a client-minted turn id and ignore repeats; derive provider messages from the log; simulate a
+  crash after a tool call event; on restart, append a synthesized "interrupted: outcome unknown" result and
+  mark the turn `interrupted`.
+- **Done when:** a catch-up request after any `seq` returns the missing events, a retried POST adds no
+  second turn, and the repaired history passes a check that every tool call has a result.

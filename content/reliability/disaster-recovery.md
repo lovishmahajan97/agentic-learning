@@ -5,7 +5,8 @@ name: Disaster recovery (RPO / RTO)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - reliability/business-continuity
   - reliability/high-availability
@@ -22,9 +23,23 @@ sources:
 ---
 
 ## TL;DR
-Disaster recovery restores service after failures redundancy cannot mask. **RPO** is how much data,
-in time, you may lose; **RTO** is how long you may be down. Every design trades cost against both,
-and an unrehearsed plan is a hypothesis.
+Disaster recovery restores your agent after failures redundancy cannot mask. **RPO** is how much agent
+state, in time, you may lose; **RTO** is how long you may be down. Vector indexes, memory and
+checkpoints all count, and an unrehearsed plan is a hypothesis.
+
+## For agent builders
+- **Why it matters for agents.** An agent's state is spread across many stores: transcripts, long-term
+  memory, run checkpoints, vector indexes, prompts, tool registries and adapters. Lose one and the
+  restored agent behaves differently, and restoring checkpoints to an earlier point can make it repeat
+  actions the outside world already saw.
+- **Where it shows up in your stack.** Postgres point-in-time recovery for sessions and checkpoints,
+  vector index snapshots, git for prompts and tool schemas, artefact storage for fine-tuned adapters,
+  and the workflow engine's history store.
+- **What you control.** The inventory of agent state, restore versus rebuild per store, snapshot
+  intervals, where idempotency keys live, and the drill that runs your agent eval set on the restored
+  system.
+- **What you can skip.** Writing backup tooling; use the database's managed PITR or tools like
+  pgBackRest or WAL-G. Know the RPO/RTO arithmetic and the restore-or-rebuild table.
 
 ## Why it exists
 - **HA redundancy is in the same place and real time,** which makes it useless for a whole class of
@@ -121,6 +136,16 @@ List every store, decide whether it is *restored* or *rebuilt*, and estimate the
 | Fine-tuned weights and adapters | copy to a second region as artefacts | retraining is not a recovery plan |
 | Agent checkpoints and workflow histories | restore | runs after the recovery point replay from an earlier step |
 | Eval datasets and golden sets | restore | losing them silently breaks release gates |
+| Agent long-term memory | restore, with its embeddings or the model version to re-embed | memories are user data: same RPO and residency as transcripts |
+| Tool registry, MCP server configs, tool schemas | in git, redeployed | a restored agent with different tool schemas makes different calls |
+
+### Agents and the world that moved on
+- **Restoring agent state does not restore the world.** If checkpoints are restored to 10 minutes before
+  the disaster, runs replay steps whose emails, tickets or payments already happened.
+- **So deduplication must live in the target system,** not only in your database: the tool sends an
+  idempotency key and the receiver remembers it, so a replayed step after restore is a no-op.
+- **Keep an action log outside the restored store,** for example an append-only log in another account,
+  so you can reconcile which side effects landed after the recovery point.
 
 ## Diagram
 The timeline view: RPO looks backwards from the disaster to the last copy, RTO looks forwards and is
@@ -201,6 +226,23 @@ for name, steps, rpo in (("current", current, worst_rpo_min(24 * 60)),
 # revised: RPO 1 min (ok), RTO 145 min (ok)
 ```
 
+### Worked scenario: restoring an agent's checkpoints after a bad migration
+A bad migration corrupts the run-checkpoint table at 14:00. The team restores it to 13:50 with
+point-in-time recovery. Figures are illustrative.
+
+| Item | Value |
+|---|---|
+| Agent runs active between 13:50 and 14:00 | 120 |
+| Action-tool calls they made in that window | 300 (tickets, emails, refunds) |
+| Calls replayed on resume if nothing is done | up to 300 |
+| Duplicates with idempotency keys honoured by the target systems | 0 |
+| Duplicates with keys stored only in the restored database | up to 300, because the keys were rolled back too |
+
+- **The lesson:** the record of "this action already happened" must survive the restore, so it lives in
+  the receiving system or an action log outside the restored store.
+- **Verify the restored agent,** not only the database: run the golden eval set and a few replayed runs
+  against the restored environment before re-pointing traffic.
+
 ## Production patterns
 - **Continuous WAL archiving plus periodic base backups.** For Postgres, archive WAL to object storage in
   the DR region (tools such as pgBackRest or WAL-G do this) and take base backups often enough that replay
@@ -216,6 +258,12 @@ for name, steps, rpo in (("current", current, worst_rpo_min(24 * 60)),
   and actual, and treat a missed objective as an incident finding.
 - **Retention sized to detection time.** Set snapshot and log retention longer than the slowest past
   case of noticed corruption (35 days in the example above). Monitor the oldest restorable point.
+- **Agent eval set as the DR acceptance test.** A restore is done only when the restored agent passes the
+  same golden tasks as production, with the same prompts, tool schemas and index. Monitor eval score of
+  the restored environment against the last production run.
+- **Action log outside the restore boundary.** Append every side-effecting tool call with its
+  idempotency key to a log in a separate account, so post-restore replays can be reconciled. Monitor log
+  write failures, because a gap there means unknown actions after a restore.
 
 ## Trade-offs
 - **Shorter RPO vs cost.** It means more frequent or continuous replication, costing bandwidth, storage
@@ -229,6 +277,9 @@ for name, steps, rpo in (("current", current, worst_rpo_min(24 * 60)),
   bureaucratic.
 - **Automated vs human-decided failover.** Automation shortens RTO but can trigger on false alarms and
   cause data loss or split brain; a human decision step adds minutes and removes that class of error.
+- **Resume vs restart agent runs after restore.** Resuming from restored checkpoints saves model spend
+  and user time but risks replaying actions; restarting from scratch is simpler and flips to the safer
+  choice when tools are not idempotent.
 
 ## Pitfalls
 - **Backups that are never restored.** The job has been failing for months or the restore needs a key
@@ -243,6 +294,9 @@ for name, steps, rpo in (("current", current, worst_rpo_min(24 * 60)),
   drill shows two hours where the plan said thirty minutes.
 - **Retention shorter than the time to notice logical corruption.** The symptom is a bug report about
   bad data whose first bad write is older than the oldest backup.
+- **Forgetting agent memory and tool schemas in the inventory.** The restored agent has no long-term
+  memories or calls tools with an older schema; the symptom is users saying "it forgot me" or a spike in
+  tool validation errors after recovery.
 
 ## When to use
 - **Every production system needs a DR plan;** the choice is the strategy tier, which follows from the
@@ -310,6 +364,13 @@ prompt registry and model artefacts.
 - **Store the embedding model version** with the snapshot, because a rebuild or restore with a different
   model produces vectors the query path cannot use.
 
+### After restoring agent checkpoints from ten minutes ago, how do you stop runs repeating real actions?
+- **The world was not restored,** so emails, tickets and payments from those ten minutes already exist.
+- **Deduplicate at the receiver:** every action tool sends an idempotency key the target system
+  remembers, so a replayed step returns the first result instead of acting twice.
+- **Reconcile from an action log** kept outside the restore boundary, and pause runs whose last action
+  has an unknown outcome until a human or a read-after-restore check confirms it.
+
 ## Quiz
 ### Q: A system takes a full backup every night at 02:00. Data is destroyed at 13:00. What is the recovery point loss, and which objective does it test?
 - [ ] 13 hours, testing the RTO
@@ -334,3 +395,23 @@ prompt registry and model artefacts.
 - [ ] Vector databases do not support restoring from a snapshot
 > Rebuild is a valid recovery path, but its duration is part of the recovery time. A snapshot restore
 > turns hours of re-embedding into minutes, usually for modest storage cost.
+
+## Use cases & projects
+### Use cases
+- **RAG assistants with large indexes.** Index snapshots tagged with the embedding model turn an
+  eight-hour re-embed into a short restore inside RTO.
+- **Agents with long-term memory.** Memory stores get the same RPO, retention and residency as
+  transcripts, because losing them is a visible product regression.
+- **Action-taking agents.** Idempotency keys honoured by target systems and an external action log make
+  checkpoint restores safe to resume.
+- **Enterprise security questionnaires.** Measured RPA and RTA from drills answer the customer's DR
+  questions for an agent deployment with numbers, not promises.
+
+### Mini project
+**Run a timed DR drill on a small RAG agent (2-3 hours).**
+- **Goal:** measure the actual RPO and RTO of a toy agent and prove the restored agent behaves the same.
+- **Steps:** build a small RAG agent with Postgres (sessions and checkpoints) and a local vector index;
+  snapshot the index with its embedding model name; take a base backup and archive WAL; delete the
+  database and index; restore to a chosen second, time each RTO step, and run five golden questions.
+- **Done when:** a table records RPA and RTA per store against targets, the golden answers match the
+  pre-disaster run, and the drill notes list every manual step to automate next.

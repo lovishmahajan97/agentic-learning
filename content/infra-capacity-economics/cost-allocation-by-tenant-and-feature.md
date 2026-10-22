@@ -5,7 +5,8 @@ name: Cost allocation by tenant & feature
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - infra-capacity-economics/finops
   - infra-capacity-economics/unit-economics-per-successful-task
@@ -20,9 +21,21 @@ sources:
 ---
 
 ## TL;DR
-Cost allocation assigns every dollar of AI spend to the tenant and feature that caused it: token costs
-by tagging each call, shared GPU fleets and stores by an explicit driver. Without it you cannot price
-tiers or find unprofitable customers.
+Cost allocation assigns every dollar an agent platform spends to the tenant and feature that caused it:
+tag each model and tool call, including ones deep inside agent runs, and split shared GPU fleets and stores
+by an explicit driver, or tiers cannot be priced.
+
+## For agent builders
+- **Why it matters for agents.** An agent run spends money far from the request that started it: planner
+  calls, tool calls that call models themselves, sub-agents, retries and background jobs. If tenant and
+  feature tags do not follow every hop, most agent spend lands in an unattributed bucket.
+- **Where it shows up in your stack.** The LLM gateway or client wrapper, trace context (OpenTelemetry
+  span attributes or baggage, run metadata in LangSmith or Langfuse), job queue payloads, provider
+  projects or keys, and the monthly reconciliation job against invoices.
+- **What you control.** Which tags are mandatory, how the agent loop and its tools propagate them, the
+  driver for shared GPU and vector-store cost, and whether idle capacity is spread or shown separately.
+- **What you can skip.** Formal chargeback mechanics until internal teams pay from their own budgets.
+  Showback with trustworthy, reconciled numbers is where agent platforms start.
 
 ## Why it exists
 - **Invoices say how much, not who.** A hosted model invoice is one number per model per month; a
@@ -45,6 +58,8 @@ tiers or find unprofitable customers.
   for self-hosted models the GPU-seconds or token-seconds consumed.
 - **Propagate tags** through agents, tools and background jobs as trace attributes, *because* the call
   that spends money is often several hops away from the request that caused it.
+- **Paid tools count too.** Search APIs, code sandboxes and other per-call tools the agent uses go through
+  the same tagging, so a tenant's agent cost is not just its token bill.
 
 ### 2. Price direct costs per call
 - **Compute cost at write time** from a versioned price table, so historical rows keep the price that
@@ -67,10 +82,11 @@ Shared pools need a driver that approximates causation:
 | **Idle and headroom capacity** | Spread by usage, or a visible platform-overhead line | Policy choice, see below |
 
 - **Long context crowds others out.** A 100k-token session that decodes slowly crowds out many short ones
-  while using little arithmetic, so occupancy is often the fairer driver.
+  while using little arithmetic, so occupancy is often the fairer driver. Long-running agents with large
+  transcripts are exactly this traffic.
 - **Prompt-cache prefixes:** the first request pays the cache write and later ones get the cheap read.
-  For a prefix shared across tenants (a common system prompt), pricing every call at the blended rate is
-  usually fairer.
+  For a prefix shared across tenants (a common system prompt or tool schema set), pricing every call at
+  the blended rate is usually fairer.
 - **Idle capacity:** spreading makes tenant totals add up; keeping it separate shows the cost of
   over-provisioning instead of hiding it.
 - **Write the driver choice down.** It is a policy decision, and changing it changes everyone's numbers.
@@ -90,12 +106,12 @@ Shared pools need a driver that approximates causation:
   per-tenant quotas, and to flag tenants whose cost exceeds their revenue.
 
 ## Diagram
-Direct costs are priced per tagged call; shared invoices are split by a driver; both meet in one
-tenant-by-feature table that must reconcile to the invoices.
+Direct costs are priced per tagged call, including calls made inside agent runs; shared invoices are
+split by a driver; both meet in one tenant-by-feature table that must reconcile to the invoices.
 
 ```mermaid
 flowchart TD
-    R["Request with tenant and feature tags"] --> G{"Gateway: tags present?"}
+    R["Agent run with tenant and feature tags"] --> G{"Gateway: tags present?"}
     G -->|"no"| U["Flag as UNATTRIBUTED"]
     G -->|"yes"| E["Priced usage event"]
     P["Versioned price table"] --> E
@@ -109,6 +125,58 @@ flowchart TD
 ```
 
 ## Examples
+### Propagating tags through an agent run
+A `contextvars` variable carries tenant, feature and run ID into every model call, tool call and
+concurrent sub-task of one run; asyncio tasks copy the context automatically, but a queued job only keeps
+the tags you copy into its payload. Costs are illustrative.
+
+```python
+import asyncio, contextvars
+
+TAGS = contextvars.ContextVar("cost_tags", default=None)   # tenant, feature, run id
+LEDGER = []
+
+def record(kind, cost_usd):
+    tags = TAGS.get() or {"tenant_id": "UNATTRIBUTED", "feature": "UNATTRIBUTED"}
+    LEDGER.append({**tags, "kind": kind, "cost_usd": cost_usd})
+
+async def call_model(step, cost):          # stand-in for the gateway client
+    record(f"model:{step}", cost)
+
+async def web_search(q):                   # tool that itself calls a model to summarise
+    record("tool:web_search", 0.005)
+    await call_model("summarise_results", 0.02)
+
+async def run_agent(tenant_id, feature, run_id):
+    TAGS.set({"tenant_id": tenant_id, "feature": feature, "run_id": run_id})
+    await call_model("plan", 0.03)
+    await asyncio.gather(web_search("a"), web_search("b"))  # tasks copy the context
+    await call_model("answer", 0.04)
+    return {"job": "reembed", **TAGS.get()}                 # copy tags into job payloads
+
+job = asyncio.run(run_agent("acme", "research-agent", "r-17"))
+record("model:background_job_without_tags", 0.08)          # a hop that lost the context
+for row in LEDGER:
+    print(row["tenant_id"], row["kind"], row["cost_usd"])
+# acme model:plan 0.03 ... acme model:answer 0.04
+# UNATTRIBUTED model:background_job_without_tags 0.08
+```
+
+### Worked scenario: where an agent run's spend goes missing
+One illustrative research-agent run costs $0.42. Before propagation, only the user-facing calls carried
+tags.
+
+| Hop | Cost | Tagged before fix | Tagged after fix |
+|---|---|---|---|
+| Planner and final-answer calls | $0.12 | yes | yes |
+| Tool calls and the models tools call | $0.22 | no | yes, via trace context |
+| Background re-embedding job | $0.08 | no | yes, tags in job payload |
+| **Unattributed share** | | **~71%** | **0%** |
+
+- **Before the fix,** the tenant looked as if it cost $0.12 per run, under a third of the truth.
+- **The tool hop is the usual leak,** because tools are often written as plain functions that call the
+  model client without the run's context.
+
 ### Monthly allocation in SQL
 A month of usage: hosted API calls priced at the gateway, plus a shared GPU fleet and vector store
 billed as lump sums (PostgreSQL; numeric columns).
@@ -147,7 +215,7 @@ ORDER BY total DESC;
 
 ### Worked scenario: the tenant that looked profitable
 Illustrative month: $40,000 of direct API spend plus a $30,000 GPU fleet ($70,000 in all; vector store
-left out for simplicity). Tenant A's contract-review feature used 45% of GPU-seconds, and A holds 5% of
+left out for simplicity). Tenant A's contract-review agent used 45% of GPU-seconds, and A holds 5% of
 seats.
 
 | View | A's cost | A's contract | Margin |
@@ -199,6 +267,9 @@ print(priced_event({**call, "day": date(2026, 9, 20)})["api_cost_usd"])   # 0.04
 - **Propagate context through async work.** Carry tenant and feature as trace context (for example
   OpenTelemetry baggage or span attributes) into agents, tool calls, queues and background jobs, and copy
   them into job payloads. Monitor unattributed spend by service to find the hop that drops them.
+- **Tag the run, not just the call.** Agent teams attach run ID, tenant and feature as run metadata in
+  their tracing tool, so cost per run can be grouped by tenant and the most expensive runs opened.
+  Monitor cost per run percentiles per tenant.
 - **Split at the source with provider projects or keys.** Use separate OpenAI projects or Anthropic
   workspaces, or separate keys, per environment or major feature, so the invoice cross-checks the
   gateway's numbers. Monitor the gap between gateway-computed and invoiced cost per key.
@@ -219,6 +290,9 @@ print(priced_event({**call, "day": date(2026, 9, 20)})["api_cost_usd"])   # 0.04
 - **Per-tenant keys or dedicated pools vs pooling.** They make attribution exact, but lose pooling
   efficiency and add quota management; worth it for large enterprise tenants, not a long tail of small
   ones.
+- **Strict rejection of untagged calls vs agent availability.** Rejecting untagged calls forces clean
+  data, but a missed tag in a new tool then breaks agent runs; flag-and-alert is safer while tools are
+  still being added.
 
 ## Pitfalls
 - **Tagging only the user-facing call.** Symptom: a large unattributed bucket made of agent tool calls,
@@ -234,7 +308,7 @@ print(priced_event({**call, "day": date(2026, 9, 20)})["api_cost_usd"])   # 0.04
 
 ## When to use
 - **Set up tagging before the first multi-tenant launch;** it is cheap at the start and painful to
-  retrofit.
+  retrofit, especially once agents have many tools.
 - **Formal shared-pool allocation pays** once shared infrastructure is a material part of spend or pricing
   decisions depend on per-tenant cost.
 - **Measure** unattributed share, cost per tenant against revenue per tenant, cost per feature per active
@@ -275,6 +349,14 @@ share.
 - **Fix at the hop that drops it:** propagate tenant and feature as trace context and copy them into job
   payloads.
 - **Then enforce:** make the gateway reject or flag untagged calls so the bucket cannot regrow.
+
+### How do you make sure every call an agent makes, including inside its tools, is attributed to a tenant?
+- **Set the tags once at run start** in a context that the model client and tool wrappers read, rather
+  than passing them by hand to each function.
+- **Route every model and paid tool call through one gateway** that reads that context and flags or
+  rejects calls without it.
+- **Copy tags into queued job payloads,** because context does not survive a queue, and monitor the
+  unattributed share by service.
 
 ### When would you give a tenant dedicated keys or a dedicated pool instead of shared infrastructure?
 - **Large enterprise tenants** whose contracts need exact attribution, isolation or a guaranteed quota.
@@ -319,3 +401,25 @@ share.
 - [ ] It removes the need for an allocation driver
 > Spreading idle cost hides it inside every tenant's number. A separate line makes utilization a
 > visible, owned cost; the trade-off is that tenant totals then do not add up to the invoice by themselves.
+
+## Use cases & projects
+### Use cases
+- **Multi-tenant agent platforms.** Per-tenant cost per run shows which customers' agents are profitable
+  and which need quotas or overage pricing.
+- **Finding the leaky hop.** The unattributed share by service points at the tool, sub-agent or job that
+  drops tenant context.
+- **Pricing an agent tier.** Driver-based allocation of shared GPU cost shows what long-context or
+  long-running agent tenants really cost before a tier is priced.
+- **Internal agent platforms.** Showback per team and feature lets product teams see what their agents
+  cost before chargeback is introduced.
+
+### Mini project
+**Tenant cost report for a toy agent platform (2-3 hours).**
+- **Goal:** attribute every dollar of a small multi-tenant agent's spend to a tenant and feature, with an
+  unattributed share under 2%.
+- **Steps:** build an agent with two tools (one of which calls a model), run it for three fake tenants;
+  set tags in a context variable at run start and record each model and tool call to a SQLite or Postgres
+  ledger; add a background job that receives tags in its payload; deliberately break one hop and watch the
+  unattributed share rise; write the monthly allocation query with a shared "GPU" pool split by tokens.
+- **Done when:** you have a per-tenant, per-feature table that sums to the total ledger spend, the
+  unattributed share before and after the fix, and a note on which hop leaked.

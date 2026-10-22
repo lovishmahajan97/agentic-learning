@@ -5,7 +5,8 @@ name: Hybrid / on-prem
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - infra-capacity-economics/cloud-ai-architecture
   - infra-capacity-economics/gpu-infrastructure
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-Hybrid AI infrastructure runs some inference on hardware you control and the rest on hosted APIs, a
-gateway routing each request by data class, latency and model need. Some data cannot leave and steady
-volume is cheaper owned; on-prem alone loses frontier models.
+A hybrid agent runs some steps on models you host and others on hosted APIs, with a gateway routing each
+step by data class, latency and model need. Restricted data stays owned; frontier reasoning and bursts
+go to the cloud.
+
+## For agent builders
+- **Why it matters for agents.** An agent's transcript accumulates tool results, so one step that reads a
+  patient record or a classified file makes every later step of that run restricted. Routing must follow
+  the run's highest data class so far, not just the user's first message.
+- **Where it shows up in your stack.** An OpenAI-compatible on-prem engine (vLLM, TGI) and a hosted
+  platform behind one gateway, your agent framework's model client pointed at that gateway, and data
+  labels on the tool outputs your retrieval and database tools return.
+- **What you control.** Which tools may return restricted data, labelling their outputs, per-route prompts
+  and evals for the agent, and whether a planner on a frontier model may hand work to an on-prem executor.
+- **What you can skip.** Rack, power and procurement detail. Know the routing order, the sizing rule and
+  why owned GPUs must stay busy.
 
 ## Why it exists
 - **Regulation and contracts push on-prem.** Health, financial, defence and public-sector data often may
@@ -76,6 +89,19 @@ budget, model capability required, tenant and site. The policy maps those to a t
   not from inspecting the prompt at request time. Inspection is a detector with a miss rate, and the rule
   must hold at the boundary regardless.
 
+### Routing an agent run, step by step
+- **The run carries a high-water mark.** Its data class is the highest class of anything in its context:
+  the user's input, retrieved chunks and every tool result. It can rise mid-run and never falls, because
+  the restricted text stays in the transcript.
+- **Tools label their outputs.** A records tool returns restricted, a web search returns public; the label
+  comes from the source system, as for any request.
+- **Route each step by the mark.** Steps before the first restricted result may use the cloud; every step
+  after it goes to the owned pool, including the final answer.
+- **Split roles deliberately.** A frontier planner may see only task descriptions and public context,
+  while an on-prem executor holds the restricted data and returns a result that has to be labelled too.
+- **Memory inherits the label.** A summary or memory entry written from a restricted run is restricted,
+  so it must not be fed to a later cloud-routed run.
+
 ### A uniform API surface
 - **Application code should not know which side served it.** On-prem engines (vLLM, TGI and others) expose
   OpenAI-compatible endpoints; hosted platforms are reached through their SDKs.
@@ -125,12 +151,13 @@ owned cost per token = (amortised hardware + power + space + people) ÷ tokens a
   keep the owned side above it by giving it all the eligible work.
 
 ## Diagram
-The order of checks is the policy: classification first, so no later rule about latency, capability or
-burst can move restricted data off owned hardware.
+Each agent step runs through this check. The order of checks is the policy: classification first (the
+run's high-water mark), so no later rule about latency, capability or burst can move restricted data
+off owned hardware.
 
 ```mermaid
 flowchart TD
-    R["Request with source data label"] --> C{"Restricted data?"}
+    R["Agent step with run data label"] --> C{"Run touched restricted data?"}
     C -->|"yes"| F1{"Needs frontier model?"}
     F1 -->|"yes"| X["Refuse: signal to improve on-prem model"]
     F1 -->|"no"| OP["On-prem central pool"]
@@ -193,6 +220,45 @@ print(route(Request(DataClass.PUBLIC, False, 2000)))            # cloud:eu-regio
 - **The order of the checks is the policy:** classification first, so no later rule (latency, capability,
   burst) can move restricted data.
 
+### Per-step routing for an agent run
+Reuses `route`, `Request` and `DataClass` from above. The run's class is a high-water mark raised by each
+labelled tool result, so the step after a records lookup is already on-prem.
+
+```python
+RANK = {DataClass.PUBLIC: 0, DataClass.INTERNAL: 1, DataClass.RESTRICTED: 2}
+
+class AgentRun:
+    def __init__(self, input_class: DataClass):
+        self.data_class = input_class            # highest class seen in the context so far
+
+    def absorb(self, tool_output_class: DataClass):
+        if RANK[tool_output_class] > RANK[self.data_class]:
+            self.data_class = tool_output_class  # never lowered: the text stays in the transcript
+
+    def target(self, needs_frontier: bool, latency_budget_ms: int = 2000) -> str:
+        return route(Request(self.data_class, needs_frontier, latency_budget_ms))
+
+run = AgentRun(DataClass.INTERNAL)
+print(run.target(needs_frontier=True))           # cloud:eu-region  (plan the task)
+run.absorb(DataClass.RESTRICTED)                 # get_patient_record() returned a labelled record
+print(run.target(needs_frontier=False))          # onprem:central   (every step from here on)
+# run.target(needs_frontier=True) would now raise PermissionError: refuse, do not downgrade the label
+```
+
+### Worked scenario: where a 10-step clinical agent's tokens go
+Illustrative. Steps 1-3 plan and search public guidelines; step 4 reads a patient record; steps 4-10
+reason over it. Each step re-sends the transcript.
+
+| Steps | Data class of the run | Route | Share of the run's input tokens |
+|---|---|---|---|
+| 1-3 | internal | cloud frontier model | ~15% (short transcript) |
+| 4-10 | restricted | on-prem open-weight model | ~85% (long transcript, includes the record) |
+
+- **Most tokens land on-prem anyway,** because the later steps carry the longest prompts. Size the owned
+  pool from restricted *steps*, not from the count of restricted user requests.
+- **Eval the run on both routes,** since the run switches model at step 4 and the on-prem model must
+  continue a plan the frontier model wrote.
+
 ### Worked scenario: sizing the owned pool
 Illustrative numbers, in replicas of one model.
 
@@ -212,6 +278,12 @@ Illustrative numbers, in replicas of one model.
    that load.
 
 ## Production patterns
+- **Label every tool output and track the run's high-water mark.** Tool wrappers attach the source label
+  to each result; the agent runtime raises the run's class and sends it with every step. Monitor runs
+  whose class rose mid-run and any cloud-routed step after a restricted result, which must be zero.
+- **Planner in the cloud, executor on-prem.** When a task needs frontier planning over restricted data,
+  let the cloud model plan from task metadata only and hand execution to an on-prem agent that holds the
+  data. Monitor plan-follow failures on the on-prem side.
 - **Default-deny classification from source labels.** The data service attaches the record's label
   (document label, column tag, tenant contract) to the request, and the gateway rejects any request
   without one. Monitor rejections for missing labels and the share of traffic per class.
@@ -235,6 +307,9 @@ Illustrative numbers, in replicas of one model.
 - **Residency vs model quality.** On-prem satisfies residency and air-gap rules, but confines those
   workloads to open-weight models that typically trail the frontier; when the task needs frontier quality,
   the choice is a better on-prem model or a policy change, not a routing trick.
+- **Mid-run route switches vs consistency.** Routing each step by the high-water mark keeps restricted
+  data owned, but one run may be served by two models with different tool-calling habits; if switching
+  hurts task success, route the whole run on-prem from the start whenever it may touch restricted data.
 - **Bursting vs data paths.** Bursting absorbs peaks without over-buying hardware, but every burst path is a
   data path that must be gated by classification, and prompts must be evaluated on both models.
 - **Uniform interface vs hidden behaviour.** One gateway interface makes migration a configuration change,
@@ -243,6 +318,12 @@ Illustrative numbers, in replicas of one model.
   the provider's pricing and lock-in inside your building.
 
 ## Pitfalls
+- **Classifying the run by the user's question only.** Symptom: restricted tool results found in cloud
+  logs from later steps of runs that started with a harmless question. Fix: label tool outputs and route
+  each step by the run's high-water mark.
+- **Writing restricted runs into shared agent memory.** Symptom: a cloud-routed run quotes facts from a
+  restricted record it never fetched. Fix: memory entries inherit the run's label and are filtered by
+  route.
 - **Sizing on-prem for the peak of all traffic,** including work that could burst. Symptom: a GPU fleet
   averaging well under a quarter utilization while the finance model assumed near-full.
 - **Classification by prompt inspection instead of by source.** Symptom: a restricted document found in
@@ -260,6 +341,8 @@ Illustrative numbers, in replicas of one model.
 - **Use hybrid when** a named class of data or sites cannot use hosted APIs *and* other workloads need
   frontier models or elastic capacity. The hard parts are the routing policy, a uniform API surface, and
   keeping fixed capacity busy.
+- **Use it for agents when** some tools return regulated or site-local data while planning, search or
+  drafting benefit from a frontier model.
 - **Stay fully hosted when** no residency or connectivity constraint exists and volume is below the
   break-even.
 - **Go fully on-prem only when** policy forbids every hosted path and open-weight models meet the quality
@@ -313,12 +396,20 @@ insufficient.
 - **Order of checks:** classification runs first, so no latency, capability or burst rule can move
   restricted data.
 
-### Quality complaints arrive only during traffic peaks. What is your first hypothesis?
+### Your hybrid agent's task success drops only during traffic peaks. What is your first hypothesis?
 - **Bursting changed the model:** at peak, eligible requests overflow from the open-weight on-prem model to
   the cloud model (or the reverse during fallback), and a prompt tuned on one route regresses on the other.
-- **Confirm:** split quality metrics by route and correlate with burst volume.
+- **Confirm:** split quality and tool-call error metrics by route and correlate with burst volume.
 - **Fix:** keep prompts and evals per route and require a workload that may run on both sides to pass its
   eval on both.
+
+### An agent starts on a public question, then a tool returns a restricted record at step 4. How do you route the rest of the run?
+- **Raise the run's class at step 4** from the tool output's source label and route every later step,
+  including the final answer, to the owned pool.
+- **Never lower it:** the record stays in the transcript, so trimming the label without trimming the text
+  would leak it on the next cloud call.
+- **Design for it:** keep the on-prem model evaluated on continuing cloud-written plans, or route runs
+  that may touch restricted tools on-prem from step 1.
 
 ### Restricted traffic peaks at 3 replicas, eligible interactive at 6, and an overnight batch needs 4. How many replicas do you own?
 - **Own 4:** 3 for the restricted peak, which cannot burst, plus 1 spare for a node failure.
@@ -362,3 +453,24 @@ insufficient.
 > The restriction is on the data, not on the time or on identifiers that a detector might miss. The
 > correct response is a policy refusal, which becomes evidence for procuring a stronger on-prem model
 > or formally revisiting the rule.
+
+## Use cases & projects
+### Use cases
+- **Clinical and financial agents.** Planning and literature search use a hosted frontier model, while
+  every step after a patient or account record is read runs on owned GPUs.
+- **Agents at industrial or retail sites.** A site-local model serves low-latency or offline agent steps,
+  with central systems used when the link is up.
+- **Keeping owned GPUs busy with agent evals.** Nightly eval sweeps and batch agents backflow onto the
+  on-prem pool when interactive restricted traffic is quiet.
+- **Customer-VPC deployments of a vendor agent.** The agent's restricted steps run inside the customer's
+  account while non-sensitive steps may use the vendor's hosted model, if the contract allows it.
+
+### Mini project
+**Build a high-water-mark router for a two-tool agent (2 hours).**
+- **Goal:** prove that once a tool returns restricted data, no later step of the run reaches a cloud model.
+- **Steps:** stand up two OpenAI-compatible endpoints (a local small model as "on-prem" and any hosted or
+  second local model as "cloud"); write an agent with a public search tool and a labelled records tool;
+  route each step through a gateway that tracks the run's class; log route, class and step for 20 runs
+  with mixed questions.
+- **Done when:** the log shows zero cloud-routed steps after a restricted result, a frontier-only request
+  on a restricted run is refused, and you report task success per route.

@@ -5,7 +5,8 @@ name: Scaling laws
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: background
 related:
   - model-internals/small-language-models
   - model-internals/mixture-of-experts
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-Scaling laws are power-law fits predicting pre-training loss from parameters N, tokens D and compute C.
-Chinchilla set about 20 tokens per parameter as compute-optimal; practice now over-trains smaller models
-because serving cost scales with N.
+Scaling laws predict pre-training loss from parameters N, tokens D and compute C. For agent builders they
+explain why small over-trained models are strong, why agent calls cost about 2N FLOPs per token, and why
+benchmarks do not predict agent success.
+
+## For agent builders
+- **Why it matters for agents.** An agent multiplies per-token cost by many calls and long transcripts,
+  so the 2N-FLOPs-per-token rule is how you compare candidate models on cost per task. The laws also explain
+  why a recent 8B can replace an older 70B for some agent steps.
+- **Where it shows up in your stack.** Model cards (parameters, training tokens), model-selection and
+  cost spreadsheets, and the "bigger model or more reasoning effort" decision for hard agent steps.
+- **What you control.** Which model size backs each agent role, and whether you buy accuracy with a bigger
+  model, more test-time compute or better retrieval. You do not fit scaling laws yourself.
+- **What you can skip.** The fitting methods, the published constants and the Kaplan-versus-Chinchilla
+  history beyond one sentence. Keep 6ND, 2N per token, tokens per parameter, and "loss is smooth, task
+  metrics are not".
 
 ## Why it exists
 - **Frontier runs are too expensive to guess.** A frontier run is on the order of 10²⁵ FLOPs (illustrative)
@@ -45,7 +58,19 @@ because serving cost scales with N.
   is far more compute than training.
 
 ## How it works
-### The compute identity
+### What you use as an agent builder
+1. **Cost per agent task.** Every processed token (prompt and generated) costs about 2N FLOPs, so an agent
+   step over a 30k-token transcript on a 70B model costs about 9× the same step on an 8B.
+2. **Model-card sanity check.** Tokens per parameter tells you whether a model is under-trained (about 1),
+   compute-optimal (about 20) or over-trained for cheap serving (hundreds to thousands).
+3. **Do not extrapolate task success.** Loss falls smoothly with scale; agent success is a thresholded
+   metric (the task finished or it did not), so it can jump. Measure it on your own agent eval.
+4. **Three levers, not one.** A larger base model, more test-time compute per hard step, or better context
+   (retrieval, tools). Price each on your eval.
+
+The subsections below are background for reading model cards and vendor claims.
+
+### Background: the compute identity
 | Pass | Cost |
 |---|---|
 | Forward | about 2N FLOPs per token (one multiply-add per parameter) |
@@ -55,7 +80,7 @@ because serving cost scales with N.
 
 This identity is the bridge between the training-side and serving-side arguments below.
 
-### The loss fit
+### Background: the loss fit
 Chinchilla's parametric form is
 
 ```
@@ -77,7 +102,7 @@ L(N, D) = E + A / N^α + B / D^β
 - **This fit leans to data.** With the constants above a ≈ 0.45, so it favours data slightly more; the
   other two methods gave close to 0.5 each.
 
-### Three ways to fit it
+### Background: three ways to fit it
 Hoffmann et al. used three methods and got the same answer; the agreement is what made it convincing.
 1. **Fix N, vary training length,** and take the lower envelope of the curves.
 2. **IsoFLOP curves:** at fixed C, vary N and find the loss-minimising size.
@@ -89,7 +114,7 @@ Method matters. Kaplan's different exponents came partly from:
 
 If you fit your own law, tune the schedule per run and state what you count.
 
-### Inference-aware over-training
+### Background: inference-aware over-training
 - **Compute-optimal means "cheapest training for a given loss".** It ignores serving.
 - **Lifetime compute** for a model that generates T tokens over its life is roughly `6ND + 2NT`.
 - **When T is much larger than D,** true for any widely used model, shrinking N and raising D at the same
@@ -98,7 +123,7 @@ If you fit your own law, tune the schedule per run and state what you count.
   why strong small models exist at all. The loss curve flattens past the optimum but does not stop
   improving.
 
-### What the laws do and do not predict
+### Background: what the laws do and do not predict
 - **They predict** pre-training loss, equivalently perplexity, on held-out text.
 - **Not downstream accuracy directly.** Thresholded metrics (exact match, pass/fail) can jump abruptly
   while loss falls smoothly: the "emergent abilities" phenomenon. Schaeffer et al. argued much of the
@@ -127,6 +152,39 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: 2N FLOPs per token, applied to a 12-step agent
+The serving side of the compute identity, applied to an agent: a 6k-token prefix, ~1.5k tokens appended
+per step, 300 generated tokens per step. It ignores attention cost, which grows with context.
+
+```python
+def agent_tokens(steps=12, prefix=6_000, per_step=1_500, out=300, prefix_cache=False):
+    """Tokens the model processes for one agent task (prompt tokens plus generated tokens)."""
+    total = 0
+    for s in range(steps):
+        context = prefix + per_step * s              # transcript grows every step
+        new = context if (s == 0 or not prefix_cache) else per_step
+        total += new + out
+    return total
+
+for cache in (False, True):
+    t = agent_tokens(prefix_cache=cache)
+    for name, n in [("8B", 8e9), ("70B", 70e9)]:
+        flops = 2 * n * t                            # about 2N FLOPs per processed token
+        print(f"cache={cache!s:5} {name:>3}: {t:>7,} tokens/task  {flops:.1e} FLOPs/task  "
+              f"{flops * 1e6:.1e} FLOPs per million tasks")
+```
+
+| Setup | Tokens per task | 8B FLOPs per task | 70B FLOPs per task |
+|---|---|---|---|
+| Re-process the transcript every step | 174,600 | 2.8 × 10¹⁵ | 2.4 × 10¹⁶ |
+| Append-only with prefix caching | 26,100 | 4.2 × 10¹⁴ | 3.7 × 10¹⁵ |
+
+- **Reading.** Model size scales cost linearly (70B is ~9× the 8B); transcript handling scales it by ~7×.
+  Both levers matter as much as each other, and only an agent eval can say whether the 8B finishes enough
+  tasks.
+- **At a million tasks a month** the gap between the worst and best row is about 2.4 × 10²² versus
+  4.2 × 10²⁰ FLOPs, roughly 57×.
+
 ### Three ways to spend a 10²⁴ FLOP budget
 Take a 10²⁴ FLOP training budget and a model that will serve 10¹³ tokens over its life (both
 illustrative). Use Chinchilla's published fit as a stand-in for the curve, and compare the
@@ -196,6 +254,12 @@ for name, n, d in [("Gopher", 280, 300), ("Chinchilla", 70, 1_400),
 | "70B on 100B tokens" | about 1.4 | badly under-trained; be sceptical of its quality |
 
 ## Production patterns
+- **Compare agent models on cost per successful task.** Estimate tokens per task from traces, multiply by
+  price or 2N FLOPs, and divide by the task success rate on your agent eval. Re-run it whenever a newer,
+  smaller over-trained model ships, because those often close the gap on narrow steps.
+- **Read tokens per parameter before shortlisting.** A model card that implies about 1 token per parameter
+  is a weak candidate for any agent role; heavily over-trained small models are the usual picks for cheap
+  sub-steps. Confirm on your eval, not the card.
 - **Run a ladder before committing a big budget.** Train rungs spanning several orders of magnitude of
   compute, give each its own learning-rate schedule decayed to its own length, and state whether
   embeddings are counted. Hold out the largest rung and check the fit predicts its loss before trusting
@@ -213,6 +277,9 @@ for name, n, d in [("Gopher", 280, 300), ("Chinchilla", 70, 1_400),
   dollar of a reasoning mode against an upgrade of the base model on your own eval set.
 
 ## Trade-offs
+- **Bigger agent model vs better context.** A larger model raises capability on every step and every
+  token, while retrieval, tools and a tidy transcript raise it only where needed; for knowledge-bound agent
+  failures better context usually wins, for planning failures a bigger model may.
 - **Compute-optimal vs over-trained.** Compute-optimal minimises training cost per unit of loss, but yields
   a large model that is expensive to serve; it flips to over-training once lifetime served tokens exceed a
   few multiples of the training tokens.
@@ -225,6 +292,9 @@ for name, n, d in [("Gopher", 280, 300), ("Chinchilla", 70, 1_400),
   paid per query forever; it wins for low-volume hard queries and loses for high-volume easy ones.
 
 ## Pitfalls
+- **Predicting agent success from a leaderboard trend.** Symptom: a model one size up is expected to fix
+  your agent and does not, or a smaller one is rejected without testing. Fix: task success is thresholded,
+  so measure it on your own agent eval for each candidate.
 - **Treating 20 tokens per parameter as a law of nature.** It is a fit for Chinchilla's data and objective;
   the ratio for a model you will deploy is set by inference economics, often in the hundreds or thousands.
   Fix: pick the ratio from lifetime cost, `6ND + 2NT`.
@@ -242,6 +312,8 @@ for name, n, d in [("Gopher", 280, 300), ("Chinchilla", 70, 1_400),
 
 ## When to use
 Most practitioners never fit a scaling law; they use its implications.
+- **Agent builders:** estimate cost per agent task from 2N per processed token, shortlist models by tokens
+  per parameter, and settle the choice on an agent eval.
 - **Choose which model to deploy:** a heavily over-trained 8B can match a compute-optimal 20B.
 - **Estimate inference cost** from 2N FLOPs per token.
 - **Sanity-check claims:** "70B parameters trained on 100B tokens" means badly under-trained.
@@ -294,18 +366,22 @@ returns, and confirm you can actually source 18T tokens without heavy repetition
 - **Why it matters:** it changes whether you predict the next scale's behaviour or abandon a capability one
   scale too early.
 
-### You must fit a scaling law for a new data mix. How do you design the experiment?
-- **Ladder:** several model sizes spanning orders of magnitude of compute, each with a learning-rate
-  schedule tuned to its own length, and a consistent rule for counting parameters.
-- **Fit two ways,** IsoFLOP curves and the parametric form, and check they agree.
-- **Validate:** hold out the largest rung and check the fit predicts it, and avoid extrapolating many orders
-  of magnitude past the fitted range.
+### Your agent fails 30% of tasks on an 8B model. Do you move to a 70B?
+- **Classify the failures first.** Missing facts point to retrieval, wrong tool arguments to schemas or
+  validation, and bad multi-step plans to model capability.
+- **Price the upgrade.** At about 2N FLOPs per processed token, the 70B costs roughly 9× per task; compare
+  cost per successful task, not cost per call.
+- **Test the alternatives** on the same agent eval: the larger model for the planner only, more test-time
+  compute on hard steps, or better context.
 
-### How does mixture of experts complicate scaling-law reasoning?
-- **N is no longer one number.** Active parameters set FLOPs per token, total parameters set memory and
-  capacity, and the two scale loss and cost differently.
-- **So state which N** a fit or comparison uses; mixing them gives fits that disagree with published ones by
-  a large factor.
+### How would you use scaling-law reasoning to estimate what a new agent feature will cost?
+- **Tokens per task from traces:** prompt plus generated tokens for every step, including the growing
+  transcript.
+- **Multiply by 2N** for self-hosted FLOPs (or by the provider's per-token prices) and by expected task
+  volume.
+- **Then adjust** for prefix caching and per-step model choice, and validate against a week of real
+  usage.
+
 
 ## Quiz
 ### Q: Why did Chinchilla (70B parameters, 1.4T tokens) outperform Gopher (280B parameters, 300B tokens) at similar training compute?
@@ -333,3 +409,24 @@ returns, and confirm you can actually source 18T tokens without heavy repetition
 > The laws are fits of pre-training loss against N, D and C. Thresholded task metrics can jump
 > discontinuously as loss falls smoothly, and post-training quality depends on data and reward signals the
 > laws do not model.
+
+## Use cases & projects
+### Use cases
+- **Model selection for an agent role.** Shortlisting candidates by size and tokens per parameter before
+  running them through the agent eval.
+- **Cost forecasting for a new agent feature.** Turning traced tokens per task and 2N FLOPs per token into
+  a monthly compute or API budget.
+- **Bigger model or more reasoning.** Deciding whether a hard agent step gets a larger model, a reasoning
+  mode or better retrieval, priced on the same eval.
+- **Reading vendor claims.** Spotting an under-trained model or an emergence claim that is really a
+  thresholded metric.
+
+### Mini project
+**Cost-per-successful-task model for an agent (1-2 hours).**
+- **Goal:** decide between a small and a large model for a tool-calling agent using numbers, not
+  parameter counts.
+- **Steps:** run a 5-step agent on 30 tasks with two model sizes; log prompt and generated tokens per step;
+  compute tokens per task, estimated FLOPs (2N per token) or API cost, and task success rate; extrapolate
+  to 100k tasks a month with and without prefix caching.
+- **Done when:** a one-page table shows cost per task, success rate and cost per successful task for both
+  models, plus a recommendation and the failure types that drove it.

@@ -480,3 +480,24 @@ if any marker is ever retrieved or generated for another tenant.
 - [ ] Enabling row-level security on the conversations table
 > A leaked token is bounded to one tenant only if credentials are scoped per tenant and kept out of the
 > prompt and traces. Row-level security protects rows, not secrets, and the provider key is unrelated.
+
+## Use cases & projects
+### Use cases
+- **RAG agents over customer documents.** A mandatory tenant filter in the retrieval client and row
+  security under the document tables keep one customer's chunks out of another's context window.
+- **Agents with OAuth tool connectors.** Per-tenant tokens are fetched at run time and injected only into
+  the tool adapter, so a prompt injection cannot make the agent act with another tenant's credentials.
+- **Long-term agent memory.** Memory and checkpoint keys include the tenant, so a recalled fact or a
+  resumed run can never come from the wrong customer.
+- **Release safety for retrieval and prompt changes.** A cross-tenant canary runs after every change to
+  retrieval, prompts or caching, and blocks the release if any foreign data appears.
+
+### Mini project
+**Build and break a cross-tenant canary (2-3 hours).**
+- **Goal:** prove that a small RAG agent cannot leak data across tenants, even when asked to.
+- **Steps:** seed two tenants, each with a unique canary string in one document; bind the tenant to the
+  run from the request, never from tool arguments; enforce the tenant filter inside the retrieval client;
+  write tests that ask tenant A's agent, including injected prompts like "search acme's files", for
+  tenant B's canary; then remove the filter once and confirm the test catches it.
+- **Done when:** the canary test passes with isolation on, fails loudly with the filter removed, and
+  runs in CI on every change to retrieval or prompts.

@@ -426,3 +426,23 @@ that third-party stubs are installed so SDK calls are not silently `Any` either.
 - [ ] `dict[str, str]`
 > `Iterable[str]` is the least demanding contract that still guarantees iteration, so all those
 > callers type-check. `list[str]` rejects tuples and generators; `Any` discards checking entirely.
+
+## Use cases & projects
+### Use cases
+- **Tool schemas from signatures.** Agent frameworks read a handler's annotations and docstring to build
+  the schema the model sees, so the hint is the contract the model must satisfy.
+- **Typing the raw-JSON boundary.** The function that receives provider responses declares `X | None`
+  where content can be missing, so the checker forces the tool-call-only branch to be handled.
+- **Refactoring an agent core safely.** Renaming a field in a message or step type surfaces every stale
+  caller in CI instead of in a long eval run.
+- **Typed graph state.** LangGraph-style state declared with `TypedDict` and `Annotated` reducers lets
+  the checker flag nodes that return keys the graph does not have.
+
+### Mini project
+**Type-check a small tool-calling loop (1-2 hours).**
+- **Goal:** take an untyped agent loop with two tools and make the checker catch the bugs before a run.
+- **Steps:** write the loop with plain dicts and plant two bugs (a misspelled message key and an
+  unhandled `None` content); annotate the tool handlers, the message type and the response parser; run
+  mypy or pyright in strict mode and fix what it reports; generate each tool's schema from its signature.
+- **Done when:** the checker reports both planted bugs before any model call, the fixed loop passes clean,
+  and the generated tool schemas match the annotated parameters.

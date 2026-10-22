@@ -443,3 +443,24 @@ loss after many passes often comes with memorised phrasing and brittleness on pa
 - [ ] The validation loss can no longer be computed
 > Reseeding the sampler each epoch gives different batch groupings and decorrelated noise between passes
 > while staying reproducible; a fixed order biases what the model has just seen when it is evaluated.
+
+## Use cases & projects
+### Use cases
+- **Fine-tuning a small model to call your tools.** With a few thousand trajectories, the epoch count
+  decides whether argument formatting is learned or the training traces are memorised.
+- **Hosted fine-tuning jobs.** Picking the epoch setting and reading per-epoch eval scores is most of the
+  tuning a team does on a managed job.
+- **Choosing which checkpoint to deploy.** Per-epoch evals on held-out tool-call and task metrics pick the
+  model that goes behind the agent, often before the final epoch.
+- **Refreshing a fine-tune with new traces.** When the dataset grows, the right epoch count usually
+  falls, so it is re-checked rather than copied from the last run.
+
+### Mini project
+**Find the right epoch count for a tool-calling fine-tune (2-3 hours).**
+- **Goal:** see where held-out tool-call accuracy peaks and where memorisation starts.
+- **Steps:** prepare a few hundred tool-calling trajectories and a held-out set of new requests; LoRA
+  fine-tune a small open model for several epochs, saving and evaluating at the end of each; log training
+  loss, validation loss and held-out tool-call validity per epoch; check outputs for verbatim replay of
+  training traces.
+- **Done when:** you have a per-epoch table and chart, the epoch you would ship with a reason, and one
+  example of memorised output from a later epoch if it appears.

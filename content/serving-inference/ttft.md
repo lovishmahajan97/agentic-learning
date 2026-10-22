@@ -391,3 +391,24 @@ depth rather than GPU utilisation; and move long-context or batch traffic to a s
 > Headers and the first frame (often a role-only chunk or `message_start`) are sent before prefill
 > completes, so they under-report. The first content delta is the first evidence that generation
 > has produced a token.
+
+## Use cases & projects
+### Use cases
+- **Multi-step tool-calling agents.** Per-step latency is mostly TTFT, so teams track it per step and
+  watch it grow as the transcript grows.
+- **RAG agents.** Retrieval width sets prompt length, so choosing how many chunks to insert is a TTFT
+  decision as well as a quality one.
+- **Agents with long system prompts and many tools.** A stable, byte-identical prefix lets prompt or
+  prefix caching skip most of the prefill on every step.
+- **Self-hosted agent models.** Queue depth and TTFT p99 tell operators when to add replicas before users
+  feel the slowdown.
+
+### Mini project
+**Profile TTFT across an agent run (1-2 hours).**
+- **Goal:** show how TTFT changes step by step in a 10-step tool-calling loop, with and without a stable
+  prefix and trimmed tool results.
+- **Steps:** build a small agent with two fake tools that return large outputs; stream every call and log
+  the time to the first content delta, input tokens and cached input tokens; run it once appending raw
+  tool output and once trimming it before appending.
+- **Done when:** you have a per-step table and chart of TTFT and prompt size for both runs, plus a short
+  note on which change saved the most time.

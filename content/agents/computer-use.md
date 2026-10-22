@@ -5,7 +5,8 @@ name: Computer use
 kind: concept
 difficulty: core
 est_minutes: 13
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/sandboxing
   - agents/tool-calling
@@ -24,6 +25,19 @@ sources:
 Computer use is an agent that sees screenshots and acts through mouse, keyboard and scroll, reaching
 GUIs with no API. It is the most general tool and the least efficient: prefer APIs or DOM access, keep
 it for the long tail, and sandbox it.
+
+## For agent builders
+- **Why it matters for agents.** Customers will ask for agents that drive legacy apps and portals with
+  no API. Computer use makes that possible, but its cost, compounding errors and injection exposure
+  decide whether the agent finishes 40% or 75% of tasks and whether it can be trusted with Send.
+- **Where it shows up in your stack.** A vendor computer-use tool type (such as Anthropic's computer use
+  tool), an OS automation layer (xdotool, pyautogui) or a browser driver such as Playwright, a VM with a
+  virtual display, and your harness's screenshot pruning, gating and step budget.
+- **What you control.** Screenshot size and coordinate scaling, the action vocabulary, settle waits,
+  verification, how many screenshots stay in context, hit-test gating, task decomposition and the VM's
+  session scope.
+- **What you can skip.** How vendors train coordinate grounding. Treat it as a measured per-step error
+  rate and design around it.
 
 ## Why it exists
 - **Most software has no API.** Legacy desktop applications, internal web tools, SaaS products with a UI
@@ -385,3 +399,23 @@ text as untrusted. Report measured completion rate and cost per invoice before p
 - [ ] When the model supports vision
 > Generality is computer use's only advantage. Every structured alternative is cheaper and more
 > reliable, so a good harness tries them first and falls back to the screen for the long tail.
+
+## Use cases & projects
+### Use cases
+- **Back-office agents on legacy desktop apps.** An ERP or claims system with no API is read and updated
+  through the screen inside a scoped VM, with the final submit gated.
+- **Cross-application workflows.** Copying data from one tool into a web portal is split into
+  checkpointed sub-tasks so a failure retries from a known state.
+- **QA and UI testing agents.** An agent walks through a product's screens like a user and reports what
+  broke, with every action logged with its screenshot.
+- **Browser agents with a fallback.** DOM-level actions handle most steps and screenshots cover canvas
+  content or obfuscated pages.
+
+### Mini project
+**A gated computer-use loop in a VM (2-3 hours).**
+- **Goal:** run a small computer-use agent on a local web form and measure completion, cost and gating.
+- **Steps:** start a VM or container with Xvfb and a browser on a local form with a Send button; adapt
+  the minimal loop from the examples with `keep_shots=3` and a 40-step budget; plug in the hit-test gate
+  so Send needs approval; run 10 attempts and log steps, image tokens per call and gated actions.
+- **Done when:** a table shows completion rate, steps per task and tokens per step staying flat, and every
+  run that reached Send stopped for approval instead of clicking it.

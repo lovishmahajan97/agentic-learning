@@ -441,3 +441,24 @@ in a layer inside CORS if the browser must read crash responses.
 - [ ] Register both with `@app.middleware("http")` so they share a task
 > Headers are added on the response path by layers outside the one that produced the response; CORS
 > must therefore wrap auth, which also lets CORS answer preflight requests before auth rejects them.
+
+## Use cases & projects
+### Use cases
+- **Stitching one agent run into one trace.** A request-ID or tracing layer on the outside tags every LLM
+  call, tool call and log line of a run, so a slow or wrong answer can be replayed step by step.
+- **Browser chat UIs that show real errors.** CORS wrapping auth means an expired token surfaces as a 401
+  the UI can handle, not an opaque "CORS error".
+- **Protecting a paid agent endpoint.** Body-size limits and rate limits placed before anything reads the
+  body stop oversized prompts and abusive clients before any tokens are spent.
+- **Keeping streamed steps unbuffered.** Pure ASGI middleware on streaming routes lets step and token
+  events reach the user as they happen.
+
+### Mini project
+**Order the middleware stack of an agent API (1-2 hours).**
+- **Goal:** prove with logs that layer order decides tracing, CORS behaviour and streaming.
+- **Steps:** build a small FastAPI agent route that streams three fake steps; add request-ID, CORS and a
+  simple bearer-token auth layer; log the request ID on every step; send a browser-style request with an
+  `Origin` header and a bad token, then swap the CORS and auth order and repeat.
+- **Done when:** you have a short table of both orders showing which response carried
+  `Access-Control-Allow-Origin`, whether every step log had the request ID, and whether stream events
+  arrived one by one.

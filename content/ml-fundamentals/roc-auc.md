@@ -5,7 +5,8 @@ name: ROC-AUC
 kind: metric
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - ml-fundamentals/confusion-matrix
   - ml-fundamentals/precision-recall-f1
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-ROC-AUC is the probability that a random positive outscores a random negative: ranking quality across all
-thresholds, unaffected by prevalence. Right for comparing scorers; wrong for judging a deployed rare-positive
-classifier, where it hides false-alarm volume and calibration.
+ROC-AUC is the probability a random positive outscores a random negative. Agent teams use it to ask
+whether a guardrail, judge or router confidence can rank at all; it hides false-alarm volume and
+calibration, so it never signs off a rare-positive check.
+
+## For agent builders
+- **Why it matters for agents.** Before you tune a handoff threshold, a cascade cut or a guardrail, you
+  need to know whether the score separates good from bad at all. AUROC of "confidence versus was the
+  agent right" near 0.5 means no threshold will work, however long you tune it.
+- **Where it shows up in your stack.** Comparing injection or moderation detectors, validating an LLM
+  judge's numeric score against human pass/fail labels, router confidence for model cascades, and
+  `roc_auc_score` in the eval harness.
+- **What you control.** Which signal you score (verbalised confidence, log-probabilities, sampling
+  agreement, a verifier), the labelled set, and whether you read total AUC or TPR at your false-block budget.
+- **What you can skip.** Signal-detection history and DeLong's test derivation. Know the pairwise meaning,
+  why prevalence does not move it, and when to switch to the PR curve.
 
 ## Why it exists
 - **Every confusion-matrix metric depends on a threshold,** and the threshold is usually decided late, per
@@ -120,7 +133,9 @@ cost = pi * (1 - TPR) * C_FN + (1 - pi) * FPR * C_FP
 - **`"ovo"`** averages pairwise AUCs between every pair of classes, which is less sensitive to imbalance.
 - **Both need probability vectors,** not hard labels.
 
-### Where it shows up in LLM systems
+### Where it shows up in agents and LLM systems
+- **Agent self-checks:** the AUROC of any "am I done / am I right" signal against labelled run outcomes
+  says whether the agent can decide when to stop, retry or hand off.
 - **Guardrail, moderation and injection detectors:** AUC chooses the model or version; then the PR curve and a
   threshold at the false-positive budget make it a classifier.
 - **Rerankers:** AUC over (relevant, irrelevant) pairs is a sanity check beside NDCG.
@@ -245,6 +260,22 @@ detector with AUC 0.97, thresholded at TPR 0.9 where FPR is 0.03 (illustrative o
 Re-express success as alerts per day at a target recall, then look for an operating point or a second stage
 that fits the review budget.
 
+### Agent scenario: choosing a confidence signal for a cascade
+A support agent runs a small model first and escalates to a large one when unsure. On 1,000 labelled
+tickets the small model was right on 700. Three candidate signals are scored against "small model was
+right" (illustrative figures).
+
+| Signal | Extra cost per ticket | AUROC | TPR at FPR ≤ 10% | Verdict |
+|---|---|---|---|---|
+| Verbalised "how sure are you" | none | 0.56 | 0.12 | cannot route; stop tuning |
+| Token log-probability of the answer label | none | 0.74 | 0.41 | usable if the API exposes it |
+| Agreement across 5 samples | 4 extra calls | 0.83 | 0.62 | best, at 5× small-model cost |
+
+- **Read it as a ranking test.** Here "positive" is "small model right" and FPR is the share of wrong
+  answers kept; the budget column says how many right answers you keep while letting through at most
+  10% of the 300 wrong ones.
+- **Then calibrate and pick the cut** on the chosen signal; AUROC told you which signal, not where to cut.
+
 ## Production patterns
 - **AUC plus average precision for every detector version.** Log both from the eval harness with
   `roc_auc_score` and `average_precision_score`, and gate promotion on a paired bootstrap interval of the
@@ -259,6 +290,9 @@ that fits the review budget.
 - **Router and judge sanity check.** Before tuning a cascade or trusting a numeric judge, compute AUROC of the
   confidence against correctness or human labels; near 0.5 means no threshold can work. Recompute when the
   model or prompt changes.
+- **Score agent self-checks against run outcomes.** Log the agent's stop, retry or handoff signal with every
+  run, label a weekly sample of outcomes, and track AUROC of the signal per agent version. A drop after a
+  model or prompt change means the agent no longer knows when it is wrong.
 - **Calibration as a separate gate.** Because AUC cannot see calibration, add ECE or Brier wherever the score
   feeds a threshold, cascade or user-facing confidence, and track it alongside AUC.
 
@@ -351,6 +385,13 @@ too, which AUC cannot tell you.
   verifier, and re-measure AUROC.
 - **Only then calibrate,** because calibration cannot reorder answers.
 
+### Your agent eval uses an LLM judge that scores transcripts 1 to 10. How do you decide whether to trust it?
+- **Treat it as a detector:** label 200+ transcripts pass or fail by hand and compute the judge's AUROC
+  against those labels; ties are common on a 10-point scale, and the metric counts them as half.
+- **Then read the operating point:** pick the pass cut-off from TPR and FPR on that set, and check the
+  failure class with the PR curve if failures are rare.
+- **Re-run on every judge model or prompt change,** because the ranking can shift silently.
+
 ## Quiz
 ### Q: What does ROC-AUC = 0.85 literally mean?
 - [ ] 85% of the model's predictions are correct
@@ -378,3 +419,23 @@ too, which AUC cannot tell you.
 > The precision axis shows the fraction of alerts that are true at each recall level, which is what the
 > queue experiences. The ROC's FPR axis is normalised by the huge negative count, so an FPR of 1% looks
 > fine while producing five times as many false alerts as there are positives.
+
+## Use cases & projects
+### Use cases
+- **Choosing a cascade's confidence signal.** AUROC against "small model was right" shows whether
+  verbalised confidence, log-probabilities or sampling agreement can route at all.
+- **Validating an LLM judge.** AUROC of judge scores against human pass/fail labels says whether the judge
+  separates good runs from bad before anyone sets a pass cut-off.
+- **Comparing guardrail detectors.** Picking between injection classifiers on ranking, then on TPR at the
+  false-block budget, then on alerts per day.
+- **Regression checks after model upgrades.** Tracking AUROC of the agent's handoff signal per version
+  catches an upgrade that made the agent worse at knowing when it is wrong.
+
+### Mini project
+**Rank three confidence signals for an agent (1-3 hours).**
+- **Goal:** find which confidence signal lets a Q&A agent tell its right answers from its wrong ones.
+- **Steps:** run an agent on 200+ questions with known answers and label each answer; record verbalised
+  confidence, log-probability of the answer if your API exposes it, and agreement across 5 samples;
+  compute AUROC and TPR at FPR ≤ 10% for each with a paired bootstrap interval; plot the three ROC curves.
+- **Done when:** you have a table and a plot naming the best signal, the interval of its lead over the
+  next one, and a note on whether its extra cost is worth paying.

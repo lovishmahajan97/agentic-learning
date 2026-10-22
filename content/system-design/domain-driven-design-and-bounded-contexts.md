@@ -439,3 +439,24 @@ unit-tested, and versioned independently of the model.
 - [ ] Domain-driven design forbids transactions
 > Aggregates are the unit of transactional consistency; across contexts, independent deployability and
 > uptime matter more than instantaneous agreement, so domain events and sagas carry the change.
+
+## Use cases & projects
+### Use cases
+- **Enterprise agents across many systems.** Tools grouped per bounded context (billing, CRM, support)
+  each speak one vocabulary, so the model never has to reconcile three meanings of "customer".
+- **MCP servers per domain.** Each team publishes a server for its context with adapters that translate
+  upstream data, and unmapped values fail loudly instead of reaching the model.
+- **Multi-system actions as sagas.** A plan change that touches billing and provisioning runs as steps with
+  compensations, not as one cross-system transaction.
+- **Context-tagged retrieval and evals.** Indexes and eval sets are split by context, so a regression in
+  one domain is visible and owned by one team.
+
+### Mini project
+**Put an anticorruption layer between an agent and two systems (2-3 hours).**
+- **Goal:** give an agent tools over two mock systems that disagree on what a "customer" is, with
+  translation in code rather than the prompt.
+- **Steps:** create two fake APIs, one billing and one support, with conflicting fields and status values;
+  write an adapter per system that maps them into one published language; expose tools that return only
+  the translated shape; make an unmapped status raise a clear error; run 10 questions through an agent.
+- **Done when:** the agent answers all 10 without the prompt explaining either system's quirks, and a
+  test shows an unknown upstream status fails at the adapter instead of reaching the model.

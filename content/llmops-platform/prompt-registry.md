@@ -5,7 +5,8 @@ name: Prompt registry
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - prompting/prompt-versioning
   - prompting/prompt-templates
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-A prompt registry stores immutable, numbered prompt versions with their model settings, mutable labels
-like `production` or `canary`, and a cached runtime fetch, so prompt changes get history, evidence and
-rollback without a code deploy.
+A prompt registry stores an agent's system prompts and tool descriptions as immutable, numbered versions
+with model settings, plus mutable labels like `production` or `canary`, so agent behaviour changes get
+history, evidence and rollback without a code deploy.
+
+## For agent builders
+- **Why it matters for agents.** Most agent behaviour lives in text: the system prompt, tool descriptions,
+  planner and reflection prompts. When an agent run goes wrong, the first question is which versions of
+  that text it ran with, and only a registry answers it.
+- **Where it shows up in your stack.** Prompt management in observability platforms (Langfuse, LangSmith,
+  Braintrust), MLflow's prompt registry, or a home-grown versions-and-labels table, read through an SDK
+  with a TTL cache.
+- **What you control.** What a version contains (messages, tool descriptions, model id, decoding params),
+  who may move `production`, the cache TTL, and resolving the label once per agent run rather than once
+  per step.
+- **What you can skip.** Vendor comparisons. The immutable-version and mutable-label split matters; the
+  product hosting it rarely does.
 
 ## Why it exists
 - **Prompts are behaviour-defining config edited by people who do not ship code.** String constants are
@@ -53,10 +67,12 @@ rollback without a code deploy.
   resolved by a routing rule.
 - **Label moves are compare-and-set:** "move `production` from v12 to v13, only if it is still v12", so two
   people promoting at once cannot silently overwrite each other.
+- **For agents, tool descriptions belong in the version too.** The model reads them like prompt text, and
+  rewording one changes tool selection as much as editing the system prompt does.
 
 ### Prompt and model are a pair
 - **A prompt is tuned to a model.** The same text that works on one model family may over-refuse, ignore
-  the schema or change tone on another.
+  the schema, change tone or call tools differently on another.
 - **So a version stores model id and decoding parameters** alongside the text.
 - **Swapping the model under an unchanged prompt is a new bundle** and must be re-evaluated; the registry
   makes that visible by refusing to pretend the text alone is the artifact.
@@ -72,6 +88,9 @@ rollback without a code deploy.
 - **Log every call's prompt name, version and digest into the trace.** Observability platforms with prompt
   management (Langfuse is the common open-source example) link a trace to its prompt version
   automatically, turning "find every answer produced by v12" into a filter.
+- **Resolve once per agent run.** An agent run spans many model calls, sometimes minutes. Resolve the label
+  at run start and pin that version for every step, because a label move mid-run would otherwise mix two
+  prompt versions inside one trajectory.
 
 ### TTL is the propagation delay
 - **Every label move, rollback included, takes up to one TTL to land.** With a 60-second TTL and fifty
@@ -79,6 +98,8 @@ rollback without a code deploy.
 - **Fine for a planned deploy, too slow for an emergency rollback** of a harmful prompt. That is why some
   SDKs and home-grown registries add push invalidation (a webhook or pub/sub message that evicts the
   cached entry) on top of the TTL.
+- **Runs already in flight keep their pinned version.** A rollback stops new runs from using the bad
+  version; for a harmful agent prompt you also need a way to cancel or stop runs that started before it.
 
 ### Change workflow
 1. **Create a draft version.**
@@ -92,6 +113,8 @@ rollback without a code deploy.
 - **So validate at the label move** (the version's variable set against what the running application
   declares it provides), and make rendering fail loudly on a missing variable rather than send the literal
   placeholder to the model.
+- **The same goes for tools.** A system prompt that tells the agent to use a tool the deployed code does
+  not register should be refused at the label move, not discovered as a failed tool call.
 
 ### Where to host it
 | Option | Gives you | Watch out for |
@@ -103,8 +126,8 @@ rollback without a code deploy.
 What matters is the split between immutable versions and mutable labels, not the vendor.
 
 ## Diagram
-Edits create immutable versions; only the pipeline moves a label; the app reads through a TTL cache with
-stale and bundled fallbacks, and logs the version it used.
+Edits create immutable versions; only the pipeline moves a label; the agent resolves a version through a
+TTL cache with stale and bundled fallbacks, pins it for the run, and logs it on every step.
 
 ```mermaid
 flowchart TD
@@ -113,10 +136,10 @@ flowchart TD
     EV --> CI["Pipeline service account"]
     CI -->|"compare-and-set move"| L["Label: production"]
     L --> ML[("Append-only move log")]
-    A["App request"] --> C["SDK cache, short TTL"]
+    A["Agent run starts"] --> C["SDK cache, short TTL"]
     C -->|"expired"| L
     C -.->|"registry down"| S["Stale copy or bundled file"]
-    C --> T["Trace logs name, version, digest"]
+    C --> T["Pinned for run, logged per step"]
 ```
 
 ## Examples
@@ -229,6 +252,27 @@ promote(reg, "support_answer", v2, {"context", "question", "customer_tier"}, by=
 rollback(reg, "support_answer", by="oncall:lee")   # production is v1 again, and the move is logged
 ```
 
+### An agent run that pins its prompt version
+Continues the registry above. The agent resolves `production` once, keeps that version for every step and
+stamps it on each step's trace span. `llm`, `tools` and `span` are your model client, tool registry and
+tracer.
+
+```python
+def run_agent(reg, task, llm, tools, span, max_steps=10):
+    p = reg.get("support_agent")                 # resolve the label ONCE per run
+    pin = {"prompt": "support_agent", "version": p["version"], "digest": p["digest"]}
+    messages = render(p["messages"], question=task["question"], context="")
+    for step in range(max_steps):
+        reply = llm(model=p["model"], params=p["params"], messages=messages,
+                    tools=p.get("tools", []))     # tool descriptions are versioned with the prompt
+        span(step=step, **pin, tool=reply.get("tool_call"))   # every step carries the same pin
+        if not reply.get("tool_call"):
+            return reply["content"], pin
+        result = tools[reply["tool_call"]["name"]](**reply["tool_call"]["args"])
+        messages += [reply["message"], {"role": "tool", "content": str(result)}]
+    return None, pin                             # step budget exhausted; the pin still says what ran
+```
+
 ### Worked scenario: rolling back a harmful prompt across fifty replicas
 A prompt version starts giving wrong refund amounts. Fifty replicas use the SDK cache with a 60-second TTL.
 
@@ -242,6 +286,9 @@ A prompt version starts giving wrong refund amounts. Fifty replicas use the SDK 
 - **The move log gives the rollback target** without anyone remembering the old text.
 - **The traces give the blast radius:** filter by the bad version's id and digest to list every affected
   answer.
+- **For agents, count runs, not just answers.** Agent runs that started on the bad version keep it until
+  they finish; with runs lasting several minutes, the tail of bad behaviour outlasts the TTL unless you can
+  cancel them.
 
 ## Production patterns
 - **SDK cache with an explicit fallback** — whenever prompts are fetched at runtime. Configure the client
@@ -255,8 +302,11 @@ A prompt version starts giving wrong refund amounts. Fifty replicas use the SDK 
   on label move that evicts cached entries, keeping the TTL as the backstop. Monitor time from move to
   the last replica reporting the new version.
 - **Version and digest on every span** — when you need incident forensics. Add prompt name, version and
-  digest as trace attributes on every model call. Monitor the share of production traces that resolve to
-  a registered version; anything under 100% is a gap.
+  digest as trace attributes on every model call, including every step of an agent run. Monitor the share
+  of production traces that resolve to a registered version; anything under 100% is a gap.
+- **Pin per run** — for any multi-step agent. Resolve the label at run start, store the pinned version in
+  the run's checkpoint so a resumed run uses the same text, and monitor runs whose steps carry more than
+  one version (should be zero).
 - **Tenant labels instead of forks** — when customers need variants. Resolve `tenant:<id>` first and fall
   back to `production`, with the same gate for both. Monitor the number of tenant labels pointing at
   versions with no recent eval evidence.
@@ -271,6 +321,8 @@ A prompt version starts giving wrong refund amounts. Fifty replicas use the SDK 
 - **Runtime control vs a dependency.** Runtime fetching keeps behaviour changeable without redeploy but adds
   a dependency. The TTL cache and bundled fallback remove the availability risk while introducing a
   propagation delay of one TTL.
+- **Pinning per run vs fast rollback.** Pinning keeps each agent trajectory consistent and replayable, but
+  in-flight runs ignore a rollback until they end; long-running agents need a cancel path as well.
 - **Explicit prompt-model pairs vs migration cost.** Storing model settings with the prompt makes
   re-evaluation mandatory on model change. It also means a platform-wide model migration touches every
   prompt version rather than one config line.
@@ -284,18 +336,20 @@ A prompt version starts giving wrong refund amounts. Fifty replicas use the SDK 
   changes nothing until the next deploy, and an engineer who concludes the registry is broken.
 - **Logging only the prompt name.** Not the version and digest. Symptom: an investigation that knows which
   prompt family failed and cannot tell whether it was before or after Tuesday's change.
-- **Treating the registry as prompt-only.** Leaving temperature and model id in application config.
-  Symptom: a prompt that passed its eval behaves differently in production because the two were tuned
-  apart.
+- **Treating the registry as prompt-only.** Leaving temperature, model id and tool descriptions in
+  application config. Symptom: a prompt that passed its eval behaves differently in production because the
+  pieces were tuned apart.
 - **Letting anyone with edit rights move `production` from the UI.** Symptom: a behaviour change with no
   pipeline run and no evidence attached.
 - **Promoting a version whose new variable the code does not supply.** Symptom: model inputs containing a
   literal `{{customer_tier}}` or an empty slot, and answers that ignore the tier. Fix: validate variables
   at the label move and render strictly.
+- **Fetching the label on every agent step.** Symptom: a trajectory whose early steps follow one prompt and
+  later steps another after a label move, and a replay that cannot reproduce it. Fix: pin per run.
 
 ## When to use
 - **Use when** a second person edits prompts, a prompt needs per-tenant or per-locale variants, or an audit
-  or incident process must tie an answer to the exact text that produced it.
+  or incident process must tie an agent's answer or action to the exact text that produced it.
 - **Avoid (for now) when** one engineer owns a handful of prompts: a prompts directory in the repository
   with versioned file names is enough.
 - **Measure** what the registry should deliver: time from prompt edit to production, number of versions
@@ -340,7 +394,14 @@ regression would have been caught by the legal-summary golden set before the lab
 - **The loser re-reads and decides.** It can re-run its gate against the new champion before trying again.
 - **The move log** records both attempts' outcome, so the audit shows exactly who changed what.
 
-### Your registry has an outage. What does the product do?
+### Your agent's prompt label moved while long runs were in flight. How should the agent behave?
+- **Each run keeps the version it started with.** Resolve the label once at run start and pin it, so one
+  trajectory never mixes two prompt versions and can be replayed exactly.
+- **Store the pin in the run's checkpoint,** so a run resumed after a crash uses the same text.
+- **For a harmful version, rollback is not enough:** stop or cancel the in-flight runs that pinned it, and
+  find them by filtering traces on its version and digest.
+
+### Your registry has an outage. What does the agent product do?
 - **Keep serving.** The SDK serves its in-memory copy past the TTL, and a bundled file of production
   versions covers a cold start.
 - **What you lose** is the ability to deploy or roll back prompts until it recovers, so keep a code-side
@@ -385,3 +446,24 @@ regression would have been caught by the legal-summary golden set before the lab
 - [ ] To the application release, because prompts ship with code
 > "Was this text tested" has a single answer per version. Attaching it to a label would lose the evidence
 > every time the label moved and would let an untested version inherit a tested label's history.
+
+## Use cases & projects
+### Use cases
+- **Tuning a support agent's system prompt without a deploy.** A product manager drafts a version, the
+  eval gate attaches evidence, and the pipeline moves `production`.
+- **Versioning tool descriptions.** Rewording a tool's description is tracked, evaluated and rolled back
+  like any prompt change, because it steers tool selection.
+- **Incident forensics on agent runs.** Every step's span carries prompt version and digest, so "which
+  runs used v13" is one trace filter.
+- **Per-customer agent variants.** Tenant labels give one customer a stricter refund policy prompt without
+  forking the agent's code.
+
+### Mini project
+**Add a registry with per-run pinning to a small agent (1-2 hours).**
+- **Goal:** prove that an agent run is tied to exactly one prompt version, even when the label moves
+  mid-run.
+- **Steps:** use the minimal registry above with a system prompt and two tool descriptions; build a
+  three-step agent that resolves `production` once and logs version and digest per step; start a run, move
+  the label during step 2, then roll back via the move log.
+- **Done when:** the trace shows every step of the in-flight run on the original version, a new run uses
+  the moved label, and rollback restores the previous version with a logged move.

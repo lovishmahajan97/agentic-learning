@@ -5,7 +5,8 @@ name: OpenTelemetry instrumentation
 kind: practice
 difficulty: core
 est_minutes: 17
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - observability/opentelemetry
   - observability/tracing
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-OpenTelemetry (OTel) is the vendor-neutral standard for traces, metrics and logs. In Node you load the
-SDK first, let auto-instrumentation wrap HTTP, databases and Redis, and add spans for agent steps;
-context follows `await` and crosses services in `traceparent`.
+OpenTelemetry (OTel) is the vendor-neutral standard for traces, metrics and logs, and how you see what an
+agent run actually did. In Node, load the SDK first, auto-instrument HTTP and databases, and add spans per
+agent step and tool call.
+
+## For agent builders
+- **Why it matters for agents.** An agent run is a tree of model calls, tool calls, retrievals and queue
+  hops. When a run takes 40 s, loops or burns 60,000 tokens, a trace with one span per step and tool is
+  how you find which step, which tool and which prompt version did it.
+- **Where it shows up in your stack.** `instrumentation.ts` loaded before the app, the Anthropic SDK's own
+  model-call spans with `gen_ai.*` usage, your `agent.run`, `agent.step` and `tool.*` spans, BullMQ
+  context propagation, and an LLM observability tool (Langfuse, Phoenix) fed over OTLP.
+- **What you control.** Span names and attributes (tenant, run id, step, prompt version, tool name),
+  whether prompt content is recorded, sampling (keep every failed run), and flushing on shutdown.
+- **What you can skip.** Collector internals and writing your own exporters. Use the Node SDK,
+  auto-instrumentation and a collector config someone else maintains.
 
 ## Why it exists
 - **Agent requests fan out across processes.** An HTTP handler calls a planner model, which calls three
@@ -237,6 +250,48 @@ export async function plan(tenant: string, runId: string, prompt: string) {
 }
 ```
 
+### Agent scenario: one span per run, step and tool call
+The run span holds totals; each step span holds that step's tokens and tool count; each tool span holds
+the tool name and whether it returned an error. A slow or looping run then reads as a waterfall.
+
+```ts
+import { trace, SpanStatusCode, type Span } from "@opentelemetry/api";
+const tracer = trace.getTracer("agent-loop");
+
+async function inSpan<T>(name: string, attrs: Record<string, string | number>, fn: (s: Span) => Promise<T>) {
+  return tracer.startActiveSpan(name, { attributes: attrs }, async (span) => {
+    try { return await fn(span); }
+    catch (e: any) { span.recordException(e); span.setStatus({ code: SpanStatusCode.ERROR }); throw e; }
+    finally { span.end(); }
+  });
+}
+
+export function runAgent(runId: string, tenant: string, task: string) {
+  return inSpan("agent.run", { "app.run_id": runId, "app.tenant": tenant, "app.prompt_version": "agent-v3" }, async (run) => {
+    let tokens = 0;
+    for (let step = 0; step < 20; step++) {
+      const turn = await inSpan("agent.step", { "app.step": step }, async (s) => {
+        const t = await callModel(runId, step);                  // SDK model-call span nests here
+        s.setAttributes({ "app.tool_calls": t.toolCalls.length, "app.step_tokens": t.inputTokens + t.outputTokens });
+        for (const c of t.toolCalls) {
+          await inSpan(`tool.${c.name}`, { "app.tool": c.name }, async (ts) => {
+            const r = await callTool(c);                         // returns { content, isError }
+            ts.setAttribute("app.tool_error", r.isError ? 1 : 0);
+          });
+        }
+        return t;
+      });
+      tokens += turn.inputTokens + turn.outputTokens;
+      if (turn.toolCalls.length === 0) break;
+    }
+    run.setAttribute("app.total_tokens", tokens);
+  });
+}
+```
+
+- **Span names stay low-cardinality.** Tool names are a small fixed set, so `tool.<name>` is fine; never
+  put run ids or arguments in span names.
+
 ### Carrying trace context through a BullMQ job by hand
 Without the opt-in `telemetry` option, the producer writes `traceparent` into the job data and the
 worker restores it, so the worker's `CONSUMER` span becomes a child of the API request.
@@ -281,6 +336,13 @@ receives all 8,000 spans per second and buffers whole traces, so the cost moves 
 to collector capacity.
 
 ## Production patterns
+- **A fixed span schema for agent runs.** When several teams build agents, agree on `agent.run`,
+  `agent.step` and `tool.<name>` spans with run id, step, prompt version and token attributes, so one
+  dashboard answers "slowest tool" and "steps per run" for every agent. Monitor steps-per-run and
+  error-tool-result rate by prompt version.
+- **Keep every failed or long agent run.** Tail-sample on error status and on run duration or step count
+  above a threshold, because the runs you need to debug are the rare loops and failures. Monitor how many
+  failed runs lack a stored trace.
 - **Collector gateway with tail sampling.** When errors and slow traces matter more than volume, run the
   Collector's `tail_sampling` processor with policies for error status and high latency, and route all
   spans of a trace to the same collector instance (a trace-id-aware load-balancing exporter). Monitor
@@ -369,6 +431,14 @@ trace spans API, database, Redis and worker.
 - **Libraries use only the API** so they can ship instrumentation without forcing an exporter or backend
   on their users.
 
+### An agent run took 40 s and 60,000 tokens. How would your tracing let you explain why?
+- **Span tree per run:** `agent.run` with total tokens, one `agent.step` per model turn with its tokens
+  and tool count, one `tool.<name>` span per call, and the SDK's model-call span nested inside each step.
+- **Read the waterfall:** find the longest spans (a slow tool, a retried model call) and the step count
+  (a loop re-calling one tool), and compare prompt versions on the run span.
+- **Make sure it was kept:** tail sampling that keeps slow and failed runs, and context carried through
+  the queue so worker steps join the run's trace.
+
 ### Some DB spans attach to the wrong request's trace, but only under load. What is happening?
 - **Context follows scheduling, not registration:** `AsyncLocalStorage` restores the context active when
   a continuation was scheduled, so a pool or batching client that runs queued callbacks later runs them
@@ -419,3 +489,24 @@ trace spans API, database, Redis and worker.
 - [ ] Record only the HTTP status, since the auto-instrumented span already exists
 - [ ] Skip spans for model calls and rely on provider dashboards
 > Token and model attributes make cost and latency queryable at low volume; prompt text is large, sensitive and billed per byte, so it belongs behind an opt-in content mode or in a purpose-built LLM observability store.
+
+## Use cases & projects
+### Use cases
+- **Debugging looping agents.** A step-and-tool span tree shows an agent calling the same tool ten times
+  with near-identical arguments.
+- **Cost attribution per agent and tenant.** Token metrics with model and tenant attributes show which
+  agent, prompt version or customer drives spend.
+- **End-to-end traces across queued steps.** Context injected into BullMQ jobs keeps API request, worker
+  steps and tool calls in one trace.
+- **Feeding LLM observability tools.** OTLP export sends the same spans to Langfuse or Phoenix for prompt
+  and eval review without a second instrumentation.
+
+### Mini project
+**Trace a tool-calling agent end to end (2 hours).**
+- **Goal:** see a full agent run, API request to last tool call, as one trace with tokens per step.
+- **Steps:** run Jaeger or another OTLP backend locally; add `instrumentation.ts` loaded with `--import`;
+  wrap a small agent with `agent.run`, `agent.step` and `tool.*` spans; enqueue the run through BullMQ
+  with an injected carrier; add a deliberately slow tool and a tool that errors; send `SIGTERM` mid-run
+  and check that `sdk.shutdown()` flushed.
+- **Done when:** one trace shows API, queue hop, every step and tool with token attributes, the slow tool
+  is obvious in the waterfall, and the error tool span carries an error attribute.

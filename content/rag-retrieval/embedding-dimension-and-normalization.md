@@ -413,3 +413,23 @@ picking the cheapest configuration that meets the recall target.
 > Contextual encoders map text into a narrow cone, so even unrelated pairs have high cosine. That is
 > normal and model-specific; rankings remain meaningful but any threshold has to be calibrated for this
 > model on labelled pairs rather than carried over from another one.
+
+## Use cases & projects
+### Use cases
+- **Per-user agent memory at scale.** Dimension and bytes per float decide whether millions of memory
+  vectors fit in RAM, which is where Matryoshka truncation and `halfvec` pay off.
+- **"Nothing relevant found" in a search tool.** A calibrated similarity threshold on normalized vectors lets
+  the tool tell the agent to ask a clarifying question instead of answering from weak hits.
+- **Switching embedding models.** Thresholds and metrics are model-specific, so a model change means
+  recalibrating the threshold on labelled pairs.
+- **Cost-sizing a vector store.** The `d × bytes_per_float` sum is the first line of every capacity plan for
+  agent knowledge bases.
+
+### Mini project
+**Truncate, quantize and calibrate an agent memory store (1-2 hours).**
+- **Goal:** measure how much memory truncation and quantization save and what they cost in recall.
+- **Steps:** embed 5,000-20,000 notes with a model that supports Matryoshka truncation; normalize once in a
+  shared function; compare full, half and quarter dimension, each at float32 and float16, on 30 recall
+  queries; then pick a "no good hit" threshold from labelled relevant and irrelevant pairs.
+- **Done when:** a table shows memory per vector, total size and recall at 5 for each setting, plus the
+  calibrated threshold and the precision it gives.

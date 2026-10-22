@@ -422,3 +422,25 @@ request is the fingerprint.
 > The embeddings fan-out is I/O-bound: each call waits on the network, so one thread can keep 32
 > requests in flight. The other options are CPU- or GPU-bound and would not benefit; they would block
 > the loop instead.
+
+## Use cases & projects
+### Use cases
+- **Parallel tool calls in one agent step.** When the model asks for three tools at once, a `TaskGroup`
+  runs them together so the step takes as long as the slowest tool, not the sum.
+- **Many agent sessions per worker.** A single async FastAPI worker holds hundreds of concurrent chat
+  sessions, because each one spends most of its time awaiting the model.
+- **Streaming agent responses.** Tokens and tool events flow to the browser over SSE while the same loop
+  keeps serving other users.
+- **Bulk evals and embedding jobs.** A `Semaphore`-capped fan-out runs thousands of eval prompts or
+  embedding batches against a provider without tripping its rate limits.
+
+### Mini project
+**Build an async agent step runner and find the blocking tool (1-2 hours).**
+- **Goal:** show that parallel tool calls on one event loop cut step latency, and that one sync tool
+  freezes every session.
+- **Steps:** write three fake async tools that `await asyncio.sleep` for 1, 2 and 3 seconds; run them
+  sequentially, then in a `TaskGroup`, and time both; add a fourth tool that calls `time.sleep(2)`, run
+  ten simulated sessions at once and log event-loop lag; then wrap that tool in `asyncio.to_thread` and
+  rerun.
+- **Done when:** you have a table of step latency (sequential versus parallel) and loop lag (blocking
+  versus `to_thread`), plus a short note on which change fixed which number.

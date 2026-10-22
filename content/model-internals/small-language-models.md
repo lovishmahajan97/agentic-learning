@@ -5,7 +5,8 @@ name: Small language models (SLMs)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - model-internals/scaling-laws
   - model-internals/hallucination
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-An SLM is a roughly 0.5–10B-parameter model (no fixed boundary) that runs on one consumer GPU, a CPU or
-a phone. Over-training, distillation and curated data make it strong on narrow tasks, trading
+An SLM (roughly 0.5–10B parameters, no fixed boundary) is the cheap, fast model you put on an agent's
+narrow, high-volume steps: routing, extraction, query rewriting, tool-output summaries. It trades
 knowledge and reasoning for speed, cost and privacy.
+
+## For agent builders
+- **Why it matters for agents.** An agent makes many model calls per task, and most are narrow: classify
+  the intent, rewrite the query, extract fields from a tool result. Running those on an SLM and keeping a
+  frontier model for planning cuts cost and step latency several times over.
+- **Where it shows up in your stack.** Model routers and cascades, guardrail and PII classifiers, RAG query
+  rewriters and rerank-style steps, on-device or air-gapped agents, and LoRA adapters served with vLLM or
+  llama.cpp.
+- **What you control.** Which steps go to which model, the escalation rule (logit margin, schema check),
+  how facts reach the SLM (retrieval, tool results), and the eval gate each fine-tune must pass.
+- **What you can skip.** Pruning recipes and embedding-tying details unless you train SLMs yourself. Keep
+  the rule "SLM for form, retrieval and tools for facts".
 
 ## Why it exists
 - **Most production requests are narrow.** A ticket classifier, entity extractor, query rewriter or PII
@@ -44,6 +57,16 @@ knowledge and reasoning for speed, cost and privacy.
   retrieval and fine-tuned to the task, actually fits.
 
 ## How it works
+### Where SLMs sit in an agent
+| Agent step | Good SLM fit? | Why |
+|---|---|---|
+| Intent or tool routing over a fixed set | yes | narrow classification, labelled data easy to collect |
+| Query rewriting before retrieval | yes | short input, short output, facts not needed |
+| Extracting fields from a tool result | yes | the answer is in the input |
+| Guardrails and PII redaction | yes | high volume, latency-critical |
+| Open-ended planning over many tools | usually no | multi-step composition degrades fastest with size |
+| Answering from memory | no | long-tail facts shrink first |
+
 ### What "small" changes architecturally
 - **Same decoder-only transformer,** with fewer layers, a smaller hidden size, and almost always
   grouped-query attention.
@@ -124,6 +147,41 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: which steps of a research agent move to an SLM
+A research agent makes 10 model calls per task. The planner stays on a frontier model; narrow steps move
+to a self-hosted 3B, with 10% escalated back. All prices are illustrative placeholders, not quotes.
+
+```python
+FRONTIER = (3.0, 15.0)      # placeholder $ per million input / output tokens
+SLM = (0.10, 0.40)          # placeholder $ per million tokens for a self-hosted 3B
+steps = [                   # (name, calls per task, input tokens, output tokens, runs on)
+    ("plan / choose tool", 3, 4000, 300, "frontier"),
+    ("rewrite search query", 2, 600, 40, "slm"),
+    ("extract fields from tool result", 3, 1500, 80, "slm"),
+    ("summarise long tool output", 2, 3000, 150, "slm"),
+]
+ESCALATE = 0.10             # share of SLM calls that fail the margin or schema check
+
+def cost(price, n, i, o):
+    return n * (i * price[0] + o * price[1]) / 1e6
+
+all_frontier = sum(cost(FRONTIER, n, i, o) for _, n, i, o, _ in steps)
+mixed = 0.0
+for _, n, i, o, where in steps:
+    if where == "frontier":
+        mixed += cost(FRONTIER, n, i, o)
+    else:   # every call runs on the SLM, escalated ones also pay the frontier price
+        mixed += cost(SLM, n, i, o) + ESCALATE * cost(FRONTIER, n, i, o)
+print(f"all frontier ${all_frontier:.4f}/task, mixed ${mixed:.4f}/task, "
+      f"saving {1 - mixed / all_frontier:.0%}")
+# all frontier $0.0939/task, mixed $0.0554/task, saving 41%
+```
+
+- **Reading.** Seven of ten calls moved, but the saving is 41%, because the three planner calls carry
+  most of the tokens. The next lever is a shorter planner prompt (stable prefix, prompt caching), not more
+  SLM steps.
+- **Latency.** The SLM steps also return faster, so wall-clock per task drops on every step that moved.
+
 ### Cost model and escalation rule for a ticket classifier
 A support organisation receives 2 million tickets a month, classifies each into 40 queues and extracts
 three fields. All prices and rates are illustrative placeholders to show the shape of the calculation, not
@@ -189,6 +247,12 @@ def distill_loss(student_logits, teacher_logits, labels, T=2.0, alpha=0.5):
 ```
 
 ## Production patterns
+- **Split the agent by step type.** Keep planning and tool selection on a strong model and move narrow
+  steps (query rewriting, extraction, tool-output summaries, guardrails) to an SLM. Log model, tokens and
+  latency per step so you can see which steps carry the cost before moving more.
+- **Validate SLM output before the agent acts on it.** Parse tool arguments against the tool's JSON schema
+  and retry or escalate on failure, because small models break formats more often. Monitor schema-failure
+  and escalation rates per step.
 - **Cascade with confidence escalation.** Serve the SLM first and escalate on a small top-two class
   probability margin or a failed schema check, as in the `route` function above. Tune the threshold on held-out data and
   monitor the escalation rate, accuracy on SLM-kept traffic, and blended cost per task.
@@ -205,6 +269,9 @@ def distill_loss(student_logits, teacher_logits, labels, T=2.0, alpha=0.5):
   prompt, and cap retrieved context. Track prefill latency and accuracy by input length.
 
 ## Trade-offs
+- **Cheap agent steps vs a harder system to debug.** Mixing models per step cuts cost and latency, but a
+  failed task may now trace to any of several models and prompts; it is worth it only with per-step
+  logging and evals.
 - **Cost and latency vs breadth.** Both fall roughly in proportion to parameter count, but factual breadth
   and multi-step reasoning fall too; the trade flips the moment the task needs knowledge not supplied in
   context.
@@ -222,6 +289,9 @@ def distill_loss(student_logits, teacher_logits, labels, T=2.0, alpha=0.5):
   notices until an audit.
 
 ## Pitfalls
+- **Making the SLM the agent's planner.** Symptom: loops that pick the wrong tool, repeat calls or stop
+  early on multi-step tasks, because composition degrades fastest with size. Fix: keep planning on a larger
+  model and give the SLM bounded, single-step jobs.
 - **Judging an SLM with zero-shot prompts written for a frontier model.** Symptom: "it fails" on tasks it
   would handle after a few-shot prompt or a small fine-tune, and a premature conclusion that SLMs are
   useless. Fix: evaluate after few-shot prompting or a small fine-tune.
@@ -240,6 +310,8 @@ def distill_loss(student_logits, teacher_logits, labels, T=2.0, alpha=0.5):
   instructions in and cap retrieved context.
 
 ## When to use
+- **Use in an agent for:** routing, query rewriting, extraction from tool results, summarising tool output
+  and guardrail checks, each behind a validation or escalation rule.
 - **Use when:** the task is narrow and high-volume, the inputs carry the facts the answer needs, latency or
   cost budgets are tight, data cannot leave a device or network, or you have labelled data to fine-tune on.
 - **Avoid as the only model for:** open-ended assistance, novel reasoning, or knowledge-heavy question
@@ -273,11 +345,21 @@ accuracy gap, if the documents are heterogeneous free text that needs world know
 enough that the big model is affordable anyway.
 
 ## Interview questions
-### Why do small models usually tie their input and output embeddings?
-- **The vocabulary is a big share of the budget.** A 128k vocabulary with a 2,048-dimensional hidden state
-  is about 262M parameters, roughly a fifth of a 1.2B model.
-- **Tying shares one matrix** for input and output, so the model does not pay that cost twice and spends
-  the saving on depth, which MobileLLM found matters more at sub-billion scale.
+### Your agent costs too much per task. How do you decide which steps can run on a small model?
+- **Measure first.** Log tokens, cost and latency per step type; the steps that carry the tokens are the
+  only ones worth moving.
+- **Move narrow, input-grounded steps.** Routing, query rewriting, extraction and tool-output summaries
+  fit an SLM; planning over many tools usually does not.
+- **Gate each move** with a per-step eval and an escalation rule (logit margin or schema failure), and
+  track task success, not just step accuracy.
+
+### An SLM in your agent occasionally emits tool arguments that break the downstream API. What do you do?
+- **Validate before acting.** Parse the arguments against the tool's JSON schema and never execute an
+  invalid call.
+- **Recover cheaply.** Retry once with the validation error in the prompt, then escalate to the larger
+  model, and log both rates.
+- **Fix the source:** constrained or structured decoding where your engine supports it, or fine-tune on
+  examples of valid calls for that tool.
 
 ### Why not just quantise a 70B model instead of using a 3B one?
 - **Quantisation buys about 4×,** from bf16 to 4-bit, while the gap between 70B and 3B is about 20× in
@@ -332,3 +414,24 @@ enough that the big model is affordable anyway.
 > The first, second and fourth are narrow, in-distribution tasks where the needed information is in the
 > input. Open-ended research needs breadth of knowledge and long chains of reasoning, which are exactly
 > the capabilities that shrink fastest with parameter count.
+
+## Use cases & projects
+### Use cases
+- **Cheap sub-steps in a multi-model agent.** Query rewriting, field extraction and tool-output
+  summaries run on a 1–8B model while the planner stays on a frontier model.
+- **Intent and tool routers.** A fine-tuned SLM picks the workflow or sub-agent for each request in tens
+  of milliseconds.
+- **Guardrails in the loop.** PII redaction and policy classifiers run on every message and tool result
+  without adding a frontier-sized bill.
+- **On-device and air-gapped agents.** Field, factory or regulated deployments where no data may leave the
+  device or network.
+
+### Mini project
+**Move one agent step to an SLM behind an eval gate (2-3 hours).**
+- **Goal:** cut cost per task of a small RAG agent by moving its query-rewriting step to a local SLM
+  without lowering answer quality.
+- **Steps:** build a 3-step agent (rewrite query, retrieve, answer); log tokens and latency per step;
+  build 50 test questions with expected sources; swap the rewriter for a 1–3B model served locally (for
+  example llama.cpp or vLLM) and add a fallback to the original model when the rewrite is empty or invalid.
+- **Done when:** a table shows retrieval hit rate, final answer accuracy, cost and p95 latency per task for
+  both setups, with the fallback rate, and you can state whether the SLM version ships.

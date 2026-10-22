@@ -5,7 +5,8 @@ name: OpenAI / Anthropic Node SDKs
 kind: tool
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - node-ts-for-ai/api-clients-with-retries-and-circuit-breakers
   - node-ts-for-ai/abortcontroller-and-cancellation
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-`openai` and `@anthropic-ai/sdk` are generated, typed clients with the same bones: env-read keys,
-retries with backoff, millisecond timeouts, `AbortSignal`, async-iterable streams and typed errors. They
-differ in message and tool-call shapes and in explicit versus automatic prompt caching.
+Every step of a TypeScript agent is one call through `openai` or `@anthropic-ai/sdk`: typed clients with
+retries, millisecond timeouts, `AbortSignal`, streams and typed errors. They differ in tool-call shapes and
+in explicit versus automatic prompt caching.
+
+## For agent builders
+- **Why it matters for agents.** The agent loop is "call the model, run the tools it asked for, append the
+  results, call again". The SDK call is that loop's only model-facing line, so its retries, timeouts,
+  cancellation and tool-call shape decide how a 10-step run behaves under a provider incident.
+- **Where it shows up in your stack.** `client.messages.create` or `.stream()` with `tools`,
+  `client.chat.completions.create` or `client.responses.create` with `tools`, `stop_reason` and
+  `tool_calls` as the loop's branch points, and `usage` for per-step cost.
+- **What you control.** Retry layer and timeouts per step, the `signal` that stops a run when the user
+  leaves, a byte-stable prefix (system prompt plus tool list) for caching, and the step budget around
+  the loop.
+- **What you can skip.** Writing your own SSE parser or argument-fragment reassembly; `.finalMessage()` and
+  the stream helpers do it. Tool runners are optional once you understand the loop they hide.
 
 ## Why it exists
 - **A hand-rolled `fetch` fails in predictable ways.** Under load the provider returns 429 or 529, and the
@@ -115,6 +129,22 @@ differ in message and tool-call shapes and in explicit versus automatic prompt c
 - **Structured output.** OpenAI: `response_format` with a JSON schema and `strict: true` (`text.format` on
   the Responses API). Anthropic: an `output_config.format` JSON schema in current SDK versions. In both, keep
   your own `safeParse` on the result, as the schema-validation lesson argues.
+
+### The agent loop on a native SDK
+Each iteration is one ordinary SDK call; the loop is your code (or `toolRunner` on Anthropic's beta surface):
+1. **Call** with the stable prefix first: `system`, then `tools`, then the growing `messages`.
+2. **Branch on the stop signal.** Anthropic: `stop_reason` of `tool_use` means run tools; `end_turn` means
+   done; `max_tokens`, `pause_turn` and `refusal` each need their own branch. OpenAI Chat Completions:
+   `tool_calls` present on the message means run tools.
+3. **Echo the assistant turn unchanged, run every requested tool, validate inputs with the tool's schema,
+   and send all results for that turn back together.**
+4. **Repeat under a budget:** a maximum step count, a token or cost ceiling summed from `usage`, and the
+   run's `AbortSignal` passed to every call.
+
+- **Every step is a new request that resends the transcript,** so input tokens grow per step; caching the
+  prefix is what keeps step 10 cheap.
+- **Per-step retries compound.** The SDK's `maxRetries` applies to each step's call, so a run's worst-case
+  wall clock is the per-call worst case times the number of steps.
 
 ### Caching, batching, platforms
 - **Anthropic caching is opt-in.** Place `cache_control: { type: "ephemeral" }` on the last stable block
@@ -227,6 +257,58 @@ The one thing the adapters hide: the four objects of a tool round trip, in each 
 - **Two calls in one turn:** OpenAI expects two `tool` messages; Anthropic expects both `tool_result`
   blocks in the same single user message.
 
+### A budgeted agent loop on the Anthropic SDK
+The round trip above, repeated until the model finishes. Budgets are explicit, the run's `signal` reaches
+every call, tool inputs are validated with Zod before a handler runs, and a failed tool goes back to the
+model as `is_error` instead of crashing the run.
+
+```ts
+import Anthropic from "@anthropic-ai/sdk";
+import { z } from "zod";
+import { db } from "./db";
+
+const client = new Anthropic({ maxRetries: 2, timeout: 60_000 });
+const SYSTEM = "You are a support agent. Use tools for order data; never guess.";
+const tools: Anthropic.Tool[] = [{ name: "lookup_order", description: "Fetch an order by id",
+  input_schema: { type: "object", properties: { orderId: { type: "string" } }, required: ["orderId"] } }];
+const LookupOrder = z.object({ orderId: z.string().regex(/^ord_\w+$/) });
+const handlers: Record<string, (input: unknown) => Promise<string>> = {
+  lookup_order: async (input) => JSON.stringify(await db.orders.find(LookupOrder.parse(input).orderId)),
+};
+
+export async function runAgent(task: string, signal: AbortSignal, maxSteps = 6, maxInputTokens = 100_000) {
+  const messages: Anthropic.MessageParam[] = [{ role: "user", content: task }];
+  let inputTokens = 0;
+  for (let step = 1; step <= maxSteps; step++) {
+    const msg = await client.messages.create(
+      { model: "claude-opus-5-5", max_tokens: 2048, system: SYSTEM, tools, messages }, { signal });
+    inputTokens += msg.usage.input_tokens;
+    messages.push({ role: "assistant", content: msg.content });            // echo the turn unchanged
+    if (msg.stop_reason === "end_turn")
+      return { text: msg.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join(""), step, inputTokens };
+    if (msg.stop_reason !== "tool_use") throw new Error(`stopped: ${msg.stop_reason}`); // max_tokens, refusal...
+    if (inputTokens > maxInputTokens) throw new Error("token budget exhausted");
+    const results: Anthropic.ToolResultBlockParam[] = [];
+    for (const b of msg.content) {
+      if (b.type !== "tool_use") continue;
+      try {
+        const run = handlers[b.name];
+        if (!run) throw new Error(`unknown tool ${b.name}`);
+        results.push({ type: "tool_result", tool_use_id: b.id, content: await run(b.input) });
+      } catch (e) {                                                         // message written for the model
+        results.push({ type: "tool_result", tool_use_id: b.id, is_error: true,
+                       content: e instanceof Error ? e.message : "tool failed" });
+      }
+    }
+    messages.push({ role: "user", content: results });                     // all results, one user message
+  }
+  throw new Error("step budget exhausted");
+}
+```
+
+- **The default branch matters.** `pause_turn` (used with server-side tools) and future stop reasons land in
+  the `throw`; handle the ones your configuration can produce instead of looping on them.
+
 ### Worked scenario: worst-case latency of one call
 With the adapters' settings, `timeout: 60_000` and `maxRetries: 3`, during a provider outage where every
 attempt times out:
@@ -238,9 +320,12 @@ attempt times out:
 | Plus backoff sleeps | a few seconds more, longer if `retry-after` says so |
 | A 60 s proxy timeout in front | the user sees a 504 after the first attempt while the SDK keeps retrying |
 | Outer retry loop of 3 attempts on top | up to 12 requests and about 12 minutes for one click |
+| A 6-step agent run with only the SDK layer | each step can take 240 s, so up to 24 minutes for one run |
 
 - **Fix:** pick one retry layer, set the proxy and handler timeouts above `timeout × (maxRetries + 1)`, and
   pass the request's `AbortSignal` so a user who gives up also stops the chain.
+- **For agents, add a run deadline.** Per-call settings cannot bound a multi-step run; give the run its own
+  wall-clock budget (an `AbortSignal` that fires at the deadline) and lower `timeout` per step.
 
 ### Reading request IDs and rate-limit headers
 `.withResponse()` exposes the raw `Response`, which carries the provider's rate-limit headers.
@@ -265,15 +350,17 @@ console.log({
 - **Timeouts sized from the retry budget.** Set handler and proxy timeouts above `timeout × (maxRetries + 1)`
   plus backoff, and stream any generation with a large `max_tokens`. Watch for 504s and
   `APIConnectionTimeoutError` that appear only on long answers.
-- **Log request IDs and usage on every call.** Record `_request_id` (or `stream.request_id`), normalised
-  input and output tokens, and cache counts in one structured log line. Monitor cost per route, and keep
-  the ID so support tickets can be traced.
 - **Verify caching with counters.** For Anthropic, alert when `usage.cache_read_input_tokens` is zero on a
   route that sets `cache_control`; for OpenAI, track `usage.prompt_tokens_details.cached_tokens`. Keep
-  timestamps and per-user data after the stable prefix.
+  timestamps and per-user data after the stable prefix, and keep the agent transcript append-only so every
+  step after the first reads the cached system prompt and tool list.
 - **Back off from rate-limit headers.** Read the provider's remaining-request and remaining-token headers via
   `.withResponse()` (for OpenAI, the `x-ratelimit-remaining-requests` family) and slow a worker pool before
   hitting 429s. Monitor the 429 rate per API key.
+- **Budgeted, traced agent runs.** Wrap the loop with a step cap, a summed-`usage` token ceiling and a run
+  deadline signal. Log one structured line per step: step number, `stop_reason`, tools called, normalised
+  input and output tokens, cache counts and `_request_id` (or `stream.request_id`), so support tickets can
+  be traced. Monitor steps per run, runs ending on a budget, and cost per route and per completed task.
 - **Same surface on cloud platforms.** When a customer must stay inside their cloud, swap the client for
   `AzureOpenAI`, `@anthropic-ai/bedrock-sdk` or `@anthropic-ai/vertex-sdk` behind the same `ModelClient`
   interface. Monitor per-platform latency and error rates separately.
@@ -318,6 +405,9 @@ console.log({
 - **A non-streaming request with a very large `max_tokens` through a proxy with a short idle timeout.**
   Symptom: 504s or `APIConnectionTimeoutError` on long answers only, then retries that may pay for the same
   long generation again. Stream long generations.
+- **An agent loop with no step or token budget.** Symptom: a run that calls the same tool repeatedly until a
+  proxy timeout or the monthly bill stops it. Fix: a step cap, a token ceiling summed from `usage`, and a
+  log line when either ends a run.
 - **Verifying caching by vibes.** Symptom: a system prompt with a timestamp in it, a cache hit rate of zero
   and a bill that never drops. Fix: move variable content after the breakpoint and alert on
   `cache_read_input_tokens`.
@@ -325,6 +415,8 @@ console.log({
 ## When to use
 - **Use the native SDK** whenever you commit to a provider and want its full surface: streaming helpers,
   tool runners, batch and files endpoints, explicit caching, platform clients for Azure, Bedrock or Vertex.
+- **Write your own agent loop on it** when you need per-step control: approvals, custom stop rules, exact
+  request bodies for caching and audit, or traces per step.
 - **Wrap it behind a narrow interface** so tests can inject a fake and a second provider can be added
   later. Keep the SDK's retries while deciding explicitly where your own retries, queue redelivery and
   circuit breaker sit.
@@ -390,6 +482,13 @@ chain, and record the request ID from the response for the inevitable support ti
   invalidates it, and a prefix below the minimum cacheable length is never cached.
 - **Fix:** move variable content after the `cache_control` breakpoint and alert on the hit rate.
 
+### Walk me through the agent loop you would write on the native SDK, and how it stops.
+- **Loop:** call with a stable `system` and `tools` prefix, echo the assistant turn, run every requested
+  tool with schema-validated inputs, and return all results for the turn in one message.
+- **Stop rules:** `end_turn` (or no `tool_calls`) ends the run; `max_tokens`, `refusal` and unknown stop
+  reasons get their own branch; a step cap, token ceiling and run deadline end runaway loops.
+- **Operate it:** one log line per step with tokens and request ID, and the user's `AbortSignal` on every call.
+
 ## Quiz
 ### Q: What is the key structural difference between a tool call in OpenAI Chat Completions and in Anthropic Messages?
 - [ ] OpenAI requires a JSON schema while Anthropic infers parameters from the description
@@ -417,3 +516,30 @@ chain, and record the request ID from the response for the inevitable support ti
 > The SDKs expose a class per status (and a `status` field) precisely so callers can branch on a stable
 > contract. Message wording is informational and may change; code that depends on it breaks silently
 > when it does.
+
+## Use cases & projects
+### Use cases
+- **Hand-written agent loops.** Teams that need approvals, custom stop rules or per-step traces write the
+  loop directly on `messages.create` or `chat.completions.create`.
+- **Cost-controlled long runs.** A cached system prompt and tool list, verified with the cache counters,
+  keeps step 10 of a research agent close to the price of step 1.
+- **Provider fallback for agents.** Two adapters behind one interface let a run fail over when the breaker
+  for one provider opens, with typed errors deciding what is retryable.
+- **Agents inside a customer's cloud.** The Bedrock, Vertex or Azure clients keep the same loop code while
+  traffic stays in the customer's account.
+
+### Mini project
+**Write a budgeted tool-calling agent on both SDKs (2-3 hours).**
+- **Goal:** one agent loop with two tools that runs on Anthropic and OpenAI behind a shared interface, with
+  budgets and cancellation.
+- **Steps:** define `lookup_order` and `refund_order` with one Zod schema each; write the loop for Anthropic
+  (`tool_use` blocks) and for OpenAI Chat Completions (`tool_calls` with string arguments); add a step cap
+  of 6, a token ceiling and an `AbortSignal`; log one line per step with tokens and the request ID.
+- **Done when:** the same task succeeds on both providers, a forced bad argument comes back as an error
+  result the model recovers from, aborting mid-run stops further calls, and the logs show cached tokens
+  rising after step 1.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): the document Q&A service streams answers
+through a native SDK behind an injected interface, with timeouts, classified retries, a circuit breaker and
+a fallback provider.

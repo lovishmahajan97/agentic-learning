@@ -5,7 +5,8 @@ name: Vitest / Jest & integration testing
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - node-ts-for-ai/dependency-injection
   - node-ts-for-ai/openai-anthropic-node-sdks
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-Model calls are slow, billed and non-deterministic, so split tests into three layers: unit tests with an
-injected fake, integration tests with the real SDK over intercepted HTTP plus real databases, and scored
-evals against the real model. Injecting the model client is what makes the first two layers possible.
+Agent code around the model (loop, tool dispatch, budgets, parsing) is deterministic once the model is
+faked. Test it in three layers: injected fakes, the real SDK over intercepted HTTP plus real databases,
+and scored evals against the real model.
+
+## For agent builders
+- **Why it matters for agents.** Most agent bugs are not "the model was dumb": a tool result keyed to the
+  wrong call id, a loop that ignores its step budget, a stream that never aborts. A scripted fake model
+  replays a whole trajectory (tool call, tool call, answer) and catches them in milliseconds.
+- **Where it shows up in your stack.** Vitest or Jest for the runner, an injected `ModelClient` for the
+  agent, `msw` for provider HTTP, Testcontainers or CI service containers for the agent's Postgres and
+  Redis, and a separate eval suite for task success.
+- **What you control.** The interface boundary (inject the model and tools), the scripted trajectories,
+  `maxRetries: 0` on test clients, fail-closed networking, and the threshold that gates promotion.
+- **What you can skip.** Snapshotting model text and deep Jest-versus-Vitest comparisons; pick one runner
+  and spend the effort on fakes and fixtures.
 
 ## Why it exists
 - **The model call breaks every test assumption.** It takes seconds, costs money per token, needs a
@@ -87,6 +100,11 @@ differ in how code reaches the test.
    stream transcript), store them as JSON, and replay them through the interceptor. They are the only
    cheap way to test the provider's real response shape, and to notice that an SDK upgrade changed a type.
    Refresh them deliberately, not on every run.
+
+**For agents, the fake scripts a trajectory, not one answer.** Each call to the fake returns the next
+scripted turn (a tool call, another tool call, then a final answer). A test then walks the whole loop:
+- dispatch to the right tool, with results keyed to the right call id;
+- the step budget, and error results fed back after a tool throws.
 
 **Each layer catches what the one below cannot see.** The fake cannot see serialization bugs; the
 interceptor cannot see output-quality drift; evals cannot see a bug in your retry logic because they are
@@ -202,6 +220,57 @@ describe("summarize (integration, real SDK over intercepted HTTP)", () => {
 });
 ```
 
+### Agent loop against a scripted trajectory
+`runAgent(task, { model, tools, maxSteps })` is the code under test. `model.next(history)` returns either
+`{ toolCalls: [...] }` or `{ text }`; `tools` maps names to async handlers; after each tool round the loop
+appends a `{ toolResults }` entry to the history.
+
+The fake model is a queue of scripted turns that also records a copy of each history it was shown,
+because the loop keeps mutating the same array.
+
+```ts
+import { it, expect, vi } from "vitest";
+import { runAgent, type Turn } from "../src/agent";
+
+const scripted = (...turns: Turn[]) => {
+  const seen: unknown[][] = [];                                   // copies: what the model saw per step
+  const next = vi.fn(async (history: unknown[]) => {
+    seen.push(structuredClone(history));
+    return turns.shift() ?? { text: "done" };
+  });
+  return { next, seen };
+};
+
+it("dispatches the tool, keys the result by call id, then answers", async () => {
+  const lookup = vi.fn(async () => ({ status: "shipped" }));
+  const model = scripted(
+    { toolCalls: [{ id: "c1", name: "lookup_order", input: { orderId: "ord_42" } }] },
+    { text: "Order ord_42 has shipped." },
+  );
+  const out = await runAgent("where is ord_42?", { model, tools: { lookup_order: lookup }, maxSteps: 4 });
+  expect(lookup).toHaveBeenCalledWith({ orderId: "ord_42" });
+  expect(out.text).toContain("shipped");
+  expect(model.seen[1].at(-1)).toMatchObject({ toolResults: [{ id: "c1", isError: false }] });  // step 2 input
+});
+
+it("stops at the step budget when the model keeps calling tools", async () => {
+  const loop = { next: vi.fn(async () => ({ toolCalls: [{ id: "c", name: "search", input: {} }] })) };
+  await expect(runAgent("x", { model: loop, tools: { search: async () => [] }, maxSteps: 3 }))
+    .rejects.toThrow(/step budget/);
+  expect(loop.next).toHaveBeenCalledTimes(3);
+});
+
+it("feeds a tool failure back to the model instead of crashing the run", async () => {
+  const model = scripted({ toolCalls: [{ id: "c1", name: "lookup_order", input: {} }] }, { text: "Sorry" });
+  const failing = async () => { throw new Error("upstream down"); };
+  await runAgent("x", { model, tools: { lookup_order: failing }, maxSteps: 4 });
+  expect(model.seen[1].at(-1)).toMatchObject({ toolResults: [{ id: "c1", isError: true }] });
+});
+```
+
+- **What these three tests pin down:** routing, the budget and error handling, which are exactly the
+  behaviours an eval would only show as a vague drop in task success.
+
 ### Backoff under fake timers
 A self-contained retry helper that sleeps 1 s, then 2 s. Under fake timers the test runs in
 milliseconds; each `advanceTimersByTimeAsync` is awaited so the promise chain between timers settles.
@@ -266,6 +335,9 @@ Illustrative orders of magnitude for the Check yourself situation, not a benchma
 - **Split suites by config.** Keep the scored real-model suite in its own config or directory and run it
   from a scheduled CI workflow with `vitest run --config <eval config>`, never from the PR workflow.
   Track its pass rate and spend per run as metrics with an owner.
+- **Production traces become scripted trajectories.** When an agent misbehaves in production, turn its
+  trace (model turns and tool results) into a scripted fake plus tool stubs and add it to the unit suite,
+  so the fix stays fixed. Track how many incidents gained a regression trajectory.
 
 ## Trade-offs
 - **Injected fake: speed vs drift.** Fast and deterministic, but it can drift from the real client's
@@ -298,6 +370,9 @@ Illustrative orders of magnitude for the Check yourself situation, not a benchma
   no longer tests anything. Fix: snapshot the prompt, score the output.
 - **Rollback isolation while the code takes its own pooled connection.** Symptom: "row not found" for
   fixtures the test just inserted, and rows that survive between tests. Fix: inject the transaction client.
+- **Testing only the happy path of the agent loop.** Symptom: production runs that loop forever, crash on
+  a tool exception or send a result for the wrong call id. Fix: scripted trajectories for budget exhaustion,
+  tool failure, unknown tool names and parallel calls in one turn.
 - **Leaving `onUnhandledRequest` at its default (`"warn"`).** Symptom: a test hit the real network because
   a URL did not match the handler, with only a warning buried in the output. Fix: set it to `"error"` in
   the shared setup file.
@@ -366,6 +441,13 @@ merge gate becomes fast and deterministic without pretending the model is determ
 - **Threshold, not assertion:** for example pass rate ≥ 0.9 or a judge score floor, published as a metric.
 - **Ownership:** someone owns the threshold and the alert, or regressions go unnoticed.
 
+### How do you unit-test an agent's tool loop when the model is non-deterministic?
+- **Inject the model** behind a `next(history)` interface and script a trajectory: tool call, tool call,
+  final answer.
+- **Assert the loop's own behaviour:** the right tool gets the right input, results carry the right call
+  id, a throwing tool becomes an error result, and a model that never stops hits the step budget.
+- **Leave quality to evals:** whether the model picks good tools is measured on a golden set, not asserted.
+
 ## Quiz
 ### Q: What does an HTTP-interception test with the real SDK catch that an injected fake model cannot?
 - [ ] Non-deterministic differences in the model's wording
@@ -393,3 +475,29 @@ merge gate becomes fast and deterministic without pretending the model is determ
 > Model output is statistical, so a single failing case is not a regression and a single passing one is
 > not proof. A scored suite with a golden set and a pass-rate floor measures quality drift without
 > making every merge depend on provider latency, cost and randomness.
+
+## Use cases & projects
+### Use cases
+- **Agent loop regression suites.** Scripted trajectories pin tool routing, budgets and error handling, so a
+  refactor of the loop cannot silently break them.
+- **Provider adapter checks.** One msw test per adapter catches a renamed field or a tool schema the
+  provider rejects before an SDK upgrade ships.
+- **Agent memory and state stores.** Integration tests against real Postgres and Redis check run records,
+  token budgets and memory writes under parallel workers.
+- **Prompt and tool-definition review.** Inline snapshots of the rendered system prompt and tool schemas
+  turn every prompt edit into a reviewable diff.
+
+### Mini project
+**Build a three-layer test suite for a small agent (2-3 hours).**
+- **Goal:** a two-tool agent whose loop, provider adapter and quality are each tested at the right layer.
+- **Steps:** inject the model behind `next(history)`; write scripted trajectories for success, budget
+  exhaustion and a failing tool; add one msw test that runs the real Anthropic or OpenAI SDK with
+  `maxRetries: 0` and `onUnhandledRequest: "error"`; snapshot the rendered tool definitions; put a
+  ten-question eval with a pass-rate threshold in its own config.
+- **Done when:** the PR suite runs in seconds with no provider key, breaking the step budget in code turns
+  a test red, and the eval prints a pass rate from a separate command.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): a test suite with unit tests against a fake
+model client, integration tests running real Postgres and Redis in containers plus intercepted provider
+HTTP, and a separate scored eval of 20+ questions run outside the merge gate.

@@ -476,3 +476,24 @@ the caller controls its lifetime with `with`.
 - [x] When the block raises, because the exception is thrown in at the yield and skips the close
 > The exception from the block is raised inside the generator at the `yield`, so code after it runs
 > only if it is in `finally`. An early `return` exits normally and does run it.
+
+## Use cases & projects
+### Use cases
+- **MCP sessions per agent run.** The MCP client's transports and sessions are async context managers, so
+  an `AsyncExitStack` closes every server a run opened.
+- **Code sandboxes and browsers.** A run-scoped context manager stops the container or browser even when
+  the run crashes or the user presses Stop.
+- **Process-scoped clients.** FastAPI `lifespan` opens model and HTTP clients once and closes them on
+  shutdown, instead of per request.
+- **Tracing and memory writes.** Spans and DB transactions close or roll back on every exit path, so traces
+  and agent memory never end up half-written.
+
+### Mini project
+**Leak-proof agent run with an exit stack (1-2 hours).**
+- **Goal:** acquire several run-scoped resources and show they are all released on success, error and
+  cancellation.
+- **Steps:** write three `@asynccontextmanager` fakes (an MCP session, a sandbox, a trace span) that log
+  open and close; in an agent run, enter only the ones the plan needs via `AsyncExitStack`; run it three
+  ways: normal finish, a tool that raises, and a task cancelled mid-run; count open resources after each.
+- **Done when:** every scenario ends with zero open resources, the logs show reverse-order cleanup, and a
+  test fails if any close is skipped.

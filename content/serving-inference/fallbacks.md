@@ -437,3 +437,24 @@ failing over tool-executing turns without idempotency keys, which would duplicat
 > During a primary outage every request moves simultaneously to the fallback. If its rate limit was sized
 > for a trickle, it fails within seconds, turning one outage into two. Pre-provisioned quota and load
 > shedding prevent it.
+
+## Use cases & projects
+### Use cases
+- **Customer-support agents during a provider outage.** A ladder from the primary model to a second
+  provider to a "we will follow up" handoff keeps the channel answering instead of erroring.
+- **Cost-tiered agents.** Steps such as summarising tool output fall back to a smaller model under load,
+  while the planner keeps the strongest model.
+- **Agents with side-effecting tools.** Failing over only before a tool fires, and resuming from the
+  recorded tool result after, prevents a duplicate refund or email.
+- **RAG assistants.** Falling back to a cached or retrieval-only answer with sources when generation is
+  unavailable, and labelling it as degraded.
+
+### Mini project
+**A fallback ladder that survives tool calls (2-3 hours).**
+- **Goal:** keep a 5-step tool-calling agent completing runs when its primary model fails, without
+  repeating any tool side effect.
+- **Steps:** wrap two model clients behind one function with an ordered ladder; inject failures (timeouts,
+  5xx, 429) on the primary at a set rate; record each executed tool call with an idempotency key so a
+  failed-over step resumes from the recorded result; tag every step with the model that served it.
+- **Done when:** under a 30% injected failure rate most runs complete, no tool runs twice for the same
+  key, and a trace or log shows which model served each step.

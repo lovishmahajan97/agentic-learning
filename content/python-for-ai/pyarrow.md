@@ -347,3 +347,23 @@ not the serving layer; build an ANN index per tenant from it.
 - [ ] They are the same format with different file extensions
 > Both are columnar. Arrow optimizes random access and zero-copy sharing in memory, while Parquet uses
 > encodings, compression and statistics to be small and selectively readable on disk.
+
+## Use cases & projects
+### Use cases
+- **RAG source of truth.** Chunks, metadata and embeddings live in Parquet with a fixed schema, so a
+  vector database can be rebuilt or re-embedded from it at any time.
+- **Per-tenant agent memory exports.** Partitioning by tenant lets a job read or delete one tenant's
+  rows without touching the rest.
+- **Long-term trace storage.** Months of agent steps stored compressed and columnar, cheap to query for
+  only IDs, tools and token counts.
+- **Handing data between tools.** Polars, DuckDB and Hugging Face `datasets` read the same Arrow data,
+  often without copying.
+
+### Mini project
+**Parquet store for an agent's RAG chunks (1-3 hours).**
+- **Goal:** keep a small agent's retrieval corpus in Parquet so its vector index can be rebuilt from disk.
+- **Steps:** chunk 200 documents; define an explicit schema with `large_string` for text, a
+  `fixed_size_list` of floats for embeddings and a tenant column; write a dataset partitioned by tenant;
+  read back only one tenant's IDs and embeddings; load them into an in-memory index and run a few queries.
+- **Done when:** the reread touches only the requested columns and tenant, the schema rejects an
+  embedding of the wrong length, and the rebuilt index returns the same top results as before.

@@ -523,3 +523,23 @@ see what the answer was based on.
 > The second pair is nearly identical in surface form and embedding space but opposite in intent, so a
 > cached answer to one is harmful for the other. The other pairs are genuine paraphrases, which is exactly
 > what a semantic cache is meant to match.
+
+## Use cases & projects
+### Use cases
+- **Prefix caching across agent steps.** A static system prompt and tool list, with an append-only
+  transcript, lets every step after the first reuse the cached prefix.
+- **Tool-result caching.** Read-only lookups and searches repeated within or across runs come from Redis
+  with a TTL, cutting latency per step.
+- **Tenant-safe keys.** Tenant and tool schema version go into every cache key, so one customer never sees
+  another's cached result.
+- **Invalidation on data change.** Document updates or deletions evict the cached tool results and
+  retrieval answers that depended on them.
+
+### Mini project
+**Cache an agent's prefix and tool results (1-2 hours).**
+- **Goal:** measure what prefix and tool-result caching save in a multi-step agent.
+- **Steps:** build an agent with one read-only lookup tool; lay out the prompt static-first; add a Redis
+  cache for the tool keyed on tenant, tool schema version and arguments, with a TTL; run 10 tasks with and
+  without caching; log cached-input tokens from provider usage fields and tool cache hit rate.
+- **Done when:** you have a table of cost, latency and cache hit rate for both runs, and a test showing a
+  write tool is never cached and a schema version bump misses the old entries.

@@ -352,3 +352,24 @@ effects it must be excluded from the concurrent group. Confirm with calls per tu
 > Every `tool_use` needs a `tool_result`, and an error result tells the model what happened so it can
 > retry just that call. An empty result looks like success, and re-running the successful calls wastes
 > time and may duplicate side effects.
+
+## Use cases & projects
+### Use cases
+- **Research agents.** Several independent searches or page fetches in one turn cut the wall-clock time
+  of each research step.
+- **Support agents.** Account, order and policy lookups for one customer run together before the agent
+  answers.
+- **Dashboard and reporting agents.** Metrics from several services are gathered concurrently, with a
+  per-call timeout so one slow service does not stall the turn.
+- **Mixed read-write turns.** Reads run in parallel while writes are held back and run one at a time,
+  so state is never changed by two calls at once.
+
+### Mini project
+**Add parallel execution to a harness (1-2 hours).**
+- **Goal:** run independent tool calls from one turn concurrently and measure the saving.
+- **Steps:** give an agent three read tools with simulated latency and one write tool; execute a turn's
+  calls with `asyncio`, a concurrency cap and per-call timeouts; run reads concurrently and writes
+  serially using a parallel-safe flag; make one call time out on purpose; answer every call in one
+  message, with an error result for the timeout.
+- **Done when:** a table shows turn latency sequential versus parallel, the timed-out call returned an
+  error result while the others succeeded, and the write never overlapped another call.

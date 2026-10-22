@@ -5,7 +5,8 @@ name: Stopping conditions / termination
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - agent-reliability/max-step-budgets
   - agent-reliability/loop-detection
@@ -23,6 +24,19 @@ sources:
 An agent loop never ends on its own, so termination is designed: a function over run state returns
 continue, done or abort by combining the model's structured done signal, independent verifiers and hard
 limits, and every exit records a labelled reason.
+
+## For agent builders
+- **Why it matters for agents.** Every tool-calling loop you write needs an exit you designed. Without
+  one, truncated answers, narrated plans and endless re-checking all come back as "returned text", and
+  your app shows them as finished work.
+- **Where it shows up in your stack.** The provider stop field (`stop_reason` for Claude,
+  `finish_reason` for OpenAI Chat Completions), framework turn caps such as `max_turns` in the OpenAI
+  Agents SDK or `recursion_limit` in LangGraph, and the run status your UI, retries and evals read.
+- **What you control.** The terminal tool and its schema, the verifier a submit must pass, the order of
+  checks in `decide()`, the single nudge, the reserved wrap-up call, and the outcome taxonomy every run
+  emits.
+- **What you can skip.** Clever prompt wording that asks the model to "know when it is done". A
+  structured submit plus an external check beats any instruction to self-assess.
 
 ## Why it exists
 - **The loop has no natural exit.** An agent loop is `while True: call model; run tools`. Prompt the
@@ -384,3 +398,24 @@ partial or exhausted so the completion metric reflects reality rather than the m
 - [ ] Any order, since each check is independent
 > Hard limits and cancellations must win regardless of what the model claims, so they are evaluated
 > first. The model's signal is the least trustworthy input and comes last, gated by the verifier.
+
+## Use cases & projects
+### Use cases
+- **Coding agents.** "Done" means a `submit_result` call plus a green test run that the harness executes,
+  not the model writing "I have completed the task".
+- **Ticket and CRM agents.** A verifier confirms the record exists and passes a schema check before the
+  run counts as `succeeded`; everything else is labelled partial or failed.
+- **Research and report agents.** With no hard verifier, a rubric-based judge gates the submit, and budget
+  exits return a labelled `partial` carrying the no-tools wrap-up summary.
+- **Multi-agent orchestrators.** Sub-agents return the same labelled status, so the parent retries, switches
+  approach or propagates `partial` instead of trusting a child's draft.
+
+### Mini project
+**Add labelled termination to a toy agent (2-3 hours).**
+- **Goal:** turn a bare `while True` tool loop into one that ends only through `decide()` with a status and
+  a reason code.
+- **Steps:** give a small agent two tools (read a file, run a test command) plus `submit_result`; add the
+  fail-closed stop-reason map, a verifier that runs the tests, one nudge after a bare `end_turn`, a step cap
+  and a no-tools wrap-up call; then force each exit with a fake model (truncate, narrate, loop, succeed).
+- **Done when:** a test suite proves a truncated response never returns `succeeded`, every exit path shows
+  up with its reason code in a per-run log, and a table counts outcomes over 20 scripted runs.

@@ -437,3 +437,24 @@ encoder–decoder processes the input once and cross-attends to it cheaply from 
 > Every weight participates in one multiply-accumulate per token, which is two FLOPs, giving ≈2N; the
 > attention-score term (about 4·n·d per layer) stays minor until context is several times the hidden
 > size. 6N is the training estimate, which includes the backward pass.
+
+## Use cases & projects
+### Use cases
+- **Costing an agent before launch.** The ≈2N FLOPs-per-token rule plus expected transcript length gives a
+  first estimate of compute per run, which you compare with hosted per-token pricing.
+- **Choosing a model per agent step.** A small encoder handles routing, guardrail classification and
+  embeddings; a decoder handles planning and tool calling, because only it generates.
+- **Explaining long-run slowdowns.** Every appended tool result is attended to by every later token, so
+  transcript length explains why late steps get slower and dearer.
+- **Reading a self-hosted model card.** Layers, hidden size and head counts in `config.json` tell you
+  memory, speed and context behaviour before you benchmark.
+
+### Mini project
+**Estimate the cost of one agent run from the architecture (1-2 hours).**
+- **Goal:** predict compute and token cost of a 10-step tool-calling run from a model's config, then check
+  it against measured usage.
+- **Steps:** pick an open model and read its layers and hidden size from `config.json`; log input and output
+  tokens per step of a small agent with two fake tools; compute ≈2N FLOPs per token and the attention term
+  per step; compare the total with the provider or engine usage numbers.
+- **Done when:** you have a per-step table of tokens and estimated FLOPs, and a short note on which steps
+  dominate and why transcript growth, not step count, drives the total.

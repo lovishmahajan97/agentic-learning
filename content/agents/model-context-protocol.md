@@ -417,3 +417,24 @@ set and check latency and error rates per server before go-live.
 - [ ] The model refuses to use more than one server
 > Each server tends to expose many tools, and every definition is rendered into the prompt. Allow-listing
 > the needed tools and reviewing descriptions addresses both the cost and the trust problem.
+
+## Use cases & projects
+### Use cases
+- **Plugging an agent into existing systems.** GitHub, databases, file stores and SaaS tools that
+  already ship MCP servers become agent tools without writing a connector per framework.
+- **Exposing your product to other agents.** One MCP server makes your API usable from Claude Desktop,
+  Claude Code, IDE agents and customers' own agents.
+- **Internal tool platforms.** A platform team publishes curated, allow-listed MCP servers so every
+  agent team reuses the same audited tools.
+- **Coding and IDE agents.** Local stdio servers give a coding agent filesystem, test-runner or database
+  access scoped by the host.
+
+### Mini project
+**Build an MCP server and a host that uses it (2-3 hours).**
+- **Goal:** expose a small system as an MCP server and drive it from your own agent loop.
+- **Steps:** with the official Python SDK's `FastMCP`, write a server with three tools (for example
+  search notes, read note, create note) and one resource; run it over stdio; write a host that runs the
+  handshake, calls `tools/list`, allow-lists two of the tools, prefixes names with the server name and
+  routes each `tool_use` to `tools/call`; map `isError` to `is_error`; kill the server mid-run.
+- **Done when:** the agent completes a task using only MCP tools, the excluded tool never appears in the
+  request, and the dead server becomes an error result the model can see instead of a crashed loop.

@@ -469,3 +469,24 @@ these tests check the plumbing that the model depends on.
 - [ ] Retrying the test until the model produces the expected answer
 > A fake server keeps SDK, retries and parsing real while fixing the model's output. Temperature zero
 > does not guarantee identical text, and mocking the handler is no longer end to end.
+
+## Use cases & projects
+### Use cases
+- **Tenant-filtered retrieval.** An integration test against a real vector store in a container checks
+  that a tenant filter returns only that tenant's documents and copes with fewer than *k* hits.
+- **SDK serialisation.** A fake model server behind the real provider SDK (`base_url=`) proves tool
+  results and tool-call messages survive the round trip intact.
+- **Ingestion to answer.** An end-to-end journey uploads a document, waits for ingestion, asks a question
+  and asserts the answer cites that document's ID.
+- **Streaming through the proxy.** An e2e test against the deployed agent API checks that tokens arrive
+  incrementally, not buffered into one response.
+
+### Mini project
+**Write an integration test for a RAG agent with a fake model server (2-3 hours).**
+- **Goal:** test a RAG agent's real plumbing (vector store, SDK, tool dispatch) with a scripted model.
+- **Steps:** start a vector store with Testcontainers; ingest documents for two tenants; run a small
+  HTTP server that speaks the provider's chat API and returns a scripted tool call then a final answer;
+  point the real SDK at it with `base_url=`; assert on the trajectory (search tool called with the
+  tenant filter) and on cited IDs, not on wording.
+- **Done when:** the test passes locally and in CI, a broken tenant filter makes it fail, and no real
+  model API key is needed.

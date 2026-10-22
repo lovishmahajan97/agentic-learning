@@ -466,3 +466,24 @@ per-slice interval that says whether six points at that n is signal at all.
 > A manifest must pin every value that can move the score. An alias can resolve to different weights
 > over time, so an empty diff cannot rule out a model change; pinning the snapshot makes the cause
 > attributable. Reusing cached outputs keyed on the alias would be worse: it would hide the change.
+
+## Use cases & projects
+### Use cases
+- **CI gate for an agent repository.** Every pull request runs the task set and fails the build when a
+  slice drops below its threshold, the same way unit tests do.
+- **Nightly runs against a pinned model snapshot.** Stored manifests and trajectories show whether a
+  score change came from your code or from the provider.
+- **Re-grading old runs when the rubric improves.** Because raw outputs and traces are kept, a new
+  grader can be applied without re-running the agent.
+- **Investigating "fixed 9, broke 2".** A paired per-task diff against the baseline points straight at
+  the trajectories that changed.
+
+### Mini project
+**Write a minimal agent eval harness (2-3 hours).**
+- **Goal:** run a small tool-calling agent over a task set reproducibly, with every output and trace kept.
+- **Steps:** load tasks from a JSONL file; create a fresh fake-tool sandbox per task; cap steps and
+  tokens per run; retry transient errors and record any that still fail as errors, not passes; write a
+  run manifest (model id, prompt hash, sampling settings, dataset and grader versions); store each
+  trajectory; grade final state with code; diff per task against a saved baseline run.
+- **Done when:** two runs with the same manifest give comparable results, errors are reported separately
+  from failures, and the diff lists which tasks flipped and links to their traces.

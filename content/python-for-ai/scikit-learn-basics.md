@@ -409,3 +409,23 @@ real score will be lower but will predict production.
 - [x] Macro-F1 with stratified cross validation, compared against a majority-class dummy baseline
 > Accuracy rewards predicting the majority class, which already scores 85%. Macro-F1 weights every class
 > equally, stratification keeps rare classes in each fold, and the dummy baseline shows the floor to beat.
+
+## Use cases & projects
+### Use cases
+- **Request routing.** A logistic regression on embeddings sends each request to the right agent or
+  tool set in milliseconds, with no tokens spent.
+- **Pre-loop guardrails.** A cheap classifier flags abuse or out-of-scope requests before the agent loop
+  starts, falling back to the LLM only when confidence is low.
+- **Eval metrics.** `sklearn.metrics` computes tool-choice accuracy, per-class F1 and agreement between
+  an LLM judge and human labels.
+- **Output quality checks.** A classifier over agent answers flags likely failures for human review.
+
+### Mini project
+**Embedding router with an LLM fallback (1-3 hours).**
+- **Goal:** route requests to one of four agent skills with a classifier, and hand only uncertain cases to
+  the LLM.
+- **Steps:** label 400 requests across four routes; embed them; build a `Pipeline` with logistic
+  regression; split by user so one user's requests never appear in both train and test; compare macro-F1
+  against `DummyClassifier`; pick a probability threshold below which the request goes to the LLM router.
+- **Done when:** you report macro-F1 versus the dummy baseline, the share of requests sent to the LLM at
+  your threshold, and the accuracy of the requests the classifier keeps.

@@ -460,3 +460,24 @@ destructive tool never running without approval, and spec every remaining mock a
 - [ ] It makes the test independent of the client's interface
 > An autospecced double mirrors the real interface, so a typo or wrong argument fails the test. A bare
 > MagicMock accepts anything, letting interface mistakes pass tests and fail in production.
+
+## Use cases & projects
+### Use cases
+- **Scripted fake LLM.** A fake that emits a fixed sequence of tool-call and text messages drives the
+  agent loop through rare branches (malformed call, empty reply, refusal) on every run.
+- **Recording fake tools.** Fake tools store the arguments they received, so a test asserts that a
+  destructive tool was never called without approval.
+- **In-memory retrieval.** A small in-memory vector store makes RAG prompt-assembly tests fast and
+  deterministic, with real stores left to integration tests.
+- **Transport-level doubles.** `httpx.MockTransport` or cassettes under the provider SDK test retries,
+  rate-limit handling and response parsing without a network.
+
+### Mini project
+**Build a fake-LLM harness for an approval-gated agent (2-3 hours).**
+- **Goal:** test an agent that must ask for approval before calling a `delete_record` tool.
+- **Steps:** define a client interface and a scripted fake that implements it; write fake tools that
+  record calls; add tests where the model requests the delete with and without prior approval, returns
+  malformed arguments, and times out on the second attempt; use an autospecced double for one SDK
+  client and confirm a misspelled method fails the test.
+- **Done when:** each test asserts on outcome or recorded tool calls, not on internal call order, and
+  removing the approval check from the agent makes exactly the approval tests fail.

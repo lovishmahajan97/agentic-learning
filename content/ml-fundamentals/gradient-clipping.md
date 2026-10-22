@@ -394,3 +394,23 @@ the new threshold tells them whether the clip was changing the outcome.
 > Adam's second moment has a long memory, so one outlier inflates it and shrinks later updates for that
 > parameter; clipping keeps the outlier out of the statistics in the first place. Adam's normalization
 > limits the size of the immediate step, not the damage to its running statistics.
+
+## Use cases & projects
+### Use cases
+- **Fine-tuning on lumpy agent traces.** A few transcripts with huge tool outputs or retry loops produce
+  gradient spikes; clipping keeps them from undoing the rest of the run.
+- **Data-quality triage.** Logging the pre-clip norm with trace ids turns clipping into a detector for
+  malformed or oversized trajectories in the training set.
+- **RL and preference tuning of agents.** Reward-driven updates are noisier than supervised ones, so the
+  clip threshold and clip rate are watched closely.
+- **Mixed-precision agent fine-tunes.** The ordering (accumulate, unscale, clip, step) decides whether
+  clipping works at all under loss scaling.
+
+### Mini project
+**Find the bad traces with the grad norm (1-3 hours).**
+- **Goal:** use pre-clip gradient norms to locate the agent traces that destabilise a fine-tune.
+- **Steps:** build a small tool-call dataset and inject a handful of bad traces (a 20k-token tool result,
+  malformed JSON, a retry loop); fine-tune a small model with clipping on, logging the pre-clip norm and
+  the trace ids in each batch; rank batches by norm.
+- **Done when:** the injected traces show up at the top of the ranking, you have a norm curve with the
+  spikes marked, and you can state the clip rate for the run.

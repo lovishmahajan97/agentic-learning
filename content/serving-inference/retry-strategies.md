@@ -436,3 +436,23 @@ policy holds.
 - [ ] Automatic detection of which errors are transient
 > Three attempts per request still means 3× load when all requests fail together. A budget limits retries
 > to a fraction of recent traffic, so during an incident the extra load stays near 10% instead of 200%.
+
+## Use cases & projects
+### Use cases
+- **Agents on rate-limited provider APIs.** One retry layer that honours `Retry-After` keeps runs alive
+  through 429 bursts without multiplying load.
+- **Tool calls to flaky internal services.** Transient tool errors are retried in code, while validation
+  errors go back to the model as observations it can correct.
+- **Side-effecting agent actions.** Retries on payment, email or ticket tools carry an idempotency key, so
+  a timeout never becomes a duplicate action.
+- **Batch evaluation runs.** A retry budget stops an eval sweep of thousands of agent runs from turning a
+  provider hiccup into a self-inflicted outage.
+
+### Mini project
+**Find and collapse stacked retries (1-2 hours).**
+- **Goal:** measure how many model calls one agent run really makes when every layer retries, then fix it.
+- **Steps:** build a small tool-calling loop with SDK retries, a tenacity wrapper on the tool and a
+  framework-level retry; inject a 20% transient failure rate; count attempts per run; then move transport
+  retries to one layer with full jitter and a per-run retry budget.
+- **Done when:** you have a before/after table of attempts per run and p95 latency, and the after column
+  shows attempts close to the step count with no duplicate tool side effects.

@@ -5,7 +5,8 @@ name: SQL
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - backend-fundamentals/database-design
   - backend-fundamentals/postgresql-transactions-and-isolation-levels
@@ -21,9 +22,23 @@ sources:
 ---
 
 ## TL;DR
-SQL is declarative: you state which rows you want and a cost-based planner picks the algorithm. With the
-right index a query survives 1000× data growth; without it, it collapses. Think in sets, and read the plan
-instead of guessing.
+Agents read and write SQL constantly: run logs, memory lookups, cost reports and text-to-SQL tools. SQL
+is declarative and a cost-based planner picks the algorithm, so index the agent's real queries, think in
+sets, and read the plan.
+
+## For agent builders
+- **Why it matters for agents.** Every agent step lands in tables (runs, steps, tool calls, token
+  counts), and the questions you ask later ("spend per tenant", "failure rate per tool", "last N
+  messages for this thread") are SQL. A text-to-SQL tool also lets the model itself issue queries,
+  which turns plan quality and safety into agent behaviour.
+- **Where it shows up in your stack.** Postgres behind LangGraph checkpointers and chat-history stores,
+  pgvector hybrid queries that mix similarity with a `WHERE tenant_id = $1` filter, SQLAlchemy in your
+  FastAPI service, and SQL-database tools in agent frameworks.
+- **What you control.** Parameters instead of string building (including for model-generated values), a
+  read-only role and `statement_timeout` for any query an agent can issue, keyset pagination over
+  transcripts, and indexes matching the agent's hot lookups.
+- **What you can skip.** Relational algebra proofs and exotic join hints. Know evaluation order, NULL
+  logic, sargability, `EXPLAIN ANALYZE` and N+1; that covers agent backends.
 
 ## Why it exists
 - **Navigational databases coupled code to layout.** Programs walked pointers from record to record, so
@@ -133,9 +148,26 @@ predicate is true.
 - **Working rule:** let the ORM handle simple writes and reads by key; write (and `EXPLAIN`) the hot or
   analytical queries by hand.
 
+### SQL that an agent issues
+When the model writes or fills in SQL (a text-to-SQL tool, a memory lookup with model-chosen filters),
+treat the query as untrusted input:
+
+| Guard | Why |
+|---|---|
+| **Read-only role or connection** | a hallucinated `DELETE` fails at the database, not in your prompt |
+| **`statement_timeout` on that role** | one model-written cross join cannot pin a connection |
+| **Row cap returned to the model** | 50 rows fit in context; 50,000 blow the window and the bill |
+| **Parameters for model-chosen values** | a model-extracted name with an apostrophe must not become SQL |
+| **Tenant filter added by your code** | never trust the model to remember `WHERE tenant_id = $1` |
+
+- **Return errors as tool results.** The database's error message ("column does not exist") is exactly
+  what the model needs to repair its query on the next step.
+- **Expose views, not raw tables.** A narrow view with clear column names gives the model fewer ways to
+  write a wrong or expensive query.
+
 ## Diagram
-Follow a query from text to rows: the planner, fed by statistics, picks scans and joins; stale statistics
-or a non-sargable predicate is where it goes wrong.
+Follow a query from text to rows, whether your code or the agent's SQL tool wrote it: the planner, fed by
+statistics, picks scans and joins; stale statistics or a non-sargable predicate is where it goes wrong.
 
 ```mermaid
 flowchart TD
@@ -236,6 +268,45 @@ times, not a benchmark).
 Each of the 1,001 queries looks fast in the log; the sum is the latency. The join lets the planner use
 `(conversation_id, created_at)` once per conversation inside a single statement.
 
+### Agent scenario: a guarded SQL tool over the agent's own run log
+An ops agent answers "which tool is failing most?" by querying `tool_calls`. The tool is read-only,
+row-capped and time-boxed, and returns database errors to the model so it can fix its query.
+
+```python
+import sqlite3, time
+
+db = sqlite3.connect(":memory:")
+db.executescript("""
+CREATE TABLE tool_calls (id INTEGER PRIMARY KEY, run_id INT, tool TEXT, status TEXT, ms INT);
+INSERT INTO tool_calls (run_id, tool, status, ms) VALUES
+ (1,'search','ok',420),(1,'fetch','error',3000),(2,'search','ok',380),(2,'fetch','ok',900),(3,'fetch','error',3000);
+""")
+db.execute("PRAGMA query_only = ON")          # the agent's connection cannot write
+
+def run_sql_tool(sql: str, params=(), max_rows=50, budget_s=2.0):
+    """Tool exposed to the agent: read-only, row-capped, time-boxed."""
+    deadline = time.monotonic() + budget_s
+    db.set_progress_handler(lambda: time.monotonic() > deadline, 10_000)  # nonzero aborts
+    try:
+        cur = db.execute(sql, params)
+        rows = cur.fetchmany(max_rows + 1)
+        return {"columns": [d[0] for d in cur.description], "rows": rows[:max_rows],
+                "truncated": len(rows) > max_rows}
+    except sqlite3.Error as e:
+        return {"error": str(e)}               # returned to the model as a tool result
+    finally:
+        db.set_progress_handler(None, 0)
+
+print(run_sql_tool("""SELECT tool, COUNT(*) AS calls, SUM(status = 'error') AS errors, AVG(ms) AS avg_ms
+FROM tool_calls GROUP BY tool ORDER BY errors DESC"""))
+# {'columns': [...], 'rows': [('fetch', 3, 2, 2300.0), ('search', 2, 0, 400.0)], 'truncated': False}
+print(run_sql_tool("DELETE FROM tool_calls"))  # {'error': 'attempt to write a readonly database'}
+print(run_sql_tool("SELECT * FROM tool_calls WHERE run_id = ?", (2,), max_rows=1))  # truncated: True
+```
+
+In PostgreSQL the same guards are a role with only `SELECT` grants on a few views, a per-role
+`statement_timeout`, and `LIMIT` enforced by the tool wrapper rather than by the prompt.
+
 ## Production patterns
 - **Rank by total time, not mean.** Enable the `pg_stat_statements` extension and sort by `total_exec_time`
   weekly; a 2 ms query run a million times outranks a 5 s nightly report. Monitor the top ten after each
@@ -249,7 +320,14 @@ Each of the 1,001 queries looks fast in the log; the sum is the latency. The joi
 - **Keyset pagination everywhere users scroll.** Return an opaque cursor encoding `(created_at, id)` and
   back it with an index ending in those columns. Monitor p95 latency by page depth; it should be flat.
 - **Detect N+1 in tests.** Count queries per request in integration tests (for example SQLAlchemy's
-  `before_cursor_execute` event) and fail when a list endpoint's count grows with result size.
+  `before_cursor_execute` event) and fail when a list endpoint's count grows with result size. Agent
+  history loaders (messages, then tool calls per message) are a frequent N+1 source.
+- **A separate database role for agent tools.** Grant the text-to-SQL tool `SELECT` on curated views only,
+  with its own short `statement_timeout`, and inject the tenant filter in code. Monitor rejected and
+  timed-out agent queries per run; a spike usually means a prompt or schema change confused the model.
+- **One index per agent hot path.** Loading a thread's last N messages, a run's steps in order and a
+  tenant's memories by recency each get an index ending in the sort column, so context assembly stays a
+  few milliseconds as history grows. Monitor context-assembly latency per agent step.
 
 ## Trade-offs
 - **Declarative vs control.** The planner adapts to data growth, but you give up control of the
@@ -282,9 +360,18 @@ Each of the 1,001 queries looks fast in the log; the sum is the latency. The joi
   on the first title containing an apostrophe.
 - **Trusting plans from a small dev database.** Symptom: instant in staging, a sequential scan over 50
   million rows in production, because the planner's choice flips with size.
+- **Giving the agent's SQL tool a read-write connection.** Symptom: an eval transcript where the model
+  "cleaned up" rows with a `DELETE`. Fix: a read-only role, curated views and a timeout, enforced by the
+  database rather than by instructions in the prompt.
+- **Dumping unbounded result sets into context.** Symptom: one tool call returns thousands of rows, the
+  next step hits the context limit or costs 10× normal. Fix: cap rows in the tool, return a `truncated`
+  flag, and let the model aggregate in SQL instead.
 
 ## When to use
-- **Use when:** the question is relational: filtering, joining, aggregating or ranking rows across entities.
+- **Use when:** the question is relational: filtering, joining, aggregating or ranking rows across entities,
+  such as agent spend, tool failure rates, or a thread's recent messages for context assembly.
+- **Give an agent SQL when:** users ask open-ended questions over structured data; wrap it in a read-only,
+  row-capped, time-boxed tool and evaluate it on a set of known questions with known answers.
 - **Write by hand:** anything that joins more than two tables, aggregates, or runs on a hot path; let the
   ORM handle simple key lookups and inserts.
 - **Measure before shipping:** run `EXPLAIN ANALYZE` against production-sized data and confirm scan types
@@ -327,12 +414,6 @@ volume, which is why plans must be checked against production-sized data.
 - **Fix:** rewrite with `NOT EXISTS`, which compares row by row and ignores the NULL, or filter NULLs out of
   the subquery explicitly.
 
-### When would you split one big join into two queries?
-- **When the join multiplies rows.** One conversation × many messages × many tool calls can produce a huge
-  intermediate result shipped over the wire.
-- **Two targeted queries** (conversations with messages, then tool calls for those message ids) move less
-  data. Keep the count of queries constant, not proportional to rows, so it does not become N+1.
-
 ### Users report that page 200 of a list takes seconds while page 1 is instant. Diagnose and fix.
 - **Cause:** `LIMIT/OFFSET` reads and discards every earlier row, so cost grows linearly with depth.
 - **Fix:** keyset pagination on `(created_at, id)` with a matching index; every page is one index seek.
@@ -344,6 +425,20 @@ volume, which is why plans must be checked against production-sized data.
 - **Then read the plan** with `EXPLAIN (ANALYZE, BUFFERS)` on production-sized data, checking scan types and
   estimated versus actual rows; a gap of 10× or more points to stale statistics or a predicate the
   planner cannot estimate.
+
+### How would you expose a database to an agent as a text-to-SQL tool safely?
+- **Least privilege at the database:** a role with `SELECT` on a few curated views, a short
+  `statement_timeout`, and no access to raw PII columns, because prompts are not a security boundary.
+- **Guards in the tool wrapper:** inject the tenant filter, cap returned rows with a truncation flag, and
+  return database errors as tool results so the model can repair the query.
+- **Evaluate it:** a set of questions with known answers, scored on result correctness, not SQL text.
+
+### Each step of your agent gets slower as conversations grow. Where in SQL do you look?
+- **Context assembly queries first.** Loading history with `OFFSET`, or messages then tool calls per
+  message (N+1), costs more every step as the thread grows.
+- **Check the plans:** the "last N messages" query should be an index scan on `(conversation_id,
+  created_at)` with a `LIMIT`, flat in cost regardless of thread length.
+- **Measure per step:** time spent in the database versus the model call, from traces, before changing anything.
 
 ## Quiz
 ### Q: Why can WHERE date(created_at) = '2026-10-20' not use a B-tree index on created_at?
@@ -370,3 +465,25 @@ volume, which is why plans must be checked against production-sized data.
 - [ ] It avoids the need for an index on the sort column
 > OFFSET reads and discards every preceding row, so cost grows with page depth. A keyset cursor uses the
 > index to start exactly where the previous page ended; the trade is losing random page jumps.
+
+## Use cases & projects
+### Use cases
+- **Context assembly.** Each agent step loads the thread's last N messages and relevant memories; an
+  indexed, limited query keeps that cost flat as conversations grow.
+- **Text-to-SQL agents.** Analysts ask questions in English and the agent queries a warehouse or
+  Postgres through a read-only, row-capped tool.
+- **Cost and reliability reporting.** Spend per tenant, tokens per run, and tool failure rates per
+  release are window-function and `GROUP BY` queries over run logs.
+- **Hybrid retrieval.** pgvector similarity combined with tenant and date filters in one SQL statement,
+  where sargable filters decide whether the query stays fast.
+
+### Mini project
+**Build a guarded text-to-SQL tool for an agent (2-3 hours).**
+- **Goal:** an agent tool that answers questions over a small `agent_runs` and `tool_calls` dataset
+  without being able to write, scan forever or flood its context.
+- **Steps:** create the tables in SQLite or Postgres with a few hundred fake rows; write the tool
+  wrapper (read-only connection, timeout, row cap with a `truncated` flag, errors returned as results);
+  connect it to a model with tool calling; write 10 questions with known answers, such as "which tool
+  failed most last week".
+- **Done when:** at least 8 of 10 answers match, a prompt asking the agent to delete rows fails at the
+  database, and `EXPLAIN` shows index scans for the two most frequent queries.

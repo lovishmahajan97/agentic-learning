@@ -454,3 +454,25 @@ that is an eval over real prompts, and replies would be recorded examples, not g
 - [ ] It stores every generated value and picks the smallest one
 > Shrinking the choice sequence works for any strategy composition automatically. Type-based
 > shrinking, as in classic QuickCheck, needs a shrinker per type and struggles with mapped values.
+
+## Use cases & projects
+### Use cases
+- **Tool-argument parsing.** The property "the dispatcher never raises on any model output" is checked
+  against generated truncated JSON, wrong types and odd Unicode.
+- **RAG chunkers.** Invariants such as "chunks rejoin to the original text" and "no chunk exceeds the
+  size limit" hold for every document, chunk size and overlap.
+- **Tool-result round-trips.** Serialising a tool result to JSON and parsing it back returns an equal
+  value for every generated result.
+- **Stateful agent memory.** Rule-based state machines exercise conversation memory, caches and rate
+  limiters with random sequences of operations.
+
+### Mini project
+**Fuzz an agent's tool dispatcher with Hypothesis (1-2 hours).**
+- **Goal:** show that a tool dispatcher turns every possible model output into a result or a structured
+  error, never an exception.
+- **Steps:** write a dispatcher for two tools with typed arguments; build a strategy that mixes valid
+  tool calls, valid calls with wrong types, and arbitrary text; assert the dispatcher returns a result
+  or an error object; add a round-trip property for the tool-result JSON; keep a small example budget
+  for the pull-request lane.
+- **Done when:** Hypothesis has found and shrunk at least one real bug you then fixed, the failing input
+  is kept as an explicit example, and the suite passes in seconds.

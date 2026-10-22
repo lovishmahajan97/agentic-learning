@@ -460,3 +460,26 @@ VLM transcription for numbers unless outputs are cross-checked.
 - [ ] It always requires a text layer to be present
 > VLMs often handle complex layouts better than rule-based tools, but they generate rather than copy, so a
 > smudged or unusual value can be silently changed. Cross-checking against OCR or the text layer catches this.
+
+## Use cases & projects
+### Use cases
+- **Agents answering from policy and pricing PDFs.** Tables parsed with their row and column headers let
+  the agent quote "Refund window, Enterprise plan: 30 days" instead of a stray number.
+- **User-uploaded files at runtime.** A `read_document`-style tool that triages pages and OCRs scans
+  stops the agent from reading empty strings and claiming the file says nothing.
+- **Scanned contracts and forms.** Per-page OCR routing and OCR confidence in tool results let the agent
+  flag low-confidence values for a human instead of acting on them.
+- **Knowledge-base ingestion.** Removing running headers and fixing reading order keeps two-column and
+  templated documents retrievable by the agent's search tool.
+
+### Mini project
+**Build a parser golden set and a page-triage read tool (2-3 hours).**
+- **Goal:** make an agent's `read_document` tool return correct text and tables from your ugliest 10 pages.
+- **Steps:** collect 10 hard pages (two-column, scanned, a table, a running header, a mixed digital and
+  scanned file); write the expected text or table for each; build a tool that checks each page's text
+  layer, OCRs empty or garbage pages, strips repeated headers and serialises tables with their headers;
+  return page number, `source` and an OCR flag in each result; ask an agent 10 questions whose answers
+  sit in those pages.
+- **Done when:** a CI-style script scores each page against its expected output, the agent answers the
+  table questions with the right numbers, and you have one before-and-after example of a value that
+  naive `extract_text()` got wrong.

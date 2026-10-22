@@ -381,3 +381,22 @@ double-charge. Keep `BackgroundTasks` for the non-financial trace and metrics wr
 - [ ] Writing the invoice record that finance reconciles against
 > The test is whether losing the work on a crash is acceptable. An analytics event is; a payment,
 > an invoice or a multi-minute job need a durable queue with persisted job state and retries.
+
+## Use cases & projects
+### Use cases
+- **Trace writing after each agent turn.** Record the run's tool calls and timings after the answer is
+  sent, accepting that a crash may lose a few traces.
+- **Usage and cost counters.** Bump token and request counters without adding latency to the user's turn.
+- **Eval sampling.** Copy a small share of completed runs into an eval review table, where losing one
+  sample does not matter.
+- **Deciding what must move to a queue.** Memory extraction, long agent runs and anything billed or
+  user-visible fail the loss test and go to a durable worker instead.
+
+### Mini project
+**Agent follow-ups with a loss audit (1-2 hours).**
+- **Goal:** add after-response follow-ups to an agent endpoint and measure what a restart loses.
+- **Steps:** build a FastAPI agent route (a fake model plus one tool); add a trace write and a usage
+  counter as `BackgroundTasks`, each opening its own DB session and catching its own exceptions; send a
+  burst of requests and restart the server mid-burst; compare responses sent with traces stored.
+- **Done when:** you have a short table of requests answered versus traces written, a list classifying
+  each follow-up as loss-tolerant or queue-bound, and no follow-up shares the request's DB session.

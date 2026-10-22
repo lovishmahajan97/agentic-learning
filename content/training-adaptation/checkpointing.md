@@ -439,3 +439,24 @@ purpose and checking that the resumed loss curve overlays the uninterrupted one.
 - [ ] Gradient checkpointing is the sharded form of checkpointing
 > The shared name is historical. One is about durability and resume; the other trades compute for
 > activation memory during backward and writes nothing to storage.
+
+## Use cases & projects
+### Use cases
+- **Shipping the best step, not the last.** Running agent evals on each saved checkpoint picks the model
+  that wins on tool-call validity and task success, which is often mid-run.
+- **Fast rollback after a bad release.** A registered earlier checkpoint lets the serving config point
+  back to the known-good model in minutes instead of retraining.
+- **Fine-tuning on spot or preemptible GPUs.** Full training state lets a preempted run resume where it
+  stopped instead of starting over.
+- **Reproducible model lineage.** Storing base model hash, data version and eval scores with each
+  checkpoint answers which data produced the model behind an agent incident.
+
+### Mini project
+**Checkpoint, resume and select for an agent fine-tune (1-2 hours).**
+- **Goal:** prove that a fine-tune can survive a kill and that you ship the best checkpoint by agent evals.
+- **Steps:** run a small LoRA fine-tune on tool-calling trajectories with periodic saves and a cap on kept
+  checkpoints; kill the process mid-run and resume from the latest checkpoint; confirm the loss curve
+  continues smoothly; evaluate every kept checkpoint on held-out tool-call validity; write a metadata file
+  per checkpoint.
+- **Done when:** you have a resumed run whose loss matches an uninterrupted run, a table of eval scores
+  per checkpoint, and the chosen adapter with its metadata (base model, data version, step, scores).

@@ -381,3 +381,28 @@ memory and DB connection limits allow it. If something blocks, fix it with an as
 - [ ] The provider's API returned 429 responses
 > For async workers the heartbeat runs on the event loop. A synchronous model call or CPU-heavy step inside
 > an async handler starves it, and after `--timeout` the master kills the worker and its in-flight requests.
+
+## Use cases & projects
+### Use cases
+- **Hosting an agent runner.** Many concurrent runs that mostly await model and tool calls fit on few
+  workers, while CPU-heavy tool steps decide whether you need more.
+- **Services with a local model.** A reranker or embedding model loaded per worker sets the memory
+  ceiling, so worker count is a memory decision, not a core count.
+- **Moving run state out of process.** Workers do not share memory, so checkpoints and run registries move
+  to a database or Redis before you scale past one worker.
+- **Recycling leaky workers.** `--max-requests` restarts a worker that slowly leaks memory from native
+  libraries, at the cost of cutting its in-flight runs unless drained.
+
+### Mini project
+**Show the per-worker state trap and fix it (1-2 hours).**
+- **Goal:** prove that an in-memory run registry breaks under several workers, then fix it.
+- **Steps:** build a FastAPI agent stub with `POST /runs` that stores a run in a dict and
+  `GET /runs/{id}` that reads it; run it under Gunicorn with Uvicorn workers and 4 workers; fire 50
+  create-then-read pairs and count the 404s; move the registry to Redis or SQLite and repeat; then add a
+  blocking `time.sleep` in one handler and watch `--timeout` kill the worker.
+- **Done when:** you have a before and after count of failed reads (non-zero, then zero) and a log line
+  showing the heartbeat timeout killing the blocked worker.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide), which asks for a Gunicorn/Uvicorn worker
+configuration you can justify and an operations note with worker count and pool sizing arithmetic.

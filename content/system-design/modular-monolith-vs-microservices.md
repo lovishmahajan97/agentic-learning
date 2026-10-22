@@ -425,3 +425,25 @@ API. What is the most likely consequence?
 > GPU serving scales on batched throughput while an API scales on connection concurrency; co-locating
 > them wastes the expensive resource and makes every API deploy evict the model. Idempotency concerns
 > arise from network boundaries, not from co-location.
+
+## Use cases & projects
+### Use cases
+- **First production agent.** A small team ships the loop, tool registry, retriever and memory as modules
+  of one FastAPI deployable, so a 15-step run makes in-process calls instead of 15 network round trips.
+- **Splitting out GPU serving.** A team that self-hosts a model moves it to its own deployable, because
+  the model server scales on batched GPU throughput while the agent API scales on connections.
+- **Isolating untrusted code execution.** A coding or data-analysis agent runs generated code in a
+  separate sandbox service, because that is a security boundary, not a modularity preference.
+- **Background agent runs.** The same image runs as an API and as a `worker` that drains a queue of
+  long-running agent jobs, giving a separate failure domain without a new codebase.
+
+### Mini project
+**Measure the cost of a network hop per agent step (1-2 hours).**
+- **Goal:** show how a synchronous hop compounds across a multi-step agent run.
+- **Steps:** build a tiny agent loop with two fake tools behind a `Tool` interface; implement each tool
+  once in-process and once behind a local HTTP endpoint; run a 10-step and a 20-step task with each
+  version and record per-step and total latency; add an import-boundary check so the loop can only reach
+  tools through the interface.
+- **Done when:** you have a table of total run latency for in-process versus HTTP tools at 10 and 20
+  steps, the boundary check fails a deliberate violation, and a short note says which single module you
+  would split out first and why.

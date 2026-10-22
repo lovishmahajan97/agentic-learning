@@ -457,3 +457,23 @@ gateway is the right idea; the single-instance, fail-closed shape is what needs 
 - [ ] The OpenAI API specification requires aliases
 > Indirection is what makes deprecations and migrations cheap: the mapping from alias to deployments
 > changes in one place and can be canaried, while the application code stays untouched.
+
+## Use cases & projects
+### Use cases
+- **Budget per agent.** A virtual key per agent or feature caps spend, so a looping agent is cut off without
+  touching other traffic.
+- **Role aliases.** Agents call `fast` and `strong`; the platform team remaps them during a model migration
+  with no agent code change.
+- **Spend attribution.** Run and step tags sent as metadata line up gateway spend with agent traces, so you
+  can see which step costs most.
+- **Shared rate limits.** Many parallel agents share provider quotas through one egress point that queues
+  and load-balances across deployments.
+
+### Mini project
+**Put an agent behind a LiteLLM proxy (1-2 hours).**
+- **Goal:** route an agent's calls through a gateway with aliases, a budgeted key and per-step tags.
+- **Steps:** run the LiteLLM proxy locally with two aliases mapped to two models; point an OpenAI-compatible
+  agent client at it via `base_url`; create a virtual key with a small budget; tag each call with run and
+  step metadata; run tasks until the budget trips.
+- **Done when:** tool calls and streaming work through the proxy, spend is visible per tag, and the agent
+  receives a clear error once the key's budget is exhausted, which your loop handles by stopping cleanly.

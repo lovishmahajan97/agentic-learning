@@ -502,3 +502,24 @@ even that arrives late, the problem is an intermediary, not the model.
 > Buffering is the classic signature: generation ran at normal speed but a proxy, compression layer or
 > the client's own body reader held the bytes. High TTFT would delay the first token, not bunch all of
 > them, and HTTP/2 streams SSE fine without chunked encoding.
+
+## Use cases & projects
+### Use cases
+- **Chat-style assistants with tools.** Streaming the answer and "calling search…" events keeps users
+  engaged through multi-step runs and lets them stop a run early.
+- **Coding and research agents.** Long runs forward step boundaries and tool results as events, so the
+  UI shows a live trace instead of a spinner.
+- **Agent backends behind proxies and gateways.** Teams audit every hop for buffering and add heartbeats
+  so slow tools do not trip idle timeouts mid-stream.
+- **Streamed structured output.** Tool arguments and JSON answers arrive as deltas; the agent buffers
+  them and parses only when the block ends.
+
+### Mini project
+**Stream an agent run end to end (1-3 hours).**
+- **Goal:** serve a small tool-calling agent over SSE that forwards tokens, tool start and end events, and
+  a terminal `done` or `error` event.
+- **Steps:** build a FastAPI endpoint around a two-tool agent loop using the provider's streaming API;
+  buffer tool-argument deltas until each block ends; emit a heartbeat comment during a deliberately slow
+  tool; write a small client that renders events and flags a stream that ends without a terminal event.
+- **Done when:** the client shows the first token before the run finishes, tool events appear in order,
+  and killing the server mid-run is reported as an incomplete run rather than a silent success.

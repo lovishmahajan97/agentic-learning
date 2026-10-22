@@ -5,7 +5,8 @@ name: Cloud AI architecture (AWS Bedrock, Azure OpenAI, Vertex AI)
 kind: concept
 difficulty: core
 est_minutes: 17
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - infra-capacity-economics/api-provider-quotas-and-regional-limits
   - infra-capacity-economics/hybrid-on-prem
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Bedrock, Azure OpenAI and Vertex AI serve models as a managed API inside your cloud account's identity,
-network, logging and billing perimeter. You gain solved procurement and compliance; you pay with model
-lag, per-region quotas and more lock-in.
+In most enterprises your agent's model calls go through Bedrock, Azure OpenAI or Vertex AI: a managed
+API inside the cloud's identity, network, logging and billing perimeter. You gain approval and
+compliance; you pay with model lag, per-region quotas and lock-in.
+
+## For agent builders
+- **Why it matters for agents.** An agent run is many model calls carrying tool results full of customer
+  data. Putting those calls inside the customer's cloud perimeter is often what gets an agent approved,
+  and the platform's per-region quota and capacity mode decide whether a 10-step run finishes at peak.
+- **Where it shows up in your stack.** Your agent framework's model client pointed at the Bedrock Converse
+  API (which supports tool use), an Azure OpenAI *deployment*, or Vertex through the Gen AI SDK; plus the
+  managed agent, retrieval and guardrail services each cloud sells next to the model.
+- **What you control.** Which model version is pinned under your agent evals, which region and capacity
+  mode each agent uses, whether calls go through your own gateway, and which managed agent pieces you
+  adopt versus keep in your own code.
+- **What you can skip.** Console click-paths and the full product catalog. Know the seven layers, the
+  deployment-name trap, version pinning and the reserved-versus-shared arithmetic.
 
 ## Why it exists
 - **A vendor's public API triggers reviews unrelated to the model.** Who approved this vendor, where does
@@ -143,21 +157,37 @@ break-even utilization u* = reserved cost ÷ (tokens the reservation could serve
   worst moment.
 - **Commitment terms** (hourly, monthly, longer) mean a forecast error is paid for the length of the term.
 
+### What changes when the caller is an agent
+| Layer | One-shot chat call | Agent run |
+|---|---|---|
+| Identity | One app identity calls the model | The agent's identity calls the model *and* its tools; keep them separate so a prompt injection cannot borrow model permissions for cloud APIs |
+| Capacity | One request per user turn | 5-50 calls per run, each re-sending a growing transcript, so TPM per run is many times a chat turn |
+| Logging | Prompt and answer | Every step, including tool inputs and results, which often hold the most sensitive data in the run |
+| Versions | A change shifts tone | A change shifts tool-choice and argument formats, which breaks the loop rather than the prose |
+| Features | Text generation | Tool use, structured output and prompt caching, which may arrive on a cloud platform later than on the vendor's API |
+
+- **Managed agent services are layer 7.** Each cloud sells an agent runtime and managed retrieval next to
+  the model. They save glue code but own your loop, memory and tool wiring, so they deepen lock-in more
+  than a model call does.
+
 ### The reference architecture
-Application → internal AI gateway (auth, routing, quotas, logging, prompt and response capture) → private
-endpoint → cloud AI platform in the approved region → optional cross-region or second provider fallback.
-The gateway is where you keep the option to move between platforms, which answers the second-layer
-lock-in these services create.
+Agent runtime (your loop and tools) → internal AI gateway (auth, routing, quotas, logging, prompt and
+response capture) → private endpoint → cloud AI platform in the approved region → optional cross-region
+or second provider fallback. The gateway is where you keep the option to move between platforms, which
+answers the second-layer lock-in these services create.
 
 ## Diagram
-The request path of the reference architecture: the gateway sends base load to reserved capacity, spills
-bursts to pay-as-you-go, and leaves the region only if the residency rule allows it.
+The path of one agent step: the gateway sends base load to reserved capacity, spills bursts to
+pay-as-you-go, and leaves the region only if the residency rule allows it. Tool calls go back to the
+agent runtime, which runs them and sends the next step.
 
 ```mermaid
 flowchart TD
-    A["Application"] --> G["Internal AI gateway"]
+    A["Agent runtime step"] --> G["Internal AI gateway"]
+    R2["Model reply with tool call"] -.->|"run tool, append result"| A
     G -.->|"tenant, feature, region tags"| T[("Logs, quota and cost telemetry")]
     G -->|"private endpoint"| R["Reserved deployment, approved region"]
+    R -->|"200"| R2
     R -->|"429 at peak"| P["Pay-as-you-go deployment, same region"]
     P -->|"429 or outage"| F{"Residency allows another region?"}
     F -->|"yes"| X["Cross-region profile or second provider"]
@@ -241,7 +271,69 @@ def complete_with_spill(client: openai.AzureOpenAI, reserved: str, paygo: str, m
         return r, "paygo"          # count these: a rising spill rate means the reservation is too small
 ```
 
+### An agent tool loop on the Bedrock Converse API
+The same loop shape works on every platform; here the tool schema travels in `toolConfig` and the
+model asks for a tool by stopping with `tool_use`. The model id is a placeholder; `lookup_order` is a
+stand-in for a real tool.
+
+```python
+import os, json, boto3
+
+rt = boto3.client("bedrock-runtime", region_name=os.environ["AWS_REGION"])
+TOOLS = {"tools": [{"toolSpec": {
+    "name": "lookup_order", "description": "Fetch an order by id",
+    "inputSchema": {"json": {"type": "object", "properties": {"order_id": {"type": "string"}},
+                             "required": ["order_id"]}}}}]}
+
+def lookup_order(order_id: str) -> dict:          # stand-in: call your own service here
+    return {"order_id": order_id, "status": "shipped"}
+
+def run_agent(model_id: str, question: str, max_steps: int = 8) -> str:
+    messages = [{"role": "user", "content": [{"text": question}]}]
+    for step in range(max_steps):                  # every step is one quota-counted model call
+        r = rt.converse(modelId=model_id, messages=messages, toolConfig=TOOLS,
+                        inferenceConfig={"maxTokens": 400})
+        msg = r["output"]["message"]; messages.append(msg)
+        if r["stopReason"] != "tool_use":
+            return msg["content"][0]["text"]
+        results = []
+        for block in msg["content"]:
+            if "toolUse" in block:
+                tu = block["toolUse"]
+                out = lookup_order(**tu["input"])      # this data is now in the next prompt and the logs
+                results.append({"toolResult": {"toolUseId": tu["toolUseId"], "content": [{"json": out}]}})
+        messages.append({"role": "user", "content": results})
+    raise RuntimeError("step budget exhausted")
+```
+
+- **The perimeter question is the tool result.** `out` re-enters the prompt on the next step and lands in
+  invocation logs, so residency, logging and abuse-monitoring terms apply to tool data, not just to the
+  user's question.
+
+### Worked scenario: what an agent run costs a reservation
+Illustrative figures. A support agent averages 8 model calls per run; prompts grow from 3k to 10k tokens,
+so a run charges about 52k input and 3k output tokens.
+
+| Quantity | Value |
+|---|---|
+| Tokens per run | ~55k |
+| Runs per peak hour | 1,200, so ~66M tokens per hour |
+| Same traffic as one-shot chat (one ~4k-token call per question) | ~4.8M tokens per hour, about 14x less |
+| Reservation sized from chat traffic | spills most agent steps to pay-as-you-go at peak |
+
+- **Size from steps, not users.** Load-test the reservation with recorded agent transcripts, because the
+  prompt-heavy mix of agent steps consumes a unit differently from short chat turns.
+
 ## Production patterns
+- **One gateway for every agent step.** Point the agent framework's model client at the internal gateway,
+  never at a platform SDK directly, and tag each call with agent name, run id and step number. Monitor
+  tokens and spill rate per agent, so one chatty agent cannot hide inside the team total.
+- **Gate version changes on agent evals.** Before moving a pinned model, replay the agent eval set and
+  check tool-choice accuracy, argument validity and task success, not only answer quality. Monitor tool
+  call parse failures per model version after every switch.
+- **Separate model and tool identities.** Give the agent runtime one workload identity for model calls and
+  narrowly scoped ones per tool, so a hijacked step cannot use model permissions on other cloud APIs.
+  Monitor access-denied events per tool identity.
 - **Reserve the base, spill the burst.** When load has a steady floor plus peaks, size provisioned
   capacity for the floor and route overflow to a pay-as-you-go deployment on 429, as in the snippet above.
   Monitor reservation utilization against u\* and the spill rate.
@@ -270,6 +362,9 @@ def complete_with_spill(client: openai.AzureOpenAI, reserved: str, paygo: str, m
 - **Consolidated billing vs multi-cloud freedom.** Billing against committed spend simplifies procurement
   and can discount the model bill, but ties model choice to one cloud's catalog and makes a multi-cloud
   model strategy harder.
+- **Managed agent runtime vs owning the loop.** A cloud's agent service gets a first agent running fast,
+  but its loop, memory and tool wiring are hard to move or test outside that cloud; owning the loop in
+  your code behind a gateway flips the balance once you need custom control flow or a second cloud.
 - **Managed adjacent services vs lock-in.** Knowledge bases, agents and guardrails accelerate delivery, but
   every one adopted deepens lock-in and narrows the exit path; the trade flips when the component is
   commodity and replaceable behind an interface.
@@ -277,8 +372,16 @@ def complete_with_spill(client: openai.AzureOpenAI, reserved: str, paygo: str, m
   the residency guarantee; where regulation names a region, they must be disabled.
 
 ## Pitfalls
+- **Sizing capacity from user count instead of agent steps.** Symptom: a reservation that looked ample
+  spills or throttles once the agent ships, because each run is many growing calls. Fix: size from
+  recorded transcripts.
+- **Assuming a tool-use feature exists on the cloud platform because it exists on the vendor API.**
+  Symptom: an agent that works in a prototype against the vendor API fails or degrades on the approved
+  cloud. Fix: check feature parity per platform before choosing the model.
 - **Passing the model family name instead of the deployment name to Azure OpenAI.** Symptom: a 404
-  "deployment not found" even though the model is clearly available in the region.
+  "deployment not found" even though the model is clearly available in the region. Fix: keep the
+  deployment mapping in the gateway's config (checking endpoint, region and API version too), so agent
+  code never names Azure deployments directly.
 - **Sizing capacity in one region and discovering the model is not offered there** or the quota is lower.
   Symptom: a launch delayed by a quota-increase ticket. Fix: check availability and quota first.
 - **Leaving auto-upgrade or default model versions in place.** Symptom: a silent behaviour change that
@@ -294,6 +397,8 @@ def complete_with_spill(client: openai.AzureOpenAI, reserved: str, paygo: str, m
 - **Use a cloud AI platform when** the organisation already runs on that cloud, when identity, private
   networking and compliance scope are review gates, when spend commitments can absorb the model bill, or
   when you need reserved capacity in a chosen region.
+- **Use it for agents when** the agent touches customer data that must stay inside an approved cloud
+  perimeter, which is the common case for enterprise and forward-deployed agent work.
 - **Prefer the vendor's direct API when** you need the newest models or features first and your data terms
   are satisfied by the vendor's contract.
 - **Prefer self-hosting when** open-weight models meet the bar and volume makes it cheaper, or when the data
@@ -343,13 +448,6 @@ behaviour drift from version upgrades.
 - **Then weigh the SLO and term:** a peak-latency SLO can justify reserving below u\*, and a long commitment
   makes forecast errors expensive.
 
-### An Azure OpenAI call returns 404 "deployment not found" although the model is available in that region. What is wrong?
-- **Most likely** the code passes the model family name as `model`; on Azure, `model` is the deployment
-  name you created.
-- **Check also** the endpoint, region and API version, since the deployment lives in one resource.
-- **Prevent it** by keeping the deployment mapping in the gateway's config so application code never names
-  Azure deployments directly.
-
 ### Outputs from a model you depend on changed without any deploy on your side. How do you stop that happening again?
 - **Cause:** an auto-upgrade or default version moved under you, or a pinned version reached retirement.
 - **Fix:** pin explicit versions (disable auto-upgrade on Azure, pin model ids on Bedrock and Vertex) and
@@ -364,6 +462,22 @@ behaviour drift from version upgrades.
   decisions, adopting them only where they are replaceable behind an interface.
 - **Prove the exit:** keep a second provider or region wired as fallback and exercise it, so moving is a
   routing change rather than a rewrite.
+
+### A customer wants your support agent deployed inside their Azure tenant. What changes in the agent, not just the endpoint?
+- **The model client:** calls go to their Azure OpenAI deployment names through a gateway, so the agent
+  code keeps one interface and the mapping lives in config.
+- **Feature parity:** confirm that tool calling, structured output and caching behave the same on their
+  model version, then replay the agent eval set there before go-live.
+- **Data and identity:** tool results now carry their data into prompts and logs, so logging goes to their
+  workspace and tools run under their scoped identities.
+
+### Would you build on a cloud's managed agent service or run your own agent loop on the model API?
+- **Managed service when** the agent is a standard retrieval-plus-tools assistant, the team is small, and
+  staying on one cloud is acceptable.
+- **Own loop when** you need custom control flow, your own evals and tracing per step, or the same agent on
+  two clouds or a vendor API.
+- **Either way,** keep tools and prompts in your own repo and the model behind a gateway, so the managed
+  layer can be replaced.
 
 ## Quiz
 ### Q: What is the main reason enterprises route model calls through Bedrock, Azure OpenAI or Vertex AI rather than the model vendor's public API?
@@ -391,3 +505,25 @@ behaviour drift from version upgrades.
 > Cross-region and global modes are designed to route to wherever capacity exists; they do not know
 > your legal constraints. The violation surfaces in an audit, not in an error, so it must be
 > prevented by configuration.
+
+## Use cases & projects
+### Use cases
+- **Enterprise agents on customer data.** A claims or support agent runs inside the customer's own cloud
+  account so tool results never leave the approved identity, network and logging perimeter.
+- **Forward-deployed agents.** The same agent is shipped to customers on different clouds, with a gateway
+  mapping one model interface to Bedrock, Azure OpenAI or Vertex per deployment.
+- **Capacity for agent launches.** Reserved capacity sized from agent-step traffic covers the base load
+  of an internal agent, with pay-as-you-go absorbing bursts.
+- **Regulated, region-pinned agents.** Residency rules decide which region, deployment type and fallback
+  each agent may use.
+
+### Mini project
+**Port a tool-calling agent to a cloud platform behind a gateway (2-3 hours).**
+- **Goal:** run one small agent on a cloud AI platform without changing the agent code when the backend
+  changes.
+- **Steps:** write a two-tool agent loop against a thin `complete(messages, tools)` interface; implement
+  that interface once for a vendor API and once for Bedrock Converse (or Azure OpenAI); tag every call
+  with run id and step; run the same five tasks on both backends and log steps, tokens and tool-call
+  errors per run.
+- **Done when:** both backends pass the five tasks with the agent code untouched, and you have a table of
+  tokens per run and any feature differences you hit, with the model version pinned on each.

@@ -5,7 +5,8 @@ name: Human-in-the-loop
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/approval-gates-for-consequential-actions
   - agents/state-machines
@@ -25,6 +26,19 @@ sources:
 Human-in-the-loop places a person before, during or after an agent's actions, because models err and
 people hold authority and information agents lack. Attention is scarce, so review where it cuts most risk
 and make each decision cheap, informed and genuine.
+
+## For agent builders
+- **Why it matters for agents.** The first production agent most teams ship runs with people approving,
+  supervising or auditing its actions. How you design that loop decides whether the agent earns autonomy
+  or stalls behind a rubber-stamp queue.
+- **Where it shows up in your stack.** A pause-and-resume point in the harness (a NEEDS_HUMAN state or
+  LangGraph's `interrupt()`), a review queue and UI, a decision log, a per-class autonomy config and a
+  structured clarification request the agent can raise.
+- **What you control.** The triggers (stakes, uncertainty signals, novelty, policy, ambiguity), what the
+  reviewer sees, timeout defaults, routing, audit rates and the agreement thresholds that widen or
+  tighten autonomy.
+- **What you can skip.** The human-factors literature beyond its two findings: reviewers stop reading
+  when almost everything is fine, and supervisors of reliable systems intervene late.
 
 ## Why it exists
 - **Small error rates are large at volume.** An agent right 97% of the time is wrong 30 times per
@@ -340,3 +354,24 @@ so the customer can widen autonomy on evidence rather than on trust.
 - [ ] The time of day the decision was made
 > Decisions with reasons are labelled data; they measure agreement per action class and seed regression
 > tests. Transcripts are large and rarely read; the other options carry little signal.
+
+## Use cases & projects
+### Use cases
+- **Refund and billing agents.** Small refunds run automatically with a sampled audit while large ones
+  block on a person, with the split set by measured agreement per class.
+- **Outbound email agents.** Drafts that commit to prices, dates or cancellations are routed for review
+  with the commitments highlighted; routine acknowledgements are audited.
+- **Coding agents opening pull requests.** The PR review is the in-the-loop step, and rejection reasons
+  become regression evals for the agent.
+- **New agent rollouts.** Every deployment starts at full review so logged decisions show which action
+  classes can graduate to auditing.
+
+### Mini project
+**Review queue with canaries and graduated autonomy (2-3 hours).**
+- **Goal:** put a person in front of a toy refund agent and measure whether the review is real.
+- **Steps:** have the agent propose decisions on 200 synthetic refund requests; pause each proposal into
+  a SQLite queue with an effect-first preview; review them in a tiny CLI that records decision, reason
+  and time; insert 10 known-bad canaries; compute agreement per class and run `review_worth_it` from the
+  examples to decide which class to automate.
+- **Done when:** you have agreement and decision time per class, a canary catch rate, and a config row
+  per class (block, audit or auto) justified by those numbers.

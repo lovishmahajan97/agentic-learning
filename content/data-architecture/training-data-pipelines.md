@@ -5,7 +5,8 @@ name: Training data pipelines
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - training-adaptation/data-curation
   - training-adaptation/synthetic-data-generation
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-A training data pipeline turns raw sources into versioned, deduplicated, decontaminated, token-ready
-shards with provenance. What you remove shapes the model as much as what you add, runs must reproduce
-from a dataset hash, and offline packing keeps GPUs fed.
+When you fine-tune a model on agent trajectories, this pipeline turns raw traces into versioned,
+deduplicated, decontaminated, template-exact shards. It decides whether the tuned agent calls tools
+correctly or just memorized your eval tasks.
+
+## For agent builders
+- **Why it matters for agents.** Fine-tuning a smaller model to call your tools reliably is a common way to
+  cut agent cost and latency. The training data is logged agent traces, and their duplicates, leaked eval
+  tasks and template bugs show up as broken tool calls in production.
+- **Where it shows up in your stack.** Trace exports from your agent's logs, `apply_chat_template` with the
+  tool definitions, loss masks, `datasketch` or `datatrove` for dedup, and a manifest hash in the SFT or
+  LoRA run config.
+- **What you control.** Which turns carry loss (assistant reasoning and tool calls, not tool results or the
+  system prompt), group splits by task and session, decontamination against the agent eval suite, and
+  mixture weights for rare tools.
+- **What you can skip.** Pretraining-scale web filtering and the theory behind quality classifiers. Keep the
+  MinHash intuition, the masking rule and the repetition arithmetic.
 
 ## Why it exists
 - **"Export a JSONL file and point the trainer at it" fails invisibly.** The failures do not show in the
@@ -134,13 +148,26 @@ Cheap operations shrink the data before expensive ones run.
 - **Its throughput must exceed the model's consumption** in tokens per second with headroom, which is why
   the expensive work moved offline. Prefetching and multiple workers handle the rest.
 
+### Agent trajectories as training data
+The same stages apply when the source is your agent's own logs, with four agent-specific rules:
+- **Filter on outcome, not just text quality.** Keep trajectories whose task succeeded (eval pass, user
+  accepted, no rollback) and drop ones that hit the step budget or looped, because SFT copies whatever
+  behaviour it sees.
+- **Mask by role across every turn.** Assistant turns, including tool-call turns, carry loss; system prompt,
+  user turns and tool results get the ignore index, because the model should learn to call tools, not to
+  predict what your APIs return.
+- **Render with the serving tool definitions.** Pass the same tool schemas to the chat template at training
+  and serving time; a renamed argument in training data teaches calls your runtime rejects.
+- **Dedup and split by task.** Agents retry the same task many times, so cluster near-duplicate trajectories,
+  split by task or session group, and decontaminate against the agent eval suite's task prompts.
+
 ## Diagram
 Cheap filters shrink the data before expensive stages run; the output is a hashed set of shards the
-training run references.
+training run references. For agent fine-tunes the sources are logged trajectories filtered by outcome.
 
 ```mermaid
 flowchart TD
-    S["Sources + provenance manifest"] --> F["Heuristic filters"]
+    S["Traces + sources, with provenance"] --> F["Heuristic and outcome filters"]
     F --> D["Exact + MinHash dedup"]
     D --> C["Decontaminate vs eval sets"]
     C --> Q["Model-based quality filter"]
@@ -232,6 +259,50 @@ print(1 - 300 / 4096)                # padding fraction of 300-token examples in
 - **Read it as a recall dial.** b = 10, r = 10 misses a third of pairs at s = 0.8; b = 50, r = 2 flags almost
   everything and floods the verification step.
 
+### Agent scenario: masking a multi-turn tool-calling trajectory
+For a trajectory of user, assistant tool call, tool result and final answer, every assistant turn carries
+loss and everything else is ignored. It reuses the prefix-stability idea from `render` above, and passes
+the serving tool schemas through the template's `tools` argument.
+
+```python
+IGNORE = -100
+
+def render_trajectory(tok, messages, tools):
+    """Labels cover every assistant turn (tool calls and final answer); tool results are masked."""
+    enc = lambda s: tok(s, add_special_tokens=False)["input_ids"]
+    full_ids = enc(tok.apply_chat_template(messages, tools=tools, tokenize=False))
+    labels = [IGNORE] * len(full_ids)
+    for i, m in enumerate(messages):
+        if m["role"] != "assistant":
+            continue
+        start = len(enc(tok.apply_chat_template(messages[:i], tools=tools, tokenize=False,
+                                                add_generation_prompt=True)))
+        upto = enc(tok.apply_chat_template(messages[:i + 1], tools=tools, tokenize=False))
+        assert full_ids[:len(upto)] == upto, "template must be prefix-stable"
+        labels[start:len(upto)] = upto[start:]
+    return full_ids, labels
+
+def keep(traj):
+    """Outcome filter: only successful, bounded runs become training data."""
+    return traj["outcome"] == "success" and not traj["hit_step_budget"] and traj["tool_errors"] == 0
+```
+
+Decode one rendered trajectory with labels shown before every run; templates differ in how they serialize
+tool calls, and some are not prefix-stable across tool turns, which the assertion catches.
+
+### Worked scenario: from 40,000 logged runs to a tool-calling SFT set
+Illustrative numbers for a support agent's logs.
+
+| Stage | Trajectories left | Why |
+|---|---|---|
+| Raw exported runs | 40,000 | every session in the period |
+| Outcome filter (success, no step-budget hit) | 22,000 | failed and looping runs teach failure |
+| MinHash dedup by task (retries of one task) | 9,000 | users and evals retry the same task many times |
+| Decontaminate against 500 eval tasks | 8,600 | 400 trajectories overlapped eval prompts |
+| Mixture check: `refund_order` tool | 300 examples at 15 % weight of an 8,600-example epoch | about 1,290 draws, about 4.3 passes: watch for memorization |
+
+The 400 overlapping runs would have inflated the agent eval score while doing nothing for live traffic.
+
 ## Production patterns
 - **Use a dedup library built for scale.** For corpora beyond one machine, run MinHash dedup with an
   existing tool (Hugging Face `datatrove` was used for FineWeb; `datasketch` offers `MinHashLSH` with a
@@ -248,6 +319,10 @@ print(1 - 300 / 4096)                # padding fraction of 300-token examples in
   debugging possible.
 - **Benchmark the loader before the run.** Measure loader tokens per second against the model's
   consumption on the target hardware, and watch GPU utilization for a sawtooth during the first minutes.
+- **Trace-to-dataset export with outcome labels.** Agent teams log every run with task id, tool calls, tool
+  results and outcome, then export only successful, deduplicated trajectories into the pipeline, holding out
+  whole tasks for the agent eval. Monitor tool-call validity rate and task success of the tuned model against
+  the base model on the held-out tasks.
 
 ## Trade-offs
 - **Aggressive heuristic filtering vs coverage.** It removes junk cheaply but also legitimate code, tables
@@ -282,7 +357,10 @@ print(1 - 300 / 4096)                # padding fraction of 300-token examples in
 
 ## When to use
 - **Use** this pipeline, at whatever scale, the moment training data comes from more than one source or
-  will be used more than once.
+  will be used more than once, including a first LoRA run on your own agent's traces.
+- **Avoid fine-tuning at all** while prompt changes, better tool descriptions or retrieval still fix the
+  agent's failures; the pipeline is worth building once you have hundreds of successful trajectories and a
+  stable tool set.
 - **Small fine-tunes still need the properties.** For a few thousand customer examples the stages are small
   scripts, but keep template-exact rendering, loss masking, dedup against the eval set, and a manifest hash
   in the training config.
@@ -342,10 +420,19 @@ the dedup cluster sizes as well.
   overfitting come from, so track held-out loss on that domain.
 - **Levers:** lower the weight, add more domain data, or deduplicate it harder first.
 
-### When would you not pack SFT examples?
-- **When the trainer cannot reset position ids or mask attention across documents** and examples are
-  short and unrelated, cross-document attention may hurt more than padding costs.
-- **Otherwise pack:** 300-token examples in 4,096-token slots waste over 90 % of each sequence on padding.
+### You are fine-tuning a model on your agent's logged trajectories. Which tokens should carry loss, and why?
+- **Assistant turns only:** reasoning text, tool-call turns and the final answer, because those are the
+  behaviours you want the model to produce.
+- **Mask tool results, user turns and the system prompt:** training on tool results teaches the model to
+  predict your APIs' output and invent results instead of waiting for them.
+- **Render with the serving tool schemas** and decode a few examples with labels shown before the run.
+
+### Your fine-tuned agent model aces the eval suite but fails on live tasks and calls tools with stale argument names. What went wrong?
+- **Contamination:** trajectories for eval tasks leaked into training, often as retries of the same task;
+  decontaminate against eval prompts and split by task.
+- **Schema drift:** training traces were logged before a tool's arguments were renamed, so the model learned
+  the old schema; re-render or drop traces older than the current tool version.
+- **Fix the pipeline, not the model:** add both checks as blocking gates.
 
 ## Quiz
 ### Q: Why do near-duplicate removal with MinHash rather than relying on exact document hashing?
@@ -375,3 +462,24 @@ the dedup cluster sizes as well.
 > result is a sawtooth utilization pattern; whether that happens depends on model size and worker count,
 > but the reproducibility benefit holds regardless. Precomputed shards make the loader a simple reader and make the exact
 > sequence of training tokens part of the versioned dataset.
+
+## Use cases & projects
+### Use cases
+- **Distilling an agent into a smaller model.** Successful trajectories from a large model become SFT data
+  for a cheaper model that calls the same tools, cutting cost and latency per step.
+- **Fixing a recurring tool-call failure.** A targeted set of corrected trajectories for one tool, with a
+  mixture weight and repetition count written down, teaches the right arguments without overfitting.
+- **Keeping agent evals honest.** Decontaminating training traces against the eval suite and splitting by task
+  keeps a fine-tuned agent's benchmark gains real.
+- **Reproducible fine-tune debugging.** A manifest hash and seeded loader let the team re-run a LoRA job that
+  regressed and attribute the change to data, not noise.
+
+### Mini project
+**Turn agent logs into a decontaminated SFT set (2-3 hours).**
+- **Goal:** produce a versioned, masked training set from a small agent's trajectories and prove it is clean.
+- **Steps:** run a simple two-tool agent on 100-200 generated tasks and log each run with task id and outcome;
+  keep successful runs; dedup with `datasketch` `MinHashLSH`; hold out 20 tasks as the eval set and remove
+  overlapping trajectories; render with `render_trajectory` and the serving tool schemas; write shards and a
+  manifest.
+- **Done when:** a report shows trajectories left per stage, zero eval-task overlap, one decoded example with
+  labels shown covering only assistant turns, and the manifest hash recorded in a training config.

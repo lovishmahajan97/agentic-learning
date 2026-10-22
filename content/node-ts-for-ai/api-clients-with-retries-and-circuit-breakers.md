@@ -5,7 +5,8 @@ name: API clients with retries & circuit breakers
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - serving-inference/retry-strategies
   - reliability/circuit-breakers
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-LLM and tool APIs fail transiently (429, 5xx, resets), so every call needs a per-attempt timeout,
-classified retries with jittered backoff, and a total deadline. A circuit breaker above that fails fast
-while a provider is down. SDKs already retry; you add the rest.
+Every model and tool call an agent makes can fail transiently (429, 5xx, resets), so each needs a
+per-attempt timeout, classified retries with jittered backoff and a deadline. A circuit breaker fails fast
+while a provider or tool is down.
+
+## For agent builders
+- **Why it matters for agents.** An agent makes dozens of model and tool calls per run, so a 1% transient
+  failure rate per call breaks a large share of runs unless calls retry. Badly layered retries do the
+  opposite: they multiply load and cost across every step during an outage.
+- **Where it shows up in your stack.** The Anthropic and OpenAI SDK options `maxRetries` and `timeout`,
+  your tool wrappers around SaaS and internal APIs, `opossum` or `cockatiel` policies, and the queue's
+  `attempts` setting above the whole step.
+- **What you control.** Who owns retries (SDK, tool wrapper or queue), which errors retry, idempotency
+  keys for side-effecting tools, the run's deadline, and what the model sees when a tool fails.
+- **What you can skip.** Writing your own retry loop around the vendor SDK, and shared-state breakers
+  across the fleet. Per-process breakers and SDK retries cover most agent services.
 
 ## Why it exists
 - **Unbounded latency.** A naive client does `await fetch(url)`. A provider that accepts the TCP
@@ -131,6 +144,15 @@ sleep(n) = random(0, min(cap, base × 2^n))      // attempt n
   its retry; during an outage the budget empties and failures surface immediately.
 - **Prior art:** it is the per-client analogue of a breaker; some service meshes and gRPC clients
   implement it as retry throttling.
+
+### In an agent loop: failures become tool results
+- **Model calls and tool calls fail differently.** A failed model call stops the step; a failed tool call
+  can be reported back to the model, which may pick another tool, fix its arguments or answer without it.
+- **Return, do not throw, after retries are spent.** Wrap each tool so an exhausted retry, an open breaker
+  or a 4xx becomes an error tool result (both major APIs let a tool result be marked as an error), and the
+  loop continues.
+- **Bound the whole run.** Give the run a deadline and pass the remaining time into each step, so retries
+  late in a run cannot outlive what the caller or the queue job allows.
 
 ### Composing the layers
 From the outside in:
@@ -253,6 +275,57 @@ breaker.on("open", () => console.warn("breaker open: anthropic"));
 export const answer = (prompt: string) => breaker.fire(prompt);
 ```
 
+### Agent scenario: a tool wrapper that reports failures to the model
+Each tool gets its own breaker (the `CircuitBreaker` class above) and its own retry policy; side-effecting
+tools retry only with an idempotency key. Whatever happens, the loop receives a tool result it can hand
+back to the model.
+
+```ts
+type ToolResult = { content: string; isError: boolean };
+type ToolSpec = { name: string; idempotent: boolean; run: (args: unknown, signal: AbortSignal, key: string) => Promise<string> };
+
+const breakers = new Map<string, CircuitBreaker>();
+
+export async function callTool(spec: ToolSpec, args: unknown, idemKey: string, deadline: number): Promise<ToolResult> {
+  const breaker = breakers.get(spec.name) ?? breakers.set(spec.name, new CircuitBreaker(3, 30_000)).get(spec.name)!;
+  const attempts = spec.idempotent ? 3 : 1;                          // never blindly retry a tool that sends or charges
+  try {
+    const content = await breaker.call(async () => {
+      for (let n = 0; ; n++) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw new Error("run deadline reached");
+        try {
+          return await spec.run(args, AbortSignal.timeout(Math.min(remaining, 15_000)), idemKey);
+        } catch (e: any) {
+          const status = e?.status as number | undefined;
+          const transient = status === undefined || status === 429 || status >= 500;
+          if (!transient || n + 1 >= attempts) throw e;
+          await sleep(jitter(n, 500, 4_000));
+        }
+      }
+    }, () => { throw new Error(`${spec.name} is temporarily unavailable`); });
+    return { content, isError: false };
+  } catch (e: any) {
+    return { content: `Tool ${spec.name} failed: ${e.message}. Try another approach or answer without it.`, isError: true };
+  }
+}
+```
+
+- **Caveat on classification.** Treating a missing `.status` as transient is a simplification; for tools
+  that are not idempotent, `attempts` is 1, so an ambiguous timeout is reported instead of repeated.
+
+### Worked scenario: a 12-step agent run during a search-API incident
+The search tool is called on 6 of the 12 steps and is failing slowly (every attempt hits a 15 s timeout).
+
+| Layout | Search attempts in the run | Added wall-clock time | What the model sees |
+|---|---|---|---|
+| Tool wrapper retries 3 and throws, queue retries the step 3 times | 9 on the first search step, then the run fails | ~135 s plus backoff | nothing: the run ends in `failed` |
+| Tool wrapper retries 3, failure returned as tool result | 18 (6 steps × 3) | ~4.5 minutes | 6 error results, may stop calling search |
+| Same, plus a per-tool breaker with threshold 3 | 9, then fast fallbacks | ~135 s | error results, then "unavailable" on the last 3 search calls |
+
+- **The breaker counts logical calls.** It wraps the whole retry sequence, so 3 exhausted sequences (9
+  attempts) trip it; each half-open probe after the 30 s reset adds one more attempt while the outage lasts.
+
 ### Worked scenario: how nested retries amplify an outage
 One user action during a provider incident, where every attempt fails slowly.
 
@@ -267,6 +340,12 @@ Full-jitter sleeps for `fetchWithRetry` defaults (`baseMs: 500`, `capMs: 8_000`,
 from 0-500 ms, 0-1,000 ms and 0-2,000 ms before attempts 2, 3 and 4.
 
 ## Production patterns
+- **Tool failures as tool results.** When an agent calls external tools, wrap each one so exhausted
+  retries, open breakers and 4xx responses come back to the model as error tool results instead of
+  failing the step. Monitor error tool results per tool and whether runs still finish after one.
+- **Idempotency keys from run and step.** For tools that create, send or charge, derive the key from run
+  id, step and tool-call index, so a retried step or a redelivered job is deduplicated by the downstream
+  API. Monitor duplicate side effects per tool.
 - **One retry owner per call path.** Decide whether the SDK, the handler or the queue retries, and set
   the others to fail fast (for example SDK `maxRetries: 2` and a queue job with `attempts: 1` for that
   step). Monitor attempts per logical request and provider calls per user action during incidents.
@@ -357,7 +436,16 @@ error. Idempotency keys make any remaining retries safe to repeat.
   never left (`ECONNREFUSED`, connect timeouts).
 - **Never retry** 400, 401, 403, 404 or 422, because the same request fails the same way.
 - **Retry only if idempotent:** resets and read timeouts after sending, because the server may have
-  completed and billed the call.
+  completed and billed the call. For agent tools that send or charge, that means an idempotency key
+  derived from run id, step and tool-call index.
+
+### A tool your agent depends on starts timing out. What should the agent loop do?
+- **Bound each call:** per-attempt timeout, a couple of jittered retries only if the tool is idempotent,
+  all inside the run's remaining deadline.
+- **Report, do not crash:** return an error tool result so the model can try another tool or answer with
+  what it has, instead of throwing and letting the queue re-run the whole step.
+- **Trip a per-tool breaker** so later steps and other runs get a fast "unavailable" result rather than
+  paying the timeout again.
 
 ### Why put the circuit breaker outside the retry loop rather than inside it?
 - **Outside,** one exhausted retry sequence counts as one logical failure, and an open breaker stops
@@ -406,3 +494,24 @@ error. Idempotency keys make any remaining retries safe to repeat.
 - [x] 400 Bad Request caused by an over-long prompt
 - [ ] 429 Too Many Requests from a shared rate limit
 > A 400 means the request itself is invalid and will fail identically on every attempt; retrying only adds load and latency, whereas 503, 429 and a reset before any response bytes are transient signals that a later attempt can succeed.
+
+## Use cases & projects
+### Use cases
+- **Agents behind a shared provider quota.** SDK retries honour `Retry-After` on 429s so bursts of agent
+  steps slow down instead of failing.
+- **Flaky SaaS tools.** A per-tool breaker turns a CRM or search outage into a fast error tool result the
+  model can work around.
+- **Side-effecting tools.** Idempotency keys from run and step let an agent retry "create ticket" or
+  "send email" without doing it twice.
+- **Provider fallback.** A breaker on the primary model routes agent steps to a secondary model while the
+  primary is down.
+
+### Mini project
+**Fault-injected agent tools (2 hours).**
+- **Goal:** show that an agent finishes, or fails cleanly, when its tools misbehave.
+- **Steps:** build a 3-tool agent (one read-only search, one side-effecting "create note", one lookup);
+  put a stub server in front of the tools that returns 429 with `Retry-After`, 503, resets and 20 s
+  stalls on demand; wrap tools with `callTool`; set the SDK to `maxRetries: 2` and nothing above it; run
+  20 tasks per fault mode and log attempts per tool, breaker transitions and run outcomes.
+- **Done when:** a table shows attempts per run, run success rate and wall-clock time for each fault mode,
+  no "create note" side effect happens twice, and runs keep finishing while search is down.

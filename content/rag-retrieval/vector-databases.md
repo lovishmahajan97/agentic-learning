@@ -452,3 +452,23 @@ when hybrid sparse-dense search and quantization become requirements.
 > than building the graph in one pass over loaded data. Bulk load, then build, is the documented
 > sequence for pgvector, and engines such as Qdrant let you defer indexing during bulk upload for the
 > same reason.
+
+## Use cases & projects
+### Use cases
+- **Long-term agent memory.** Per-user recall is a very selective filtered query, so filter indexes and
+  filtered-search behaviour decide whether memory recall stays fast and complete.
+- **Save-then-recall in one task.** An agent that writes a fact and reads it on the next step needs
+  read-your-writes consistency from the store.
+- **Teams already on Postgres.** pgvector keeps vectors, metadata and transactions in one database, which is
+  often the simplest store for an agent backend.
+- **Large multi-tenant knowledge bases.** Dedicated stores such as Qdrant, Milvus or Pinecone are chosen when
+  scale, sharding or filtering needs outgrow a single Postgres node.
+
+### Mini project
+**Back an agent's memory tools with pgvector or Qdrant (2-3 hours).**
+- **Goal:** build `remember` and `recall` tools on a real vector store and measure filtered recall.
+- **Steps:** create a collection with user id, timestamp and model name as metadata, plus a filter index on
+  user id; load notes for 50 users; expose `remember(text)` and `recall(query)` tools to a small agent; test
+  save-then-recall in one task and measure recall and latency at two `ef_search` values.
+- **Done when:** recall never returns another user's notes, a fact saved in one step is found in the next,
+  and a table shows recall and p95 latency per `ef_search` setting.

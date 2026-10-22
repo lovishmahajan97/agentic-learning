@@ -5,7 +5,8 @@ name: Logging
 kind: practice
 difficulty: intro
 est_minutes: 12
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - observability/tracing
   - observability/monitoring
@@ -20,9 +21,22 @@ sources:
 ---
 
 ## TL;DR
-Logging records discrete events as structured records bound to trace and request ids. In LLM apps logs
-hold what traces and metrics should not: rendered prompts, raw completions, tool arguments, guardrail
-decisions and provider errors, redacted and retained by policy.
+Logging records each agent event (model call, tool call, guardrail, stop) as a structured record bound to
+trace and run ids. Logs hold what traces and metrics should not: raw completions, tool arguments and
+errors, redacted and retained by policy.
+
+## For agent builders
+- **Why it matters for agents.** Traces are sampled and short-lived; an agent that refunded the wrong
+  order three weeks ago is investigated from logs. Every tool call, its arguments, its result status
+  and the step that chose it must be a queryable event.
+- **Where it shows up in your stack.** structlog or the standard `logging` module in your agent service,
+  the OpenTelemetry logs signal for trace correlation, and framework callbacks you route into your logger
+  instead of `print`.
+- **What you control.** Event names (`agent.step`, `tool.call`, `llm.parse_failed`), the bound ids (trace,
+  run, conversation, tenant), payload policy for prompts and tool results, redaction, and the separate
+  audit path for tools with side effects.
+- **What you can skip.** Log shipper and indexer internals. Know binding, levels, payload policy, the
+  canonical line and the audit split.
 
 ## Why it exists
 - **Wrong answers do not raise.** A model can return a well-formed response that is wrong, truncated or
@@ -91,6 +105,20 @@ Three techniques, usually combined:
   model, total tokens, cost, latency breakdown, retries, tools used, guardrail result and outcome.
 - **Most "what kinds of requests do X" questions** become a query over this single table; per-event lines
   remain for drilling in.
+
+### What an agent run should log
+| Event | Level | Fields |
+|---|---|---|
+| `agent.step` | INFO | iteration, decision (tool name or final), context tokens |
+| `tool.call` | INFO | tool name, argument hash, result size, status, latency |
+| `tool.failed` | WARNING | tool name, error type, whether the error was returned to the model |
+| `approval.requested` / `approval.decided` | INFO, plus the audit log | action, approver id, decision |
+| `agent.stopped` | INFO, or WARNING if not a final answer | stopping reason, steps, total tokens |
+
+- **Bind the run id once** with the request id, so every record from every step and tool joins to the
+  run without each call site passing it.
+- **Side-effecting tools write to the audit log too** (refunds, emails sent, records changed), because
+  operational logs are sampled and expire while the audit record must not.
 
 ### Where logs sit relative to traces and metrics
 | Signal | Gives | Coverage |
@@ -191,6 +219,46 @@ the last deploy" is now a single group-by.
  "guardrail": "pass", "finish_reason": "length", "outcome": "repaired"}
 ```
 
+### Agent loop events with a bound run id
+Reuses the structlog configuration above. `call_model` and `TOOLS` are stand-ins. Every record carries
+`run_id`, `trace_id` and `tenant`; tool failures are warnings that also tell you whether the model saw
+the error.
+
+```python
+def run_agent(task, tenant, trace_id, call_model, TOOLS, max_steps=8):
+    clear_contextvars()
+    bind_contextvars(run_id=uuid.uuid4().hex, trace_id=trace_id, tenant=tenant)
+    messages = [{"role": "user", "content": task}]
+    for step in range(1, max_steps + 1):
+        reply = call_model(messages)
+        log.info("agent.step", iteration=step, decision=reply.get("name", "final"))
+        if reply["type"] == "final":
+            log.info("agent.stopped", reason="final_answer", steps=step)
+            return reply["text"]
+        args_sha = hashlib.sha256(json.dumps(reply["args"], sort_keys=True).encode()).hexdigest()[:12]
+        try:
+            result = str(TOOLS[reply["name"]](**reply["args"]))
+            log.info("tool.call", tool=reply["name"], args_sha=args_sha, result_chars=len(result))
+        except Exception as e:
+            result = f"Tool error: {e}"
+            log.warning("tool.failed", tool=reply["name"], args_sha=args_sha,
+                        error=type(e).__name__, returned_to_model=True)
+        messages += [reply["message"], {"role": "tool", "content": result}]
+    log.warning("agent.stopped", reason="step_budget", steps=max_steps)
+```
+
+### Worked scenario: a canonical line per agent run
+One `run.summary` record per run (values illustrative) turns operating questions into group-bys:
+
+| Question | Query over `run.summary` |
+|---|---|
+| Which task types hit the step budget most this week? | count where `stop_reason=step_budget`, group by `task_type` |
+| Did the new prompt raise tool failures? | sum `tool_failures` over runs, split by `prompt_version` |
+| What does a typical run cost? | p50 and p95 of `cost_usd`, grouped by `model` |
+
+A run with `steps=7`, `tools=["search_orders","get_order","refund"]`, `tool_failures=1`,
+`stop_reason=final_answer`, `input_tokens=18400` and `output_tokens=950` is one row, not 30 lines.
+
 ### Worked numbers: what each payload policy costs
 One million calls a day at 20 KB per payload, before indexing.
 
@@ -216,6 +284,10 @@ One million calls a day at 20 KB per payload, before indexing.
 - **Dev console, prod JSON.** Switch the final renderer by environment (structlog's
   `ConsoleRenderer` locally, `JSONRenderer` in production) so humans and machines both read well. Monitor
   for unparsed lines at the indexer, which mean a stray `print`.
+- **Audit events for side-effecting tools.** The tool wrapper for any action that changes the world
+  (refund, send, delete, write) emits an audit record with run id, tool, arguments, approver and result to
+  an append-only store, separate from sampled logs. Monitor that audit records equal side-effecting tool
+  calls; any gap is a missing write.
 - **Retention tiers with deletion by key.** Hot searchable logs for a short window, archive after, then
   deletion; deletion jobs filter on tenant and user ids. Monitor time to complete a deletion request.
 
@@ -231,6 +303,9 @@ One million calls a day at 20 KB per payload, before indexing.
 - **Sampling vs completeness.** Sampling payload logs cuts cost dramatically, but the request you need is
   the one not sampled. Keeping 100% of errors, warnings and flagged responses, plus a per-request debug
   switch, recovers most of the value.
+- **Per-step events vs one run summary.** Per-step agent events let you replay a run's decisions, but a
+  40-step run writes 80+ lines. A canonical run summary answers most fleet questions in one row; keep both
+  and sample per-step INFO events once volume hurts, never the warnings.
 - **Synchronous vs asynchronous sinks.** Synchronous logging is simple and loses nothing, but a slow sink
   stalls the request path; asynchronous handlers decouple at the cost of possible loss on crash.
 
@@ -247,6 +322,9 @@ One million calls a day at 20 KB per payload, before indexing.
   bill that dwarfs the metrics system.
 - **Logging only failures.** Symptom: a model that quietly degrades (wrong but well-formed answers) with
   nothing in the logs to compare against.
+- **Logging tool calls without the run and step.** Symptom: "who issued this refund" returns a tool line
+  with no link to the agent run, prompt or user that triggered it. Fix: bind the run id at the start of
+  every run and log the iteration on each tool event.
 - **Unbounded field values (a 200 KB tool result in a log field).** Symptom: records dropped at the
   shipper or indexer, with gaps exactly where the big payloads were.
 
@@ -258,7 +336,7 @@ One million calls a day at 20 KB per payload, before indexing.
 - **Avoid** logging inside tight loops or per token.
 - **Measure** log volume per request, the fraction of records carrying a trace id, and the time to answer
   "show me everything about request X".
-- **Interviews:** explain what you would log for a RAG request, which fields go on every line versus per
+- **Interviews:** explain what you would log for a RAG request or an agent run, which fields go on every line versus per
   event, and how to keep prompts out of the log store without losing debuggability.
 
 ## Role lens
@@ -310,11 +388,20 @@ exempt from sampling or the numerator is unknown.
 - **Mixing them** forces audit retention onto payload-heavy debug data, or debug sampling onto records
   you must legally keep.
 
-### Your logging bill tripled after a feature launch. Where do you look first?
+### Your logging bill tripled after launching an agent feature. Where do you look first?
 - **Bytes per request by event name:** a new event logging full tool results or prompts at INFO is the
-  usual cause.
+  usual cause; agents make it worse because each run logs many steps.
 - **Then fix the shape:** cap field sizes in the pipeline, move payloads to references, and stop
   deriving dashboards from log counts when a metric would do.
+
+### What would you log for an agent that can issue refunds through a tool?
+- **Operational events per run:** each `agent.step` with the decision, each `tool.call` with an argument
+  hash, status and latency, and `agent.stopped` with the stopping reason, all bound to the run, trace and
+  tenant ids.
+- **An audit record per refund:** run id, user, arguments, amount, approval decision and result, written
+  append-only and never sampled.
+- **Raw evidence on failure:** the raw completion on parse failures and the tool error text that was
+  returned to the model.
 
 ## Quiz
 ### Q: Why bind request and trace ids in middleware rather than passing them to each log call?
@@ -341,3 +428,23 @@ exempt from sampling or the numerator is unknown.
 - [ ] Redaction only works on JSON-rendered output
 > One forgotten call site is a leak. Centralising redaction turns a per-developer habit into a
 > property of the system, and lets compliance rules evolve in one place.
+
+## Use cases & projects
+### Use cases
+- **Investigating an agent action weeks later.** Bound run ids plus audit records answer "which run,
+  prompt and user led to this refund" after traces have expired.
+- **Prompt and model change reviews.** Parse failures and tool failures grouped by prompt version show
+  whether a change made the agent worse.
+- **Fleet questions about agent runs.** A canonical run summary answers step-budget, cost and tool-usage
+  questions with one query.
+- **Privacy-safe debugging.** Hashed arguments and by-reference payloads keep customer data out of the
+  log store while failures stay reproducible.
+
+### Mini project
+**Add structured logging and a run summary to an agent (1-2 hours).**
+- **Goal:** answer three operating questions about an agent from logs alone.
+- **Steps:** add structlog with clear-then-bind and the redaction processor to a small tool-calling agent;
+  log `agent.step`, `tool.call`, `tool.failed` and `agent.stopped`; emit one `run.summary` line per run;
+  run 50 tasks with one tool failing 10% of the time; load the JSON lines into pandas or DuckDB.
+- **Done when:** you can show stopping reasons by count, tool failure rate per tool, and every line of one
+  chosen run in order, with no API key surviving redaction.

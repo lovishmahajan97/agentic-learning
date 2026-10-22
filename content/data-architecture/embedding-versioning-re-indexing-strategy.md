@@ -5,7 +5,8 @@ name: Embedding versioning / re-indexing strategy
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - rag-retrieval/embedding-models
   - rag-retrieval/embedding-pipelines
@@ -22,25 +23,38 @@ sources:
 ---
 
 ## TL;DR
-A vector only means something relative to the recipe (model, settings, chunker) that produced it, so a
-recipe change means re-embedding everything. Version the recipe, build beside the old index, evaluate,
-swap atomically, and hash content to re-embed only changed chunks.
+Your agent's retrieval tool only works if queries and stored vectors share one recipe (model, settings,
+chunker). Version the recipe, build the new index beside the old, evaluate the agent, swap atomically,
+and hash content to re-embed only changed chunks.
+
+## For agent builders
+- **Why it matters for agents.** A RAG agent or a memory tool calls `search` dozens of times per task.
+  If the index and the query embedder drift apart, the tool still returns results, the agent still cites
+  them confidently, and nothing errors. Answer quality silently falls to near-random retrieval.
+- **Where it shows up in your stack.** The embedding call inside your retrieval tool, the vector store
+  collection or table it searches (Qdrant aliases, OpenSearch aliases, a pgvector view), the long-term
+  memory store of a memory-enabled agent, and the nightly ingestion job that feeds them.
+- **What you control.** The recipe hash stamped on every vector, the alias the tool resolves at call
+  time, the eval gate (retrieval metrics plus agent task success) before a swap, and the content-hash
+  cache that keeps routine runs cheap.
+- **What you can skip.** The internals of HNSW and IVF training. Know which parameters are fixed at build
+  time and which are query-time knobs; that is enough to decide re-embed versus re-index.
 
 ## Why it exists
 - **The index silently depends on three things.** Which model turned text into vectors; how it was called
   (dimension, normalization, instruction prefix, input truncation); and how documents were cut into chunks.
-  None of those appear in the vector itself.
+  None of those appear in the vector itself, and none appear in the tool result the agent reads.
 - **Mixing models fails silently.** A query embedded with model B against an index built with model A is
   not "slightly worse". If dimensions differ, the store at least rejects the query. If they happen to
   match, cosine similarity across spaces is noise, so retrieval degrades to near-random while the pipeline
-  reports no error at all.
+  reports no error at all, and the agent grounds its answer on irrelevant chunks.
 - **Change is forced on you.** Embedding models improve and vendors deprecate old ones; you will want
   longer context, a multilingual or a cheaper model; you will tune the chunker; you may quantize vectors to
-  save memory. Each of those invalidates every stored vector.
-- **"Just re-embed in place" fails three ways.** During the hours or days the job runs, live queries hit a
-  mix of two spaces. If the new model is worse on your eval set, there is nothing to roll back to. And it
-  pays full cost to re-embed unchanged content, when usually only a small fraction changed since the last
-  run.
+  save memory. Each of those invalidates every stored vector, including an agent's long-term memories.
+- **"Just re-embed in place" fails three ways.** During the hours or days the job runs, live agent
+  queries hit a mix of two spaces. If the new model is worse on your eval set, there is nothing to roll
+  back to. And it pays full cost to re-embed unchanged content, when usually only a small fraction
+  changed since the last run.
 - **What versioning buys.** Versioning the index and swapping it as a unit removes all three problems.
 
 ## How it works
@@ -53,13 +67,13 @@ embedding_version = hash(model_id, model_revision, dimension, normalization,
 ```
 
 - **Store it on every vector row and on the collection,** *because* the only reliable compatibility check
-  is to compute the query-side recipe and compare. The query path reads the collection's version and
+  is to compute the query-side recipe and compare. The retrieval tool reads the collection's version and
   refuses, or routes elsewhere, on mismatch.
 - **Pin the model *revision*, not just its name.** Hosted models can be silently updated, and open-weight
   models on a hub have commit hashes.
 - **Chunker parameters belong in the recipe,** because retrieval granularity changes what a vector means. A
   512-token chunk and a 128-token chunk of the same paragraph are different items even under the same
-  model, and the citation offsets you return to users change with them.
+  model, and the citation offsets your agent returns to users change with them.
 
 ### Re-embedding versus re-indexing
 Two operations hide behind the word "re-index", and they cost very different amounts.
@@ -78,17 +92,18 @@ Re-indexing is needed even when the model never changes:
   the table holds data for this reason. As the corpus grows into topics the original sample did not cover,
   lists become unbalanced and recall at a fixed `nprobe` falls, so the centroids must be retrained.
 - **Accumulated deletes and updates.** Many implementations mark deleted vectors rather than removing them,
-  so a heavily churned index carries dead entries that cost memory and can weaken graph connectivity until
-  compaction or rebuild.
+  so a heavily churned index (agent memory stores churn a lot) carries dead entries that cost memory and
+  can weaken graph connectivity until compaction or rebuild.
 - **Same swap, no embedding calls.** Re-indexing uses the same blue-green swap but skips the embedding
   calls. Keep two version counters (`embedding_version` for the vectors, an index build id for the
   structure) so you can tell which one moved when recall changes.
 
 ### The query side is part of the version
 - **The alias resolves to a pair:** the collection and the recipe that built it.
-- **The query path embeds with exactly that recipe** (model, prefix, dimension), *because* swapping the
+- **The retrieval tool embeds with exactly that recipe** (model, prefix, dimension), *because* swapping the
   collection while the query embedder stays on the old model recreates the cross-space mismatch in reverse.
-- **Key query-embedding caches on `(query_text, embedding_version)`,** never on text alone.
+- **Key query-embedding caches on `(query_text, embedding_version)`,** never on text alone. Agents repeat
+  similar search queries often, so these caches get high hit rates and serve stale vectors widely.
 - **Adapters are a temporary bridge only.** A learned mapping from the new model's space into the old one
   (a linear or small adapter trained on pairs of embeddings of the same texts) lets a new query model run
   against the old index before the rebuild finishes. It recovers only part of the quality, so it must pass
@@ -107,19 +122,19 @@ Re-indexing is needed even when the model never changes:
 
 ### Blue-green indexes and the alias swap
 1. **Build beside.** Build the new version into a separate collection or table (`docs_v7` beside
-   `docs_v6`) while the old one keeps serving.
+   `docs_v6`) while the old one keeps serving the agent.
 2. **Resolve through a pointer.** Most stores support an alias the application resolves at query time:
    Qdrant collection aliases, OpenSearch index aliases; in pgvector a view or a config row naming the live
    table.
-3. **Repoint in one operation** when the build finishes and passes evaluation. Queries never see a mixed
-   index.
+3. **Repoint in one operation** when the build finishes and passes evaluation. Agent tool calls never see
+   a mixed index.
 4. **Roll back** by repointing the alias back; delete the old collection after a soak period.
 
 - **The price:** temporarily holding two copies of vectors and two ANN graphs, which must be planned into
   memory and disk sizing.
 
 ### Catching up on writes during the build
-Documents keep changing while the rebuild runs.
+Documents (and agent memories) keep changing while the rebuild runs.
 
 | | Dual-write | Replay |
 |---|---|---|
@@ -131,8 +146,8 @@ Documents keep changing while the rebuild runs.
 ### Evaluate before you swap
 - **A new model is not better by assumption.** Run the retrieval eval set (queries with known relevant
   chunks) against both collections and compare recall@k and MRR.
-- **Also check answers on a sample,** because a model that retrieves different-but-also-relevant chunks can
-  shift answers in ways retrieval metrics miss.
+- **Also check agent answers on a sample,** because a model that retrieves different-but-also-relevant
+  chunks can shift answers, tool-call counts and citations in ways retrieval metrics miss.
 - **The swap is gated on this comparison,** which is why the build must be separate.
 
 ### Dimension and quantization changes
@@ -153,24 +168,55 @@ That duration is what makes dual-write or replay necessary, and makes content ha
 routine runs in between.
 
 ## Diagram
-A recipe change never touches the live collection: the new one is built beside it, caught up, and only
-promoted if it wins the eval.
+A recipe change never touches the collection the agent searches: the new one is built beside it, caught
+up, and only promoted if it wins the eval.
 
 ```mermaid
 flowchart TD
     R["Recipe change: model, dim, chunker"] --> V["New embedding_version hash"]
     V --> B["Build docs_v7 beside docs_v6"]
     L["Live writes"] -->|"dual-write or replay"| B
-    B --> E{"Eval: recall at k, MRR vs v6"}
+    B --> E{"Eval: recall at k, agent answers"}
     E -->|"worse"| X["Discard v7, keep v6 live"]
     E -->|"at least as good"| S["Repoint alias docs to v7"]
-    S --> Q["Query side embeds with v7 recipe"]
+    S --> Q["Retrieval tool embeds with v7 recipe"]
     S --> K["Soak period"]
     K -->|"regression"| RB["Repoint alias back to v6"]
     K -->|"stable"| D["Delete docs_v6"]
 ```
 
 ## Examples
+### A retrieval tool that fails loud on a recipe mismatch
+The agent's `search_docs` tool reads the alias target and its recipe, and returns a structured error
+instead of silently searching the wrong space. The store is a dict so the logic is visible.
+
+```python
+import hashlib, json
+
+def recipe_hash(r: dict) -> str:
+    return hashlib.sha256(json.dumps(r, sort_keys=True).encode()).hexdigest()[:12]
+
+QUERY_RECIPE = {"model": "text-embedding-3-small", "revision": "2024-01", "dim": 1536,
+                "normalize": True, "chunker": "recursive", "chunk_tokens": 400, "overlap": 40}
+alias = {"docs": "docs_v7"}
+collections = {"docs_v7": {"emb_version": recipe_hash(QUERY_RECIPE), "rows": []}}
+
+def search_docs(query: str, k: int = 5) -> dict:
+    """Tool exposed to the agent. Returns results or an error the agent can report."""
+    target = collections[alias["docs"]]
+    if target["emb_version"] != recipe_hash(QUERY_RECIPE):
+        # never search across spaces; surface it so the agent says "retrieval unavailable"
+        return {"error": "embedding_version_mismatch", "collection": alias["docs"]}
+    return {"collection": alias["docs"], "emb_version": target["emb_version"], "results": []}
+
+print(search_docs("refund window"))                  # ok: versions match
+QUERY_RECIPE["model"] = "newer-embedding-model"      # someone upgrades the query side only
+print(search_docs("refund window"))                  # {'error': 'embedding_version_mismatch', ...}
+```
+
+Log `emb_version` with every tool call in the agent trace, so a bad answer can be traced to the index
+version it was grounded on.
+
 ### Recipe hash, content-keyed cache and alias swap
 A minimal version of the three mechanisms. The vector store is abstracted as a dict of collections so the
 logic is visible.
@@ -218,10 +264,11 @@ print("retired:", swap("docs", "docs_v7"), "live:", alias["docs"])
 ```
 
 The eval gate is deliberately a comment: in production `swap` runs only after recall@k on the eval set for
-`docs_v7` is at least as good as for `docs_v6`.
+`docs_v7` is at least as good as for `docs_v6`, and the agent eval suite passes against it.
 
 ### Worked scenario: full rebuild versus routine run
-Using the illustrative rate limit above (a million tokens per minute) on the 10-million-chunk corpus.
+Using the illustrative rate limit above (a million tokens per minute) on the 10-million-chunk corpus
+behind a support agent's knowledge tool.
 
 | Run | Chunks embedded | Tokens | Embedding time |
 |---|---|---|---|
@@ -229,12 +276,13 @@ Using the illustrative rate limit above (a million tokens per minute) on the 10-
 | Nightly run, 1% of chunks changed (illustrative) | 100,000 | 40 million | ~40 min |
 | Nightly run without content hashing | 10,000,000 | 4 billion | ~67 h, longer than a day, so it overruns the next run |
 
-- **Reading it:** content hashing turns the nightly job from impossible into minutes; the full rebuild is
-  rare but long enough that it needs dual-write or replay.
+- **Reading it:** content hashing turns the nightly job from impossible into minutes, so the agent sees
+  yesterday's policy changes today; the full rebuild is rare but long enough that it needs dual-write or
+  replay.
 
 ### Production snippet: blue-green in pgvector with a view as the alias
-The application queries `docs`; the swap is a single statement, and rollback is the same statement naming
-the old table.
+The retrieval tool queries `docs`; the swap is a single statement, and rollback is the same statement
+naming the old table.
 
 ```sql
 -- build v7 beside v6, index it without blocking writes
@@ -248,14 +296,17 @@ CREATE OR REPLACE VIEW docs AS SELECT * FROM docs_v7;
 ```
 
 ## Production patterns
-- **Recipe-stamped collections with a fail-loud query path.** Use from the first production index. Store
-  `embedding_version` on the collection and each row; at query time compare it with the embedder's recipe
-  hash and raise on mismatch instead of searching. Monitor mismatch errors (should be zero) and which
-  version each request was served from.
+- **Recipe-stamped collections with a fail-loud retrieval tool.** Use from the first production index.
+  Store `embedding_version` on the collection and each row; inside the tool, compare it with the
+  embedder's recipe hash and return an error instead of searching. Monitor mismatch errors (should be
+  zero) and which version each agent tool call was served from.
 - **Alias-based blue-green swap.** Use for any corpus that takes more than minutes to rebuild. Qdrant
   collection aliases, OpenSearch's `_aliases` endpoint with remove and add actions in one request, or a
   Postgres view repointed with `CREATE OR REPLACE VIEW`. Monitor recall@k on the eval set before and after
-  the swap, plus p95 latency for the first hour.
+  the swap, plus p95 latency of the retrieval tool for the first hour.
+- **Agent eval in the swap gate.** Beyond recall@k and MRR, replay a fixed set of agent tasks against the
+  new alias and compare task success, citation accuracy and tool calls per task. A new index that makes
+  the agent search three times instead of once is a regression even if recall looks flat.
 - **Content-hash cache table for incremental runs.** Use once ingestion runs on a schedule. Keep a table
   keyed on `(chunk_key, embedding_version)` and skip hits. Monitor fraction of chunks re-embedded per run:
   near zero normally, 100% only on version changes. A sudden jump with no recipe change usually means the
@@ -263,12 +314,10 @@ CREATE OR REPLACE VIEW docs AS SELECT * FROM docs_v7;
 - **Tune query-time recall before rebuilding.** When recall dips, raise `hnsw.ef_search` (pgvector session
   setting) or the IVF probe count first, because they need no rebuild. Rebuild with higher `M` or
   `ef_construction` only if that cannot reach the target within the latency budget.
-- **Weekly fixed-eval recall tracking between swaps.** Run the same eval set against the live alias on a
-  schedule. A slow decline with no recipe change signals stale centroids or accumulated deletes: schedule a
-  re-index, not a re-embed.
-- **Retirement window for old versions.** Keep the previous collection for an explicit soak (for example a
-  week, set by your rollback needs), then delete it. Monitor disk and memory headroom, because two indexes
-  coexist during every rebuild.
+- **Weekly fixed-eval recall tracking and a retirement window.** Run the same eval set against the live
+  alias on a schedule; a slow decline with no recipe change signals stale centroids or accumulated deletes,
+  so schedule a re-index, not a re-embed. Keep the previous collection for an explicit soak (for example a
+  week, set by your rollback needs), then delete it, watching disk and memory headroom.
 
 ## Trade-offs
 - **Atomic cutover vs double memory.** Blue-green rebuilds give atomic cutover and instant rollback but
@@ -279,8 +328,8 @@ CREATE OR REPLACE VIEW docs AS SELECT * FROM docs_v7;
   chunking an insertion shifts every later boundary in that document, so all following chunks re-embed too.
   Structure-aware chunking that cuts on headings or paragraphs keeps the blast radius local.
 - **Pinned revision vs owning upgrades.** Pinning a model revision protects consistency but means you
-  consciously own upgrades. Letting a vendor update silently is cheaper to operate right up until retrieval
-  quality shifts with no deploy to blame.
+  consciously own upgrades. Letting a vendor update silently is cheaper to operate right up until your
+  agent's answers shift with no deploy to blame.
 - **Dual-write vs replay.** Dual-write keeps the new index current with no catch-up step but couples live
   ingestion to the new collection and makes it race the backfill. Replay keeps ingestion untouched at the
   cost of a catch-up pass, and tends to win when builds take days and the change watermark is trustworthy.
@@ -288,9 +337,9 @@ CREATE OR REPLACE VIEW docs AS SELECT * FROM docs_v7;
   storage and an ANN graph; set an explicit retirement window rather than letting versions accumulate.
 
 ## Pitfalls
-- **Upgrading the query-side model without rebuilding the index.** Symptom: plausible-looking but
-  irrelevant chunks with no errors, and eval recall that collapses overnight. Fix: the query path reads the
-  recipe from the alias target.
+- **Upgrading the query-side model without rebuilding the index.** Symptom: the agent cites plausible-looking
+  but irrelevant chunks with no errors, and eval recall collapses overnight. Fix: the retrieval tool reads
+  the recipe from the alias target.
 - **Changing the chunker and reusing the old vectors** because "the model is the same". Symptom: citations
   pointing at wrong offsets and duplicated or truncated passages in context. Fix: chunker params are in the
   recipe hash.
@@ -299,8 +348,8 @@ CREATE OR REPLACE VIEW docs AS SELECT * FROM docs_v7;
 - **Swapping on build completion rather than on eval results.** Symptom: a regression discovered by users,
   with the old index already deleted. Fix: gate the swap on the eval and keep a soak window.
 - **Forgetting that filters and metadata live beside vectors.** A rebuild that drops ACL or tenant fields
-  produces an index that passes retrieval eval and fails a security review. Fix: diff schemas and test a
-  filtered query before the swap.
+  produces an index that passes retrieval eval and lets an agent retrieve another tenant's documents. Fix:
+  diff schemas and test a filtered query before the swap.
 - **Sizing memory for one copy of the index.** Symptom: out-of-memory or evictions precisely during the
   rebuild, the moment you can least afford it. Fix: plan for two.
 - **Caching query embeddings keyed on query text alone.** Symptom after a swap: popular (cached) queries
@@ -309,8 +358,8 @@ CREATE OR REPLACE VIEW docs AS SELECT * FROM docs_v7;
   cause is usually stale IVF centroids or accumulated deletes, and a re-index (no re-embedding) fixes it.
 
 ## When to use
-- **Version from the first production index,** because the first model upgrade arrives sooner than planned
-  and the retrofit is painful.
+- **Version from the first production index,** including agent memory stores, because the first model
+  upgrade arrives sooner than planned and the retrofit is painful.
 - **Use the alias swap** for any corpus that takes longer than a few minutes to rebuild; below that, a
   rebuild-and-replace in a transaction is fine.
 - **Add content hashing** as soon as ingestion runs on a schedule rather than once; it pays for itself.
@@ -350,6 +399,14 @@ may retrieve differently on your domain, which only the eval gate catches.
 - **Wasted cost.** It re-embeds unchanged content; building beside, gating on eval and swapping an alias
   fixes all three.
 
+### Your RAG agent started citing irrelevant documents this morning, with no errors anywhere. How do you debug it?
+- **Check versions first.** Compare the `emb_version` logged on the agent's retrieval tool calls with the
+  query embedder's recipe hash; a query-side model upgrade or an unpinned vendor update is the usual cause.
+- **Check the swap log.** If an alias moved overnight, compare the eval results that gated it and roll the
+  alias back while you investigate.
+- **Check caches and filters.** Query-embedding caches keyed on text alone, or a rebuild that dropped
+  metadata fields, produce the same symptom.
+
 ### Recall has drifted down 6 points over three months and nobody changed the model. How do you debug it?
 - **Rule out a recipe change first:** compare the stored `embedding_version` with the query embedder's, and
   check whether a vendor silently updated an unpinned model.
@@ -371,11 +428,12 @@ may retrieve differently on your domain, which only the eval gate catches.
 - **Throughput, not price, is the constraint:** at a few cents per million tokens the bill is around a
   hundred dollars. Add HNSW build time on top.
 
-### What has to change on the query side when you swap the index?
+### What has to change in the agent's retrieval tool when you swap the index?
 - **The query embedder:** the alias must resolve to collection plus recipe, so queries use the same model,
   prefix and dimension.
 - **Caches:** query-embedding caches keyed on text alone serve old-space vectors for popular queries; key
   them on `(query_text, embedding_version)`.
+- **Traces:** log the served version on every tool call so eval regressions can be attributed to a swap.
 
 ## Quiz
 ### Q: Why can't you query an index built with embedding model A using vectors from model B?
@@ -405,3 +463,26 @@ may retrieve differently on your domain, which only the eval gate catches.
 > Dual-write or watermark-and-replay both deliver a complete new collection at swap time. Pausing ingestion
 > leaves users with stale data for days; copying after the swap creates a gap; mixing models in one
 > collection is exactly the failure versioning exists to prevent.
+
+## Use cases & projects
+### Use cases
+- **Upgrading the embedding model behind a RAG agent.** Build beside, gate on retrieval and agent evals,
+  swap the alias the retrieval tool resolves, keep the old one for rollback.
+- **Re-embedding an agent's long-term memory store.** Memories written under an old recipe must move as a
+  unit, or recall of past user preferences becomes random.
+- **Nightly knowledge-base refresh for a support agent.** Content hashing re-embeds only the policies that
+  changed, so the agent's answers stay current within a day.
+- **Shrinking vector memory for a multi-tenant agent platform.** Matryoshka truncation or int8 quantization
+  is a new version that must pass the same eval gate before cutover.
+
+### Mini project
+**Blue-green swap behind an agent's search tool (2-3 hours).**
+- **Goal:** upgrade the embedding recipe of a small RAG agent with zero mixed-space queries and a measured
+  go/no-go decision.
+- **Steps:** index about 500 chunks under recipe v1 in pgvector or Qdrant; expose a `search_docs` tool that
+  checks the recipe hash and logs `emb_version`; write 30 questions with known relevant chunks; build v2
+  (a different model or chunk size) beside v1; run recall@5 and the agent on all 30 questions against both;
+  swap the alias, then roll it back.
+- **Done when:** a table compares v1 and v2 on recall@5 and agent answer accuracy, the trace shows every
+  tool call tagged with its version, and a deliberate query-side-only upgrade makes the tool return a
+  mismatch error instead of results.

@@ -5,7 +5,8 @@ name: Residual connections
 kind: concept
 difficulty: core
 est_minutes: 12
-status: crisp-verified
+status: agentic
+agent_relevance: background
 related:
   - ml-fundamentals/normalization
   - ml-fundamentals/backpropagation
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-A residual connection adds a layer's input to its output, `y = x + F(x)`, so each layer starts as "do
-nothing" and learns a correction. The identity path carries gradients through depth; in
-transformers it is the residual stream that heads and MLPs share.
+A residual connection adds a layer's input to its output, `y = x + F(x)`, building the residual stream
+every LLM shares across layers. For agent builders, that additive stream is why LoRA, steering, logit-lens
+debugging and layer dropping behave predictably.
+
+## For agent builders
+- **Why it matters for agents.** You will not add skip connections, but you will adapt and debug the models
+  behind your agents. LoRA adapters, activation steering and the logit lens all work because each layer
+  adds into one shared stream rather than replacing it.
+- **Where it shows up in your stack.** `target_modules` in a PEFT LoRA config (the projections that read
+  from and write into the stream), forward hooks for interpretability or steering, and layer-pruned or
+  early-exit variants of open models offered for low-latency routing.
+- **What you control.** Which projections get adapters, which tensor you hook (the stream is a cumulative
+  sum, the branch output is one layer's contribution), and whether a pruned model passes your agent eval.
+- **What you can skip.** The ResNet history and the full `2^L` path derivation: remember that the identity
+  path keeps gradients alive, which is why deep models fine-tune with ordinary settings.
 
 ## Why it exists
 - **Deeper was supposed to be at least as good.** The 2014–2015 expectation: a 56-layer network can
@@ -44,7 +57,17 @@ transformers it is the residual stream that heads and MLPs share.
   within two years and has never dropped it.
 
 ## How it works
-### Forward: additive composition
+### What the agent builder does with it
+- **Place adapters on stream projections.** LoRA adds a low-rank term to a projection that writes into the
+  stream, so its downstream effect is an added increment, predictable and removable.
+- **Hook the right tensor.** The stream at layer k is the sum of all earlier writes; a layer's own
+  contribution is its branch output.
+- **Debug fine-tunes layer by layer.** The logit lens decodes intermediate streams, showing where a tuned
+  agent model starts preferring a different tool or token.
+- **Treat layer dropping as an eval question.** Any prefix of the sum is a usable output, so pruning is
+  often cheap in quality, but only your agent eval says how cheap.
+
+### Background: forward, additive composition
 - **The block:** `y = x + F(x, W)`, where `F` is the sublayer: a pair of convolutions in a ResNet,
   attention or the MLP in a transformer.
 - **Shapes must match** for the addition. That is why a ResNet uses a projection shortcut only where width
@@ -60,7 +83,7 @@ x_L = x_0 + Σ_{l<L} F_l(x_l)
 Each layer's contribution is a *term in a sum* rather than a *factor in a product*. That structural fact
 is behind everything else.
 
-### Backward: the identity term
+### Background: backward, the identity term
 Differentiate one block: `∂y/∂x = I + ∂F/∂x`. Through `L` blocks, the gradient with respect to an early
 activation is
 
@@ -78,7 +101,7 @@ activation is
    tens of layers long, even in a 110-layer network. That is why deleting one block at test time barely
    hurts a ResNet, while deleting a layer from a plain network destroys it.
 
-### Why the shortcut must be the identity
+### Background: why the shortcut must be the identity
 - **Tested alternatives:** the identity-mappings follow-up tried scaling the skip path by a constant,
   gating it as highway networks did, and placing a 1×1 convolution or dropout on it.
 - **All trained worse,** because anything multiplicative on the skip path turns the clean `I` back into a
@@ -108,7 +131,7 @@ read in any combination. Techniques that depend on this picture:
   residual layers) so the sum starts at a sensible scale; some recipes add a learned scalar per branch
   initialized near zero.
 - **Activation memory:** the stream must be stored for backward at every layer, `[batch, seq, d_model]`
-  per block, a visible slice of activation memory.
+  per block, a visible slice of activation memory when fine-tuning on long agent traces.
 - **Fixed width** spends capacity uniformly across depth; architectures that change width mid-network pay
   with projection shortcuts at those points.
 
@@ -130,6 +153,22 @@ flowchart TD
 ```
 
 ## Examples
+### Worked scenario: pruning layers from an agent's tool router
+A team serves a 32-layer open model as the first-step tool router of an agent and wants lower latency.
+Because the output is a sum of layer increments, they test dropping late blocks one at a time against a
+500-case routing eval. Accuracy figures are illustrative; the method is the point.
+
+| Blocks removed | Share of layer compute saved | Routing accuracy | Decision |
+|---|---|---|---|
+| 0 | 0% | baseline | reference |
+| 2 (late layers) | ~6% | within noise of baseline | keep |
+| 4 (late layers) | 12.5% | small drop on rare tools | keep only after a short LoRA heal |
+| 4 (early layers) | 12.5% | large drop | reject: cost varies by layer |
+
+- **Why it is possible at all:** any prefix of the residual sum is a usable output, and short paths
+  dominate, so single blocks matter less than in a plain network.
+- **Why you still measure:** the cost depends on which layer goes, and on rare tools more than common ones.
+
 ### Gradient at layer 1 of a 64-layer stack, with and without skips
 A 64-layer stack of `tanh(Linear)` blocks with and without the skip connection, comparing the gradient
 norm at the first layer with the last. The loss has a random target, so the output gradient is of order
@@ -201,23 +240,24 @@ for alpha in (0.9, 0.95, 1.0, 1.05):                      # learned skip scale y
 A drift of just 5% in `α` either way shrinks the direct gradient path about 12× or grows it about 10×.
 
 ## Production patterns
-- **Scale branch output projections at init.** In deep Pre-LN models initialize each block's attention
-  and MLP output projection with standard deviation divided by `√(2 × n_layers)` (GPT-2's rule; nanoGPT
-  writes it as `0.02 / math.sqrt(2 * n_layer)`). Log the stream norm per layer at step zero; it should stay
-  near the embedding scale.
+- **Attach adapters and steering to the stream deliberately.** Put LoRA on the projections that write into
+  the stream (set them in the PEFT config's target modules), or add steering vectors at a single chosen
+  layer, and hook the branch output when you need a layer's own contribution rather than the cumulative
+  sum. Monitor the agent eval with the adapter on and off.
+- **Debug agent fine-tunes with the logit lens.** Apply the final norm and unembedding to intermediate
+  streams on a fixed prompt set (for example the first tool-choice token of your eval traces) and track
+  how early the right token appears. Use it to locate where a fine-tune changed behaviour.
+- **Validate layer dropping before shipping it.** For latency, remove or share blocks one at a time and
+  measure eval quality per removal; the additive structure makes many layers cheap to drop, but the cost
+  varies by layer and must be measured, including on rare tools and long trajectories.
 - **Monitor branch-to-stream ratios.** Register forward hooks (`module.register_forward_hook`) on each
   block to log the branch-output norm next to the stream norm. A branch at 1% of the stream is a layer
   doing little; a ratio that climbs sharply mid-run is worth lining up against the loss and grad-norm
   traces.
-- **Debug with the logit lens.** Apply the final norm and unembedding to intermediate streams on a fixed
-  prompt set and track how early the right token appears. Use it to locate where a fine-tune changed
-  behaviour.
-- **Validate layer dropping before shipping it.** For latency, remove or share blocks one at a time and
-  measure eval quality per removal; the additive structure makes many layers cheap to drop, but the cost
-  varies by layer and must be measured.
-- **Attach adapters and steering to the stream deliberately.** Put LoRA on the projections that write into
-  the stream, or add steering vectors at a single chosen layer, and hook the branch output when you need a
-  layer's own contribution rather than the cumulative sum.
+- **Scale branch output projections at init (when training from scratch).** In deep Pre-LN models
+  initialize each block's attention and MLP output projection with standard deviation divided by
+  `√(2 × n_layers)` (GPT-2's rule; nanoGPT writes it as `0.02 / math.sqrt(2 * n_layer)`). Log the stream
+  norm per layer at step zero; it should stay near the embedding scale.
 
 ## Trade-offs
 - **Optimizable depth vs fixed width.** Hundreds of layers train with ordinary SGD or Adam, but every layer
@@ -232,12 +272,18 @@ A drift of just 5% in `α` either way shrinks the direct gradient path about 12�
   argument does not settle.
 - **Stored stream vs memory.** The stream must be stored per layer for backward, costing
   `batch × seq × d_model` activations per block; gradient checkpointing trades recompute for that memory
-  when long sequences make it dominant.
+  when long sequences (long agent traces) make it dominant.
 - **Gated shortcuts vs plain identity.** Gated or scaled shortcuts add flexibility and can train without
   normalization, but any non-identity factor on the skip path compounds across depth and in practice
   trains worse unless the gate starts as pass-through.
 
 ## Pitfalls
+- **Treating the stream as "the layer's output"** when hooking activations for interpretability or
+  steering. The stream at layer k is the sum of all previous writes, not what layer k computed; read the
+  branch output for the layer's own contribution.
+- **Shipping a pruned agent model on aggregate accuracy alone.** Layer removal can look free on common
+  tools and hurt rare ones or long trajectories. Fix: evaluate per tool and per trajectory length before
+  rollout.
 - **Dropout, a projection or a scale on the skip path** instead of on the branch output. The model trains
   noticeably slower and deeper configurations stop converging: the identity-mappings result rediscovered.
 - **Unscaled branch output projections in a deep Pre-LN model.** The stream norm at step zero grows
@@ -251,9 +297,6 @@ A drift of just 5% in `α` either way shrinks the direct gradient path about 12�
 - **Zero-padding or truncating across a dimension mismatch.** Part of the signal is silently discarded;
   the symptom is a deep model that matches a shallower baseline exactly, because the extra layers add
   nothing.
-- **Treating the stream as "the layer's output"** when hooking activations for interpretability or
-  steering. The stream at layer k is the sum of all previous writes, not what layer k computed; read the
-  branch output for the layer's own contribution.
 
 ## When to use
 - **Use residual connections** in any network more than a handful of layers deep; every transformer does,
@@ -262,8 +305,8 @@ A drift of just 5% in `α` either way shrinks the direct gradient path about 12�
   with depth, and fix `d_model` for the whole stack.
 - **Reach for the stream picture** when debugging deep-model training (plot each layer's branch-output
   norm against the stream norm: a branch at 1% of the stream is a layer doing little), when placing
-  adapters or steering vectors, and when evaluating early-exit or layer-pruning proposals; all rest on the
-  additive structure.
+  adapters or steering vectors on an agent model, and when evaluating early-exit or layer-pruning
+  proposals for latency; all rest on the additive structure.
 - **Interviews:** the degradation-problem story, the `I + J` Jacobian argument and the link to Pre-LN
   placement are the expected depth; explaining why a gate on the shortcut is harmful separates recall from
   understanding.
@@ -307,14 +350,12 @@ leave the skip path clean.
 - **Expanded,** it has `2^L` paths including the pure identity, so `∂L/∂x_L` reaches layer 0 undiminished.
 - **A plain stack** has only the full product of `L` Jacobians, which shrinks or explodes exponentially; in
   the 64-layer example the layer-1 gradient was about 14 orders of magnitude below the last layer's.
+- **Debugging corollary:** if a deep Pre-LN model you built spikes early at the recipe's learning rate,
+  check the stream norm at step zero per layer; steady growth with depth means branch output projections
+  were not scaled at init (divide by the square root of the number of residual layers, as GPT-2 does),
+  and also check the final norm and that nothing multiplicative sits on the skip path.
 
-### A deep Pre-LN model you built spikes early at the recipe's learning rate. What do you look at?
-- **Stream norm at step zero, per layer:** if it grows steadily with depth, branch output projections were
-  not scaled at init.
-- **Fix:** divide those weights' init by the square root of the number of residual layers, as GPT-2 does.
-- **Also check** that the final norm exists and that nothing multiplicative sits on the skip path.
-
-### What is the residual stream, and why does it matter when you hook or adapt a model?
+### You want to steer or adapt your agent's model. What is the residual stream, and why does it matter?
 - **A shared additive bus:** every head and MLP reads `x` through input projections and adds its output
   back, so the stream at layer k is the sum of all earlier writes.
 - **Techniques that rely on the sum:** the logit lens decodes intermediate streams, steering adds a vector
@@ -322,12 +363,20 @@ leave the skip path clean.
 - **Hook the right tensor:** read the branch output for one layer's own contribution; the stream gives
   the cumulative sum.
 
-### Why can you often drop layers from a trained transformer for latency?
+### Your agent's tool router is too slow. Can you drop layers from it, and how would you decide?
 - **The output is a sum:** each layer writes an increment into the stream, and any prefix is a usable, if
   coarser, output.
 - **Short paths dominate:** Veit et al. found most gradient flows through paths a few tens of layers long,
   so single blocks matter less than in a plain network.
-- **But measure it:** quality cost varies by layer, so evaluate each removal before shipping.
+- **But measure it:** quality cost varies by layer, so evaluate each removal before shipping, per tool and
+  per trajectory length, and consider a short LoRA heal after pruning.
+
+### Your LoRA fine-tune changed the agent's tool choices in unexpected places. How do you localize it?
+- **Logit lens on both models:** decode the intermediate streams of the base and adapted models on the
+  same eval prompts and find the first layer where the preferred tool token differs.
+- **Compare branch outputs at that layer,** not the stream, to see which sublayer's write changed.
+- **Then act:** restrict the adapter's target modules or layers, or fix the training traces that taught
+  the behaviour, and re-run the eval with the adapter on and off.
 
 ## Quiz
 ### Q: Why does a residual connection keep gradients from vanishing through depth?
@@ -354,3 +403,25 @@ leave the skip path clean.
 - [ ] The shortcut can be replaced by a 1×1 convolution at no cost
 > Multiplicative changes to the skip path turn the clean identity term in the gradient back into a
 > product, undoing the benefit; all tested variants degraded training, and increasingly so with depth.
+
+## Use cases & projects
+### Use cases
+- **LoRA adapters for agent behaviour.** Adapters on stream-writing projections add a removable increment,
+  so one base model can serve several agents with different adapters.
+- **Debugging a fine-tuned agent model.** The logit lens shows at which layer the model starts preferring
+  a different tool or answer token.
+- **Low-latency routers and classifiers.** Layer-pruned or early-exit variants trade a little quality for
+  speed on the first step of an agent loop, judged by the agent eval.
+- **Activation steering experiments.** Adding a vector to the stream at one layer is a research tool for
+  nudging behaviour such as verbosity or refusal, with predictable downstream effects.
+
+### Mini project
+**Logit lens on an agent's tool choice (2-3 hours).**
+- **Goal:** see at which layer a small open model commits to the right tool, and what dropping late layers
+  does to that choice.
+- **Steps:** write 30 prompts that each require one of three tools; register forward hooks to capture the
+  residual stream after every block; apply the final norm and unembedding to each captured stream and
+  record the rank of the correct tool-name token per layer; then skip the last 2 and last 4 blocks and
+  re-score tool choice.
+- **Done when:** you have a per-layer chart of the correct tool's rank, a table of tool-choice accuracy
+  with 0, 2 and 4 late blocks removed, and a note on the earliest layer where the choice is reliable.

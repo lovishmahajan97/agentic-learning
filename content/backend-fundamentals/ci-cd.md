@@ -5,7 +5,8 @@ name: CI/CD
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - backend-fundamentals/docker
   - backend-fundamentals/kubernetes
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-CI merges and verifies every change on a clean machine; CD turns each verified build into one immutable
-artifact with an automated path to production. Small, routine releases make failure cheap to reverse. For
-AI systems it also gates prompts and models with evaluations.
+CI verifies every change to your agent (code, prompts, tool schemas, model version) on a clean machine,
+including an eval gate; CD promotes one immutable artifact through canaries to production, so agent
+regressions are caught early and cheap to revert.
+
+## For agent builders
+- **Why it matters for agents.** An agent's behaviour changes when anything changes: a prompt line, a tool
+  description, the model version, the retrieval index. None of these fail a type checker. The pipeline's
+  eval gate is the only thing standing between that edit and users.
+- **Where it shows up in your stack.** GitHub Actions or GitLab workflows, a mocked-model unit suite, a
+  smoke and full agent eval set (task success, tool-call correctness, cost and steps per run), image build
+  and scan, and canary or GitOps rollout of the agent service.
+- **What you control.** Which paths trigger the full eval, pass thresholds and tolerances, the CI-only
+  provider key and its spend cap, and pinning code, prompt, tool schemas and model version into one
+  artifact so rollback reverts them together.
+- **What you can skip.** Choosing among CI vendors and deep pipeline-syntax trivia. Know the stages,
+  build-once-promote-many, eval gates, canaries and OIDC to the cloud.
 
 ## Why it exists
 - **Late integration is where bugs live.** Weeks of divergent branches meet at release time, and the merge
@@ -109,6 +123,23 @@ AI systems it also gates prompts and models with evaluations.
 | **GPU work** | Self-hosted runners or cluster Jobs, never the default runner |
 | **Rollback scope** | The deployable unit pins code, prompt and model version together, so a rollback reverts all three |
 
+### The agent eval stage
+An agent is scored on trajectories, not single answers. Run each eval task through the real loop with
+recorded or fake tools, then score the run.
+
+| Metric | What it catches | Typical gate |
+|---|---|---|
+| Task success rate | The agent no longer completes the job | Fail if it drops beyond tolerance vs main |
+| Tool-call correctness | Wrong tool, malformed arguments after a schema edit | Fail on any rise in invalid calls |
+| Steps per run | A prompt change makes the agent loop or dither | Fail if the mean rises sharply |
+| Cost or tokens per run | A model bump or verbose prompt multiplies spend | Warn or fail above a budget |
+| Safety cases | Injection or forbidden-action prompts now succeed | Zero tolerance |
+
+- **Fake tools make it deterministic enough to gate,** because the only variance left is the model's;
+  real tools change underneath you and cost money or cause side effects.
+- **Run each case a few times** when the model is sampled, and gate on rates, because one run per case
+  turns noise into false failures.
+
 ### How you know it is working
 - **The four DORA metrics:** deployment frequency, lead time for changes, change failure rate, and time to
   restore service.
@@ -116,7 +147,8 @@ AI systems it also gates prompts and models with evaluations.
 
 ## Diagram
 Fast, cheap checks run first and every later stage reuses the one digest built in stage two, so what reaches
-production is exactly what was tested.
+production is exactly what was tested. For an agent, the smoke eval gate scores whole runs, and the canary
+compares task success and cost per run, not just errors.
 
 ```mermaid
 flowchart TD
@@ -208,6 +240,52 @@ sys.exit(1 if bad else 0)    # a non-zero exit fails the CI job
 # Prints: REGRESSION groundedness: 0.91 -> 0.88 (tolerance 0.02) / eval gate: FAIL
 ```
 
+### Agent trajectory gate with fake tools
+Runs each eval task through the agent loop with deterministic fake tools and gates on success, invalid
+tool calls, steps and cost. `run_agent` is your agent entry point; it must accept a tool table and return
+the run's tool calls, final answer and token usage.
+
+```python
+import json, statistics, sys
+
+FAKE_TOOLS = {   # deterministic stand-ins: no network, no side effects, no flakiness from APIs
+    "search_orders": lambda customer_id: [{"id": "o-17", "status": "delayed"}],
+    "issue_refund":  lambda order_id, amount: {"ok": True},
+}
+
+def score(case, run):
+    calls = run["tool_calls"]
+    invalid = sum(1 for c in calls if c["name"] not in FAKE_TOOLS or "error" in c)
+    return {"success": case["check"](run), "invalid": invalid, "steps": len(calls),
+            "tokens": run["usage"]["input"] + run["usage"]["output"]}
+
+def gate(cases, run_agent, baseline, repeats=3):
+    rows = [score(c, run_agent(c["prompt"], tools=FAKE_TOOLS)) for c in cases for _ in range(repeats)]
+    cand = {"success": statistics.mean(r["success"] for r in rows),
+            "invalid": statistics.mean(r["invalid"] for r in rows),
+            "steps": statistics.mean(r["steps"] for r in rows),
+            "tokens": statistics.mean(r["tokens"] for r in rows)}
+    fails = []
+    if cand["success"] < baseline["success"] - 0.03: fails.append("task success dropped")
+    if cand["invalid"] > baseline["invalid"]:          fails.append("more invalid tool calls")
+    if cand["steps"] > baseline["steps"] * 1.3:        fails.append("runs got 30% longer")
+    if cand["tokens"] > baseline["tokens"] * 1.5:      fails.append("tokens per run up 50%")
+    print(json.dumps(cand), *fails, sep="\n")
+    sys.exit(1 if fails else 0)                        # non-zero fails the CI job
+```
+
+- **Thresholds here are examples;** set yours from the run-to-run variance you measure on main.
+
+### Worked scenario: a tool-description edit that passed unit tests
+A pull request shortens the `issue_refund` tool description to save tokens. Figures are illustrative.
+
+| Stage | Result |
+|---|---|
+| Commit stage, model mocked | Green: code and schema are valid |
+| Smoke trajectory eval, 20 cases × 3 runs | Task success 0.92 → 0.85; the agent now calls `issue_refund` without `search_orders` first |
+| Gate | Fails on success drop; the PR author restores the ordering hint in the description |
+| Without the gate | Refunds issued against the wrong order would have reached the canary, or users |
+
 ### Worked scenario: renaming a column without breaking a rollout
 A team wants to rename `user_name` to `display_name` on a service that deploys by rolling update.
 
@@ -234,6 +312,12 @@ A team wants to rename `user_name` to `display_name` on a service that deploys b
 - **GitOps promotion by digest.** The pipeline commits the new digest to the config repository and Argo CD or
   Flux syncs it, so `git log` answers "what ran when" and `git revert` is the rollback. Alert on applications
   that stay out of sync.
+- **Agent canary on run-level metrics.** Route a small share of agent sessions to the new version and
+  compare task success signals (user thumbs, completion events, escalations to a human), tool error rate
+  and cost per run with the baseline before promoting. Abort automatically when cost or error rate jumps.
+- **Prompts and tool schemas as versioned files.** Keep prompts and tool definitions in the repo, include
+  their hash in the image and in every trace, so an eval score or an incident maps to exact prompt
+  versions. Monitor which prompt hash each environment runs.
 
 ## Trade-offs
 - **Eval on every PR vs cost and noise.** It catches prompt regressions early but costs money, time and
@@ -250,6 +334,9 @@ A team wants to rename `user_name` to `display_name` on a service that deploys b
   controller to operate; direct `kubectl` from the pipeline is simpler for a single team and few services.
 - **Aggressive caching vs staleness.** Pipelines stay fast, but a stale cache produces "green in CI, broken in
   prod"; key caches on lockfile hashes and expire them on base-image changes.
+- **Fake tools vs realism in agent evals.** Fakes make the gate deterministic, cheap and safe, but miss
+  failures from real API behaviour (pagination, rate limits, schema drift). Keep fakes in the per-PR gate
+  and run a smaller suite against sandboxed real tools nightly.
 
 ## Pitfalls
 - **Tolerating flaky tests.** Symptom: a "just re-run it" culture in which a real failure is merged because
@@ -272,6 +359,11 @@ A team wants to rename `user_name` to `display_name` on a service that deploys b
 - **Shipping a destructive migration (rename or drop a column) in the same release as the code that needs
   it.** Symptom: errors from still-running old replicas during rollout, and a rollback that fails because the
   old code cannot read the new schema.
+- **Tool descriptions and schemas treated as non-code.** Symptom: an edit to a tool's docstring skips the
+  eval gate and the agent starts misusing the tool. Fix: include tool definition paths in the eval
+  trigger filter.
+- **Agent evals that hit real side-effecting tools.** Symptom: CI sends emails, files tickets or issues
+  refunds. Fix: fake or sandboxed tools in every pipeline stage before production.
 
 ## When to use
 - **Use from day one** for any codebase with more than one contributor or more than one deploy; a five-minute
@@ -280,6 +372,8 @@ A team wants to rename `user_name` to `display_name` on a service that deploys b
   prompt or model changes affect users, canaries once traffic is large enough for a comparison to mean
   something.
 - **Use path filters** so documentation changes skip the heavy stages.
+- **For agents, add the trajectory eval gate** as soon as the agent has users: prompts, tool schemas, model
+  config and retrieval settings all trigger it.
 - **Measure:** the four DORA metrics plus pipeline duration, flake rate and eval-gate pass rate.
 - **Interviews:** explain build-once-promote-many, why small frequent deploys are safer, how you test
   non-deterministic model code, and how a CI job authenticates to the cloud without a stored key.
@@ -329,7 +423,7 @@ artifact so a rollback reverts both.
 - **Blue-green** fits when you need instant switch-back and can afford double capacity; rolling is the cheap
   default with the least protection.
 
-### How do you test code that calls an LLM without making CI flaky or expensive?
+### How do you test code that calls an LLM or runs an agent loop without making CI flaky or expensive?
 - **Unit tests mock or record the client** and assert structure and control flow, so they are deterministic,
   free and fast.
 - **Quality is an evaluation stage** with thresholds over many cases: a roughly 20-case smoke set per pull
@@ -343,6 +437,14 @@ artifact so a rollback reverts both.
   short-lived credentials.
 - **So nothing long-lived exists to leak;** keep the trust conditions narrow, for example main branch of one
   repository.
+
+### What would your CI pipeline check before a change to an agent's tool definitions ships?
+- **Schema validity** in the commit stage: every tool definition parses and matches its handler's
+  signature, with the model mocked.
+- **A trajectory eval** with fake tools: task success, invalid tool calls, steps and tokens per run versus
+  main, run several times per case to average out sampling noise.
+- **A canary** on run-level metrics after deploy, with prompt and tool-schema hashes in traces so a
+  regression traces back to the exact change.
 
 ## Quiz
 ### Q: Why build the image once and promote the same digest through environments rather than rebuilding per environment?
@@ -371,3 +473,25 @@ artifact so a rollback reverts both.
 > The credential is short-lived, and the cloud's trust policy accepts the token only when its claims
 > (repository, branch or environment) match, which removes the single most common CI leak. OIDC tokens are deliberately
 > short-lived, and `kubectl` access works with many credential types.
+
+## Use cases & projects
+### Use cases
+- **Prompt and tool-schema changes.** Every edit to a system prompt or tool description runs a trajectory
+  eval gate before merge, catching behaviour regressions no unit test sees.
+- **Model version bumps.** Switching the agent's model triggers the full eval set and a cost-per-run
+  comparison, then a canary.
+- **Retrieval index rebuilds.** A new chunking or embedding config runs retrieval and end-to-end agent
+  evals before the index is promoted.
+- **Rollback of a bad agent release.** Code, prompts, tool schemas and model version are pinned in one
+  artifact, so `git revert` or a digest rollback restores all of them.
+
+### Mini project
+**Put an eval gate in front of your agent (2-3 hours).**
+- **Goal:** a GitHub Actions workflow that blocks a pull request when an agent change lowers task success
+  or raises cost per run.
+- **Steps:** write 15 eval cases for a small tool-calling agent with fake tools and a `check` per case;
+  record a baseline JSON from main; add the trajectory gate script; wire a workflow that runs unit tests
+  with the model mocked on every PR and the gate when `prompts/**` or `tools/**` change, using a CI-only
+  key with a spend cap; open a PR that deliberately breaks a tool description.
+- **Done when:** the breaking PR fails the gate with a readable reason, a harmless PR passes, and the
+  workflow run shows the eval cost stayed under your cap.

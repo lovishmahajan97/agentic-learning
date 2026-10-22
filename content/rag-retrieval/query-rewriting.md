@@ -412,3 +412,24 @@ and after.
 - [ ] The embedding model truncated the rewritten query
 > Normalisation that "fixes" codes, numbers or quoted strings destroys the exact-match signal BM25 depends
 > on; the rewriter prompt must protect literals and the eval should include identifier-heavy queries.
+
+## Use cases & projects
+### Use cases
+- **Conversational support agents.** Follow-ups like "what about the second one?" must become a
+  standalone query before search, or retrieval runs on a pronoun.
+- **Agents searching logs or tickets by identifier.** Error codes, SKUs and ticket IDs must survive the
+  rewrite verbatim, so teams add a literal-preservation guard to the search tool.
+- **Agents over jargon-heavy corpora.** Rewriting user wording into the corpus's vocabulary, while also
+  searching the original text, lifts recall on internal docs.
+- **Trace review for agent quality.** Reading the queries an agent actually wrote is often the fastest way
+  to find why a run answered wrong.
+
+### Mini project
+**Add a guarded rewrite step to an agent's search tool (1-2 hours).**
+- **Goal:** make multi-turn follow-ups retrieve correctly without corrupting literals.
+- **Steps:** collect about 20 multi-turn conversations, including some with error codes or IDs; add a
+  rewrite prompt that turns the history plus last turn into a standalone query; add a server-side check
+  that every quoted string, number and code in the user text still appears in the rewritten query, falling
+  back to the original if not; compare hit rate with no rewrite, rewrite only, and guarded rewrite.
+- **Done when:** you have a hit-rate table for the three variants and a list of the rewrites the guard
+  caught, with one sentence on each.

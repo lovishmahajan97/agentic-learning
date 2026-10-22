@@ -5,7 +5,8 @@ name: Business continuity
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: background
 related:
   - reliability/disaster-recovery
   - reliability/fmea
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-Business continuity keeps critical functions running through any disruption: outages, vendor failures,
-model deprecations, incidents, key people leaving. Disaster recovery is its technical subset. It starts
-from a business impact analysis, because mid-disruption nobody has time to decide what matters.
+Business continuity keeps the business functions your agent performs running through any disruption:
+provider outages, model deprecations, tool vendor changes, missing approvers, key people leaving.
+Disaster recovery is its technical subset; a business impact analysis comes first.
+
+## For agent builders
+- **Why it matters for agents.** Once an agent does a job people depend on (triage, refunds, scheduling),
+  its model, tools and human approvers become business dependencies. Most continuity events for agents
+  never show on a dashboard: a deprecation notice, a quota cut, the one prompt owner leaving.
+- **Where it shows up in your stack.** The fallback model list and its eval scores, the degraded-mode
+  flag, the human-approval queue, portable prompts and tool schemas in git, and the vendor-exit checklist
+  for model and tool suppliers.
+- **What you control.** The continuity ladder per agent function, which rung each failure lands on,
+  whether a validated second model exists, and how manual or fallback work is reconciled afterwards.
+- **What you can skip.** The ISO 22301 management-system details and BIA templates; the business owns
+  those. Know the RTO + catch-up rule and build the ladder rungs that are engineering's.
 
 ## Why it exists
 - **DR answers "how do we bring the system back", not the hour in between.** Which functions must keep
@@ -43,18 +56,15 @@ from a business impact analysis, because mid-disruption nobody has time to decid
   for the deal.
 
 ## How it works
-### Business impact analysis first
-The BIA is a ranked inventory of business **functions, not systems**. For each function record:
-- what it does and who depends on it;
-- the **maximum tolerable downtime** (how long before harm becomes unacceptable; some frameworks call it
-  maximum acceptable outage);
-- the resources, systems and upstream suppliers it needs;
-- the cost of an hour of disruption in money, compliance exposure and customer trust.
-
-- **RPO and RTO for each supporting system are derived from this,** which is why an honest BIA often
-  shrinks the list needing expensive recovery: most functions can wait a day, a few cannot wait ten minutes.
-- **Restoring the system is not restoring the function.** People still clear the backlog, re-enter work
-  done by hand and verify results, so the system RTO must leave room:
+### Background: the BC lifecycle in brief
+- **Business impact analysis (BIA) first.** A ranked inventory of business **functions, not systems**:
+  what each does and who depends on it, its **maximum tolerable downtime** (some frameworks say maximum
+  acceptable outage), the systems and suppliers it needs, and what an hour of disruption costs in money,
+  compliance exposure and trust.
+- **RPO and RTO for each supporting system are derived from the BIA,** so an honest one often shrinks the
+  expensive list: most functions can wait a day, a few cannot wait ten minutes.
+- **Restoring the system is not restoring the function.** People still clear the backlog, re-enter manual
+  work and verify results, so the system RTO must leave room:
 
 ```
 RTO + time to catch up and verify ≤ maximum tolerable downtime
@@ -62,9 +72,8 @@ RTO + time to catch up and verify ≤ maximum tolerable downtime
 
 - **Example:** a function that tolerates four hours and needs two hours of catch-up gets an RTO of two
   hours, not four.
-
-### Threat and dependency mapping
-For each critical function, list how it can be disrupted and through which dependency:
+- **Threat and dependency mapping** lists, per function, how it can be disrupted and through which
+  dependency; FMEA is the structured tool for it.
 
 | Category | Examples |
 |---|---|
@@ -74,23 +83,31 @@ For each critical function, list how it can be disrupted and through which depen
 | People | key-person loss, mass unavailability |
 | External | legal, regulatory, reputational |
 
-- **AI-specific entries:** supplier concentration on one model vendor, model and API deprecation
-  timelines, sudden pricing or quota changes, and prompts and eval sets as intellectual property that may
-  live in one person's head or one unbacked-up notebook.
-- **FMEA is the structured tool** for this step.
+### Continuity risks specific to agents
+- **Supplier concentration on one model vendor,** plus model and API deprecation timelines and sudden
+  pricing or quota changes.
+- **Prompts, tool schemas and eval sets are intellectual property** that may live in one person's head
+  or one unbacked-up notebook.
+- **Tool and MCP server suppliers.** An agent that books, files or pays through a third-party API stops
+  when that API changes terms or retires an endpoint, even if your model is fine.
+- **Human approvers are a dependency.** An agent whose consequential actions wait on a human gate is
+  only as continuous as the approver rota; holidays and sick days are continuity events.
+- **Embedding model lock-in.** The whole index depends on one embedding model; its retirement forces a
+  re-embed that must be planned like a migration.
 
 ### Strategies per function, in a ladder
-Each critical function gets a sequence of fallbacks, cheapest and most automatic first:
+Each agent-backed function gets a sequence of fallbacks, cheapest and most automatic first:
 1. **Automatic technical fallback**: secondary provider, smaller self-hosted model, cached results.
    Owned by engineering and covered by fault-tolerance mechanisms.
-2. **Degraded service**: retrieval-only answers, templated responses, longer queues, with customers
-   informed. Owned by product; the acceptable degradation is decided in advance, not in the incident.
+2. **Degraded service**: retrieval-only answers, templated responses, longer queues, or the agent drafts
+   and a human sends, with customers informed. Owned by product; the acceptable degradation is decided in
+   advance, not in the incident.
 3. **Manual workaround**: humans perform the function with a documented procedure and the minimum
    tooling, *because* the business function matters more than the automation that normally does it.
 4. **Suspension with communication**: the function pauses, customers and regulators are told what and
    when, and the backlog plan is known.
 
-### The three phases of an event
+### Phases, plans and drills (compressed)
 | Phase | What happens |
 |---|---|
 | **Response** | detect, contain, decide to activate, communicate |
@@ -99,29 +116,20 @@ Each critical function gets a sequence of fallbacks, cheapest and most automatic
 
 - **Plans are detailed about response and vague about recovery,** yet recovery is where data gets lost:
   tickets triaged on a spreadsheet never entered, fallback-model answers nobody re-checked.
-
-### Plans, roles and communication
-The business continuity plan documents:
-- **activation criteria:** who may declare an event and on what evidence;
-- **roles with named deputies** and decision authority during the event;
-- **a communication tree** for staff, customers and regulators;
-- **recovery and return-to-normal steps.**
-
-It is written for someone reading it at 3 a.m. with the usual experts unavailable, a different document
-from an architecture diagram.
-
-### Testing and maintenance
-- **Plans decay.**
-- **Tabletop exercises** walk the team through a scenario on paper and surface missing decisions.
-- **Functional drills** actually execute the fallback: switch provider in production for an hour, process
-  a day's work manually for a sample.
-- **Each exercise ends with recorded findings and owners.**
+- **The plan documents** activation criteria (who may declare an event, on what evidence), roles with
+  named deputies and decision authority, a communication tree for staff, customers and regulators, and
+  recovery and return-to-normal steps.
+- **Write it for 3 a.m.** with the usual experts unavailable; it is a different document from an
+  architecture diagram.
+- **Plans decay, so test them.** Tabletop exercises walk a scenario on paper and surface missing
+  decisions; functional drills execute the fallback (switch provider in production for an hour, process
+  a day's work manually for a sample). Each exercise ends with recorded findings and owners.
 - **Review** when architecture, suppliers or staffing change, and at least annually. ISO 22301 formalises
   this lifecycle; regulated customers may ask for alignment with it.
 
 ### Vendor exit as a continuity control
-For every critical supplier, know the exit:
-- portable prompts and evals that have been run on a second model;
+For every critical supplier of your agent (model, embedding model, tool APIs), know the exit:
+- portable prompts, tool schemas and evals that have been run on a second model;
 - an export path for the vector index and its embedding-model version;
 - contract clauses on notice periods;
 - a tested procedure to switch.
@@ -209,6 +217,24 @@ print(derived_rto_h(4, 2))
 - **If `drain_hours` returns infinity,** the restored service cannot outrun arrivals and the backlog plan
   needs extra capacity, not a shorter RTO.
 
+### Worked scenario: the approval queue is the continuity risk
+A refunds agent proposes refunds and a human approves each one. During a holiday week only two approvers
+are on the rota. Figures illustrative.
+
+| Quantity | Value |
+|---|---|
+| Refunds proposed by the agent at peak | 120 per hour |
+| Approver throughput | 2 people × 40 per hour = 80 per hour |
+| Backlog growth | 40 per hour, so 320 after an 8-hour day |
+| Customer promise | refund decision within 24 hours |
+
+- **Nothing is down,** yet the function misses its promise by day two. The BIA should list approvers as a
+  dependency with a minimum rota.
+- **Ladder options:** auto-approve refunds below a threshold the business accepts, route overflow to a
+  trained deputy group, or pause new proposals and tell customers the expected wait.
+- **Reconcile afterwards:** sample auto-approved refunds for errors, because the degraded rung changed
+  the control.
+
 ## Production patterns
 - **Monthly live fallback exercise.** Route a slice of production traffic, or all of it for one hour, to
   the second provider with its validated prompts. Monitor the eval-measured accuracy gap, fallback error
@@ -224,6 +250,9 @@ print(derived_rto_h(4, 2))
   deprecation notice arrives or quarterly.
 - **Reconciliation step in every recovery.** After stand-down, enter manually handled work into the system
   of record and re-check fallback-model outputs on a sample. Monitor items still unreconciled.
+- **Approver rota as a monitored dependency.** For agents behind human approval gates, track queue depth
+  and approver throughput, and page a deputy group when the backlog would breach the customer promise.
+  Monitor approval wait time p95.
 
 ## Trade-offs
 - **Thorough BIA vs owner time.** It focuses spend on the functions that matter, but takes real time from
@@ -236,6 +265,9 @@ print(derived_rto_h(4, 2))
   the balance tilts to more drills as contractual penalties and regulatory exposure grow.
 - **Detailed vs short plans.** Detailed plans cover more scenarios but go stale faster; shorter plans with
   clear roles and a decision tree survive turnover better than hundred-page binders.
+- **Human gates vs continuity.** Approval gates make agent actions safer but turn approver availability
+  into a dependency; relaxing the gate during a disruption keeps the function alive at the price of
+  weaker control.
 
 ## Pitfalls
 - **Writing the plan for systems instead of functions.** The team restores the database while nobody
@@ -251,6 +283,8 @@ print(derived_rto_h(4, 2))
   record.
 - **Ignoring supplier-side disruptions** such as deprecations, quota cuts and terms changes because the
   dashboard is green; the symptom is a ninety-day deadline nobody planned for.
+- **Forgetting the agent's tool suppliers.** The model has a fallback, but the booking or payments API
+  the agent acts through has none; the symptom is an agent that answers fine and cannot do its job.
 
 ## When to use
 - **Do a BIA** the moment an AI feature supports a function someone depends on contractually or
@@ -306,6 +340,13 @@ silent quality drop.
 - **Rung 3:** a documented manual workaround with a named lead; **rung 4:** suspend and communicate, with a
   backlog plan.
 
+### Your agent's tool vendor announces it is retiring the API the agent books through. What do you do?
+- **Treat it as a continuity event:** the function stops on the retirement date even though the model is
+  fine, so it goes on the plan with a dated owner.
+- **Run the exit:** find the replacement API, update the tool schema and adapter behind a stable tool
+  name, and rerun the agent eval set to catch changed arguments or results.
+- **Keep a manual rung** (agent drafts, human books) until the new tool passes evals in production.
+
 ### When is a validated second model provider not worth it?
 - **When the function is non-critical** and can wait for the primary to return; running evals twice and
   managing behaviour differences then costs more than the outage.
@@ -341,3 +382,23 @@ silent quality drop.
 - [ ] A load balancer health check marking a node unhealthy
 > Key-person loss stops a function's ability to change or recover safely without any system going
 > down. BC treats people and knowledge as dependencies to be documented and duplicated.
+
+## Use cases & projects
+### Use cases
+- **Support and triage agents under contract.** A continuity ladder (second model, rules, manual triage,
+  communicated pause) keeps first-response SLAs during a provider outage.
+- **Model deprecation notices.** Portable prompts and a versioned eval set turn a retirement into
+  scheduled migration work instead of a scramble.
+- **Agents behind human approval gates.** Approver rotas, deputies and threshold-based auto-approval keep
+  the function alive when approvers are unavailable.
+- **Enterprise security questionnaires.** "What happens if your AI vendor is unavailable" is answered
+  with drill dates, fallback eval gaps and manual-mode throughput.
+
+### Mini project
+**Write and drill a one-page continuity ladder for an agent (1-2 hours).**
+- **Goal:** prove an agent-backed function survives its model provider going away for an afternoon.
+- **Steps:** pick a small agent (for example a ticket classifier); write a BIA line with maximum
+  tolerable downtime; implement a degraded-mode flag that switches to a second model, then to keyword
+  rules; run your eval set on each rung; size the manual rung with the backlog code above.
+- **Done when:** a one-page plan lists rungs, owners and activation criteria, and a table shows each
+  rung's accuracy, throughput and the derived RTO.

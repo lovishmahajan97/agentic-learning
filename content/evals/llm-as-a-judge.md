@@ -439,3 +439,24 @@ feeds back into the rubric and triggers re-calibration when the generator change
 > Judges misgrade executable artifacts by inspection. A SQL query can be run against a fixture and
 > compared to the expected rows deterministically, which is cheaper and more reliable than any judgment.
 > Tone, groundedness and completeness against the question are the kinds of criteria that need a judge.
+
+## Use cases & projects
+### Use cases
+- **Grading groundedness of a RAG agent's reply.** A judge checks whether each claim in the final answer
+  is supported by what the retrieval and tools returned.
+- **Scoring trajectories.** A judge reviews the plan and tool sequence for cases code cannot assert, such
+  as whether the agent should have asked a clarifying question.
+- **Online monitoring of sampled production traces.** A calibrated judge flags low-quality replies daily
+  so the team reviews the worst ones first.
+- **Critic step inside the agent.** A judge-style review of a draft before it is sent catches unsupported
+  claims, at the cost of an extra model call.
+
+### Mini project
+**Build and calibrate a groundedness judge for a RAG agent (2-3 hours).**
+- **Goal:** create a judge you can trust to grade one criterion on agent replies.
+- **Steps:** collect 50 replies with the tool results each was based on; label each by hand as grounded
+  or not; write a judge prompt for that single criterion with anchors and a yes/no verdict plus reason;
+  run it, swapping the order of inputs where relevant; measure agreement with your labels and read every
+  disagreement; revise the rubric once and re-measure.
+- **Done when:** you have an agreement number before and after the revision, a list of the judge's error
+  patterns, and a stated threshold below which the judge may not gate a release.

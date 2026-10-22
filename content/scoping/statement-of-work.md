@@ -5,7 +5,8 @@ name: Statement of work
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - scoping/success-metrics-kpis
   - scoping/requirements-traceability
@@ -17,23 +18,35 @@ related:
 ---
 
 ## TL;DR
-A statement of work (SOW) is the project contract: deliverables, acceptance, customer obligations, out
-of scope and change control. AI work needs a stricter one, because outputs are probabilistic: acceptance
-is statistical on an agreed eval set, and customer dependencies are dated obligations.
+A statement of work (SOW) is the contract for your agent project: deliverables, acceptance, customer
+obligations, out of scope and change control. Agents need a stricter one: statistical acceptance on a
+frozen eval set, and named tools and actions.
+
+## For agent builders
+- **Why it matters for agents.** An agent acts: it calls APIs, writes records, sends messages. The SOW is
+  where "which actions, on which systems, with what approval" gets agreed, and where task-level acceptance
+  replaces "it seems to work in the demo".
+- **Where it shows up in your stack.** Acceptance clauses become your eval harness and frozen scenario
+  set; action scope becomes the tool list and permissions you register; data-handling clauses become trace
+  retention and redaction settings.
+- **What you control.** Proposing a phased SOW, writing acceptance as a computation, listing write actions
+  as explicitly in or out of scope, and making credentials and sandbox access dated customer obligations.
+- **What you can skip.** The legal terms in the MSA. Leave liability and IP wording to counsel, and this
+  lesson is not legal advice.
 
 ## Why it exists
-- **Two parties start with different finish lines.** The customer imagines "an assistant that answers our
-  policy questions correctly." The vendor or internal team imagines "a RAG prototype over the documents you
-  give us." The gap stays invisible until the delivery date, when it becomes a dispute about money and
-  reputation. The SOW makes the pictures match in writing while changing them is still cheap.
+- **Two parties start with different finish lines.** The customer imagines "an agent that answers our
+  policy questions and updates the case correctly." The vendor or internal team imagines "a RAG prototype
+  over the documents you give us." The gap stays invisible until the delivery date, when it becomes a
+  dispute about money and reputation. The SOW makes the pictures match while changing them is still cheap.
 - **"Answer questions correctly" cannot be accepted or rejected,** because any probabilistic system answers
   some questions wrongly, so the customer can always find a failure.
-- **Undated dependencies become your missed milestone.** "Customer will provide data" with no date or format
-  turns a three-week data delay into the delivery team's slip.
+- **Undated dependencies become your missed milestone.** "Customer will provide data" (or API credentials
+  for the agent's tools) with no date or format turns a three-week delay into the delivery team's slip.
 - **Fixed scope and price on an unmeasured quality level** transfers unpriced research risk to whoever
   signed it.
 - **Ownership and operation questions arrive at the worst moment** when nothing says who owns the eval set,
-  prompts and fine-tuned weights, or who operates the system after go-live. The SOW settles these before
+  prompts and fine-tuned weights, or who operates the agent after go-live. The SOW settles these before
   work starts, while each side can still walk away.
 
 ## How it works
@@ -42,18 +55,18 @@ is statistical on an agreed eval set, and customer dependencies are dated obliga
   agreement (MSA).
 - **Each project gets an SOW under it** with the specifics. An order-of-precedence clause says which
   document wins when they conflict.
-- **Internal projects** often have a charter or project brief that does the same job; the structure below
-  applies to both.
+- **Internal agent projects** often have a charter or project brief that does the same job; the structure
+  below applies to both.
 - **Caveat:** the legal terms are for counsel, and this lesson is not legal advice.
 
 ### Core sections
 1. **Objective and success metrics.** The business problem and the agreed metric tree, so every deliverable
    can be traced to a purpose.
-2. **Scope and deliverables.** Concrete artefacts: a deployed service in a named environment, an eval
-   report, a runbook, a handover session. Name the use cases, document types, languages and channels in
-   scope.
+2. **Scope and deliverables.** Concrete artefacts: a deployed agent service in a named environment, an eval
+   report, a runbook, a handover session. Name the use cases, document types, languages, channels and
+   tools in scope.
 3. **Out of scope.** Explicit, because scope disputes are almost always about what was *assumed* to be
-   included: other languages, write-back to the CRM, mobile, 24/7 support.
+   included: other languages, write-back to the CRM, mobile, 24/7 support, new tools.
 4. **Acceptance criteria.** Each deliverable has an observable test, and for model behaviour it is
    statistical: "On the agreed held-out eval set of N cases, field accuracy is at least X% overall and at
    least Y% on each named critical field, with no critical-severity failures, measured by the agreed
@@ -61,22 +74,24 @@ is statistical on an agreed eval set, and customer dependencies are dated obliga
    - Name who runs the test, how long the customer has to accept or reject, and what happens if they do
      not respond, for example deemed acceptance after 10 business days.
 5. **Customer responsibilities.** Each a dated obligation: data extract in a specified format by a date,
-   SSO and network access by a date, SME hours per week for labelling and review, security review
-   turnaround. State the consequence when one slips: the timeline moves day for day.
-6. **Assumptions.** Facts the plan rests on, such as volumes, document formats, API availability and model
-   provider access. Each one, if false, triggers change control.
+   SSO, network and tool API access by a date, SME hours per week for labelling and review, security
+   review turnaround. State the consequence when one slips: the timeline moves day for day.
+6. **Assumptions.** Facts the plan rests on, such as volumes, document formats, API availability and rate
+   limits, and model provider access. Each one, if false, triggers change control.
 7. **Timeline and milestones,** ideally phase-gated: discovery, then proof of concept, then pilot, then
    production. Each gate has exit criteria and a go/no-go decision.
 8. **Change control.** How a change is requested, estimated, approved and priced. Without it, small
-   additions accumulate unpaid.
+   additions (one more tool, one more channel) accumulate unpaid.
 9. **Roles, governance and support boundaries.** Who decides, the steering cadence, the escalation path, and
    who operates, monitors and pays for inference after go-live.
 10. **Commercials.** Fixed fee, time and materials, or milestone-based payment, tied to the gates.
 
-### AI-specific clauses
+### AI- and agent-specific clauses
+- **Action scope and autonomy.** List each tool, whether it reads or writes, and which write actions need
+  human approval. A new write action is a change request, because it changes the risk profile.
 - **Eval set ownership and freeze.** Agree who builds the acceptance set (ideally jointly with the
   customer's SMEs), that it is representative, and that it is frozen before tuning, so acceptance does not
-  chase a moving target.
+  chase a moving target. For agents, include end-to-end task scenarios, not just single answers.
 - **Model and provider changes.** State what happens if the provider deprecates the model or changes
   pricing mid-project, and that re-validation counts as a change.
 - **Phase-based commitment.** Commit to quality targets only after a discovery or PoC phase has measured
@@ -85,12 +100,13 @@ is statistical on an agreed eval set, and customer dependencies are dated obliga
   threshold applies to the point estimate or to a confidence bound, and size N to match.
 - **Zero-tolerance lines need the same care.** Zero failures in N cases shows, at 95% confidence, only that
   the true rate is below about 3/N (the "rule of three"). If a failure type truly must never happen, also
-  require a deterministic control, such as a validator or a hard filter, not just a clean eval run.
+  require a deterministic control, such as a validator, a hard filter or a tool permission the agent
+  cannot bypass, not just a clean eval run.
 - **Post-acceptance performance.** Acceptance certifies behaviour on a frozen set at one date, and
   production inputs drift afterwards. State the warranty period, who monitors which metrics after go-live,
   the threshold that triggers remediation, and whether remediation is in scope or a change.
-- **Data handling.** Where customer data goes, retention, use (or no use) for training, and deletion at the
-  end. This often references the data processing agreement.
+- **Data handling.** Where customer data goes (including agent traces and tool results), retention, use
+  (or no use) for training, and deletion at the end. This often references the data processing agreement.
 
 ## Diagram
 A phase-gated SOW: each gate turns measured results into the next commitment, and any change or false
@@ -107,7 +123,7 @@ flowchart TD
     G2 -->|"failing cases listed"| F["Fix and re-run"]
     F --> A
     G2 -->|"accepted or silent"| W["Go-live, warranty, support boundary"]
-    CR["Change request or false assumption"] -.->|"estimate, approve, price"| P
+    CR["Change request, new tool or false assumption"] -.->|"estimate, approve, price"| P
 ```
 
 ## Examples
@@ -146,9 +162,31 @@ All thresholds and dates here are illustrative. What the strong version achieves
 | Dated dependency with a consequence | a late extract moves the schedule instead of eating the team's time |
 | Explicit out of scope | in week 4 the customer asks for posting to the ERP; clause 6.3 makes it a change request with its own estimate rather than an argument |
 
+### Worked scenario: action scope and acceptance for an AP agent (illustrative)
+The same customer later asks for an agent that resolves invoice exceptions by looking up purchase orders
+and emailing suppliers. The pilot SOW adds an action table and task-level acceptance.
+
+| Tool | Access | Approval | In scope |
+|---|---|---|---|
+| `lookup_po` | read | none | yes |
+| `draft_supplier_email` | write (draft only) | AP clerk sends | yes |
+| `post_to_ledger` | write | n/a | no, clause 6.3 |
+
+| Acceptance line (200 frozen exception scenarios) | Threshold | Allows |
+|---|---|---|
+| Task resolved correctly, graded per rubric | at least 85% | up to 30 failed scenarios |
+| Agent escalates instead of guessing on the 20 "ambiguous PO" scenarios | at least 18 of 20 | 2 misses |
+| Calls to any tool outside the table | zero, enforced by the tool registry | rule of three: below 1.5% (3/200) from the run alone |
+| Median model cost per scenario | at most the agreed cap | measured by the harness from usage fields |
+
+- **The action table is the risk boundary.** Adding `post_to_ledger` later is a change request with its
+  own security review, not a prompt tweak.
+- **Zero out-of-scope calls is backed by permissions,** not only by the eval run, for the same rule-of-three
+  reason as the currency line.
+
 ### Acceptance harness for clause 4.2
 A minimal, runnable version of the computation behind the clause. It also shows how the choice between
-point estimate and confidence bound changes the verdict.
+point estimate and confidence bound changes the verdict; the same structure grades agent scenarios.
 
 ```python
 import math
@@ -188,16 +226,19 @@ print(accept(rows)["rule_of_three_bound"])          # 0.005, about 0.5%
 - **Phase-gated SOWs.** Sign a short discovery and PoC SOW first, then a pilot or production SOW whose
   thresholds come from the PoC measurements. Track each gate's exit criteria and the go/no-go decision in
   the steering notes.
-- **Acceptance set under version control.** Store the frozen acceptance set, its labelling guide and the
-  harness in a repository both parties can read, with a content hash recorded in the SOW appendix. Monitor
-  that the hash at acceptance matches the signed one.
-- **Dependency tracker with day-for-day clauses.** Keep each customer obligation, its due date and its
-  actual delivery date in a shared tracker reviewed at every steering meeting. Monitor cumulative slip
-  days, because they move milestones under the day-for-day clause.
+- **Acceptance set under version control.** Store the frozen acceptance set (answers and agent scenarios),
+  its labelling guide and the harness in a repository both parties can read, with a content hash recorded
+  in the SOW appendix. Monitor that the hash at acceptance matches the signed one.
+- **Action table mirrored in the tool registry.** Generate the agent's registered tools and permissions
+  from the SOW's action table, so an unlisted tool cannot be called. Monitor for any tool call not in the
+  table and treat it as a contract breach to investigate.
+- **Dependency tracker with day-for-day clauses.** Keep each customer obligation (data, SSO, tool API
+  credentials, sandbox access), its due date and its actual delivery date in a shared tracker reviewed at
+  every steering meeting. Monitor cumulative slip days, because they move milestones.
 - **Change log tied to clauses.** Log every change request with the SOW clause it touches, its estimate and
   its approval. Monitor the number of unapproved requests in flight, which signals scope creep.
 - **Post-go-live monitoring clause.** Name the metrics, owner and remediation threshold for the warranty
-  period, and wire the same harness to a sample of production traffic. Monitor drift against the
+  period, and wire the same harness to a sample of production agent traces. Monitor drift against the
   acceptance numbers.
 
 ## Trade-offs
@@ -210,30 +251,33 @@ print(accept(rows)["rule_of_three_bound"])          # 0.005, about 0.5%
   effort to agree on and to build the eval set for. That effort is worth it whenever payment or go-live
   depends on acceptance.
 - **Protection vs speed to signature.** A long out-of-scope list protects the delivery team but can read as
-  defensive and slow the signature. Focus it on the extensions customers most often assume are included.
+  defensive and slow the signature. Focus it on the extensions customers most often assume are included,
+  such as extra write actions.
 - **Capped loss vs repeated negotiation.** Phase gates let both sides stop early, which caps loss. The cost
   is negotiating several times, which only pays off when uncertainty is high.
 
 ## Pitfalls
 - **Acceptance criteria in prose such as "accurate" or "production-ready".** Symptom: an acceptance meeting
   where the customer shows three wrong answers and refuses sign-off.
-- **Customer dependencies without dates or consequences.** Symptom: the team waits weeks for data or access
-  while the delivery date stays fixed.
+- **Customer dependencies without dates or consequences.** Symptom: the team waits weeks for data, tool API
+  credentials or access while the delivery date stays fixed.
 - **Committing to a quality target before measuring feasibility on real data.** Symptom: a project that is
   technically sound but contractually failed because the data was worse than the sample.
+- **No action scope for the agent.** Symptom: mid-pilot the customer expects the agent to update records it
+  was only meant to read, and nobody can point to a clause. Fix: an action table with approval rules.
 - **No support boundary after go-live.** Symptom: the delivery team is paged for production incidents
   months after the engagement ended.
 - **An eval set the customer can change during the project.** Symptom: acceptance thresholds are met and
   then the set is "updated" with new hard cases before sign-off.
 
 ## When to use
-- **Use when:** someone outside the team must accept the result, and especially when money or a go-live
+- **Use when:** someone outside the team must accept the agent, and especially when money or a go-live
   date depends on it.
 - **Draft it:** at the end of scoping, once the success metrics, baseline plan and dependencies are known.
   Ideally phase it so the first SOW covers only discovery and a PoC.
 - **Lighter version:** for a two-week internal spike, a one-page brief with objective, out of scope and an
   exit question is enough.
-- **Day to day:** the SOW is the reference in every scope discussion.
+- **Day to day:** the SOW is the reference in every scope discussion, including "can the agent also do X?"
 - **Interviews:** expect "how would you write acceptance criteria for a model?" The answer is a frozen,
   representative eval set, per-slice thresholds, a zero-tolerance list and a named harness.
 
@@ -257,11 +301,20 @@ the frozen set, zero-tolerance error types, and dated customer obligations. This
 early exit and a defensible target, and it stops either side from pricing a guess.
 
 ## Interview questions
-### How is an SOW for an AI project different from one for ordinary software?
-- **Acceptance is statistical:** a rate on a frozen, representative eval set with per-field thresholds and
-  a named harness, because a probabilistic system always fails on some inputs.
-- **Extra clauses:** eval set ownership and freeze, model deprecation and re-validation, data handling,
-  post-acceptance drift monitoring, and phase-based commitment before quality targets.
+### How is an SOW for an AI agent project different from one for ordinary software?
+- **Acceptance is statistical:** a rate on a frozen, representative eval set (answers and end-to-end task
+  scenarios) with per-field thresholds and a named harness, because a probabilistic system always fails on
+  some inputs.
+- **Extra clauses:** action scope and approvals, eval set ownership and freeze, model deprecation and
+  re-validation, data and trace handling, post-acceptance drift monitoring, and phase-based commitment.
+
+### How would you write the scope and acceptance for an agent that can take write actions?
+- **List every tool** with read or write access and which writes need human approval; a new write action
+  is a change request.
+- **Accept on task scenarios,** with a resolution threshold, an escalation threshold on ambiguous cases and
+  a cost cap per scenario.
+- **Back zero-tolerance lines with permissions,** such as a tool registry generated from the action table,
+  because a clean run of 200 only bounds the rate below about 1.5%.
 
 ### The customer shows three wrong answers at acceptance and refuses to sign. What went wrong, and how do you recover?
 - **Root cause:** acceptance was written in prose, so any failure counts as a breach.
@@ -281,8 +334,8 @@ early exit and a defensible target, and it stops either side from pricing a gues
   master for that supplier, which is what makes "zero" credible.
 
 ### What belongs in the customer-responsibilities section, and why the day-for-day clause?
-- **Dated obligations:** data extract format and date, SSO and network access, SME hours per week, security
-  review turnaround.
+- **Dated obligations:** data extract format and date, SSO, network and tool API access, SME hours per
+  week, security review turnaround.
 - **Day-for-day movement** makes slips visible and fair, so a late extract moves milestones instead of
   silently consuming the delivery team's time.
 
@@ -313,3 +366,25 @@ early exit and a defensible target, and it stops either side from pricing a gues
 > Quality depends on the customer's data and task definition, so other customers' results or public
 > benchmarks do not transfer. Once feasibility is measured on real data, the risk is known well enough
 > to price.
+
+## Use cases & projects
+### Use cases
+- **Agent pilots with a customer.** The action table and scenario-based acceptance keep "can it also send
+  the email?" from becoming an unpaid scope change.
+- **Fixed-fee discovery for agent ideas.** A first SOW buys measurement on real data, so the pilot SOW's
+  thresholds are earned rather than guessed.
+- **Internal platform teams.** A one-page brief with tools in scope, exit question and acceptance harness
+  does the same job for an internal agent.
+- **Model migrations mid-engagement.** A re-validation clause makes a provider's model retirement a priced
+  change instead of a free rebuild.
+
+### Mini project
+**Write an agent SOW and its acceptance harness (2-3 hours).**
+- **Goal:** turn a vague agent request into SOW clauses that a script can accept or reject.
+- **Steps:** pick a small agent (for example a support agent with two read tools and one draft-only write
+  tool); write the deliverables, out-of-scope list, action table, dated customer obligations and
+  acceptance lines; build 50 frozen scenarios; extend the `accept` harness to grade task resolution,
+  escalations and out-of-table tool calls; run it on your agent with point-estimate and lower-bound
+  readings.
+- **Done when:** the harness prints pass or fail per clause, the two readings disagree on at least one line
+  you then resolve in the clause wording, and an unlisted tool call is blocked by the registry.

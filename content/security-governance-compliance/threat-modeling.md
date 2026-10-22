@@ -5,7 +5,8 @@ name: Threat modeling
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - security-governance-compliance/ai-security
   - security-governance-compliance/zero-trust
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-Threat modeling answers four questions: what are we building, what can go wrong, what will we do, did
-we do well. For AI systems the diagram marks every flow of untrusted text into the context and every
-output that becomes an action.
+Before an agent ships a new tool, threat modeling answers four questions: what are we building, what can
+go wrong, what will we do, did we do well. The diagram marks every untrusted flow into the context and
+every output that becomes an action.
+
+## For agent builders
+- **Why it matters for agents.** Each tool, content source or identity you add changes what one injected
+  instruction can reach. The diagram is the only place the path from "read a pasted link" to
+  "`issue_refund`" becomes visible before an attacker finds it.
+- **Where it shows up in your stack.** The design doc for a new tool, the threat register beside your
+  architecture decision records, the CI lint over that register, and the adversarial cases in your agent
+  eval suite.
+- **What you control.** Which flows exist at all (eliminate beats reduce), what each tool checks in code,
+  which turns need approval, and whether every attacker story has a test that runs on every prompt or
+  model change.
+- **What you can skip.** Precise risk scores and exhaustive taxonomies. Coarse buckets, STRIDE as a
+  completeness prompt and attacker stories you can turn into eval cases carry nearly all the value.
 
 ## Why it exists
 - **Controls chosen without a model are chosen at random.** Threat modeling finds classes of problems,
@@ -304,6 +318,14 @@ added to the evaluation suite; and the register updated with an owner for each t
 - **Track two numbers:** percentage of threats with a verified test, and time from a new-tool pull request
   to an updated register.
 
+### You are splitting one agent into a planner and three worker agents. How does the threat model change?
+- **New flows appear between agents.** Each worker's output becomes the planner's input, so a worker that
+  read untrusted content passes attacker text upward with the standing of a trusted teammate.
+- **Spoofing becomes real:** one agent can claim to be another, so messages need an identity the
+  orchestrator sets, not one written in the text.
+- **Re-draw identities per agent:** each worker gets only its own tools and credentials, so a steered
+  worker cannot borrow the planner's privileges.
+
 ## Quiz
 ### Q: In a data-flow diagram for an LLM application, why should tool output be labelled as its own trust level rather than merged with "system data"?
 - [ ] Tool outputs are usually larger than other inputs and need separate size limits
@@ -330,3 +352,23 @@ added to the evaluation suite; and the register updated with an owner for each t
 - [ ] The diagram uses standard STRIDE notation throughout
 > Shostack's fourth question is "did we do a good job", and the answer is verification. Volume of threats
 > or tidy notation proves nothing about how the system behaves under attack.
+
+## Use cases & projects
+### Use cases
+- **Adding a tool to a live agent.** A browse, email or payment tool triggers a register update and new
+  adversarial eval cases before the pull request merges.
+- **Multi-agent redesigns.** Splitting one agent into planner and workers adds inter-agent flows and
+  identities that the old diagram never showed.
+- **Deploying into a customer's estate.** A joint diagram walk with their security team maps their
+  controls onto your register and shortens their sign-off.
+- **RAG over shared corpora.** The diagram exposes cross-tenant retrieval and poisoned-document paths that
+  a chat-box review misses.
+
+### Mini project
+**Threat-model and test a small support agent (2-3 hours).**
+- **Goal:** turn a diagram into a register whose every mitigation is proven by a test.
+- **Steps:** sketch the data-flow diagram for an agent with retrieval, `read_order`, `issue_refund` and
+  `fetch_url`; walk STRIDE and write five attacker stories; record a decision per threat in a register
+  file; add the CI lint from this lesson; write one adversarial eval case per mitigated story.
+- **Done when:** the lint passes with no missing decisions, owners or tests, and deleting any one control
+  makes its matching eval case fail.

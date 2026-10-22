@@ -441,3 +441,24 @@ tracing and an evaluation set built from historical tickets with their resolutio
 > Retrieval, planning and fine-tuning are shape-specific. Evaluation, tracing and output control are
 > cross-cutting because every shape has probabilistic output whose quality must be measured and whose
 > downstream effects must be bounded.
+
+## Use cases & projects
+### Use cases
+- **Deciding agent versus workflow.** Walking the six questions before building stops a team from
+  shipping an open-ended loop for a job whose steps can be enumerated.
+- **Reviewing a new agent design.** The matching shape's checklist asks where the eval set, tracing,
+  control layer and approval gates are, so missing boxes surface in review, not production.
+- **Composing an agent product.** A support agent is often a RAG assistant plus a tool-using agent plus
+  a gateway; naming the shapes lets teams reuse shared services.
+- **Onboarding engineers to an agent platform.** One page per shape gives new engineers the vocabulary
+  and the reasons behind each box.
+
+### Mini project
+**Classify and blueprint three agent ideas (1-2 hours).**
+- **Goal:** practise matching problems to shapes and writing down deviations.
+- **Steps:** pick three ideas (for example invoice extraction, a docs Q&A bot, a ticket-triage agent
+  that can call an API); walk the six questions for each; choose a shape; draw the boxes with mermaid;
+  write one ADR per deliberate deviation, such as dropping a reranker.
+- **Done when:** each idea has a named shape, a diagram that includes the cross-cutting boxes (eval set,
+  tracing, control layer), and at least one ADR, and at least one idea was classified as a workflow
+  rather than an agent with the reason stated.

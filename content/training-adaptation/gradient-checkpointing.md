@@ -458,3 +458,25 @@ cuts stored activations to one block input per layer (~67 MB each, ~2 GB total) 
 > live block eager attention still builds the full `5·a·s²·b` score tensors, about 10 GB for a single 7B layer
 > at 8k, so the floor is set by one block and only a kernel that never materialises the matrix removes it.
 > Optimizer state in QLoRA is tiny, and accumulation steps do not keep activations alive between micro-batches.
+
+## Use cases & projects
+### Use cases
+- **Fine-tuning a tool-calling model on whole trajectories.** Long agent traces (system prompt, tool
+  schemas, every call and result) only fit on one GPU with checkpointing and FlashAttention both on.
+- **Distilling a large agent into a small one.** Teacher trajectories are long by construction, so the
+  student's SFT run is activation-bound and checkpointing sets the maximum trace length you can keep.
+- **Training a RAG answerer on long retrieved contexts.** Several retrieved passages per example push
+  sequence length up, and checkpointing keeps those examples intact instead of truncating the evidence.
+- **Debugging a LoRA run on agent data that does not learn.** Flat loss with checkpointing on is the
+  classic reentrant zero-gradient trap, and knowing it saves a day of data hunting.
+
+### Mini project
+**Fit a 16k-token agent trace on one GPU (1-3 hours).**
+- **Goal:** measure what gradient checkpointing buys when fine-tuning a small model on full agent
+  trajectories, and confirm the adapters actually receive gradients.
+- **Steps:** export or synthesise 50 tool-calling traces as chat rows with a `tools` field; render them
+  with the model's chat template and record lengths; run a few QLoRA steps on a small instruct model with
+  checkpointing off, then on with `use_reentrant=False`, then on with the reentrant default and frozen
+  embeddings; log peak memory with `torch.cuda.max_memory_allocated()`, step time and LoRA gradient norms.
+- **Done when:** you have a table of peak memory and step time for each setting, the longest trace fits
+  untruncated with checkpointing on, and you can show the reentrant run's zero gradient norms and the fix.

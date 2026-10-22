@@ -5,7 +5,8 @@ name: Enterprise connectors (Salesforce, SAP, ServiceNow, SharePoint, Confluence
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - enterprise-integration/incremental-synchronization-and-cdc
   - enterprise-integration/webhooks
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-A connector pulls content, metadata and permissions out of a system of record and keeps that copy
-current, or lets an agent act in it. The hard parts are auth, rate limits, change, deletions and
-permissions; missing one makes the assistant stale or leaky.
+Connectors are how an enterprise agent sees and acts: they sync content, metadata and permissions into
+its RAG index, or expose a system as a tool. Get auth, rate limits, change, deletions or permissions
+wrong and the agent is stale or leaky.
+
+## For agent builders
+- **Why it matters for agents.** An agent is only as useful as the systems it can reach. Retrieval tools
+  read the synced copy; action tools (create a Jira issue, look up an SAP order) call the source live. Both
+  inherit every auth, quota and permission decision the connector makes.
+- **Where it shows up in your stack.** The ingestion pipeline behind your vector store, the MCP servers or
+  function tools your agent calls, the tool's OAuth app registration in the customer tenant, and the
+  retrieval filter that applies ACLs before the model sees a chunk.
+- **What you control.** Sync versus live-tool per source, which identity each tool call uses (service
+  account or the end user's delegated token), per-tool call budgets so a looping agent cannot exhaust the
+  customer's API quota, and the canonical document shape every source normalizes into.
+- **What you can skip.** Memorising each vendor's object model. Know the five-step contract, how each
+  source models change and permissions, and the backfill arithmetic; read the vendor docs per project.
 
 ## Why it exists
 - **Knowledge is scattered.** Enterprise knowledge lives in a dozen SaaS and on-prem systems (Salesforce,
@@ -42,7 +56,8 @@ permissions; missing one makes the assistant stale or leaky.
   3. it never notices deletions, so documents removed for legal reasons keep surfacing;
   4. it hard-codes one tenant's quirks, so the second customer breaks it.
 - **A connector is the disciplined version.** A repeatable contract for auth, enumeration, change
-  tracking, permissions and normalization that every source implements.
+  tracking, permissions and normalization that every source implements, so every agent tool on top of it
+  behaves the same way.
 
 ## How it works
 ### The connector contract
@@ -60,6 +75,17 @@ embedding, ACL-aware retrieval, tool calling) should not care where a document c
 5. **Normalize** into a canonical document (id, source URL, title, body, author, timestamps, ACL, source
    metadata) so one indexing pipeline serves all sources.
 
+### Two shapes an agent consumes
+| Shape | What the agent calls | Freshness | Permission enforcement |
+|---|---|---|---|
+| Synced corpus | A `search_docs` retrieval tool over your index | One sync cycle behind | ACL filter on stored principals |
+| Live tool | An action or lookup tool calling the source API | Current | The source's own checks, if called as the user |
+
+- **Prose goes in the corpus** (Confluence pages, SharePoint files, Slack threads), because agents need
+  ranked semantic search across them.
+- **Records and actions go behind tools** (SAP orders, ServiceNow incidents, creating Jira issues), because
+  values change constantly and writes must hit the source.
+
 ### What differs per system
 | System | Access and query | Change tracking | Permission model |
 |---|---|---|---|
@@ -70,7 +96,7 @@ embedding, ACL-aware retrieval, tool calling) should not care where a document c
 | Confluence, Jira | Atlassian REST with CQL and JQL | Query by `lastmodified` or `updated` | Space permissions plus page restrictions inheriting down the tree; Jira project permission schemes plus optional issue security levels |
 | Slack | Web API (`conversations.history`, `conversations.replies`) for backfill | Events API for live changes | Channel membership, which changes often |
 
-Per-system caveats that change the design:
+Per-system caveats that change the agent design:
 - **Salesforce visibility is too complex to replicate faithfully**, so many connectors restrict scope to
   objects with simple sharing or check access at query time.
 - **SAP data is structured transactional records, not prose**, so the connector is more often a tool an
@@ -96,10 +122,10 @@ Per-system caveats that change the design:
   anonymous links) grant access to a scope, not a listed principal. Guest or external users have no IdP
   account. Neither may be dropped.
 - **Fail closed.** A principal that resolves to nobody grants nothing; it must never be ignored in a way
-  that widens access.
+  that widens access, because the agent will happily quote whatever retrieval returns.
 
 ### Sizing the first crawl
-The initial backfill, not the steady state, decides the project plan.
+The initial backfill, not the steady state, decides when the agent pilot can start.
 
 | Input (illustrative SharePoint tenant) | Value |
 |---|---|
@@ -113,7 +139,7 @@ Levers that follow from the arithmetic:
 - **Batch where the API allows it.** Graph JSON batching groups up to 20 requests per call, though
   throttling still counts the individual requests.
 - **Read permissions once per folder** whose inheritance is intact, instead of once per file.
-- **Crawl the highest-value containers first**, so the pilot is useful before the crawl finishes.
+- **Crawl the highest-value containers first**, so the pilot agent is useful before the crawl finishes.
 - **Make the crawl resumable** by checkpointing per container.
 - **Expect steady state to be cheap.** After the backfill, cost scales with the change rate, typically a
   small fraction of the corpus per day.
@@ -125,7 +151,8 @@ Levers that follow from the arithmetic:
   does not remove any of the auth, quota or permission work above.
 
 ## Diagram
-Every source runs the same five-step contract; only the cursor and the ACL vocabulary differ.
+Every source runs the same five-step contract; only the cursor and the ACL vocabulary differ. The agent's
+retrieval tool reads the ACL-aware index at the bottom.
 
 ```mermaid
 flowchart TD
@@ -139,13 +166,14 @@ flowchart TD
     P --> X["Crosswalk to IdP IDs"]
     X --> N["5. Normalize canonical doc"]
     N --> I[("ACL-aware index")]
+    I --> T["Agent search tool, filtered per user"]
     C -.->|"persist cursor last"| K[("Cursor store")]
 ```
 
 ## Examples
 ### SharePoint library sync with Graph delta queries
 The first call returns every item; later calls with the saved `deltaLink` return only changes, and
-deleted items carry a `deleted` facet, which is how the connector removes them from the index.
+deleted items carry a `deleted` facet, which is how the connector removes them from the agent's index.
 
 ```python
 import time, requests
@@ -196,6 +224,29 @@ What the code commits to:
   Graph has request options for reporting sharing changes on business drives; without them, or in
   addition, run a periodic permission resync.
 
+### The agent's retrieval tool over that index
+The tool the model calls never takes a user ID as an argument; the runtime injects the authenticated
+caller's resolved principals, so a prompt injection cannot ask for someone else's documents.
+
+```python
+SEARCH_TOOL = {
+    "name": "search_company_docs",
+    "description": "Search SharePoint, Confluence and Slack content the current user may see.",
+    "input_schema": {"type": "object",
+                     "properties": {"query": {"type": "string"}, "top_k": {"type": "integer"}},
+                     "required": ["query"]},
+}
+
+def run_search_tool(args: dict, session, index, crosswalk) -> list[dict]:
+    principals = crosswalk.principals_for(session.idp_user_id)   # user + expanded groups + link scopes
+    if not principals:
+        return []                                                # fail closed: unresolved user sees nothing
+    hits = index.search(args["query"], top_k=min(args.get("top_k", 8), 20),
+                        filter={"acl_any": principals})          # filter BEFORE ranking, not after
+    return [{"title": h["title"], "url": h["url"], "modified": h["modified"],
+             "snippet": h["text"][:500]} for h in hits]          # URLs let the agent cite sources
+```
+
 ### Backfill planner: will the pilot be ready in time?
 Plug in the item count, calls per item and the rate the source really gives you.
 
@@ -221,6 +272,21 @@ print(backfill_days(2_000_000, 2, 10, perms_per_folder=50_000))  # 2.4  inherita
 The per-folder plan only holds where inheritance is intact; folders with broken inheritance still need
 per-item reads.
 
+### Worked scenario: a sales agent eating the Salesforce quota
+An account-research agent calls a live `get_account` tool and a `list_opportunities` tool. Numbers are
+illustrative; check the org's real daily allocation in its limits endpoint.
+
+| Quantity | Value |
+|---|---|
+| Agent sessions per day | 2,000 |
+| Steps per session (median) | 6 |
+| Salesforce calls per step (tool plus pagination) | 2 |
+| Calls per day | 24,000 |
+| Same agent with a retry loop bug at p99 (40 steps) | adds thousands of calls from a few sessions |
+
+The fix was a per-session tool budget (stop after N Salesforce calls and say so), caching account
+lookups for the session, and alerting when the agent's share of the org's API usage passed the agreed slice.
+
 ## Production patterns
 - **Persist the cursor after the batch commits.** For every container, write items first and the delta
   token or watermark last, in the same job step. Monitor sync lag (source change to searchable) and the age
@@ -228,56 +294,63 @@ per-item reads.
 - **Run permission sync on its own, faster cadence.** A separate job re-reads ACLs and group membership
   (Slack channels, Entra groups) more often than content, because access changes matter more than edits.
   Monitor permission-sync lag and unresolved-principal count.
-- **Budget the customer's quota explicitly.** Agree a share of the API allocation with the customer's
-  admins, throttle the crawler to it, and honour `Retry-After` on every call. Salesforce reports org API
-  usage in a response header and a limits endpoint; Graph returns 429 with `Retry-After`. Monitor 429 rate
-  and calls per sync.
+- **Budget the customer's quota explicitly, crawler and agent together.** Agree a share of the API
+  allocation with the customer's admins, throttle the crawler to it, cap live tool calls per agent session,
+  and honour `Retry-After` on every call. Salesforce reports org API usage in a response header and a limits
+  endpoint; Graph returns 429 with `Retry-After`. Monitor 429 rate and calls per sync and per agent session.
+- **Inject identity in the runtime, not the prompt.** Retrieval and action tools take the caller's
+  identity from the authenticated session, never from model-supplied arguments, so injected text cannot
+  widen access. Monitor tool calls rejected for missing identity.
 - **Canary as a restricted test user.** Keep test users with known narrow access per source and run
-  scheduled queries as them; any hit on a document they cannot open in the source is a P1. Monitor the
-  permission-mismatch rate.
+  scheduled agent queries as them; any hit on a document they cannot open in the source is a P1. Monitor
+  the permission-mismatch rate.
 - **Reconcile deletions periodically.** Even with tombstones, list all live IDs per container on a slow
   schedule (weekly, say) and delete index entries the source no longer has. Monitor items deleted by
   reconciliation; a non-zero trend means the delta path is missing deletes.
 
 ## Trade-offs
-- **Copy-and-index vs federated live search.** Your own index gives fast, rankable retrieval but creates
-  a second copy whose permissions and freshness you must keep in sync. Federated search through source APIs
-  avoids the copy and flips the cost to latency and per-query rate limits.
+- **Copy-and-index vs federated live search.** Your own index gives the agent fast, rankable retrieval but
+  creates a second copy whose permissions and freshness you must keep in sync. Federated search through
+  source APIs avoids the copy and flips the cost to latency per agent step and per-query rate limits.
 - **Service accounts vs delegated tokens.** Application-level service accounts make crawling simple but
   see more than any user, so you must replicate ACLs. Delegated user tokens enforce source permissions
-  natively but see only one user's slice and stop working when the refresh token or consent is revoked.
+  natively on agent actions but see only one user's slice and stop working when the refresh token or
+  consent is revoked.
 - **Buy vs build.** A connector platform gets twenty sources quickly, but you inherit its permission
   fidelity and sync cadence. Building wins when one source is business-critical and needs field-level control.
-- **Index-time vs query-time permissions.** Syncing permissions at index time makes queries cheap, but
-  changes lag by one sync cycle. Checking access live is exact but adds a source API call per candidate
-  document.
+- **Index-time vs query-time permissions.** Syncing permissions at index time makes agent retrieval cheap,
+  but changes lag by one sync cycle. Checking access live is exact but adds a source API call per candidate
+  document, multiplied by every retrieval step the agent takes.
 
 ## Pitfalls
 - **Crawling with an admin token and dropping ACLs.** Symptom: a user reports the assistant quoted a
-  document they cannot open in the source system.
+  document they cannot open in the source system. Fix: capture ACLs at sync and filter per user.
 - **Nightly full re-fetches instead of delta cursors.** Symptom: HTTP 429s, and the customer's other
-  integrations fail during your crawl window.
+  integrations fail during your crawl window. Fix: delta tokens or change events.
 - **Ignoring deletions and permission removals.** Symptom: retrieval returns links that 404 or show
-  "access denied" in the source.
+  "access denied" in the source, and the agent cites them confidently.
 - **Treating broken inheritance as rare in SharePoint or Confluence.** Symptom: a few sensitive folders
   indexed with their parent site's wider audience.
 - **Joining users by display name or unverified email.** Symptom: ACL entries resolve to nobody (users see
   less than in the source) or to the wrong person after a name collision.
 - **Dropping sharing-link permissions because they name no principal.** Symptom: documents shared "with
   the organization" are invisible to everyone, or, if mapped carelessly, visible to guests.
+- **Letting the model pass the user or tenant as a tool argument.** Symptom: a red-team prompt retrieves
+  another user's documents. Fix: bind identity in the tool runtime from the session.
 - **Promising a source before checking scope, approval or licence.** Teams messages, Slack DMs or a SAP
   module can need extra steps. Symptom: a blocked project in week three.
 
 ## When to use
-- **Use when** an AI feature must read or act on a customer system more than once.
+- **Use when** an AI feature or agent must read or act on a customer system more than once.
 - **Pilot shortcut:** for a one-off pilot, an export file may be enough.
 - **Production minimum:** delta sync, deletion handling and permission capture from day one, because
   retrofitting ACLs onto a populated index means re-crawling it.
+- **Sync or tool:** sync prose the agent searches; call live for records it reads exactly or writes.
 - **Size before committing:** item count times calls per item divided by the sustained rate the source
   will actually give you.
-- **Measure:** sync lag (source change to searchable), API calls per sync and share of the customer's
-  quota, 429 rate, permission-mismatch rate from spot checks as restricted test users, unresolved-principal
-  count, and items in error.
+- **Measure:** sync lag (source change to searchable), API calls per sync and per agent session, share of
+  the customer's quota, 429 rate, permission-mismatch rate from spot checks as restricted test users,
+  unresolved-principal count, and items in error.
 - **Interviews:** name the five responsibilities and explain how one specific source models permissions
   and change.
 
@@ -314,10 +387,12 @@ source documents so access can be audited, and spot-check by querying as a restr
 - **Change the order, not just the speed:** crawl high-value sites first and checkpoint per container so a
   crash resumes instead of restarting.
 
-### A user says the assistant quoted a document they cannot open. How do you debug it?
-- **Find the chunk and its stored ACL**, then compare with the item's current permissions in the source.
+### A user says the agent quoted a document they cannot open. How do you debug it?
+- **Find the chunk and its stored ACL** from the agent trace's retrieval step, then compare with the item's
+  current permissions in the source.
 - **Common causes:** admin-token crawl with no ACL, broken inheritance indexed with the parent's audience, a
-  sharing link mapped too widely, or a permission removal not yet synced.
+  sharing link mapped too widely, a permission removal not yet synced, or a tool that trusted a
+  model-supplied user argument.
 - **Fix the class, not the item:** add a restricted-user canary and a faster permission-sync job.
 
 ### When would you check permissions live at query time instead of syncing them?
@@ -327,10 +402,17 @@ source documents so access can be audited, and spot-check by querying as a restr
 - **Cost:** a source API call per candidate document, so it suits small candidate sets and sources with
   generous rate limits.
 
-### Does wrapping a source as an MCP server solve integration?
+### Does wrapping a source as an MCP server solve integration for your agent?
 - **It standardises the tool interface** an agent sees, which helps reuse across agents and hosts.
 - **It does not remove** OAuth app registration, scopes, rate limits, change tracking or permission
   enforcement; the MCP server still has to implement all of them.
+
+### Which customer systems would you sync for the agent and which would you expose as live tools?
+- **Sync prose** that needs semantic search across many items: Confluence, SharePoint, Slack threads.
+- **Expose as tools** records that must be exact and current or that the agent writes: SAP orders,
+  ServiceNow incidents, Salesforce opportunities, Jira issue creation.
+- **Guard the tools** with per-session call budgets and the user's own identity, because a looping agent
+  can drain a shared API quota in minutes.
 
 ## Quiz
 ### Q: Why do production connectors use delta tokens or change events rather than nightly full crawls?
@@ -359,3 +441,23 @@ source documents so access can be audited, and spot-check by querying as a restr
 > Orders, materials and invoices are rows, not prose, and change constantly; querying them live through
 > OData or BAPI calls returns current values and lets SAP's own authorization objects apply, which embedding
 > snapshots would bypass.
+
+## Use cases & projects
+### Use cases
+- **Internal knowledge agents.** An employee assistant answers from Confluence, SharePoint and Slack with
+  per-user ACL filtering and citations back to the source.
+- **Service desk agents.** A ServiceNow-connected agent reads knowledge articles from the index and opens
+  or updates incidents through a live tool.
+- **Sales and account research.** An agent combines synced call notes with live Salesforce lookups,
+  under a per-session API budget.
+- **Order and inventory agents.** SAP exposed as OData lookup tools, called as the user so SAP's
+  authorization objects apply.
+
+### Mini project
+**Permission-aware Confluence search tool for an agent (2-3 hours).**
+- **Goal:** give an agent a `search_company_docs` tool that only returns pages the caller may read.
+- **Steps:** sync one Confluence space (or a fixture of 50 pages with fake restrictions) with an `updated`
+  watermark; store each page's allowed principals; build the tool with identity injected from the session;
+  run the same agent question as two test users with different access.
+- **Done when:** the restricted user's trace shows zero hits from the restricted pages, a deleted page
+  disappears after the next sync, and a re-run from the saved watermark fetches only changed pages.

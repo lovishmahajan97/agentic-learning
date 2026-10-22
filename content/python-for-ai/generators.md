@@ -413,3 +413,23 @@ count equals the loaded count would have caught this.
 - [ ] Call `next()` on it until it is exhausted
 > Async generator cleanup may need to await, which garbage collection cannot do synchronously.
 > `aclosing` awaits `aclose()` deterministically, releasing the connection at a known point.
+
+## Use cases & projects
+### Use cases
+- **Streaming agent events to a UI.** An async generator yields tokens, tool-call starts and tool results,
+  and FastAPI's `StreamingResponse` sends them as SSE.
+- **RAG ingestion at flat memory.** A chain of generators reads, chunks and batches a large corpus for the
+  embedding API without loading it all.
+- **Large eval runs.** Prompts stream from a JSONL file through the agent, with results written as they
+  arrive and a checkpoint so a crash resumes.
+- **Stopping a stream early.** When the user stops a run, `contextlib.aclosing()` closes the upstream model
+  stream at a known point.
+
+### Mini project
+**Stream an agent loop as typed events (1-2 hours).**
+- **Goal:** turn a two-tool agent loop into an async generator of events and stream it to a browser.
+- **Steps:** define an event schema (token, tool_call, tool_result, final); write the loop as an async
+  generator that yields those events from a fake model and two fake tools; expose it through a FastAPI
+  `StreamingResponse` as SSE; wrap the upstream stream in `aclosing()` and log when it closes.
+- **Done when:** `curl` shows events arriving one at a time, closing the client mid-run logs the upstream
+  close, and memory stays flat over 1,000 simulated runs.

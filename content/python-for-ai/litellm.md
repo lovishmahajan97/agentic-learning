@@ -448,3 +448,23 @@ silent permanent failover with worse quality is noticed.
 - [ ] It prevents streaming responses from working
 > Silently dropping a parameter such as a response format or stop sequence turns a loud error into a
 > quiet behaviour change, often visible only during a fallback when debugging is hardest.
+
+## Use cases & projects
+### Use cases
+- **Model routing per agent role.** A cheap model for routing steps, a strong one for planning and a judge
+  model for evals, all behind one call shape.
+- **Fallbacks during outages.** `fallbacks` and `num_retries` keep an agent running when one provider
+  rate-limits or fails.
+- **Spend control per agent or tenant.** Proxy virtual keys with budgets and `metadata` for attribution
+  answer "what did this agent cost last month".
+- **Cross-provider agent evals.** The same agent tasks run against several models to compare quality,
+  latency and cost before a switch.
+
+### Mini project
+**Route one agent across two providers (2-3 hours).**
+- **Goal:** run the same tool-calling agent on two providers and prove the fallback works.
+- **Steps:** write one agent loop with a single tool using LiteLLM; configure a primary and a fallback
+  model; run 10 tasks on each; force a primary failure (for example an invalid model name) and confirm
+  the fallback serves; log per-task cost and tool-call parse success.
+- **Done when:** you have a per-provider table of success, cost and latency, plus a note on any parameter
+  that behaved differently or was dropped.

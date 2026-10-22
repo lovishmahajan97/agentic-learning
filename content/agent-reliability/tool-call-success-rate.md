@@ -5,7 +5,8 @@ name: Tool-call success rate
 kind: metric
 difficulty: core
 est_minutes: 12
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - agent-reliability/task-completion-rate
   - agent-reliability/tool-adapters-service-interfaces
@@ -24,6 +25,18 @@ sources:
 Tool-call success rate is the fraction of tool invocations that succeed, split into layers: well-formed,
 permitted, executed and effective. Failure compounds (ten steps at 95% is about 60% end to end), and the
 layers localize it to model, policy, tool or environment.
+
+## For agent builders
+- **Why it matters for agents.** Every step of a loop depends on a tool call working, so small per-call
+  failure rates compound into failed tasks. The layer that fails tells you who fixes it: the prompt, the
+  policy, the integration or the retrieval index.
+- **Where it shows up in your stack.** `tool.call.result` events from your adapters, Prometheus-style
+  counters by tool and error class, tracing backends, and the join from tool events to task outcomes.
+- **What you control.** The shared error taxonomy, the `attempt` and `step_id` fields, automatic retries
+  for retryable classes, structured error results that let the model recover, per-tool alerts and the
+  per-step target you derive from task goals.
+- **What you can skip.** One global success percentage. It averages a broken tool against healthy ones
+  and hides which layer failed.
 
 ## Why it exists
 - **Completion rate says the agent fails, not why.** Most agent failures are tool failures in disguise: a
@@ -349,3 +362,25 @@ change for arguments, an index check for empties.
 - [ ] The policy is denying first attempts and approving retries
 > Per-attempt measures tool health, per-step measures what the agent experiences; a widening gap is the
 > early warning that a tool is degrading.
+
+## Use cases & projects
+### Use cases
+- **Catching a bad tool-description deploy.** A step change in `invalid_arguments` for one tool right
+  after a deploy points at the contract, not the vendor.
+- **Early warning on vendor degradation.** A widening gap between per-attempt and per-step success shows
+  retries carrying a failing API before tasks start failing.
+- **Routing pages to the right team.** Error classes map to prompt, policy, integration and retrieval
+  owners, so alerts land with whoever can fix them.
+- **Setting reliability targets.** Working back from a task-completion goal and step count gives the
+  per-step rate each tool must hit.
+
+### Mini project
+**Tool-call health dashboard for an agent (1-2 hours).**
+- **Goal:** measure tool success by layer and connect it to task outcomes.
+- **Steps:** make your agent's adapters emit `tool.call.result` events with `tool`, `error_class`,
+  `attempt` and `step_id`; inject faults (bad arguments, a 429 storm, empty results) into fake tools; run
+  30 tasks; compute per-attempt and per-step success per tool and class, the recovery rate, and completion
+  conditional on each tool failing.
+- **Done when:** a table or chart shows each tool's rates by class, the injected 429 storm appears as a
+  per-attempt drop with per-step success held up by retries, and you can name the tool whose failures most
+  reduce completion.

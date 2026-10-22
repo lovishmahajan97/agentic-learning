@@ -346,3 +346,23 @@ every message. In production, confirm by tracking the share of delivery-date ans
 - [ ] To test the fallback model
 > Without `none` cases an agent that calls a tool on every turn scores perfectly on recall while wasting
 > cost and latency; the `none` cases are what expose over-calling.
+
+## Use cases & projects
+### Use cases
+- **Gating prompt and model changes.** A selection eval in CI shows whether a new model or a reworded
+  description helped or hurt before it ships.
+- **Growing a tool catalogue.** Measuring accuracy as tools are added tells you when to merge,
+  rename or defer-load tools.
+- **Connecting MCP servers.** Vendor tool descriptions often overlap; a selection eval shows which ones
+  to rewrite or drop.
+- **Production monitoring.** Label-free signals such as schema-validation failures per tool flag a
+  selection regression between eval runs.
+
+### Mini project
+**Build a tool selection eval (2-3 hours).**
+- **Goal:** measure how often an agent picks the right tool, or none, and show the effect of one fix.
+- **Steps:** give an agent eight tools, two of them deliberately overlapping; write 60 labelled cases,
+  including at least 10 `none` cases; run each case as one model call with no tools executed; score tool
+  match, argument match and should-call precision; rewrite the two overlapping descriptions and re-run.
+- **Done when:** you have a before-and-after table per tool, a confusion list of which tools get mixed
+  up, and a paired comparison showing whether the change beats noise.

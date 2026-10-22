@@ -5,7 +5,8 @@ name: Prompt engineering
 kind: practice
 difficulty: intro
 est_minutes: 12
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - prompting/system-prompt
   - prompting/few-shot
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-Prompt engineering specifies a task through the model's input (instructions, context, examples, output
-format) and iterates against a measured eval set. It is the cheapest lever you own: seconds per
-iteration, no training data, no redeploy.
+An agent's behaviour is specified almost entirely by its prompts: system prompt, tool descriptions,
+examples and output format. Prompt engineering writes those and iterates against a measured eval set;
+it is the cheapest lever you own, seconds per iteration with no training or redeploy.
+
+## For agent builders
+- **Why it matters for agents.** Every step of an agent loop is a prompted model call: choose a tool,
+  fill its arguments, read a result, decide to stop. A vague instruction is not one bad answer; it is a
+  wrong tool call that the next ten steps build on.
+- **Where it shows up in your stack.** The system prompt, each tool's name and description, the
+  argument schema descriptions, router and planner prompts, and the rubric prompts of your LLM judges.
+  Frameworks such as LangGraph or the provider agent SDKs assemble these, but you still write them.
+- **What you control.** The words, the order, the delimiters around tool results and retrieved text,
+  the output format, and the eval set that decides whether a change ships.
+- **What you can skip.** Magic phrases, personas and tips. Agents improve from precise specification
+  and a measured loop, not from wording tricks.
 
 ## Why it exists
 - **A model only sees its tokens.** A language model is a conditional distribution over next tokens;
@@ -55,6 +68,22 @@ A production prompt has recognisable parts, each narrowing the distribution in a
 4. **Examples**: demonstrations of input → output for things easier to show than to say (few-shot).
 5. **Output format**: a schema, tags or a fixed template, so the response is parseable.
 6. **Constraints and edge cases**: what to do when the input is empty, ambiguous or out of scope.
+
+### In an agent, the prompt is many specifications
+An agent re-reads the same prompt on every step, so each part has an agent-specific job:
+
+| Prompt surface | What it decides in the loop |
+|---|---|
+| **System prompt** | Scope, tone, when to ask the user, when to stop |
+| **Tool name and description** | Whether the model picks this tool at all, and when it must not |
+| **Argument descriptions** | Units, formats and allowed values, so calls validate first time |
+| **Tool-result wrapper** | That fetched pages and API output are data, not new instructions |
+| **Stop and hand-off rules** | When to give a final answer, escalate or ask a clarifying question |
+
+- **Tool descriptions are prompts.** Selection accuracy often moves more from rewriting one ambiguous
+  tool description than from any system-prompt change.
+- **Errors compound.** A 95%-accurate step repeated over 10 steps succeeds end to end only about 60% of
+  the time (0.95^10 ≈ 0.6), so small per-step gains matter a lot in agents.
 
 ### Each design rule has a mechanism behind it
 | Rule | Because |
@@ -108,17 +137,17 @@ Prompt engineering is engineering because of the loop, not the wording:
 
 ### Where prompting stops
 When the eval plateaus after precise instructions and good examples, the gap is no longer specification:
-- **Missing facts** need retrieval.
+- **Missing facts** need retrieval or a lookup tool the agent can call.
 - **Stable style at high volume** is cheaper fine-tuned.
 - **A capability gap** needs a stronger model or a decomposition of the task.
 
 ## Diagram
-The loop is the engineering: every change is scored on the same fixed set, and a plateau sends you out of
-prompting to retrieval, fine-tuning or a different model.
+The loop is the engineering: every change to an agent's prompts is scored on the same fixed set of
+tasks, and a plateau sends you out of prompting to retrieval, tools, fine-tuning or a different model.
 
 ```mermaid
 flowchart TD
-    A["Versioned prompt template"] --> B["Run fixed eval set, several runs"]
+    A["Versioned agent prompts"] --> B["Run fixed eval set, several runs"]
     B --> C["Score with code or rubric"]
     C --> D["Read and group failures"]
     D --> E{"Cause of failures?"}
@@ -131,9 +160,12 @@ flowchart TD
 ```
 
 ## Examples
-### Scoring two prompt versions with a harness
-Two versions of a ticket-classification prompt scored on the same labeled set. V1 is what people write
-first; V2 enumerates labels, defines them and fixes the output format. The harness turns "I think it is
+### Scoring two versions of an agent's triage step
+The first step of a support agent routes each ticket to a sub-agent, so this is a classification prompt
+scored on a labeled set. V1 is what people write first; V2 enumerates labels, defines them and fixes the
+output format.
+
+The harness turns "I think it is
 better" into a number you can defend, and it is reused for every later change.
 
 ```python
@@ -200,6 +232,23 @@ A team reran the harness on 200 real tickets, one run each (illustrative numbers
 - **Then read the 2 breaks.** If both are refunds now labeled `other`, the new definition of billing is
   too narrow; fix it before shipping, not after.
 
+### Worked scenario: one tool description fixes an agent
+A research agent has two tools, `search_docs` (internal wiki) and `web_search`. On a 100-task eval it
+answers internal questions badly, and traces show why (illustrative numbers).
+
+| Metric | Before | After rewriting `search_docs` description |
+|---|---|---|
+| Internal questions routed to `search_docs` | 58 of 80 | 76 of 80 |
+| Tasks solved end to end | 61 of 100 | 79 of 100 |
+| Mean steps per task | 7.4 | 5.1 |
+| Input tokens per task | ~42k | ~29k |
+
+- **The old description** was "Search documents." The model could not tell it from `web_search`.
+- **The new description** says what the wiki holds, gives two example queries, and says "use this before
+  `web_search` for anything about our product, policies or customers".
+- **Fewer steps is the cost win.** Every avoided wrong call also avoids a tool result appended to the
+  transcript, which every later step re-reads.
+
 ## Production patterns
 - **Prompts as versioned templates in the repo.** Store each prompt as a template file next to the code,
   reviewed in pull requests and tagged with a version string. Log that version on every request so a
@@ -216,6 +265,15 @@ A team reran the harness on 200 real tickets, one run each (illustrative numbers
 - **Regression run on model upgrades.** Before switching model versions, rerun every prompt's eval set
   on the new model. Prompts tuned to one model's quirks often regress on the next; track score deltas per
   prompt.
+- **Enforce must-hold rules outside the prompt.** Prompting shifts behavior probabilistically, and
+  delimiters are a learned cue, not an enforcement boundary; schema validity and forbidden actions belong
+  in code (validation, guardrails, tool permissions). Monitor blocked actions per run.
+- **Trajectory evals for agent prompts.** Score whole agent runs, not single calls: task success, tool
+  selection accuracy, steps per task and tokens per task. Version the system prompt and every tool
+  description together, because a tool-description change is a prompt change.
+- **Fix from traces.** Read the failing agent traces, tag each failure (wrong tool, bad argument,
+  ignored result, stopped early, looped), and fix the most frequent tag first. Monitor the tag mix per
+  prompt version.
 
 ## Trade-offs
 - **Fast iteration vs per-request cost.** Iteration takes seconds with no training data, but every
@@ -229,6 +287,9 @@ A team reran the harness on 200 real tickets, one run each (illustrative numbers
 - **Probabilistic vs guaranteed.** Prompting shifts behavior probabilistically; when you need a hard
   guarantee (valid schema, forbidden content never emitted), the constraint must move into code:
   validation, constrained decoding, guardrails.
+- **Longer agent prompts vs cost per step.** Every rule in an agent's system prompt is re-sent on every
+  step of every run. Prompt caching softens this when the prefix is stable, but a bloated prompt still
+  costs attention and latency; prune rules the eval does not need.
 
 ## Pitfalls
 - **Judging a change on one sample.** Symptom: "it worked yesterday" regressions, because every run is a
@@ -243,10 +304,14 @@ A team reran the harness on 200 real tickets, one run each (illustrative numbers
   Symptom: no measurable gain on the eval and a prompt that nobody dares to shorten.
 - **Solving a knowledge or capability gap with wording.** Symptom: a prompt that keeps growing while
   accuracy plateaus, which means retrieval, tools or a different model is the fix.
+- **Tuning the system prompt while ignoring tool descriptions.** Symptom: the agent keeps calling the
+  wrong tool however you phrase the system prompt. Fix: rewrite tool names and descriptions so each says
+  what it does, when to use it and when not to.
 
 ## When to use
 - **Always first.** Prompting comes before retrieval design, fine-tuning or model changes, because it is
-  the cheapest to try and it tells you which of the others you need.
+  the cheapest to try and it tells you which of the others you need. For agents, start with the system
+  prompt and tool descriptions before adding more tools or sub-agents.
 - **Measure:** accuracy or rubric score on a fixed set, format-compliance rate, tokens per request and
   latency, and track all four per prompt version.
 - **Day to day:** writing system prompts and templates, reading failing transcripts, and shipping
@@ -298,17 +363,25 @@ fixable in the prompt, or knowledge gaps that need retrieval or a different mode
 - **Stable style at high volume is a cost question.** Fine-tuning removes per-call instruction tokens once
   behavior is stable; a capability gap needs a stronger model or decomposition.
 
-### When would you not rely on the prompt to enforce a rule?
-- **When it must always hold.** Prompting shifts behavior probabilistically, so a valid schema or content
-  that must never be emitted belongs in code: validation, constrained decoding, guardrails.
-- **When untrusted text reaches the prompt.** Delimiters help the model separate data from instructions,
-  but they are a learned cue, not an enforcement boundary.
-
 ### What would you log and monitor for a prompt in production?
 - **Prompt version per request**, so metric shifts map to a specific change.
 - **Quality and format metrics:** eval score per version, format-compliance or parse-failure rate.
 - **Cost and speed:** tokens per request and latency, because every instruction and example is paid for
   on every call.
+
+### Your agent picks the wrong tool on a third of internal questions. How do you fix it with prompting?
+- **Read the traces first.** Check which tool it chose instead and what the two descriptions say; most
+  confusions come from overlapping or one-line descriptions.
+- **Rewrite the descriptions.** State what each tool covers, give example queries, and say when to prefer
+  one over the other.
+- **Measure on a routing eval.** Score tool-selection accuracy and end-to-end success on the same tasks
+  before and after, with several runs per task.
+
+### Why does a small per-step prompt improvement matter more in an agent than in a single call?
+- **Errors compound across steps.** At 95% per step, a 10-step task succeeds about 60% of the time
+  end to end; at 98% it is about 82%.
+- **Wrong steps also cost tokens.** Each bad tool call appends a result that every later step re-reads,
+  so per-step accuracy drives both success and cost.
 
 ## Quiz
 ### Q: A prompt says "Summarize this document" and the summaries vary wildly in length and focus between runs. What is the most accurate explanation?
@@ -338,3 +411,23 @@ fixable in the prompt, or knowledge gaps that need retrieval or a different mode
 > specification gap. Reasoning cannot recover facts the model never saw and wording cannot either; the fix
 > is to put the missing knowledge where the model can read it at request time. Fine-tuning is a poor way
 > to inject a changing list of identifiers, because it teaches patterns more reliably than exact facts.
+
+## Use cases & projects
+### Use cases
+- **Support and triage agents.** The router prompt's label definitions decide which sub-agent or queue
+  each ticket reaches, and a closed label set keeps routing parseable.
+- **Tool-using research agents.** Tool descriptions and the system prompt's search-before-answer rule
+  decide whether the agent looks things up or guesses.
+- **LLM-as-judge evals.** The judge's rubric is itself a prompt, iterated against human labels with the
+  same paired comparison.
+- **Model upgrades on a live agent.** Re-running the prompt eval set tells you whether the new model
+  needs prompt changes before it takes traffic.
+
+### Mini project
+**Prompt-eval harness for a two-tool agent (2-3 hours).**
+- **Goal:** prove with numbers that a prompt change improves an agent's tool selection.
+- **Steps:** build a small agent with two overlapping tools (say, a fake internal search and a fake web
+  search); write 30 tasks labeled with the correct first tool; run each task 3 times with one-line tool
+  descriptions, then with rewritten descriptions; log first tool chosen, success and steps.
+- **Done when:** you have a before/after table of tool-selection accuracy, success rate and steps per
+  task, plus a paired count of tasks fixed and broken by the change.

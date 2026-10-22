@@ -411,3 +411,30 @@ differently from `input-required` in the user-facing flow.
 - [ ] Send the message again with a higher priority flag
 > Streaming delivers status and artifact events as they happen, and push notifications let a task that
 > outlives any connection notify the caller. Holding one long request open is fragile behind proxies.
+
+## Use cases & projects
+### Use cases
+- **Delegating to a partner's agent.** A travel agent hands a booking task to an airline's agent it
+  cannot see inside, then follows the task id until artifacts such as an itinerary come back.
+- **Cross-team agents inside a company.** A support agent asks the finance team's agent to approve a
+  credit, without either team importing the other's framework or prompts.
+- **Long-running back-office work.** Reconciliations or report generation that run for many minutes use
+  streaming or push notifications instead of one held-open request.
+- **Agent marketplaces and registries.** Agent Cards let a client discover which skills and security
+  schemes a peer offers before sending it any work.
+
+### Mini project
+**Wrap a small agent behind an A2A server and call it from another agent (2-3 hours).**
+- **Goal:** one agent that delegates a summarisation task to a second agent over A2A and handles the
+  full task lifecycle, including an input-required pause.
+- **Steps:** serve an Agent Card describing one skill; implement the server with an official A2A SDK so a
+  task moves through working and completed states; make the peer ask for missing input once; build a
+  client agent that sends the message, persists task id and `contextId`, streams updates and answers the
+  follow-up question; label peer artifacts as untrusted before they reach the client's model.
+- **Done when:** restarting the client mid-task resumes from the stored task id, and the final artifact
+  arrives with the trace showing each state change.
+
+### Major project
+The module Capstone (see the module guide) builds a billing-dispute agent on MCP tools. A2A is a
+stretch goal there: put one lookup behind a peer agent served over A2A, so the investigation exercises
+task states and untrusted-artifact handling next to the MCP tools.

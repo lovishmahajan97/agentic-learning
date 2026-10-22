@@ -5,7 +5,8 @@ name: Loop detection
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - agent-reliability/stopping-conditions-termination
   - agent-reliability/max-step-budgets
@@ -19,6 +20,20 @@ related:
 Loop detection watches an agent's actions for exact repeats, short cycles and no-progress stretches, then
 escalates (tell the model, block, replan, abort), because budgets stop loops only after burning the whole
 allowance and making repetition visible is the cheapest fix.
+
+## For agent builders
+- **Why it matters for agents.** Repeating the same failing tool call is the most common way a
+  tool-calling loop gets stuck, and from inside the context the repeats look like ordinary history.
+  Catching it at step eight instead of the budget at step thirty saves most of the cost and gives the run
+  a chance to recover.
+- **Where it shows up in your stack.** In your harness, between the model's response and tool dispatch;
+  in the orchestrator of a multi-agent system for handoff ping-pong; and in offline jobs over traces of
+  budget-exhausted runs.
+- **What you control.** How arguments are canonicalized, which volatile fields are stripped from results
+  before hashing, which tools are pollable, the thresholds per rung (inform, block, replan, abort) and the
+  wording of the inform message.
+- **What you can skip.** Semantic near-duplicate detection on day one. Exact repeats plus (action, result)
+  hashing catch most loops at almost no cost.
 
 ## Why it exists
 - **Same context in, same action out.** A model picks its next action from the context; if the context
@@ -332,3 +347,25 @@ persists. Log both cases so the thresholds can be tuned from real traces rather 
 - [ ] Increase the repeat threshold
 > Models vary key order and whitespace between calls; without canonicalization identical intents hash
 > differently and are never counted. Hashing only the name would flag unrelated calls instead.
+
+## Use cases & projects
+### Use cases
+- **Coding agents re-running a failing test.** The (action, result) hash shows nothing changed, so the
+  guard informs, then blocks, before the budget burns.
+- **Search and browsing agents.** Reworded queries returning the same empty result are caught once
+  arguments are canonicalized and results are hashed.
+- **Job-polling agents.** Pollable tools get a higher ceiling or a time cap, so a changing status counts as
+  progress while ten identical statuses count as a loop.
+- **Multi-agent routers.** An orchestrator-level (from, to, task) counter stops a router and a billing agent
+  bouncing one ticket back and forth.
+
+### Mini project
+**Add a loop guard to a scripted agent (1-2 hours).**
+- **Goal:** detect exact repeats, short cycles and no-progress steps in a tool loop and escalate through
+  inform, block and abort.
+- **Steps:** build a fake model that replays a scripted list of tool calls (an exact repeat, an A B A B
+  cycle, and a polling sequence whose status changes); implement `before()` and `after()` with canonical
+  argument hashing and result hashing; strip a timestamp field from results; set thresholds of three, four
+  and six.
+- **Done when:** the repeat and cycle scripts end `stuck` with logged evidence, the polling script finishes
+  without a false positive, and a short note records which rung resolved each case.

@@ -5,7 +5,8 @@ name: Zero trust
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - security-governance-compliance/ai-security
   - security-governance-compliance/prompt-injection-defense
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-Zero trust drops the assumption that anything inside the perimeter is trustworthy: every request is
-authenticated, authorised per resource and given least privilege for the shortest time. An agent is
-exactly such a trickable component, so each tool call is verified, not trusted.
+An agent inside your network is a trickable insider, so zero trust verifies each of its tool calls:
+authenticated, authorised per resource against the delegating user's rights, and given least privilege
+for the shortest time, whatever its network location.
+
+## For agent builders
+- **Why it matters for agents.** Your agent reads text an outsider can write, and holds credentials to
+  real systems. If those credentials are a broad service account, one injected email becomes a
+  cross-tenant breach that the logs attribute only to "support-bot".
+- **Where it shows up in your stack.** The token exchange your agent runtime does before each tool call,
+  the PEP in your tool dispatcher or gateway, the policy engine behind it, workload identity for agents
+  and MCP or tool servers, and the egress policy of code sandboxes.
+- **What you control.** Token audience, scope and lifetime per tool call, which session context the PEP
+  sees (such as taint), where backend secrets are attached, and which egress destinations are allowed.
+- **What you can skip.** An organisation-wide zero-trust programme. Delegated, scoped, short-lived tokens
+  plus one PEP in front of your agent's tools give most of the benefit for one agent.
 
 ## Why it exists
 - **The perimeter model trusted location.** Outside the VPN or firewall was hostile, inside was trusted;
@@ -340,3 +353,24 @@ user's business unit, restrict egress, and log principal plus delegator for ever
 - [x] Authorising each call with a short-lived token scoped to that tool and the delegating user's rights
 > Zero trust verifies every request against identity and policy. Network isolation and encryption at
 > rest are useful but do not decide whether a specific call is permitted, and prompts enforce nothing.
+
+## Use cases & projects
+### Use cases
+- **Multi-tenant support and CRM agents.** Delegated tokens keep a steered agent inside the requesting
+  user's tenant and make every action attributable to user plus agent.
+- **Agents connecting to MCP or internal tool servers.** Workload identity and a PEP in front of each server
+  replace "it runs in the VPC" as the reason to trust it.
+- **Coding and data agents with sandboxes.** Default-deny egress and secrets attached at dispatch stop an
+  injected instruction from shipping data or keys out.
+- **Agents deployed in a customer's estate.** Mapping the customer's IdP roles into delegated scopes is
+  usually what gets the deployment through their security review.
+
+### Mini project
+**Put a PEP in front of an agent's tools (2-3 hours).**
+- **Goal:** show that an injected instruction cannot read another tenant's data or write after untrusted
+  content, whatever the model proposes.
+- **Steps:** give a small tool-calling agent a fake CRM with two tenants; mint short-lived claims dicts
+  per tool call (`sub`, `act`, `aud`, `scope`, `exp`, tenant) in place of a real token service; route every
+  call through `pep_call`; plant an injected email asking for the other tenant's account and a write.
+- **Done when:** both injected calls are denied with logged reasons, the audit log names user and agent
+  for every call, and an expired token is refused on the next call.

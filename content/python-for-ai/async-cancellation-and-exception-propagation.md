@@ -397,3 +397,27 @@ or a compensating action.
 - [x] The block exits normally, so the expected TimeoutError is never raised and the deadline is silently lost
 > `asyncio.timeout` works by cancelling the task and converting the arriving `CancelledError` into
 > `TimeoutError` at block exit; swallowing the exception means there is nothing to convert.
+
+## Use cases & projects
+### Use cases
+- **User presses Stop mid-turn.** Cancelling the turn's task closes the model stream and aborts the
+  in-flight tool calls instead of letting them run on and bill.
+- **Per-turn and per-tool deadlines.** `asyncio.timeout` around each tool and the whole turn keeps a slow
+  search API from holding a session past its latency budget.
+- **Fail-fast parallel tools.** A `TaskGroup` cancels the sibling tools as soon as one hits a fatal error,
+  so the agent can re-plan without waiting on pointless work.
+- **Client disconnects on streaming routes.** When the browser drops an SSE connection, cancellation
+  unwinds the agent loop and releases its connections and sandboxes.
+- **Audit writes that must land.** A short shielded write records what the agent did, even when the turn
+  around it is cancelled.
+
+### Mini project
+**Make an agent turn stop cleanly (1-2 hours).**
+- **Goal:** prove that cancelling a turn stops every tool, runs every cleanup and keeps deadlines
+  working.
+- **Steps:** build a fake turn that streams "tokens" and runs three tools in a `TaskGroup`, each logging
+  in `finally`; cancel the turn after 1 second and check all cleanups ran; add one tool that swallows
+  `CancelledError` and show that `asyncio.timeout` no longer raises; fix it by re-raising; finally compare
+  a failing tool under `TaskGroup` with `gather(return_exceptions=True)`.
+- **Done when:** a pytest file asserts cleanup on cancel, timeout firing, and the fail-fast versus
+  best-effort behaviour, and the swallowing tool's test fails until you fix it.

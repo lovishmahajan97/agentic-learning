@@ -494,3 +494,23 @@ retries within the remaining budget.
 - [ ] Retrying resets the asyncio event loop
 > A timeout only means the client stopped waiting. The server may have finished the work, so retries
 > need idempotency (keys or naturally idempotent operations) and must fit inside the remaining deadline.
+
+## Use cases & projects
+### Use cases
+- **Chat agents behind a load balancer.** The run deadline sits a few seconds under the proxy timeout, so
+  the user gets a clean error event instead of a silent 504 while the agent keeps spending.
+- **Tool-calling agents with slow third-party APIs.** Each tool gets its own limit, capped by the budget
+  left, and a timeout comes back to the model as an error result it can work around.
+- **Streaming assistants.** A read (gap) timeout catches a stalled token stream, while a total deadline
+  stops a stream that trickles forever.
+- **Background research agents.** Long runs get a generous wall-clock budget plus a step cap, so a looping
+  agent ends with a report of what it finished rather than an open-ended bill.
+
+### Mini project
+**Put a time budget on a tool-calling agent (1-2 hours).**
+- **Goal:** show that one slow tool cannot hang the run or blow past the proxy limit.
+- **Steps:** build a small FastAPI agent endpoint with two fake tools, one of which sometimes sleeps far
+  longer than expected; wrap the loop in `asyncio.timeout` for the run budget and each tool in the
+  minimum of its own limit and the budget left; return a timed-out tool to the model as an error result.
+- **Done when:** a load test with the slow tool shows every request finishing under the run budget, the
+  logs record which step timed out, and the trace shows the model reacting to the timeout result.

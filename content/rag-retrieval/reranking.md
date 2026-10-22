@@ -454,3 +454,24 @@ those checks would I try a different or fine-tuned reranker.
 > Reranking can only promote what retrieval returned; if the relevant chunk was already within the first
 > 20 nearly every time, deeper candidate lists add cost without new relevant material. Batch size affects
 > throughput, not per-pair scores, and sequence length is per pair, not per batch.
+
+## Use cases & projects
+### Use cases
+- **Token-lean search tools.** Reranking lets a tool return 3 strong chunks instead of 10 mixed ones,
+  which matters because every tool result is re-read on later agent steps.
+- **Honest "nothing found" answers.** A reranker score threshold gives the agent a signal to re-query or
+  say it does not know.
+- **Fine-grained policy and contract agents.** Wrong year, negation and topic-but-no-answer passages are
+  what cross-encoders catch and bi-encoders miss.
+- **Latency-budgeted pipelines.** Teams tune candidate depth and fall back to the first-stage order when
+  the reranker is slow or down.
+
+### Mini project
+**Add a reranker to an agent's search tool and measure the payoff (2-3 hours).**
+- **Goal:** show how a cross-encoder changes answer quality, tokens and latency in a small RAG agent.
+- **Steps:** start from any retriever over 1k-5k chunks; add a sentence-transformers `CrossEncoder` that
+  reranks the top 20, 50 and 100 candidates down to 3; label 30 queries; record precision@3, added
+  latency per call and tool-result tokens; run the agent on 10 queries with and without reranking and
+  compare total transcript tokens.
+- **Done when:** you have a table of quality, latency and tokens per candidate depth, a chosen depth and
+  "no relevant context" threshold, and a fallback path tested by disabling the reranker.

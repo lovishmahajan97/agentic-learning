@@ -5,7 +5,8 @@ name: Reasoning models / test-time compute
 kind: concept
 difficulty: core
 est_minutes: 18
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - prompting/chain-of-thought
   - model-internals/sampling-strategies
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-Test-time compute spends more inference per query: longer chains of thought, several attempts with a vote
-or verifier, or search. A transformer does fixed compute per token, so hard problems need more tokens;
-reasoning models are RL-trained to spend them thinking.
+Test-time compute buys accuracy with more inference: longer thinking, several attempts with a vote or
+verifier, or search. For agents it is a per-step budget: spend it on planning and hard decisions, not on
+every tool call.
+
+## For agent builders
+- **Why it matters for agents.** Agents plan, choose tools and recover from errors, which is exactly the
+  multi-step work reasoning helps with. But thinking tokens are billed, delay the first answer token and
+  fill the transcript, and an agent pays that on every step it is enabled.
+- **Where it shows up in your stack.** Thinking-budget or effort settings on the model API (for example
+  `budget_tokens` or `reasoning_effort`), rules for passing thinking blocks back with tool results,
+  best-of-N with tests in coding agents, and pass^k in agent evals.
+- **What you control.** Which agent steps think and how much, whether you sample several attempts and
+  pick with a verifier, how old traces are kept out of history, and when to escalate to a reasoning tier.
+- **What you can skip.** GRPO maths and the R1 training stages, unless you train reasoners. Keep "tokens
+  are compute", the four strategies, and pass@k versus pass^k.
 
 ## Why it exists
 - **Compute per token is fixed.** A decoder-only transformer spends L layers, one pass, on every token.
@@ -49,6 +62,15 @@ reasoning models are RL-trained to spend them thinking.
   the DeepSeek-R1 report describes these emerging without demonstration.
 
 ## How it works
+### Where test-time compute pays off in an agent
+| Agent step | Spend extra compute? | Strategy |
+|---|---|---|
+| Initial plan or task decomposition | yes | reasoning mode with a moderate budget |
+| Choosing among many tools with subtle differences | often | reasoning, or a cheap model with escalation |
+| Writing code or a patch | yes, if tests exist | parallel best-of-N selected by the tests |
+| Recovering after a failed tool call | yes | sequential revision with the error in context |
+| Parsing a tool result or formatting the answer | no | fast model, low temperature |
+
 ### Tokens as computation
 - **Each generated token costs a forward pass,** about 2N FLOPs plus attention over the growing context, and
   its result is written into the context where later steps read it through attention.
@@ -185,6 +207,20 @@ print(solve("A train leaves at 09:40 and arrives at 13:05. How many minutes is t
 - **Prefer a verifier when one exists.** Run the unit tests on each sampled patch and return the first that
   passes, which turns coverage directly into accuracy.
 
+### Agent scenario: thinking on every step versus planner-only
+A 15-step agent: 3 planning or recovery steps and 12 routine tool steps. Each step emits ~200 answer
+tokens; thinking adds ~2,000 tokens where enabled. Decode speed is an illustrative 50 tokens/s.
+
+| Policy | Output tokens per task | Decode time per task | Extra context if traces stay in history |
+|---|---|---|---|
+| Thinking on all 15 steps | 15 × 2,200 = 33,000 | ~660 s | up to 30,000 tokens by the last step |
+| Thinking on the 3 planning steps | 3 × 2,200 + 12 × 200 = 9,000 | ~180 s | up to 6,000 tokens |
+
+- **Reading.** Planner-only thinking cuts output tokens about 3.7×. Run both policies on the agent eval: if
+  task success is the same, the extra 24,000 tokens per task bought nothing.
+- **Context.** Dropping earlier traces from history (where the API allows it) keeps the transcript and the
+  KV cache from growing by the trace length every step.
+
 ### pass@k, pass^k and the GRPO advantage, in numbers
 Runnable, pure Python. The pass@k form is the standard unbiased estimator from n runs with c successes;
 pass^k is computed the same way for "all k succeed".
@@ -219,6 +255,10 @@ print([round((r - mu) / sd, 2) for r in (1, 0)])   # advantage of a correct and 
   deviation estimator.
 
 ## Production patterns
+- **Think per agent step, not per agent.** Enable reasoning (or a larger budget) on planning, tool
+  selection among many similar tools and error recovery, and keep routine parsing and formatting steps on
+  a fast setting. Log thinking tokens and latency per step type, and compare task success against
+  all-steps thinking on the agent eval.
 - **Difficulty-aware routing.** Send traffic to a fast model first and escalate on low agreement, a failed
   verifier or a failed schema check, as in `solve` above. Monitor escalation rate, cost per solved task and
   p95 latency per tier.
@@ -239,6 +279,9 @@ print([round((r - mu) / sd, 2) for r in (1, 0)])   # advantage of a correct and 
   that several vendors advise against, and A/B the plain prompt against the old one on the eval set.
 
 ## Trade-offs
+- **Smarter steps vs slower agents.** Thinking improves planning and recovery, but its cost and latency
+  repeat on every enabled step of a long loop; it pays on the few decisive steps and rarely on routine
+  tool calls.
 - **Accuracy vs cost and latency.** Accuracy on verifiable multi-step tasks rises with inference budget, but
   cost and latency rise linearly with tokens; the trade flips when the task is easy, high-volume or
   latency-bound, where a fine-tuned small model wins.
@@ -272,6 +315,8 @@ print([round((r - mu) / sd, 2) for r in (1, 0)])   # advantage of a correct and 
   the curve per route and set the budget at the knee.
 
 ## When to use
+- **Use in agents for:** planning, decomposition, choosing among similar tools, recovering from a failed
+  call, and code steps where tests can select among samples.
 - **Use when** the task has multi-step structure and a checkable, or at least judgeable, answer: maths, code
   generation and debugging, planning inside agents, complex data transformations, and hard classifications
   where a rationale changes the verdict.
@@ -319,14 +364,20 @@ Decide on pass@1, pass@5 and cost per solved task measured on their task set.
   attempts succeed.
 - **They diverge fast:** 7 successes in 10 runs gives pass@5 of 1.00 but pass^5 of about 0.08.
 
-### How does GRPO differ from PPO, and why did DeepSeek-R1 use rule-based rewards?
-- **Baseline:** PPO trains a value network as large as the policy; GRPO scores each response against the
-  mean and standard deviation of a group of samples for the same prompt, so no critic has to be held in
-  memory or trained.
-- **No critic on sparse traces:** long reasoning traces with one final reward are hard for a critic to
-  learn.
-- **Rule-based rewards** such as "the answer equals 42" or "the tests pass" cannot be gamed the way a learned
-  reward model can over long RL runs.
+### Your agent got more accurate with a reasoning model but each task now takes four times as long. What do you change?
+- **Find the decisive steps:** log success and thinking tokens per step type; usually planning and error
+  recovery carry the gain.
+- **Think only there:** keep routine tool steps on a fast setting or a fast model, and measure task
+  success against the all-steps baseline.
+- **Trim the rest:** drop old traces from history where the API allows, and set budgets per step at the
+  knee of the accuracy-versus-tokens curve.
+
+### How would you use test-time compute in a coding agent that has a test suite?
+- **Parallel best-of-N:** sample several patches and run the tests on each; the first that passes wins,
+  turning coverage into accuracy at near single-attempt latency.
+- **Escalate the misses:** tasks where no sample passes go to a reasoning model or a human.
+- **Guard the verifier:** weak or flaky tests let wrong patches through, so track pass@1 against pass@N and
+  review test coverage.
 
 ### After enabling a reasoning mode for all traffic, cost rose fivefold with no quality gain. How do you fix it?
 - **Segment the traffic:** most requests are probably simple extraction or chat, where long traces add cost
@@ -369,3 +420,23 @@ Decide on pass@1, pass@5 and cost per solved task measured on their task set.
 > Traces are generated tokens with all the usual costs, and research on chain-of-thought faithfulness shows
 > they can omit the real reasons behind an answer. Longer is not always better; on easy tasks it adds cost
 > and can reduce accuracy.
+
+## Use cases & projects
+### Use cases
+- **Planner steps in multi-step agents.** A reasoning setting on the decomposition step, a fast setting on
+  the tool calls that follow.
+- **Coding agents with tests.** Best-of-N patches selected by the test suite, escalating unsolved tasks to
+  a reasoning tier.
+- **Difficulty-aware routing.** A fast model answers first; low agreement or a failed verifier escalates
+  to a reasoning model.
+- **Agent evals.** Reporting pass^k for agents that must succeed every time, and pass@k where a verifier
+  picks the winner.
+
+### Mini project
+**Find the right thinking budget per agent step (2-3 hours).**
+- **Goal:** show where reasoning helps a small agent and where it only adds cost.
+- **Steps:** build a 5-step agent (plan, two tool calls, check, answer) on 30 tasks with checkable answers;
+  run it with thinking off, on for the plan step only, and on for all steps, three runs each; log task
+  success, thinking tokens and wall-clock per step.
+- **Done when:** a table shows task success (mean and pass^3), tokens and latency per policy, and you can
+  name the cheapest policy within one point of the best success rate.

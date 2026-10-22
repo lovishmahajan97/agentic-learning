@@ -5,7 +5,8 @@ name: Perplexity
 kind: metric
 difficulty: core
 est_minutes: 12
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - ml-fundamentals/loss-functions
   - model-internals/tokenization
@@ -21,9 +22,20 @@ sources:
 ---
 
 ## TL;DR
-Perplexity is `exp(mean of −log p(token))`, the effective number of equally likely choices per token;
-lower is better. It tracks training, quantisation and data quality cheaply, but is tokenizer-dependent and
-blind to instruction-following and facts.
+Perplexity is `exp(mean of −log p(token))`, lower is better. Agent builders use it as a cheap gate when
+quantising or fine-tuning the agent's model and as a token-level confidence signal, never as proof the
+agent completes tasks.
+
+## For agent builders
+- **Why it matters for agents.** When you quantise, prune or fine-tune the model behind an agent (for
+  example on agent traces), perplexity on a fixed text is the fastest regression check, and token
+  log-probabilities on a tool call are a cheap confidence signal for escalation.
+- **Where it shows up in your stack.** Fine-tuning loss curves (log-perplexity), `llama-perplexity` in
+  llama.cpp, the logprobs option many model APIs and engines expose, and contamination checks in evals.
+- **What you control.** The fixed eval text, window and stride you check into the repo, the threshold
+  that blocks a quantised build, and whether low-logprob tool calls are retried or escalated.
+- **What you can skip.** Compression theory and the history of the metric. Know why it is not comparable
+  across tokenizers and why it says nothing about tool use, instruction following or facts.
 
 ## Why it exists
 - **The raw score is unusable.** The probability a model gives a held-out corpus is a product of thousands
@@ -42,6 +54,15 @@ blind to instruction-following and facts.
   and arrive late, while perplexity is computed on every batch.
 
 ## How it works
+### Where it enters an agent workflow
+| Agent task | Perplexity or logprobs role | Decides on its own? |
+|---|---|---|
+| Quantising the agent's self-hosted model | regression gate before agent evals | no, agent evals decide |
+| Fine-tuning on agent traces | held-out loss shows over- or under-fitting | no, tool-call accuracy decides |
+| Escalating an uncertain tool call or label | mean token logprob of the output | only with a threshold tuned on data |
+| Screening documents for a RAG corpus | outliers under a reference model | flags for review |
+| Trusting a benchmark for model choice | contamination probe | signal, not proof |
+
 ### Definition
 For a token sequence x₁ … x_T under a model p:
 
@@ -144,6 +165,36 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: gate a tool call on its own perplexity
+Many APIs and serving engines can return per-token log-probabilities. Perplexity over just the generated
+tool call, plus its least confident token, is a cheap signal for "execute" versus "escalate".
+
+```python
+import math
+
+def call_perplexity(token_logprobs):
+    """Perplexity of one generated tool call from its per-token log-probabilities (nats)."""
+    return math.exp(-sum(token_logprobs) / len(token_logprobs))
+
+def decide(token_logprobs, max_ppl=1.5, min_token_p=0.2):
+    ppl = call_perplexity(token_logprobs)
+    worst = math.exp(min(token_logprobs))           # least confident single token
+    if ppl > max_ppl or worst < min_token_p:        # placeholder thresholds: tune on labelled traces
+        return f"escalate (ppl={ppl:.2f}, worst token p={worst:.2f})"
+    return f"execute  (ppl={ppl:.2f}, worst token p={worst:.2f})"
+
+# Logprobs for the tokens of '{"tool": "refund", "order_id": "A1043", "amount": 120}' (illustrative)
+confident = [-0.01, -0.02, -0.05, -0.01, -0.03, -0.02, -0.10, -0.04, -0.02, -0.08]
+shaky     = [-0.01, -0.02, -0.05, -0.01, -0.03, -0.02, -2.30, -0.04, -0.02, -1.90]
+print(decide(confident))   # execute  (ppl=1.04, worst token p=0.90)
+print(decide(shaky))       # escalate (ppl=1.55, worst token p=0.10)
+```
+
+- **Why the worst token matters.** Perplexity averages, so a single uncertain argument value (an order ID,
+  an amount) can hide in a long call; checking the minimum token probability catches it.
+- **Limit.** Confidence is not correctness: a model can be confidently wrong, and RLHF-tuned models are
+  often poorly calibrated. Tune thresholds on labelled traces and keep schema and business-rule checks.
+
 ### Sliding-window perplexity with Hugging Face Transformers
 Each window of `max_len` tokens is fed to the model, but only the final `trg_len` tokens are scored;
 earlier tokens are masked with `-100` so they serve as context only. The script also reports bits per
@@ -214,6 +265,15 @@ for name, n_tokens in [("32k vocab", 300), ("128k vocab", 200)]:
   per-token denominator changed. Bits per byte is identical.
 
 ## Production patterns
+- **Two-stage gate for the agent's model.** When you quantise or fine-tune the self-hosted model behind
+  an agent, run the perplexity check first because it takes minutes, then the agent eval (tool-call
+  validity, task success). Block on either; never ship on perplexity alone.
+- **Watch held-out loss when fine-tuning on agent traces.** Keep a held-out split of traces and track its
+  loss next to tool-call accuracy per checkpoint; held-out loss rising while training loss falls means the
+  run is memorising traces.
+- **Logprob-based escalation for risky tool calls.** For actions with side effects, compute call
+  perplexity and minimum token probability, route low-confidence calls to a stronger model or a human, and
+  monitor escalation rate and the error rate of executed calls.
 - **Perplexity gate for quantisation and pruning.** Check a fixed eval file, window and stride into the
   repository and run them before and after every compression change; llama.cpp ships a `llama-perplexity`
   tool for GGUF models. Put the delta in the pull request next to task evals, and block on a rise far
@@ -224,13 +284,11 @@ for name, n_tokens in [("32k vocab", 300), ("128k vocab", 200)]:
 - **Contamination probe.** Compare a model's perplexity on a benchmark's test set with its perplexity on
   freshly written text of the same style; a suspiciously low score on the test set suggests it was in
   training data. Run it before trusting a public benchmark result.
-- **Long-context regression check.** Plot per-position perplexity over long documents after extending a
-  context window. A curve that climbs past the original training length means the window is not being used.
-- **Domain-fit screen for model selection.** Compute bits per byte for each candidate base model on a few
-  hundred of the customer's documents before running costly task evals, and keep the sample fixed for later
-  comparisons.
 
 ## Trade-offs
+- **Free confidence signal vs calibration.** Token logprobs cost nothing extra to collect and catch many
+  shaky tool calls, but tuned chat models can be confidently wrong; it pays only when thresholds are fitted
+  on labelled agent traces.
 - **Dense and cheap vs blind to quality.** A label-free signal at any scale, but blind to correctness,
   helpfulness and safety; it flips to task metrics the moment you leave pre-training.
 - **Checkpoint comparability vs tokenizer lock-in.** Comparable across checkpoints of one model and
@@ -244,6 +302,11 @@ for name, n_tokens in [("32k vocab", 300), ("128k vocab", 200)]:
   pessimistic.
 
 ## Pitfalls
+- **Shipping a quantised agent model on perplexity alone.** Symptom: perplexity barely moved, yet tool-call
+  JSON breaks more often or arguments drift. Fix: always follow the perplexity gate with the agent eval,
+  with a separate check on structured outputs.
+- **Treating low perplexity as a correct tool call.** Symptom: confident calls with the wrong ID or amount
+  get executed. Fix: keep schema and business-rule validation regardless of confidence.
 - **Comparing per-token perplexity across tokenizers.** Symptom: a model with a 32k vocabulary "beats" one
   with 128k on the same text purely because its tokens are shorter. Fix: bits per byte.
 - **Reporting without dataset, tokenizer, window and stride.** Symptom: numbers nobody can reproduce, which
@@ -260,6 +323,8 @@ for name, n_tokens in [("32k vocab", 300), ("128k vocab", 200)]:
   library shift labels.
 
 ## When to use
+- **Use in agent work for:** a fast regression gate before agent evals when the model changes, held-out
+  loss during fine-tuning on traces, and logprob confidence for escalating risky tool calls.
 - **Use when** the question is "how well does this model fit this distribution of text": pre-training and
   continued pre-training, checking a quantised or pruned model against the original, choosing a base model
   for domain adaptation, and detecting shifted or anomalous inputs.
@@ -306,11 +371,19 @@ summaries. Bring perplexity back later only as a regression check when quantisin
 - **Then run task evals,** with special attention to JSON validity and other fragile outputs, because
   perplexity is a gate for model-level changes, not the acceptance criterion.
 
-### Why does chunked evaluation give a worse perplexity than sliding-window evaluation on the same model?
-- **Context starvation.** In non-overlapping chunks the first tokens of every chunk have almost no context,
-  so they are predicted badly.
-- **The sliding window** advances by `stride` and scores only the newest tokens, so each token keeps most of
-  a window of context, at up to `window / stride` times more forward passes.
+### You fine-tuned your agent's model on 5,000 tool-use traces. Held-out loss improved. Is it ready?
+- **Not yet.** Lower loss means the model fits the trace distribution better, not that it calls tools
+  correctly or finishes tasks.
+- **Run the agent eval:** tool-call validity, argument accuracy, task success and steps per task on
+  held-out tasks, plus a regression set of general instructions.
+- **Check for memorisation:** held-out loss should be measured on traces from tasks the model never saw.
+
+### How could you use token log-probabilities to make an agent safer?
+- **Score each generated tool call:** perplexity over its tokens plus the least confident token, which
+  catches a single shaky argument value.
+- **Route by risk:** execute confident read-only calls, escalate low-confidence calls with side effects
+  to a stronger model or a human.
+- **Caveat:** calibration varies by model, so fit thresholds on labelled traces and keep schema checks.
 
 ### How would you use perplexity to test whether a model has seen a benchmark's test set?
 - **Compare two texts of the same style:** the benchmark test items and freshly written items the model
@@ -352,3 +425,22 @@ summaries. Bring perplexity back later only as a regression check when quantisin
 > Preference tuning changes the output distribution on purpose, so fit to raw text getting worse is
 > expected and not a defect. The right evaluation for an assistant is the task it is meant to perform, which
 > perplexity on web text does not measure.
+
+## Use cases & projects
+### Use cases
+- **Quantising a self-hosted agent model.** A perplexity delta on a fixed file is the first gate before
+  the slower agent eval.
+- **Fine-tuning on agent traces.** Held-out loss per checkpoint shows when a run starts memorising traces.
+- **Confidence-based escalation.** Token logprobs on a tool call decide whether a side-effecting action runs
+  or goes to a stronger model or a human.
+- **Curating a RAG corpus.** Documents with extreme perplexity under a reference model are flagged as
+  boilerplate, garbage or a different language.
+
+### Mini project
+**Logprob confidence gate for a tool-calling agent (2-3 hours).**
+- **Goal:** test whether tool-call perplexity predicts wrong tool calls well enough to drive escalation.
+- **Steps:** run a small model with logprobs enabled (a local engine or an API that returns them) on 50
+  tool-calling tasks with known correct calls; record call perplexity and minimum token probability per
+  call; label each call right or wrong; sweep thresholds.
+- **Done when:** you have a table of escalation rate versus error rate among executed calls, a chosen
+  threshold, and a note on how many wrong calls were confident anyway.

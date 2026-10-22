@@ -5,7 +5,8 @@ name: AbortController & cancellation
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - node-ts-for-ai/promises-and-async-error-propagation
   - node-ts-for-ai/streams-and-backpressure
@@ -19,9 +20,21 @@ sources:
 ---
 
 ## TL;DR
-Promises cannot be cancelled, so JavaScript cancels cooperatively: an `AbortController`'s `AbortSignal` is
-passed to every operation that should stop together. It stops paid generation when users leave (if the
-provider stops on disconnect) and makes a 30-second timeout a real stop.
+Agent runs get abandoned: users hit stop, steps time out. Promises cannot be cancelled, so one
+`AbortSignal` goes to every model call, tool call and stream of the run, making stop and a 30-second
+timeout real stops.
+
+## For agent builders
+- **Why it matters for agents.** A run fans out into many paid, slow operations. Without one signal threaded
+  through them, "stop" only stops the UI while the model keeps generating and tools keep running, and a
+  timeout only stops waiting (if the provider stops on disconnect, aborting also stops the billing).
+- **Where it shows up in your stack.** The `signal` option of the OpenAI and Anthropic Node SDKs,
+  `abortSignal` in the Vercel AI SDK, `fetch` inside your tools, stream pipelines to the UI, and the stop
+  button in your chat frontend.
+- **What you control.** One root controller per run, child controllers per step or branch via
+  `AbortSignal.any`, deadlines propagated across hops, and the rule that aborts are never retried.
+- **What you can skip.** DOM-spec event details. Know `AbortSignal.timeout`, `AbortSignal.any`,
+  `throwIfAborted` and how to tell `AbortError` from `TimeoutError`.
 
 ## Why it exists
 - **Model calls are the most expensive thing a Node service does:** seconds of latency, tokens billed as they
@@ -200,6 +213,35 @@ export async function handler(req: IncomingMessage, res: ServerResponse) {
 void sleep;                                                  // sleep(ms, undefined, { signal }) for cancellable waits
 ```
 
+### Agent scenario: a stoppable tool-calling loop
+One run controller (the stop button), a per-step timeout, and a step cap. Every model and tool call gets
+the combined signal, so stop or a slow step ends the work, not just the wait.
+
+```ts
+type Step = { done: boolean; toolCalls: Array<{ name: string; args: unknown }> };
+
+export async function runAgent(
+  callModel: (signal: AbortSignal) => Promise<Step>,
+  runTool: (c: { name: string; args: unknown }, signal: AbortSignal) => Promise<string>,
+  run: AbortSignal,                       // aborted by the stop button or client disconnect
+  maxSteps = 10,
+) {
+  for (let i = 0; i < maxSteps; i++) {
+    run.throwIfAborted();                 // safe point between steps
+    const step = AbortSignal.any([run, AbortSignal.timeout(20_000)]);   // fresh per step
+    const out = await callModel(step);
+    if (out.done) return "done";
+    // side-effecting tools should be idempotent: an abort may land mid-call
+    await Promise.allSettled(out.toolCalls.map((c) => runTool(c, step)));   // results feed the next
+    // model call through the transcript (omitted here)
+  }
+  return "step limit reached";
+}
+```
+
+- **Why the timeout is per step:** `AbortSignal.timeout` counts from creation, so building it at the top of
+  each step gives every step its own 20 s, while `run` still caps the whole run.
+
 ### `Promise.race` keeps billing; a signal stops it
 Save as `race.mjs` and run `node race.mjs` (about 7 seconds). A fake provider bills one token every 100 ms.
 The race "times out" at 1 s but the work runs on to all 50 tokens; the signal version stops at 9.
@@ -241,6 +283,10 @@ Gateway deadline 30 s; each hop subtracts elapsed time and a 500 ms margin (illu
 | Tool → model provider (after retrieval) | 10 s | 20 − 0.5 = 19.5 s | Fresh 30 s: could run to 40 s, billed after the user got a 504 |
 
 ## Production patterns
+- **A controller per agent run, addressable by run id.** When the stop button arrives on a different request
+  than the stream (a separate `POST /runs/:id/stop`), agent teams keep a map from run id to controller in the
+  process running the run and abort it there; with several replicas, route the stop to the owning replica.
+  Monitor time from stop to the last billed token.
 - **One root controller per request.** In middleware, create the controller, abort it on `res` `'close'`
   (or use `request.signal` in `fetch`-style frameworks), combine with `AbortSignal.timeout`, and attach the
   result to the request context. Monitor sockets to providers still open after request end.
@@ -271,6 +317,9 @@ Gateway deadline 30 s; each hop subtracts elapsed time and a 500 ms margin (illu
   timeout on a slow-but-fine provider turns success into waste; set them from measured p99 latency.
 
 ## Pitfalls
+- **A stop button that only closes the UI stream.** Symptom: after "stop", the agent's tool calls still land
+  (a ticket gets created) and the trace shows more model steps. Fix: the stop aborts the run's controller,
+  which every step and tool receives.
 - **`Promise.race` with a timer as a "timeout".** Symptom: the request returns 504 while the provider keeps
   streaming and the token bill keeps growing. Fix: pass `AbortSignal.timeout(ms)` to the call itself.
 - **Not wiring `res.on('close')` to a controller.** Symptom: upstream connections and token spend continue for
@@ -349,6 +398,13 @@ after the deadline and token usage per request before and after will show the di
 - **Cross process boundaries explicitly:** send the deadline in a header or gRPC deadline, because a signal
   does not cross a process; only the closed connection does.
 
+### How would you implement a stop button for an agent that has tool calls in flight?
+- **One controller per run:** created when the run starts, its signal combined per step and passed to the
+  model call and every tool call; the stop request aborts it.
+- **Safe points:** `throwIfAborted()` between steps so no new step starts after stop.
+- **Side effects:** make tools idempotent or let must-finish tools ignore the run signal, and record in the
+  trace which tool calls completed before the abort.
+
 ### How does your retry layer tell a client cancellation from a timeout?
 - **Read the reason:** `signal.reason` (or the rejection's `name`) is `AbortError` for a client disconnect and
   `TimeoutError` for `AbortSignal.timeout`.
@@ -382,3 +438,24 @@ after the deadline and token usage per request before and after will show the di
 > An abort is a decision by the owner of the request (client disconnect, parent cancellation) that the
 > work is no longer wanted. Retrying it spends tokens for nobody. Only a timeout signal, identified by
 > its `TimeoutError` reason, may justify a fallback attempt.
+
+## Use cases & projects
+### Use cases
+- **Stop buttons in chat and coding agents.** One run signal stops the model stream, pending tool calls and
+  the UI stream together.
+- **Per-step timeouts.** A slow tool or model step aborts after its budget and the loop can fall back or end
+  the run cleanly.
+- **Speculative branches.** A planner runs two approaches with child controllers and aborts the loser as
+  soon as one succeeds.
+- **Multi-hop agent systems.** A gateway deadline propagated to the agent service, tool services and the
+  provider keeps inner hops from billing after the user got a 504.
+
+### Mini project
+**Make an agent run truly stoppable (1-2 hours).**
+- **Goal:** prove that "stop" ends billing and tool side effects, not just the UI.
+- **Steps:** build `runAgent` above with a fake model that "bills" a token every 100 ms and two fake tools
+  that log when they complete; expose `POST /runs/:id/stop` that aborts the run's controller; add a 20 s
+  per-step timeout; log aborts by reason.
+- **Done when:** a test that hits stop mid-step shows token count stops growing within 200 ms, no tool logs
+  completion after the stop, the abort is logged as `AbortError` (not an error), and a forced slow step
+  produces a `TimeoutError`.

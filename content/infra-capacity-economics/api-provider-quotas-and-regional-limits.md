@@ -5,7 +5,8 @@ name: API provider quotas & regional limits
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - infra-capacity-economics/cloud-ai-architecture
   - infra-capacity-economics/capacity-planning
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-Hosted model APIs cap each account's requests and tokens per minute, per model, per region, by spend
-tier. Exceed them and you get 429s; a full pool fails regardless. So API capacity planning is quota
-planning: measure, keep headroom, spread regions, reserve the base.
+Every agent step is a hosted-API call counted against requests and tokens per minute, per model, per
+region, by tier. Agents multiply calls and re-send growing transcripts, so they hit 429s first;
+plan quota per run, self-limit, pause runs cleanly, spread regions.
+
+## For agent builders
+- **Why it matters for agents.** One agent run is 5-50 calls, each charged prompt plus `max_tokens`, with
+  the prompt growing every step. A quota that looks huge for chat holds only a few runs per minute, and a
+  429 at step 9 must pause the run, not crash it or redo its tools.
+- **Where it shows up in your stack.** The 429 and overload errors your agent framework's model client
+  raises, its built-in retry settings, `Retry-After` and remaining-budget headers, parallel tool calls and
+  sub-agent fan-out, and the provider's batch API for eval sweeps.
+- **What you control.** `max_tokens` per step type, transcript size (compaction, caching), how many runs
+  and sub-agents you admit at once, retry and checkpoint behaviour, and which agents go to batch.
+- **What you can skip.** Each provider's exact limiter algorithm. Know the units, the `max_tokens` trap,
+  the binding-ceiling formula and quota versus capacity.
 
 ## Why it exists
 - **The provider's fleet is finite and shared.** Without limits one customer's spike would degrade every
@@ -100,6 +113,20 @@ binding ceiling   = min(RPM quota, max RPM from TPM, concurrency cap ÷ mean sec
 
 Running this calculation per model per region is the core of quota planning.
 
+### Agent loops multiply every limit
+- **The unit of demand is the run, not the request.** A run's token charge is the sum over its steps of
+  (prompt so far + `max_tokens`), and the prompt grows with every tool result, so the charge grows roughly
+  quadratically with run length.
+- **In agents, input usually dominates.** Tightening `max_tokens` still helps, but transcript size
+  (compaction, trimming verbose tool results) is the bigger lever on TPM.
+- **Fan-out spends concurrency.** Parallel tool calls that each trigger a model call, or a planner spawning
+  sub-agents, put many requests in flight at once and hit a concurrency cap before the TPM quota.
+- **A failed step is not a failed request.** Steps before it already ran tools with side effects, so the
+  recovery unit is "pause the run and resume from its checkpoint", not "retry the whole thing".
+- **Admit runs, not just steps.** A gateway that admits a step only when budget exists can still start
+  more runs than it can finish, leaving dozens half-done when the budget runs dry; cap concurrent runs per
+  agent type as well.
+
 ### Quota versus capacity
 - **A quota is a promise about *your* admission,** not about the pool's availability.
 - **A saturated regional pool fails you under quota:** overload or capacity errors (Anthropic's 529,
@@ -138,16 +165,17 @@ Running this calculation per model per region is the core of quota planning.
    not during the incident; keep a table of quota per model per region in the runbook.
 
 ## Diagram
-One request through a gateway that limits itself below quota: a 429 means wait as told, an overload
-error means stop sending to that deployment for a while and try another.
+One agent step through a gateway that limits itself below quota: a 429 means wait as told, an overload
+error means stop sending to that deployment for a while and try another. If every route is exhausted,
+the agent runtime checkpoints the run instead of failing it.
 
 ```mermaid
 sequenceDiagram
-    participant A as App
+    participant A as Agent step
     participant G as Gateway limiter
     participant D1 as Deployment A
     participant D2 as Deployment B
-    A->>G: request, prompt plus max_tokens
+    A->>G: step, transcript plus max_tokens
     Note over G: debit token and request buckets at 85% of quota
     G->>D1: send
     D1-->>G: 429 with Retry-After
@@ -240,7 +268,74 @@ print(binding_rpm(400_000, 10_000, 1_000, 800, concurrency=50, secs_per_request=
 # ("concurrency cap (Little's Law)", 200): fix max_tokens and the next limit binds
 ```
 
+### Worked scenario: how many agent runs fit in 400k TPM?
+Illustrative. A research agent takes 12 steps per run; prompts average 8k tokens across the run. The
+provider reserves `max_tokens` at admission.
+
+| Setting | Charged per step | Per 12-step run | Steps per minute | Runs per minute |
+|---|---|---|---|---|
+| `max_tokens=4000`, 8k average prompt | 12,000 | 144,000 | ~33 | ~2.8 |
+| `max_tokens=800` | 8,800 | 105,600 | ~45 | ~3.8 |
+| Plus compaction to a 4k average prompt | 4,800 | 57,600 | ~83 | ~6.9 |
+
+- **Same quota, 2.5x the runs,** and the bigger win came from the transcript, not from `max_tokens`.
+- **Compare with chat:** the same 400k TPM served 222 one-shot requests per minute in the calculator above.
+
+### An agent loop that pauses on quota instead of failing
+The run keeps its transcript and the results of tools already executed, so a resume never repeats a side
+effect. `send` returns status, headers and the parsed reply; `save` persists the run.
+
+```python
+import time, random
+from dataclasses import dataclass, field
+
+class Throttled(Exception): pass
+
+@dataclass
+class Run:
+    messages: list
+    tool_results: dict = field(default_factory=dict)   # tool_call_id -> result, survives a pause
+    done: bool = False
+
+def model_step(send, messages, max_tokens, attempts=3):
+    for attempt in range(attempts):
+        status, headers, reply = send(messages, max_tokens)
+        if status == 200: return reply
+        if status == 429:
+            time.sleep(float(headers.get("retry-after", 2 ** attempt)) * random.uniform(1.0, 1.5))
+        elif status in (503, 529): break          # overloaded: retrying here cannot create capacity
+        else: raise RuntimeError(status)
+    raise Throttled()
+
+def drive(run: Run, send, tools: dict, save, max_tokens=800, max_steps=20) -> str:
+    for _ in range(max_steps):
+        try:
+            reply = model_step(send, run.messages, max_tokens)
+        except Throttled:
+            save(run); return "paused"            # a scheduler resumes it when budget returns
+        run.messages.append(reply["message"])
+        if not reply["tool_calls"]:
+            run.done = True; save(run); return "done"
+        for call in reply["tool_calls"]:
+            if call["id"] not in run.tool_results:          # never re-run a finished tool
+                run.tool_results[call["id"]] = tools[call["name"]](**call["args"])
+            run.messages.append({"role": "tool", "tool_call_id": call["id"],
+                                 "content": str(run.tool_results[call["id"]])})
+    save(run); return "step budget exhausted"
+```
+
+- **Turn off the SDK's own retries** when wrapping it like this, or the two retry layers multiply into the
+  retry storm this lesson warns about.
+
 ## Production patterns
+- **Budget per run and cap concurrent runs.** Estimate a run's token charge from recorded transcripts
+  (steps × average prompt plus `max_tokens`) and cap concurrent runs per agent type so admitted runs can
+  finish. Monitor runs paused for quota and median run completion time.
+- **Checkpoint and resume on throttling.** Persist the transcript and tool results after every step; on
+  exhausted retries, pause the run and let a scheduler resume it. Monitor paused-run age and duplicate
+  tool executions, which should be zero.
+- **Cap fan-out at the gateway.** Limit in-flight calls per run, counting parallel tool calls and
+  sub-agents, so one planner cannot take the whole concurrency cap. Monitor in-flight calls per run at p99.
 - **Self-limit below quota.** For every deployment, run a gateway token bucket at 80–90% of TPM and RPM
   (as in the limiter above), so rejections happen in your priority queue. Monitor local queue wait and
   provider 429s, which should stay near zero.
@@ -253,7 +348,7 @@ print(binding_rpm(400_000, 10_000, 1_000, 800, concurrency=50, secs_per_request=
 - **Circuit-break overloaded deployments.** On 503 or 529, stop sending to that deployment for a cooldown
   and fail over within the residency rules. Monitor open circuits per deployment and overload rate while
   under quota.
-- **Batch APIs for offline work.** Send evaluations, backfills and nightly jobs to the provider's batch API,
+- **Batch APIs for offline work.** Send agent evaluations, backfills and nightly jobs to the provider's batch API,
   which has separate limits and typically a lower price. Monitor batch turnaround against the job's
   deadline.
 - **Quota register in the runbook.** One table of quota, current peak and increase lead time per model per
@@ -261,6 +356,9 @@ print(binding_rpm(400_000, 10_000, 1_000, 800, concurrency=50, secs_per_request=
   before it nears the self-limit.
 
 ## Trade-offs
+- **Pausing runs vs finishing them late.** Checkpointing on throttle protects tools from repeated side
+  effects and keeps the pool healthy, but a user waits on a paused run; for interactive agents, admit
+  fewer runs up front instead of pausing many mid-flight.
 - **Self-limiting vs unused quota.** Limiting below quota prevents 429 storms and lets you prioritise, but
   leaves a slice of paid-for quota unused; the margin should shrink as your token estimates get better.
 - **Spreading vs residency and cache benefits.** Spreading across regions or deployments multiplies quota
@@ -275,6 +373,10 @@ print(binding_rpm(400_000, 10_000, 1_000, 800, concurrency=50, secs_per_request=
   flip from useful to useless when a workload is interactive or has a deadline inside the batch window.
 
 ## Pitfalls
+- **Restarting a throttled agent run from step 1.** Symptom: duplicate emails, tickets or writes from
+  tools that already ran, plus a second full token bill. Fix: persist tool results by call id and resume.
+- **Stacking the framework's retries on top of the gateway's.** Symptom: one throttled step turns into
+  a dozen requests and 429s spread to every agent. Fix: retry in one layer only.
 - **Retrying 429s immediately and without a cap.** Symptom: latency rising across every endpoint while
   throughput stays flat, because retries consume the budget that fresh requests need.
 - **Leaving `max_tokens` at a large default.** Symptom: hitting TPM at a fraction of the token volume the
@@ -289,7 +391,9 @@ print(binding_rpm(400_000, 10_000, 1_000, 800, concurrency=50, secs_per_request=
   Symptom: an audit finding rather than a runtime error.
 
 ## When to use
-- **Applies to** every workload on a hosted model API.
+- **Applies to** every workload on a hosted model API, and first to agents, because they generate the
+  most calls and tokens per user action.
+- **For a new agent,** measure steps per run and tokens per step in staging before asking for quota.
 - **Plan quotas when you choose the model and region,** not at launch: convert peak demand into the
   provider's units, compare with the current allocation per model per region, and file increases with
   weeks of lead time.
@@ -342,13 +446,22 @@ and reserved capacity in-region.
 - **Response:** circuit-break and fail over where residency allows, and buy reserved capacity for the base
   load if you have a peak SLO.
 
-### How is retry logic for an LLM gateway different from retrying an ordinary HTTP call?
+### How is retry logic in an agent loop different from retrying an ordinary HTTP call?
 - **A sustained 429 is not transient,** so blind retries become a retry storm that consumes the budget
   fresh requests need.
 - **Do instead:** honour `Retry-After`, add jitter, cap attempts, queue by priority, and shed or defer when
   the wait exceeds the latency budget.
 - **Treat overload separately:** open a circuit on a deployment returning 503 or 529, because retries
   cannot create capacity.
+- **The run has state:** earlier steps ran tools, so on exhausted retries checkpoint and resume the run
+  rather than restarting it, and retry in one layer only.
+
+### Your new research agent hits 429s at a tenth of the traffic your chat product handles on the same quota. Why, and what do you change?
+- **Each run is many calls with growing prompts:** 12 steps at 8k average prompt plus `max_tokens=4000`
+  charge ~144k tokens, so 400k TPM holds under 3 runs per minute.
+- **Cut the charge:** compact the transcript, trim verbose tool results, set `max_tokens` per step type.
+- **Then shape demand:** cap concurrent runs and fan-out, move eval sweeps to the batch API, and request
+  quota sized from measured tokens per run.
 
 ### Your provider caps you at 50 concurrent requests and long generations take 15 seconds. What is your ceiling, and what moves it?
 - **Little's Law:** 50 ÷ 15 s × 60 = 200 requests per minute, whatever the token quota says.
@@ -390,3 +503,24 @@ and reserved capacity in-region.
 > Global or multi-region routing violates residency silently. The in-region toolkit is tighter
 > token reservation, prioritisation, separate batch limits, and reserved capacity or increases with
 > lead time.
+
+## Use cases & projects
+### Use cases
+- **Launching a new agent on a hosted API.** Tokens per run from staging transcripts become the quota
+  request, filed weeks before launch.
+- **Multi-agent and fan-out systems.** Per-run caps on in-flight calls keep a planner and its sub-agents
+  from taking the whole concurrency cap.
+- **Nightly agent eval sweeps.** Hundreds of eval tasks go to the batch API so they do not drain the
+  daytime TPM that interactive agents need.
+- **Long-running background agents.** Checkpoint-and-resume lets a run survive a throttled hour without
+  repeating tool side effects.
+
+### Mini project
+**Make a toy agent survive a quota (2 hours).**
+- **Goal:** show that an agent loop behind a token-bucket gateway pauses and resumes cleanly under a tight
+  quota without duplicating tool calls.
+- **Steps:** build a fake model endpoint that returns 429 with `Retry-After` once a per-minute token budget
+  is spent; run ten concurrent 8-step agent runs through the limiter and the pause-and-resume loop above;
+  log tokens charged per step, pauses and tool executions.
+- **Done when:** all ten runs finish, no tool runs twice for the same call id, and a table shows runs per
+  minute before and after cutting `max_tokens` and compacting the transcript.

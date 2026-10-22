@@ -5,7 +5,8 @@ name: Graceful shutdown
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - fastapi-for-ai/graceful-shutdown-and-worker-draining
   - deployment/health-checks
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-On SIGTERM a Node service must fail readiness, stop intake, finish in-flight work within a deadline
-shorter than the grace period, close queues and pools, flush telemetry and exit. Otherwise every deploy
-truncates LLM streams, re-runs jobs and leaks half-done writes.
+On SIGTERM an agent API or worker must fail readiness, stop intake, bring in-flight agent steps to a
+checkpoint before a deadline, close queues and pools, flush telemetry and exit. Otherwise every deploy
+truncates streams, re-runs tool calls and loses traces.
+
+## For agent builders
+- **Why it matters for agents.** Agent runs outlive deploys: a run may be mid-way through step 7 of 15,
+  streaming tokens to a user and holding a BullMQ job lock. Shutdown decides whether that run resumes
+  cleanly at step 8 or replays tools, double-charges and leaves the user with a cut-off answer.
+- **Where it shows up in your stack.** `process.on('SIGTERM')` in agent APIs, BullMQ workers and MCP
+  servers; `worker.close()`; `AbortController` on in-flight model calls; Kubernetes
+  `terminationGracePeriodSeconds` and `preStop`; `sdk.shutdown()` for the run's final spans.
+- **What you control.** Where a run may stop (a step boundary), the drain deadline per workload, what a
+  streaming client is told, and the close order of worker, Redis, pool and telemetry.
+- **What you can skip.** Kernel signal details beyond "PID 1 needs a handler or `tini`", and Kubernetes
+  internals past the SIGTERM-to-SIGKILL timeline.
 
 ## Why it exists
 - **Processes are killed constantly:** deploys, autoscaling, node drains, out-of-memory kills.
@@ -97,6 +110,14 @@ truncates LLM streams, re-runs jobs and leaks half-done writes.
 - **Otherwise send a final event** that tells the client to resume or retry.
 - **Abort the upstream model call** with an `AbortController`, so you stop paying for tokens nobody will
   receive.
+
+### Agent runs: stop at a step boundary
+- **A step is the unit to finish.** A model turn plus its tool calls usually fits in the deadline; a
+  whole 15-step run usually does not.
+- **Check a shutdown flag between steps.** When it is set, checkpoint the transcript, enqueue the next
+  step as a new job, and return, so another worker resumes the run after the deploy.
+- **Abort mid-step only when the deadline is close.** Cancel the model call with its `AbortController`;
+  the step re-runs later, which is safe only if its tool side effects carry idempotency keys.
 
 ### Close order and exit
 - **Redis:** `queue.close()` and `redis.quit()`, which waits for pending replies, unlike `disconnect()`.
@@ -198,6 +219,50 @@ process.on("SIGINT",  () => void shutdown("SIGINT"));
 process.on("unhandledRejection", (e) => { console.error(e); void shutdown("unhandledRejection", 1); });
 ```
 
+### Agent scenario: an agent worker that yields at step boundaries
+The processor runs steps until the run finishes or shutdown starts. On shutdown it checkpoints, hands the
+next step back to the queue and returns, so `worker.close()` completes quickly instead of waiting for a
+whole run.
+
+```ts
+import { Queue, Worker } from "bullmq";
+// conn() is an ioredis factory with maxRetriesPerRequest: null; loadRun, runStep, saveStep are app code
+const stopping = new AbortController();               // aborted when shutdown begins
+const steps = new Queue("agent-steps", { connection: conn() });
+
+const agentWorker = new Worker("agent-steps", async (job) => {
+  const { runId } = job.data as { runId: string };
+  let { nextStep, done } = await loadRun(runId);
+  while (!done) {
+    if (stopping.signal.aborted) {                     // yield: another worker resumes after the deploy
+      await steps.add("step", { runId }, { jobId: `run-${runId}-from-${nextStep}` });
+      return { yielded: nextStep };
+    }
+    const r = await runStep(runId, nextStep, stopping.signal);   // model call gets the signal too
+    await saveStep(runId, nextStep, r);                // checkpoint before the next step starts
+    done = r.final; nextStep++;
+  }
+  return { done: true };
+}, { connection: conn(), concurrency: 4 });
+
+export async function drainAgents() {
+  stopping.abort();                                    // running steps finish or abort, then yield
+  await agentWorker.close();                           // waits for active jobs, which now return fast
+}
+```
+
+- **Passing the signal into `runStep` is a choice.** It aborts the in-flight model call immediately; pass
+  it only once the deadline is near if you would rather let the current step finish.
+
+Illustrative timeline, assuming each step takes under 10 seconds:
+
+| Moment (30 s grace, 5 s `preStop`) | Without step-boundary yield | With yield |
+|---|---|---|
+| SIGTERM, 4 runs active at steps 3, 7, 9, 12 of 15 | `worker.close()` waits for whole runs | each run finishes its current step |
+| ~10 s later | still running, minutes left | 4 runs checkpointed, next steps re-enqueued |
+| 25 s deadline | `process.exit(1)`, locks expire, runs replay from their last checkpoint | already exited cleanly |
+| After deploy | stall checker re-runs 4 jobs | new pods resume at steps 4, 8, 10, 13 |
+
 ### Production snippet: the container and manifest side
 The code above only works if the signal reaches Node and the timings line up. Exec-form `CMD` behind
 `tini` makes Node receive SIGTERM; the manifest sets the grace period, the `preStop` sleep and separate
@@ -247,6 +312,9 @@ for the worker deployment and the deadline with it, or add per-chunk checkpoints
 resumes cheaply.
 
 ## Production patterns
+- **Yield agent runs at step boundaries.** When agent runs are longer than any grace period, have the
+  worker check a shutdown signal between steps, checkpoint, and re-enqueue the next step, so a deploy
+  costs at most one step per run. Monitor yielded runs per deploy and runs that resumed successfully.
 - **Zero-error rollouts as a test.** Run a steady load against a staging deployment while triggering a
   rollout restart, and fail the check if the load balancer logs any 5xx or connection resets. Monitor
   5xx and stalled-job counts per rollout in production too.
@@ -338,6 +406,14 @@ not a shell.
 - **So the app must** keep serving through propagation, drain, close and exit before the grace period
   ends.
 
+### A deploy starts while 40 agent runs are mid-flight, some streaming to users. What should happen?
+- **Workers:** stop claiming jobs, let each run finish its current step, checkpoint, re-enqueue the next
+  step and exit; new pods resume the runs.
+- **Streaming API pods:** finish streams that end within the deadline, otherwise send a final event with
+  the run id so the client reconnects, and abort the upstream model call.
+- **Safety net:** tool side effects carry idempotency keys, because any step cut off by the deadline will
+  run again.
+
 ### Your containers always take exactly 30 seconds to stop and never log a shutdown line. What is wrong?
 - **The signal never reaches Node:** a shell-form `CMD npm start` or wrapper script is PID 1 and does not
   forward SIGTERM, or Node is PID 1 with no handler and the kernel ignores the signal.
@@ -387,3 +463,24 @@ not a shell.
 - [ ] Flush telemetry, then exit and let the orchestrator close the remaining sockets
 - [ ] Close the worker, then exit, because the stall checker will finish any remaining jobs
 > The pool must outlive every request and job that may still query, so it closes only after the server and worker have drained; ending it first produces "pool after end" errors in the last jobs. Telemetry goes last, under a short cap, so the close steps' own spans are exported before exit.
+
+## Use cases & projects
+### Use cases
+- **Deploying agent workers during the day.** Step-boundary yields let you roll out new prompts or tools
+  without killing long research or coding runs.
+- **Streaming chat agents.** A final "reconnect" event with the run id keeps users from seeing a
+  truncated answer during a rollout.
+- **MCP servers in containers.** A SIGTERM handler closes transports and in-flight tool calls before the
+  orchestrator kills the server.
+- **Complete traces of the last runs.** Flushing OpenTelemetry last keeps the spans of runs that were
+  interrupted by the deploy.
+
+### Mini project
+**Deploy-safe agent worker (2 hours).**
+- **Goal:** prove a deploy costs at most one repeated step per active agent run.
+- **Steps:** build a BullMQ agent worker with a fake 10-step agent (each step sleeps 3 s and calls a
+  fake side-effecting tool with an idempotency key); add the shutdown orchestrator and step-boundary
+  yield; start 5 runs; send SIGTERM while they are mid-run; start a fresh worker; repeat 10 times.
+- **Done when:** every run completes with 10 checkpointed steps, no tool side effect is applied twice,
+  the old worker always exits before its 20-second deadline, and shutdown logs show each close step with
+  its duration.

@@ -431,3 +431,24 @@ conversational gain is measurable; otherwise fall back to routing.
 - [ ] Any two models that share a tokenizer
 > Linear mode connectivity holds for models sharing an initialisation. Independently trained models have
 > permuted hidden units and different basins, and different sizes do not even have matching tensor shapes.
+
+## Use cases & projects
+### Use cases
+- **One model with tool use and conversation.** Merging a tool-calling fine-tune with an instruct tune
+  of the same base avoids routing every agent step between two specialists.
+- **Adding a domain skill without retraining.** A domain fine-tune merged into the agent's tool-use
+  model brings vocabulary in when the original training data is unavailable.
+- **Vetting community merges.** Before putting a hub "merged" model behind an agent, teams check its
+  lineage and run their tool-call and refusal suites against the parents.
+- **Cheap experiments before a real fine-tune.** A merge grid costs minutes of CPU or GPU time, so it is
+  a quick test of whether combined skills are reachable at all.
+
+### Mini project
+**Merge two adapters and gate the result on an agent suite (2-3 hours).**
+- **Goal:** combine a tool-use skill and a style or domain skill into one model and prove whether it
+  holds both.
+- **Steps:** take two LoRA adapters (or full fine-tunes) trained from the same base revision; build a
+  small grid of merges (linear plus TIES at two densities); score each candidate and both parents on 40
+  tool-calling tasks, 20 style or domain prompts and 15 refusal prompts.
+- **Done when:** a table shows every candidate against both parents, and you either ship the best merge
+  or document why a router over the two specialists is the better path.

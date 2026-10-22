@@ -5,7 +5,8 @@ name: Caching (semantic, prompt)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - serving-inference/prefix-caching
   - prompting/prompt-caching
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-LLM caching is three layers: exact-match response caches skip identical requests, semantic caches skip
-*similar* ones by embedding distance, and prompt caching reuses a shared prefix's KV cache so only
-prefill is saved. They save, fail and key differently.
+Agents re-send the same system prompt, tool schemas and growing transcript on every step, so prompt
+caching is their main cost lever. Exact and semantic response caches skip whole generations, but only fit
+repeat-heavy, non-personal sub-calls.
+
+## For agent builders
+- **Why it matters for agents.** A 40-step session over a 12k-token prefix re-sends roughly half a million
+  prefix tokens. Prompt caching turns most of that into cheap cache reads and cuts time to first token on
+  every step, which is what makes long tool-calling loops affordable.
+- **Where it shows up in your stack.** `cache_control` breakpoints and the usage fields on the Anthropic
+  API, automatic caching and cached-token counts on OpenAI, vLLM prefix caching or SGLang RadixAttention
+  when self-hosting, and Redis or a vector store for response and tool-result caches.
+- **What you control.** Prompt order (tools, then system, then an append-only transcript), where
+  breakpoints sit, keeping tool schemas byte-identical, which read-only tool results you memoise, and
+  whether any user-facing answer may come from a semantic cache at all.
+- **What you can skip.** Semantic-cache tuning for the main agent loop: answers depend on conversation
+  state, so near-miss hits are wrong. Spend the effort on prefix stability instead.
 
 ## Why it exists
 - **Prefill cost scales with prompt length, and most of the prompt repeats.** In agent and RAG systems the
@@ -126,6 +140,20 @@ Vendor specifics at the time of writing, which change:
 
 Most real systems run prompt caching always and add a response-level cache only where repeats are
 measured.
+
+### Caching inside an agent loop
+| What repeats in an agent | Cache it with | Rule |
+|---|---|---|
+| Tool schemas and system prompt | prompt caching, breakpoint after them | byte-identical and in a fixed order on every step |
+| Earlier turns of the transcript | prompt caching, incremental | append only; editing or trimming an old turn misses from that point |
+| Read-only tool results (search, lookup) | exact cache keyed on tool, arguments, tenant | short TTL; never for tools with side effects |
+| Embeddings of retrieved chunks | exact cache keyed on chunk hash and embedding model | invalidate on model change |
+| The agent's final answer | usually nothing | depends on run state, so semantic hits are wrong |
+
+- **Compaction costs one miss.** Summarising old turns into a new block rewrites the transcript, so the
+  next call writes a fresh cache entry; compact rarely, at a boundary, not a little every step.
+- **Sub-agents share prefixes only if they share bytes.** Give parallel sub-agents the same tool list and
+  system prompt in the same order if you want them to read one cached prefix.
 
 ## Diagram
 Read the request top to bottom: the cheapest full skip is tried first, and whatever falls through still
@@ -238,7 +266,52 @@ for tau in (0.9, 0.8):
     print(tau, c.get(("globex",) + ns[1:], "How do I cancel my order?"))  # other tenant: never hits
 ```
 
+### Worked scenario: prompt caching across a 40-step agent session
+Only the 12k-token tools-and-system prefix is counted, at the same illustrative prices (3 per million
+input, 1.25× write, 0.1× read), with steps arriving inside the five-minute TTL.
+
+| Cost line | Without caching | With caching |
+|---|---|---|
+| Prefix tokens sent | 40 × 12,000 = 480,000 | same tokens, billed differently |
+| First step | 12,000 × 3 / 10⁶ ≈ 0.036 | one write: 12,000 × 3.75 / 10⁶ ≈ 0.045 |
+| Steps 2-40 | 39 × 12,000 × 3 / 10⁶ ≈ 1.40 | 39 reads: 39 × 12,000 × 0.30 / 10⁶ ≈ 0.14 |
+| **Prefix cost per session** | **≈ 1.44** | **≈ 0.19, about 7-8× less** |
+
+- **The growing transcript adds more:** with incremental breakpoints each step writes only its own delta
+  and reads the rest, so the saving grows with session length.
+- **One dynamic line at the top** (a timestamp) turns every step back into the left column, plus the write
+  premium.
+
+### Memoising read-only tool results within an agent run
+Agents often repeat the same lookup across steps. Cache only tools marked read-only, keyed on tenant, tool
+name and canonical arguments, with a short TTL.
+
+```python
+import hashlib, json, time
+
+READ_ONLY = {"search_docs", "get_order_status"}      # never cache tools with side effects
+_cache = {}
+
+def call_tool(ctx, name, args, tools, ttl_s=60):
+    if name not in READ_ONLY:
+        return tools[name](**args)
+    key = hashlib.sha256(json.dumps([ctx.tenant, name, args], sort_keys=True).encode()).hexdigest()
+    hit = _cache.get(key)
+    if hit and hit["expires"] > time.monotonic():
+        ctx.metrics["tool_cache_hits"] += 1
+        return hit["value"]
+    value = tools[name](**args)
+    _cache[key] = {"value": value, "expires": time.monotonic() + ttl_s}
+    return value
+```
+
 ## Production patterns
+- **Track cached-input share per agent step.** Log uncached, cache-write and cache-read input tokens from
+  the usage fields on every step of every run, and alert when the cache-read share for step 2 onward
+  falls. Monitor it per agent version, because prompt edits are the usual cause.
+- **Freeze the tool list per run.** Load and sort tool schemas once at run start, rather than toggling
+  tools per step by feature flag, so the cached prefix survives all steps. Monitor prefix-cache misses
+  that coincide with tool-list changes.
 - **Static-first prompt with a CI assertion.** Render tools, then system, then messages; put the
   breakpoint after the last stable block; add an integration test that sends the same prefix twice and
   asserts `cache_read_input_tokens` > 0. Monitor cache-read tokens as a fraction of total input.
@@ -269,6 +342,9 @@ for tau in (0.9, 0.8):
   byte of volatile content moved earlier shortens the cacheable prefix.
 - **Resident prefixes vs batch size.** On self-hosted engines a prefix cache occupies KV memory that could
   hold running sequences, so retention competes with batch size under load.
+- **Tool-result caching: fewer calls vs stale observations.** Memoising a lookup saves latency and API
+  cost inside a run, but the agent may act on data that changed seconds ago; keep TTLs short and skip
+  caching for anything the agent will act on irreversibly.
 
 ## Pitfalls
 - **A timestamp, request id or user name early in the system prompt.** Symptom:
@@ -288,6 +364,9 @@ for tau in (0.9, 0.8):
   bill barely moves, because the hits were on short prefixes.
 - **Expecting decode to speed up.** Symptom: unchanged tokens per second after enabling caching, which is
   correct, since only prefill is skipped.
+- **Rewriting the agent transcript every step** (trimming, re-summarising, re-inserting memory at the
+  top). Symptom: cache reads cover only the tools-and-system block while step cost keeps climbing. Fix:
+  append-only transcript, memory after the stable prefix, compaction at rare boundaries.
 
 ## When to use
 - **Prompt caching:** wherever a prompt has a stable prefix above the model's minimum: agent loops, long
@@ -331,7 +410,7 @@ prompt.
 - **Prompt caching reuses the KV cache of a shared prefix,** skipping prefill but generating the answer
   fresh, so it helps every call with a stable prefix and never returns stale text.
 
-### After a release, `cache_read_input_tokens` dropped to zero and the bill rose. How do you debug it?
+### After a release, your agent's `cache_read_input_tokens` dropped to zero and the bill rose. How do you debug it?
 - **Diff the rendered prompt** between two requests and find the first differing token; a timestamp,
   request id, user name or reordered tool list early in the prompt breaks every later position.
 - **Check the prefix length** is still above the model's minimum and the breakpoint is after the stable
@@ -356,6 +435,14 @@ prompt.
   subscription") can need different answers.
 - **Validate on sampled hits** graded by a human or judge, tracking hit precision next to hit rate, and
   consider a cheap verifier call before returning a hit.
+
+### Which parts of a tool-calling agent would you cache, and with which layer?
+- **Prompt caching for the loop:** tools and system prompt first and byte-stable, an append-only
+  transcript, breakpoints after the stable block, verified with the usage fields per step.
+- **Exact caches for deterministic sub-calls:** read-only tool results within a run and embeddings of
+  retrieved chunks, keyed on tenant and arguments with short TTLs.
+- **No semantic cache on the agent's answers,** because they depend on run state, and no caching of
+  side-effecting tools at all.
 
 ## Quiz
 ### Q: What does provider-side prompt caching reduce?
@@ -383,3 +470,24 @@ prompt.
 > Embedding similarity is not answer equivalence. "Cancel my order" and "cancel my subscription" sit close
 > together and need different answers, so hit precision must be measured and the threshold tuned for
 > correctness, not hit rate.
+
+## Use cases & projects
+### Use cases
+- **Long-running coding and research agents.** Prompt caching keeps per-step input cost and TTFT flat as
+  the transcript grows, as long as it stays append-only.
+- **RAG agents over a large static manual.** A cached document prefix answers many questions for a
+  fraction of the input price.
+- **Support FAQ front door.** A tenant-scoped semantic cache answers repeated policy questions before the
+  agent loop starts, with sampled precision review.
+- **Agents that repeat lookups.** Memoised read-only tool results cut repeated search or status calls
+  within one run.
+
+### Mini project
+**Measure and protect prompt-cache hits in an agent (1-2 hours).**
+- **Goal:** show the cost and TTFT effect of a stable prefix across a 10-step tool-calling loop, and catch
+  regressions automatically.
+- **Steps:** build a small agent with two tools and a long system prompt above the model's minimum; add a
+  `cache_control` breakpoint after it; log uncached, cache-write and cache-read tokens per step; then
+  inject a timestamp at the top and rerun; write a test asserting `cache_read_input_tokens` > 0 on step 2.
+- **Done when:** you have a per-step table for both runs, a cost estimate per session for each, and a test
+  that fails on the timestamped prompt.

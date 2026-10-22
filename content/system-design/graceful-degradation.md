@@ -450,3 +450,23 @@ works.
 > Unused paths rot and deploy-gated switches are slow. Routine traffic through each level, synthetic
 > checks and runtime flags are what make the ladder real; bigger models, longer timeouts and more
 > retries typically make the incident worse.
+
+## Use cases & projects
+### Use cases
+- **Incident modes for agents.** Under provider trouble the agent drops to a smaller model and fewer steps,
+  with a label telling the user it is in a reduced mode.
+- **Read-only fallback.** Write tools are disabled first, so the agent can still look things up while
+  nothing irreversible happens.
+- **Budget exhaustion.** When the step budget ends, the agent returns what it found so far instead of an
+  error.
+- **Kill switch and handoff.** A runtime flag turns the agent off and routes users to a human or a static
+  answer without a deploy.
+
+### Mini project
+**Add a three-level degradation ladder to an agent (1-3 hours).**
+- **Goal:** give an agent predefined smaller modes controlled by a runtime flag.
+- **Steps:** define levels in config (full: strong model, 15 steps, all tools; reduced: small model, 5
+  steps, read tools only; off: static handoff message); read the level from a flag at the start of each
+  run; return a labelled partial answer when the step cap is hit; run the same tasks at each level.
+- **Done when:** flipping the flag changes behaviour without a restart, write tools never run in reduced
+  mode, and you have a table of success rate and cost per level.

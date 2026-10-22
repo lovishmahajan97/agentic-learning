@@ -5,7 +5,8 @@ name: Durable execution & checkpointing
 kind: concept
 difficulty: core
 est_minutes: 18
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - agent-reliability/state-persistence-and-conversation-recovery
   - agent-reliability/state-and-checkpoint-stores
@@ -23,6 +24,19 @@ sources:
 Durable execution makes an agent run's progress outlive its process; checkpointing persists state at step
 boundaries so a resume continues from the last boundary, not from scratch. The hard part is side effects,
 so checkpointing is inseparable from idempotent tools.
+
+## For agent builders
+- **Why it matters for agents.** A long agent run spends tokens and creates tickets, branches and messages
+  as it goes. Without checkpoints, every deploy or OOM restarts it from zero, re-pays the tokens and
+  repeats the side effects on top of the first attempt's half-finished work.
+- **Where it shows up in your stack.** LangGraph checkpointers keyed by a thread id (for example
+  `PostgresSaver` from `langgraph-checkpoint-postgres`), Temporal workflows with model and tool calls as
+  activities, or your own snapshot table plus a lease.
+- **What you control.** What the checkpoint contains, where the save sits (between "model decided" and
+  "tools run"), the intent-execute-record protocol with stable idempotency keys, how waits are parked,
+  per-call timeouts and retries, and checkpoint schema versions.
+- **What you can skip.** Saving partial model output. A model call can be repeated safely; only side
+  effects need the intent record.
 
 ## Why it exists
 - **A chat completion is one request; an agent run is not.** If a single call's process dies, the client
@@ -404,3 +418,25 @@ attempts and a second ticket appears.
 - [ ] The model's temperature setting
 > Without recorded pending intents, a resume cannot tell whether an in-flight tool ran; it either
 > repeats the side effect or loses it. Prompt text and settings are reconstructable from a version id.
+
+## Use cases & projects
+### Use cases
+- **Coding agents that survive deploys.** A run that has created a branch and opened a pull request
+  resumes at its last step after a worker restart instead of opening a second one.
+- **Approval-gated agents.** A run waiting two days for a human approval is parked as a status plus a
+  wake-up signal, costing storage instead of a held worker.
+- **Back-office agents with many side effects.** Ticket, email and CRM writes go through recorded intents
+  with stable keys, so a crash between execute and record does not duplicate them.
+- **Long research agents on spot capacity.** Reclaimed instances lose at most the step in flight, not the
+  hour of tokens already spent.
+
+### Mini project
+**Make a toy agent crash-safe (2-3 hours).**
+- **Goal:** show that a run killed between executing a tool and recording its result resumes without a
+  duplicate side effect.
+- **Steps:** write a 5-step agent loop whose tool appends a row to a local "tickets" table; save a
+  checkpoint (transcript, step index, budgets, pending intents with keys derived from run id and step) to
+  SQLite before tools run; add a dedup table keyed by idempotency key; kill the process at random points
+  with an injected exception and resume under the same run id.
+- **Done when:** across 50 randomized crash-and-resume trials the tickets table holds exactly one row per
+  logical call, and a version without stable keys shows the duplicates.

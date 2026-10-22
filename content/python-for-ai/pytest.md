@@ -504,3 +504,24 @@ change the economics of writing tests, which is why suites built on pytest have 
 > Each `parametrize` multiplies the existing set of test instances by its own cases, so stacking
 > produces every combination. Use a single decorator with explicit tuples when only specific pairs
 > are meaningful.
+
+## Use cases & projects
+### Use cases
+- **Agent loop guards.** Parametrized tests pin the step limit, the stop condition and the handling of
+  a reply with no tool call, so a refactor of the loop cannot quietly remove a safety stop.
+- **Tool dispatcher hardening.** A table of malformed tool calls (unknown name, missing argument, wrong
+  type, fenced JSON) checks that each one becomes an error message to the model, not a crash.
+- **Prompt and context builders.** Tests assert that user text is escaped, that retrieved chunks are
+  ordered and trimmed to budget, and that the system prompt stays byte-stable across runs.
+- **Lane separation in CI.** Markers keep real-model tests in a nightly lane while pull requests run the
+  offline suite in seconds.
+
+### Mini project
+**Build an offline pytest suite for a tiny tool-calling agent (2-3 hours).**
+- **Goal:** cover an agent loop with two tools using no network and no real model.
+- **Steps:** write a `fake_llm` fixture in `conftest.py` that replays a scripted list of replies;
+  parametrize at least eight cases (normal answer, one tool call, two chained calls, unknown tool,
+  malformed arguments, step limit reached, empty reply, tool raising); mark one real-model test
+  `integration` and exclude it by default.
+- **Done when:** the default run passes in under a few seconds with no network access, every case has a
+  readable id, and breaking the step limit in the loop makes exactly one test fail.

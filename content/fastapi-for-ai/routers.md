@@ -407,3 +407,30 @@ separate internal service, so the public stack cannot accidentally inherit body 
 > Mounting attaches a separate ASGI application in-process, so it is isolated: its own docs, handlers and
 > middleware (the parent's middleware still wraps it). That is the point when you need isolation, and the
 > cost when you wanted one merged API. There is no HTTP proxying, and dependencies are not inherited.
+
+## Use cases & projects
+### Use cases
+- **Agent backends with several audiences.** End users start runs under `/v1/agents`, the agent loop
+  calls internal tools under `/tools`, and operators manage prompt versions under an admin prefix, each
+  behind its own guard declared once.
+- **Tool servers for agents.** A service whose routes become agent tools keeps each tool family in its
+  own router and tag, so imported tool lists stay grouped and readable.
+- **Eval and replay surfaces.** An `/internal/eval` router lets an eval harness replay recorded agent
+  traces against the live service without exposing those routes to end users.
+- **Versioned agent APIs.** A `/v2` runs router can ship a new run payload while `/v1` keeps serving
+  older clients from the same process.
+
+### Mini project
+**Split a single-file agent service into guarded routers (1-2 hours).**
+- **Goal:** turn a `main.py` holding run, tool and admin routes into three routers, with auth applied
+  once per group and no route left unguarded.
+- **Steps:** create `runs`, `tools` and `admin` modules, each with an `APIRouter`; attach them with
+  `include_router` using a prefix, a tag and a group dependency (user auth, service token, admin); add a
+  test that walks `app.routes` and fails if any route under `/tools` or the admin prefix lacks its guard.
+- **Done when:** `/docs` shows the three tagged groups, requests without the right credential get 401 or
+  403 on every guarded route, and the route-walk test fails when you delete one router-level dependency.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): the document question-answering service
+there is built on versioned routers, with upload, job status, chat and health surfaces each in their own
+router.

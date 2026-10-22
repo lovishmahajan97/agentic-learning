@@ -436,3 +436,24 @@ analysis can isolate a bad batch instead of discarding the whole dataset.
 > Each comparison carries less information than a full demonstration, which is why many are needed.
 > They win on cost and consistency: judging is easier than producing, and a reward model can aggregate
 > thousands of noisy comparisons into a usable signal.
+
+## Use cases & projects
+### Use cases
+- **Building a golden eval set for a new agent.** Domain experts grade 100-300 real traces per step (tool
+  choice, arguments, use of the result, final answer) so prompt and model changes have a trusted score.
+- **Calibrating an LLM judge.** Adjudicated human labels on an overlap set tell you whether the judge
+  agrees well enough with people to replace them on the bulk of traffic.
+- **Turning production feedback into training data.** Thumbs-down runs go into an annotation queue, get
+  corrected trajectories or preference pairs, and feed the next fine-tune or few-shot pool.
+- **Labeling guardrail and router classifiers.** Small models that route requests or block unsafe tool
+  calls need clean, agreed labels because their mistakes show up directly as wrong actions.
+
+### Mini project
+**Label agent traces and measure agreement (2-3 hours).**
+- **Goal:** produce a small labeled trace set and know how much to trust it and an LLM judge.
+- **Steps:** collect 50 traces from a toy tool-calling agent; write a one-page rubric with per-step labels;
+  have two people (or you twice, a day apart) label all 50; compute Cohen's kappa per label; adjudicate
+  disagreements and refine the rubric; then run an LLM judge with the same rubric and compute its kappa
+  against the adjudicated labels.
+- **Done when:** you have a JSONL of adjudicated labels, a table of kappa per label for human-human and
+  judge-human, and a short note on which labels the judge may own and which still need people.

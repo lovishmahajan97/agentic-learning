@@ -5,7 +5,8 @@ name: Docker / CI/CD deployment
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - backend-fundamentals/docker
   - backend-fundamentals/ci-cd
@@ -22,9 +23,20 @@ sources:
 ---
 
 ## TL;DR
-Ship a Node AI service as a multi-stage image of compiled JavaScript and production deps, run Node as PID
-1 so `SIGTERM` drains streams, inject keys at runtime, and gate on typecheck and tests, with evals beside
-the gate, not inside it.
+Ship a Node agent service as a multi-stage image, run Node as PID 1 so `SIGTERM` drains agent runs, inject
+keys at runtime, and gate on typecheck and tests, with evals of prompts and tools beside the gate, not
+inside it.
+
+## For agent builders
+- **Why it matters for agents.** An agent run holds a connection for many steps and minutes, spawns tool
+  servers, and depends on prompts and tool schemas that can regress without a red test. A careless deploy
+  cuts runs mid-step, orphans MCP subprocesses and ships prompt changes blind.
+- **Where it shows up in your stack.** The Dockerfile and `CMD`, `terminationGracePeriodSeconds` and
+  `preStop` in the pod spec, readiness probes, the CI workflow, and the eval job that gates promotion.
+- **What you control.** Exec-form `CMD` and an init process for tool subprocesses, the grace period versus
+  your longest allowed run, where provider keys come from, and which checks block a prompt or model change.
+- **What you can skip.** Registry internals and exotic BuildKit features; a cached `npm ci` layer, a pruned
+  runtime stage and SHA tags cover almost every agent service.
 
 ## Why it exists
 - **TypeScript does not run as written.** It must be compiled (or type-stripped), its dependency tree is
@@ -77,6 +89,9 @@ the gate, not inside it.
 - **Division of labour.** The drain (stop accepting, finish or abort in-flight streams, close the pool) is
   the graceful-shutdown lesson. The deployment delivers the signal and sets the grace period longer than
   the longest completion you allow.
+- **Agent runs are longer than completions.** A multi-step run can outlast any sane grace period. Either
+  cap run length under the grace period, or run agents as durable jobs that checkpoint after each step so a
+  new pod resumes them, and let the HTTP pod only stream progress.
 
 ### Memory and the container boundary
 - **The default V8 heap limit is a heuristic** from detected memory. Older releases read host memory and
@@ -117,7 +132,8 @@ the gate, not inside it.
 4. **Prompts, tool schemas and the model identifier ship in the image**, so changing them is a deploy like
    any other.
 5. **Eval beside the gate.** A job runs the golden set against the real model with a budget and publishes a
-   score; a drop blocks promotion to production without making every PR pay for model calls.
+   score; a drop blocks promotion to production without making every PR pay for model calls. For agents
+   the score includes task success, steps per run and tool-call errors, not only answer quality.
 6. **Canary prompt or model changes.** Route a slice of traffic, compare quality and cost metrics, widen.
 
 ## Diagram
@@ -225,6 +241,20 @@ A chat service caps completions at 120 seconds by policy (an illustrative value;
 - **Cost:** every rollout can now take up to that long per pod batch, which is why the cap is the policy
   maximum, not "infinite".
 
+### Worked scenario: deploying while agents are mid-run
+A research agent's runs take a few minutes typically and up to 15 minutes at the policy cap (illustrative
+values). Three ways to survive a rollout:
+
+| Approach | Grace period needed | Runs cut per rollout | What you pay |
+|---|---|---|---|
+| In-process drain, 135 s grace | 135 s | every run older than about 2 minutes | wasted tokens, users restart runs |
+| In-process drain sized for the cap | 5 + 900 + 5 + 5 = 915 s | none | every rollout takes 15+ minutes per pod batch |
+| Durable job, checkpoint after each step | 135 s (for the streaming pod) | none; another worker resumes from the last completed step | a queue, a run-state store and idempotent tools |
+
+- **The third row is why long agents run as jobs.** The HTTP pod streams progress from the run store; the
+  worker that receives `SIGTERM` finishes its current step, saves state and exits, so deploy speed and run
+  length stop fighting.
+
 ## Production patterns
 - **Deploy by digest, roll back by tag.** Tag every image with `${{ github.sha }}` and deploy that exact
   digest to staging and then production, so rollback re-points to the previous SHA without a rebuild.
@@ -242,9 +272,9 @@ A chat service caps completions at 120 seconds by policy (an illustrative value;
 - **Audit images for leaked secrets.** Run `docker history --no-trunc <image>` (or a scanner in CI) on
   release images to confirm no key appears in build args or layers. Alert on any match and rotate the key
   immediately, since registry copies cannot be recalled.
-- **Canary prompt and model changes.** Route a small slice of traffic to the new digest, compare quality
-  score, cost per request and error rate against the baseline, then widen. Monitor the eval score as the
-  promotion gate.
+- **Canary prompt, tool-schema and model changes.** Route a small slice of traffic to the new digest,
+  compare quality score, task success, steps per run, tool error rate, cost per request and error rate
+  against the baseline, then widen. Monitor the eval score as the promotion gate.
 
 ## Trade-offs
 - **Multi-stage: smaller image vs build complexity.** Shrinks the runtime image and attack surface; for a
@@ -276,6 +306,9 @@ A chat service caps completions at 120 seconds by policy (an illustrative value;
 - **Readiness green while draining, or the listener closed the instant `SIGTERM` arrives with no `preStop`
   delay.** Symptom: a burst of 502s or connection resets at every rollout even though the drain code looks
   correct. Fix: flip readiness on `SIGTERM` and sleep in `preStop` before `server.close()`.
+- **No init process in an agent that spawns stdio tool servers.** Symptom: zombie or orphaned MCP server
+  processes pile up in the container until it hits a process or memory limit. Fix: `docker run --init`,
+  `tini` or `dumb-init` as the entrypoint, and close MCP clients on shutdown.
 - **Deploying prompt or model-id changes with no eval.** Symptom: users report a quality regression days
   after a deploy that "only touched a text file". Fix: a budgeted eval that blocks promotion, plus a canary.
 
@@ -337,12 +370,20 @@ streaming load and confirm zero truncated responses.
 - **Avoid it** with native tokenizer, ONNX or other prebuilt binaries, because musl breaks some of them.
 - **Default:** `node:<major>-slim` (glibc), pinned to an LTS major and rebuilt on a schedule for patches.
 
-### How would you size `terminationGracePeriodSeconds` for a streaming service?
+### How would you size `terminationGracePeriodSeconds` for a streaming agent service?
 - **Add the phases:** `preStop` delay for endpoint propagation, plus the longest allowed completion, plus
   pool close and a margin.
 - **Example:** 5 s + 120 s + about 10 s gives about 135 s, versus the default of 30.
 - **Verify:** deploy under synthetic streaming load; zero truncated responses and pods exiting before the
   deadline mean the drain works.
+
+### Your agent runs can last 15 minutes. How do you deploy several times a day without killing them?
+- **Do not stretch the grace period to match:** a 900-second drain makes every rollout take 15+ minutes
+  per pod batch and hides handlers that never stop.
+- **Run agents as durable jobs:** checkpoint state after each step to a store, make tools idempotent, and
+  let a worker that receives `SIGTERM` finish its current step and exit so another resumes the run.
+- **Keep the HTTP pod thin:** it streams progress from the run store and drains in the normal 135-second
+  budget.
 
 ## Quiz
 ### Q: Why copy `package.json` and the lockfile and run `npm ci` before copying the source tree?
@@ -371,3 +412,30 @@ streaming load and confirm zero truncated responses.
 > Anything present at build time lands in an image layer and is readable from image history or any
 > registry copy. Runtime injection keeps the secret out of the artifact, lets it rotate without a
 > rebuild, and allows different keys per environment.
+
+## Use cases & projects
+### Use cases
+- **Streaming chat agents on Kubernetes.** Exec-form `CMD`, a readiness flip and a `preStop` sleep keep
+  rollouts from truncating answers mid-stream.
+- **Long-running research or coding agents.** Runs execute as checkpointed jobs so deploys never wait out,
+  or cut, a 15-minute run.
+- **Agents that spawn MCP tool servers.** An init process reaps stdio subprocesses, and the image carries
+  the tool servers' code at a pinned version.
+- **Prompt and model changes as releases.** Prompts, tool schemas and model ids ship in the SHA-tagged
+  image, pass an eval gate and roll out behind a canary.
+
+### Mini project
+**Containerise an agent service with a safe rollout (2-3 hours).**
+- **Goal:** a Node agent API in a multi-stage image that survives a rolling deploy with streams in flight
+  and blocks promotion when the eval score drops.
+- **Steps:** write the Dockerfile with a cached `npm ci` layer, a pruned runtime stage, `USER node` and
+  exec-form `CMD` with `--max-old-space-size`; add a `SIGTERM` handler that flips readiness and drains;
+  write a GitHub Actions workflow that typechecks, tests, builds a SHA-tagged image and runs a five-task
+  eval against a stub or cheap model.
+- **Done when:** `docker history --no-trunc` shows no key, stopping the container mid-stream ends the stream
+  cleanly within the grace period, and a deliberately broken prompt fails the eval job.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): a multi-stage Dockerfile running Node as PID
+1 in exec form, a CI workflow gating on typecheck, lint and tests, and a runbook covering shutdown, secrets
+injection and dashboards for the API, worker and MCP server.

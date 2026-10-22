@@ -425,3 +425,24 @@ tokenising a huge document, is invisible to it. You confirm with asyncio debug m
 - [ ] Unsafe fixes require an internet connection to download rule data
 > A fix such as removing an import with side effects can alter runtime behaviour. Keeping such fixes
 > opt-in lets `--fix` run automatically in hooks without silently changing semantics.
+
+## Use cases & projects
+### Use cases
+- **Async agent services.** `ASYNC` rules flag a blocking `time.sleep` or `requests.get` inside an async
+  tool before it stalls every concurrent session.
+- **Tools that run code or queries.** `S` rules flag `shell=True`, `eval` and SQL built with f-strings in
+  tools that receive model-chosen input.
+- **Fire-and-forget tasks.** `RUF` rules flag an `asyncio.create_task` result that is not stored, a
+  memory write that could vanish mid-flight.
+- **One fast gate.** A single pinned Ruff in the editor, pre-commit and CI replaces several linters, so
+  agent repositories get checked on every save.
+
+### Mini project
+**Lint an agent's tool package and fix what Ruff finds (1-2 hours).**
+- **Goal:** find and fix the agent-specific defects Ruff catches in a small set of tools.
+- **Steps:** write four tools with planted defects (a shell tool with `shell=True`, a calculator using
+  `eval`, an async tool calling `requests.get`, an unstored `asyncio.create_task`); enable `ASYNC`, `S`,
+  `B` and `RUF` in `[tool.ruff.lint]`; run `ruff check`; use `ruff rule <code>` to read each finding;
+  fix each by design, not by suppression.
+- **Done when:** `ruff check` passes with no inline suppressions on the planted defects, and the
+  pre-commit hook and CI run the same pinned version.

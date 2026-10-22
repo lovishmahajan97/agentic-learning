@@ -429,3 +429,25 @@ rather than inside the request's generator, and the response generator becomes a
 - [ ] Send `Content-Length` so the client knows how much is missing
 > Reconnection only carries the last id the client saw; replaying from that point requires the server
 > to have kept the events. Without a per-run buffer the reconnect simply starts a new generation.
+
+## Use cases & projects
+### Use cases
+- **Chat frontends for tool-calling agents.** Named `token`, `tool_call` and `done` events let the UI
+  render answer text, tool cards and the end of a run without guessing from raw text.
+- **Agents behind strict idle timeouts.** Comment-line keepalives hold the stream open while a slow tool
+  (a search, a code run) produces no output.
+- **Mobile and flaky networks.** Event ids plus a per-run buffer let a dropped client resume with
+  `Last-Event-ID` instead of paying for a second agent run.
+- **Re-emitting vendor streams.** One adapter turns a provider's SSE events into your own vocabulary, so
+  switching model vendors does not change the frontend.
+
+### Mini project
+**Resumable SSE stream for an agent run (2-3 hours).**
+- **Goal:** stream an agent run over `text/event-stream` that survives a silent tool call and a client
+  reconnect.
+- **Steps:** build a FastAPI endpoint that runs a fake agent with a tool that sleeps longer than your
+  keepalive interval; emit `token`, `tool_call` and `done` events with increasing ids; send a comment
+  keepalive on a timer; store each run's events in a bounded in-memory buffer; on reconnect, replay
+  events after the `Last-Event-ID` header value.
+- **Done when:** a test client that disconnects mid-run and reconnects receives every event exactly once,
+  in order, the stream stays open through the slow tool, and the run ends with an explicit `done`.

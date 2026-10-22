@@ -5,7 +5,8 @@ name: Speculative decoding
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - model-internals/kv-cache
   - model-internals/sampling-strategies
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-Speculative decoding spends decode's idle GPU compute: a cheap draft guesses several tokens and the large
-model verifies them in one pass. A rejection-sampling rule keeps outputs exactly the large model's, so
-the gain is pure latency, set by draft acceptance.
+Speculative decoding lets a cheap draft guess several tokens that the large model verifies in one pass,
+with outputs provably unchanged. For self-hosted agents it cuts per-step latency on predictable output
+(tool-call JSON, code edits, quoting RAG context) at low concurrency.
+
+## For agent builders
+- **Why it matters for agents.** An agent makes many sequential model calls, and each waits on decode, so
+  time per output token multiplies across the run. Tool-call JSON, code edits and answers that quote
+  retrieved text are predictable, which is exactly where drafts are accepted most often.
+- **Where it shows up in your stack.** The speculative decoding settings of a self-hosted engine (vLLM's
+  draft-model and n-gram modes, a configurable number of speculative tokens), `assistant_model` and
+  `prompt_lookup_num_tokens` in Hugging Face `generate`. Hosted APIs may use it internally; you do not
+  configure it there.
+- **What you control.** Whether to enable it per serving pool, which drafter (n-gram lookup, a small
+  same-family model, trained heads), and how many tokens to speculate, all measured at real concurrency.
+- **What you can skip.** The full rejection-sampling proof; remember that the lossless rule keeps outputs
+  exactly the target's, so your agent evals do not need re-baselining for quality, only latency.
 
 ## Why it exists
 - **Decode is bandwidth-bound.** The large model produces one token per forward pass, and that pass is
@@ -36,7 +50,7 @@ the gain is pure latency, set by draft acceptance.
   Single-request latency has a bandwidth floor, and a GPU with more FLOPs does little.
 - **The autoregressive dependency blocks the obvious use.** Token *t+1* is unknown until token *t* is
   chosen, so you cannot simply ask for two tokens at once. "Use a smaller model" trades quality for speed,
-  which is usually unacceptable.
+  which is usually unacceptable for an agent's planner.
 - **You only need to guess, not know.** If something cheap proposes a continuation, the large model scores
   every proposed position in one pass, because given a candidate prefix its distributions at all positions
   are computed in parallel, exactly as in prefill.
@@ -56,7 +70,7 @@ the gain is pure latency, set by draft acceptance.
 4. **Roll back.** KV-cache entries for rejected positions, in both models, are discarded; the accepted
    tokens are appended and the loop repeats.
 
-### Why the output is exactly the target's
+### Background: why the output is exactly the target's
 - **It is rejection sampling.** Where the draft puts too little mass on a token (`q < p`), it is always
   accepted when drafted and the shortfall is made up by the residual on rejections. Where it puts too much
   (`q > p`), it is accepted only a fraction `p/q` of the time.
@@ -75,7 +89,7 @@ P(emit x) = q(x)·min(1, p(x)/q(x)) + (1 − α) · max(0, p(x) − q(x)) / (1 �
   total-variation distance. Acceptance measures how much the drafter's distribution overlaps the
   target's, not whether its single top guess is right.
 - **Under greedy decoding** the rule collapses to "accept while the draft matches the target's argmax",
-  the easiest version to reason about.
+  the easiest version to reason about, and the usual case for tool-calling steps run at temperature 0.
 
 ### What the speedup depends on
 Let α be the probability a draft token is accepted. Treating each position as an independent trial, the
@@ -97,7 +111,8 @@ speedup ≈ (1 − α^(γ+1)) / ((1 − α) · (γ·c + 1))
 - **Both conditions are needed.** The draft must be much cheaper than the target *and* agree with it
   often; either alone is not enough.
 - **Agreement depends on the text.** Highest on predictable text such as code, boilerplate, structured
-  output and anything that copies from the prompt; lowest on creative text at high temperature.
+  output (tool calls) and anything that copies from the prompt; lowest on creative text at high
+  temperature.
 - **γ has an optimum.** Raising γ lifts the ceiling but lowers average acceptance of later positions, and
   past a point the extra verification compute costs more than it saves.
 
@@ -112,12 +127,14 @@ speedup ≈ (1 − α^(γ+1)) / ((1 − α) · (γ·c + 1))
 - **Check the acceptance mode.** Medusa also offers a relaxed "typical acceptance" rule that trades
   exactness for higher acceptance; only the rejection-sampling rule above is lossless, so check which mode
   a deployment uses before claiming identical outputs.
+- **Agents favour prompt lookup.** Agent contexts are full of text the output will copy: file contents a
+  coding agent edits, retrieved passages, earlier tool results. N-gram drafting exploits that for free.
 
 ### Why it stops helping
 - **High concurrency removes the idle compute.** The server already feeds the GPU many tokens per pass, so
   verifying γ extra tokens per request costs real compute and can lower total throughput.
 - **So it is a latency tool** for workloads with few concurrent requests, or a throughput tool only while
-  the batch is still bandwidth-bound.
+  the batch is still bandwidth-bound. Many concurrent agents on one GPU look like a batch workload.
 - **Tune it by measurement.** Engines such as vLLM expose draft-model and n-gram modes with a configurable
   number of speculative tokens; find the setting by measuring tokens/second per request and per GPU at the
   real batch size.
@@ -173,6 +190,21 @@ for alpha, draft_ms in [(0.8, 2), (0.5, 2), (0.3, 2), (0.8, 8)]:
 # alpha=0.8 draft=8ms:  18.2 ms/token, speedup 1.38x
 ```
 
+### Worked scenario: a self-hosted coding agent
+A coding agent runs 15 sequential steps on a low-concurrency pool; each step emits about 300 output
+tokens (a tool call carrying a code edit). Same illustrative costs as above.
+
+| Setup | ms per token | Decode time per step | Decode time per 15-step run |
+|---|---|---|---|
+| No speculation | 25 | 7.5 s | 112.5 s |
+| Drafter, α = 0.5 (novel code) | 18.8 | ~5.6 s | ~84.6 s |
+| Prompt lookup or drafter, α = 0.8 (edits copying the file) | ~10 | ~3.0 s | ~45 s |
+
+- **Same output, faster run.** The lossless rule means the agent's trajectory and eval scores are
+  unchanged at temperature 0; only wall-clock time moves.
+- **Measure acceptance per step type.** Tool-call JSON and edits tend to sit near the top row; free-text
+  reasoning sits lower.
+
 ### A runnable verification step
 Toy distributions that exercise the accept, reject and bonus paths, checking measured tokens per pass
 against the formula.
@@ -211,22 +243,22 @@ print(f"alpha={alpha:.2f} predicted={(1 - alpha**(gamma + 1)) / (1 - alpha):.2f}
 ```
 
 ## Production patterns
-- **Try prompt lookup first on copy-heavy routes.** For RAG answers that quote sources or code edits, use
-  n-gram drafting: no second model to host. In Hugging Face Transformers, `generate(...,
-  prompt_lookup_num_tokens=10)`; in vLLM, its n-gram speculative method. Monitor acceptance rate and time
-  per output token.
+- **Try prompt lookup first on copy-heavy agent routes.** For RAG answers that quote sources or coding
+  agents that rewrite files, use n-gram drafting: no second model to host. In Hugging Face Transformers,
+  `generate(..., prompt_lookup_num_tokens=10)`; in vLLM, its n-gram speculative method. Monitor acceptance
+  rate and time per output token.
 - **Use assisted generation with a same-family drafter.** In Hugging Face, `model.generate(...,
   assistant_model=draft)` with a much smaller model sharing the tokenizer; in vLLM, its draft-model
   speculative mode with a set number of speculative tokens. Monitor acceptance, draft memory and p95 time
   per output token.
 - **Split latency and throughput pools.** Enable speculation on low-concurrency interactive pools (chat,
-  coding, sequential agents) and leave high-batch pools without it. Monitor per-GPU tokens/second in each
-  pool, since that is what speculation can lower.
+  coding, sequential agents) and leave high-batch pools, such as offline agent evals or bulk jobs, without
+  it. Monitor per-GPU tokens/second in each pool, since that is what speculation can lower.
 - **Tune γ at production concurrency.** Sweep the number of speculative tokens (for example 2 to 6)
-  under replayed real traffic and pick the best p50/p95 time per output token that does not cut per-GPU
-  throughput. Re-tune when the batch size or model changes.
+  under replayed real agent traffic and pick the best p50/p95 time per output token that does not cut
+  per-GPU throughput. Re-tune when the batch size or model changes.
 - **Gate on output equivalence.** With greedy decoding and the lossless rule, outputs should match the
-  non-speculative path; diff a sample of responses after enabling it, and confirm the acceptance mode
+  non-speculative path; diff a sample of agent steps after enabling it, and confirm the acceptance mode
   (strict vs typical) before promising identical outputs.
 
 ## Trade-offs
@@ -240,6 +272,8 @@ print(f"alpha={alpha:.2f} predicted={(1 - alpha**(gamma + 1)) / (1 - alpha):.2f}
   training heads per target model.
 - **Larger γ vs wasted verification.** It raises best-case tokens per pass but spends more verification on
   positions increasingly likely to be rejected; the optimum shifts lower as batch size grows.
+- **Draft memory vs agent concurrency.** A draft model's weights and cache take GPU memory that could hold
+  more agents' KV caches; prompt lookup avoids that cost.
 
 ## Pitfalls
 - **Enabling it on a heavily batched server.** Throughput falls: verification tokens compete for compute
@@ -261,8 +295,8 @@ print(f"alpha={alpha:.2f} predicted={(1 - alpha**(gamma + 1)) / (1 - alpha):.2f}
 - **Use when** per-request latency (time per output token) matters more than aggregate throughput:
   interactive assistants, coding tools, agents making many sequential calls, or any deployment with few
   concurrent requests per GPU.
-- **Expect the most** from predictable outputs: code, structured data, RAG answers that quote context, and
-  templated text; n-gram drafting is nearly free to try there.
+- **Expect the most** from predictable outputs: code, structured data and tool calls, RAG answers that
+  quote context, and templated text; n-gram drafting is nearly free to try there.
 - **Avoid or measure carefully** when the server runs large batches or outputs are high-entropy.
 - **Measure** acceptance rate, tokens per target pass, p50/p95 time per output token and per-GPU
   throughput before and after, at production concurrency.
@@ -304,15 +338,21 @@ low concurrency while leaving the high-throughput pool without it.
 - **Speedup depends on draft cost.** With 2 ms draft steps and a 27 ms verify pass against a 25 ms
   baseline, about 10 ms per token, roughly 2.5×; with 8 ms draft steps it falls to about 1.4×.
 
+### Your self-hosted coding agent spends most of each run waiting on decode. Would speculative decoding help?
+- **Probably, if concurrency is low.** Agent steps are sequential and their output (tool-call JSON, edits
+  that copy file contents) is predictable, so acceptance is high and per-step latency falls.
+- **Check first:** start with prompt lookup, measure acceptance per step type and p95 time per output
+  token, and confirm per-GPU throughput holds at the pool's real number of concurrent agents.
+
 ### Acceptance is only 20% after you enable a draft model. What do you check?
 - **Tokenizer and prompt format.** The drafter must share the tokenizer and see the same chat template, or
   its token ids and context differ from the target's.
 - **Workload and settings.** High temperature or creative routes lower overlap; compare acceptance by route,
   try a closer same-family drafter, n-gram lookup on copy-heavy routes, or a smaller γ.
 
-### How do you choose between a draft model, n-gram lookup and Medusa or EAGLE heads?
-- **N-gram lookup** costs almost nothing and shines when outputs copy the prompt, but helps little on novel
-  text.
+### Your agent platform serves RAG answers, code edits and open chat. How do you choose drafters?
+- **N-gram lookup** costs almost nothing and shines when outputs copy the prompt (RAG quotes, code
+  edits), but helps little on novel text.
 - **A draft model** works across tasks without training, at the cost of extra memory and a shared-tokenizer
   constraint.
 - **Medusa or EAGLE heads** usually reach higher acceptance with no second model, but must be trained per
@@ -348,3 +388,22 @@ low concurrency while leaving the high-throughput pool without it.
 - [ ] Prompts that quote long passages from retrieved documents
 > Speculation converts idle compute into extra tokens. When batching has already saturated compute,
 > the verification tokens and draft passes cost real time and total throughput can fall.
+
+## Use cases & projects
+### Use cases
+- **Self-hosted coding agents.** Edits that reproduce most of a file are ideal for prompt lookup, cutting
+  per-step latency without changing the edit.
+- **RAG answer steps.** Answers that quote retrieved passages give n-gram drafting high acceptance.
+- **Interactive agent pools.** Low-concurrency pools serving users who wait on each step get speculation;
+  batch pools for evals and offline jobs do not.
+- **Tool-call heavy loops.** Structured JSON with repeated keys and tool names is predictable, so drafts
+  are accepted often at temperature 0.
+
+### Mini project
+**Measure speculative decoding on agent-shaped output (2-3 hours).**
+- **Goal:** find out how much prompt lookup speeds up an agent's code-edit and tool-call steps.
+- **Steps:** collect 30 prompts from an agent's logs or write them (file-rewrite edits, tool-call JSON,
+  free-text reasoning); with a small open model in Hugging Face, time `generate` greedily with and without
+  `prompt_lookup_num_tokens`; confirm outputs are identical; compute ms per output token per step type.
+- **Done when:** you have a table of speedup per step type, a check that every output matched the
+  baseline, and a recommendation for which agent steps or pools should enable it.

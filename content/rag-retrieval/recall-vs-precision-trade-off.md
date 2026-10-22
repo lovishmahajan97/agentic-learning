@@ -429,3 +429,25 @@ in the candidate set.
 - [ ] Slower first-stage retrieval
 > Cosine or dot-product scores are relative to each query's embedding, so a value that marks "relevant"
 > for one query can be above every candidate for another, which silently returns nothing.
+
+## Use cases & projects
+### Use cases
+- **Support agents over a help centre.** Tuning candidate depth and the reranker decides whether the one
+  article with the refund rule reaches the agent without five near-duplicates beside it.
+- **Research agents that search many times.** Each search result stays in the transcript, so per-call
+  precision controls how fast the context fills and how often later steps are steered wrong.
+- **Agents that must say "I don't know".** An explicit "no evidence" tool result, backed by measured
+  recall, lets the agent refuse or ask instead of answering from memory.
+- **Regression gates for retrieval changes.** Teams track recall@k and precision@k on a golden set before
+  shipping a new embedder, chunker or reranker behind the agent's search tool.
+
+### Mini project
+**Tune k and a reranker for an agent's search tool (2-3 hours).**
+- **Goal:** find the candidate depth and final k that give the agent high recall without flooding its
+  context.
+- **Steps:** build a small corpus and a golden set of about 30 questions with labelled relevant chunks;
+  wrap retrieval as a `search` tool; measure recall@k and precision@k for several k values with and without
+  a reranker; then run a simple tool-calling agent on the golden questions at two settings and log answer
+  correctness and tool-result tokens.
+- **Done when:** you have a table of recall, precision, tokens per tool result and answer accuracy per
+  setting, and a one-paragraph recommendation for the default k with its reason.

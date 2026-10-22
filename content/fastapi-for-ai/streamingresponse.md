@@ -449,3 +449,26 @@ not accidentally setting `Content-Length`, and add periodic keepalive chunks for
 > Tokens generated after the client left are pure cost. Starlette cancels the generator on disconnect
 > in recent versions, and checking `request.is_disconnected()` with cleanup in `finally` makes that
 > behaviour explicit and version-independent.
+
+## Use cases & projects
+### Use cases
+- **Chat agents that call tools.** Stream "searching...", tool results and answer tokens so users see
+  progress during a multi-second loop instead of a spinner.
+- **Coding and research agents with long runs.** Steady step events keep the connection busy, so idle
+  timeouts on load balancers and proxies do not cut the run.
+- **Cost control on abandoned runs.** Detecting disconnects and cancelling the upstream model call stops
+  billing for tokens nobody will read.
+- **Internal agent consoles.** Typed NDJSON events (step, tool, delta, done, error) let a dashboard render
+  the agent's trace live from the same endpoint users call.
+
+### Mini project
+**Stream a two-tool agent as typed NDJSON (1-2 hours).**
+- **Goal:** serve a small tool-calling loop through `StreamingResponse` with a clear event protocol and
+  in-band errors.
+- **Steps:** write an async generator that runs a fake agent with two tools (one slow, one that can
+  fail); emit step, tool, delta, done and error records as one JSON object per line; validate input
+  before the first byte; check `request.is_disconnected()` and cancel work in `finally`; consume it with
+  a client that splits on newlines.
+- **Done when:** the client prints events as they arrive, a forced tool failure ends with an error record
+  instead of a broken stream, and closing the client mid-run logs a cancellation with no further model
+  calls.

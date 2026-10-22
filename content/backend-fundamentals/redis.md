@@ -5,7 +5,8 @@ name: Redis
 kind: tool
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - fastapi-for-ai/redis-caching
   - node-ts-for-ai/redis
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-Redis is an in-memory data-structure server whose commands run atomically on one thread. That makes it
-the default home for shared, short-lived state (caches, rate limits, locks, sessions, queues), at the cost
-of memory-sized data and weaker durability than a database.
+Redis is an in-memory data-structure server whose commands run atomically on one thread. Agent backends
+use it for shared, short-lived state: tool caches, token-rate limits, model-call semaphores, scratch
+state and job queues, never as the system of record.
+
+## For agent builders
+- **Why it matters for agents.** A fleet of agent workers shares one provider quota, one set of cached
+  tool results and one view of which runs are active. Redis's atomic commands make those shared limits
+  and caches correct across every worker without a database round trip per agent step.
+- **Where it shows up in your stack.** Celery, RQ and BullMQ brokers behind agent jobs, Redis-backed
+  chat-history and semantic-cache integrations in agent frameworks, rate limiters in your FastAPI
+  gateway, and pub/sub or streams pushing an agent's tokens to the right web socket.
+- **What you control.** Key design (tenant, run, hash of tool arguments), a TTL on every cache key,
+  separate instances for cache versus queue, Lua scripts for multi-step atomic checks, and fencing for any
+  lock guarding a side effect.
+- **What you can skip.** Cluster internals and Redlock debates beyond "unsafe without fencing". Know the
+  data types, eviction policies, persistence modes and the four patterns below.
 
 ## Why it exists
 - **Backends need shared, hot state.** The cached answer to an expensive call, requests a client made this
@@ -127,6 +141,20 @@ second of, and put anything that must survive in a database.
 4. **Redlock is disputed.** Acquiring on a majority of independent nodes addresses failover loss, but its
    safety under clock drift and process pauses is contested (Kleppmann's critique is the usual reference).
    Treat Redis locks as an efficiency mechanism, not a correctness guarantee, unless fenced.
+
+### Where Redis sits in an agent loop
+| Agent step | Redis role | Key shape |
+|---|---|---|
+| **Before a model call** | token-rate limit and concurrency semaphore shared by all workers | `rl:{tenant}:{window}`, `sem:{provider}` |
+| **Before a read-only tool call** | cache the result of deterministic tools (search, lookup) | `tool:{name}:{sha256(args)}` |
+| **During the run** | per-run token and step budget counters | `budget:{run_id}` with a TTL |
+| **Streaming output** | pub/sub or a stream to the node holding the user's socket | `run:{run_id}:events` |
+| **Background work** | broker for long agent jobs | owned by Celery, RQ or BullMQ |
+
+- **Cache only tools that are safe to repeat.** A cached `search` result is fine; caching `send_email` or
+  `create_refund` would skip a side effect the agent believes it performed.
+- **Budgets are guard rails, not billing.** A per-run counter stops a looping agent quickly; the
+  authoritative token totals still go to the database.
 
 ## Diagram
 One request path through Redis: an atomic rate-limit check first, then cache-aside with a short lock so
@@ -247,6 +275,45 @@ A 5 MB cached response (say, a large shared document summary) is read 1,000 time
 The arithmetic is illustrative, but the shape is common: one node's network saturates while the cluster
 looks underused.
 
+### Agent scenario: a shared semaphore and a per-run budget
+Many agent workers share one provider. A sorted-set semaphore caps in-flight model calls fleet-wide, and
+expired entries free slots held by crashed workers. A per-run counter stops a looping agent.
+
+```python
+import time, uuid
+
+SEM_ACQUIRE = """
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', tonumber(ARGV[1]) - tonumber(ARGV[2]))
+if redis.call('ZCARD', KEYS[1]) < tonumber(ARGV[3]) then
+  redis.call('ZADD', KEYS[1], ARGV[1], ARGV[4])
+  return 1
+end
+return 0
+"""
+sem_acquire = r.register_script(SEM_ACQUIRE)
+
+def call_model_with_slot(call, provider="llm", limit=50, lease_s=120):
+    token = str(uuid.uuid4())
+    while not sem_acquire(keys=[f"sem:{provider}"], args=[time.time(), lease_s, limit, token]):
+        time.sleep(0.2)                       # back off; production adds jitter and a deadline
+    try:
+        return call()
+    finally:
+        r.zrem(f"sem:{provider}", token)      # release our slot only
+
+def charge_run(run_id, tokens, max_tokens=200_000):
+    used = r.incrby(f"budget:{run_id}", tokens)
+    r.expire(f"budget:{run_id}", 86400)       # scratch state: gone a day after the run
+    if used > max_tokens:
+        raise RuntimeError(f"run {run_id} over budget: {used} tokens")  # agent loop stops here
+```
+
+- **Clock caveat:** scores come from each worker's clock, so skew between hosts shifts when stale leases
+  expire; keep the lease well above the slowest model call.
+- **Numbers to size it:** with 200 concurrent agent runs, a provider limit equivalent to 50 in-flight
+  calls, and ~10 s per call, the semaphore holds runs to 50 calls at a time instead of letting 200
+  collide into rate-limit errors and retries.
+
 ## Production patterns
 - **One instance per role.** Run the cache with `maxmemory-policy allkeys-lfu` (or `allkeys-lru`) and TTLs
   on every key; run queues and locks on a separate instance with `noeviction` and `appendonly yes` plus
@@ -262,6 +329,12 @@ looks underused.
 - **Pool connections.** Create one `redis.ConnectionPool` (or client) per process at startup, with a
   bounded `max_connections`, rather than a client per request. Monitor `connected_clients` and handshake
   latency.
+- **Fleet-wide model-call limits.** Put a token-rate limiter and a concurrency semaphore in front of every
+  provider call from every agent worker, keyed by provider and tenant. Monitor semaphore wait time and
+  provider 429s; waits rising while 429s stay near zero means the limit is doing its job.
+- **Cache read-only tool results by argument hash.** Key on tool name plus a hash of canonical arguments,
+  with a TTL matched to how fast the source changes (minutes for search, hours for reference data).
+  Monitor hit ratio per tool and never cache side-effecting tools.
 
 ## Trade-offs
 - **Speed vs RAM-sized data.** Sub-millisecond operations in memory, but the dataset must fit in RAM;
@@ -293,13 +366,20 @@ looks underused.
   dominated by handshakes.
 - **Cache stampede when a popular key expires.** Symptom: a burst of identical provider calls in the same
   second. Use a short lock or early refresh on the miss path.
+- **Caching a side-effecting tool call.** Symptom: the agent reports "email sent" but nothing went out,
+  because the second run hit a cached success. Fix: cache only read-only tools, and use idempotency keys
+  in the database for side effects.
+- **Agent memory that lives only in Redis.** Symptom: users lose long-term memory or history after a
+  failover or eviction. Fix: the database holds the record; Redis holds a rebuildable copy for speed.
 
 ## When to use
 - **Use when:** state is shared across processes, read-heavy or counter-shaped, and rebuildable or
   tolerable to lose: caches, rate limits, semaphores, sessions, short-lived coordination, and simple job
   queues where occasional loss is acceptable.
+- **Agent fits:** fleet-wide model-call limits, read-only tool caches, per-run budgets, token streaming
+  fan-out and the broker for agent job queues.
 - **Avoid when:** it would be the system of record for conversations, billing or anything you cannot
-  recompute; use PostgreSQL for that and put Redis in front.
+  recompute, agent long-term memory included; use PostgreSQL for that and put Redis in front.
 - **Check first:** confirm the database genuinely cannot carry the load (a rate limit on a few hundred
   requests per second may be fine in PostgreSQL).
 - **Measure:** memory usage, evicted keys, hit ratio and slow-log entries.
@@ -343,9 +423,10 @@ a durable broker or a database-backed queue.
   script, or a weighted two-window approximation in constant memory.
 - **Key by tenant and window,** and return 429 with a retry hint when over the limit.
 
-### Two workers both wrote to the same index while holding a Redis lock. How?
+### Two agent workers both wrote to the same index while holding a Redis lock. How?
 - **The lease expired while the first worker was still busy** (a GC pause or slow model call longer than
-  `PX`), so the second worker acquired it legitimately.
+  `PX`), so the second worker acquired it legitimately. Agent steps that wait on a model are exactly the
+  long, variable-latency work that outlives a lease.
 - **Fix:** issue a fencing token from `INCR` on each acquisition and have the index reject writes carrying
   an older token; release with a token-checking script so nobody deletes another holder's lock.
 
@@ -361,6 +442,14 @@ a durable broker or a database-backed queue.
 - **Monitor:** hit ratio, evicted keys, memory usage, slow-log entries and per-node network for hot keys.
   A falling hit ratio with rising evictions means the working set no longer fits in `maxmemory`: add
   memory or stop caching entries that are rarely reused.
+
+### Your agent fleet keeps hitting provider 429s at peak. How would you use Redis to fix it?
+- **Share the limit across workers:** a token-rate limiter and a concurrency semaphore in Redis, checked
+  before every model call, because per-process limits cannot see the other workers.
+- **Make slots self-healing:** a sorted-set semaphore with lease timestamps, so a crashed worker's slot
+  frees itself after the lease instead of leaking.
+- **Measure:** semaphore wait time, 429 rate and agent step latency; then decide whether to raise quota,
+  cache read-only tool calls, or shed low-priority runs.
 
 ## Quiz
 ### Q: Why can a plain INCR in Redis be used as a correct rate-limit counter across many application servers?
@@ -386,3 +475,24 @@ a durable broker or a database-backed queue.
 - [ ] AOF persistence with allkeys-lru, so old jobs make room for new ones
 > A queue must fail loudly, never drop work silently. noeviction makes memory exhaustion an error the
 > producer sees, and AOF limits what a crash loses; LRU policies would evict idle waiting jobs.
+
+## Use cases & projects
+### Use cases
+- **Provider quota sharing.** Dozens of agent workers draw from one model-provider quota through a Redis
+  rate limiter and semaphore instead of each discovering the limit through 429s.
+- **Tool-result caching.** Repeated web searches or catalogue lookups across agent runs are served from
+  a TTL cache keyed by a hash of the arguments.
+- **Runaway-agent guards.** Per-run token and step counters stop a looping agent within one step of its
+  budget.
+- **Live streaming to users.** An agent worker publishes tokens and tool events to a channel, and whichever
+  web node holds the user's socket forwards them.
+
+### Mini project
+**Put a shared Redis guard layer in front of an agent fleet (2 hours).**
+- **Goal:** run several agent workers against one fake provider without exceeding its concurrency limit
+  or letting one run burn the budget.
+- **Steps:** run Redis in Docker; build a fake provider that returns 429 above 5 concurrent calls; start
+  4 worker processes each running agents that call it; add the sorted-set semaphore, a per-run budget
+  counter and a TTL cache for one read-only tool; kill a worker mid-call and watch its slot expire.
+- **Done when:** the fake provider logs zero 429s, an agent given a tiny budget stops with a budget error,
+  the cached tool shows a hit ratio above zero, and the killed worker's slot is reclaimed after the lease.

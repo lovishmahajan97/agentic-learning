@@ -447,3 +447,28 @@ logs undercount.
 - [ ] Access logs are required to be disabled for HTTP/2
 > Uvicorn's line is plain text without your bound fields. A middleware event carries `request_id`, tenant
 > and route template in the same JSON schema as everything else, so it can be joined and aggregated.
+
+## Use cases & projects
+### Use cases
+- **Debugging a looping agent.** Filtering by `run_id` and ordering by `step` shows which tool kept
+  failing and why the run looped.
+- **Per-run and per-tenant cost.** Summing `prompt_tokens` and completion tokens from `llm_call_finished`
+  events gives cost per run, per tenant and per model.
+- **Tool reliability reports.** `tool_call_finished` events with `tool`, status and `latency_ms` rank tools
+  by error rate and latency.
+- **Joining logs to traces.** A trace id on each line links the JSON events to the span tree in your
+  tracing tool.
+
+### Mini project
+**Make one agent run fully reconstructable from logs (1-2 hours).**
+- **Goal:** answer "what did run X do, and what did it cost?" from logs alone.
+- **Steps:** add structlog with a JSON renderer to a FastAPI agent stub; bind `request_id` and tenant in a
+  middleware with `contextvars`; bind `run_id`, `step` and `tool` inside the loop; emit
+  `agent_step_finished`, `tool_call_finished` and `llm_call_finished` events with token counts and
+  `latency_ms`; run 10 runs with fake tools, one of which fails randomly.
+- **Done when:** a single `jq` command lists every step of one run in order, and another sums tokens per
+  run, with no prompt text in any line.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide), where every log line for a request must
+carry the same request id and tenant as its trace.

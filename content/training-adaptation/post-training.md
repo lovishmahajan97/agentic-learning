@@ -393,3 +393,24 @@ the DPO stage stable, so the saving is not worth it.
 > Imitation learning improves the average behaviour; a 9% failure rate persists because nothing in the
 > loss singles it out. A reward computed by a schema check pushes directly on the failure, and sampling
 > many attempts finds the behaviour that fixes it.
+
+## Use cases & projects
+### Use cases
+- **Fixing tool-call format on an open-weight agent.** SFT on verified traces teaches the exact call
+  syntax, argument schema and stop-after-call behaviour your runtime expects.
+- **Tuning agent style and step count.** Preference pairs (short trajectory chosen, needless detour
+  rejected) shift the agent toward fewer, better steps.
+- **Training checkable agent skills.** Tasks with a pass or fail check, such as tests passing or a valid
+  API payload, feed RL methods like GRPO.
+- **Deciding not to post-train.** Teams first try prompting, few-shot examples and RAG, and only
+  post-train when an eval shows a persistent failure those cannot fix.
+
+### Mini project
+**Map agent failures to post-training stages (1-2 hours).**
+- **Goal:** turn a pile of failed agent runs into a concrete post-training plan.
+- **Steps:** run a small tool-calling agent on 40 tasks and save every transcript; label each failure as
+  format (bad JSON, wrong tool name), quality (correct but worse choice) or skill (checkable task
+  failed); for each bucket write which stage you would use (SFT, DPO or GRPO), the data you would need
+  and the eval that gates the change.
+- **Done when:** you have a failure table with counts per bucket and a one-page plan naming the first
+  stage to run and the metric that proves it worked.

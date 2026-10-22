@@ -365,3 +365,23 @@ the full million. Threads would be right only if the work were I/O or GIL-releas
 - [x] Updates can be lost, because the increment spans several bytecodes and a switch can occur between them
 > The GIL makes each bytecode safe, not each statement. Load, add and store are separate steps, so an
 > interleaving can overwrite another thread's increment; whether it shows up depends on version and timing.
+
+## Use cases & projects
+### Use cases
+- **Diagnosing jittery token streams.** A CPU-heavy step on the same process holds the GIL and delays
+  every stream; the CPU-versus-wall diagnostic finds it.
+- **Choosing threads or processes for agent tools.** Threads suit model and tool I/O and GIL-releasing
+  native code; pure-Python parsing or scoring needs processes.
+- **Local embedding or reranking models.** PyTorch releases the GIL inside its kernels, so the real knob is
+  native thread counts per worker, not Python threads.
+- **Shared agent state across threads.** The GIL does not make check-then-act safe, so budgets and caches
+  touched by worker threads still need locks.
+
+### Mini project
+**Measure the GIL on an agent worker (1-2 hours).**
+- **Goal:** show which agent workloads threads speed up and which they do not.
+- **Steps:** write a pure-Python chunker over a large text, a `hashlib`-based hashing step (which
+  releases the GIL for large inputs) and a fake model call using `time.sleep`; run each with 1 and 4
+  threads, then the chunker with 4 processes; record wall time and CPU time for each run.
+- **Done when:** a table shows the speed-up per workload, the chunker gains little from threads but scales
+  with processes, and you can state which executor each step of your agent should use.

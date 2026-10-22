@@ -5,7 +5,8 @@ name: Distributed training (data / tensor / pipeline parallelism, FSDP, DeepSpee
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: crisp
+status: agentic
+agent_relevance: background
 related:
   - training-adaptation/pre-training
   - training-adaptation/gradient-checkpointing
@@ -23,9 +24,23 @@ sources:
 ---
 
 ## TL;DR
-Caveat: this matters only for training-heavy roles; application roles need the vocabulary, not the
-practice. One GPU cannot hold big-model training state or finish pretraining in time, so data, tensor
-and pipeline parallelism plus FSDP/ZeRO split the work; interconnect decides the mix.
+Caveat: agent builders rarely run this; they need the vocabulary and arithmetic, not the practice. When
+an agent model's fine-tune outgrows one GPU, FSDP/ZeRO and data, tensor and pipeline parallelism split
+the work, and the cheapest option is usually not needing them.
+
+## For agent builders
+- **Why it matters for agents.** It decides what a fine-tune of your agent's model costs. LoRA or QLoRA
+  on a 7B-8B tool-calling model fits one GPU; a full fine-tune of a 70B agent model on trajectories needs
+  more than one 80 GB node. Knowing the 16-bytes-per-parameter arithmetic lets you reject a plan in a
+  minute.
+- **Where it shows up in your stack.** An Accelerate or Axolotl config that picks FSDP or DeepSpeed, a
+  DeepSpeed JSON file, or a `torchrun` launch line. Managed fine-tuning APIs hide it entirely. The same
+  tensor-parallel idea reappears at serving time when an open-weights agent model is split across the
+  GPUs of one node.
+- **What you control.** Whether to full fine-tune at all versus PEFT, the ZeRO stage or sharding strategy,
+  GPU count (which changes the global batch and so the learning rate), and the checkpoint format.
+- **What you can skip.** Pipeline schedules, 3D parallelism and Megatron flags are pretraining concerns.
+  Read them to follow a vendor's config, not to tune them.
 
 ## Why it exists
 - **Two separate limits: memory and time.** Either one alone forces training across GPUs.
@@ -37,6 +52,8 @@ and pipeline parallelism plus FSDP/ZeRO split the work; interconnect decides the
   FLOPs. At an illustrative sustained 400 TFLOP/s on one GPU (an H100's dense bf16 peak is about
   989 TFLOP/s; 40% utilisation is a realistic ballpark) that is ~10⁸ seconds, over three years.
   Pretraining is a thousands-of-GPUs problem by arithmetic, not ambition.
+- **Agent fine-tunes are far smaller, but hit the memory wall first.** A few thousand trajectories is a
+  tiny token count, so time is rarely the problem; whether the 70B state fits is.
 - **Each naive fix solves one limit only.** Plain data parallelism (replicate on N GPUs, split the batch)
   divides time by nearly N but every replica still holds the full 112 GB. Naive model parallelism (layers
   on different GPUs) divides memory but runs one GPU at a time while the others idle.
@@ -44,7 +61,16 @@ and pipeline parallelism plus FSDP/ZeRO split the work; interconnect decides the
   need fits the links between them.
 
 ## How it works
-### The four schemes at a glance
+### Where this meets an agent project
+1. **The fine-tune decision says "train".** A behaviour or cost gap that prompts and retrieval could not
+   close, measured on agent evals.
+2. **Size the cheapest rung.** LoRA or QLoRA on a 7B-8B base usually runs on one GPU or with plain DDP.
+3. **Only if a larger base or full fine-tuning is justified,** shard with FSDP or ZeRO-3, set through
+   Accelerate or Axolotl so the training script does not change.
+4. **Tensor and pipeline parallelism** are for pretraining scale or very large models; agent teams meet
+   them mostly in vendor configs and in serving.
+
+### Background: the four schemes at a glance
 | Scheme | What is split | What it communicates | Link it needs |
 |---|---|---|---|
 | Data parallel (DDP) | The batch | Gradient all-reduce once per step | Modest; overlaps with backward |
@@ -62,6 +88,8 @@ and pipeline parallelism plus FSDP/ZeRO split the work; interconnect decides the
 - **Scaling.** Throughput scales with N; memory per GPU does not change.
 - **Global batch** becomes N × micro-batch × accumulation steps, which is why learning rate and warmup
   must be re-tuned when the GPU count changes.
+- **For agent LoRA runs** DDP is often all you need: the adapter's gradients are tiny, so the all-reduce
+  is cheap and each GPU simply processes different trajectories.
 
 ### Sharded data parallelism: ZeRO and FSDP
 The waste in DDP is that all N replicas store identical optimizer state and gradients. ZeRO partitions
@@ -102,6 +130,8 @@ ZeRO stage 3   16Ψ/N               parameters sharded too
 - **Cost.** Two all-reduces per layer in forward and two in backward, each moving an `s·b·h` activation.
 - **So** it is bandwidth- and latency-hungry, and is kept inside a node over NVLink-class links,
   typically at degree 2–8.
+- **Agent tie-in.** Serving engines use the same split to host a model too large for one GPU, with the
+  same rule: keep it inside the node, because every generated token pays the per-layer all-reduces.
 
 ### Pipeline parallelism
 1. **Assign** contiguous groups of layers to stages on different GPUs.
@@ -124,11 +154,11 @@ ZeRO stage 3   16Ψ/N               parameters sharded too
 - **Composition.** Tensor parallelism inside a node, pipeline across nodes, data or sharded-data
   parallelism over the remaining replicas: world size = TP × PP × DP.
 - **Long contexts** add sequence or context parallelism, which splits the sequence dimension (ring
-  attention).
+  attention). Very long agent trajectories are where a fine-tune might first need it.
 
 The decision order for most teams:
 1. **If the state fits with FSDP or ZeRO-3** across the available GPUs, use only that; it covers nearly
-   all fine-tuning.
+   all fine-tuning, agent fine-tunes included.
 2. **If a layer or its activations still do not fit, or step latency matters,** add tensor parallelism
    within the node.
 3. **If the job spans many nodes with slow interconnect,** add pipeline parallelism rather than stretching
@@ -165,12 +195,12 @@ A ZeRO-3 run with optimizer offload is a few lines:
   read.
 
 ## Diagram
-The choice procedure as a decision path: try not to need it, then shard, then split matrices inside the
-node, then split layers across nodes.
+The choice procedure as a decision path for an agent model's fine-tune: try not to need it, then shard,
+then split matrices inside the node, then split layers across nodes.
 
 ```mermaid
 flowchart TD
-    J["Training job"] --> L{"Can LoRA or QLoRA avoid it?"}
+    J["Agent model fine-tune"] --> L{"Can LoRA or QLoRA avoid it?"}
     L -->|"yes"| S["Single GPU or plain DDP"]
     L -->|"no"| F{"State fits with FSDP or ZeRO-3?"}
     F -->|"yes"| FS["FSDP or ZeRO-3 only"]
@@ -183,10 +213,29 @@ flowchart TD
 ```
 
 ## Examples
+### Worked scenario: sizing a fine-tune for a tool-calling agent
+A team has 5,000 successful agent trajectories and wants a model that calls their tools reliably. Their
+hardware is one node of eight 80 GB GPUs. State per GPU before activations, from the 16-bytes rule
+(illustrative; LoRA optimizer state is small enough to ignore here):
+
+| Option | State | Per GPU on 8 GPUs | Verdict |
+|---|---|---|---|
+| LoRA on a 7B base, bf16 weights | ~14 GB of weights | fits on one GPU, DDP for speed | start here |
+| Full fine-tune of 7B, ZeRO-3 | 112 GB | 14 GB | fits; only if LoRA plateaus |
+| LoRA on 70B, bf16 base, FSDP | 140 GB of weights | ~17.5 GB | fits, sharded |
+| Full fine-tune of 70B, ZeRO-3 | ~1.12 TB | 140 GB | does not fit one node |
+
+- **The decision:** run LoRA on 7B first and compare it with the 70B base on the held-out agent eval;
+  move to 70B LoRA with FSDP only if the gap is real.
+- **Time is not the constraint:** 5,000 trajectories is a tiny token budget next to the 6 × params × tokens
+  of pretraining, so the run takes hours, not years.
+
 ### FSDP full fine-tune of a 7B model on eight GPUs
 A minimal full-parameter fine-tune with FSDP in `FULL_SHARD` mode (the ZeRO-3 equivalent), wrapping per
 decoder block and checkpointing activations per block. The model is loaded in bf16 to keep the example
-short; production runs usually keep fp32 master weights through the mixed-precision policy. Launch with
+short; production runs usually keep fp32 master weights through the mixed-precision policy.
+
+In an agent project the placeholder batch would be rendered trajectories. Launch with
 `torchrun --nproc_per_node=8 train.py`.
 
 ```python
@@ -228,7 +277,8 @@ dist.destroy_process_group()
 ```
 
 ### Planning calculator: memory, bubble and calendar time
-Pure Python, no GPU. It reproduces the lesson's numbers so you can plug in your own model and cluster.
+Pure Python, no GPU. It reproduces the lesson's numbers so you can plug in your own model and cluster
+before agreeing to a fine-tune plan.
 
 ```python
 GB = 1e9
@@ -269,7 +319,8 @@ The 1,024-GPU figure assumes perfect scaling; real runs lose some of it to commu
 scaling efficiency is measured, not assumed.
 
 ### Worked scenario: a multi-node run that scaled badly
-A team moved a ZeRO-3 fine-tune from one node of eight GPUs to four nodes (illustrative).
+A team moved a ZeRO-3 fine-tune of their agent model from one node of eight GPUs to four nodes
+(illustrative).
 
 | Observation | Cause | Fix |
 |---|---|---|
@@ -278,6 +329,9 @@ A team moved a ZeRO-3 fine-tune from one node of eight GPUs to four nodes (illus
 | Resume from the old checkpoint failed | Sharded checkpoint was tied to world size 8 | A resharding distributed checkpoint format, or consolidate on save |
 
 ## Production patterns
+- **Do not distribute first.** Agent teams size the cheapest rung before booking a cluster: QLoRA or LoRA
+  on a 7B-8B base on one GPU, or a managed fine-tuning API. Move to FSDP only when the held-out agent eval
+  shows the larger model or full fine-tune is worth it. Monitor eval pass rate per dollar of training.
 - **Hybrid sharding across nodes.** When a sharded job spans several nodes, use FSDP's
   `ShardingStrategy.HYBRID_SHARD` so all-gathers stay on intra-node links and only gradient reduction
   crosses the network. Monitor step time split between compute and communication, and model FLOPs
@@ -287,23 +341,21 @@ A team moved a ZeRO-3 fine-tune from one node of eight GPUs to four nodes (illus
   CPU-RAM-efficient loading). Monitor host RAM during initialisation, which otherwise peaks at ranks ×
   model size.
 - **Resharding checkpoints.** Save with PyTorch distributed checkpointing (`torch.distributed.checkpoint`),
-  which can load into a different world size, or consolidate with DeepSpeed's `zero_to_fp32.py` script.
-  Test a resume on a different GPU count before the run matters.
-- **Scaling-efficiency gate.** Before a long run, measure tokens per second per GPU at one node and at the
-  target size. Re-tune learning rate and warmup whenever the global batch changes, and compare loss curves
-  against the smaller run for the first few hundred steps.
+  which can load into a different world size, or consolidate with DeepSpeed's `zero_to_fp32.py` script,
+  so the serving stack for your agent gets one ordinary checkpoint. Test a resume on a different GPU count
+  before the run matters.
 - **Make hangs diagnosable.** Set a finite collective timeout in `dist.init_process_group(timeout=...)`,
   run with `NCCL_DEBUG=INFO` while debugging, and use `drop_last=True` on the sampler so ranks see equal
   batch counts. Alert on a step-time heartbeat, not GPU utilisation, because a hung collective can still
   show 100%.
 - **Keep tensor parallelism inside the node.** In Megatron-LM, set `--tensor-model-parallel-size` no
   larger than GPUs per node and use `--pipeline-model-parallel-size` to span nodes. Monitor MFU; a drop to
-  single digits signals TP traffic on a slow link.
+  single digits signals TP traffic on a slow link. The same rule holds when serving a large agent model.
 
 ## Trade-offs
 - **DDP: simplest vs full state on every GPU.** The simplest and most compute-efficient scheme, but every
   GPU holds the full state. It flips to FSDP or ZeRO the moment weights plus optimizer state exceed one
-  card, or batch is memory-limited.
+  card, or batch is memory-limited. For agent LoRA runs it rarely flips.
 - **ZeRO-3/FSDP: memory ÷ N vs gathers on the critical path.** It divides memory by N but adds all-gathers
   on the critical path and is sensitive to the interconnect; across slow inter-node links use hybrid
   sharding so gathers stay inside the node.
@@ -314,8 +366,14 @@ A team moved a ZeRO-3 fine-tune from one node of eight GPUs to four nodes (illus
   far outnumber stages; it flips against you when the global batch is small or stages are unbalanced.
 - **Offload: fits the impossible vs speed.** CPU or NVMe offload fits otherwise impossible jobs on few GPUs
   at a large speed cost; it pays only when wall-clock is cheap and GPUs are not.
+- **Bigger agent model vs PEFT on a smaller one.** A 70B full fine-tune may score higher on agent evals but
+  costs a multi-node run and a harder serving setup; it flips only when the eval gap survives a fair LoRA
+  baseline.
 
 ## Pitfalls
+- **Reaching for a cluster before trying PEFT.** Symptom: a multi-node full fine-tune whose agent eval
+  barely beats a one-GPU LoRA. Fix: run the LoRA or QLoRA baseline first and make the larger run justify
+  itself on the same eval.
 - **Scaling GPUs without re-tuning for the larger global batch.** Symptom: a loss curve that no longer
   matches the single-GPU run, usually because learning rate and warmup were left unchanged. Fix: re-tune
   both for the new global batch.
@@ -335,10 +393,13 @@ A team moved a ZeRO-3 fine-tune from one node of eight GPUs to four nodes (illus
 - **Application roles:** you need the vocabulary and arithmetic, not the practice: enough to read a
   DeepSpeed or FSDP config, to know why a 70B full fine-tune needs more than one 80 GB node, and to
   recognise that the cheapest "distributed" option is usually to not need it (LoRA, QLoRA, a smaller base).
+- **Agent builders use it when** an agent eval proves a larger base or full fine-tune is worth the cost,
+  and when reviewing a vendor's or teammate's training plan.
 - **Training roles decide:** the ZeRO stage or sharding strategy, the FSDP wrap unit, whether to add tensor
   parallelism inside the node, the global batch and learning-rate schedule, and checkpoint format.
 - **Measure:** tokens per second per GPU against the single-GPU baseline (scaling efficiency) and model
-  FLOPs utilisation.
+  FLOPs utilisation. Before a long run, measure at one node and at the target size, and compare loss
+  curves against the smaller run for the first few hundred steps.
 - **Interviews:** say what each scheme communicates, how often, and which link it needs; and derive the
   16-bytes-per-parameter memory budget on the spot.
 
@@ -362,6 +423,14 @@ change the problem to LoRA on a bf16 base (140 GB of weights sharded to ~17.5 GB
 optimizer state) or QLoRA. The arithmetic decides, not the framework.
 
 ## Interview questions
+### Your team wants to full fine-tune a 70B model on agent trajectories. How do you respond?
+- **Do the arithmetic first:** 70B × 16 bytes ≈ 1.12 TB of state, 140 GB per GPU on eight 80 GB GPUs under
+  ZeRO-3, so it does not fit one node.
+- **Then question the need:** LoRA on the 70B bf16 base shards to ~17.5 GB per GPU, and LoRA on a 7B-8B
+  base fits one GPU; either is a fair baseline.
+- **Decide on the agent eval:** go multi-node only if the full fine-tune beats the LoRA baseline on held-out
+  tasks by enough to pay for the run and the harder serving setup.
+
 ### What do the ZeRO stages shard, and what does stage 3 cost?
 - **Stage 1** shards optimizer state, **stage 2** adds gradients, **stage 3** adds parameters, so per-GPU
   state falls from 16Ψ to 16Ψ/N; for 7B on 8 GPUs, 112 GB down to 14 GB.
@@ -390,13 +459,13 @@ optimizer state) or QLoRA. The arithmetic decides, not the framework.
 - **So** it needs on the order of a thousand GPUs for a run of days, and memory (112 GB of state) rules out
   one GPU anyway.
 
-### You moved from 8 to 32 GPUs and the loss curve changed. What happened?
+### Your agent-model fine-tune moved from 8 to 32 GPUs and the loss curve changed. What happened?
 - **The global batch changed:** N × micro-batch × accumulation grew 4×, while learning rate and warmup were
   tuned for the smaller batch.
 - **Fix:** re-tune learning rate and warmup, or lower accumulation steps to keep the global batch
   constant.
-- **Then check scaling efficiency:** tokens per second per GPU against the 8-GPU run, to confirm the
-  extra GPUs are doing useful work.
+- **Then check scaling efficiency and the agent eval:** tokens per second per GPU against the 8-GPU run,
+  and the held-out agent tasks, to confirm the extra GPUs bought a model that is no worse.
 
 ## Quiz
 ### Q: Which parallelism scheme communicates activations in every layer and therefore needs NVLink-class bandwidth?
@@ -422,3 +491,25 @@ optimizer state) or QLoRA. The arithmetic decides, not the framework.
 - [ ] Enabling gradient checkpointing inside each stage
 > The bubble is the time stages wait for work to arrive; more micro-batches in flight keep every stage busy
 > for a larger share of the step, while more stages or checkpointing make the bubble worse or leave it alone.
+
+## Use cases & projects
+### Use cases
+- **Reviewing a fine-tune plan for an agent model.** The 16-bytes rule tells you in a minute whether a
+  proposed full fine-tune fits the hardware or should be a LoRA.
+- **Choosing between a 7B LoRA and a 70B fine-tune.** Sharded LoRA on 70B is feasible on one node, so the
+  real question becomes whether the agent eval gap pays for it.
+- **Reading a vendor's or teammate's training config.** Knowing what `FULL_SHARD`, ZeRO stages and offload
+  mean lets you spot a run that will not reproduce on smaller staging hardware.
+- **Serving a large open-weights agent model.** Tensor parallelism inside one node is the same split and
+  the same interconnect rule at inference time.
+
+### Mini project
+**Size three fine-tune options for one agent (1-2 hours).**
+- **Goal:** produce a one-page sizing note that recommends how to fine-tune a tool-calling agent's model on
+  your hardware, with the arithmetic shown.
+- **Steps:** count tokens in a sample of agent trajectories; extend the planning calculator with LoRA and
+  QLoRA rows (base weights in bf16 or 4-bit plus a small adapter); compute per-GPU state for 7B and 70B
+  under DDP, ZeRO-3 and LoRA on your GPU count; if you have two GPUs, launch a tiny LoRA run with `torchrun`
+  and compare measured peak memory with the estimate.
+- **Done when:** the note has a table of options with fits or does not fit, an estimated run time from the
+  token count, and a recommendation tied to an agent eval you would run to justify any step up.

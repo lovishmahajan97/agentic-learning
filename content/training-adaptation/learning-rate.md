@@ -449,3 +449,23 @@ training loss alone.
 > Early steps combine the largest gradients with the least reliable second-moment estimates; a full-size
 > step there overshoots sharply curved directions. Decay is irrelevant that early, and a too-low rate
 > produces slowness, not spikes.
+
+## Use cases & projects
+### Use cases
+- **LoRA fine-tunes on agent trajectories.** The peak rate is the first setting to sweep, because it
+  decides whether the adapter learns tool selection at all or wrecks the chat format.
+- **Hosted fine-tuning jobs.** Adjusting the learning-rate multiplier is the main lever when a managed
+  job underfits or the model starts forgetting general skills.
+- **Debugging a diverged run.** Loss spikes early in training point to a peak rate that is too high or a
+  warmup that is too short, before anyone blames the data.
+- **Re-running with a new base model.** A rate that worked on one base is a starting point, not a
+  constant, so teams re-run a small grid when they switch.
+
+### Mini project
+**Sweep the learning rate for a tool-calling LoRA (2-3 hours).**
+- **Goal:** choose a peak rate that maximises held-out tool-call accuracy without losing general ability.
+- **Steps:** prepare a few hundred tool-calling trajectories; run a short LoRA fine-tune at three to four
+  peak rates spaced by about 3x, with the same warmup and decay; for each, log the loss curve, held-out
+  tool-call validity and a small general-instruction suite.
+- **Done when:** you have one chart of loss curves and a table of tool-call and general scores per rate,
+  plus the rate you would ship and the evidence for it (including any run that spiked or diverged).

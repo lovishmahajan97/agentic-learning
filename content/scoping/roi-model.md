@@ -5,7 +5,8 @@ name: ROI model
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - scoping/success-metrics-kpis
   - scoping/baseline-measurement-before-deployment
@@ -17,13 +18,24 @@ related:
 ---
 
 ## TL;DR
-An ROI model turns success metrics into money: baseline × improvement × adoption × capture rate, minus
-one-time and recurring costs, over a horizon. Build ranges, sensitivity and break-even, not one heroic
-number, because capture rate and adoption usually decide it.
+An ROI model turns an agent's success metrics into money: baseline × improvement × adoption × capture
+rate, minus one-time and recurring costs, over a horizon. Build ranges, sensitivity and break-even, not one
+heroic number, because capture rate and adoption usually decide it.
+
+## For agent builders
+- **Why it matters for agents.** Agents cost more per task than a single model call: several LLM steps,
+  tool calls, retries and human review of failed runs. The ROI model is where that cost per successful
+  task meets the value the agent creates, and it decides whether the agent gets funded.
+- **Where it shows up in your stack.** Provider usage fields and your trace store give tokens, steps and
+  retries per run; your eval and audit pipeline gives success rate; both feed the recurring cost line.
+- **What you control.** Model tier per step, step budgets, caching, when the agent stops and hands off,
+  and review design. Each moves cost per successful task and therefore break-even.
+- **What you can skip.** Corporate-finance theory beyond ROI, payback month and NPV. Let the customer's
+  finance owner supply the discount rate and capture rate.
 
 ## Why it exists
-- **Budget holders reason in payback and NPV, not eval scores.** AI projects compete with every other
-  project; if you cannot say what the system is worth, someone else decides, usually with a vendor's slide
+- **Budget holders reason in payback and NPV, not eval scores.** Agent projects compete with every other
+  project; if you cannot say what the agent is worth, someone else decides, usually with a vendor's slide
   or a gut feeling.
 - **It protects the customer.** A use case that cannot clear break-even under plausible assumptions should
   be found in week two, not in month nine.
@@ -32,8 +44,8 @@ number, because capture rate and adoption usually decide it.
   1. **Freed time is not money.** Salaries do not fall when each person saves twenty minutes a day unless
      hiring is avoided, overtime drops, or the time goes to work that has value.
   2. **Adoption is not instant.** Real adoption ramps and plateaus below 100%.
-  3. **AI adds recurring costs:** inference per task (including failed and retried tasks), human review of
-     outputs, eval-set upkeep, monitoring, and re-validation when a model version is deprecated.
+  3. **AI adds recurring costs:** inference per task (including failed and retried agent runs), human
+     review of outputs, eval-set upkeep, monitoring, and re-validation when a model version is deprecated.
   4. **A point estimate hides which assumption the case rests on,** so no one knows what to measure in the
      pilot to confirm or kill it.
 - **The assumptions that decide AI ROI** (how much freed time becomes real savings, how fast people adopt)
@@ -57,21 +69,23 @@ measurement:
 - **It is low** when the freed time just becomes slack.
 
 ### Cost lines
-- **One-time:** discovery, integration, data preparation, building the eval set (SME hours count), security
-  review, training and change management.
+- **One-time:** discovery, integration (tool and API wiring for the agent), data preparation, building the
+  eval set (SME hours count), security review, training and change management.
 - **Recurring:** inference cost per task × total tasks attempted, platform or vendor fees, human review
-  minutes per output × loaded cost, engineering upkeep (prompt and eval maintenance, monitoring, incident
-  response), and periodic re-validation when the provider retires a model.
+  minutes per output × loaded cost, engineering upkeep (prompt, tool-schema and eval maintenance,
+  monitoring, incident response), and periodic re-validation when the provider retires a model.
 - **Divide recurring cost by successful tasks, not attempted ones,** because retries and failed attempts
   consume tokens but produce nothing, and the review time on a bad draft is a cost, not a saving.
+- **Agent runs vary widely in cost.** A run that loops through ten tool calls costs several times one that
+  finishes in two, so use the measured distribution of steps per run, not the happy path.
 
 ### Compare against the next-best alternative
-- **The counterfactual is rarely "do nothing".** A macro library, a form redesign, a rules engine or a
-  process change might capture part of the same benefit at a fraction of the cost and risk, and a sharp
-  finance reviewer will ask about it.
-- **State the AI case as incremental value.** If better templates would remove half of the handle time the
-  assistant targets, the AI project's return is computed on the other half, and its build cost is compared
-  with the template project's cost, not with zero.
+- **The counterfactual is rarely "do nothing".** A macro library, a form redesign, a rules engine, a
+  single-call assistant or a process change might capture part of the same benefit at a fraction of the
+  cost and risk, and a sharp finance reviewer will ask about it.
+- **State the agent case as incremental value.** If better templates would remove half of the handle time
+  the agent targets, the agent project's return is computed on the other half, and its build cost is
+  compared with the template project's cost, not with zero.
 
 ### Horizon, ramp and summary measures
 Model month by month over a horizon the sponsor uses, often 24 or 36 months, with an adoption ramp from
@@ -95,15 +109,15 @@ comparable rollouts or the pilot. Report three numbers, because they answer diff
    and report the chance that NPV is negative alongside the tornado chart.
 
 ## Diagram
-Benefits and costs both trace to measured inputs; the sensitivity loop finds the one input the pilot must
-measure.
+Benefits and costs both trace to measured inputs; agent traces supply cost per successful task, and the
+sensitivity loop finds the one input the pilot must measure.
 
 ```mermaid
 flowchart TD
     B["Baseline: volume, handle time, errors"] --> BEN["Benefit lines"]
     F["Finance: loaded cost, capture rate"] --> BEN
     P["Pilot: minutes saved, adoption"] --> BEN
-    T["Traces: cost per successful task"] --> C["Cost lines: one-time and recurring"]
+    T["Agent traces: cost per successful task"] --> C["Cost lines: one-time and recurring"]
     BEN --> M["Monthly model over 24-36 months"]
     C --> M
     M --> R["ROI, payback month, NPV"]
@@ -113,6 +127,24 @@ flowchart TD
 ```
 
 ## Examples
+### Worked scenario: cost per successful task for a support agent (illustrative numbers)
+A month of pilot traces for a tool-calling support agent. Prices and counts are illustrative; take yours
+from provider usage fields and your trace store.
+
+| Line | Value |
+|---|---|
+| Agent runs attempted | 10,000 |
+| Model cost per attempted run (all steps, retries included) | $0.12, so $1,200 |
+| Runs that succeed (audited, not self-reported) | 8,000 |
+| Failed runs reviewed by a human, 1 minute each at $0.80/min | 2,000 × $0.80 = $1,600 |
+| **Cost per successful task** | ($1,200 + $1,600) / 8,000 = **$0.35** |
+| Naive figure (model cost / attempts, no review) | $0.12 |
+
+- **The naive figure understates unit cost almost 3×,** and most of the gap is human review of failures,
+  not tokens. Raising success rate or failing fast to a human usually beats a cheaper model.
+- **Compare with the drafting example below,** which assumes $0.04 per ticket for one model call; a
+  multi-step agent at $0.35 needs a larger saving per ticket to break even.
+
 ### Monthly model with sensitivity and break-even
 A drafting assistant for a 40,000-ticket-per-month support team. All inputs are illustrative. A real
 model takes volume and handle time from the baseline, loaded cost and capture rate from finance, and AI
@@ -167,7 +199,8 @@ What the run tells you:
 | Joint mild pessimism (capture 0.45, adoption 0.5, 3 minutes saved, each milder than its single-input stress) | ROI of about −17% and no payback within 24 months |
 
 Three modest disappointments together sink a case that survives each one alone, so the one-at-a-time view
-flatters the case.
+flatters the case. To model a multi-step agent instead, set `ai_cost_per_ticket` from the measured cost
+per successful task above and re-run the break-even.
 
 ### Monte Carlo with correlated inputs
 Continues the script above (reuses `BASE` and `evaluate`). A shared "usefulness" factor drives both minutes
@@ -198,9 +231,12 @@ print(f"NPV p10 / p50 / p90 = {npvs[500]:,} / {npvs[2500]:,} / {npvs[4500]:,}")
 - **Finance-owned assumption sheet.** Keep capture rate, loaded cost per minute and discount rate in a
   sheet the customer's finance owner signs, and have the model read from it. Monitor for assumption edits
   between reviews, each with a named approver.
-- **Cost per successful task from traces.** Compute recurring AI cost as total inference, retry and review
-  spend divided by successful tasks, from production traces tagged by task ID. Monitor it weekly against
-  the modelled value, because retries and discarded drafts drift it upward.
+- **Cost per successful task from agent traces.** Compute recurring cost as total inference, tool, retry
+  and review spend divided by audited successful tasks, from production traces tagged by task ID. Monitor
+  it weekly against the modelled value, because retries, longer loops and discarded drafts drift it upward.
+- **Step and spend budgets per run.** Cap the number of agent steps and tokens per run, and hand off to a
+  human when the cap is hit, so the cost distribution has a ceiling the model can assume. Monitor the
+  share of runs that hit the cap.
 - **Re-run the model at each gate.** Refresh inputs with baseline numbers, then pilot measurements, and
   re-run before every expansion decision. Monitor the gap between measured and break-even values of the
   top sensitivity input.
@@ -221,26 +257,31 @@ print(f"NPV p10 / p50 / p90 = {npvs[500]:,} / {npvs[2500]:,} / {npvs[4500]:,}")
 - **Detail vs speed.** A detailed bottom-up model is defensible but slow to build. For an early go/no-go, a
   10-line version with honest ranges is enough, provided the break-even input is identified.
 - **Clean story vs overstatement.** Counting capture rate at 100% simplifies the story but overstates
-  value. It is only justified when the team is actively hiring or paying for overtime the tool will remove.
+  value. It is only justified when the team is actively hiring or paying for overtime the agent will
+  remove.
+- **Autonomy vs unit cost.** A fully autonomous agent removes review minutes but needs a stronger model and
+  more steps; an assistive agent is cheaper per run but saves less. Model both before choosing.
 
 ## Pitfalls
 - **Treating time saved as cash saved.** Symptom: a CFO asks which budget line goes down, and nobody can
   answer. Fix: a finance-owned capture rate.
 - **Pricing inference on successful tasks only.** Symptom: actual monthly spend runs well above the model,
-  because retries, failed runs and unused drafts were never counted. Fix: price per attempt, divide by
-  successes.
+  because retries, failed agent runs and unused drafts were never counted. Fix: price per attempt, divide
+  by successes.
+- **Costing the agent from the happy path.** Symptom: real runs average far more steps than the demo, and
+  spend doubles. Fix: use the measured steps-per-run distribution and a step budget.
 - **Assuming instant, complete adoption.** Symptom: a payback month that slips every quarter while usage
   sits on a plateau far below the modelled figure. Fix: a measured ramp and plateau.
 - **Forgetting the human review cost.** Symptom: "time saved" shrinks in the pilot because reviewers spend
   minutes checking each output. Fix: a review-minutes line, or measure savings net of review.
-- **Comparing the AI case against doing nothing.** Symptom: a finance reviewer asks why a cheaper process
-  or template fix was not costed, and the model has no answer. Fix: cost the next-best alternative.
+- **Comparing the agent case against doing nothing.** Symptom: a finance reviewer asks why a cheaper
+  process or template fix was not costed, and the model has no answer. Fix: cost the next-best alternative.
 - **Building the model before the baseline exists.** Symptom: ROI inputs that the customer's own data
   contradicts when the pilot report is reviewed. Fix: baseline first.
 
 ## When to use
-- **Use when:** scoping, as soon as the success metrics are agreed. Use it to kill or prioritise use cases
-  before anyone writes integration code.
+- **Use when:** scoping, as soon as the success metrics are agreed. Use it to kill or prioritise agent use
+  cases before anyone writes tool integrations.
 - **Refine:** with baseline numbers, then with pilot measurements, and re-run it before any expansion
   decision.
 - **Skip only for:** exploratory work explicitly funded as learning.
@@ -269,12 +310,19 @@ might be avoided hiring next year, overtime or backlog cost. I would use the mea
 and full per-attempt cost, then show the break-even capture rate so they can judge whether it is plausible.
 
 ## Interview questions
-### A vendor says their tool saves 50% of agent time. How would you turn that into a value estimate?
+### A vendor says their agent saves 50% of staff time. How would you turn that into a value estimate?
 - **Start from the baseline,** not the claim: eligible volume and measured handle time.
 - **Multiply through the real factors:** realistic adoption plateau, minutes saved net of review, loaded
   cost and a finance-owned capture rate.
 - **Subtract recurring cost per successful task,** including retries, then report ROI, payback and NPV with
   a break-even on the riskiest input.
+
+### How do you compute cost per successful task for a multi-step agent, and what usually dominates it?
+- **Sum every cost of attempted runs:** all model steps, retries and tool fees, plus human review of failed
+  or escalated runs, then divide by audited successes, not self-reported ones.
+- **What dominates is often review,** not tokens: in the worked example review of 2,000 failures is $1,600
+  against $1,200 of model spend.
+- **So the levers are success rate and failing fast to a human,** with a step budget to cap long loops.
 
 ### Why is capture rate often the most sensitive input in an AI ROI model?
 - **Definition:** it is the share of freed time that becomes cash or valuable redeployed capacity.
@@ -289,18 +337,18 @@ and full per-attempt cost, then show the break-even capture rate so they can jud
   three modest misses give about −17% ROI.
 - **Fix:** add a joint scenario or a Monte Carlo and report the probability that NPV is negative.
 
-### Six months after launch, actual AI spend is well above the model. Where do you look?
+### Six months after launch, actual agent spend is well above the model. Where do you look?
 - **Unit of cost:** whether inference was priced per successful task instead of per attempt, missing
   retries, failed runs and unused drafts.
-- **Volume:** drafts generated for every ticket rather than only adopted cases, and growth in eligible
-  volume.
-- **Upkeep:** eval maintenance, monitoring and re-validation after a provider retired a model version.
+- **Run length:** steps per run drifting up after a prompt or tool change, or loops that never hit a cap.
+- **Volume and upkeep:** drafts generated for every ticket rather than only adopted cases, eval maintenance,
+  monitoring and re-validation after a provider retired a model version.
 
 ### How do you handle a finance reviewer who asks why you did not just fix the templates?
 - **Cost the next-best alternative.** Estimate how much of the targeted handle time a template or process
   change removes, and at what cost.
-- **Restate the AI case as incremental value** on the remainder, with its build cost compared against the
-  template project's cost, not against zero.
+- **Restate the agent case as incremental value** on the remainder, with its build cost compared against
+  the template project's cost, not against zero.
 
 ## Quiz
 ### Q: In an AI labour-efficiency benefit, what does the capture rate represent?
@@ -329,3 +377,24 @@ and full per-attempt cost, then show the break-even capture rate so they can jud
 > The highest-sensitivity input decides the investment, so the pilot should measure it against the
 > break-even value. Raising the assumption hides the risk. Shortening the horizon changes the question
 > without reducing the uncertainty.
+
+## Use cases & projects
+### Use cases
+- **Agent go/no-go in scoping.** A 10-line model with honest ranges kills agent ideas whose break-even
+  needs more minutes saved than the workflow contains.
+- **Choosing autonomy level.** Comparing an autonomous agent (higher model cost, no review) with an
+  assistive one (cheaper, review minutes) on the same model shows which clears break-even.
+- **Model-tier decisions.** Swapping a cheaper model into some agent steps is judged by its effect on cost
+  per successful task, including any drop in success rate.
+- **Expansion reviews.** Re-running the model with pilot traces and measured adoption decides whether the
+  agent rolls out to the next region.
+
+### Mini project
+**Cost an agent from its own traces (2-3 hours).**
+- **Goal:** compute cost per successful task for a small agent and feed it into the ROI model above.
+- **Steps:** run a two-tool agent on 100 tasks, logging tokens, steps and retries per run from the provider
+  usage fields; label success by audit; add a review-minutes cost for failures; compute cost per
+  successful task; set `ai_cost_per_ticket` to it and re-run `evaluate` and the break-even search; then try
+  a step budget and a cheaper model for one step.
+- **Done when:** you have a table of naive versus true unit cost, the new break-even minutes saved, and a
+  one-paragraph recommendation on which lever (success rate, step cap, model tier) moves ROI most.

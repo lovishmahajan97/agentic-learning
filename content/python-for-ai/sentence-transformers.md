@@ -399,3 +399,23 @@ latency and a precision metric on labelled queries.
 - [ ] The tokenizer is case-sensitive
 > Without unit normalisation, dot product mixes direction with magnitude, and magnitude can correlate
 > with text properties such as length or rarity, so high-norm documents win everywhere. Normalising makes dot product equal cosine similarity, which compares direction only.
+
+## Use cases & projects
+### Use cases
+- **An agent's `search_docs` tool.** A bi-encoder embeds the corpus once and each tool call costs one query
+  embedding plus a nearest-neighbour lookup.
+- **Reranking before the agent reads.** A cross-encoder rescores a candidate pool so only the best few
+  chunks reach the context window.
+- **Long-term agent memory.** Stored facts and past conversation summaries are embedded and recalled by
+  similarity when a new turn arrives.
+- **Tool selection for large toolsets.** Embedding tool descriptions lets an agent shortlist relevant tools
+  instead of sending every schema on every step.
+
+### Mini project
+**Build and measure a retrieval tool for an agent (2-3 hours).**
+- **Goal:** ship a `search_docs` tool and prove reranking improves what the agent sees.
+- **Steps:** chunk 100-300 short documents; embed them with `normalize_embeddings` on and the model's
+  query and document prompts; write 20 test questions with a known correct chunk; measure top-5 hit rate
+  with the bi-encoder alone, then with a cross-encoder reranking the top 50.
+- **Done when:** the tool returns JSON results an agent can call, and you have a hit-rate table for both
+  setups plus per-query latency.

@@ -5,7 +5,8 @@ name: Fault tolerance
 kind: concept
 difficulty: core
 est_minutes: 17
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - reliability/high-availability
   - reliability/circuit-breakers
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-Fault tolerance keeps a system delivering correct, or explicitly degraded, service while components
-fail, using timeouts, bounded retries, idempotency, breakers, bulkheads, fallbacks and replicated state.
-The question is which faults you tolerate, how you detect them, and what happens before recovery.
+Fault tolerance keeps an agent delivering correct, or explicitly degraded, results while model calls
+and tools fail, using timeouts, bounded retries, idempotency keys, breakers, bulkheads and fallbacks,
+so a 429 or lost reply never sends an email twice.
+
+## For agent builders
+- **Why it matters for agents.** Every agent step is a remote call that can fail ambiguously, and many
+  steps act on the world. A 20-step run at 99% per step finishes cleanly only ~82% of the time, so step
+  failures are routine, not exceptional.
+- **Where it shows up in your stack.** The provider SDK's retry settings, the tool-execution layer of
+  your agent loop, idempotency keys on action tools, schema validation of tool arguments, circuit
+  breakers around providers and the fallback model list.
+- **What you control.** Which errors are retried (transient only), where retries live (one layer),
+  how keys are minted (once per intended action), what the agent does on an unknown outcome, and which
+  rung of the degradation ladder serves the answer.
+- **What you can skip.** Byzantine agreement protocols. Know the 3f + 1 versus 2f + 1 fact, then treat
+  wrong-but-valid model output with validation and approval gates instead.
 
 ## Why it exists
 - **Components fail at rates you cannot engineer away.** A fleet of 1,000 disks with a 1% annual failure
@@ -117,9 +131,21 @@ You tolerate what you design for.
 - **Fencing tokens or a single arbiter** prevent two nodes from both believing they lead.
 - **So thresholds trade failover speed** against the risk of acting on a wrong diagnosis.
 
+### Classifying agent step failures
+An agent loop should handle each class differently, because one retry policy for all of them either
+duplicates actions or gives up on recoverable errors.
+
+| Failure in a step | Class | Agent response |
+|---|---|---|
+| 429, 503, connection reset on a model call | transient | jittered retry within budget, then fallback model |
+| Malformed or schema-invalid tool arguments | value fault, recoverable | feed the validation error back to the model, retry the step once or twice |
+| Timeout on a side-effecting tool | unknown outcome | read-after-timeout with the idempotency key, then retry or skip |
+| 400, 401, revoked key, policy denial | permanent | fail fast with a typed error the agent or user can see |
+| Valid but wrong argument (wrong account ID) | value fault, silent | validate against ground truth or route to an approval gate |
+
 ## Diagram
-A fault is contained at each layer before it can become a user-visible failure; the dotted path is the
-degraded answer.
+A fault in an agent step is contained at each layer before it can become a user-visible failure; the
+dotted path is the degraded answer.
 
 ```mermaid
 flowchart TD
@@ -184,6 +210,32 @@ def tolerant_complete(primary, fallback, req, *, budget_s=45, attempt_timeout_s=
 - **For side-effecting tool calls,** add an idempotency key to `req` before the first attempt, never
   inside the loop.
 
+### Agent tool step with an idempotency key and unknown-outcome handling
+The key is minted once per intended action and stored with the step, so a crash-and-resume or a retry
+sends the same key. `lookup` is the read-after-timeout query against the target system.
+
+```python
+import uuid
+
+class Timeout(Exception): ...
+
+def execute_action_step(step, tool, lookup, store):
+    key = step.setdefault("idempotency_key", str(uuid.uuid4()))   # minted before the first attempt
+    store.save(step)                                              # persisted with the run checkpoint
+    for attempt in range(2):
+        try:
+            return tool(**step["args"], idempotency_key=key)
+        except Timeout:
+            prior = lookup(key)               # unknown outcome: did the first attempt land?
+            if prior is not None:
+                return prior                  # it did; never act twice
+    return {"status": "unknown_outcome", "idempotency_key": key}  # surface to the agent, do not guess
+```
+
+- **The model sees `unknown_outcome` as a tool result,** so it can tell the user or ask for approval
+  instead of hallucinating success.
+- **Cost of the extra read is one query per timeout,** which is cheap next to a duplicate purchase order.
+
 ### Worked scenario: nested retries during an outage
 Three layers each retry "a few times" with no shared budget: the SDK (3 attempts), the service (3) and
 the browser client (3). The provider starts failing every call.
@@ -215,6 +267,11 @@ the browser client (3). The provider starts failing every call.
 - **Labelled degradation ladder.** Define per operation: primary model, smaller model, cached answer,
   typed "unavailable", and tag responses with which rung served them. Monitor fallback share and run
   chaos tests that force each rung.
+- **Validation-error feedback for tool calls.** When the model emits arguments that fail the tool's JSON
+  schema, return the validator's message as the tool result and let the model retry the step, capped at
+  one or two repairs. Monitor repair rate per tool; a rising rate signals a schema or prompt regression.
+- **Disable SDK retries inside the agent loop.** Let one agent-level step handler own retries, so the
+  provider SDK, the framework and the loop do not each retry. Monitor provider calls per agent step.
 
 ## Trade-offs
 - **Retries vs load.** Retries raise success rates for transient faults but add load exactly when the
@@ -233,6 +290,9 @@ the browser client (3). The provider starts failing every call.
 - **Voting vs cost.** Masking by voting (several replicas or several sampled LLM answers) hides value
   faults but multiplies cost and latency by N; it pays only when errors are independent and a wrong
   answer is expensive, and buys nothing when every sample shares the same misleading context.
+- **Self-repair vs step budget.** Letting the model fix its own malformed tool call recovers many runs,
+  but each repair is another model call and can loop; cap repairs and count them against the run's step
+  budget.
 
 ## Pitfalls
 - **Retrying non-idempotent tool calls after a timeout.** The first call succeeded and the reply was
@@ -245,6 +305,9 @@ the browser client (3). The provider starts failing every call.
   symptom is latency without errors in logs until the budget finally expires.
 - **Fallbacks that were never exercised.** The secondary provider's key expired or its tool schema
   drifted, discovered only during the primary's outage. Chaos tests exist for this.
+- **Hiding tool failures from the model.** Swallowing an error and returning an empty result makes the
+  agent reason as if the call succeeded; the symptom is confident answers built on missing data. Fix:
+  return a typed error or `unknown_outcome` as the tool result.
 
 ## When to use
 - **Baseline for every remote call:** timeout, bounded jittered retry on transient classes, and
@@ -298,7 +361,7 @@ cases that still slip through, and the duplicate rate becomes a tracked metric.
 - **Fix:** retry in one layer only, propagate a deadline, add a retry budget, and put a circuit breaker
   around the dependency so it fails fast once errors persist.
 
-### When would you choose fail-safe over fail-open for a guard service?
+### When should an agent fail safe rather than fail open when its guard service is down?
 - **Fail-safe** (block the action) when the guard protects money, data or safety: an agent should refuse
   to act when its policy check is down.
 - **Fail-open** only when the guard's absence is low-risk, because fail-safe turns a guard outage into a
@@ -308,6 +371,14 @@ cases that still slip through, and the duplicate rate becomes a tracked metric.
 - **About three:** success goes 95%, 99.75%, then about 99.99%; a fourth adds almost nothing.
 - **Caveat:** that assumes independent failures. In a real outage they are correlated, so the deadline,
   breaker and fallback matter more than the count.
+
+### An agent's tool calls fail in different ways. How would you design the step error handler?
+- **Classify first:** transient model errors get jittered retries and a fallback model; schema-invalid
+  arguments get the validation message fed back for one or two repairs; permanent errors fail fast.
+- **Side-effecting tools** carry an idempotency key minted before the first attempt, and a timeout
+  triggers read-after-timeout instead of a blind retry.
+- **Everything else becomes a typed tool result,** so the model and the user see failures rather than
+  silent empty data.
 
 ## Quiz
 ### Q: Why must retries be combined with idempotency rather than used alone?
@@ -333,3 +404,25 @@ cases that still slip through, and the duplicate rate becomes a tracked metric.
 - [ ] Timing, because the model answered too quickly to have reasoned
 > Byzantine (arbitrary) faults are wrong-but-plausible outputs from a component that has not crashed.
 > They are caught by validation against ground truth and by approval gates, not by retries or timeouts.
+
+## Use cases & projects
+### Use cases
+- **Agents that act on business systems.** Purchase orders, tickets, refunds and emails need idempotency
+  keys and read-after-timeout so a retried step cannot act twice.
+- **High-traffic assistants on a hosted provider.** Transient-only retries with a shared deadline and a
+  retry budget ride out 429 bursts without tripling load during incidents.
+- **Structured-output pipelines.** Feeding schema validation errors back to the model repairs most
+  malformed tool calls within one extra step.
+- **Multi-provider agents.** A labelled degradation ladder (primary model, smaller model, cached answer,
+  typed unavailable) keeps runs finishing during a provider outage.
+
+### Mini project
+**Make an agent's action tool safe to retry (2-3 hours).**
+- **Goal:** prove that a "create ticket" tool never creates duplicates under timeouts, crashes and
+  provider errors.
+- **Steps:** build a fake ticket service that stores idempotency keys with a unique constraint and
+  randomly delays replies past the caller's timeout; write the agent step handler with transient-only
+  retries, a key minted before the first attempt, and read-after-timeout; run 1,000 simulated steps with
+  injected 429s, timeouts and a worker crash between attempts.
+- **Done when:** the service holds exactly one ticket per intended action, the log shows retries,
+  repairs and unknown outcomes per class, and provider calls per step stay at or below the retry cap.

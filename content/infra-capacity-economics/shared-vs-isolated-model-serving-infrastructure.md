@@ -402,3 +402,25 @@ along with its cost. Dedicated capacity is reviewed against their utilization ev
 > Latency and configuration needs are met by dedicated replicas inside a shared cluster. A separate
 > cluster or account is justified by what must not be shared at all: region, control plane,
 > operators and network.
+
+## Use cases & projects
+### Use cases
+- **Multi-tenant agent SaaS.** One shared pool serves most customers' agents cheaply, while per-tenant
+  in-flight caps stop one customer's fan-out from starving the rest.
+- **Separating evals and batch agents from interactive ones.** Eval sweeps and offline agents run on a
+  batch pool or a low-priority class, so nightly runs do not move daytime TTFT.
+- **Per-customer fine-tuned tool-calling models.** Multi-LoRA serving shares one base model while each
+  customer gets its own adapter and behaviour.
+- **Enterprise contracts with residency or no-shared-control-plane terms.** These justify a dedicated
+  cluster or account, while latency-only demands are met with dedicated replicas.
+
+### Mini project
+**Prove a noisy-neighbour fix for agents (2-3 hours).**
+- **Goal:** show that a per-tenant in-flight cap protects an interactive agent from another tenant's
+  fan-out on a shared endpoint.
+- **Steps:** put a small gateway in front of one model endpoint (local or hosted) that tags each call
+  with a tenant id; run tenant A as an interactive agent issuing one call at a time and tenant B as a
+  batch job firing 30 parallel sub-agent calls; measure tenant A's TTFT with no cap, then with a cap on
+  tenant B's in-flight calls counted across its whole fan-out.
+- **Done when:** you have a before/after table of tenant A's p50 and p95 TTFT, tenant B's total runtime
+  in both cases, and a one-paragraph recommendation on when B should move to a separate pool instead.

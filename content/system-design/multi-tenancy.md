@@ -472,3 +472,24 @@ latency per tenant so this is seen before the tickets.
 > The models describe degrees of sharing for a single resource. Real systems pool compute, bridge or
 > pool data, and silo for the tier that pays for it; bridge is partitioned structure on shared
 > infrastructure, not dedicated hardware.
+
+## Use cases & projects
+### Use cases
+- **B2B support-agent SaaS.** Many customers' agents share one pooled stack, with each tenant's
+  knowledge base, memory and tool connectors scoped by a tenant id resolved at the edge.
+- **Enterprise tier on a silo.** A regulated customer gets dedicated data stores or a dedicated stack
+  while smaller tenants stay pooled, driven by the same tenant config record.
+- **Per-tenant agent configuration.** Each tenant picks a model tier, prompt version, enabled tools and
+  step and token budgets, so one codebase serves different agent behaviour per customer.
+- **Fair use and billing.** Per-tenant concurrency caps on agent runs and a token meter per tenant stop
+  one customer's batch job from starving others and feed the invoice.
+
+### Mini project
+**Make a tiny agent tenant-aware end to end (2-3 hours).**
+- **Goal:** carry one tenant id from the request through retrieval, memory, tool credentials and metering.
+- **Steps:** build a small agent API with a tenant dependency that resolves the tenant from an API key;
+  seed two tenants with different documents and a per-tenant tool token in a config dict; filter
+  retrieval and key memory by tenant; record tokens per tenant per run; cap concurrent runs per tenant.
+- **Done when:** the same question returns different grounded answers for the two tenants, a test proves
+  tenant A can never retrieve or remember tenant B's data, and a per-tenant usage table prints after a
+  batch of runs.

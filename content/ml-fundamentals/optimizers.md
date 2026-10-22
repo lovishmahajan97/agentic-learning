@@ -5,7 +5,8 @@ name: Optimizers (Adam, AdamW)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - ml-fundamentals/gradient-descent
   - ml-fundamentals/backpropagation
@@ -23,14 +24,27 @@ sources:
 ---
 
 ## TL;DR
-An optimizer turns gradients into updates. Adam divides a running mean of each parameter's gradient by
-the root of its running mean square, so every parameter moves about one learning rate. AdamW decays
-weights directly, not through the gradient, and is the transformer default.
+AdamW drives almost every agent-model fine-tune. It moves each parameter about one learning rate per
+step and decays weights directly; its optimizer state is why full fine-tuning a 7B model needs about
+112 GB while LoRA fits one GPU.
+
+## For agent builders
+- **Why it matters for agents.** When you fine-tune a model to call your tools or follow your agent's
+  format, AdamW's learning rate, warmup and memory decide whether the run fits your hardware and whether it
+  converges. The 16-bytes-per-parameter rule is usually what makes LoRA the default for agent teams.
+- **Where it shows up in your stack.** `torch.optim.AdamW` inside fine-tuning libraries, the optimizer and
+  learning-rate settings of trainer configs, 8-bit optimizer options, FSDP or DeepSpeed ZeRO sharding, and
+  the learning-rate knob of hosted fine-tuning services.
+- **What you control.** Peak learning rate (very different for LoRA and full fine-tuning), warmup and
+  decay, weight decay on matrices only, β2 for long runs, and whether optimizer state is saved with each
+  checkpoint.
+- **What you can skip.** Convergence theory and the zoo of newer optimizers. Know the update rule, why
+  bias correction and warmup exist, coupled versus decoupled decay, and the memory arithmetic.
 
 ## Why it exists
-- **Gradient scales differ by orders of magnitude.** The embedding row of a rare token receives a gradient
-  only when that token appears, and a small one; layer-norm gains, attention projections and output heads
-  each see their own typical magnitude.
+- **Gradient scales differ by orders of magnitude.** The embedding row of a rare token, such as a tool
+  name that appears only in your traces, receives a gradient only when that token appears, and a small
+  one; layer-norm gains, attention projections and output heads each see their own typical magnitude.
 - **One learning rate cannot fit all.** Either it suits the large-gradient parameters and the
   small-gradient ones barely move, or it suits the small ones and the large ones diverge. Plain gradient
   descent also crawls along low-curvature directions (see the gradient-descent lesson).
@@ -130,10 +144,12 @@ That number drives the alternatives:
 - **SGD with momentum** still matches or beats Adam on some convolutional benchmarks with a tuned schedule.
 - **Newer optimizers** such as Lion, Sophia and Muon trade memory or steps against Adam and should be
   compared under equal compute before adoption.
+- **For agent fine-tunes** the dataset is often a few thousand trajectories, so runs are short; warmup,
+  the peak learning rate and the number of epochs matter more than β2.
 
 ## Diagram
 One AdamW step per parameter: decay is applied to the weight directly, while the gradient flows through
-the two moment estimates.
+the two moment estimates. In a LoRA fine-tune this runs only for the adapter weights.
 
 ```mermaid
 flowchart TD
@@ -150,6 +166,21 @@ flowchart TD
 ```
 
 ## Examples
+### Worked scenario: full fine-tune or LoRA for a 7B tool-calling model
+A team wants a 7B model to follow its tool-call format on one 80 GB GPU. Adapter size is illustrative
+(about 0.5% of parameters, 35M), with adapter weights, gradients, m and v in fp32.
+
+| Setup | Weights | Gradients and optimizer state | Total before activations | Fits on 80 GB? |
+|---|---|---|---|---|
+| Full AdamW, mixed precision | 14 GB fp16 + 28 GB fp32 master | 14 GB grads + 56 GB m, v | about 112 GB | no |
+| Full AdamW, 8-bit m and v | 42 GB | 14 GB grads + about 14 GB m, v | about 70 GB | barely, no room for long trajectories |
+| LoRA, frozen bf16 base | 14 GB base + about 0.14 GB adapters | about 0.42 GB for adapter grads, m, v | about 15 GB | yes, with room for activations |
+
+- **LoRA wins on memory by roughly 7×** here, leaving space for the long sequences agent traces need.
+- **Its learning rate is higher:** start the sweep around 1e-4 to 3e-4 instead of 1e-5 to 5e-5.
+- **Check quality, not just fit:** compare tool-call accuracy on held-out tasks against a full fine-tune
+  on a sharded setup if the LoRA result falls short.
+
 ### Hand-written AdamW matches torch.optim.AdamW
 A hand-written AdamW step compared against `torch.optim.AdamW` on the same parameters. The two must
 agree exactly, which confirms the update rule above is the whole algorithm; the final print shows the
@@ -185,7 +216,8 @@ print(g.abs())                                            # ... even though the 
 
 ### Production setup: parameter groups without decay on biases and norms
 The common convention: matrices (2-D and above) get weight decay; biases and normalisation gains (1-D) do
-not. β2 = 0.95 as in many LLM recipes.
+not. β2 = 0.95 as in many LLM recipes. With LoRA, frozen base weights are skipped, so only adapters get
+optimizer state.
 
 ```python
 import torch
@@ -222,6 +254,9 @@ Mixed precision with AdamW, before activations (7 × 10⁹ parameters).
   56 GB to about 14 GB, for roughly 70 GB in total: still tight before activations.
 
 ## Production patterns
+- **LoRA plus AdamW as the default agent fine-tune.** Freeze the base, train adapters with AdamW at a LoRA
+  learning rate found by a short sweep, and gate the checkpoint on the agent eval suite. Monitor tool-call
+  accuracy and a general-skills eval side by side.
 - **Use `torch.optim.AdamW`, never Adam plus `weight_decay`, for decay.** Build parameter groups so 1-D
   parameters (biases, norm gains) get `weight_decay=0.0`. Monitor the weight-norm trend per layer.
 - **Save and restore optimizer state.** Include `optimizer.state_dict()` and the scheduler state in every
@@ -250,6 +285,8 @@ Mixed precision with AdamW, before activations (7 × 10⁹ parameters).
 - **Larger ε: stability vs adaptivity.** It stabilises parameters with tiny gradients, especially in low
   precision, but damps the very adaptivity Adam exists for; move it deliberately, do not leave the default
   untouched in bf16.
+- **LoRA vs full fine-tuning.** LoRA cuts optimizer memory to almost nothing and is easy to swap per agent
+  or customer, but may fall short of a full fine-tune on large behaviour changes; the eval decides.
 
 ## Pitfalls
 - **`torch.optim.Adam` with `weight_decay`, believed to be AdamW.** Symptom: regularisation that seems to
@@ -258,6 +295,8 @@ Mixed precision with AdamW, before activations (7 × 10⁹ parameters).
   with parameter groups that exclude them.
 - **Carrying an SGD learning rate such as 0.1 into Adam.** Symptom: immediate divergence, since Adam's step
   is about η per parameter per step.
+- **Reusing a full fine-tuning learning rate for LoRA, or the reverse.** Symptom: a LoRA run that barely
+  moves, or a full fine-tune that forgets general skills; sweep in the right range for the method.
 - **Skipping warmup.** Symptom: a loss spike in the first few hundred steps, sometimes unrecoverable,
   caused by updates computed from a second-moment estimate built on a handful of samples.
 - **Resuming without optimizer state.** Symptom: a loss spike at the resume point as m and v restart from
@@ -275,6 +314,8 @@ Mixed precision with AdamW, before activations (7 × 10⁹ parameters).
   appear, paired with warmup, a cosine or linear decay and gradient clipping.
 - **Switch** to 8-bit Adam, Adafactor or parameter-efficient fine-tuning when optimizer memory is the
   binding constraint; keep SGD with momentum for convolutional recipes known to work with it.
+- **For agent fine-tunes,** start with LoRA plus AdamW; move to full fine-tuning only when the eval shows
+  adapters cannot reach the behaviour you need.
 - **Measure** the loss and gradient-norm curves and the ratio of update size to weight size per layer, a
   useful sanity check that updates are neither negligible nor wild.
 - **Interviews:** write the Adam update, explain bias correction, contrast coupled L2 with decoupled decay,
@@ -308,6 +349,14 @@ the shrink per step is ηλ, so a learning-rate schedule scales the decay along 
   each step about η regardless of gradient size.
 - **Bias correction and ε:** dividing by (1 − βᵗ) undoes the zero start; ε prevents division by zero and
   sets a floor.
+
+### You need a 7B model to learn your agent's tool-call format on a single 80 GB GPU. How do you set up the optimizer?
+- **Do the byte arithmetic:** full AdamW is about 16 bytes per parameter, roughly 112 GB, so it does not
+  fit; LoRA keeps optimizer state only for adapters and fits with room for activations.
+- **Configure:** AdamW on adapter parameters, a LoRA-range learning rate from a short sweep, warmup, decay
+  and clipping around 1.0, and optimizer state saved in each checkpoint.
+- **Judge by the agent eval:** tool-call accuracy on held-out tasks plus a general-skills check for
+  forgetting.
 
 ### Your fine-tune diverges in the first 200 steps with Adam at lr = 0.1. What happened and what do you change?
 - **Wrong scale:** Adam moves each parameter by about η per step, so 0.1 is enormous; SGD-style rates do
@@ -365,3 +414,23 @@ the shrink per step is ηλ, so a learning-rate schedule scales the decay along 
 > The usual accounting is 16 bytes per parameter: 2 (fp16 weights) + 2 (fp16 gradients) + 4 (fp32 master
 > weights) + 4 (m) + 4 (v). 7 × 10⁹ × 16 bytes ≈ 112 GB, which is why full fine-tuning at this size needs
 > several GPUs or sharded and quantised optimizer state, and why PEFT is so common.
+
+## Use cases & projects
+### Use cases
+- **LoRA fine-tunes for tool calling.** AdamW on adapters is the standard recipe for teaching an open
+  model your tool schemas and output format on a single GPU.
+- **Per-customer or per-agent adapters.** Tiny optimizer state makes it cheap to train one adapter per
+  tenant or specialist sub-agent and swap them at serving time.
+- **Capacity quotes for fine-tuning.** The 16-bytes-per-parameter rule tells you how many GPUs a full
+  fine-tune needs before anyone books hardware.
+- **Diagnosing failed training runs.** Divergence, resume spikes and stalled LoRA runs usually trace back to
+  learning rate, warmup or missing optimizer state.
+
+### Mini project
+**AdamW settings audit on a small agent fine-tune (2-3 hours).**
+- **Goal:** see how learning rate, warmup and decoupled decay change a small fine-tune on tool-call data.
+- **Steps:** build 500 synthetic (request, tool-call JSON) examples; fine-tune a small open model or a
+  small transformer with LoRA using `torch.optim.AdamW` and parameter groups; run three peak learning
+  rates with and without warmup; resume one run from a checkpoint without optimizer state.
+- **Done when:** you have loss curves for all runs, the exact-match rate of generated tool calls on 100
+  held-out requests, and a short note naming the resume spike and the best setting.

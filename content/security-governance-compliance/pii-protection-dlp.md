@@ -5,7 +5,8 @@ name: PII protection / DLP
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - safety-security/pii-redaction
   - safety-security/data-leakage
@@ -21,9 +22,23 @@ sources:
 ---
 
 ## TL;DR
-PII protection decides which personal data may reach which destination; DLP finds it in motion, in use
-and at rest and enforces allow, redact, tokenize, block or alert. LLM systems copy free text into
-prompts, providers, logs, indexes and weights, so every copy can leak.
+An agent copies personal data as free text into prompts, providers, tool arguments, memory, traces and
+indexes. PII protection decides which data may reach which destination; DLP finds it and enforces allow,
+redact, tokenize, block or alert at each crossing.
+
+## For agent builders
+- **Why it matters for agents.** A single agent turn can move a customer's email from a tool result into
+  the context, out to an external model, into a trace, into long-term memory and into a third-party
+  tool's arguments. Every hop is a copy, and none of them knows the string is personal data.
+- **Where it shows up in your stack.** The AI gateway in front of your model provider, the wrapper around
+  tool calls and tool results, memory and vector-index ingestion, and the trace or log collector your
+  agent framework writes to.
+- **What you control.** The class-by-destination policy, whether the model sees real values or
+  placeholders, which tools may receive real values, what memory stores, and how erasure fans out to
+  derived copies.
+- **What you can skip.** Building detectors from scratch. Use an analyzer such as Presidio plus checksums
+  and exact data match, and put your effort into enforcement points and measuring recall on your own
+  traffic.
 
 ## Why it exists
 - **Personal data stopped living in typed columns.** A `ssn` field could be encrypted, masked and
@@ -218,6 +233,43 @@ print(p.unmask("I have emailed PERSON_1 at EMAIL_1."))
 - **The mapping object is itself a sensitive store:** keep it in memory or a short-TTL cache, never in
   logs or traces.
 
+### Agent scenario: placeholders through a tool-calling loop
+The same `Pseudonymiser` wraps every tool call, so the model reasons over placeholders end to end. Tools
+inside your boundary get real values at dispatch; tools outside it must never receive raw PII; every
+tool result is masked before it re-enters the context.
+
+```python
+import re
+
+EMAIL = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
+INTERNAL = {"lookup_customer", "send_customer_email"}      # run inside your boundary
+
+def detect(text):                                           # stand-in for your real detectors
+    return [("EMAIL", e) for e in EMAIL.findall(text)]
+
+def call_tool(p, name, args, tools):
+    if name in INTERNAL:                                     # real values only inside the boundary
+        args = {k: p.unmask(v) if isinstance(v, str) else v for k, v in args.items()}
+    elif any(detect(str(v)) for v in args.values()):
+        raise PermissionError("raw PII in arguments to an external tool")
+    result = tools[name](**args)
+    return p.mask(result, detect(result))                    # results re-enter context pseudonymised
+
+tools = {
+    "lookup_customer": lambda order_id: f"order {order_id} belongs to jane@example.com",
+    "send_customer_email": lambda to, body: f"sent to {to}",
+}
+p = Pseudonymiser()
+print(call_tool(p, "lookup_customer", {"order_id": "4411"}, tools))   # order 4411 belongs to EMAIL_1
+# the model only ever saw EMAIL_1, so that is what it proposes as the recipient:
+print(call_tool(p, "send_customer_email", {"to": "EMAIL_1", "body": "Refund sent"}, tools))
+# sent to EMAIL_1  (the real address was used inside the tool, then masked again)
+```
+
+- **Traces stay clean for free,** because the context the framework logs only ever holds placeholders.
+- **Memory is the hard case.** The mapping expires with the conversation, so long-term memory should store
+  source-record IDs that are looked up again under access control, not placeholders or raw values.
+
 ### Worked policy matrix for a support assistant
 | Data class | External LLM | Logs and traces | Vector index | Display to agent |
 |---|---|---|---|---|
@@ -245,6 +297,9 @@ print(p.unmask("I have emailed PERSON_1 at EMAIL_1."))
   which synthetic test sets hide.
 - **Erasure that follows lineage.** Record source-record IDs on chunks, embeddings, summaries and eval rows
   so a deletion request fans out to derived copies. Monitor time-to-delete across all derived stores.
+- **A DLP wrapper on every agent tool call.** Pseudonymise tool results before they enter the context and
+  check arguments bound for third-party tools, in the orchestrator rather than in each tool. Monitor
+  external-tool calls refused for raw PII and memory writes that contain detector hits.
 - **Sanctioned tenant plus endpoint controls for shadow AI.** Provide an enterprise AI tool with
   contractual data terms, then add browser or CASB warnings on unsanctioned AI domains. Monitor traffic to
   unsanctioned domains before and after the sanctioned tool launches.
@@ -340,6 +395,14 @@ at-rest scans to catch whatever slipped through.
 - **Then add browser or endpoint DLP and network or CASB controls** that warn or block on unsanctioned AI
   domains; blocking alone pushes traffic to personal devices.
 
+### Your support agent has a CRM tool, a third-party web-search tool and long-term memory. Where does DLP go?
+- **Around the tools, not only the provider call.** Mask CRM results before they enter the context, and
+  refuse search queries that carry raw PII, because a search query is egress to another third party.
+- **At the memory write.** Store source-record IDs rather than raw values, and run detectors on whatever
+  memory text remains, because memory outlives the conversation and its mapping.
+- **In the trace collector,** so whatever slips past still does not land in observability with broad
+  access and long retention.
+
 ## Quiz
 ### Q: Why validate candidate card numbers with the Luhn checksum after a regex match?
 - [ ] Luhn decrypts the card number so it can be safely tokenized
@@ -365,3 +428,25 @@ at-rest scans to catch whatever slipped through.
 > Teams focus on the provider egress and forget that their observability pipeline captures full prompts
 > and responses, often with broad access and long retention, which frequently makes it the largest
 > silent PII store.
+
+## Use cases & projects
+### Use cases
+- **Customer support agents on an external model.** Names and emails travel as placeholders; card numbers
+  are blocked at the gateway; real values are used only inside internal tools.
+- **Agents with long-term memory.** Memory stores record IDs, so an erasure request deletes the source and
+  the memory no longer resolves it.
+- **RAG over tickets and transcripts.** Ingestion redacts or tags personal data before chunking and
+  embedding, with lineage so deletions reach every chunk.
+- **Observability for agent traces.** Masking in the collector keeps full-trace debugging possible
+  without creating the largest PII store in the company.
+
+### Mini project
+**Run a support agent on placeholders only (2-3 hours).**
+- **Goal:** an agent that completes a refund-email task while neither the model, the traces nor a
+  third-party tool ever sees a raw email address.
+- **Steps:** wire the `Pseudonymiser` and `call_tool` wrapper from this lesson into a small tool-calling
+  loop with one internal CRM tool and one fake external search tool; log every context the framework
+  sends to the model; run a DLP scan (Presidio or the regexes here) over those logs; add a test where the
+  model tries to put a raw address into the search tool.
+- **Done when:** the task completes, the log scan returns zero hits, and the external-tool test raises
+  `PermissionError`.

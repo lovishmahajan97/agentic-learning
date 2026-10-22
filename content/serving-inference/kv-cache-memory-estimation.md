@@ -414,3 +414,23 @@ will have higher TPOT because every step reads all 40 caches.
 > Engines profile a worst-case forward pass and reserve memory for activations, graphs and sampling before
 > sizing the cache pool. Block size does not change total pool bytes, and the K/V factor is correct. Trust
 > the log and tighten the workspace term in the estimate.
+
+## Use cases & projects
+### Use cases
+- **Sizing replicas for an agent fleet.** Bytes per token times the transcript length at the last step
+  gives the cache each run needs, and therefore how many runs a GPU holds.
+- **Choosing a model for long-running agents.** Two models of similar quality can differ several-fold in
+  KV heads, and so in concurrent runs per GPU.
+- **Setting step and compaction limits.** Maximum steps per run and when to compact history follow from
+  the cache budget per run.
+- **Explaining preemption storms late in agent runs.** Capacity sized from step 1 fails once transcripts
+  reach step 15 or 20.
+
+### Mini project
+**Agent capacity calculator (1-2 hours).**
+- **Goal:** predict how many concurrent agent runs one replica holds, then check it against the engine.
+- **Steps:** write a script that reads a model's `config.json`, computes bytes per token, and turns prefix
+  size, tokens per step and maximum steps into a final transcript length; compute runs per GPU for two
+  models and an fp16 versus FP8 cache; then start vLLM and compare with the cache blocks in its startup log.
+- **Done when:** your estimate and the engine's log agree within your stated workspace margin, and you have
+  a table of runs per GPU for each model and cache precision.

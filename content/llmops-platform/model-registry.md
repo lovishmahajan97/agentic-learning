@@ -5,7 +5,8 @@ name: Model registry
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - llmops-platform/experiment-tracking
   - llmops-platform/prompt-registry
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-A model registry maps a model name to immutable versions (exact weights or provider snapshot, adapters,
-serving config, lineage, eval evidence) and mutable aliases like `champion`, so "what is in production"
-has one answer and rollback is a pointer move.
+An agent depends on several models: the main LLM, a router, an embedder, a judge or guard. A model
+registry maps each to immutable versions and mutable aliases like `champion`, so "what is this agent
+running" has one answer and rollback is a pointer move.
+
+## For agent builders
+- **Why it matters for agents.** An agent run touches many models: the planner LLM, a cheaper router or
+  summariser, the embedder behind RAG, a guardrail classifier, a fine-tuned tool-calling adapter. Any of
+  them changing silently changes the agent, and only a registry tells you which versions a run used.
+- **Where it shows up in your stack.** MLflow's model registry, the Hugging Face Hub pinned by commit sha
+  for open weights, and "virtual" versions that record a provider snapshot id for hosted models.
+- **What you control.** Which artifacts count as a model (adapters, quantized variants, embedders,
+  judges), alias names per environment and tenant, resolving aliases once at startup, and logging every
+  resolved version into the agent's trace.
+- **What you can skip.** Registry internals and the old fixed-stage workflow. If your agent only calls one
+  hosted model, a pinned snapshot id in config is enough until a second model or a fine-tune appears.
 
 ## Why it exists
 - **Files in a bucket do not say what is serving.** Names like `adapter_final_v2_really.safetensors`,
@@ -32,7 +45,7 @@ has one answer and rollback is a pointer move.
   this trained on".
 - **An LLM "model" is several artifacts.** A base model identity, a LoRA adapter, a quantization choice, a
   tokenizer revision and a serving configuration can each drift independently while all still look like
-  "the model".
+  "the model". An agent multiplies that by the number of model roles it uses.
 - **The naive fixes fail predictably.** Git does not survive multi-gigabyte weights even with LFS and has no
   lineage to runs or evals. "Deploy the newest file" makes deploys non-deterministic: two replicas started
   an hour apart can serve different models. A spreadsheet is the pattern with no enforcement, wrong within
@@ -58,16 +71,16 @@ has one answer and rollback is a pointer move.
   Archived). Newer versions replaced them with free-form aliases plus tags, because fixed stages could not
   express "two production models for two tenants" or "the canary candidate".
 
-### What counts as a model in an LLM application
+### What counts as a model in an agent
 Register every artifact whose change alters model behaviour:
 
-| Artifact | Why it is registered |
-|---|---|
-| Fine-tuned weights and LoRA adapters | the obvious case |
-| Quantized variants | one version per quantization, because they are evaluated separately |
-| Embedding models | their version must match the vector index built with them |
-| Reward or judge models | a judge change moves every score |
-| Provider-hosted models | a "virtual" version records only a provider snapshot id and decoding config |
+| Artifact | Why it is registered | Agent role |
+|---|---|---|
+| Fine-tuned weights and LoRA adapters | the obvious case | a tool-calling or domain adapter |
+| Quantized variants | one version per quantization, because they are evaluated separately | a cheaper self-hosted planner |
+| Embedding models | their version must match the vector index built with them | RAG retrieval and memory search |
+| Reward or judge models | a judge change moves every score | eval judge, guardrail, reflection critic |
+| Provider-hosted models | a "virtual" version records only a provider snapshot id and decoding config | the main agent LLM |
 
 - **Virtual versions matter:** they give an API-based model the same lifecycle, evidence and rollback story
   as self-hosted weights.
@@ -76,7 +89,8 @@ Register every artifact whose change alters model behaviour:
 
 ### Lifecycle
 1. **Register from a tracking run**, so lineage is automatic.
-2. **Attach evidence:** the eval run fingerprint and scores on a named golden-set version.
+2. **Attach evidence:** the eval run fingerprint and scores on a named golden-set version (for an agent,
+   task success and tool-call validity on the agent golden set).
 3. **Request review.** The reviewer reads the model card, the metric diff against the champion and the
    slice results.
 4. **Promote by alias, deploy, observe the canary**, then promote to `champion`.
@@ -89,8 +103,10 @@ Register every artifact whose change alters model behaviour:
   verifies it, and logs the resolved version into every trace and response header.
 - **Resolve once, at startup, deliberately.** A running replica never changes model mid-flight, and a
   rollout happens by starting new replicas against the new alias target, which is what a canary needs.
+  For agents this also means one run never switches models between steps.
 - **Embedders use the same mechanism** to prevent the classic bug of querying an index built with embedder
   v2 using embedder v3: the index build records the embedder version and the query path refuses a mismatch.
+  Agent long-term memory stores built from embeddings have the same constraint.
 
 ### Rollback is a rollout
 - **A pointer move in the registry, a new rollout in serving.** Its real duration is the time to start
@@ -113,19 +129,19 @@ Register every artifact whose change alters model behaviour:
 - **Design it in:** cheap up front, expensive to retrofit.
 
 ## Diagram
-Versions flow in from tracked runs and gather evidence; aliases point at them; servers resolve the alias
-once at startup and log what they got.
+Versions flow in from tracked runs and gather evidence; aliases point at them; the agent service resolves
+each model role's alias once at startup and logs what it got.
 
 ```mermaid
 flowchart TD
     R["Tracking run"] -->|"register, lineage"| V[("Immutable version + hash")]
-    E["Eval run on golden set"] -->|"evidence tags"| V
+    E["Agent eval on golden set"] -->|"evidence tags"| V
     V --> RV["Review: card, metric diff, slices"]
     RV -->|"set alias"| CH["Alias: challenger"]
     CH --> K["Canary replicas"]
     K -->|"healthy"| CP["Alias: champion"]
-    CP -->|"resolve once at startup"| S["Serving replica"]
-    S --> T["Trace logs resolved version"]
+    CP -->|"resolve once at startup"| S["Agent service replica"]
+    S --> T["Trace logs resolved versions"]
     K -.->|"regress: set alias back"| CP
 ```
 
@@ -167,6 +183,34 @@ model = mlflow.pyfunc.load_model(f"models:/{NAME}/{resolved.version}")   # load 
                                                                           # alias again: it may move in between
 ```
 
+### An agent service resolving every model role at startup
+Pure Python, runnable. The agent declares its model roles; at startup it resolves each alias once,
+refuses to start if the embedder does not match the memory index, and stamps the resolved set on every
+run's trace. `resolve` stands in for `get_model_version_by_alias` or a provider-snapshot lookup.
+
+```python
+class EmbedderMismatch(RuntimeError):
+    pass
+
+REGISTRY = {("agent-llm", "champion"): "provider:vendor-model-2025-04-14",   # virtual version
+            ("router", "champion"): "router-adapter:3",
+            ("kb-embedder", "champion"): "kb-embedder:4",
+            ("guard", "champion"): "guard-classifier:2"}
+
+def resolve(name, alias="champion"):
+    return REGISTRY[(name, alias)]
+
+def start_agent_service(roles, index_meta):
+    pins = {role: resolve(name) for role, name in roles.items()}   # once, at startup
+    if pins["embedder"] != index_meta["embedder"]:                 # memory or RAG index built with another embedder
+        raise EmbedderMismatch(f"index built with {index_meta['embedder']}, resolved {pins['embedder']}")
+    return pins
+
+pins = start_agent_service({"planner": "agent-llm", "router": "router", "embedder": "kb-embedder",
+                            "guard": "guard"}, {"name": "kb-main", "embedder": "kb-embedder:4"})
+print(pins)   # attach this dict to every agent run's root span, so any trajectory names its models
+```
+
 ### Refusing an embedder-index mismatch at startup
 Pure Python, runnable. The index build job records the embedder version; the query service compares it
 with the embedder version it resolved from the registry and refuses to start on a mismatch.
@@ -202,12 +246,17 @@ Illustrative orders of magnitude for one replica, not a benchmark. An 8B-paramet
 - **The alias move is the fast part.** Everything after it is a rollout.
 - **Keeping the previous champion cached** removes the slowest step until the new champion has survived its
   canary window.
+- **For an agent with mixed roles, rollback time is per role.** Rolling back the hosted planner takes
+  seconds; rolling back a self-hosted 8B tool-calling adapter takes the self-hosted rows above.
 
 ## Production patterns
 - **Alias URIs in serving config** — for every deployment. Reference `models:/<name>@champion` in config,
   resolve once at startup with `get_model_version_by_alias`, then load by the resolved version number.
   Monitor that every replica logs a resolved version and that versions across replicas agree outside a
   rollout.
+- **Model-role manifest per agent** — when one agent uses several models. Declare roles (planner, router,
+  embedder, guard) in the agent's config, resolve them together at startup, and attach the resolved set to
+  every run's root span. Monitor runs whose spans lack a resolved version for any role.
 - **Pinned and mirrored Hub revisions** — when serving open weights. Download with an explicit commit sha
   (`snapshot_download(repo_id, revision=sha)` in `huggingface_hub`) into your own artifact store and load
   from there. Monitor upstream repositories for force-pushes, gating or license changes.
@@ -217,9 +266,9 @@ Illustrative orders of magnitude for one replica, not a benchmark. An 8B-paramet
 - **Promotion only by the pipeline** — when audits matter. Restrict alias-set permission on `champion` to a
   CI service account that checks for eval evidence tags before moving it. Alert on any version promoted
   without an `eval_fingerprint` tag.
-- **Embedder version stamped on the index** — for any RAG system. The index build writes the embedder
-  version into the index metadata; the query service refuses to start on mismatch. Monitor mismatch
-  refusals and retrieval quality after embedder changes.
+- **Embedder version stamped on the index** — for any RAG system or agent memory store. The index build
+  writes the embedder version into the index metadata; the query service refuses to start on mismatch.
+  Monitor mismatch refusals and retrieval quality after embedder changes.
 
 ## Trade-offs
 - **Deterministic deploys vs storage.** Immutable versions plus aliases give deterministic deploys and
@@ -236,13 +285,14 @@ Illustrative orders of magnitude for one replica, not a benchmark. An 8B-paramet
   honest minimum.
 - **Atomic bundles vs attribution.** Registering model plus prompt as one versioned unit makes promotion
   atomic, but it multiplies versions whenever either half changes and blurs which half caused a metric
-  move.
+  move. With four agent model roles the blur gets worse.
 
 ## Pitfalls
 - **Pointing serving config at a branch or `latest` tag.** Instead of a version or alias. Symptom: two
   replicas returning different answers for the same input after a rolling restart.
 - **Registering weights without the tokenizer and serving config.** Symptom: a version that scores well in
-  the eval harness and produces garbage in production because the tokenizer revision differs.
+  the eval harness and produces garbage in production because the tokenizer revision differs. For tool
+  calling, a missing chat template shows up as malformed tool calls.
 - **Advancing the embedding model without rebuilding the index.** Symptom: retrieval quality collapsing
   after a "routine" model upgrade while every service reports healthy.
 - **Attaching eval results to the alias rather than the version.** Symptom: a rolled-back champion that
@@ -251,10 +301,12 @@ Illustrative orders of magnitude for one replica, not a benchmark. An 8B-paramet
   from the weights it actually loaded, because a promotion landed between the calls.
 - **Pinning only to a Hub repository name and mirroring nothing.** Symptom: a broken deploy the day the
   upstream author force-pushes, gates the repository or changes the license.
+- **Registering only the main LLM.** Leaving the router, guard and embedder in ad-hoc config. Symptom: an
+  agent regression traced weeks later to a guard-classifier swap nobody recorded.
 
 ## When to use
-- **Use when** a model is first retrained, quantized or swapped after launch, or two environments need
-  different models.
+- **Use when** a model is first retrained, quantized or swapped after launch, two environments need
+  different models, or an agent starts depending on a second model role.
 - **Before then** a pinned artifact URI with a hash in config is sufficient and honest.
 - **Include provider-hosted models** as virtual versions once an API model swap would be a user-visible
   change, which is nearly always.
@@ -294,6 +346,14 @@ revision, rebuild or roll back, and add the mismatch check so the failure become
 - **Both are needed** because deploys must be deterministic (versions) while what an environment runs must
   change without code edits (aliases).
 
+### Your agent uses a hosted planner, a self-hosted router and an embedder. How do you version them?
+- **Register each role.** The planner as a virtual version (provider snapshot id plus decoding config), the
+  router adapter and embedder as real versions with hashes and lineage.
+- **Resolve all roles once at startup** and attach the resolved set to every run's trace, so a trajectory
+  names every model it touched.
+- **Gate role changes on the agent eval,** not only the component's own metric, because a better router
+  can still lower end-to-end task success.
+
 ### Two replicas give different answers to the same input after a rolling restart. How do you debug it?
 - **Compare the resolved versions** each replica logged at startup; if they differ, config pointed at
   something floating such as `latest` or a Hub branch.
@@ -317,7 +377,7 @@ revision, rebuild or roll back, and add the mismatch check so the failure become
 - **Change:** keep the previous champion cached on nodes or a few old-version replicas warm through the
   canary window, and measure rollback end to end in drills.
 
-### How do you stop a fine-tuned adapter for one customer reaching another tenant?
+### How do you stop a fine-tuned adapter for one customer reaching another tenant's agent?
 - **Scope aliases per tenant** (for example `tenant-acme`) and keep the serving path for each tenant
   resolving only its own aliases.
 - **Record the training dataset version** in lineage so it is clear which customer's data an adapter used.
@@ -347,3 +407,24 @@ revision, rebuild or roll back, and add the mismatch check so the failure become
 - [ ] The model's parameter count
 > Lineage flows from the training run, which recorded the dataset version, code commit and params, into
 > the registered version; without that link the question has no verifiable answer.
+
+## Use cases & projects
+### Use cases
+- **Shipping a fine-tuned tool-calling adapter.** The adapter is registered from its training run, gated
+  on the agent eval, and promoted to `champion` by alias.
+- **Swapping the hosted planner model.** A virtual version records the new snapshot id, so the swap has
+  evidence and a one-call rollback.
+- **Keeping RAG and agent memory consistent.** The embedder version stamped on the index stops an embedder
+  upgrade from silently breaking retrieval.
+- **Per-tenant agent models.** Tenant aliases keep one customer's fine-tuned adapter out of every other
+  tenant's agent.
+
+### Mini project
+**Model-role manifest for a RAG agent (1-2 hours).**
+- **Goal:** an agent service that knows, and logs, exactly which model versions every run used.
+- **Steps:** run MLflow locally; register an embedder and a small classifier as versions and record a
+  hosted planner as a tagged virtual version; give each a `champion` alias; write a startup routine that
+  resolves all roles once, checks the embedder against the index metadata, and attaches the set to each
+  run's trace.
+- **Done when:** moving the embedder alias makes the service refuse to start, moving it back restores it,
+  and every trace from a test run lists all resolved versions.

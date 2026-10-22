@@ -448,3 +448,23 @@ extraction into two smaller calls.
 - [ ] Providers reject schemas that were not produced by Pydantic
 > One definition serves both roles. A hand-maintained copy will eventually allow something the
 > validator rejects or vice versa, producing failures that are hard to attribute.
+
+## Use cases & projects
+### Use cases
+- **Tool argument validation.** Each tool's arguments are a `BaseModel` with `extra="forbid"`, so an
+  invented field or wrong type becomes a structured error instead of a silent default.
+- **Structured outputs.** Extraction and classification agents return a model whose JSON Schema is sent
+  to the provider and whose validator checks the answer.
+- **Self-repair loops.** Validation errors go back to the model as a tool error, with a small retry
+  budget, so it fixes its own call on the next turn.
+- **Agent service boundaries.** FastAPI request and response models and settings for keys and limits use
+  the same classes, so the API and the agent agree on shapes.
+
+### Mini project
+**Build a validated tool with a bounded repair loop (1-2 hours).**
+- **Goal:** a tool whose arguments are validated by Pydantic, with errors returned to the model for repair.
+- **Steps:** define a `BaseModel` for the arguments with field descriptions and `extra="forbid"`; send
+  its JSON Schema as the tool definition; validate each call with `model_validate`; on failure return the
+  error list as the tool result; cap repairs at two; log every failure.
+- **Done when:** a test feeding three malformed calls (wrong type, extra field, missing field) shows each
+  repaired or stopped within the budget, and the logged errors name the exact field.

@@ -5,7 +5,8 @@ name: Circuit breakers
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - reliability/bulkheads
   - reliability/fault-tolerance
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-A circuit breaker counts a dependency's recent failures and, past a threshold, fails fast for a
-cooling-off period, then lets a few trial calls test recovery. It trades a few wrongly rejected requests
-for a caller that stays alive.
+A circuit breaker around each model and tool call counts recent failures and, past a threshold, fails fast
+for a cooling-off period, then probes recovery. Your agent gets an instant "tool unavailable" it can plan
+around instead of hanging.
+
+## For agent builders
+- **Why it matters for agents.** An agent turn chains several model and tool calls, so one slow dependency
+  stalls the whole turn and holds a worker. Without a breaker, a degraded provider or tool API turns into
+  thousands of stuck agent runs and a full outage of your service.
+- **Where it shows up in your stack.** Wrappers around your LLM client and every tool adapter, gateway
+  routing between providers, libraries such as `pybreaker` or Resilience4j, and mesh outlier detection.
+- **What you control.** One breaker per failure domain (provider × model × region, each tool endpoint), what
+  counts as a failure (timeouts and 5xx yes, your own 4xx no), the timeout inside the breaker, and what the
+  agent sees when it is open: a fallback model, or a structured tool error the model can reason about.
+- **What you can skip.** Hand-writing a production breaker. Use a library; understand the three states,
+  the minimum-calls guard and the retry ordering well enough to configure and debug it.
 
 ## Why it exists
 - **Failing dependencies drain callers.** Every caller that keeps trying a failing or timing-out
@@ -32,13 +45,14 @@ for a caller that stays alive.
   recovery harder.
 - **Cascading failure has a precise mechanism.** An agent service calls a provider with a 30-second timeout
   at 50 requests per second; the provider degrades to 100 percent timeouts. By Little's law the service
-  accumulates 50 × 30 = 1,500 stuck calls, far more than any sensible pool. Within a minute the pool is
-  exhausted, health checks fail, the orchestrator restarts pods, and a partial outage upstream becomes a
-  total outage here.
+  accumulates 50 × 30 = 1,500 stuck calls, far more than any sensible pool.
+- **Then it spreads.** Within a minute the pool is exhausted, health checks fail, the orchestrator restarts
+  pods, and a partial outage upstream becomes a total outage here.
 - **Timeouts and retries are not enough.** Timeouts bound a single call but not the aggregate: 1,500 stuck
   calls at 30 seconds each is the result *with* timeouts. Retries with backoff make the aggregate worse,
-  because they multiply attempts exactly when attempts are worthless. Waiting for the provider to fix
-  itself is not a strategy when your own service dies first.
+  because they multiply attempts exactly when attempts are worthless.
+- **Waiting is not a strategy.** Hoping the provider fixes itself fails when your own service dies first;
+  agent loops that retry inside each step make this worse, because every run multiplies the attempts.
 - **The breaker does two things at once.** It stops consuming the caller's resources immediately, because
   rejected calls return in microseconds rather than seconds, and it removes load from the dependency,
   which is struggling precisely because it is overloaded, so whatever is wrong there can clear.
@@ -47,30 +61,33 @@ for a caller that stays alive.
 
 ## How it works
 ### Three states
-A breaker is a small state machine wrapped around a call.
+A breaker is a small state machine wrapped around a model or tool call.
 
 1. **Closed.** Calls flow through. Every outcome is recorded in a sliding window, either the last N calls
    or the last T seconds. If the failure ratio in the window crosses a threshold *and* the window holds at
-   least a minimum number of calls, the breaker trips. The minimum exists because one failure out of one
-   call is a 100 percent failure rate and should not trip anything.
-2. **Open.** Every call is rejected immediately with a distinct error (`CircuitOpen`), no network
+   least a minimum number of calls, the breaker trips.
+2. **Why the minimum.** One failure out of one call is a 100 percent failure rate and should not trip
+   anything.
+3. **Open.** Every call is rejected immediately with a distinct error (`CircuitOpen`), no network
    involved, for a reset interval. This is where resources are freed and the dependency gets relief.
-3. **Half-open.** When the interval elapses, a limited number of trial calls are allowed. If they succeed
-   the breaker closes and the window is cleared; if any fails it reopens and the timer restarts. The limit
-   matters because if every waiting caller rushed in on the first tick of recovery, a partly healed
-   dependency would be knocked down again.
+4. **Half-open.** When the interval elapses, a limited number of trial calls are allowed. If they succeed
+   the breaker closes and the window is cleared; if any fails it reopens and the timer restarts.
+5. **Why the probe limit.** If every waiting caller rushed in on the first tick of recovery, a partly
+   healed dependency would be knocked down again.
 
 ### What counts as a failure
 | Outcome | Count it? | Because |
 |---|---|---|
 | Timeouts, connection errors, 5xx | yes | they describe the dependency's health |
 | 429 | judgment call | many teams count it (calling a rate-limited endpoint helps nobody); others route it to a separate rate-limit backoff so one noisy caller's quota exhaustion does not open the breaker for everyone sharing it |
-| 4xx client errors (malformed request, invalid schema) | no | they are your bug; counting them opens the breaker on a healthy provider |
+| 4xx client errors (malformed request, invalid schema, bad tool arguments from the model) | no | they are your bug or the model's; counting them opens the breaker on a healthy provider |
 | Slow success | yes, for LLM traffic | a provider answering correctly in 25 seconds is, for an interactive product, down |
 
 - **Either way, a 429's `Retry-After` should inform the wait.**
 - **Slow calls need explicit handling.** Libraries such as Resilience4j expose a slow-call-rate threshold
   for exactly this; if yours does not, a tight timeout turns slowness into a countable failure.
+- **Model-generated bad arguments are not tool failures.** When the model sends a malformed tool call,
+  return a validation error to the model; do not count it against the tool's breaker.
 
 ### Consecutive count or failure ratio
 - **Consecutive count** (the one in Nygard's and Fowler's original descriptions) trips after N consecutive
@@ -78,8 +95,8 @@ A breaker is a small state machine wrapped around a call.
   dependency failing 70 percent of the time may never accumulate N in a row.
 - **Ratio over a sliding window** handles partial failure, which is the common case for overloaded
   providers, at the cost of the minimum-calls guard and more state.
-- **Rule:** consecutive counts for low-traffic or all-or-nothing dependencies, ratios for anything with
-  steady traffic.
+- **Rule:** consecutive counts for low-traffic or all-or-nothing dependencies (many niche agent tools),
+  ratios for anything with steady traffic (your main model endpoint).
 
 ### Choosing thresholds
 | Setting | Starting point | Reasoning |
@@ -117,21 +134,26 @@ A breaker is a small state machine wrapped around a call.
   since it keeps the service and its health checks alive.
 - **The user experience is rescued by what you do with `CircuitOpen`:** route to a secondary provider or
   smaller model, return a cached or degraded answer, or enqueue the work for later and say so.
+- **For a tool, tell the model.** Return a structured tool result such as "search unavailable, retry later"
+  so the model can try another tool, answer from context, or tell the user, instead of looping on the
+  same call.
 - **The breaker is the detector; the fallback is the recovery.**
 
 ### Composition with retries, timeouts and bulkheads
 - **Retry outermost, then the breaker, then the timeout around the call.** This is a common arrangement and
   the one Resilience4j documents as its default. Each retry attempt is counted by the breaker, and once it
-  opens the remaining attempts short-circuit instantly, provided the retry policy treats `CircuitOpen` as
-  non-retryable.
+  opens the remaining attempts short-circuit instantly.
+- **That needs `CircuitOpen` to be non-retryable** in the retry policy, or the outer retries keep waiting.
 - **Retry inside the breaker is wrong:** each counted "call" takes several timeouts to register, delaying
   the trip while multiplying load.
 - **A bulkhead sits alongside:** a concurrency cap per dependency bounds how many callers can be stuck while
   the breaker is still accumulating its minimum calls.
+- **The agent loop is a retry layer too.** A model that re-issues a failed tool call is an outer retry, so
+  the breaker must sit below the loop and its rejection must reach the model as a final answer for now.
 
 ## Diagram
 The three states and what moves the breaker between them; note that half-open lets only a few probes
-through before deciding.
+through before deciding. In an agent, every model endpoint and tool endpoint has its own copy.
 
 ```mermaid
 stateDiagram-v2
@@ -220,6 +242,37 @@ async def answer(prompt):
 - **Emit a metric on every state transition;** a breaker that opens silently is an outage nobody is
   looking at.
 
+### Agent tool executor: one breaker per tool, open means a tool result
+The agent loop calls `run_tool` for each tool call the model emits. An open breaker becomes a structured
+result the model reads on its next step, so it can switch tools instead of retrying. It reuses the
+`CircuitBreaker` class above.
+
+```python
+breakers = {}                                              # one breaker per tool endpoint, created lazily
+
+def breaker_for(tool_name):
+    if tool_name not in breakers:
+        breakers[tool_name] = CircuitBreaker(window=50, min_calls=20, fail_ratio=0.5,
+                                             reset_after=30.0, probes=3)
+    return breakers[tool_name]
+
+async def run_tool(tool_name, args, tools, timeout=5.0):
+    fn = tools[tool_name]
+    try:
+        out = await breaker_for(tool_name).call(fn, **args, timeout=timeout)
+        return {"ok": True, "content": out}
+    except CircuitOpen:
+        return {"ok": False, "error": "tool_unavailable",     # the model sees this, not a stack trace
+                "message": f"{tool_name} is temporarily unavailable; use another tool or answer without it"}
+    except (asyncio.TimeoutError, ConnectionError, UpstreamError):
+        return {"ok": False, "error": "tool_failed", "message": f"{tool_name} failed; you may retry once"}
+```
+
+- **The model gets a decision, not a hang:** a timeout of 5 seconds inside the breaker bounds each step, and
+  the open state answers in microseconds.
+- **Bad arguments never reach the breaker:** validate the model's tool arguments against the schema before
+  `run_tool`, and return a validation error, so a confused model cannot open a healthy tool's breaker.
+
 ### Worked scenario: one minute of a provider outage
 Illustrative timeline for the service above (50 requests per second, 20-second timeout, minimum 20 calls,
 50 percent ratio) when the provider starts timing out every call at t = 0.
@@ -232,6 +285,16 @@ Illustrative timeline for the service above (50 requests per second, 20-second t
 | ~50 s | pods restarted, outage spreads to routes that never used the provider | half-open: only 3 probes go out; they time out ~20 s later and the breaker reopens |
 
 The breaker does not help with the ~1,000 calls started before it trips; a bulkhead caps those at its size.
+
+### Worked scenario: a search tool goes down mid-run
+Illustrative: a research agent averages 6 search calls per run, 200 runs in flight, search starts timing out
+at 5 seconds per call.
+
+| | Without a tool breaker | With a per-tool breaker |
+|---|---|---|
+| Cost per run | 6 × 5 s = 30 s of waiting, then a model that retries search | ~5 s for the first failures, then instant `tool_unavailable` |
+| Workers held | all 200 runs stuck on search | runs continue, answering from context or a second tool |
+| Model behavior | re-issues search, burning steps and tokens | reads the error and changes plan |
 
 ### Production config: the same policy in Resilience4j
 For JVM services the library expresses these settings directly (Spring Boot property names).
@@ -263,6 +326,9 @@ resilience4j:
 - **Make `CircuitOpen` non-retryable.** In Resilience4j add `CallNotPermittedException` to the retry
   policy's ignored exceptions; in your own code, exclude `CircuitOpen` from the retry predicate. Monitor that
   latency drops when a breaker opens; if it does not, the retry layer is still waiting.
+- **Surface open breakers to the model.** Return a structured `tool_unavailable` result, and optionally drop
+  that tool from the tool list for new runs while its breaker is open. Monitor steps wasted on repeated
+  calls to an unavailable tool per run.
 - **Mesh-level outlier detection for per-host faults.** Istio's DestinationRule `outlierDetection`
   (`consecutive5xxErrors`, `interval`, `baseEjectionTime`) ejects individual bad hosts from the pool, which
   complements an application breaker that decides when the whole dependency is down. Monitor ejected-host
@@ -284,6 +350,9 @@ resilience4j:
 - **Local vs shared state.** Local per-process breakers need no coordination, but every replica discovers
   the outage independently and small replicas may never accumulate enough calls; shared state fixes that at
   the cost of a network hop and a new dependency on the store.
+- **Telling the model vs hiding the failure.** A visible `tool_unavailable` lets the agent adapt but can
+  change answers in ways your evals never saw; a silent fallback keeps behavior stable but may serve worse
+  results. Eval the agent with each breaker forced open.
 
 ## Pitfalls
 - **Counting 4xx client errors as failures.** Symptom: the breaker opens after you ship a bad prompt
@@ -301,6 +370,8 @@ resilience4j:
   rejecting nearly all traffic, while direct calls to the dependency succeed.
 - **Letting every replica probe at the same instant.** Symptom: a dependency that recovers for ten seconds
   and collapses again on each reset tick; add jitter to the reset interval.
+- **Raising `CircuitOpen` into the agent loop as an exception.** Symptom: whole runs fail or restart when
+  one optional tool is down. Fix: convert it into a tool result the model can act on.
 
 ## When to use
 - **Use when** a synchronous call goes to a dependency that can fail slowly and whose failure you can do
@@ -345,6 +416,14 @@ utilization should stay flat.
   restart pods.
 - **A breaker fixes the aggregate** by rejecting in microseconds once the failure ratio is clear, and a
   bulkhead caps occupancy before that.
+
+### A tool your agent depends on goes down. What should the agent see, and why?
+- **A structured tool result, not an exception:** something like `tool_unavailable` with a short message,
+  returned by the tool executor when the breaker is open.
+- **Because the model is a planner:** it can switch to another tool, answer from context, or tell the user,
+  instead of re-issuing the same call and burning steps.
+- **Keep the breaker below the loop** and validate arguments first, so a confused model's bad calls do not
+  open a healthy tool's breaker.
 
 ### Consecutive-failure breaker or failure-ratio breaker: which would you pick and why?
 - **Consecutive count** is simple and reacts fast to hard, all-or-nothing outages, and suits low-traffic
@@ -400,3 +479,24 @@ utilization should stay flat.
 > counted, and until it trips every request keeps sending three attempts to the dependency. With retry
 > outside and `CircuitOpen` non-retryable, each attempt is counted, the trip comes sooner, and the
 > remaining attempts short-circuit instead of reaching the network.
+
+## Use cases & projects
+### Use cases
+- **Tool-calling agents on flaky internal APIs.** A breaker per CRM, ticketing or search endpoint keeps the
+  agent responsive and lets it say "tool unavailable" instead of hanging.
+- **Multi-provider LLM gateways.** Breakers keyed by provider × model × region route agent traffic to a
+  secondary model when one deployment degrades.
+- **RAG pipelines.** A breaker on the vector store or reranker lets the agent fall back to keyword search or
+  answer with a caveat during an outage.
+- **Long-running background agents.** An open breaker parks work in a queue for later rather than letting
+  hundreds of runs wait on a dead dependency.
+
+### Mini project
+**Make an agent survive a dead tool (1-2 hours).**
+- **Goal:** show that a per-tool breaker turns a hung agent into one that changes plan.
+- **Steps:** build a small agent with two tools (primary search and a fallback lookup); wrap each in the
+  breaker from this lesson with a 5-second timeout; inject 100 percent timeouts into primary search; run 50
+  tasks with and without the breaker and log steps, wall time and how often the model re-called the dead
+  tool.
+- **Done when:** you have a table comparing both runs, the breaker opens after its minimum calls, later runs
+  get `tool_unavailable` instantly and switch tools, and the breaker closes after you heal the tool.

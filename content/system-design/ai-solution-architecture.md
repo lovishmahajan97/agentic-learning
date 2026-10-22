@@ -406,3 +406,25 @@ and choose the cheapest model that clears the eval bar. Record each decision as 
 > Improvement requires seeing failures, turning them into labelled examples, and measuring each change
 > against them before release. A bigger model or more data may raise quality once, but without the loop
 > nobody can tell whether the next change helped or hurt.
+
+## Use cases & projects
+### Use cases
+- **Turning an agent prototype into a product.** The layer map shows which pieces the demo skipped
+  (gateway, control layer, traces, eval gate) before the first customer finds them.
+- **Design reviews for a new agent feature.** A C4 sketch, an NFR table with step and token budgets and
+  a threat model give reviewers one page to challenge instead of a prompt file.
+- **Moving deterministic work out of the loop.** Lookups, arithmetic and routing move into code or
+  tools, which shortens transcripts and makes failures reproducible.
+- **Preparing for a model or provider change.** A gateway seam plus an eval gate turns a deprecation
+  into a measured swap rather than an outage on step 3 of 8.
+
+### Mini project
+**Layer a toy agent (2-3 hours).**
+- **Goal:** refactor a single-function agent into orchestration, model gateway, control layer and
+  observability layers, and prove each layer is separately testable.
+- **Steps:** start from a loop with two tools and one hard-coded provider call; put the model call
+  behind a small gateway interface; validate every tool argument against a schema and add an approval
+  gate on the one write tool; emit a span per step with tokens and latency; write 10 golden tasks.
+- **Done when:** you can swap the model by changing one config value, the 10 tasks run as a test with a
+  pass rate, a malformed tool argument is rejected before execution, and a one-page C4 sketch plus an
+  NFR table sit in the repo.

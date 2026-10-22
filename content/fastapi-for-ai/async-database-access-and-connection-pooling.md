@@ -427,3 +427,24 @@ session-scoped features such as `SET` and advisory locks that transaction poolin
 > Transaction mode hands out a different server connection per transaction, so a statement prepared on
 > one may not exist on the next. Disable the driver and dialect statement caches, or use PgBouncer's
 > protocol-level prepared statement support.
+
+## Use cases & projects
+### Use cases
+- **Agent routes that read history and write steps.** Short sessions around each read or write keep
+  connections free while the model call is in flight.
+- **DB-backed tools.** SQL lookups, pgvector retrieval and memory stores each take their own short
+  session, so a slow tool does not pin a connection for the whole run.
+- **Scaling agent replicas.** The fleet-wide budget of processes times pool size tells you when to add
+  PgBouncer before Postgres refuses connections.
+- **Worker checkpoints.** Agent jobs writing per-step checkpoints share the same connection budget as the
+  API and must be counted in it.
+
+### Mini project
+**Pool exhaustion and the fix (1-2 hours).**
+- **Goal:** reproduce QueuePool timeouts caused by holding a session across a model call, then fix them.
+- **Steps:** build a FastAPI agent route on an `AsyncEngine` with a small pool; version A opens one
+  session, reads history, awaits a fake 2-second model call, then writes the step; version B releases
+  the session before the model call and opens a new one to write; load both with the same concurrency.
+- **Done when:** you have a table of throughput, p95 latency and pool timeouts for both versions, with
+  version B showing no timeouts at a concurrency that breaks version A, and a one-line budget check for
+  your planned replica count.

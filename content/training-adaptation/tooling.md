@@ -459,3 +459,25 @@ adapter or merge it into the bf16 base.
 - [ ] Loss that never decreases from its initial value
 > Averaging the loss over the easy-to-predict user turns pulls the number down, and the model learns to
 > continue conversations in the user's voice because that is what it was trained to predict.
+
+## Use cases & projects
+### Use cases
+- **A small model for one agent step.** TRL or Unsloth LoRA on exported traces gives a cheap model for a
+  router, classifier or extraction step that a large model handled well but expensively.
+- **Reliable tool calling in an open-weights agent.** Training on rendered tool-call traces with the same
+  chat template you serve with fixes calls that arrive as plain text or malformed JSON.
+- **Reproducible fine-tunes across a team.** An Axolotl YAML checked in beside the agent code makes the
+  run reviewable and repeatable when the base model or the trace set changes.
+- **Preference tuning from agent feedback.** Thumbs-up and thumbs-down pairs from production become DPO
+  data in TRL, nudging tone or tool choice without a full RL setup.
+
+### Mini project
+**LoRA a small model on your agent's tool-call traces (2-3 hours).**
+- **Goal:** fine-tune a small instruct model so it emits your agent's tool calls in a format your serving
+  stack parses, and prove it with a held-out agent eval.
+- **Steps:** export 200-500 successful traces with their tool schemas; convert them to chat rows and run
+  the tool-call render check from Examples; print which tokens the loss sees; train a LoRA with TRL
+  `SFTTrainer` (or Unsloth on one GPU); serve base and tuned models behind the same agent loop and run 50
+  held-out tasks.
+- **Done when:** you have parse-success and task-success rates for base versus tuned model, the loss mask
+  shows only assistant turns, and the adapter loads and calls tools correctly in the serving engine.

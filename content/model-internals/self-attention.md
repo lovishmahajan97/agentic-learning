@@ -5,7 +5,8 @@ name: Self-attention
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: background
 related:
   - model-internals/attention-mechanism
   - model-internals/multi-head-attention
@@ -21,13 +22,24 @@ sources:
 ---
 
 ## TL;DR
-Self-attention draws queries, keys and values from one sequence, so each token builds its representation
-from the tokens it may see. It is the only cross-position operation, one matmul over all positions, and
-O(n²): the root of context limits and FlashAttention.
+Self-attention lets every token in your agent's transcript read every earlier token in one O(n²) step.
+That is why a model can use a tool result from ten steps ago, and why long agent runs cost more per step.
+
+## For agent builders
+- **Why it matters for agents.** The transcript is one causal sequence: system prompt, tool schemas,
+  calls and results. Self-attention is the only way information moves between those positions, so a
+  fact helps the agent only if it sits in the window, and every extra token is paid for on later steps.
+- **Where it shows up in your stack.** Context-length limits and input-token pricing on hosted APIs,
+  time-to-first-token on long prompts (prefill), `padding_side` and `attention_mask` when you batch
+  agent sessions on a self-hosted model, and sliding-window or streaming options in serving engines.
+- **What you control.** How fast the transcript grows (summarise or drop stale tool output), whether
+  long inputs go through retrieval instead, and correct left padding when batching generation.
+- **What you can skip.** Induction-head interpretability and the exact FLOP derivation. Keep the n/(2d)
+  crossover, the prefill/decode split and the causal-mask rule.
 
 ## Why it exists
 - **Meaning depends on neighbours.** "bank" next to "river" and "bank" next to "account" need different
-  representations.
+  representations; a tool result means something only next to the call that produced it.
 - **Older layers pay for distance.** A recurrent network reads left to right and accumulates a state,
   which is sequential and leaks information over distance. A convolution sees a fixed window and needs
   many stacked layers before distant tokens interact.
@@ -72,7 +84,8 @@ Why the mask is built this way:
 - **Causal at all** because training predicts every next token in one pass with teacher forcing. If
   position *i* could see *i+1*, the task would be trivial in training and impossible at inference, when
   *i+1* does not exist yet.
-- **Encoders drop it.** BERT-style models let every token see every other.
+- **Encoders drop it.** BERT-style models let every token see every other; the embedding and reranker
+  models in your RAG step are usually of this kind.
 - **Padding uses the same mechanism:** −∞ on padded key positions.
 
 ### Shapes and FLOPs for one layer
@@ -100,17 +113,19 @@ Counting a matmul of `[m, k]·[k, p]` as 2·m·k·p FLOPs:
 - **But production models add an explicit scheme** nearly always (a few recent families drop it in some
   layers).
 
-### What happens at inference
-- **Earlier K and V never change** under the causal mask, so they are cached.
+### What happens at inference (each agent step)
+- **Earlier K and V never change** under the causal mask, so they are cached, and an append-only
+  transcript can reuse them across agent steps.
 - **Decode has one query row.** Work per step is `[1, d]·[d, n]` per head, O(n·d) rather than O(n²·d),
   bound by reading the cache from memory rather than by arithmetic.
 - **Prefill vs decode.** Prefill (the whole prompt at once) is the compute-bound n² case; decode is the
-  bandwidth-bound linear case. That split is the backbone of serving economics.
+  bandwidth-bound linear case. That split is the backbone of serving economics, and a large new tool
+  result is a fresh prefill.
 
 ### Patterns that emerge
 - **Recurring head types:** previous-token heads, heads that attend to delimiters, and induction heads
   that find an earlier occurrence of the current token and copy what followed it, a mechanism behind
-  in-context learning.
+  in-context learning (and why few-shot tool-call examples in the prompt work).
 - **Attention sinks.** Many heads dump most of their weight on the first token: softmax must put its mass
   somewhere, and a constant, content-free position is a convenient no-op.
 - **Why it matters:** evicting the first tokens from a sliding-window cache breaks those heads, which is
@@ -118,7 +133,8 @@ Counting a matmul of `[m, k]·[k, p]` as 2·m·k·p FLOPs:
 
 ## Diagram
 One layer of causal self-attention: the same input X feeds all three projections, the mask hides the
-future before softmax, and the output projection writes back into the residual stream.
+future before softmax, and the output projection writes back into the residual stream. In an agent, X
+is the whole transcript so far.
 
 ```mermaid
 flowchart TD
@@ -182,9 +198,24 @@ for n in (2_048, 8_192, 32_768, 131_072):
 # n= 131072: core/proj = 16.00   scores   1099.5 GB per layer
 ```
 
+### Agent scenario: a research agent crosses the crossover
+A research agent on a d = 4096 model starts at 2k tokens and appends a search result of roughly 3k tokens
+each step (illustrative sizes). The ratio column is the n/(2d) formula above.
+
+| Step | Context *n* | Core ÷ projections | What dominates the layer |
+|---|---|---|---|
+| 1 | ~2,048 | 0.25 | linear layers; attention is a minor cost |
+| 3 | ~8,192 | 1.00 | equal halves; MLP still makes linear work dominant |
+| 11 | ~32,768 | 4.00 | the quadratic attention core |
+| with pasted documents | ~131,072 | 16.00 | attention by far; prefill time balloons |
+
+- **Reading the table:** the agent does not slow down because it takes more steps, but because each step
+  re-reads a longer transcript.
+- **Fix:** keep only summaries of used search results, so the context stays near the left rows.
+
 ### Worked incident: short prompts in a batch returned junk
-A team batched prompts of different lengths for a decoder-only model and saw only the longest prompt
-answer correctly.
+A team batched agent prompts of different lengths for a self-hosted decoder-only model and saw only the
+longest prompt answer correctly.
 
 | Step | Finding |
 |---|---|
@@ -202,25 +233,31 @@ out = model.generate(**batch, max_new_tokens=64)   # passes attention_mask with 
 ```
 
 ## Production patterns
+- **Compact the transcript as the agent runs.** Replace used tool output with short summaries and cap
+  raw result size, because every kept token is re-read on every later step. Track context tokens per
+  step and task success before and after compaction.
+- **Append, do not edit, history.** Earlier K and V stay valid only if the prefix is unchanged, so append
+  new turns and compact at deliberate checkpoints. Monitor cached versus uncached input tokens per step.
 - **Left-pad for decoder-only generation.** Set `tokenizer.padding_side = "left"` and always pass the
   `attention_mask`. Add a regression test that one prompt gives identical greedy output alone and in a
   mixed-length batch.
-- **Profile attention share at real lengths before optimizing.** Use the PyTorch profiler on traffic
+- **Profile attention share at real agent lengths before optimizing.** Use the PyTorch profiler on traffic
   shaped like production; at short context the linear layers dominate and attention kernels will not
   help. Track the attention share of step time per context bucket.
 - **Never materialize the n×n scores.** Use `F.scaled_dot_product_attention` or an engine with fused
   kernels so memory stays linear in n. Monitor peak memory against context length; quadratic growth
   means a naive path is still in use.
-- **Keep sink tokens when windowing the cache.** If you evict old positions for streaming, retain the
-  first few tokens plus a recent window, as attention-sink schemes do. Monitor quality on long sessions
-  versus full attention.
-- **Guard against fully masked rows.** Make sure every query row has at least one visible key, or replace
-  NaN rows explicitly. Alert on NaN losses or outputs and log the batch that produced them.
+- **Keep sink tokens when windowing the cache.** If you evict old positions for long-running sessions,
+  retain the first few tokens plus a recent window, as attention-sink schemes do. Monitor quality on long
+  sessions versus full attention, and guard against fully masked rows that return NaN.
 
 ## Trade-offs
 - **Short paths and parallelism vs O(n²).** O(1) path length and full parallelism across positions, paid
   for with O(n²) compute and memory. The balance flips against dense attention when n is many times d,
   when sliding windows, sparse patterns or retrieval take over part of the job.
+- **Keep everything in context vs compact.** A full transcript lets the agent recall any earlier detail
+  exactly; compaction cuts cost and latency but can drop the one detail a later step needed. Compact
+  outputs you can re-fetch; keep decisions and user constraints verbatim.
 - **Content routing vs no locality prior.** Routing adapts to any structure in the data but brings no
   built-in locality bias, so small-data regimes favour architectures with stronger priors and large-data
   regimes favour attention.
@@ -231,6 +268,9 @@ out = model.generate(**batch, max_new_tokens=64)   # passes attention_mask with 
   into a fixed state and give up some of that precise recall.
 
 ## Pitfalls
+- **Letting tool output grow the transcript unchecked.** Symptom: each agent step is slower than the last
+  and time-to-first-token climbs. Fix: cap and summarise tool results, and move large documents behind
+  retrieval.
 - **Masking with zeros after softmax, or masking the wrong triangle.** Tokens see the future. Symptom: a
   training loss that falls suspiciously close to zero, followed by nonsense at inference. Fix: mask logits
   with −∞ where j > i before softmax, and assert the weights above the diagonal are zero.
@@ -246,10 +286,12 @@ out = model.generate(**batch, max_new_tokens=64)   # passes attention_mask with 
 
 ## When to use
 Self-attention is not optional in a transformer, so the real decisions are around it.
-- **Decide:** how long a context you can afford, encoder (bidirectional) or decoder (causal) for a task,
-  how to pad and mask batches correctly, and which kernel serves it.
+- **Decide:** how long an agent transcript you can afford, encoder (bidirectional) or decoder (causal)
+  for a task such as reranking versus planning, how to pad and mask batches correctly, and which kernel
+  serves it.
 - **Measure:** the share of attention time in your profiles at your actual sequence lengths before
   optimizing anything; at short context the linear layers dominate and attention kernels will not help.
+- **Avoid:** pasting whole documents into every step when a retrieval step can supply the relevant slice.
 - **Interviews:** derive the O(n²·d) cost and the n/(2d) crossover, explain why the mask uses −∞ before
   softmax, state why positions must be added explicitly, and show how the KV cache and the
   prefill/decode split follow from causality.
@@ -280,11 +322,19 @@ materializing them) and possibly sparse or windowed attention are what determine
 - **Self-match dominates.** For vectors of similar norm each token scores itself highest, so the layer
   would mostly copy its input; separate projections make the relation learned and asymmetric.
 
-### Your training loss drops almost to zero but generation is nonsense. What is the likely bug?
-- **A leaking causal mask.** Zeroing weights after softmax or masking the wrong triangle lets position i
-  see i+1, making next-token prediction trivial in training.
-- **Confirm it** by checking that the attention weights above the diagonal are exactly zero, and that the
-  mask is −∞ on logits before softmax.
+### Each step of your agent gets slower even though the step count is modest. What is happening and what do you do?
+- **The transcript grows**, and every step re-reads all of it: prefill cost rises with n and, past the
+  n/(2d) crossover, the quadratic attention core dominates.
+- **Check** context tokens per step and whether the prefix is stable enough for cached K and V to be
+  reused.
+- **Fix** by summarising used tool output, capping raw results and retrieving long documents instead of
+  pasting them.
+
+### You batch many agent sessions on a self-hosted decoder model and short prompts return junk. Why?
+- **Right padding.** Pad tokens sit between the prompt and the generated tokens, so short prompts
+  continue from padding.
+- **Fix** with `padding_side = "left"` plus the attention mask, and a regression test that alone and
+  batched greedy outputs match.
 
 ### Why is decode bandwidth-bound while prefill is compute-bound?
 - **Prefill** processes the whole prompt: n queries against n keys, large matrix multiplications, the
@@ -295,7 +345,8 @@ materializing them) and possibly sparse or windowed attention are what determine
 ### When would you choose a linear-attention or state-space model over softmax self-attention?
 - **When context is very long and cost dominates**, because they run in O(n) instead of O(n²).
 - **But not when exact recall matters.** They compress history into a fixed state and give up some of the
-  precise copying and induction that softmax attention does well.
+  precise copying and induction that softmax attention does well, which agents rely on to reuse exact
+  ids and values from earlier tool results.
 
 ### At d = 4096 and 32 heads, how big is the score matrix at 8k context, and why does it matter?
 - **Arithmetic:** 32 × 8192² × 2 bytes ≈ 4.3 GB per layer per sequence in fp16, if materialized.
@@ -327,3 +378,23 @@ materializing them) and possibly sparse or windowed attention are what determine
 > Self-attention costs O(n²·d) per layer and recurrence O(n·d²), so attention is cheaper when n < d.
 > At long contexts recurrence is cheaper in FLOPs, and attention is kept for its path length and
 > parallelism.
+
+## Use cases & projects
+### Use cases
+- **Long-running research and coding agents.** Transcript growth, not step count, sets per-step latency,
+  so compaction policy is designed from the n/(2d) crossover.
+- **Self-hosted batch serving of agent sessions.** Correct left padding and masks keep outputs identical
+  whether a session runs alone or in a batch.
+- **Choosing encoder or decoder per step.** Bidirectional encoders handle embedding and reranking; causal
+  decoders handle planning and tool calls.
+- **Streaming or very long sessions.** Sliding-window caches keep attention-sink tokens so quality holds
+  as old turns are evicted.
+
+### Mini project
+**Profile transcript growth in a tool-calling loop (1-2 hours).**
+- **Goal:** show how context length per step drives latency, and how much compaction recovers.
+- **Steps:** build a 10-step agent with a fake search tool that returns about 3k tokens; log input tokens
+  and time-to-first-token per step; rerun with a compaction rule that keeps a 200-token summary of each
+  used result; compute n/(2d) per step for the model's hidden size.
+- **Done when:** you have a two-run table of context tokens, latency and ratio per step, and a note
+  saying which step crossed the crossover and how compaction changed it.

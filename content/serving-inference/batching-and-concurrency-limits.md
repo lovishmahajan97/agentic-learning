@@ -432,3 +432,24 @@ replica is 40 concurrent requests. How many replicas do you need, roughly?
 > Concurrency = arrival rate × residence time = 20 × 6 = 120 in flight. At a knee of 40 per replica
 > that is three replicas before headroom. Confusing requests per second with concurrent requests is the
 > classic error.
+
+## Use cases & projects
+### Use cases
+- **Planner-and-subagent fan-out.** A per-run cap on in-flight LLM calls stops one planner that spawns
+  many subagents from pushing the shared engine past its knee.
+- **Multi-tenant agent products.** Gateway caps per tenant keep one customer's long-context agents from
+  stalling everyone else's decode.
+- **Hosted-API agents.** A client-side semaphore sized below the provider rate limit turns 429 storms into
+  a short, predictable queue.
+- **Capacity planning.** Little's law turns expected agent runs per minute, calls per run and seconds per
+  call into a replica count.
+
+### Mini project
+**Find the knee for your agent's call pattern (2-3 hours).**
+- **Goal:** measure where adding concurrent agent calls stops raising goodput on one endpoint.
+- **Steps:** pick a self-hosted or hosted model; replay a fixed set of agent-shaped calls (system prompt,
+  tool schemas, a few prior steps) at concurrency 1, 2, 4, 8, 16, 32 and 64; record TTFT, TPOT, tokens
+  per second and the share meeting a latency SLO you choose; then wrap your agent client in an
+  `asyncio.Semaphore` set at the knee.
+- **Done when:** you have a table of concurrency versus throughput and goodput, a marked knee, and a run of
+  your agent with the semaphore showing stable step latency under a burst.

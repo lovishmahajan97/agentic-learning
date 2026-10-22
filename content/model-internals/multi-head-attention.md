@@ -5,7 +5,8 @@ name: Multi-head attention
 kind: concept
 difficulty: core
 est_minutes: 12
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - model-internals/self-attention
   - model-internals/attention-mechanism
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-Multi-head attention runs *h* attentions in parallel, each in a d_model / h subspace, and concatenates
-them, so a position can look in *h* places for *h* reasons. Parameters and FLOPs match one wide head;
-attention-probability memory and the sharding unit scale with *h*.
+Multi-head attention runs *h* attentions in parallel, each in a d_model / h subspace. For agent builders
+the head counts in a model's config decide KV cache per token, how many agent sessions fit on a GPU and
+how the model shards.
+
+## For agent builders
+- **Why it matters for agents.** When you self-host the model behind your agents, `num_attention_heads`,
+  `num_key_value_heads` and `head_dim` set the KV cache each long agent transcript holds, and therefore
+  how many concurrent sessions one GPU serves.
+- **Where it shows up in your stack.** The model's `config.json`, the tensor-parallel setting of your
+  serving engine, and KV-cache utilization dashboards. On hosted APIs it is hidden, but it is part of why
+  long-context calls cost what they do.
+- **What you control.** Which model you pick (full MHA or GQA layout), how many GPUs you shard it across
+  (a divisor of the head count), and the context cap per agent route.
+- **What you can skip.** What individual heads learn and the low-rank analysis, unless you train models.
+  Keep "parameters and FLOPs do not change with *h*, KV cache follows KV heads".
 
 ## Why it exists
 - **One softmax, one weighting.** A single head gives each query position one probability distribution
@@ -88,7 +101,7 @@ What *does* change with *h*:
   Bhojanapalli et al. analyse), so more, thinner heads means each expresses less intricate patterns.
 - **KV cache, only via KV heads.** Per token per layer it is 2·(number of KV heads)·d_k, which equals 2d
   for full multi-head attention and shrinks only when KV heads are shared, the subject of grouped-query
-  attention.
+  attention. This is the number that caps concurrent agent sessions.
 
 ### What heads learn
 - **Specialists.** Previous-token heads, heads that track syntactic roles, heads that attend to
@@ -183,6 +196,20 @@ print("6 GPUs?", 32 % 6 == 0)   # False: 32 heads do not divide across 6 GPUs
 # Llama-3-8B (GQA): KV 0.125 MiB/token, query heads split evenly on TP=[1, 2, 4, 8]
 ```
 
+### Agent scenario: how many agent sessions fit on one GPU
+A support agent's sessions average 16,384 tokens of transcript (system prompt, tool schemas, results).
+Assume about 40 GiB of GPU memory is left for the KV cache after weights and headroom (illustrative).
+Per-token figures come from the config code above.
+
+| Model | KV per token | KV per 16k session | Sessions in 40 GiB |
+|---|---|---|---|
+| Llama-2-7B (full MHA, 32 KV heads) | 0.5 MiB | 8 GiB | about 5 |
+| Llama-3-8B (GQA, 8 KV heads) | 0.125 MiB | 2 GiB | about 20 |
+
+- **Same query heads, same head_dim:** the four-fold difference comes only from KV heads.
+- **Operational consequence:** the agent platform's concurrency limit, and its cost per session, is set
+  by `num_key_value_heads` and transcript length, not by parameter count.
+
 ### Worked incident: throughput collapsed after a head-dimension change
 A team trained a small model with a custom head dimension above 256 to "give each head more room".
 
@@ -194,15 +221,18 @@ A team trained a small model with a custom head dimension above 256 to "give eac
 | Fix | return to d_k = 128 and raise *h* instead; parameters and FLOPs are unchanged |
 
 ## Production patterns
-- **Pick head_dim from the kernels.** Keep d_k at 64 or 128 and derive *h*, so FlashAttention-class
-  kernels apply. In a test, restrict PyTorch's backend with `torch.nn.attention.sdpa_kernel` to the flash
-  backend so an unsupported shape fails loudly. Monitor attention memory against context length.
+- **Size agent concurrency from KV heads, not query heads.** Read `num_key_value_heads` and `head_dim`
+  from the config; full MHA has as many KV heads as query heads. Multiply by your p95 transcript length
+  to set the engine's maximum concurrent sequences. Monitor KV-cache utilization and preemptions.
+- **Prefer GQA models for long agent transcripts.** When two candidate models score similarly on your
+  agent evals, the one with fewer KV heads serves several times more sessions per GPU. Compare sessions
+  per GPU at your real context length.
 - **Choose the tensor-parallel degree from head counts.** The number of query heads should divide by the
   TP degree; KV heads either divide too or the engine must replicate them. Check this before buying or
   allocating a node, and monitor per-GPU memory balance.
-- **Size the cache from KV heads, not query heads.** Read `num_key_value_heads` and `head_dim` from the
-  config; full MHA has as many KV heads as query heads. Monitor KV-cache utilization in the serving
-  engine.
+- **Pick head_dim from the kernels when fine-tuning or training.** Keep d_k at 64 or 128 and derive *h*,
+  so FlashAttention-class kernels apply. In a test, restrict PyTorch's backend with
+  `torch.nn.attention.sdpa_kernel` to the flash backend so an unsupported shape fails loudly.
 - **Unit-test the reshape.** Compare one head's output with a single-head computation on that slice of
   the projections, and compare the whole module with `F.scaled_dot_product_attention`. Run it in CI on
   every attention change.
@@ -212,6 +242,9 @@ A team trained a small model with a custom head dimension above 256 to "give eac
   score matrix has rank at most d_k. Past a point extra heads buy diversity at the price of per-head
   expressiveness (the 2017 ablation saw quality fall at 32 heads of width 16); most current models settle
   at d_k = 128.
+- **Full MHA vs shared KV heads for agents.** Full MHA keeps every head's own keys and values, at four or
+  more times the cache of a GQA layout; for long agent transcripts that cache, not quality, usually
+  decides which model you can afford to serve.
 - **Same FLOPs vs bigger attention tensor.** Same FLOPs and parameters as a single wide head, yet the
   attention-probability tensor is *h* times larger. Harmless with fused kernels, a memory wall without.
 - **Easy sharding vs layout constraints.** Heads shard across GPUs with no communication inside
@@ -221,6 +254,9 @@ A team trained a small model with a custom head dimension above 256 to "give eac
   but mean some attention compute at inference is doing little useful work.
 
 ## Pitfalls
+- **Sizing agent capacity from parameter count.** Two 7-8B models can differ four-fold in KV cache per
+  token. Symptom: preemptions and queueing once transcripts grow. Fix: compute capacity from KV heads,
+  head_dim and p95 context length.
 - **Reshaping without the transpose.** Going from `[B, n, h·d_k]` straight to `[B, h, n, d_k]` makes heads
   mix positions instead of channels. Symptom: a model that trains without error but learns slowly and
   produces incoherent output.
@@ -234,9 +270,12 @@ A team trained a small model with a custom head dimension above 256 to "give eac
   the change.
 
 ## When to use
-Multi-head attention is a given inside any transformer; what you decide is the split.
+Multi-head attention is a given inside any transformer; what you decide is the split, or which model's
+split you serve.
 - **Reading a config:** `num_attention_heads`, `num_key_value_heads` and `head_dim` tell you the KV cache
   per token, the shard granularity for tensor parallelism and whether fast kernels apply.
+- **Choosing a self-hosted agent model:** compare sessions per GPU at your transcript length alongside
+  eval scores.
 - **Designing or fine-tuning a small model:** keep d_k at a kernel-friendly size and choose *h* from that
   rather than the other way round.
 - **Debugging from scratch:** test with h = 1 first, then confirm the reshape by checking that the
@@ -270,6 +309,14 @@ only shrinks if you reduce KV heads through GQA, which the question did not do.
 - **h heads give h independent weightings** in different subspaces at the same parameter and FLOP cost,
   because h·d_k = d_model.
 
+### You must host an agent platform with 16k-token sessions on your own GPUs. How do head counts guide model choice?
+- **Compute KV per token** as 2 × layers × KV heads × head_dim × bytes; full MHA at Llama-2-7B scale is
+  0.5 MiB per token, a GQA model like Llama-3-8B is 0.125 MiB.
+- **Multiply by session length** (8 GiB versus 2 GiB at 16k) and divide free GPU memory to get sessions
+  per GPU.
+- **Decide with evals:** if quality is comparable on your agent tasks, the GQA model serves about four
+  times the sessions.
+
 ### Your from-scratch MHA trains without errors but learns slowly and outputs incoherent text. What do you check?
 - **The reshape and transpose.** Viewing `[B, n, h·d_k]` directly as `[B, h, n, d_k]` mixes positions
   into heads; it must be view to `[B, n, h, d_k]`, then transpose.
@@ -282,7 +329,7 @@ only shrinks if you reduce KV heads through GQA, which the question did not do.
 - **When kernels or sharding object.** Head dimensions outside the kernels' supported set fall back to
   slow paths, and *h* must still divide by the tensor-parallel degree.
 
-### A customer wants to serve a 32-head model on a 6-GPU node with tensor parallelism. What do you tell them?
+### A customer wants to serve a 32-head model for their agents on a 6-GPU node with tensor parallelism. What do you tell them?
 - **32 heads do not split evenly across 6 GPUs**, and heads are the unit tensor parallelism shards
   attention by.
 - **Options:** run TP on 4 GPUs and use the rest for another replica or pipeline stage, pick a model
@@ -320,3 +367,24 @@ only shrinks if you reduce KV heads through GQA, which the question did not do.
 - [ ] The KV cache per token for full multi-head attention
 > Parameters and projection FLOPs depend only on d_model, and the full-MHA KV cache per token is 2d per
 > layer. The n×n probability map is produced once per head, so its memory scales with h.
+
+## Use cases & projects
+### Use cases
+- **Capacity planning for self-hosted agents.** KV heads, head_dim and transcript length give sessions
+  per GPU before any load test.
+- **Choosing between candidate open models.** At similar eval scores, the layout with fewer KV heads is
+  the cheaper one to serve for long agent runs.
+- **Planning a multi-GPU deployment.** Head counts decide which tensor-parallel degrees split the model
+  evenly on the hardware you own.
+- **Debugging a slow fine-tuned model.** An unsupported head_dim explains a silent fall-back to slow
+  attention paths.
+
+### Mini project
+**Build an agent-capacity calculator from model configs (1-2 hours).**
+- **Goal:** given a model's `config.json` and an agent's transcript profile, report sessions per GPU and
+  valid tensor-parallel degrees.
+- **Steps:** load two or three open-model configs; read layers, query heads, KV heads and head_dim
+  (computing head_dim as hidden size over heads when absent); take p50 and p95 transcript lengths from a
+  logged agent run; compute KV per session and sessions per GPU for a stated free-memory budget.
+- **Done when:** the tool prints a comparison table per model, flags TP degrees that do not divide the
+  head count, and its numbers for Llama-2-7B and Llama-3-8B match 0.5 and 0.125 MiB per token.

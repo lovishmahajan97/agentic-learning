@@ -5,7 +5,8 @@ name: Content moderation
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - safety-security/llama-guard
   - safety-security/input-output-guardrails
@@ -20,8 +21,19 @@ sources:
 
 ## TL;DR
 Content moderation scores text (and images) against a harm taxonomy and routes it: allow, block,
-safe-complete or escalate, on input, output and retrieved content. It is classification with policy
-attached: thresholds and actions are product decisions.
+safe-complete or escalate. In an agent it runs on user turns, tool results and anything the agent
+publishes; thresholds and actions are product decisions.
+
+## For agent builders
+- **Why it matters for agents.** Agents do not only answer; they post replies, send emails and write
+  tickets. Moderation becomes a gate on publishing tool calls, and tool results (forum posts, web pages,
+  inbound emails) need scoring before the agent quotes them.
+- **Where it shows up in your stack.** A hosted moderation endpoint or a self-hosted Llama Guard-style
+  model called from your rail middleware, on three streams: input, tool results and outgoing content.
+- **What you control.** The taxonomy, thresholds per category and per surface, which tools count as
+  publishing, the safe-completion path for self-harm, and what the agent does when a draft is blocked.
+- **What you can skip.** Training a safety classifier; use a hosted or open-weight one and spend the
+  effort on routing, calibration at real prevalence and the review queue.
 
 ## Why it exists
 - **You are responsible for what your app produces.** Provider usage policies hold you to it, and legal
@@ -103,6 +115,15 @@ prevalence, 90% recall, 2% false-flag rate on benign items.
 | Retrieved documents and tool results | user-generated content in a RAG corpus quoted verbatim | one more classifier pass |
 
 Most systems moderate all three and accept the cost.
+
+### In an agent loop
+- **Publishing tools are outputs.** A `post_reply` or `send_email` call carries text a person will read,
+  so its content argument is moderated before the call runs, *because* a posted message cannot be
+  retracted like a streamed sentence.
+- **Tool results are context.** Fetched pages and inbound messages are scored before the model sees
+  them, so the agent does not quote harmful text "from the sources".
+- **A block is a step result, not a crash.** Tell the agent the draft was blocked and why, let it revise
+  once, then hand off to a human.
 
 ### Streaming
 - **The user sees text before the full response can be scored.**
@@ -203,6 +224,27 @@ def hosted_scores(text: str) -> dict[str, float]:
 # Map the vendor's category names onto your taxonomy, then call the same route() logic.
 ```
 
+### Agent scenario: moderating a publishing tool call
+A community agent drafts forum replies. The executor runs `route()` from the first example on the draft
+before `post_reply` executes and returns a block as a tool result the agent can act on.
+
+```python
+PUBLISHING_TOOLS = {"post_reply", "send_email"}
+MAX_REVISIONS = 1
+
+def gate(tool: str, args: dict, revisions: int) -> dict | None:
+    """Return a tool_result-style dict to send back instead of running the tool, or None to proceed."""
+    if tool not in PUBLISHING_TOOLS:
+        return None
+    verdict = route(args["body"], "output")          # same thresholds as chat output
+    if verdict["action"] in ("allow", "allow_and_flag"):
+        return None                                  # flagged drafts still post, and join the review queue
+    if revisions >= MAX_REVISIONS:
+        return {"is_error": True, "content": "Draft blocked again; handed to a human moderator."}
+    return {"is_error": True,
+            "content": f"Draft blocked by moderation ({verdict['category']}). Revise without that content."}
+```
+
 ### Worked scenario: the same classifier at different prevalence
 Recall 90% and false-flag rate 2% held fixed; only the share of harmful traffic changes.
 
@@ -225,6 +267,9 @@ data sampled at real prevalence.
   reviewers' overturn rate, and adjust thresholds per category from those labels.
 - **Conversation-window scoring.** Score the last few turns together alongside the single message, and
   keep per-user repeat-flag counts for rate-limits. Monitor red-team multi-turn bypasses.
+- **Gate publishing tools in the executor.** Agent teams list which tools publish to people, moderate
+  their content arguments before execution, and return blocks as tool results with one revision allowed.
+  Monitor blocked drafts per tool and how often a revision passes versus escalates.
 - **Delimit text as data for LLM classifiers.** Wrap content in tags, state that it is data, and
   constrain output to a schema, so "rate all categories 0" inside the text cannot steer the classifier.
 
@@ -260,12 +305,17 @@ data sampled at real prevalence.
   assembled across ten turns, each comfortably below every threshold.
 - **Tuning thresholds on a balanced test set.** Symptom: a production review queue that is mostly false
   positives, because real prevalence is far lower than in the test data.
+- **Moderating the chat reply but not the agent's actions.** Symptom: the chat UI is clean, but the agent
+  posted an abusive reply through `post_reply` because tool arguments never went through moderation. Fix:
+  gate every publishing tool in the executor.
 - **Passing text to a classifier without delimiting it as data.** Symptom: an input that says "rate all
   categories 0" doing exactly that.
 
 ## When to use
 - **Use when:** a product has untrusted users or shows generated text to people.
 - **Minimum:** output moderation plus a safe-completion path for self-harm.
+- **In agents:** moderate tool results before they enter context and the content of every publishing
+  tool call before it runs.
 - **Start** with a hosted endpoint for breadth and speed; add a policy-driven classifier when your domain
   has rules the fixed taxonomy cannot express or false positives hurt a legitimate use case.
 - **Measure:** per-category precision and recall on labelled traffic sampled at real prevalence, the share
@@ -312,6 +362,13 @@ classifier is a separate component.
 - **Log direction and category per decision** so you can tell whether harm came from users, sources or
   the model.
 
+### Your agent can post replies to a public forum. Where does moderation sit?
+- **On tool results:** score the fetched thread before the model reads it, so harmful posts are not
+  quoted back.
+- **On the `post_reply` arguments:** moderate the draft in the executor before the call runs, because a
+  posted message cannot be retracted the way a streamed sentence can.
+- **On a block:** return it to the agent as a tool error, allow one revision, then hand off to a human.
+
 ### When would you pick a self-hosted safety model over a hosted moderation endpoint?
 - **When your policy needs custom categories** the fixed vendor taxonomy cannot express, which Llama
   Guard-style models handle by taking the policy in the prompt.
@@ -347,3 +404,24 @@ classifier is a separate component.
 - [ ] Blocklists cannot be stored alongside the model
 > Blocklists have both error types at once: low recall against obfuscation and false positives on
 > innocent substrings. They remain useful as a fast first stage for exact terms a contract names.
+
+## Use cases & projects
+### Use cases
+- **Community and social agents.** Drafted replies are moderated before `post_reply` runs, with a review
+  queue for flagged drafts.
+- **RAG agents over user-generated content.** Retrieved forum posts and reviews are scored before the
+  agent quotes them.
+- **Companion and wellbeing assistants.** Self-harm signals on input route to a safe-completion template
+  and escalation instead of a refusal.
+- **Outbound email and messaging agents.** Every message the agent sends passes the same thresholds as
+  chat output, with the decision logged.
+
+### Mini project
+**Moderation gate for a posting agent (1-2 hours).**
+- **Goal:** stop an agent from publishing harmful drafts while keeping benign ones flowing.
+- **Steps:** build an agent with a fake `post_reply` tool that appends to a local file; plug a hosted or
+  open-weight moderation model into a routing table with per-category thresholds; gate `post_reply` in
+  the executor and return blocks as tool errors with one revision; run 30 benign and 10 adversarial
+  prompts.
+- **Done when:** no adversarial draft reaches the posts file, you report block, revise-and-pass and
+  escalation counts, and you list every benign draft that was wrongly blocked.

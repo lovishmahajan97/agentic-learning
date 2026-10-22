@@ -379,3 +379,25 @@ last run, and does it run on every prompt and model change with a held-out slice
 > Zero ASR is trivially achieved by refusing anything risky-looking, and defences tuned on a fixed suite
 > overfit it. The over-refusal set shows the cost and the held-out templates show whether the hardening
 > generalises.
+
+## Use cases & projects
+### Use cases
+- **Testing indirect prompt injection.** Instructions planted in web pages, emails or tool results check
+  whether the agent calls a side-effecting tool it was never asked to call.
+- **Release-gating an agent with write tools.** Zero attack success on critical cells, such as sending
+  email or issuing refunds, is a ship condition, measured beside over-refusal.
+- **Measuring a guardrail layer.** Running the same suite with and without a guardrail shows what it
+  actually blocks and what benign requests it now refuses.
+- **Re-testing after every prompt or model change.** A versioned attack suite reopens checks that a
+  one-off pre-launch red team would have left closed.
+
+### Mini project
+**Build a canary-graded injection suite for an email agent (2-3 hours).**
+- **Goal:** measure how often injected instructions in tool results make an agent take an unauthorised
+  action.
+- **Steps:** give a small agent `read_inbox` and a stubbed `send_email` tool; write 20 attack emails
+  across 4 templates, each asking the agent to send a canary string to an outside address; hold out one
+  template; add 15 benign-but-edgy requests; run each case *k* times and grade from the tool-call trace
+  (canary present in a `send_email` call); then add one defence and re-run.
+- **Done when:** a table shows attack success per template, the held-out result and over-refusal before
+  and after the defence.

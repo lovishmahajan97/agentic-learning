@@ -5,7 +5,8 @@ name: OAuth 2.0 / OIDC
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - backend-fundamentals/authentication-vs-authorization
   - backend-fundamentals/rbac
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-OAuth 2.0 gives an app a scoped, expiring access token to call an API for a user without seeing their
-password. OpenID Connect (OIDC) adds a signed ID token saying *who* logged in. Most login bugs come from
-confusing these tokens.
+Agents that act for users need delegated, scoped, expiring credentials: OAuth 2.0 issues access tokens
+for each tool's API without the agent seeing a password, and OIDC's signed ID token says *who* the user
+is. Confusing the two is the classic bug.
+
+## For agent builders
+- **Why it matters for agents.** Every tool that touches a user's data (GitHub, Drive, Slack, a CRM) needs
+  a token that limits the agent to what that user consented to. OAuth turns "the agent has an admin key"
+  into "the agent holds a narrow, revocable token per user per tool".
+- **Where it shows up in your stack.** "Connect your account" buttons in agent products, the token vault
+  behind the tool runtime, MCP server authorization (which builds on OAuth 2.1 and PKCE), and the
+  client-credentials grant your agent workers use to call internal APIs as themselves.
+- **What you control.** Scopes requested per tool, where refresh tokens live (server-side, never in the
+  prompt or the model's context), token exchange to narrow audience per downstream call, and which work
+  runs as the user versus as the agent.
+- **What you can skip.** Writing your own authorization server and the full RFC text. Know the code flow
+  with PKCE, the three token types and who validates each; that covers agent tool auth.
 
 ## Why it exists
 - **Password sharing was the old answer.** A third-party calendar app asked for your Google password. That
@@ -131,9 +145,28 @@ Why the checks in step 5 matter:
   app delete a repository the user could not delete themselves.
 - **Both checks run on every request** (see RBAC).
 
+### Where tokens live in an agent
+The model plans and picks tools; it never holds credentials. The tool runtime does.
+
+| Piece | Holds | Never holds |
+|---|---|---|
+| **LLM context** (prompt, transcript, tool results) | Tool names, arguments, user id | Access, refresh or ID tokens |
+| **Tool runtime / gateway** | Looks up the token for `(user, tool)` and attaches `Authorization: Bearer …` | Long-lived admin keys |
+| **Token vault** (encrypted DB or secrets manager) | Refresh tokens per user per provider, rotated on use | Plaintext in logs |
+| **Agent worker identity** | Client-credentials token for internal APIs | User passwords |
+
+- **Keep tokens out of the context window,** because anything in the transcript can be echoed back by a
+  prompt-injected tool result, logged in traces, or sent to an eval vendor.
+- **Resolve credentials at call time,** keyed on the authenticated session's `(iss, sub)`, never on a user
+  id the model wrote into the tool arguments; otherwise a manipulated agent can act as another user.
+- **Fail closed with a consent prompt.** When no token exists or refresh fails, the tool returns a
+  structured "needs authorization" result and the UI shows a connect button, rather than the agent
+  retrying blindly.
+
 ## Diagram
 Follow the code: it is the only thing that crosses the browser, and it is worthless without the verifier
-that stays on the server.
+that stays on the server. In an agent product this is the "Connect your account" flow; the client
+backend is your tool runtime and the resource server is the tool's API.
 
 ```mermaid
 sequenceDiagram
@@ -242,6 +275,52 @@ def authorize(auth_header: str, needed_scope: str) -> dict:
     return claims   # next: the user's own role check (RBAC) on the resource
 ```
 
+### Agent tool runtime: per-user tokens resolved outside the model
+The model emits a tool call; the runtime attaches the right user's token, refreshes it when needed and
+never returns the token to the model. `vault` is your encrypted token store; `refresh` posts
+`grant_type=refresh_token` to the provider's `/token` endpoint.
+
+```python
+import time, requests
+
+class NeedsAuthorization(Exception): ...
+
+def get_token(vault, user_key, provider, refresh):
+    rec = vault.get(user_key, provider)               # keyed on the session's (iss, sub), not model output
+    if rec is None:
+        raise NeedsAuthorization(provider)            # UI shows "Connect GitHub"
+    if rec["expires_at"] - time.time() < 60:          # refresh a minute early
+        new = refresh(provider, rec["refresh_token"])  # rotation: provider returns a new refresh token
+        rec = {"access_token": new["access_token"],
+               "refresh_token": new.get("refresh_token", rec["refresh_token"]),
+               "expires_at": time.time() + new["expires_in"]}
+        vault.put(user_key, provider, rec)
+    return rec["access_token"]
+
+def run_tool(call, session, vault, refresh):
+    try:
+        token = get_token(vault, session.user_key, call.provider, refresh)
+    except NeedsAuthorization as e:
+        return {"error": "needs_authorization", "provider": str(e)}   # model sees this, not a token
+    r = requests.request(call.method, call.url, json=call.args, timeout=20,
+                         headers={"Authorization": f"Bearer {token}"})
+    if r.status_code == 403:
+        return {"error": "insufficient_scope", "detail": "ask the user to grant more access"}
+    return {"status": r.status_code, "body": r.json()}       # the token never enters the transcript
+```
+
+### Worked scenario: blast radius of one leaked agent credential
+An agent platform serves 2,000 users who each connected GitHub. A worker's memory dump leaks.
+
+| Design | What the attacker gets | How long it lasts |
+|---|---|---|
+| One shared admin token for the org | Every repo of all 2,000 users, write access | Until someone notices and rotates |
+| Per-user refresh tokens, no rotation | Every user whose token the worker had loaded | Months: refresh tokens rarely expire |
+| Per-user access tokens only in the worker, refresh tokens in a vault, rotation on | The handful of users active on that worker | Minutes to an hour (`expires_in`) |
+
+Moving refresh tokens to a vault and turning on rotation shrinks the incident from "all users, forever"
+to "a few users, under an hour", with reuse detection flagging any replay.
+
 ## Production patterns
 - **Backend-for-frontend for SPAs.** When a browser app needs login, run the code flow on a small backend
   and give the browser only an HttpOnly, Secure, SameSite session cookie; tokens stay server-side. Monitor
@@ -260,6 +339,12 @@ def authorize(auth_header: str, needed_scope: str) -> dict:
 - **Exact redirect URIs per environment.** Register `https://app.example.com/callback` and the staging and
   localhost equivalents separately, never a wildcard. Review the registered list in the provider console
   as part of each release that touches login.
+- **Per-tool, per-user token vault for agents.** Store refresh tokens encrypted, keyed on `(iss, sub)`
+  and provider, and let only the tool runtime read them. Monitor refresh failures and
+  `needs_authorization` rates per tool; a jump usually means a provider revoked consent or changed scopes.
+- **Client credentials for the agent's own work.** Background agents (nightly triage, eval runs) get their
+  own client registration with narrow scopes, so audit logs separate "the agent did this" from "user X's
+  agent did this". Alert on any client-credentials token used against user-scoped endpoints.
 
 ## Trade-offs
 - **Delegation vs moving parts.** No password sharing, paid for with redirect complexity, more moving parts
@@ -276,6 +361,10 @@ def authorize(auth_header: str, needed_scope: str) -> dict:
   and recovery out of your codebase, but add a vendor on the critical path and provider-specific quirks in
   claim names and refresh policies. For B2B customers SSO is a requirement, so this is rarely a real
   choice.
+- **Delegated user tokens vs a shared service account for agent tools.** User tokens cap the agent at the
+  user's own permissions and give clean audit trails, but cost a consent flow per tool and per user. A
+  shared service account is simpler to wire, and acceptable only when every user may see everything that
+  account can reach.
 
 ## Pitfalls
 - **Treating an access token as proof of identity** by calling `/userinfo` and trusting the result.
@@ -298,8 +387,13 @@ def authorize(auth_header: str, needed_scope: str) -> dict:
 - **Handing an agent or integration a broad, long-lived refresh token "to be safe".** Symptom: one
   compromised worker can act as every user. Fix: request minimal scopes, and use client credentials for
   work the agent does as itself.
+- **Putting tokens in the prompt or tool results.** Symptom: an access token appears in traces, eval
+  datasets or a model reply after a prompt injection. Fix: the runtime attaches credentials outside the
+  model and redacts `Authorization` headers from logged tool calls.
 
 ## When to use
+- **Use delegated tokens for agent tools** whenever the agent reads or writes a user's data in a
+  third-party system; the agent should never exceed what that user could do by hand.
 - **Use OIDC when humans log in** and you do not want to own passwords, MFA and account recovery. For B2B
   products that is nearly always: "do you support SSO" appears in the first security questionnaire.
 - **Use the authorization code grant** when your product must call APIs as the user (Google Drive, GitHub,
@@ -371,6 +465,14 @@ rotation enabled.
   secret alone does not tie the code to the session that started the flow.
 - **RFC 9700** makes it mandatory for public clients and recommends it for all.
 
+### A prompt-injected document tells your agent to email a user's files to an outside address. What in your auth design limits the damage?
+- **Scopes cap the tool.** If the mail tool's token only has read scopes, the send fails with a 403 no
+  matter what the model decides.
+- **Credentials are bound to the session, not to model output.** The runtime resolves the token from the
+  authenticated `(iss, sub)`, so the injection cannot switch users.
+- **Tokens never enter the context,** so the injected text cannot exfiltrate them; high-risk actions also
+  get a human confirmation step.
+
 ## Quiz
 ### Q: Why does the authorization code flow send a code through the browser and exchange it server-side instead of returning the access token directly?
 - [ ] Codes are shorter than tokens and fit more reliably in a redirect URL
@@ -398,3 +500,26 @@ rotation enabled.
 > A public client ships its code to users, so any embedded secret is public. PKCE binds the code to a
 > per-request verifier that never travels the front channel, so an intercepted code cannot be
 > redeemed; the IETF best-practice now recommends it for all clients.
+
+## Use cases & projects
+### Use cases
+- **"Connect your account" for agent tools.** A coding or sales agent gets per-user GitHub, Google or CRM
+  tokens through the code flow with PKCE, scoped to exactly the tools it exposes.
+- **Authorizing remote MCP servers.** An MCP client obtains a token for a remote server through an OAuth
+  flow, so the server knows which user's data each tool call may touch.
+- **Background agents acting as themselves.** Nightly triage or eval agents use client credentials with
+  narrow scopes, keeping their actions distinct from user-driven runs in audit logs.
+- **Enterprise agent rollouts.** Customers require SSO through Okta or Entra ID before employees may use an
+  internal agent, and the ID token's `(iss, sub)` keys each agent session.
+
+### Mini project
+**Give an agent a delegated GitHub tool (2-3 hours).**
+- **Goal:** a tool-calling agent that lists a user's open issues with a per-user token the model never
+  sees.
+- **Steps:** register an OAuth app with GitHub (or any provider with a sandbox); implement `/login` and
+  `/callback` with `state` and PKCE; store the refresh or access token in a local encrypted table keyed on
+  the user; write a `list_issues` tool whose runtime attaches the token; return `needs_authorization` when
+  no token exists; redact `Authorization` from logged tool calls.
+- **Done when:** the agent answers "what issues are assigned to me?" for two different test users with
+  different results, revoking consent in the provider makes the next call return `needs_authorization`,
+  and grepping your traces finds no token.

@@ -488,3 +488,24 @@ than making indexing synchronous.
 > This is the dual-write problem: a database commit and a broker publish cannot be made atomic. A crash
 > between them loses the event. The transactional outbox writes the event in the same database transaction
 > and relays it afterwards, so an event exists if and only if the row does.
+
+## Use cases & projects
+### Use cases
+- **Keeping a RAG index fresh.** Document-changed events feed an embedding consumer keyed by document id,
+  so edits re-index in order and a replay can rebuild the index after a chunking change.
+- **Agents triggered by tickets, emails or webhooks.** Each inbound event starts at most one run, because
+  the consumer dedupes on `event_id` before it launches the agent loop.
+- **Run telemetry for billing and evals.** Run-started, tool-called and run-completed events let billing,
+  eval sampling and audit consume the same stream without touching the agent's hot path.
+- **Fan-out to specialist agents.** One "ticket classified" event can wake a triage agent and a
+  summariser independently, so adding a third consumer needs no change to the producer.
+
+### Mini project
+**Build an event-triggered ticket agent that never runs twice (2-3 hours).**
+- **Goal:** a consumer that starts one agent run per ticket event, even under duplicate delivery.
+- **Steps:** run a local broker or a Postgres-backed queue; publish ticket events with an `event_id` and
+  a ticket id as partition key; write a consumer that records processed ids, calls a stub agent and
+  passes `event_id` as the idempotency key to a fake "post reply" tool; add a retry limit and a
+  dead-letter table; deliberately publish each event twice.
+- **Done when:** every ticket has exactly one posted reply despite the duplicates, a poison event lands
+  in the dead-letter table after the retry limit, and a replay from the start produces no new replies.

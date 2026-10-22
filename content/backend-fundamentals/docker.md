@@ -5,7 +5,8 @@ name: Docker
 kind: tool
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - backend-fundamentals/kubernetes
   - backend-fundamentals/ci-cd
@@ -22,9 +23,23 @@ sources:
 ---
 
 ## TL;DR
-Docker packages an app with its exact filesystem (OS libraries, interpreter, CUDA runtime, code) into an
-immutable, content-addressed image and runs it as an isolated process on the host kernel. What passed CI
-is byte-for-byte what runs in production.
+Docker packages your agent service, tool servers and eval runners with their exact filesystem into an
+immutable image and runs each as an isolated process on the host kernel, so the agent that passed evals
+in CI is byte-for-byte what serves users.
+
+## For agent builders
+- **Why it matters for agents.** An agent is several processes: the agent API, MCP or tool servers, a
+  vector database, workers, and often a sandbox for model-generated code. Images make each one
+  reproducible, and container flags are the first line of isolation for code the model writes.
+- **Where it shows up in your stack.** The Dockerfile for your agent API, `docker compose` for the local
+  stack (agent, Redis, Postgres, vector DB), containerised MCP servers, code-interpreter sandboxes, and
+  the image your CI eval job runs.
+- **What you control.** Image size (cold start when scaling agent workers), exec-form `CMD` and SIGTERM
+  handling so streaming responses drain, a non-root `USER`, and sandbox flags such as no network, read-only
+  root and memory caps for generated code.
+- **What you can skip.** Overlay filesystem internals and runtime plumbing (containerd, runc). Know layers
+  and the cache, namespaces versus cgroups, PID 1, and that plain containers are not a strong enough
+  boundary for hostile code.
 
 ## Why it exists
 - **A service depends on far more than `requirements.txt`.** The interpreter version, system libraries such
@@ -128,9 +143,24 @@ volumes from a single file: the local development stack that mirrors production 
 - **On a Kubernetes node** Docker-built images run unchanged, but `docker ps` shows nothing.
 - **The choice rarely changes the Dockerfile;** it changes who needs root on the build machine.
 
+### Containers in an agent stack
+| Component | Image contents | What matters most |
+|---|---|---|
+| Agent API (FastAPI, streaming) | Code, deps, no weights, no secrets | SIGTERM draining of in-flight streams, small image |
+| Tool or MCP servers | One service per image, narrow deps | Separate identity and credentials per tool |
+| Code-execution sandbox | Minimal Python plus allowed libraries | No network, no secrets, read-only root, CPU, memory and PID caps |
+| Eval runner | Same agent image plus the eval harness | Identical digest to what ships |
+| Self-hosted model server | CUDA runtime plus inference engine | Driver compatibility, pull time, weights outside |
+
+- **One image per role,** because a tool server with a CVE or a sandbox escape should not reach the agent's
+  provider key or memory store.
+- **Pin by digest in the eval job and the deploy,** so an eval score always refers to exactly the bytes that
+  shipped.
+
 ## Diagram
 Follow an image from recipe to running process: build once, address by digest, and every node runs the same
-bytes with only a thin writable layer on top.
+bytes with only a thin writable layer on top. The same path serves your agent API, its tool servers and
+the image your eval job scores.
 
 ```mermaid
 flowchart TD
@@ -225,6 +255,49 @@ diagnosis.
 - **Telling the two 137 cases apart:** `docker inspect` reports `OOMKilled: true` for memory kills; a stop
   that took exactly ten seconds points at signal handling.
 
+### Agent code-execution tool in a locked-down container
+The agent's `run_python` tool runs model-written code in a throwaway container. All flags are standard
+`docker run` options; the sandbox image is a slim Python image with only the libraries you allow.
+
+```python
+import subprocess, uuid
+
+def run_python(code: str, timeout_s: int = 20) -> dict:
+    name = f"sbx-{uuid.uuid4().hex[:8]}"
+    cmd = ["docker", "run", "--rm", "--name", name, "-i",
+           "--network", "none",              # no egress: cannot exfiltrate or reach internal hosts
+           "--read-only", "--tmpfs", "/tmp:size=64m",
+           "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+           "--user", "65534:65534",          # nobody
+           "--memory", "512m", "--cpus", "1", "--pids-limit", "64",
+           "python:3.12-slim", "python", "-"]   # no -e flags: the environment holds no secrets
+    try:
+        p = subprocess.run(cmd, input=code, capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        subprocess.run(["docker", "kill", name], capture_output=True)
+        return {"error": "timeout", "limit_s": timeout_s}
+    if p.returncode == 137:
+        return {"error": "killed: memory limit or timeout", "exit": 137}
+    return {"exit": p.returncode, "stdout": p.stdout[-4000:], "stderr": p.stderr[-2000:]}
+
+print(run_python("import os; print(sorted(os.environ))"))   # no provider keys visible
+print(run_python("import urllib.request as u; u.urlopen('https://example.com')"))  # fails: no network
+```
+
+- **This is defence in depth, not a security boundary** for hostile code: the container shares the host
+  kernel, so multi-tenant agent platforms run the same flags under gVisor or a microVM.
+
+### Worked scenario: agent worker cold start during a traffic spike
+Agent workers autoscale from 4 to 20 replicas. Figures are illustrative orders of magnitude.
+
+| Image design | Size | Pull on a fresh node | Ready time |
+|---|---|---|---|
+| Agent API plus a local embedding model and its weights | ~9 GB | minutes | requests queue and stream timeouts fire |
+| Agent API only, embeddings via a separate model server | a few hundred MB | seconds | new replicas take traffic quickly |
+| Same, base layers already cached on the node | only changed layers | near zero | limited by app startup |
+
+Keeping weights and GPU runtimes out of the agent API image is what makes its autoscaling responsive.
+
 ## Production patterns
 - **Deploy by digest.** Tag images with the git SHA, then record the pushed digest (shown by `docker push`,
   or `docker inspect --format '{{index .RepoDigests 0}}' <image>`) in the deploy manifest. Monitor which
@@ -241,6 +314,11 @@ diagnosis.
 - **Keep weights out of the image.** Ship code and runtime only; load weights from object storage or a
   persistent volume with a node-local cache, and pre-pull large images on GPU nodes. Measure pull time and
   model-load time separately.
+- **Compose file for the whole agent stack.** One `compose.yaml` runs the agent API, MCP servers, Redis,
+  Postgres with pgvector and a fake-tools service, so every developer and the CI eval job start the same
+  topology with `docker compose up`. Monitor how long the stack takes to become healthy.
+- **Evaluate the image you ship.** The CI eval job runs against the freshly built image by digest, and the
+  deploy step promotes that same digest only if evals pass. Record digest and eval score together.
 
 ## Trade-offs
 - **Reproducible images vs pull time.** Deploys are reproducible and rollback is a pointer change, but a
@@ -254,6 +332,9 @@ diagnosis.
   install` without a lockfile yields different images on different days.
 - **One container vs split model server.** API plus model in one container is simple to run; splitting the
   model server from the API adds a network hop in exchange for scaling and restarting the two independently.
+- **Container per tool call vs warm sandbox pool.** A fresh container per code execution gives clean state
+  and isolation between users, at the cost of start latency on every call. A warm pool cuts latency but
+  must be wiped or recycled between sessions, or one user's files leak into another's run.
 
 ## Pitfalls
 - **Shell-form `CMD` or no SIGTERM handler.** Symptom: `docker stop` takes exactly ten seconds and in-flight
@@ -274,10 +355,15 @@ diagnosis.
   traceback, typically during model load or a large batch.
 - **Mounting `/var/run/docker.sock` into a CI or agent container "so it can build".** Symptom: anything in
   that container can start a privileged container and own the host. Fix: a rootless or daemonless builder.
+- **Running model-generated code in the agent's own container.** Symptom: a generated script reads the
+  provider key from the environment or deletes the app's files. Fix: a separate sandbox container with no
+  network and no secrets, or a microVM for untrusted users.
 
 ## When to use
 - **Use when** you deploy anything more than once or onto more than one machine: inference APIs, workers,
   eval jobs, fine-tuning runs.
+- **Use for agents** as soon as the agent has more than one process (tool servers, a vector DB) or runs
+  model-written code, which needs a separate, locked-down container at minimum.
 - **Skip it** for a notebook on your laptop; serverless platforms that accept source or a zip build the image
   for you.
 - **Measure:** image size, cached and uncached build time, pull time, and time from container start to ready;
@@ -336,11 +422,19 @@ measurements, because the second needs a startup probe and a weight cache rather
 - **Instead** load from object storage or a persistent volume with a node-local cache, keeping the image to
   code and runtime.
 
-### Why is mounting the Docker socket into a CI job dangerous, and what do you use instead?
+### Why is mounting the Docker socket into a CI job or an agent's container dangerous, and what do you use instead?
 - **The socket is root on the host:** anything that can talk to it can start a privileged container that
-  mounts the host filesystem.
+  mounts the host filesystem. For an agent that runs shell commands, one injected instruction is enough.
 - **Use a daemonless or rootless builder** such as kaniko, Buildah or rootless BuildKit, which build OCI
   images without a privileged daemon.
+
+### How would you sandbox an agent's code-execution tool with containers, and where does that stop being enough?
+- **Separate container per execution** with `--network none`, `--read-only`, `--cap-drop ALL`, a non-root
+  user, memory, CPU and PID limits, and no secrets in the environment.
+- **Enforce a wall-clock timeout** outside the container and kill it, since the model can write infinite
+  loops.
+- **Not enough for hostile multi-tenant code,** because containers share the host kernel; use gVisor or
+  microVMs there.
 
 ## Quiz
 ### Q: Why should a Dockerfile copy the dependency manifest and install before copying the application source?
@@ -369,3 +463,25 @@ measurements, because the second needs a startup probe and a weight cache rather
 > A container is a process isolated by namespaces and cgroups on the host's kernel, which is why it
 > starts in milliseconds and why a kernel exploit escapes it. Its root filesystem comes from the image
 > and it gets its own network namespace by default.
+
+## Use cases & projects
+### Use cases
+- **Shipping the agent API.** A multi-stage image with the agent service, exec-form `CMD` and SIGTERM
+  draining so deploys do not cut off streaming answers.
+- **Code-interpreter tools.** Model-written code runs in short-lived containers with no network and no
+  secrets, under gVisor or microVMs for untrusted users.
+- **Containerised MCP and tool servers.** Each tool runs in its own image with its own credentials, so a
+  vulnerable tool cannot reach the rest of the agent.
+- **Reproducible evals.** The CI eval job scores the exact image digest that will be deployed.
+
+### Mini project
+**Containerise an agent with a sandboxed code tool (2-3 hours).**
+- **Goal:** a local agent stack where the agent API runs in one container and model-written code runs in
+  a locked-down sandbox container.
+- **Steps:** write a multi-stage Dockerfile for a small agent API with a `run_python` tool; add a
+  `compose.yaml` with the API and Redis for session memory; implement the sandbox with the flags from the
+  example; add a SIGTERM handler that finishes in-flight runs; try three hostile snippets (print the
+  environment, call the internet, allocate 2 GB).
+- **Done when:** all three hostile snippets fail safely with clear tool results, `docker stop` on the API
+  exits 0 in under ten seconds during a run, and the API image has no weights or secrets in
+  `docker history`.

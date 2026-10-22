@@ -406,3 +406,24 @@ Propose the measurement plan up front so each step is justified by a number, not
 - [ ] When the base model is upgraded every month
 > Training the examples into the weights removes thousands of tokens from every request, which pays off at
 > volume; frequent task or base-model changes mean re-training repeatedly, which erases that saving.
+
+## Use cases & projects
+### Use cases
+- **Triage after an agent eval regresses.** Label each failed trace as a behaviour, knowledge or
+  capability gap, then pick prompt, retrieval or fine-tune per label instead of one fix for everything.
+- **"Make the agent know our docs" requests.** Route them to a search tool with citations and per-tenant
+  filters, because fine-tuning facts is weak, frozen and impossible to delete.
+- **Cutting cost on a high-volume agent step.** A router or extraction step with a long few-shot prompt is
+  the classic case where fine-tuning a small model pays back, once the behaviour is stable.
+- **Planning a base-model upgrade.** Prompt and retrieval rungs carry over almost for free, while every
+  fine-tune must be retrained and re-evaluated, so the decision record tells you the upgrade bill.
+
+### Mini project
+**Build a failure-to-lever triage report for one agent (1-3 hours).**
+- **Goal:** turn a pile of failed agent runs into a ranked list of fixes, each tied to the right rung.
+- **Steps:** collect 30-50 failed traces from a small agent you own (or a sample tool-calling agent);
+  label each as wrong tool, missing knowledge, ignored context, format or cost; route labels with the
+  triage script from Examples; apply the cheapest fix for the top label (a tool-description edit or a
+  search tool) and re-run the same traces as an eval.
+- **Done when:** you have a table of failure counts per label and per lever, a before/after pass rate for
+  the fix you applied, and a written break-even estimate for the one case where fine-tuning might win.

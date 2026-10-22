@@ -5,7 +5,8 @@ name: Capacity planning (tokens/sec, requests/sec, concurrent sessions)
 kind: practice
 difficulty: core
 est_minutes: 18
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - infra-capacity-economics/queueing-theory
   - infra-capacity-economics/latency-budgets
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-One LLM request can cost a hundred times another, so plan in three linked units: requests/sec,
-input and output tokens/sec, and concurrent sequences. Little's Law links them; a load test at the SLO
-gives replica capacity; replicas = peak ÷ capacity, plus headroom.
+An agent run is many model calls with growing prompts and tool waits between them, so plan in linked
+units: runs and calls per second, input and output tokens/sec, in-flight sequences. Little's Law links
+them; a load test sets replica capacity.
+
+## For agent builders
+- **Why it matters for agents.** "1,200 users" says almost nothing: what loads the fleet is runs per
+  second × steps per run, prompts that grow with every tool result, and runs that sit idle in tools while
+  their cache may stay resident. Agents are where the RPS habit fails worst.
+- **Where it shows up in your stack.** Your traces (steps per run, tokens per step, tool time per step),
+  the engine's running and waiting counts (vLLM publishes both), provider TPM and RPM quotas, and the
+  autoscaler or reservation you size from them.
+- **What you control.** Step budgets, context compaction, `max_tokens` per step type, fan-out limits,
+  prefix caching, and whether long agent runs share a pool with interactive chat.
+- **What you can skip.** Queueing-theory derivations. Little's Law, the latency knee and the headroom rule
+  are enough to size an agent fleet.
 
 ## Why it exists
 - **The web habit breaks.** A classic web service has fairly uniform requests: if one pod handles 500 RPS
@@ -71,6 +84,17 @@ Capacity starts from traffic, not hardware. Collect, per use case:
   distribution, which is *why* it is the safe bridge between units. It does not tell you queueing delay;
   that is the job of the queueing-theory lesson.
 
+### Agent runs: two levels of Little's Law
+- **Calls per second:** λ = runs per second × steps per run (plus sub-agent calls if the agent fans out).
+- **Input per call is not constant:** with a prefix of P tokens growing by g per step, the mean prompt over
+  n steps is P + g × (n − 1) ÷ 2, and the last step is the largest. Plan with the mean for tokens/sec and
+  the last step for KV memory.
+- **In-flight sequences** come from calls: L = λ × W per call, where W excludes tool time.
+- **Live runs** come from runs: runs per second × run duration, where duration includes tool time. That
+  sizes the session store and, if you keep each waiting run's prefix resident, KV memory too.
+- **Prefix caching changes prefill, not decode:** with an append-only transcript only the ~g new tokens per
+  step are prefilled, so prefill load falls by roughly (mean prompt ÷ g) while decode is unchanged.
+
 ### The circularity: W depends on load
 - **TPOT rises as the batch grows,** so more in-flight sequences make each call longer, which makes L
   larger still.
@@ -113,12 +137,13 @@ replicas = max( peak in-flight sequences ÷ (per-replica sequence capacity × ta
   use.
 
 ## Diagram
-Read it top to bottom: traffic becomes three units, a load test turns hardware into a capacity number,
-and replicas fall out of peak demand divided by capacity, then grow for headroom and lead time.
+Read it top to bottom: agent traffic (runs, steps, tokens per step) becomes three units, a load test
+turns hardware into a capacity number, and replicas fall out of peak demand divided by capacity, then
+grow for headroom and lead time.
 
 ```mermaid
 flowchart TD
-    T["Traffic: users, messages, calls, token p50 and p95"] --> A["Arrivals: lambda requests per second"]
+    T["Agent traffic: runs, steps, tokens per step"] --> A["Arrivals: lambda model calls per second"]
     A --> TK["Input and output tokens per second"]
     A --> L["In-flight sequences: L = lambda times W"]
     LT["Load test at the latency SLO"] --> C["Replica capacity: latency knee or KV bound"]
@@ -159,6 +184,42 @@ print(plan(1200, 1, 3, 3000, 250, ttft_s=0.5, tpot_s=0.03, replica_max_seqs=64))
 - **Replicas:** at 64 sequences per replica, 7.5 replicas would run at 100%; at a 70% target that is 11,
   plus one spare gives 12.
 
+### A capacity plan for a multi-step research agent
+Same model shape and GPU as the cross-check below (128 KiB of KV per token, ~57 GB free after weights
+with margin). Figures are illustrative: 2 runs/sec at peak, 10 steps per run, a 4,000-token prefix
+growing by 1,000 tokens per step, 200 output tokens per step, 2 s of tool time per step.
+
+```python
+import math
+
+def plan_agent(runs_per_s, steps, prefix_tok, growth_tok, out_tok, ttft_s, tpot_s, tool_s,
+               kv_bytes_per_tok, kv_free_gb, target_util=0.7, spare=1):
+    calls = runs_per_s * steps                                   # λ in model calls per second
+    mean_in = prefix_tok + growth_tok * (steps - 1) / 2          # prompt grows every step
+    w_call = ttft_s + out_tok * tpot_s                           # seconds per model call
+    run_s = steps * (w_call + tool_s)                            # model time plus tool time
+    in_flight = calls * w_call                                   # Little's Law on calls
+    live_runs = runs_per_s * run_s                               # Little's Law on runs
+    seqs_per_replica = int(kv_free_gb * 1e9 // (kv_bytes_per_tok * (mean_in + out_tok)))
+    def reps(load): return math.ceil(load / (seqs_per_replica * target_util)) + spare
+    return dict(calls=calls, mean_in=mean_in, in_tps=calls * mean_in, new_in_tps=calls * growth_tok,
+                w_call=round(w_call, 1), run_s=round(run_s), in_flight=round(in_flight),
+                live_runs=round(live_runs), seqs_per_replica=seqs_per_replica,
+                replicas_calls_only=reps(in_flight), replicas_keep_cache=reps(live_runs))
+
+print(plan_agent(2, 10, 4000, 1000, 200, 0.8, 0.03, 2.0, 2 * 32 * 8 * 128 * 2, 57))
+# {'calls': 20, 'mean_in': 8500.0, 'in_tps': 170000.0, 'new_in_tps': 20000, 'w_call': 6.8,
+#  'run_s': 88, 'in_flight': 136, 'live_runs': 176, 'seqs_per_replica': 49,
+#  'replicas_calls_only': 5, 'replicas_keep_cache': 7}
+```
+
+| Reading | Meaning |
+|---|---|
+| 20 calls/sec from 2 runs/sec | ten times the arrivals a per-user count would suggest |
+| 170,000 input tokens/sec, but 20,000 new | prefix caching on an append-only transcript removes most prefill |
+| 136 in flight, 176 live runs | 40 runs are in a tool at any instant |
+| 5 vs 7 replicas | keeping every waiting run's cache resident costs 2 more replicas; letting it be evicted costs re-prefill instead |
+
 ### Worked scenario: cross-checking the plan
 Three checks on the same plan; if any disagreed badly, one of the inputs would be wrong.
 
@@ -179,6 +240,12 @@ Same workload, but traffic grows 10% a month and reserved GPUs take a quarter to
 | What to order today | 16 − 12 | 4 more replicas, ordered now, not when alerts fire |
 
 ## Production patterns
+- **Plan from agent traces, not user counts.** Pull steps per run, tokens per step and tool time per step
+  from production traces into the capacity script, per agent type. Monitor steps-per-run p95 after every
+  prompt or tool change, since one extra step raises calls/sec by a tenth on a 10-step agent.
+- **Replay recorded runs as the load test.** Drive the load test with real agent transcripts so prompts
+  grow step by step and tool gaps are realistic. Monitor where the knee falls compared with chat-shaped
+  tests.
 - **Load test with production-shaped prompts.** Replay token-length distributions sampled from production
   (not fixed-length synthetic prompts) and sweep concurrency, recording p95 TTFT and TPOT at each step.
   Monitor where the latency knee and the KV-memory bound fall, and re-run after every model or engine
@@ -198,6 +265,9 @@ Same workload, but traffic grows 10% a month and reserved GPUs take a quarter to
   lead time. Monitor provider throttle counts and remaining quota per region and model.
 
 ## Trade-offs
+- **Resident caches for waiting runs vs replica count.** Keeping each run's prefix in KV memory while it
+  waits on a tool saves re-prefill on the next step, but sizes memory by live runs instead of in-flight
+  calls (7 replicas instead of 5 in the example); it flips toward eviction when tool waits are long.
 - **Higher target utilization vs queueing delay.** It cuts GPU cost, but queueing delay rises steeply near
   saturation; it flips toward low utilization when traffic is bursty or the TTFT budget is tight.
 - **p95 token counts vs means.** Planning to p95 over-provisions on quiet days but protects the tail; means
@@ -216,6 +286,11 @@ Same workload, but traffic grows 10% a month and reserved GPUs take a quarter to
   misses its TPOT SLO at a fraction of that throughput.
 - **Forgetting agent fan-out,** counting user messages instead of model calls. Symptom: provider 429s on
   requests-per-minute at a user load the plan said was safe.
+- **Using the first step's prompt length for every step.** Symptom: KV preemptions late in long runs,
+  because the last step's context is far larger than the plan's per-call figure. Fix: model prompt growth
+  per step and size memory from the last step.
+- **Counting tool time as in-flight model work.** Symptom: an oversized GPU fleet for an agent that spends
+  most of its run waiting on APIs. Fix: W per call excludes tool time; live runs include it.
 - **Sizing to the daily average.** Symptom: queue depth and TTFT climb every weekday morning while the
   dashboard shows modest mean utilization.
 - **Load-testing with fixed-length synthetic prompts.** Symptom: a replica that met its SLO in the test
@@ -230,6 +305,8 @@ Same workload, but traffic grows 10% a month and reserved GPUs take a quarter to
 - **Keep it alive** as a spreadsheet or script fed by production telemetry: arrivals, input and output token
   histograms, TTFT and TPOT percentiles, in-flight sequences, KV-cache utilization and provider throttle
   counts.
+- **For agents, re-plan** whenever steps per run, tool latency or context compaction changes, since each
+  moves calls/sec, prompt size or live runs.
 - **Managed APIs only?** The plan is shorter but still needed, because quotas are per region and per model
   and raising them can take days.
 - **Interviews:** expect "how many GPUs for N users" questions; the strong move is to ask for the token
@@ -254,13 +331,21 @@ output token histograms and in-flight sequence counts before and after. Fix by t
 output, enabling prefix caching for shared prompts, or adding replicas sized from the new token mix.
 
 ## Interview questions
-### A product manager asks how many GPUs you need for 5,000 users. What do you ask before answering?
+### A product manager asks how many GPUs you need for 5,000 users of a new agent. What do you ask before answering?
 - **Traffic shape:** peak concurrent active users, messages per user per minute, and model calls per message
   (agents fan out).
 - **Token distribution:** input and output tokens per call at p50 and p95, because one request can cost a
   hundred times another.
 - **The SLO:** p95 TTFT and TPOT targets, since replica capacity is defined at the latency budget.
 - **Then reason:** λ, tokens/sec and L = λW, divided by a load-tested per-replica capacity, plus headroom.
+
+### An agent runs 10 steps with a 4,000-token prefix growing 1,000 tokens per step and 2 s of tool time per step. How do you size for 2 runs per second?
+- **Calls:** 2 × 10 = 20 calls/sec; the mean prompt is 4,000 + 1,000 × 9 ÷ 2 = 8,500 tokens, so 170,000
+  input tokens/sec, of which ~20,000 are new if the transcript is append-only and prefix-cached.
+- **Concurrency:** each call takes 0.8 s + 200 × 30 ms = 6.8 s, so 136 in flight; runs last ~88 s, so 176
+  are live, 40 of them in tools.
+- **Replicas:** about 49 sequences fit per replica, so 5 with a spare, or 7 if every waiting run keeps its
+  cache resident.
 
 ### Why is requests per second not enough to plan LLM capacity?
 - **Uneven cost:** a 200-token classification and a 30,000-token summary are both one request.
@@ -317,3 +402,24 @@ output, enabling prefix caching for shared prompts, or adding replicas sized fro
 - [ ] Requests per second alone, since sessions are irrelevant to GPUs
 > GPUs are occupied by in-flight sequences, which here are sessions × duty cycle ≈ 500. Open sessions
 > still size connections and session storage, and the plan adds headroom because peaks exceed averages.
+
+## Use cases & projects
+### Use cases
+- **Launching a self-hosted agent.** Runs per second, steps and tokens per step from staging traces set
+  the replica count and the reservation to order.
+- **Adding a step or a tool to an existing agent.** The plan shows how much one more step raises calls,
+  tokens and in-flight sequences before the change ships.
+- **Hosted-API agents.** The same numbers become TPM and RPM quota requests per region and model, filed
+  with lead time.
+- **Separating agent and chat pools.** Planning both shows when long agent runs would push chat past its
+  TTFT budget on a shared fleet.
+
+### Mini project
+**Build a trace-driven capacity plan for an agent (2-3 hours).**
+- **Goal:** turn real agent traces into calls/sec, tokens/sec, in-flight sequences, live runs and a
+  replica count.
+- **Steps:** run a small tool-calling agent on 30 tasks and log per step: prompt tokens, output tokens,
+  model time and tool time; fit steps per run and prompt growth; feed them into `plan_agent` above at
+  three peak run rates; compare predicted in-flight calls with a short load test or a concurrency count.
+- **Done when:** you have a one-page plan with replicas at each run rate, which term binds (KV memory or
+  prefill), and how the answer changes with prefix caching and a 20% shorter transcript.

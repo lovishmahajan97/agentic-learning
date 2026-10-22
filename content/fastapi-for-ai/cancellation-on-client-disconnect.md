@@ -442,3 +442,25 @@ user can see what happened before they stopped it.
 - [ ] An agent step that has not yet started its next model call
 > The tokens were spent and billed whether or not anyone read them, so accounting must finish; shield it
 > with a timeout. The other work produces output for a client that is gone, so cancelling it is the point.
+
+## Use cases & projects
+### Use cases
+- **"Stop generating" in chat agents.** Detecting disconnect stops token generation, so the provider stops
+  billing output nobody reads.
+- **Side-effecting tools.** A cancel check before sending an email or creating a ticket keeps a ghost run
+  from doing what the user meant to stop.
+- **Retry storms.** Cancelling the abandoned first request frees its concurrency slot before the retry
+  claims another one.
+- **Self-hosted engines.** Aborting the request frees the sequence and its KV cache in the engine's batch
+  for other users.
+
+### Mini project
+**Make an agent run stoppable (1-2 hours).**
+- **Goal:** prove that closing the client stops the agent loop, its parallel tool calls and its stream,
+  while usage accounting still completes.
+- **Steps:** build a streaming agent endpoint with a fake model that yields tokens slowly and a step that
+  runs two tools in an `asyncio.TaskGroup`; check `request.is_disconnected()` between steps and before a
+  fake side-effecting tool; clean up in `finally`; shield the usage write with a timeout; disconnect a
+  client mid-stream with a script.
+- **Done when:** logs show generation and tools stopping within one step of the disconnect, the
+  side-effecting tool never runs after it, and the usage record is written every time.

@@ -439,3 +439,24 @@ latency or benign refusals exceed budget, or if the judge cannot yet be trusted 
 > Iterating on a prompt against visible items is training on the test set; the dev-set score keeps
 > rising while production does not. A held-out slice, rotated occasionally, is the only unbiased
 > offline estimate of how the change will behave on inputs you have not tuned for.
+
+## Use cases & projects
+### Use cases
+- **Starting a new agent.** Writing acceptance criteria and seed tasks first gives the team a definition
+  of done for the agent before the first prompt is tuned.
+- **Reviewing prompt and tool-description PRs.** An eval diff in the PR shows which tasks flipped, so a
+  one-line tool-description edit is judged on the whole suite, not on the example the author tried.
+- **Model migrations.** Swapping the underlying model is accepted or rejected on task success, cost and
+  step budgets per slice, compared against the last accepted baseline.
+- **Turning incidents into tests.** Each production failure becomes a golden task, so the suite grows
+  toward the failures users actually hit.
+
+### Mini project
+**Put a small agent under an eval gate in CI (2-3 hours).**
+- **Goal:** make a merge fail when a change lowers agent task success beyond a tolerance band.
+- **Steps:** write acceptance criteria and about 20 golden tasks with deterministic graders for a small
+  tool-calling agent; keep a held-out subset you do not inspect; run each task *k* times and store a
+  baseline file of per-task scores; add a CI job that re-runs the suite on each PR, counts paired flips
+  against the baseline and posts the diff; then make a deliberately bad tool-description edit.
+- **Done when:** the bad edit fails the gate with a diff naming the flipped tasks, a harmless change
+  passes, and the held-out score is reported separately from the dev score.

@@ -449,3 +449,23 @@ tensors before storing them, and check `torch.cuda.memory_allocated()` stays fla
 - [ ] Call `torch.cuda.synchronize()` after every step
 > The GPU is waiting for data. Worker processes prefetch and collate batches while the GPU computes, and
 > pinned memory allows asynchronous copies; synchronising more often would make the stall worse.
+
+## Use cases & projects
+### Use cases
+- **Local tool models in the agent path.** Embedders, rerankers and intent routers run as PyTorch modules
+  inside tool handlers, so their latency and memory add directly to every agent step.
+- **Fine-tuning on agent traces.** LoRA or SFT runs on successful tool-calling transcripts are PyTorch
+  training loops under PEFT and TRL; reading their loss curves and OOMs needs PyTorch literacy.
+- **Debugging a slow or crashing agent worker.** Accidental CPU fallback, missing `torch.inference_mode()`
+  or growing GPU memory across concurrent sessions are PyTorch issues that look like agent issues.
+- **Capacity planning for self-hosted agents.** Choosing `dtype`, batch size and device placement decides
+  how many concurrent agent sessions one GPU serves.
+
+### Mini project
+**Profile a local reranker tool inside an agent loop (1-2 hours).**
+- **Goal:** measure what a PyTorch reranker costs per agent step and cut it.
+- **Steps:** wrap a small cross-encoder as a `rerank` tool; call it from a fake 10-step agent loop; log
+  per-call latency and peak GPU (or CPU) memory; then add `model.eval()`, `torch.inference_mode()`, bf16
+  and batching of candidates, and rerun.
+- **Done when:** you have a before/after table of latency and memory per step, and a note on which change
+  mattered most and why.

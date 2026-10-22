@@ -347,3 +347,25 @@ required variable is absent, so no silent fallback exists.
 - [ ] When running in production without a `.env` file present
 > `dotenv_values` returns a dict and leaves `os.environ` untouched, which avoids leakage between tests
 > and makes merging files explicit. SDKs that read the environment themselves need `load_dotenv` instead.
+
+## Use cases & projects
+### Use cases
+- **Local agent development.** One `.env` holds the LLM provider key, a search tool key and a tracing key,
+  so every SDK the agent touches is wired with a single `load_dotenv()` call.
+- **Agent test suites.** `conftest.py` loads a test `.env` pointing at a sandbox vector database and a
+  cheap model, so tests never hit production resources.
+- **Notebooks for prompt and tool experiments.** A notebook calls `load_dotenv()` at the top and reuses
+  the same keys as the agent service without pasting them into cells.
+- **Onboarding a new teammate.** A committed `.env.example` lists every variable the agent needs, so a
+  fresh clone runs after copying it and filling in values.
+
+### Mini project
+**Wire a two-tool agent's secrets with dotenv (1-2 hours).**
+- **Goal:** run a small tool-calling agent locally with every key coming from a `.env` file, and prove
+  that a platform-injected variable wins over the file.
+- **Steps:** write a `.env.example` listing the model key, a search tool key and a model name; add
+  `.env` to `.gitignore`; call `load_dotenv()` first in the entry point; add a startup check that fails
+  fast with the names of any missing variables; export one variable in the shell and confirm it beats
+  the file under the default `override=False`.
+- **Done when:** a fresh clone runs after copying `.env.example`, a missing key fails at startup with a
+  clear message instead of mid-run, and `git status` never shows `.env`.

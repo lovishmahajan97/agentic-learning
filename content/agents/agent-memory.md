@@ -5,7 +5,8 @@ name: Agent memory (short-term, long-term, episodic)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/memory-retrieval-update-deletion-policies
   - agents/context-compaction-summarization
@@ -22,9 +23,23 @@ sources:
 ---
 
 ## TL;DR
-A model remembers only its context window; agent memory decides what enters it. Short-term is the
-window, long-term holds facts and procedures across sessions, episodic records timestamped events.
-Memory is RAG over the agent's own history, plus a write path.
+Your agent remembers only its context window; memory is the layer you build to decide what enters it.
+Short-term is the window, long-term holds facts and procedures, episodic holds timestamped events: RAG
+over the agent's own history, plus a write path.
+
+## For agent builders
+- **Why it matters for agents.** Returning users expect the agent to know their environment, and long
+  tasks overflow the window. Memory fixes both, but it is also where privacy leaks, stale facts and
+  persistent prompt injection come from, so its write and read paths need the same care as tool code.
+- **Where it shows up in your stack.** LangGraph checkpointers for thread state and its store for
+  cross-thread memory, the LangMem library for extraction, memory services such as Mem0 and Letta (the
+  MemGPT line of work), session objects in the OpenAI Agents SDK, and a vector database with metadata
+  filters underneath.
+- **What you control.** Which memory types exist, the extraction prompt, write gating by source, scope at
+  write time, the retrieval score and token budget, the dated memory block in the prompt and the
+  compaction trigger.
+- **What you can skip.** The cognitive-science debate behind the memory taxonomy; keep the split between
+  what happened, what is true and how to act, because each needs its own write rule and lifetime.
 
 ## Why it exists
 - **A model call is a pure function of its input.** Close the session and the agent forgets the user's
@@ -379,3 +394,30 @@ where the agent must answer with the latest value.
 - [ ] History in context cannot be scoped per user
 > Every step re-reads the full context, long sessions eventually exceed it, and facts buried in a huge
 > history are attended to less reliably than the same facts retrieved and placed near the question.
+
+## Use cases & projects
+### Use cases
+- **Developer assistants tied to one codebase.** Semantic facts such as "staging DB is read-only" and
+  procedural notes for the repo save the agent from re-discovering them every session.
+- **Support agents with returning customers.** User-scoped facts with dates let the agent greet a
+  customer with current plan details instead of asking again, and show when a fact may be stale.
+- **Agents in flaky environments.** Episodic records of past failures ("deploy failed on a missing env
+  var") are retrieved before the next attempt and consolidated into a checklist.
+- **Long-running tasks.** A slot budget and early compaction keep constraints and the plan in context
+  while large tool results are summarised or stored by reference.
+
+### Mini project
+**Add scoped, dated long-term memory to a chat agent (2-3 hours).**
+- **Goal:** an agent that remembers user facts across sessions, prefers the newest value and never shows
+  one user's facts to another.
+- **Steps:** extract facts at session end into a store with user id, timestamp and source; supersede
+  near-duplicates instead of appending; filter by user before scoring; blend relevance with a small
+  recency term; render the top facts with dates in a labelled block; write a test set of 10 users whose
+  details change between sessions plus a cross-user canary.
+- **Done when:** the agent answers with the latest value for every changed detail, the canary returns no
+  foreign rows, and a fact injected from a web page is rejected by write gating.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): the billing-dispute agent keeps
+per-customer memory such as preferred contact and past disputes, with provenance and a working erasure
+path.

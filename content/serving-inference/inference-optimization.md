@@ -405,3 +405,23 @@ limits; there is no demand to fill them. If traffic later grows and the pool fil
 > Cache levers (quantized cache, GQA models, prefix caching) matter when concurrency and context make the
 > cache the dominant memory traffic or the thing that caps concurrency. If the pool is mostly empty and
 > batches are small, weight bytes dominate and weight quantization is the lever.
+
+## Use cases & projects
+### Use cases
+- **Cutting agent task latency.** Locating whether a multi-step task is prefill-heavy or decode-heavy
+  picks the lever: prefix caching and shorter prompts first, decode tricks second.
+- **Lowering cost per agent task.** Routing easy steps such as classifying or summarizing a tool result to
+  a smaller model, and capping per-step `max_tokens`, cuts GPU time without touching the hard steps.
+- **Fitting more agent runs per GPU.** Weight and cache quantization raise concurrency once an agent eval
+  confirms quality holds.
+- **Triage of a slow self-hosted deployment.** The roofline and regime table tell you which flag to try
+  before buying hardware.
+
+### Mini project
+**One-lever-at-a-time optimization of an agent (2-3 hours).**
+- **Goal:** measure what each inference lever does to a real agent task's time and quality.
+- **Steps:** record a baseline for a 10-step tool-calling agent on a small eval set (task time, tokens per
+  step, pass rate); then change one thing at a time, such as stable prefix plus prefix caching, a lower
+  per-step `max_tokens`, or a quantized model; rerun the same set after each change.
+- **Done when:** you have a table of lever, task-time change and pass-rate change, and a recommendation of
+  which levers to keep.

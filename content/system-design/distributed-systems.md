@@ -486,3 +486,24 @@ longer than the TTL.
 > A paused or partitioned holder cannot know its lease lapsed. The token lets the protected resource
 > compare the acting holder's grant against the newest grant it has seen and refuse the stale one; the
 > lease still handles dead holders, and tokens have nothing to do with wall clocks.
+
+## Use cases & projects
+### Use cases
+- **Budgeting an agent run's latency.** A run deadline split across model calls, retrieval and tools
+  stops one slow dependency from consuming the whole budget.
+- **Choosing one retry owner.** When the SDK, the framework wrapper and your loop all retry, attempts
+  multiply; picking one layer keeps load and cost predictable during a provider incident.
+- **Failing over between models.** A circuit breaker on the primary provider routes to a fallback model
+  instead of piling retries onto an endpoint that is already failing.
+- **One worker per run.** A lease with fencing tokens stops a paused worker from writing stale
+  checkpoints after another worker has taken over the run.
+
+### Mini project
+**Harden an agent loop against a flaky network (2-3 hours).**
+- **Goal:** an agent loop that meets a run deadline and never double-acts under timeouts.
+- **Steps:** wrap a stub model and a fake tool API with a fault injector that adds latency, drops
+  responses and returns errors; give the run a deadline and each step a timeout; retry in one layer only,
+  with backoff and jitter; pass an idempotency key on the tool; add a circuit breaker that switches to a
+  fallback stub model; log a trace id per run.
+- **Done when:** under injected faults runs finish or fail by the deadline, the fake tool shows no
+  duplicate effects, and the trace shows exactly where each run spent its time.

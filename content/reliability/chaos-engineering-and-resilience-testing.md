@@ -5,7 +5,8 @@ name: Chaos engineering & resilience testing
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - reliability/fmea
   - reliability/circuit-breakers
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-Resilience mechanisms (fallbacks, breakers, retries, failover) run rarely and rot silently. Resilience
-testing exercises them deliberately; chaos engineering runs controlled experiments on real systems:
-hypothesis, bounded fault, measurement. For AI, faults include 429s, latency, stale retrieval and bad output.
+An agent's fallbacks, breakers, retries and step budgets run rarely and rot silently. Resilience testing
+exercises them on purpose; chaos engineering runs controlled experiments: hypothesis, bounded fault,
+measurement. Agent faults include 429s, slow tools, stale retrieval and malformed output.
+
+## For agent builders
+- **Why it matters for agents.** Agents fail in ways no unit test reaches: a 429 storm turns into a
+  fifty-step loop, a slow tool stalls every run, a fallback model rejects your tool-call format. Injecting
+  those faults on purpose is the only way to know your loop, budgets and fallbacks behave before a real
+  incident does it for you.
+- **Where it shows up in your stack.** A fault-injecting wrapper around your model client and tool adapters,
+  model stubs that return refusals or malformed JSON, Toxiproxy or mesh fault rules in front of tool APIs,
+  synthetic canaries through fallback providers, and your agent eval harness scoring runs under fault.
+- **What you control.** Which faults you inject (the top FMEA rows first), the steady-state SLIs (task
+  completion, steps per task, cost per task), the blast radius and abort rule, and the spending cap.
+- **What you can skip.** Infrastructure chaos platforms at first. Application-level hooks in your own
+  clients cover most agent faults, because you cannot make a vendor's API fail, but your client can.
 
 ## Why it exists
 - **Fallback code is the least-tested code in any system.** A team ships multi-provider failover. Six
@@ -108,6 +122,10 @@ The discipline is defined by its method, not by breaking things.
   an agent loops fifty times and a retry storm forms.
 - **Cost.** A fault that pushes traffic to a fallback model has a dollar blast radius as well as a latency
   one, so experiments need a spending cap and the cost SLI belongs in the hypothesis.
+- **Agent steady state needs agent SLIs.** Add task completion rate, steps per task and tool calls per task
+  to success rate and p95, because an agent can "succeed" after twice the steps and three times the cost.
+- **Judge with your eval set, not only status codes.** Run a fixed set of agent tasks under the fault and
+  score them with the same graders you use in CI, so a fallback model's quality drop shows up as a finding.
 
 ## Diagram
 The experiment loop: the hypothesis and abort condition come before any fault, and both outcomes (held or
@@ -179,6 +197,52 @@ async def experiment(handler, requests, min_success=0.95):
   so the fault can be applied to one percent of real traffic.
 - **The runner's abort check becomes an alert** on the experiment slice's SLIs that flips the flag off.
 
+### Fault-injecting tool adapter for an agent
+The same idea one layer down: wrap each tool the agent can call, so experiments can make one tool slow,
+failing or wrong while the model and other tools stay real.
+
+```python
+import asyncio, os, random
+
+class ChaosTool:
+    """Wraps one agent tool. Inert unless CHAOS_TOOL names this tool."""
+    def __init__(self, name, fn):
+        self.name, self.fn = name, fn
+        self.on = os.getenv("CHAOS_TOOL") == name
+        self.rate = float(os.getenv("CHAOS_RATE", "0"))
+        self.mode = os.getenv("CHAOS_MODE", "latency")
+
+    async def __call__(self, **args):
+        if self.on and random.random() < self.rate:
+            if self.mode == "latency":
+                await asyncio.sleep(8.0)                       # does the tool timeout fire?
+            elif self.mode == "error":
+                raise ConnectionError(f"{self.name} unreachable")   # does the breaker open, does the model adapt?
+            elif self.mode == "empty":
+                return []                                      # does the agent treat empty as a fact?
+        return await self.fn(**args)
+
+# Wrap every tool at startup: tools = {n: ChaosTool(n, f) for n, f in tools.items()}
+# Experiment: CHAOS_TOOL=search CHAOS_MODE=error CHAOS_RATE=0.5, then run the agent eval set.
+```
+
+### Worked scenario: 429s against an agent loop
+Illustrative results from a staging run of 500 agent tasks with 30 percent injected 429s on the model
+client, before and after the fixes the experiment produced.
+
+| SLI | Control | Fault, first run | Fault, after fixes |
+|---|---|---|---|
+| Task completion | 96% | 81% | 95% |
+| Model calls per task (median) | 6 | 19 | 8 |
+| Steps hitting the 25-step budget | 0.4% | 12% | 0.8% |
+| Cost per task | 1.0× | 2.9× | 1.3× |
+
+- **Finding:** the agent loop retried each 429 as a new step, with no backoff, so retries consumed the step
+  budget and tokens.
+- **Fixes:** retry 429s inside the client with jittered backoff honoring `Retry-After`, never as a new agent
+  step, and count waits against the run's time budget, not its step budget.
+- **Hypothesis re-run:** completion back within 1 point of control; the experiment became a weekly job.
+
 ### How long must the experiment run? A runnable sizing check
 A standard two-proportion power calculation (two-sided 5 percent, 80 percent power) for telling a 99
 percent control from a 98 percent fault arm, and what that means in hours per arm.
@@ -223,6 +287,9 @@ abort condition has proven it fires, rather than running a tiny slice for so lon
   latency toxic (for example `toxiproxy-cli toxic add -t latency -a latency=8000 <proxy>`), or use a
   service mesh's fault-injection rules (Istio's VirtualService `fault` with `delay` or `abort` and a
   percentage). Monitor breaker transitions and bulkhead rejections.
+- **Agent eval suite under fault.** In CI or nightly, run the agent's task set once clean and once per
+  top-ranked fault (a tool down, model 429s, malformed JSON, empty retrieval) and compare completion, steps
+  and cost per task. Monitor the gap between clean and faulted runs per release.
 - **Quarterly game day with the humans.** Script a scenario (primary provider down, SSO connector cut),
   page the real on-call, and time detection, decision and recovery against the runbook. Track action items
   to closure like postmortem actions.
@@ -262,6 +329,8 @@ abort condition has proven it fires, rather than running a tiny slice for so lon
   breached by your own experiment, and a difficult conversation about who caused the outage.
 - **Ignoring the cost blast radius.** Symptom: a full-traffic primary-failure drill that routes an hour of
   traffic to the expensive fallback model, visible on the next invoice.
+- **Measuring only success rate for an agent.** Symptom: the drill "passes" at 99 percent success while
+  steps and cost per task tripled. Fix: put steps, tool calls and cost per task in the hypothesis.
 
 ## When to use
 - **Begin once** the basic mechanisms exist and observability can show SLIs for an experiment slice; before
@@ -314,6 +383,14 @@ breaker's half-open probes without a thundering herd.
   20 percent; also provider calls per user request stay bounded (no loop).
 - **Blast radius and abort:** an internal tenant at one percent, abort below 98 percent success, a spending
   cap; compare against a control slice.
+
+### A tool your agent uses goes down in an experiment and task completion barely moves, but cost doubles. What happened and what do you change?
+- **The agent compensated expensively:** it likely re-called the dead tool, or reached for slower tools and
+  more steps, so it still finished but at twice the tokens.
+- **Check the traces:** tool calls per task to the failed tool, steps per task, and which errors the model
+  saw; a raw exception or vague error invites retries.
+- **Fix:** a breaker that returns a clear `tool_unavailable` result, a cap on repeat calls to the same tool,
+  and cost per task in every future hypothesis.
 
 ### How long would you run an experiment on a 1 percent slice of a 10-request-per-second service?
 - **Size from the effect you want to see:** 99 versus 98 percent success needs roughly 2,300 requests per arm

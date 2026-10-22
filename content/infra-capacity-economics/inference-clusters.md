@@ -420,3 +420,24 @@ replica, and add a readiness gate so new replicas take traffic only after warm-u
 > A cache hit saves prefill compute, but sending a request to a saturated replica trades that saving
 > for queueing time and tail-latency damage. Affinity should be a preference with a spillover rule,
 > not a hard constraint.
+
+## Use cases & projects
+### Use cases
+- **Self-hosted coding or research agents.** Long, append-only transcripts make prefix-affinity routing
+  the difference between re-prefilling 30k tokens per step and prefilling only the newest tool result.
+- **Agent platforms with interactive and background work.** Priority classes and separate pools keep
+  nightly eval sweeps and batch agents from inflating TTFT for users waiting on a chat agent.
+- **Regulated deployments that cannot use a hosted API.** The team owns the cluster, so sizing, N+1
+  spare capacity and rollout strategy become part of the agent's reliability story.
+- **Model upgrades under live traffic.** Blue/green pools let in-flight agent runs finish on the model
+  version they started with while new runs shift by weight.
+
+### Mini project
+**Route a toy agent through two replicas (2-3 hours).**
+- **Goal:** show how session affinity changes prefill work and step latency for a multi-step agent.
+- **Steps:** run two small model-server replicas locally (or two processes of any OpenAI-compatible
+  server with prefix caching on); write a tiny router that sends each request either round-robin or by a
+  hash of the run id; drive a 10-step agent loop with a fixed system prompt and fake tool results through
+  both modes; log per-step latency and, where the server exposes it, cached prompt tokens.
+- **Done when:** you have a per-step table for both routing modes, a short note on which mode keeps
+  cached tokens high and why, and a spillover rule that sends a run elsewhere when its replica is full.

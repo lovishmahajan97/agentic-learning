@@ -5,7 +5,8 @@ name: Rollback
 kind: practice
 difficulty: core
 est_minutes: 13
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - llmops-platform/canary-shadow-deployments
   - llmops-platform/model-registry
@@ -21,9 +22,20 @@ sources:
 ---
 
 ## TL;DR
-Rollback returns production to a previously validated version of the whole AI bundle (model, prompt,
-parameters, tools, index, guardrails) in minutes by repointing an alias, not rebuilding. It must be
-planned, because some AI changes destroy their own undo path.
+Rollback returns a production agent to a previously validated bundle (model, prompt, parameters, tools,
+index, guardrails) in minutes by repointing an alias, not rebuilding. It must be planned, because some
+changes destroy their own undo path and agent side effects never roll back.
+
+## For agent builders
+- **Why it matters for agents.** An agent release is a bundle of model, system prompt, tool schemas and
+  retrieval index. When a release makes the agent loop, pick wrong tools or refuse, reverting the whole
+  bundle in minutes is the fastest fix you have.
+- **Where it shows up in your stack.** A prompt or model registry with aliases, the agent's config loaded
+  from a control plane, index aliases in the vector store, and the audit log of tool calls.
+- **What you control.** Pinned snapshots in every manifest, version-keyed caches, tool and memory schemas
+  the previous version can still read, and which runs in flight finish on which version.
+- **What you can skip.** Deep GitOps tooling; a pointer, a history list and a rehearsed drill cover most
+  agent teams.
 
 ## Why it exists
 - **Container rollback does not transfer.** For a stateless service you redeploy the previous image. AI
@@ -96,6 +108,15 @@ Rollback restores behaviour, not data. Check after the flip:
   outputs in a new schema, the old version may fail to read them. Use expand-then-contract, as with
   database migrations: a release writes data the previous manifest can still read, and drops the old
   shape only after its bake window.
+
+### Agent runs in flight
+Long-running agents add a problem chat apps do not have: a task may span many steps and minutes.
+- **Pin the manifest per run.** Record the manifest id when a run starts; a checkpointed run that resumes
+  after a rollback either finishes on its original manifest or restarts on the restored one, never mixes.
+- **Prefer restart for bad releases.** If the bad version planned the task, its remaining plan is suspect,
+  so cancel and re-run from the user's request on the restored manifest.
+- **Tool schemas are part of the contract.** If the new version added a tool argument, the old version's
+  tool adapters must still accept the calls in checkpoints written by the new one, or those runs fail.
 
 ### Rehearse it
 - **A rollback never executed is a hypothesis.** Exercise it in CI (deploy v2, roll back to v1, run a
@@ -206,6 +227,19 @@ Illustrative timeline for a release that changed the prompt and swapped the mode
 | T+4 h | quality still degraded | m41 also pointed at the floating alias, which had moved underneath |
 | T+5 h | m41 re-pinned to the old snapshot and re-promoted | rollback only works on fully pinned manifests |
 
+### Worked scenario: rolling back a ticketing agent mid-run
+A ticketing agent's new manifest a18 started duplicating tickets. Figures are illustrative.
+
+| Item | Count at rollback | Handling |
+|---|---|---|
+| Runs started on a18 and finished | 2,400 | audit log lists 310 duplicate tickets to close |
+| Runs in flight on a18 (checkpointed) | 85 | cancelled, re-queued from the original request on a17 |
+| Runs in flight on a17 | 40 | untouched |
+| Memory notes written by a18 | 1,100 | tagged with manifest id, so they are quarantined in one query |
+
+- **The flip took two minutes; reconciliation took an afternoon**, which is why every tool call and
+  memory write carries the manifest id.
+
 ## Production patterns
 - **Alias-based model registry.** Point serving at an alias, not a version number: MLflow's registry lets
   you set an alias such as `champion` on a model version (`MlflowClient().set_registered_model_alias`),
@@ -225,6 +259,9 @@ Illustrative timeline for a release that changed the prompt and swapped the mode
   old image and weights are still cached on nodes. Monitor pod readiness time during drills.
 - **Scheduled rollback drills.** A CI job that deploys v2, rolls back to v1 and runs a smoke eval, plus a
   quarterly game day. Monitor time-to-rollback against the MTTR target.
+- **Manifest id on every agent action.** Tag each tool call, memory write and outbound message with the
+  manifest id and run id, so a rollback is followed by one query listing what the bad version did.
+  Monitor the share of tool calls missing the tag.
 
 ## Trade-offs
 - **Warm previous model vs cost.** Instant rollback costs GPU memory or a second serving pool; for
@@ -310,6 +347,8 @@ and minimum sample before release so the decision happens on day one rather than
 ### When would you not auto-roll back on a guard breach?
 - **Outside the bake window**, because a late breach is more often external (provider incident, traffic
   shift, broken upstream tool) and the old version shares that dependency.
+- **When the regression is in a tool, not the bundle**, for example an upstream API changing its
+  response; disable or fix the tool instead, because both versions call it.
 - **On noisy quality signals with small samples**, where auto-rollback flaps and erodes trust; route those
   to a human with a minimum sample.
 - **When the previous version is itself broken**, for example retired by the vendor; fix forward instead.
@@ -322,12 +361,20 @@ and minimum sample before release so the decision happens on day one rather than
 - **Middle ground:** keep weights on local disk of existing nodes, so a reload avoids object storage, and
   drop them after the bake window.
 
-### How do you make a new structured-output schema safe to roll back?
+### Your agent release changes how it stores tool results and memory records. How do you keep it safe to roll back?
 - **Expand then contract:** the release writes data the previous manifest can still read (additive
-  fields, both shapes for a while).
+  fields, both shapes for a while), so the old agent can still load memory and checkpoints.
 - **Drop the old shape** only after the release is past its bake window.
 - **Test it:** the CI drill rolls back after writing records with the new version and checks the old
   version reads them.
+
+### You roll back an agent release while 200 multi-step runs are in progress. What happens to them?
+- **Decide per run, by recorded manifest id:** runs on the bad version are cancelled and restarted from
+  the user's request on the restored manifest, because their plans came from the bad version.
+- **Never resume a checkpoint on a different manifest** unless both versions share the tool and state
+  schemas; mixing produces an agent run nobody evaluated.
+- **Reconcile what rollback cannot undo:** emails sent, tickets filed and memory notes written by those
+  runs, found through the audit log and memory records filtered by manifest id.
 
 ## Quiz
 ### Q: Why is "roll back the prompt but keep the new model" risky even when the model change looked harmless?
@@ -353,3 +400,23 @@ and minimum sample before release so the decision happens on day one rather than
 - [ ] Re-embedding only documents that changed since the last release
 > Blue/green indexing preserves the old vectors, so rollback is an alias switch. In-place re-embedding
 > overwrites them and turns rollback into a multi-hour rebuild.
+
+## Use cases & projects
+### Use cases
+- **A model upgrade makes the agent loop.** Steps per task jump after a model swap; the alias moves back
+  while the team fixes the prompt offline.
+- **A tool-schema change breaks tool calls.** The new schema confuses the model; rollback restores the old
+  schema and prompt together as one manifest.
+- **A RAG agent's new index retrieves worse.** The index alias swaps back to the previous collection kept
+  through the bake window.
+- **An action-taking agent misbehaves.** Rollback stops new damage; the audit log, filtered by manifest
+  id, drives cleanup of what already happened.
+
+### Mini project
+**One-button rollback for a toy agent (2 hours).**
+- **Goal:** prove a pointer flip restores an agent's behaviour, including caches and memory.
+- **Steps:** store two agent manifests (model, prompt version, tool schema version) in a JSON registry
+  with a `prod` alias; tag each tool call and memory write with the manifest id; key a response cache by
+  manifest id; promote a deliberately broken manifest, then run a rollback script and a 20-task smoke eval.
+- **Done when:** the smoke eval passes on the restored manifest, no cached answer from the broken
+  manifest is served, and one query lists every tool call and memory note the broken version made.

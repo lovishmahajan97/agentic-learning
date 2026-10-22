@@ -5,7 +5,8 @@ name: FMEA (Failure Mode and Effects Analysis)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - reliability/chaos-engineering-and-resilience-testing
   - reliability/fault-tolerance
@@ -20,9 +21,22 @@ sources:
 ---
 
 ## TL;DR
-FMEA is a table of how each part can fail (modes), what happens (effects), why (causes) and how you would
-notice (detection), ranked by Severity × Occurrence × Detection. For AI systems it is a postmortem written
-before the incident, aimed at silent failures.
+FMEA is a table of how each step of your agent can fail (modes), what happens (effects), why (causes) and
+how you would notice (detection), ranked by Severity × Occurrence × Detection: a postmortem written before
+launch, aimed at silent, wrong-tool-call failures.
+
+## For agent builders
+- **Why it matters for agents.** An agent's worst failures return 200 OK: a plausible wrong answer, a tool
+  call against the wrong record, retrieval that went stale. FMEA is the cheapest way to find those before
+  you give the agent an irreversible tool.
+- **Where it shows up in your stack.** A spreadsheet walked over your agent's loop (retrieval, prompt
+  assembly, model call, tool selection, argument filling, tool execution, memory writes), and the backlog it
+  produces: argument guards, approval gates, evals in CI, freshness alerts and chaos experiments.
+- **What you control.** Which failure modes you list (use the guide words, plus agent ones such as wrong
+  tool, looping, injected instruction), how you score detection honestly, and which control each top row
+  gets: prevention, containment or detection.
+- **What you can skip.** The automotive handbook's full Action Priority tables. Severity first, then RPN,
+  is enough for agent work.
 
 ## Why it exists
 - **Teams discover failure modes one incident at a time.** Postmortems are reactive by definition, and
@@ -50,6 +64,8 @@ before the incident, aimed at silent failures.
   authentication, rate limiting, logging and the deployment process itself.
 - **Match granularity to the decisions you can act on:** "the backend" is too coarse, individual functions
   in a file too fine.
+- **For an agent, split tool use into its decisions:** choosing the tool, filling its arguments, executing
+  it, and interpreting its result each fail differently and need different controls.
 
 ### 2. Enumerate failure modes per function
 - **A failure mode is *how* the function fails,** stated as an observable deviation, not as "it breaks".
@@ -58,6 +74,19 @@ before the incident, aimed at silent failures.
 - **Applied to retrieval** this yields "returns nothing", "returns too many chunks and truncates the
   prompt", "returns stale documents", "returns another tenant's documents", "returns the right documents
   too slowly". A team that only lists "retrieval is down" has not done the step.
+
+### Agent-specific guide words
+| Agent step | Guide word | Example failure mode |
+|---|---|---|
+| Tool selection | wrong | calls `issue_refund` when the user asked for a status check |
+| Argument filling | wrong, to the wrong recipient | copies a similar-looking order id or email from context |
+| Loop control | more, late | repeats the same failing call until the step budget runs out |
+| Tool result interpretation | wrong, partial | treats an empty search result as "no such customer" |
+| Retrieved content | without authorization | follows an instruction embedded in a retrieved document |
+| Memory write | stale, wrong | stores a wrong fact that later runs repeat as true |
+
+- **These rows carry the high severities** for agents with side effects, and they are the ones a
+  "component unavailable" checklist never produces.
 
 ### 3. Score the three factors
 | Factor | Question | Scale (1 to 10) | Note |
@@ -92,6 +121,11 @@ RPN = S × O × D          (1 to 1,000, sort descending)
 | Containment | S | a confirmation step before an irreversible tool, a spending cap |
 | Detection | D | an eval in CI, a freshness alert, a canary query |
 
+- **Agent prevention usually means taking the decision away from the model:** pass ids from structured
+  fields, narrow the tool list per task, or validate arguments against the record in scope.
+- **Agent containment means approval gates and budgets:** a human confirms refunds above a threshold, and
+  a per-run step and spend cap bounds a loop.
+
 - **Assign an owner, re-score after the action,** and revisit the table on every architectural change.
 - **A score that never changes** is a sign the table has become decoration.
 
@@ -114,8 +148,8 @@ RPN = S × O × D          (1 to 1,000, sort descending)
   that no single failure, or common pair, reaches it.
 
 ## Diagram
-The loop runs from functions to a ranked backlog; note the severity gate before the RPN sort and the
-re-score that closes the loop.
+The loop runs from the agent's steps to a ranked backlog; note the severity gate before the RPN sort and
+the re-score that closes the loop.
 
 ```mermaid
 flowchart TD
@@ -195,6 +229,9 @@ print(len(distinct), "distinct RPN values between 1 and 1,000")   # 120
 - **Process FMEA wired into change management.** Prompt edits, model version upgrades and index rebuilds go
   through an eval gate in CI, because those process rows often score highest. Monitor eval pass rate per
   change and changes shipped without the gate.
+- **Trace-driven occurrence scores.** Score O for agent rows from logged traces and eval runs, for example the
+  share of runs where the tool arguments did not match the record in scope. Monitor that rate per release;
+  a jump re-opens the row.
 - **Re-score from incidents and chaos results.** Each postmortem updates O and D for its row and adds sibling
   modes; the top rows become chaos experiment hypotheses. Monitor the date each row was last re-scored.
 
@@ -226,6 +263,9 @@ print(len(distinct), "distinct RPN values between 1 and 1,000")   # 120
 - **Treating rows as independent.** Symptom: every row has a control, yet an incident happens when two
   controls fail together, for example the canary and the alert both running on the same scheduler that
   stopped.
+- **Scoring the model as a component that "works".** Symptom: the table has rows for the provider being down
+  but none for the model choosing the wrong tool or arguments, so the approval gate never gets built. Fix:
+  add a row per tool decision using the agent guide words.
 - **Confusing cause with mode.** Symptom: rows like "engineer forgot the filter", which cannot be detected
   or scored for effect; the mode is "retrieval returns another tenant's data", the forgotten filter is one
   of its causes.
@@ -280,6 +320,14 @@ opinions.
 - **Output:** severity-9-and-10 rows first, each with an owner and a prevention, containment or detection
   action, and the D column turned into alerts.
 
+### You are about to give an agent a tool that sends payments. What does your FMEA look like, and what controls come out of it?
+- **Rows per tool decision:** wrong tool chosen, wrong payee or amount filled in, duplicated payment on retry,
+  instruction injected from a retrieved document; all severity 10, detection near 9 without controls.
+- **Controls by type:** prevention (payee id taken from a structured field, idempotency key), containment
+  (human approval above a threshold, per-run spend cap, kill switch), detection (an eval set of near-duplicate
+  payees in CI, a reconciliation alert).
+- **Re-score after each control** and add a fault tree for "money sent to the wrong party".
+
 ### Two rows both score an RPN of 100. How do you decide which to fix first?
 - **Look at the factors, not the product:** S 10, O 2, D 5 and S 5, O 4, D 5 are both 100 but the first can
   be catastrophic.
@@ -327,3 +375,24 @@ opinions.
 > A mode is the observable deviation in the function's output. The forgotten filter and the upgrade are
 > causes; the customer seeing the document is the effect. Keeping the three apart is what makes
 > occurrence, severity and detection scorable.
+
+## Use cases & projects
+### Use cases
+- **Before adding an irreversible tool.** Refunds, payments, emails or record updates get an FMEA pass and an
+  approval gate before the agent can call them.
+- **RAG agent launch reviews.** Guide words over ingestion, retrieval and tenant scoping surface stale,
+  cross-tenant and partial-retrieval rows that uptime monitoring never sees.
+- **Model or prompt upgrades.** A process FMEA turns "we changed the model" into named modes with eval gates.
+- **Choosing chaos experiments.** The top rows of the table become the first fault-injection hypotheses for
+  the agent.
+
+### Mini project
+**FMEA your own agent and close the top row (2-3 hours).**
+- **Goal:** produce a ranked failure table for a small tool-calling agent and ship one control that lowers a
+  top row's score.
+- **Steps:** pick an agent with at least one side-effecting tool; decompose its loop into steps; apply the
+  guide words and the agent guide words to each; score S, O and D with written anchors; sort with the
+  severity gate using the script above; implement one prevention or containment control and an eval that
+  exercises it.
+- **Done when:** you have a table of at least 12 rows, the top three each have an owner and action, and the
+  re-scored row shows its new O or D with the eval passing in CI.

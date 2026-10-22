@@ -381,3 +381,23 @@ a bigger k.
 > The gap is evidence-present-but-unused, a generation-side problem caused by distractors and position.
 > More k or more overlap adds distractors; a different embedding model targets recall, which is already
 > high.
+
+## Use cases & projects
+### Use cases
+- **RAG answer tools.** Returning fewer, reranked chunks with the best at the edges lifts answer accuracy
+  without touching the retriever.
+- **Long-running research agents.** Search results from early steps drift into the middle; compaction and
+  a restated goal at the end keep them usable.
+- **Coding agents with large tool outputs.** Truncating or summarising long file and log outputs keeps
+  the key lines from being buried among hundreds of others.
+- **Model and context-size choices.** A position sweep on your own model shows whether a longer context
+  window actually helps your agent or just adds distractors.
+
+### Mini project
+**Run a position sweep on your agent's model (1-2 hours).**
+- **Goal:** measure how answer accuracy changes with the position of the gold chunk in your RAG prompt.
+- **Steps:** take 30 questions with known gold chunks; build prompts with 20 chunks each, placing the gold
+  chunk at the first, middle and last positions; run them through the model your agent uses and score
+  answers; then repeat with only the top-5 reranked chunks, best first and second-best last.
+- **Done when:** you have a table and chart of accuracy by position, a comparison against the reordered
+  top-5 setup, and a one-paragraph recommendation for your search tool's k and ordering.

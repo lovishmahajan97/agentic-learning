@@ -480,3 +480,25 @@ fakes cannot drift from reality.
 > The root is where real adapters are instantiated and handed to the services that need them, so
 > nothing else reads settings or builds clients. A queryable global registry is the service-locator
 > anti-pattern, which hides dependencies instead of making them explicit.
+
+## Use cases & projects
+### Use cases
+- **Deterministic agent-loop tests.** A scripted fake `Completer` replays tool calls in order, so planning,
+  routing and stop conditions are tested in CI with no API key and no flaky text.
+- **Swapping model providers.** One `Completer` port with an adapter per vendor lets a team move a step to a
+  cheaper or self-hosted model by changing the composition root, not the agent logic.
+- **Per-environment tool wiring.** The same agent runs with sandboxed or read-only tools in staging and real
+  ticketing or payment tools in production, chosen in one place.
+- **Replay and eval harnesses.** Injecting a recorded-response model and a fixed clock lets the eval suite
+  re-run yesterday's production traces against a new prompt.
+
+### Mini project
+**Make a tool-calling agent testable without a model (1-2 hours).**
+- **Goal:** prove the agent loop's logic is correct using only injected fakes.
+- **Steps:** define `Completer`, `Tool` and `Clock` protocols and your own `Completion` and tool-call
+  dataclasses; write a small loop that calls the model, runs requested tools and stops on a final answer or
+  a step cap; build a composition root with a real provider adapter and a scripted fake that returns a
+  fixed list of tool calls; write pytest cases for "calls the right tool", "stops at the step cap" and
+  "surfaces a tool error back to the model".
+- **Done when:** the tests pass offline in under a second, the loop module imports no vendor SDK, and
+  switching to the real adapter needs a change only in the composition root.

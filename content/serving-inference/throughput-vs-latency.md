@@ -369,3 +369,23 @@ finance with cost per token at the required latency, which is the real request.
 > Speculative decoding spends extra compute drafting and verifying several tokens per step; that
 > compute is spare at low concurrency but is exactly what a saturated GPU needs, so peak throughput
 > can fall. PagedAttention, prefix caching and chunked prefill shift the curve without that penalty.
+
+## Use cases & projects
+### Use cases
+- **Interactive versus background agents.** Teams route user-facing runs to a low-latency path and send
+  nightly or bulk agent jobs to a batch tier or a high-concurrency replica.
+- **Eval and data-generation runs.** Thousands of agent runs where nobody waits are run at the throughput
+  end to cut cost and finish overnight.
+- **Parallel tools and sub-agents.** Fan-out width per run is a throughput choice that raises queue wait
+  for every other user on the same capacity.
+- **Admission control on shared replicas.** Concurrency caps keep the latency SLO for interactive agents
+  while the rest of the load queues or sheds.
+
+### Mini project
+**Find the knee for an agent workload (2-3 hours).**
+- **Goal:** chart run latency against throughput for one agent and pick an operating point.
+- **Steps:** replay the same 10-step agent task at increasing concurrency against a self-hosted model (or
+  a hosted API within your rate limits); record run latency p50 and p99 and completed runs per minute at
+  each level; mark the point where p99 starts to climb steeply.
+- **Done when:** you have a latency-versus-throughput chart with the knee marked, and a one-paragraph
+  recommendation for the interactive cap and the background setting.

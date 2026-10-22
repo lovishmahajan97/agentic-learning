@@ -460,3 +460,24 @@ the offline pipeline would produce the same symptom.
 > First-stage retrieval scores query and chunk independently for speed and recall. A cross-encoder
 > reads them together and is more accurate, but is too slow to run over the whole corpus, so it is
 > applied only to the shortlist.
+
+## Use cases & projects
+### Use cases
+- **Internal knowledge assistants.** An employee agent answers policy, HR and engineering questions from
+  a permission-aware index, citing the source page so answers can be checked.
+- **Customer support agents.** A `search` tool over help articles, past tickets and product docs grounds
+  replies, and ACL filters keep one customer's tickets out of another's answers.
+- **Research and analyst agents.** The agent issues several searches, reranks the shortlist and
+  synthesizes a cited brief, re-searching when the first results do not cover the question.
+- **Coding agents over a private codebase.** Retrieval over code, ADRs and runbooks gives the agent the
+  conventions and context that are not in the model's weights.
+
+### Mini project
+**Build a permission-aware search tool for an agent (2-3 hours).**
+- **Goal:** expose a `search` tool that returns a few cited, permitted chunks, and measure it apart from
+  the agent.
+- **Steps:** chunk 30-50 documents and tag each with an owner group; index them with keyword plus vector
+  search and fuse by rank; inject the user's groups from the session, not from the model; wrap it as a
+  tool in a small agent loop; write 20 golden queries with the expected source documents.
+- **Done when:** you report recall@5 on the golden set, show that a user without access never receives a
+  restricted chunk, and log the tokens each tool call adds to the agent's context.

@@ -410,3 +410,26 @@ autoscaler with GPU node pools. If scale-to-zero is wanted, activate from a gate
 - [ ] The cluster autoscaler detects pending requests and starts a pod
 > A trigger must be observable while nothing is running. Activate from a gateway, queue or broker metric,
 > or use the HTTP add-on; the stock HPA does not scale from zero, and nothing buffers requests by default.
+
+## Use cases & projects
+### Use cases
+- **Agent worker pools on a task queue.** Workers that pull agent tasks from Redis, RabbitMQ or SQS scale
+  on queue depth, including to zero overnight.
+- **Self-hosted agent model servers.** A vLLM Deployment scales on running plus waiting requests, so new
+  replicas arrive before agent steps start queueing.
+- **Coordinating the two layers.** Capping agent workers so their combined load cannot exceed what the
+  model replicas, at `maxReplicaCount`, can serve.
+- **Long-running agent runs and streams.** Scale-down damping and graceful drain keep a pod alive until
+  its run or stream finishes instead of cutting it off.
+
+### Mini project
+**Queue-driven agent workers with KEDA (2-3 hours).**
+- **Goal:** scale a pool of agent workers from zero on queue depth and show what happens to the model
+  layer behind them.
+- **Steps:** run a local cluster (kind or minikube) with KEDA and Redis; write a worker that pops an
+  agent task, runs a short loop against a mock model service that sleeps per call, and acknowledges only
+  when done; add a ScaledObject or ScaledJob on the Redis list length with a sensible maximum; push 200
+  tasks and watch replicas; then lower the mock model's capacity and observe the queue.
+- **Done when:** you have a timeline of queue depth, worker replicas and completed tasks, showing scale
+  from zero and back, no task lost during scale-down, and a note on where the mock model became the
+  bottleneck.

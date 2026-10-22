@@ -5,7 +5,8 @@ name: Output validation (Pydantic, Instructor, Outlines)
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/pydantic
   - python-for-ai/instructor
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Model output is a string until proven otherwise. Pydantic defines the contract, Instructor turns
-validation failures into retries with the error fed back, and Outlines constrains decoding. Shape can be
+Every tool call, plan and handoff your agent emits is a string until proven otherwise. Pydantic defines
+the contract, Instructor retries with the error fed back, and Outlines constrains decoding. Shape can be
 guaranteed; meaning must be checked.
+
+## For agent builders
+- **Why it matters for agents.** Tool arguments, plans, routing decisions and sub-agent handoffs are all
+  model output that code acts on. One unvalidated argument can write the wrong row, call the wrong
+  account or crash the loop at step 14.
+- **Where it shows up in your stack.** Tool input schemas sent to the provider, Pydantic models in the
+  tool executor, Instructor `response_model=` for extraction steps, provider structured outputs, and
+  Outlines or XGrammar when you self-host with vLLM.
+- **What you control.** The schema (closed enums, `null` or `unknown` options, field order), strict
+  versus lax coercion, how a validation error is returned to the model as a tool error, the retry budget,
+  and where a failing step goes after retries.
+- **What you can skip.** Building FSM token indexes yourself; know that constrained decoding guarantees
+  shape and nothing more, and spend your effort on semantic validators and reference-data checks.
 
 ## Why it exists
 - **Downstream code is typed; free text is not.** The failures are mundane and constant: JSON wrapped in
@@ -119,6 +133,15 @@ Two limits matter:
 3. Parse the result with Pydantic so semantic validators run.
 4. On `ValidationError`, retry with the error text (Instructor, or ten lines of your own).
 5. After N failures, route to a fallback or a review queue rather than guessing.
+
+### Inside an agent loop
+- **Validate in the tool executor, not in the tool.** Parse every tool call's arguments into a Pydantic
+  model before running anything, *because* the executor is the one chokepoint every call passes through.
+- **Return the error as a tool result.** Instead of raising, send the `ValidationError` text back as an
+  error tool result; the model reads it on the next step and repairs the call, so the retry loop is the
+  agent loop itself.
+- **Count repair attempts per tool call.** Cap them (one or two), then stop the run or escalate, so a
+  model that cannot form valid arguments does not burn the step budget.
 
 ## Diagram
 Shape is enforced during generation; meaning is enforced by Pydantic afterwards, and only semantic
@@ -237,6 +260,39 @@ except ValidationError as e:
         print(err["loc"], err["type"])     # ('amount_cents',) int_type / ('decision',) literal_error
 ```
 
+### Agent scenario: validating tool arguments in the executor
+The agent proposes `issue_refund`; the executor validates before acting and returns errors as tool
+results, so the model repairs its own call on the next step.
+
+```python
+from pydantic import BaseModel, Field, ValidationError
+
+class IssueRefundArgs(BaseModel):
+    order_id: str = Field(pattern=r"^ORD-\d{6}$")
+    amount_cents: int = Field(ge=0, le=50_000)       # hard cap: larger refunds need a human
+    reason: str = Field(min_length=10, max_length=300)
+
+TOOLS = {"issue_refund": (IssueRefundArgs, lambda a: f"refunded {a.amount_cents} on {a.order_id}")}
+MAX_REPAIRS = 2
+
+def execute(tool_use, repairs: dict) -> dict:
+    """Turn one tool_use block into a tool_result block; never run unvalidated arguments."""
+    model, fn = TOOLS[tool_use["name"]]
+    try:
+        args = model.model_validate(tool_use["input"])
+    except ValidationError as e:
+        repairs[tool_use["name"]] = repairs.get(tool_use["name"], 0) + 1
+        if repairs[tool_use["name"]] > MAX_REPAIRS:
+            raise RuntimeError("tool arguments still invalid after repairs; escalate the run")
+        return {"type": "tool_result", "tool_use_id": tool_use["id"], "is_error": True,
+                "content": f"Invalid arguments, fix and call again:\n{e}"}
+    return {"type": "tool_result", "tool_use_id": tool_use["id"], "content": fn(args)}
+
+repairs = {}
+bad = {"id": "t1", "name": "issue_refund", "input": {"order_id": "104233", "amount_cents": "8999"}}
+print(execute(bad, repairs)["content"][:80])   # pattern and missing-field errors go back to the model
+```
+
 ### Worked scenario: reading the three metrics
 Illustrative numbers from a week of an extraction pipeline, and what each one says to change.
 
@@ -256,6 +312,10 @@ Illustrative numbers from a week of an extraction pipeline, and what each one sa
   that a retry will not fix. Monitor truncation rate by input length bucket.
 - **Bounded retries, then a queue.** Keep `max_retries` small (one or two) and route the remainder to a
   fallback or human review; alert when retries per request climb, which points at the prompt or schema.
+- **Tool errors as feedback, with a repair cap.** Agent teams validate every tool call in the executor,
+  return the `ValidationError` text as an error tool result, and cap repairs per call. Monitor repair
+  rate per tool and runs stopped for invalid arguments; a spike on one tool usually means its schema
+  description drifted from the code.
 - **Strict mode for money and identifiers.** Set strict validation on fields where a coerced value is a
   silent bug, and check ids against reference data in a separate step so validators stay cheap.
 
@@ -284,6 +344,9 @@ Illustrative numbers from a week of an extraction pipeline, and what each one sa
   does not enforce, and assuming they held; values violating the rule arrive in a valid-looking object.
 - **Making every field `Optional` to reduce failures.** The model learns that `null` escapes validation;
   the symptom is a rising null rate on fields you actually needed.
+- **Raising on bad tool arguments instead of returning an error.** Symptom: one malformed call kills a
+  long agent run that the model could have repaired. Fix: return the validation error as a tool result
+  and let the next step fix it, within a repair cap.
 - **Trusting well-formed but hallucinated identifiers.** An `order_id` that matches the regex but does not
   exist produces downstream 404s, so validate against reference data for anything used as a key.
 
@@ -296,6 +359,8 @@ Illustrative numbers from a week of an extraction pipeline, and what each one sa
 - **Skip the schema** for free-form chat text, which still needs guardrails.
 - **Measure:** validation failure rate per field, retries per request and truncation rate; together they
   say whether the prompt, the schema or the token budget is the problem.
+- **In agents:** validate every tool call in the executor before it runs, and treat plans and handoffs
+  between sub-agents as typed contracts too.
 - **Interviews:** separate syntactic from semantic validity and place each tool on that line.
 
 ## Role lens
@@ -347,7 +412,15 @@ being in the prompt, so fix the prompt before raising retry limits, and track fa
 - **When a tight grammar hurts quality,** for example committing to a decision field before the reasoning
   field; reorder fields or loosen the grammar.
 
-### How do you validate an identifier the model returns?
+### Your agent sometimes calls a tool with malformed arguments. Where do you validate, and what happens next?
+- **In the tool executor,** with a Pydantic model per tool, because every call passes through it and no
+  argument should reach a side effect unparsed.
+- **Return the error, do not crash:** send the `ValidationError` text back as an error tool result so the
+  model repairs the call on its next step.
+- **Bound it:** cap repairs per call, then stop or escalate, and track repair rate per tool to find
+  schemas whose descriptions mislead the model.
+
+### Your agent passes a model-generated identifier into the next tool call. How do you validate it?
 - **Regex or pattern checks only prove format;** a well-formed but hallucinated `order_id` still causes
   downstream 404s.
 - **Look it up against reference data** in a separate step after parsing, so validators stay cheap and
@@ -379,3 +452,24 @@ being in the prompt, so fix the prompt before raising retry limits, and track fa
 > Keys, types and enums are structural and a schema or constrained decoder enforces them. A relationship
 > between two fields is semantic, lives in a `model_validator`, and when it fails the remedy is a retry
 > with the error message.
+
+## Use cases & projects
+### Use cases
+- **Tool-calling agents with write tools.** Every refund, ticket update or database write is parsed into
+  a typed argument model before it runs.
+- **Extraction steps inside agent pipelines.** Instructor or provider structured outputs turn a document
+  into a typed record the next step can trust.
+- **Planner and router outputs.** A planner's step list or a router's choice is a closed enum or typed
+  plan, so the orchestrator never acts on free text.
+- **Multi-agent handoffs.** Sub-agents exchange versioned Pydantic contracts, so a drift in one agent's
+  output fails loudly at the boundary.
+
+### Mini project
+**Self-repairing tool calls (1-2 hours).**
+- **Goal:** make an agent recover from malformed tool arguments without crashing.
+- **Steps:** define two tools with Pydantic argument models (one with a regex id, one with a cross-field
+  rule); write an executor that returns `ValidationError` text as an error tool result with a repair cap
+  of 2; run 20 tasks, including prompts that tempt bad arguments; log first-pass failures, repairs and
+  escalations per tool.
+- **Done when:** no invalid argument ever reaches a tool function, at least most bad calls are repaired
+  within one retry, and you have a per-tool table of failure type by `loc` and `type`.

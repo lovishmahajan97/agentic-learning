@@ -399,3 +399,24 @@ the base load to dedicated capacity if the utilisation arithmetic says so.
 - [ ] At 100%, when both bill the same hours
 > With a 2× premium the crossover is 50% busy; cold starts and idle windows are billed too, so the
 > real crossover is lower. Above it the dedicated card's constant price covers more tokens.
+
+## Use cases & projects
+### Use cases
+- **Eval suites on every prompt change.** A burst of agent episodes against a self-hosted model or judge,
+  then nothing until the next change, fits per-second billing and scale to zero.
+- **Scheduled and nightly agents.** Research or report agents that run a few times a day pay only for
+  their busy seconds instead of an always-on card.
+- **Low-traffic GPU tools.** An embedder, OCR model or reranker that an agent calls occasionally, where a
+  dedicated card would sit idle most of the hour.
+- **Hybrid bases for interactive agents.** A small always-warm pool for user-facing sessions, with
+  serverless overflow for spikes, so cold starts never land mid-conversation.
+
+### Mini project
+**Cold starts inside an agent loop (2-3 hours).**
+- **Goal:** measure when a serverless GPU endpoint goes cold during an agent run and fix it.
+- **Steps:** deploy a small model or embedder on a serverless GPU platform you can access; build an agent
+  loop that calls it, with a fake tool that sleeps for a configurable gap between calls; record per-call
+  latency while raising the gap past the platform's idle window; then move weights to a cached volume or
+  baked image and repeat; finally compute the break-even busy fraction against a dedicated card.
+- **Done when:** a table shows per-call latency by tool-call gap, before and after the weight-loading
+  change, plus your break-even calculation for your expected agent traffic.

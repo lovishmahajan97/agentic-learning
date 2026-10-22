@@ -434,3 +434,24 @@ gateway so the decision stays reversible.
 > fail the stated rule. The cloud provider's managed service over private networking satisfies it,
 > which shows the isolation requirement is separate from the open-versus-proprietary choice. A rule
 > demanding hosts the customer operates would exclude it too.
+
+## Use cases & projects
+### Use cases
+- **Agents over data that cannot leave.** Open weights served in your own environment keep every tool
+  result inside the boundary.
+- **Freezing agent behaviour.** A pinned open-weight revision keeps tool-call formatting stable for as
+  long as you choose, independent of a provider's retirement schedule.
+- **Fine-tuning a narrow agent step.** Open weights allow full fine-tuning or distillation of a step
+  such as tool-argument filling.
+- **Frontier planning with a private fallback.** A proprietary planner for hard steps plus an
+  open-weight model for steps that touch restricted data, behind one gateway.
+
+### Mini project
+**Run one agent on both kinds of weights (2-3 hours).**
+- **Goal:** measure what changes when an agent moves from a proprietary API to an open-weight model
+  behind an OpenAI-compatible server.
+- **Steps:** build a 3-tool agent against a proprietary API; serve an open-weight model locally with
+  Ollama or vLLM and point the same loop at it; run 20 tasks on each; record run success, tool-call
+  parse failures, latency and cost; read the open model's licence and note any clauses that matter.
+- **Done when:** a table compares both setups on success, tool-call validity, p95 latency and cost per
+  run, and a short note says which agent roles you would place on each and why.

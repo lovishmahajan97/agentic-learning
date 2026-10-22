@@ -5,7 +5,8 @@ name: Audit trails
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - security-governance-compliance/compliance-architecture
   - security-governance-compliance/ai-incident-response
@@ -22,43 +23,56 @@ sources:
 
 ## TL;DR
 An audit trail is an append-only, tamper-evident record of who did what, when, with which inputs and
-versions. AI needs more, because without the prompt, model version, retrieved context and tool
-calls recorded at the time, an output cannot be explained later.
+versions. For agents: one event per tool call, with the human principal, model and prompt versions
+and retrieved context, because runs cannot be replayed.
+
+## For agent builders
+- **Why it matters for agents.** Agents act: they send emails, issue refunds, change records. When one does
+  something wrong, the question is "which step, on which retrieved text, under which model and prompt, for
+  which user, led to this action". Only evidence written at the time answers it.
+- **Where it shows up in your stack.** The tool-execution layer of your agent loop (where every tool call
+  passes), your approval-gate service, a transactional outbox in your app database, and an isolated WORM
+  store such as S3 Object Lock in compliance mode.
+- **What you control.** The event schema (actor, on-behalf-of user, run ID, step number, versions, input
+  references, decision), writing the event in the same transaction as the side effect, and keeping
+  personal content out of the chain itself.
+- **What you can skip.** Building your own transparency-log service on day one. A per-partition hash chain,
+  an anchored head in a separate account and a WORM bucket cover most agent deployments.
 
 ## Why it exists
 - **Someone will ask "why did the system do that?"** A customer disputing a denied refund, a regulator
-  asking how an applicant was screened, a security team investigating an agent that emailed a file
-  outside the company. The answer must come from evidence written at the time, because nothing else
-  survives.
+  asking how an applicant was screened, a security team investigating an agent that emailed a file outside
+  the company. The answer must come from evidence written at the time, because nothing else survives.
 - **You cannot re-run the request.** The provider may have updated the model, the prompt template has
   changed twice, the retrieved document was edited, and sampling is not deterministic even with the same
-  inputs.
+  inputs. A multi-step agent run compounds this: each step depends on every earlier tool result.
 - **Application logs fail as evidence.** Written for debugging, they are sampled, rotated after days,
   missing the fields that matter (which model version? which document chunks?), and editable by the
   engineers whose actions might be in question. A log line an administrator can delete proves nothing.
-- **Traces have the right shape, wrong guarantees.** Observability traces are optimized for recent,
-  aggregate debugging and are often sampled at a few percent.
-- **Compliance formalizes the need.** HIPAA's Security Rule requires audit controls on systems holding
-  health data; SOC 2 auditors test that security-relevant events are logged and reviewed; the EU AI Act
-  requires high-risk AI systems to support automatic recording of events over their lifetime. An audit
-  trail is built to meet those guarantees on purpose.
+- **Traces have the right shape, wrong guarantees.** Observability traces of agent runs are optimized for
+  recent, aggregate debugging and are often sampled at a few percent.
+- **Compliance formalizes the need.** HIPAA's Security Rule requires audit controls on systems holding health
+  data; SOC 2 auditors test that security-relevant events are logged and reviewed; the EU AI Act requires
+  high-risk AI systems to support automatic recording of events over their lifetime. An audit trail is
+  built to meet those guarantees on purpose.
 
 ## How it works
-### What goes in an AI audit event
+### What goes in an agent audit event
 An event answers who, what, when, on what basis and with what result.
 
 | Field group | Contents | Because |
 |---|---|---|
 | **Actor** | Authenticated user or service identity, tenant, and for agents the human on whose behalf it acted | "The agent did it" is not an accountable answer, so record both |
 | **Action and resource** | e.g. `claim.decision`, `tool.send_email`, with the target object ID | Lets you find every event for one object |
+| **Run position** | Agent run ID and step number | Reconstructs the sequence of tool calls that led to the action |
 | **Versions** | Model ID as returned by the provider, prompt template version, system config hash, index or embedding version, guardrail policy version | Every one of them changes behaviour, so they make reconstruction possible |
 | **Inputs by reference** | Request ID, retrieved document IDs and content hashes, tool arguments | Full prompts often contain personal data and would make the audit store your largest PII copy |
 | **Output and decision** | Output (or its hash and a pointer to a retained copy), action taken, human approval with approver identity, overrides | The dispute is about the decision and who changed it |
 | **Time** | From a trusted clock, plus the trace ID linking to the debugging trace | Ordering and the link back to debugging detail |
 
-- **A hash only proves *which* text was used if you can still produce that text.** References must point
-  at a versioned document store (or a retained payload store) whose own retention is at least as long as
-  the trail's.
+- **A hash only proves *which* text was used if you can still produce that text.** References must point at
+  a versioned document store (or a retained payload store) whose own retention is at least as long as the
+  trail's.
 
 ### Tamper evidence
 Two mechanisms, usually combined:
@@ -76,23 +90,23 @@ Two mechanisms, usually combined:
 
 ### Scaling the chain
 - **One chain is a bottleneck.** It serializes every write through one "previous hash" when many services
-  emit events.
-- **Use per-partition chains plus a Merkle tree.** Chain per service or tenant, then periodically build a
-  Merkle tree over the latest heads or over each batch of events; only its root is anchored. This is the
-  structure of transparency logs such as Certificate Transparency.
+  and agents emit events.
+- **Use per-partition chains plus a Merkle tree.** Chain per service, agent or tenant, then periodically
+  build a Merkle tree over the latest heads or over each batch of events; only its root is anchored. This
+  is the structure of transparency logs such as Certificate Transparency.
 - **Bonus: inclusion proofs.** You can prove a single record is included by handing an auditor a short
   Merkle path, without exposing other tenants' events.
 
 ### Separation of duties
 - **Isolated store.** The audit store lives in a different account or project from the application.
-- **Append-only writes.** Writes go through an append-only path and the application's credentials cannot
-  delete.
+- **Append-only writes.** Writes go through an append-only path and the application's (and the agent's)
+  credentials cannot delete.
 - **Logged reads.** Auditors and investigators get read-only access that is itself logged.
-- **Why:** the threat model includes insiders and a compromised application.
+- **Why:** the threat model includes insiders, a compromised application and a prompt-injected agent.
 
 ### Retention vs erasure
-Audit trails want to keep everything; privacy law wants personal data minimized and deletable. Resolve
-it by design:
+Audit trails want to keep everything; privacy law wants personal data minimized and deletable. Resolve it
+by design:
 - **Pseudonymous identifiers** in the trail.
 - **Content payloads stored separately** under their own retention.
 - **Crypto-shredding** (per-subject encryption keys you destroy on erasure) where content must be retained
@@ -116,17 +130,17 @@ The test of the design is "show everything that led to decision D":
 2. Verify its chain position against the latest anchor.
 3. Follow the version fields to the exact prompt template and guardrail policy in their registries.
 4. Follow the document references to the versioned store and check the content hashes match.
-5. Join any later override events on the same object.
+5. Join any later override events on the same object, and the earlier steps of the same agent run.
 
 If any hop needs a person's memory or a system that has since been rotated, the trail has a gap.
 
 ## Diagram
-Trace one consequential action: the event is written with the business change, chained, stored as
-WORM, and its head anchored outside the writer's reach.
+Trace one agent tool call: the event is written with the business change, chained, stored as WORM, and
+its head anchored outside the writer's reach.
 
 ```mermaid
 flowchart TD
-    A["Agent or service action"] --> T["DB transaction: action plus outbox row"]
+    A["Agent step: tool call"] --> T["DB transaction: action plus outbox row"]
     T --> O["Outbox relay"]
     O --> W["Audit writer: hash chain per partition"]
     W --> S[("WORM store, compliance mode")]
@@ -138,9 +152,9 @@ flowchart TD
 ```
 
 ## Examples
-### Hash-chained audit log with verification
-A minimal hash-chained audit log. In production the chain would be appended to WORM storage and the
-head hash anchored elsewhere.
+### Hash-chained audit log for an agent run
+A refund agent's run, one event per step, then a human override. In production the chain would be
+appended to WORM storage and the head hash anchored elsewhere.
 
 ```python
 import hashlib, json, time
@@ -166,29 +180,39 @@ def verify(log: list):                    # index of first broken record, or Non
         prev = rec["hash"]
     return None
 
+run = {"actor": "svc:refund-agent", "on_behalf_of": "user:4821", "run_id": "run-93a",
+       "model": "provider-model-2026-05", "prompt_version": "refund-v14"}
 log = []
-append(log, {"actor": "svc:refund-agent", "on_behalf_of": "user:4821", "action": "refund.decide",
-             "model": "provider-model-2026-05", "prompt_version": "refund-v14",
-             "retrieved": ["policy-77#sha256:9f1c..."], "decision": "deny", "approver": None})
-append(log, {"actor": "user:ops-17", "action": "refund.override", "decision": "approve",
-             "reason": "policy-77 outdated"})
+append(log, {**run, "step": 1, "action": "tool.search_policy", "retrieved": ["policy-77#sha256:9f1c..."]})
+append(log, {**run, "step": 2, "action": "refund.decide", "decision": "deny", "approver": None})
+append(log, {"actor": "user:ops-17", "action": "refund.override", "run_id": "run-93a",
+             "decision": "approve", "reason": "policy-77 outdated"})
 anchor = (len(log), log[-1]["hash"])      # copied to a store the writer cannot alter
 print(verify(log))                         # None: chain intact
-dropped = log[:1]                          # an insider deletes the override record
+dropped = log[:2]                          # an insider deletes the override record
 print(verify(dropped), len(dropped) < anchor[0])   # None True: chain still verifies, anchor exposes it
-log[0]["decision"] = "approve"             # an insider edits history
-print(verify(log))                         # 0: tampering detected at record 0
+log[1]["decision"] = "approve"             # an insider edits history
+print(verify(log))                         # 1: tampering detected at record 1
 ```
 
-- **The middle case matters.** Deleting the newest record leaves a perfectly valid chain, which is why
-  the head must be anchored outside the writer's reach.
-- **The second record shows why overrides are logged.** The dispute can be answered with the original
-  model decision, its inputs, and the human who reversed it.
+- **The middle case matters.** Deleting the newest record leaves a perfectly valid chain, which is why the
+  head must be anchored outside the writer's reach.
+- **The step events show why runs are logged per tool call.** The dispute can be answered with the policy
+  text the agent retrieved at step 1, the model decision at step 2, and the human who reversed it.
+
+### Worked scenario: investigating an agent that emailed a file outside the company
+| Question | Field that answers it | Without it |
+|---|---|---|
+| Who was the agent acting for? | `on_behalf_of` on the `tool.send_email` event | "The service account did it" |
+| Which step chose the recipient? | run ID plus step number, e.g. step 6 of 9 | Only the final answer survives |
+| Did injected text steer it? | retrieved document IDs and hashes at steps 1-5 | No way to find the poisoned document |
+| Was a guardrail in force? | guardrail policy version | Cannot tell a config bug from a model failure |
+| Did a provider update change behaviour? | model ID as returned in the response | "model: gpt" proves nothing |
 
 ### WORM bucket for the audit store (AWS CLI)
-Enable S3 Object Lock when creating the bucket (it cannot be turned off later). A default retention rule
-in compliance mode then stops anyone, including the root user, deleting or overwriting a locked object
-version before its retention expires.
+Enable S3 Object Lock when creating the bucket (it cannot be turned off later). A default retention rule in
+compliance mode then stops anyone, including the root user, deleting or overwriting a locked object version
+before its retention expires.
 
 ```bash
 aws s3api create-bucket --bucket acme-ai-audit --region us-east-1 \
@@ -203,10 +227,14 @@ aws s3api put-object-lock-configuration --bucket acme-ai-audit \
   obligations get their own bucket or a longer per-object retention.
 - **Compliance mode cannot be shortened,** so test with governance mode first; a wrong long retention on
   personal content cannot be undone.
-- **Grant the application `s3:PutObject` only,** and run the anchoring job under a different account.
+- **Grant the application and agent roles `s3:PutObject` only,** and run the anchoring job under a
+  different account.
 
 ## Production patterns
-- **Transactional outbox for audit events.** When an action changes business state, insert the audit
+- **Audit at the tool-execution layer.** Wrap the single function every agent tool call passes through so
+  it emits an audit event with run ID, step, tool name, argument references and result status, instead of
+  trusting each tool to log itself. Monitor tool calls in traces that have no matching audit event.
+- **Transactional outbox for audit events.** When a tool call changes business state, insert the audit
   event into an outbox table in the same database transaction and let a relay publish it to the audit
   writer with retries. Monitor outbox lag and rows older than a few minutes.
 - **Head anchoring on a schedule.** Every few minutes, a job in a separate account reads each partition's
@@ -215,46 +243,46 @@ aws s3api put-object-lock-configuration --bucket acme-ai-audit \
 - **Exact model version from the response.** Record the model identifier the provider returns in the
   response body, not the alias you requested, alongside prompt template and guardrail policy versions.
   Monitor the count of distinct model versions per day to catch silent provider updates.
-- **Reconstruction drill.** Each quarter, pick a random past decision and time how long it takes to
+- **Reconstruction drill.** Each quarter, pick a random past agent action and time how long it takes to
   answer "show everything that led to D" end to end. Track the time and every hop that needed a person's
   memory.
-- **Completeness reconciliation.** Nightly, compare counts of business decisions in the system of record
-  with audit events of the same action type. Alert on any difference, because a missing event looks like
-  concealment.
+- **Completeness reconciliation.** Nightly, compare counts of business decisions and agent side effects in
+  the system of record with audit events of the same action type. Alert on any difference, because a
+  missing event looks like concealment.
 
 ## Trade-offs
-- **Full payloads vs references.** Logging full prompts and outputs makes reconstruction easy but creates
-  a large sensitive-data store; references plus hashes flip the balance when inputs contain personal or
-  regulated data.
+- **Full payloads vs references.** Logging full prompts, tool results and outputs makes reconstruction easy
+  but creates a large sensitive-data store; references plus hashes flip the balance when inputs contain
+  personal or regulated data.
 - **Synchronous vs asynchronous writes.** Transactional audit writes guarantee completeness but add latency
-  and a dependency; asynchronous writes via an outbox are fine as long as delivery is guaranteed, not
-  best-effort.
+  to every agent step and a dependency; asynchronous writes via an outbox are fine as long as delivery is
+  guaranteed, not best-effort.
 - **WORM vs correction.** WORM retention prevents tampering but also prevents correcting mistakes and
   honouring erasure; it fits metadata and decisions better than raw personal content.
 - **Long retention vs exposure.** It helps disputes and audits years later, but every extra year raises
   storage cost, breach impact and discovery exposure; set it per record type from actual obligations.
 
 ## Pitfalls
-- **Recording "model: gpt" or an alias instead of the exact version returned.** Symptom: an incident
-  review that cannot tell whether a provider model update caused the change.
-- **Using the sampled debugging log pipeline as the audit trail.** Symptom: a disputed decision whose
-  event simply is not there.
-- **Letting the application role delete or rewrite audit records.** Symptom: an auditor finding that
-  integrity of the trail cannot be demonstrated.
+- **Recording "model: gpt" or an alias instead of the exact version returned.** Symptom: an incident review
+  that cannot tell whether a provider model update caused the change. Fix: log the response's model ID.
+- **Using the sampled debugging log pipeline as the audit trail.** Symptom: a disputed decision whose event
+  simply is not there. Fix: a separate, unsampled audit path.
+- **Letting the application or agent role delete or rewrite audit records.** Symptom: an auditor finding
+  that integrity of the trail cannot be demonstrated. Fix: append-only credentials and an isolated account.
 - **Logging the agent's action but not the human principal.** Symptom: an investigation that ends at "the
-  service account did it".
+  service account did it". Fix: propagate the user identity into every tool call.
 - **Storing raw prompts with personal data indefinitely.** Symptom: an erasure request that cannot be
-  fulfilled without breaking the audit chain.
+  fulfilled without breaking the audit chain. Fix: references, separate payloads, crypto-shredding.
 
 ## When to use
-- **Use when:** an AI system makes or informs decisions about people or money, takes actions through
+- **Use when:** an agent or AI system makes or informs decisions about people or money, takes actions through
   tools, touches regulated data, or must pass SOC 2, HIPAA or EU AI Act scrutiny.
-- **Lighter option:** for a low-risk internal assistant, structured logs with longer retention may be
-  enough.
+- **Lighter option:** for a low-risk internal read-only assistant, structured logs with longer retention may
+  be enough.
 - **Decide early:** fix the event schema at design time, alongside the threat model, because retrofitting
-  version and provenance fields is hard.
-- **Measure:** completeness (share of decisions with an audit event), integrity checks passing, and time
-  to answer a reconstruction query.
+  version and provenance fields into an agent loop is hard.
+- **Measure:** completeness (share of decisions and side effects with an audit event), integrity checks
+  passing, and time to answer a reconstruction query.
 - **Interviews:** distinguish audit trails from observability: different retention, access, integrity and
   completeness guarantees.
 
@@ -279,24 +307,32 @@ too: hash chaining or WORM storage lets me show the record was not altered after
 
 ## Interview questions
 ### How is an audit trail different from logging and tracing you already have?
-- **Different guarantees:** complete (no sampling), retained for the legal period, integrity-protected,
-  and readable only through logged, read-only access.
+- **Different guarantees:** complete (no sampling), retained for the legal period, integrity-protected, and
+  readable only through logged, read-only access.
 - **Different content:** actor and human principal, exact versions and input references, because the goal
   is reconstruction and defence, not recent aggregate debugging.
 
 ### An agent emailed a confidential file to an outside address. What would you need from the trail to investigate?
 - **The run:** one event per tool call with run ID and step number, so you can see which step chose the
   recipient.
-- **The basis:** retrieved document IDs and hashes and the tool arguments, to see whether injected text
-  in a document steered it.
-- **The principal and versions:** the human the agent acted for, the model version and prompt and
-  guardrail versions in force at that moment.
+- **The basis:** retrieved document IDs and hashes and the tool arguments, to see whether injected text in
+  a document steered it.
+- **The principal and versions:** the human the agent acted for, the model version and prompt and guardrail
+  versions in force at that moment.
+
+### Where in an agent framework would you emit audit events so none are missed?
+- **At the single tool-execution chokepoint,** not inside each tool, so a new tool cannot ship without
+  being audited.
+- **In the same transaction as the side effect** (or via an outbox), so a refund cannot commit without its
+  event.
+- **At approval gates too,** recording the proposed action, the approver identity and the decision, then
+  reconcile nightly against the system of record.
 
 ### Hash chaining or WORM storage: which would you choose, and when would you use both?
-- **Chaining detects** edits and deletions on re-verification but cannot stop them, and a bare chain
-  misses truncation and full rewrites unless the head is anchored.
-- **WORM prevents** overwrite and deletion until retention ends, even for admins, but cannot be corrected
-  or erased early.
+- **Chaining detects** edits and deletions on re-verification but cannot stop them, and a bare chain misses
+  truncation and full rewrites unless the head is anchored.
+- **WORM prevents** overwrite and deletion until retention ends, even for admins, but cannot be corrected or
+  erased early.
 - **Use both** for regulated decisions: WORM for prevention, an anchored chain to prove to an auditor that
   nothing is missing.
 
@@ -306,8 +342,8 @@ too: hash chaining or WORM storage lets me show the record was not altered after
   must become unreadable.
 - **Confirm retention per record type with legal,** because some records must outlive an erasure request.
 
-### Your audit writer cannot keep up with 50 services sharing one chain. What do you change?
-- **Partition the chain** per service or tenant so writes no longer serialize on one previous hash.
+### Your audit writer cannot keep up with 50 services and agents sharing one chain. What do you change?
+- **Partition the chain** per service, agent or tenant so writes no longer serialize on one previous hash.
 - **Anchor a Merkle root** over the partition heads periodically, as transparency logs do.
 - **Gain inclusion proofs:** you can show one record's presence to an auditor without exposing other
   tenants' events.
@@ -337,3 +373,26 @@ too: hash chaining or WORM storage lets me show the record was not altered after
 > Separating identity and content from the integrity chain lets you erase or render personal content
 > unreadable while the trail of decisions and versions stays intact. Blanket exemptions are not a safe legal
 > assumption and must be confirmed with counsel.
+
+## Use cases & projects
+### Use cases
+- **Agents with write tools.** Refund, booking, ticketing and email agents need a per-step trail so every
+  side effect can be tied to a user, a run and the evidence the agent saw.
+- **Prompt-injection investigations.** Retrieved document hashes per step show which document steered the
+  agent toward a harmful tool call.
+- **Regulated decision support.** Credit, hiring or claims agents must reconstruct a decision months later,
+  after the model and prompt have changed.
+- **Human-in-the-loop overrides.** Approval and override events prove who reversed an agent's decision and
+  why.
+
+### Mini project
+**Tamper-evident audit layer for a tool-calling agent (2-3 hours).**
+- **Goal:** every tool call in a small agent produces a hash-chained audit event that survives tampering
+  tests.
+- **Steps:** build an agent with three tools including one fake write tool; wrap the tool executor so each
+  call appends an event (actor, on-behalf-of user, run ID, step, model ID from the response, prompt version,
+  argument hashes); write the head hash and sequence number to a separate file as the anchor; write a
+  verifier and a reconstruction query by run ID.
+- **Done when:** editing any past event, deleting the newest one, or calling a tool outside the wrapper is
+  detected by the verifier or the nightly count check, and a reconstruction query prints the full step
+  history of one run.

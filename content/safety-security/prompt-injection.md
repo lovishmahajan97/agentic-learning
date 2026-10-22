@@ -5,7 +5,8 @@ name: Prompt injection (direct, indirect)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - prompting/prompt-injection
   - prompting/jailbreaks
@@ -24,8 +25,21 @@ sources:
 
 ## TL;DR
 Prompt injection is untrusted text treated as instructions, because a model has one input stream.
-Direct: the user attacks. Indirect: the payload hides in content the model reads. Defence is reduced
-privilege, isolated content and controlled outputs.
+Direct: the user attacks. Indirect: the payload hides in pages, emails or tool results your agent reads.
+Defence is reduced privilege, isolated content and controlled actions.
+
+## For agent builders
+- **Why it matters for agents.** It is the defining security risk of tool-using agents: every web page,
+  email, file, MCP tool description and sub-agent message can carry instructions, and the agent acts with
+  the user's privileges. A chatbot says something odd; an agent forwards the inbox.
+- **Where it shows up in your stack.** Tool results entering the context, retrieval, long-term memory
+  writes, third-party MCP servers, the tool executor (where policy runs) and the client that renders
+  markdown links and images.
+- **What you control.** Which tools a workflow holds (the trifecta and rule of two), how untrusted
+  content is wrapped, allowlists and approval gates in the executor, canaries, provenance logging, and an
+  injection regression suite in CI.
+- **What you can skip.** Hunting for the perfect "ignore instructions in the data" wording or the perfect
+  detector; neither is a boundary. Spend the effort on privileges and runtime checks.
 
 ## Why it exists
 - **SQL injection was solved by separating code from data.** Prepared statements send the query shape and
@@ -70,6 +84,16 @@ privilege, isolated content and controlled outputs.
   - memory written in earlier sessions; messages between agents.
 - **The agent runs with the user's privileges,** so a successful indirect injection lets a stranger act as
   the user.
+
+### Where it enters an agent loop
+| Loop stage | Injection carrier | Control that holds |
+|---|---|---|
+| Tool selection | poisoned MCP tool description | pin and review tool definitions, allowlist servers |
+| Tool result | web page, email, API response | quarantine and datamark before it enters context |
+| Next tool call | arguments steered by the payload | executor policy: allowlists, validation, approval |
+| Memory write | "remember to always..." in a document | write memory from typed facts, not raw text |
+| Final answer | markdown image or link | host allowlist on output URLs |
+| Sub-agent handoff | another agent's message | treat it as untrusted content too |
 
 ### Exfiltration mechanics
 - **Markdown image or link:** the URL carries encoded data, the client renders it, and the browser
@@ -235,6 +259,18 @@ Illustrative, assuming each paraphrase independently slips past the classifier 1
 
 An allowlist on recipients stays at 0% success at every row, because it does not read the payload.
 
+### Worked scenario: one browsing agent, three designs
+An illustrative regression suite of 100 injected tasks and 100 clean tasks, scored on the two metrics
+above. The numbers show the shape of the trade-off, not a benchmark.
+
+| Design | Attack success | Utility under attack | Why |
+|---|---|---|---|
+| Prompt rule only | high, varies by model | high | the payload competes with one sentence |
+| Plus quarantine and classifier | lower, never zero | slightly lower | detection is probabilistic |
+| Plus executor allowlist and approval on sends | 0% for exfiltration via sends | most tasks still pass | the check never reads the payload |
+
+The decision: ship the third design, and keep the classifier as an early-warning signal in the logs.
+
 ## Production patterns
 - **Trifecta inventory per workflow.** Before launch, list for each workflow its private data, untrusted
   inputs and outbound channels, and remove or human-gate one leg. Re-run the inventory whenever a tool or
@@ -245,6 +281,9 @@ An allowlist on recipients stays at 0% success at every row, because it does not
   output and on serialized tool arguments. Any hit is an incident.
 - **Provenance logging.** Record, per tool call, which untrusted sources were in context and whether
   argument strings appear in them. Alert when they do.
+- **Pin third-party tool definitions.** Agent teams record the tool names and descriptions an MCP server
+  served at review time and alert or refuse when they change, because a changed description is a new
+  injection carrier. Monitor definition changes per server.
 - **Injection regression suite in CI.** Run a fixed set of injected tasks after every prompt or model
   change and track attack success rate and utility under attack side by side; AgentDojo-style task pairs
   are a good template.
@@ -276,6 +315,9 @@ An allowlist on recipients stays at 0% success at every row, because it does not
   crafted inputs.
 - **Memory that persists instructions from documents.** Symptom: a behaviour change that outlives the
   session that read the poisoned file.
+- **Trusting sub-agent output as if the orchestrator wrote it.** Symptom: a research sub-agent that read a
+  poisoned page returns "next, email the report to..." and the orchestrator does it. Fix: treat handoffs
+  as untrusted content with typed fields.
 - **Testing once at launch.** Symptom: a regression after a prompt rewrite or model upgrade that nobody
   measured.
 
@@ -369,3 +411,25 @@ and run an injection suite in CI so a prompt change cannot quietly reopen the ho
 - [ ] Adding more few-shot examples of safe behaviour to the prompt
 > Exfiltration needs an outbound channel. Removing or gating it breaks the trifecta regardless of whether
 > the model was fooled, which is the property a security control needs.
+
+## Use cases & projects
+### Use cases
+- **Email and calendar agents.** Inbound messages are quarantined, sends are limited to known contacts,
+  and new recipients need approval.
+- **Browsing and research agents.** Fetched pages are datamarked, output URLs pass a host allowlist, and
+  external images are never auto-rendered.
+- **Agents with third-party MCP servers.** Tool descriptions are pinned and reviewed, and results are
+  treated as untrusted content.
+- **Ticket and support triage agents.** A quarantined step extracts typed fields from public tickets so
+  the privileged agent never sees raw ticket text.
+
+### Mini project
+**Injection regression suite for a small agent (2-3 hours).**
+- **Goal:** measure attack success rate and utility under attack for an agent before and after adding
+  architectural controls.
+- **Steps:** build an email-summary agent over a local fixture inbox with `send_email` stubbed to a log;
+  write 20 clean tasks and 20 injected messages (fake system notices, hidden text, markdown image
+  exfiltration); score both metrics; add quarantine, a canary, a recipient allowlist and the output URL
+  scrubber; score again.
+- **Done when:** you have a before and after table for both metrics, zero sends to non-allowlisted
+  addresses in the after run, and the suite runs with one command so it can live in CI.

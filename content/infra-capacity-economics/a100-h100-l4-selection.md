@@ -409,3 +409,24 @@ or fp8 becomes necessary.
 > Cost per token depends on utilisation. The H100 is far cheaper per token at full load, but at a few
 > percent utilisation the hourly price dominates and the L4's lower bandwidth still meets an
 > internal tool's latency needs. The L4 does not support MIG.
+
+## Use cases & projects
+### Use cases
+- **Tiering an agent stack by workload.** The agent model on high-bandwidth cards, embedders and
+  rerankers on cheap ones, offline eval judges wherever cost per token is lowest.
+- **Long-context agents.** Transcripts that grow every step push the agent model toward 80 GB cards or
+  fp8, because fit is the first binding constraint.
+- **Low-traffic internal agents.** A small model at a few requests per minute usually belongs on a cheap
+  card, since an idle premium card's hourly price dominates cost per token.
+- **Re-validating after a hardware move.** Moving an fp8-validated agent model to cards without fp8
+  changes numerics, so the agent eval suite must be rerun before cut-over.
+
+### Mini project
+**Cost-per-agent-run comparison across card tiers (1-2 hours).**
+- **Goal:** pick a card for a self-hosted agent model from cost per completed agent run, not list price.
+- **Steps:** define an agent profile (steps per run, input and output tokens per step, runs per hour at
+  peak and off-peak); for L4, A100 and H100 write down memory, bandwidth and your cloud's hourly price;
+  estimate whether the model and the longest transcript fit, per-step decode time from bytes divided by
+  bandwidth, and utilisation at your load; compute cost per run for each card.
+- **Done when:** a table shows fit, estimated run latency and cost per run per card at both load levels,
+  with a one-paragraph recommendation that names the binding constraint.

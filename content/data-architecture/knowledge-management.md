@@ -5,7 +5,8 @@ name: Knowledge management
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - data-architecture/document-processing-pipelines
   - data-architecture/ingestion-pipelines
@@ -18,18 +19,31 @@ related:
 ---
 
 ## TL;DR
-Retrieval cannot beat its corpus, and enterprise corpora are stale, duplicated and unowned. Knowledge
-management decides canonical sources, owners, lifecycle and metadata, so the retriever chooses among
-correct candidates; many "hallucination" reports trace here, not to the model.
+An agent's retrieval tool cannot beat its corpus, and enterprise corpora are stale, duplicated and
+unowned. Knowledge management sets canonical sources, owners, lifecycle and metadata, so the agent picks
+among correct candidates; many "hallucination" reports trace here, not to the model.
+
+## For agent builders
+- **Why it matters for agents.** An agent trusts whatever its `search` tool returns and acts on it: it
+  quotes the refund window, files the ticket, sends the email. A stale or draft chunk becomes a wrong
+  action, not just a wrong sentence, so corpus quality is an agent safety concern.
+- **Where it shows up in your stack.** The ingestion connectors that feed your vector store, the metadata
+  fields your retrieval tool filters and returns, the split between "search the index" tools and "look up
+  the live value" tools, and the triage queue behind your agent's thumbs-down button.
+- **What you control.** Which fields every chunk must carry (authority, lifecycle, ACL, verified date),
+  what the retrieval tool returns to the model alongside the text, which facts are served by live API
+  tools instead of the index, and where failures get routed.
+- **What you can skip.** Library-science taxonomy theory and full enterprise content-management
+  programmes. A small required metadata schema, a glossary and an owner per source cover most of it.
 
 ## Why it exists
 - **Similarity is not correctness.** Point a crawler at a wiki, a ticketing system and a shared drive, and
   "what is the refund window" matches a 2019 policy page, a 2023 revision, a never-approved draft, a Slack
   export of someone guessing, and three copies of one PDF with different file names. The retriever ranks by
-  similarity, which has nothing to do with correctness or currency, so the model's blended answer is
+  similarity, which has nothing to do with correctness or currency, so the agent's blended answer is
   confidently wrong.
-- **Better models do not fix bad candidates.** The embedding model, the reranker and the prompt all operate
-  on candidates, and the candidates are the problem.
+- **Better models do not fix bad candidates.** The embedding model, the reranker, the prompt and the agent
+  planner all operate on candidates, and the candidates are the problem.
 - **"Index more, the model will sort it out" fails.** The model has no signal that one chunk is
   authoritative and another deprecated unless the data carries it. Larger context windows make it worse:
   more contradictory passages fit, and the model's choice between them is arbitrary.
@@ -46,7 +60,7 @@ correct candidates; many "hallucination" reports trace here, not to the model.
 - **Why:** retrieval needs a tiebreaker between similar passages, and "which source is authoritative for
   this topic" is the one humans use.
 - **Encode it** as a `source_rank` or `authority` field on every chunk, so the retriever or reranker can
-  prefer canonical sources and the generator can cite them.
+  prefer canonical sources and the agent can cite them.
 - **Secondaries still help recall,** but they should lose to primaries on conflict.
 
 ### Assign ownership and freshness expectations
@@ -70,41 +84,46 @@ correct candidates; many "hallucination" reports trace here, not to the model.
 
 ### Deduplicate and canonicalize
 - **Why:** near-duplicates waste context slots and make the retriever look confident when it has really
-  found the same passage three times.
+  found the same passage three times; agents also read three agreeing hits as corroboration.
 - **Exact duplicates** are caught by content hashing at ingestion.
 - **Near-duplicates** (the same PDF exported twice with different headers) need a similarity threshold or a
   MinHash pass, plus a rule for which copy survives, usually the one in the canonical source.
 - **Keep the mapping,** so retrieval hits on a discarded copy can be redirected to the surviving one.
 
-### Decide what belongs in the index at all
+### Decide what belongs in the index and what becomes a tool
 - **An index is a snapshot** refreshed on the ingestion cadence. Any fact that changes faster than that, or
   must be exact for this user right now (a price, stock level, account balance, ticket status), is stale by
   construction once indexed.
-- **Look those up at query time** from the system of record through a tool or API call. The index holds the
-  stable prose that explains them (how pricing tiers work, what a status means).
+- **Look those up at query time** from the system of record through a tool or API call the agent can make.
+  The index holds the stable prose that explains them (how pricing tiers work, what a status means).
 - **Rule of thumb: index explanations, look up values.** *Because* a retrieved chunk carrying last week's
   price is indistinguishable to the model from a correct one, while a live lookup either returns the current
   value or fails visibly.
+- **Say it in the tool descriptions.** Tell the agent that `search_docs` explains policy and `get_price`
+  returns prices, so the planner routes value questions to the live tool.
 
 ### Keep a controlled vocabulary
 - **The problem:** products get renamed, teams reorganise, and three departments call one thing three
   names. With free-text tags, a filter on `product = "Atlas Pro"` misses every page still tagged with last
   year's name.
 - **The fix:** a small glossary mapping aliases and former names to one canonical term, applied to tags at
-  ingestion and used for query expansion at retrieval time.
+  ingestion and used for query expansion at retrieval time (agents generate search queries from user
+  wording, so they hit old names often).
 - **Why it is worth it:** it is cheap, owned like any other source, and closes a class of misses no
   embedding model reliably closes, because a new product name often has no semantic relationship to the old
   one.
 
-### Carry metadata that the retriever can act on
+### Carry metadata that the retriever and the agent can act on
 - **Minimum set:** source system, owner, authority rank, lifecycle state, verified date, audience or access
   scope, product or domain tags, and language.
 - **Why:** metadata filters and rerankers use these to turn "similar" into "relevant to this user now".
+  Returning source, authority and verified date in the tool result also lets the agent cite and hedge.
 - **Reject, do not default.** Metadata not populated at ingestion is never populated, so the ingestion
   contract should reject documents missing required fields.
 
 ### Close the loop from failures to content
-1. **Collect signals:** user thumbs-downs and missed eval queries are the best signal about the corpus.
+1. **Collect signals:** user thumbs-downs, missed eval queries and agent traces where the retrieved chunk
+   was wrong are the best signal about the corpus.
 2. **Classify the cause:** missing document, stale document, duplicate crowding out the right one, or a
    genuine retrieval failure.
 3. **Route the first three to the content owner** with the query attached. Cheap once ownership exists;
@@ -117,13 +136,13 @@ correct candidates; many "hallucination" reports trace here, not to the model.
 
 ### Access and tenancy are part of knowledge, not an afterthought
 - **Permissions are knowledge about who may see a document.** Ingestion must capture ACLs from the source and
-  retrieval must filter on them.
+  the retrieval tool must filter on the calling user's groups, never the agent's service identity.
 - **A correct corpus that leaks HR pages to engineering is a failed deployment.** Treat access scope as a
   required metadata field like any other.
 
 ## Diagram
-Each document passes the same gates on the way in, and failures flow back to the owner rather than into
-prompt tweaks.
+Each document passes the same gates on the way in, and agent failures flow back to the owner rather than
+into prompt tweaks.
 
 ```mermaid
 flowchart TD
@@ -133,8 +152,8 @@ flowchart TD
     L -->|"draft or archived"| X["Not indexed"]
     L -->|"published or deprecated"| D["Dedup and glossary tags"]
     D --> I[("Index with authority, ACL, verified date")]
-    I --> Q["Retrieve: ACL filter, rerank by authority"]
-    Q --> A["Answer with citations"]
+    I --> Q["Agent search tool: ACL filter, rerank"]
+    Q --> A["Agent answers with citations"]
     A -->|"thumbs-down or eval miss"| T["Triage cause"]
     T -->|"missing, stale, duplicate"| O["Content owner backlog"]
     O --> S
@@ -183,11 +202,38 @@ for row in candidates(ordered, {"all"}):
 The weights (0.05 per authority step, a small age penalty) are illustrative; in production they are
 reranker features tuned on the eval set.
 
+### Agent tools: search for explanations, look up values
+The agent gets two tools whose descriptions encode the rule, and the search result carries the metadata the
+model needs to cite and hedge.
+
+```python
+TOOLS = [
+    {"name": "search_policy",
+     "description": "Search published, canonical policy and how-to docs. Use for explanations and rules. "
+                    "Never use for current prices, stock or account values.",
+     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}},
+                      "required": ["query"]}},
+    {"name": "get_price",
+     "description": "Return the current list price for a SKU from the pricing catalogue.",
+     "input_schema": {"type": "object", "properties": {"sku": {"type": "string"}},
+                      "required": ["sku"]}},
+]
+
+def search_policy(query: str, user_groups: set[str]) -> list[dict]:
+    rows = candidates(ordered, user_groups)            # the gated ranking above, filtered by the USER's ACL
+    return [{"text": t, "source": s, "score": sc} for sc, s, t in rows[:3]]
+
+print(search_policy("refund window", {"all"})[0])
+# {'text': 'Refund window is 30 days.', 'source': 'docs', 'score': 0.805}
+```
+
+The tool schemas follow the common JSON-schema tool format; adapt the field names to your provider's SDK.
+
 ### Worked scenario: an internal support assistant at 58 percent
 Illustrative numbers. Three sources: the product documentation site (about 4,000 pages), the support
 team's Confluence space (about 9,000 pages accumulated over six years) and a Google Drive folder of PDFs
-(about 2,500 files). Everything is chunked and embedded; the eval set of 300 support questions scores 58
-percent "answer correct" as judged by the support leads.
+(about 2,500 files). Everything is chunked and embedded behind the agent's search tool; the eval set of 300
+support questions scores 58 percent "answer correct" as judged by the support leads.
 
 **Failure analysis of the 126 wrong answers:**
 
@@ -231,18 +277,20 @@ percent "answer correct" as judged by the support leads.
   or status field (for example a Confluence page label such as "deprecated") to `lifecycle_state` at every
   sync, so retiring a page needs no AI-team action. Monitor deprecated pages still receiving retrieval
   hits.
+- **Metadata in the tool result.** Return source, authority and verified date with every chunk the search
+  tool hands the agent, and instruct the agent to cite the source and flag answers grounded only on
+  secondary or old content. Monitor the share of answers citing an `authority=1` source.
 - **Near-duplicate pass with MinHash LSH.** Use when the same content is exported or copied across systems.
   Shingle chunks, index them in an LSH structure (the `datasketch` library's `MinHashLSH` is one common
   choice), keep the canonical-source copy and store the redirect mapping. Monitor duplicate ratio in top-k.
 - **Glossary-backed tag normalization and query expansion.** Use once products or teams have been renamed.
-  A small owned table of alias to canonical term, applied to tags at ingestion and appended to queries.
-  Monitor zero-result filtered queries, which often point at a missing alias.
-- **Failure triage queue routed to owners.** Use from launch. Every thumbs-down or eval miss gets one cause
-  label (missing, stale, duplicate, access, retrieval, generation) and content causes become tickets in the
-  owner's tracker with the query attached. Monitor the share of failures per cause week over week.
-- **Live lookups for volatile values.** Use for prices, stock, balances and statuses. Expose a tool that
-  calls the system of record and keep only explanatory prose in the index. Monitor answers citing indexed
-  values that also exist in a live API.
+  A small owned table of alias to canonical term, applied to tags at ingestion and appended to the agent's
+  search queries. Monitor zero-result filtered queries, which often point at a missing alias.
+- **Failure triage from agent traces, plus live lookups for volatile values.** Every thumbs-down or eval
+  miss gets one cause label (missing, stale, duplicate, access, retrieval, generation), read off the trace's
+  retrieved chunks; content causes become tickets in the owner's tracker. Prices, stock, balances and
+  statuses come from tools calling the system of record. Monitor failures per cause week over week, and
+  answers citing indexed values that also exist in a live API.
 
 ## Trade-offs
 - **Correctness on conflicts vs secondary context.** Declaring canonical sources improves correctness on
@@ -260,6 +308,8 @@ percent "answer correct" as judged by the support leads.
 - **Better filtering vs rejections.** Rich required metadata improves filtering, but every required field is
   a reason for a document to be rejected at ingestion. Keep the required set small and the optional set
   large.
+- **Live tools vs latency and cost.** Looking values up keeps them exact but adds a tool call and a
+  dependency per step. When a value changes slower than the ingestion cadence, indexing it is fine.
 
 ## Pitfalls
 - **Treating a bad answer as a model problem and iterating on prompts.** Symptom: eval scores that move a
@@ -274,6 +324,8 @@ percent "answer correct" as judged by the support leads.
   while the index keeps serving them, because nobody re-ran the cleanup. Fix: read state from the source.
 - **Skipping ACL capture at ingestion to ship faster.** Symptom: a security finding, or a user seeing a page
   they could never open in the source system. Fix: access scope is a required field.
+- **Filtering on the agent's identity instead of the user's.** Symptom: the agent's service account can
+  read everything, so every user effectively can. Fix: pass the end user's groups into the search tool.
 - **No feedback path from users to content owners.** Symptom: the same gap reported many times with nobody
   positioned to fix it. Fix: a triage queue routed to owners.
 - **Indexing volatile values such as prices or stock levels instead of looking them up.** Symptom: answers
@@ -281,7 +333,7 @@ percent "answer correct" as judged by the support leads.
   up values.
 
 ## When to use
-- **Use for any RAG system over content people maintain,** which is nearly all of them.
+- **Use for any RAG agent over content people maintain,** which is nearly all of them.
 - **Skip only for effectively immutable, single-sourced corpora,** such as a frozen archive of closed case
   files or a product's own generated logs.
 - **Start before the first index,** since the ingestion schema must carry the metadata.
@@ -326,6 +378,13 @@ justified, and the eval now isolates its effect.
 - **Fix the class, not the instance:** read lifecycle from the source, dedup to the canonical copy, and route
   the case to the page owner.
 
+### Your agent can both search docs and call a pricing API. How do you stop it quoting stale prices from the docs?
+- **Keep values out of the index:** exclude price lists from ingestion, so the search tool has nothing
+  stale to return.
+- **Encode routing in tool descriptions:** `search_policy` for explanations, `get_price` for values, and an
+  eval case per value type that checks the agent called the live tool.
+- **Monitor traces** for answers containing a price where no pricing tool call happened.
+
 ### When would you index drafts or secondary sources despite the risk?
 - **Thin canonical sources:** if primaries do not cover a topic, secondaries should win on recall and lose
   only on conflict.
@@ -338,9 +397,9 @@ justified, and the eval now isolates its effect.
 - **Serve them by live lookup** through a tool calling the system of record, and keep only the explanatory
   prose in the index; a failed lookup fails visibly, a stale chunk does not.
 
-### How would you show a customer that content, not the model, is the bottleneck?
-- **Classify a sample of failures** by cause and present the table with cited pages, as in the support
-  assistant case: 107 of 126 failures were content-caused.
+### How would you show a customer that content, not the model, is the bottleneck in their agent?
+- **Classify a sample of failures** by cause from the agent traces and present the table with cited pages,
+  as in the support assistant case: 107 of 126 failures were content-caused.
 - **Fix the largest buckets and re-run the eval:** in that case 58 to 81 percent with no model change, which
   also isolates the 19 genuine retrieval or generation errors for later work.
 
@@ -370,3 +429,25 @@ justified, and the eval now isolates its effect.
 > Content owners maintain state where they already work. A state stored only in the index or a side
 > spreadsheet drifts immediately because the people who know a page is obsolete never see it. Ingestion
 > propagates the source's state into the index.
+
+## Use cases & projects
+### Use cases
+- **Internal support agents over wikis and drives.** Lifecycle labels, dedup and authority ranks are what
+  move answer accuracy, more than model swaps.
+- **Customer-facing agents that quote policy.** Canonical sources and verified dates keep the agent from
+  promising a refund window that changed last quarter.
+- **Agents that mix search with live system calls.** "Index explanations, look up values" decides which
+  facts become retrieval chunks and which become tools.
+- **Multi-department agents.** ACL capture and user-scoped filtering keep HR or legal pages out of answers
+  for people who could not open them in the source.
+
+### Mini project
+**Corpus triage for a small RAG agent (2-3 hours).**
+- **Goal:** raise a toy support agent's accuracy by fixing the corpus, not the model or prompt.
+- **Steps:** assemble about 60 documents with deliberate problems (two superseded versions, three duplicate
+  copies, a draft, one HR-only page, a price list); write 20 eval questions; run the agent with a plain
+  `search` tool and label each failure by cause; add `authority`, `lifecycle_state`, `acl` and
+  `last_verified_at` at ingestion, dedup, move prices to a `get_price` tool, and return metadata in the tool
+  result; re-run.
+- **Done when:** a before and after table shows accuracy per cause bucket, no answer cites a draft or a
+  deprecated page, and a non-HR user never receives the HR-only chunk.

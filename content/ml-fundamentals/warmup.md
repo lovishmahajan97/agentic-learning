@@ -360,3 +360,23 @@ a wasted run.
 - [ ] Only if the learning rate at the crash point was above the warmup peak
 > The purpose of warmup is to protect against unreliable early optimizer statistics and a random init.
 > With optimizer state restored, neither applies, and repeating the ramp just slows the next few hundred steps.
+
+## Use cases & projects
+### Use cases
+- **LoRA fine-tunes on agent traces.** Short runs at fairly high adapter rates need a short ramp so the
+  first tens of steps do not spike the loss.
+- **Multi-phase agent training.** Moving from supervised traces to a preference or RL phase starts a new
+  optimizer, so the new phase usually gets its own short ramp.
+- **Resuming a crashed fine-tune.** With optimizer state restored, the schedule continues from its saved
+  step instead of repeating warmup.
+- **Reading a failed run.** A grad-norm spike in the first steps of an agent fine-tune is the signal that
+  the ramp was missing or too short.
+
+### Mini project
+**Warmup versus no warmup on a tool-call LoRA (1-2 hours).**
+- **Goal:** see the early loss spike that warmup prevents on a short agent fine-tune.
+- **Steps:** pick a small open model and a few hundred tool-call traces; run the same LoRA fine-tune three
+  times, with no warmup, with a short ramp, and with a ramp sized like a pre-training run; log loss, grad
+  norm and learning rate from step zero; score each run on held-out tool calls.
+- **Done when:** you have overlaid loss and grad-norm curves for the first steps of all three runs, a
+  tool-call accuracy table, and a note on which ramp length you would ship and why.

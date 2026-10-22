@@ -5,7 +5,8 @@ name: Loss functions (cross-entropy, contrastive)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - ml-fundamentals/classification
   - ml-fundamentals/regression
@@ -23,9 +24,23 @@ sources:
 ---
 
 ## TL;DR
-A loss is the differentiable stand-in for what you want; its gradient is the model's only signal.
-Cross-entropy, −log p(correct answer), trains anything that predicts a distribution, including every LLM
-token. Contrastive losses (InfoNCE) are cross-entropy over similarity scores.
+When you fine-tune an agent's LLM or retriever, the loss is the model's only signal.
+Cross-entropy, −log p(correct token), trains tool calls and answers; contrastive InfoNCE, cross-entropy
+over similarity scores, trains the embeddings your RAG step searches with.
+
+## For agent builders
+- **Why it matters for agents.** Fine-tuning on agent trajectories, tuning a retriever on your corpus and
+  training a reward model or DPO on preference pairs are all loss choices. Get the mask or the negatives
+  wrong and the loss falls while the agent does not get better.
+- **Where it shows up in your stack.** SFT trainers that mask prompt and tool-result tokens, the `-100`
+  label convention in PyTorch, embedding fine-tuning with in-batch and mined negatives, the pairwise loss
+  behind reward models and DPO, and perplexity in eval reports.
+- **What you control.** Which tokens are supervised (assistant turns and tool calls only), per-token versus
+  per-sequence averaging, label smoothing, batch size and temperature for contrastive training, and how
+  negatives are mined.
+- **What you can skip.** Deriving losses from scratch. Know that cross-entropy's gradient is prediction
+  minus target, that InfoNCE is cross-entropy with a free label, and how to read a loss curve against a task
+  metric.
 
 ## Why it exists
 - **The real objective is not differentiable.** Accuracy, recall@10, user satisfaction and "did the agent
@@ -34,19 +49,24 @@ token. Contrastive losses (InfoNCE) are cross-entropy over similarity scores.
 - **A surrogate must meet three requirements:** (1) be differentiable, (2) share its minimiser with the
   true objective, or come close, and (3) give useful gradient magnitudes everywhere, not just near the
   solution.
-- **Squared error fails requirement 3 for classes.** With p = σ(z), its logit gradient is
-  (p − y)·p·(1 − p). When confidently wrong, p is near 0 for the true class, p(1 − p) is near 0, and the
-  gradient vanishes exactly when the correction should be largest. Cross-entropy removes that factor,
-  which is why it replaced squared error for classification.
-- **In numbers,** for a true label y = 1 (squared error as ½(p − y)²): at p = 0.5 the logit gradient is
-  −0.125 under squared error and −0.5 under cross-entropy; at p = 0.01, confidently wrong, about −0.0098
-  versus −0.99. The more wrong the model, the more the two diverge.
 - **Embeddings need relations, not labels.** You know a query and the document that answered it belong
   together and most others do not. A loss on single outputs cannot express that; one on relative distances
   can. That is what contrastive losses are for, and needing no human labels is why most embedding models
   use them.
+- **Agent fine-tuning inherits both.** The policy model learns tool calls through token cross-entropy; the
+  retriever learns "relevant" through a contrastive loss; neither ever sees "task completed" directly, so
+  the eval suite has to check that the surrogate moved the real metric.
 
 ## How it works
+### Background: why cross-entropy, not squared error
+- **Squared error fails requirement 3 for classes.** With p = σ(z), its logit gradient is
+  (p − y)·p·(1 − p). When confidently wrong, p is near 0 for the true class, p(1 − p) is near 0, and the
+  gradient vanishes exactly when the correction should be largest.
+- **Cross-entropy removes that factor,** which is why it replaced squared error for classification.
+- **In numbers,** for a true label y = 1 (squared error as ½(p − y)²): at p = 0.5 the logit gradient is
+  −0.125 under squared error and −0.5 under cross-entropy; at p = 0.01, confidently wrong, about −0.0098
+  versus −0.99. The more wrong the model, the more the two diverge.
+
 ### Cross-entropy from maximum likelihood
 1. **Likelihood.** The model outputs a distribution q over K classes; the data gives the true class y. The
    likelihood of a dataset is Π q(y_i).
@@ -72,12 +92,15 @@ q = softmax(z),  log q_y = z_y − log Σ_j exp(z_j)
 ### Variants and LLM specifics
 - **Label smoothing** replaces the one-hot target with (1 − ε)·onehot + ε/K. It stops logits growing
   without bound and often improves calibration, at the cost of never predicting with full confidence.
-- **Class weights** scale each example's loss to counter imbalance.
+- **Class weights** scale each example's loss to counter imbalance, for example a rare "escalate" route.
 - **LLM training loss** is cross-entropy averaged over token positions. **Perplexity** is exp of that
   average: a loss of 2.0 nats means perplexity ≈ 7.4, as uncertain as choosing uniformly among about
   seven tokens.
 - **SFT loss masking:** in supervised fine-tuning the loss is usually masked so only assistant tokens
   count, because learning to predict the prompt teaches nothing you want.
+- **Agent trajectories make masking critical.** System prompts, tool schemas and tool results are often
+  over 90% of a trajectory's tokens. They are inputs, not behaviour, so they are masked and only the
+  assistant's reasoning, tool calls and final answer are supervised.
 
 ### Regression losses in brief
 - **Squared error** is cross-entropy's cousin: maximum likelihood under Gaussian noise; its minimiser is
@@ -88,7 +111,8 @@ q = softmax(z),  log q_y = z_y − log Σ_j exp(z_j)
 ### Contrastive losses
 Setting: an encoder f maps items to vectors; you have pairs that should match (anchor, positive) plus
 items that should not (negatives). The goal is a geometry where sim(anchor, positive) exceeds
-sim(anchor, negative) for every negative.
+sim(anchor, negative) for every negative. For RAG the anchor is a user question and the positive is the
+chunk that answered it.
 
 | Loss | Formula | Behaviour |
 |---|---|---|
@@ -103,8 +127,9 @@ a free label, which is why it counts as self-supervised.
 ### Design choices that follow
 - **In-batch negatives.** A batch of N pairs gives an N×N similarity matrix: the diagonal holds the
   positives and the off-diagonal entries are N(N − 1) negatives for free. Larger batches make the matching
-  task harder and the gradient more informative, which is why SimCLR and CLIP use very large batches. CLIP
-  makes the loss symmetric, averaging image-to-text and text-to-image cross-entropy over the same matrix.
+  task harder and the gradient more informative, which is why SimCLR and CLIP use very large batches.
+- **CLIP makes the loss symmetric,** averaging image-to-text and text-to-image cross-entropy over the same
+  matrix.
 - **Temperature τ** divides the similarities before the softmax. A small τ sharpens the distribution so
   gradient concentrates on the hardest negatives; too small makes training unstable and oversensitive to
   mislabelled negatives (CLIP learns τ, starting from 0.07).
@@ -115,35 +140,80 @@ a free label, which is why it counts as self-supervised.
   trivial solution of making every vector longer.
 
 ### Matching the loss to the output
-| Output | Loss |
-|---|---|
-| Distribution over discrete options | cross-entropy |
-| A quantity | squared, absolute or Huber |
-| Relations between items | contrastive or ranking losses |
-| Preferences between two responses | pairwise logistic loss on the difference of scores: the Bradley–Terry form underlying reward models and DPO |
+| Output | Loss | Agent component |
+|---|---|---|
+| Distribution over discrete options | cross-entropy | policy LLM, tool router, guardrail classifier |
+| A quantity | squared, absolute or Huber | cost or latency predictor |
+| Relations between items | contrastive or ranking losses | retriever, reranker, memory search |
+| Preferences between two responses | pairwise logistic loss on the difference of scores: the Bradley–Terry form underlying reward models and DPO | preference tuning on good versus bad runs |
 
 Multiple losses are summed with weights that are hyperparameters in their own right.
 
 ## Diagram
-Both main losses end in the same place: a softmax over scores, then −log of the correct entry.
+Both main losses end in the same place: a softmax over scores, then −log of the correct entry. The policy
+LLM takes the logits path; the retriever takes the embeddings path.
 
 ```mermaid
 flowchart TD
-    O{"What does the model output?"} -->|"class or next token"| LG["Logits z"]
-    O -->|"embeddings"| EM["Normalised vectors"]
+    O{"What does the model output?"} -->|"tool call or next token"| LG["Logits z"]
+    O -->|"retriever embeddings"| EM["Normalised vectors"]
     EM --> SIM["Similarity matrix divided by tau"]
     LG --> SM["Log-softmax, fused"]
     SIM --> SM
     SM --> CE["Minus log of correct entry"]
-    T["Target: true class or own pair"] --> CE
+    T["Target: assistant token or own pair"] --> CE
     CE --> G["Gradient: prediction minus target"]
     G --> U["Optimizer step"]
 ```
 
 ## Examples
+### Masking an agent trajectory for SFT
+Only assistant tokens (reasoning, tool calls, final answer) are supervised; system prompt, user turn and
+tool results get the label `-100`, PyTorch's default `ignore_index`.
+
+```python
+import torch, torch.nn.functional as F
+
+IGNORE = -100                                   # default ignore_index of F.cross_entropy
+
+def build_labels(segments):
+    ids, labels = [], []
+    for role, toks in segments:
+        ids += toks
+        labels += toks if role == "assistant" else [IGNORE] * len(toks)
+    return torch.tensor(ids), torch.tensor(labels)
+
+tok = lambda n: torch.randint(0, 32000, (n,)).tolist()   # stand-in for a tokenizer
+segments = [("system", tok(1500)),              # system prompt plus tool schemas
+            ("user", tok(100)),
+            ("assistant", tok(60)),             # tool call 1
+            ("tool", tok(2500)),                # search results
+            ("assistant", tok(60)),             # tool call 2
+            ("tool", tok(1700)),
+            ("assistant", tok(80))]             # final answer
+ids, labels = build_labels(segments)
+print(len(ids), (labels != IGNORE).sum().item())   # 6000 tokens, 200 supervised
+
+logits = torch.randn(len(ids), 32000)           # stand-in for model output
+loss = F.cross_entropy(logits[:-1], labels[1:])  # position t predicts token t+1; -100 is skipped
+```
+
+### Worked scenario: the unmasked agent fine-tune
+A team fine-tunes on 2,000 trajectories shaped like the one above. Numbers are illustrative.
+
+| Setting | Supervised tokens per trajectory | What the loss mostly measures | Outcome |
+|---|---|---|---|
+| No mask | 6,000 | predicting tool results and the system prompt | loss drops fast, tool-call accuracy flat |
+| Assistant-only mask | 200 (3.3%) | the agent's own tool calls and answers | loss falls slower, tool-call accuracy improves |
+
+- **The unmasked loss is dominated by inputs:** 5,800 of 6,000 tokens are text the agent should read, not
+  write, and the repeated system prompt is trivially easy to predict.
+- **Log supervised tokens per batch** next to the loss; a sudden jump to the full sequence length means the
+  mask broke.
+
 ### Cross-entropy gradient and InfoNCE in one script
 Two things in one script: cross-entropy's gradient really is prediction minus target, and InfoNCE really
-is cross-entropy over a similarity matrix.
+is cross-entropy over a similarity matrix, as used to tune a RAG retriever.
 
 ```python
 import torch, torch.nn.functional as F
@@ -190,27 +260,30 @@ for p in (0.9, 0.5, 0.1, 0.01):
     print(p, logit_grads(p))          # (-0.009, -0.1) ... (-0.0098, -0.99)
 ```
 
-Reading the table: squared error's gradient magnitude, (1 − p)²·p, peaks at p = 1/3 (about 0.148) and
-shrinks again as the model gets more wrong, so a confidently wrong example barely moves the weights.
-Cross-entropy's gradient, 1 − p in magnitude, grows monotonically with the error.
+- **Squared error peaks early:** its gradient magnitude, (1 − p)²·p, peaks at p = 1/3 (about 0.148) and
+  shrinks again as the model gets more wrong, so a confidently wrong example barely moves the weights.
+- **Cross-entropy keeps pushing:** its gradient, 1 − p in magnitude, grows monotonically with the error.
 
 ## Production patterns
+- **Mask everything the agent did not write.** Set label ids for system, user, tool-result and padding
+  positions to `-100`, the default `ignore_index` of PyTorch cross-entropy, so only assistant turns and
+  tool calls count. Monitor the count of supervised tokens per batch and log it with the loss.
 - **Pass logits, never probabilities, to the loss.** Use the fused op (PyTorch `F.cross_entropy` or
   `nn.BCEWithLogitsLoss`) and keep softmax out of the model's forward pass during training. Monitor for a
   loss that floors well above zero, the signature of a double softmax.
-- **Mask non-target tokens in SFT.** Set label ids for prompt and padding positions to `-100`, the
-  default `ignore_index` of PyTorch cross-entropy, so they contribute nothing. Monitor the count of
-  supervised tokens per batch and log it with the loss.
-- **Track loss and task metric together.** Log held-out cross-entropy (or perplexity) and the task metric
-  on the same eval schedule; when the loss keeps falling and the metric stalls, stop and inspect outputs.
-- **Contrastive fine-tuning with mined hard negatives.** Build (query, positive) pairs from search logs,
-  add BM25-ranked non-answers as negatives, and deduplicate so no true match lands in the negative set.
-  Monitor recall@k on a held-out retrieval set rather than the loss value.
+- **Track loss and agent metric together.** Log held-out cross-entropy (or perplexity) and the task metric
+  (tool-call accuracy, task success on the eval suite) on the same schedule; when the loss keeps falling and
+  the metric stalls, stop and inspect outputs.
+- **Contrastive retriever tuning with mined hard negatives.** Build (query, positive) pairs from agent
+  search logs or questions whose retrieved chunk led to an accepted answer, add BM25-ranked non-answers as
+  negatives, and deduplicate so no true match lands in the negative set. Monitor recall@k on a held-out
+  retrieval set rather than the loss value.
 - **Scale in-batch negatives within memory.** Use the largest batch that fits for InfoNCE; when it cannot
   grow, add mined negatives instead. Monitor recall@k as batch size changes.
-- **Label smoothing for calibration.** Enable it via the `label_smoothing` argument of PyTorch
-  `F.cross_entropy` (for example 0.1) for classifiers whose probabilities feed thresholds. Monitor
-  expected calibration error; skip it for distillation teachers that need sharp distributions.
+- **Label smoothing for calibrated routers.** Enable it via the `label_smoothing` argument of PyTorch
+  `F.cross_entropy` (for example 0.1) for routers and guardrail classifiers whose probabilities feed
+  thresholds. Monitor expected calibration error; skip it for distillation teachers that need sharp
+  distributions.
 
 ## Trade-offs
 - **Cross-entropy: strong gradients vs overconfidence.** Non-vanishing gradient while wrong and proper
@@ -224,16 +297,18 @@ Cross-entropy's gradient, 1 − p in magnitude, grows monotonically with the err
   amplifies the damage from false negatives and can destabilise early training; a learned temperature is
   the usual compromise.
 - **Surrogate vs real metric.** Any surrogate can decouple: the loss keeps falling while recall@10 or task
-  accuracy stalls, so track both, and let the metric decide.
+  success stalls, so track both, and let the metric decide.
+- **Imitation vs preference.** Cross-entropy on good trajectories copies them, including their quirks; a
+  pairwise preference loss can push away from bad runs too, but needs paired data and a careful eval.
 
 ## Pitfalls
 - **Softmax before a loss that applies log-softmax internally.** Probabilities get softmaxed twice; the
   loss floors well above zero and the model plateaus early.
 - **log(softmax(z)) as two separate operations.** Symptom: NaN losses after a few steps when some
   probability underflows to zero.
-- **Forgetting the loss mask in supervised fine-tuning.** Prompt and padding tokens count; the loss drops
-  fast while outputs do not improve, because predicting the prompt is easy and useless.
-- **Per-token versus per-sequence averaging left to accident.** Symptom: long documents dominating the
+- **Forgetting the loss mask in supervised fine-tuning.** Prompt, tool-result and padding tokens count;
+  the loss drops fast while outputs do not improve, because predicting the prompt is easy and useless.
+- **Per-token versus per-sequence averaging left to accident.** Symptom: long trajectories dominating the
   gradient, or short ones, depending on the accident. Decide which you want.
 - **Duplicates inside a contrastive batch treated as negatives.** Symptom: a loss that cannot fall below a
   floor and embeddings that stop improving; fix by deduplicating before batching.
@@ -243,9 +318,9 @@ Cross-entropy's gradient, 1 − p in magnitude, grows monotonically with the err
 ## When to use
 Choosing a loss is choosing what the model estimates.
 - **Cross-entropy** whenever the output is a distribution over discrete options: classification,
-  next-token prediction, routing.
-- **Contrastive** when you want geometry: retrieval embeddings, deduplication, the space a clustering will
-  run in, cross-modal alignment. **Regression losses** for quantities.
+  next-token prediction, tool selection, routing.
+- **Contrastive** when you want geometry: retrieval embeddings for RAG and memory, deduplication, the space
+  a clustering will run in, cross-modal alignment. **Regression losses** for quantities.
 - **Measure** the loss curve and the task metric together; for contrastive training, evaluate recall@k on
   a held-out retrieval set, because the loss value alone says little. Debugging a fine-tune that is not
   learning starts at the loss: masks, double softmax, scale.
@@ -282,17 +357,25 @@ absent from the training data. Only after these would I suspect the data itself.
 - **Squared error on probabilities** carries a p(1 − p) factor that vanishes when the model is confidently
   wrong.
 
+### You are fine-tuning a model on agent trajectories. Which tokens should carry loss, and why?
+- **Supervise what the agent writes:** reasoning, tool-call arguments and the final answer.
+- **Mask what it reads:** system prompt, tool schemas, user turns and tool results get `-100`, because
+  predicting them teaches the model to imitate the environment, not to act.
+- **Verify** by logging supervised tokens per batch and checking tool-call accuracy on held-out tasks, not
+  just the loss.
+
 ### Explain InfoNCE to someone who knows only classification.
 - **It is classification:** for each anchor, the candidates are the classes, the scores are similarities
   divided by τ, and the correct class is the constructed positive.
 - **In-batch:** a batch of N pairs gives N(N − 1) negatives from the similarity matrix's off-diagonal.
 - **Free label:** because you built the pair, no annotation is needed, which makes it self-supervised.
 
-### Your embedding fine-tune's loss stops falling at a floor and recall stalls. What do you check?
+### Your agent's retriever fine-tune hits a loss floor and recall stalls. What do you check?
 - **False negatives:** duplicates or near-duplicates in a batch, or mined "negatives" that are actually
-  relevant, cap how low the loss can go.
+  relevant chunks, cap how low the loss can go.
 - **Temperature:** too small amplifies those errors; try a learned τ.
-- **Fix** by deduplicating before batching and filtering mined negatives, then re-measure recall@k.
+- **Fix** by deduplicating before batching and filtering mined negatives, then re-measure recall@k and the
+  agent's answer accuracy on questions that depend on retrieval.
 
 ### When would you not use label smoothing?
 - **Use it** for classifiers whose probabilities feed thresholds, because it curbs overconfidence and often
@@ -335,3 +418,24 @@ absent from the training data. Only after these would I suspect the data itself.
 > Each anchor is contrasted against every other item in the batch, so N pairs provide N(N − 1) negatives
 > at no extra labelling cost. With few negatives the task is trivially easy and the embedding learns
 > little; this coupling to batch size is the main practical constraint of InfoNCE.
+
+## Use cases & projects
+### Use cases
+- **Fine-tuning a tool-calling model.** Assistant-only cross-entropy on successful trajectories teaches a
+  smaller model the tool-call format and choices of a larger one.
+- **Domain-tuning the RAG retriever.** InfoNCE with in-batch and mined hard negatives on (question, chunk)
+  pairs from your own corpus lifts recall@k where a general embedding model misses jargon.
+- **Preference tuning from run outcomes.** Pairs of a good and a bad run for the same task feed a reward
+  model or DPO through the Bradley–Terry pairwise loss.
+- **Calibrated routers and guardrails.** Cross-entropy with label smoothing gives probabilities that can be
+  thresholded for escalate, block or answer decisions.
+
+### Mini project
+**Assistant-only masking for an agent SFT set (1-2 hours).**
+- **Goal:** build correctly masked training examples from agent trajectories and prove the mask works.
+- **Steps:** take 20 agent traces (real or synthetic) with system, user, assistant and tool messages;
+  tokenize them with a chat template; set labels to `-100` on every non-assistant token; compute the
+  supervised-token share per trace; run one forward pass of a small model and compare the loss with and
+  without the mask.
+- **Done when:** you have a table of supervised-token share per trace, a unit test that fails if any tool
+  result token is supervised, and a note explaining why the unmasked loss is lower but meaningless.

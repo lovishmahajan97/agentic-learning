@@ -362,3 +362,24 @@ pydantic, httpx) would hit an unresolvable conflict.
 - [ ] The resolver re-ran and chose different versions
 > A lock pins Python packages, including transitive ones, but not the interpreter build, system libraries,
 > drivers or model weights. Those need their own pins, such as image digests and model revisions.
+
+## Use cases & projects
+### Use cases
+- **Trustworthy eval results.** Recording the lock hash, model snapshot and prompt version with every eval
+  run means a score can be tied to the exact environment that produced it.
+- **Explaining a behaviour change after a rebuild.** Diffing two locks shows whether `langchain-core`, a
+  provider SDK or a tokenizer moved between the good and bad builds.
+- **Automated upgrade pull requests.** Renovate or Dependabot opens lock updates and the agent eval suite
+  decides whether they merge.
+- **Pinning what the lock cannot.** Dated model snapshots, embedding model revisions and base image digests
+  close the gaps a Python lockfile leaves open.
+
+### Mini project
+**Build an eval-run manifest for an agent (1-2 hours).**
+- **Goal:** make every agent eval result reproducible from a recorded manifest.
+- **Steps:** in a locked agent project, write a small script that collects the lock file hash, Python
+  version, model identifier, prompt version and base image digest; save it as JSON next to each eval
+  result; then upgrade one framework package, re-run a 10-case eval and diff both the manifests and the
+  scores.
+- **Done when:** each eval result has a manifest, the diff names exactly what changed between runs, and you
+  can rebuild the earlier environment from its lock and get the earlier score.

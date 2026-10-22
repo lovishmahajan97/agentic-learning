@@ -5,7 +5,8 @@ name: Tokenization (BPE, SentencePiece)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - model-internals/embeddings
   - model-internals/context-window
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-A tokenizer turns text into integer ids. BPE repeatedly merges the most common adjacent pair, so common
-words become one token and rare words split. SentencePiece trains BPE or unigram on raw text. Tokens set
-cost, context and many odd behaviours.
+A tokenizer turns text into integer ids, and every agent budget is counted in them: tool schemas, tool
+results, transcript length, cost and latency. BPE and SentencePiece explain why JSON, IDs, code and
+non-English text cost more than you expect.
+
+## For agent builders
+- **Why it matters for agents.** An agent pays for its system prompt and every tool schema on every
+  step, plus every tool result it appends. Token counts, not characters or turns, decide when the
+  context fills, what a run costs and when to compact.
+- **Where it shows up in your stack.** `tiktoken` or the model's `AutoTokenizer` for counting, usage
+  fields in API responses, `apply_chat_template` for rendering, chunk sizing in the RAG step, and
+  structured-output or tool-call decoding, which works on token boundaries.
+- **What you control.** Schema and result verbosity, chunk sizes, the counting tokenizer, stop tokens and
+  chat template, and which work (letter counts, exact string edits) goes to code instead of the model.
+- **What you can skip.** Training your own tokenizer, unless you also train a model from scratch. Keep the
+  merge loop, the tokens-per-character ratios and the failure modes.
 
 ## Why it exists
 - **A model needs a fixed, finite symbol set:** an embedding row for each and a softmax over all of them
@@ -103,26 +116,29 @@ Unigram tokenization (Kudo, 2018), SentencePiece's default, works in the opposit
   word-internal pieces with `##`, and encodes by greedy longest-match from the left rather than by
   replaying merges.
 
-### Consequences you will meet
+### Consequences you will meet in agents
 - **Cost and context are counted in tokens.** English prose runs around four characters or three
   quarters of a word per token with OpenAI-style tokenizers; code, numbers and non-Latin scripts cost
   more per character, often several times more (an order of magnitude figure that varies by tokenizer
   and language). Vocabularies were enlarged in part to fix this.
+- **Structured data is token-dense.** JSON keys, quotes, braces, UUIDs and hashes split into many short
+  pieces, so tool schemas and raw API responses cost more per character than prose.
 - **Numbers.** Llama 2 splits every digit into its own token; GPT-4-era tokenizers group up to three.
   Arithmetic behaviour and number formatting sensitivity follow from this.
 - **Spaces and case.** A prompt ending in a trailing space pushes the next token off the distribution
   the model saw, because the space would normally be attached to the following word.
 - **Character-level tasks fail.** Counting letters, reversing strings or spelling rules are hard because
-  the model never sees characters, only chunks.
+  the model never sees characters, only chunks; give the agent a tool for them.
 - **Glitch tokens.** Tokens that exist in the vocabulary but barely appeared in training produce erratic
   behaviour; the "SolidGoldMagikarp" family in GPT-2/3 vocabularies is the known example.
 - **The tokenizer is part of the model.** Fine-tuning must use the same tokenizer, special tokens and
   chat template; adding tokens means resizing and initializing embeddings; constrained decoding and
-  grammars operate on token boundaries, not characters.
+  grammars (JSON mode, tool-call schemas) operate on token boundaries, not characters.
 
 ## Diagram
 The training loop learns an ordered merge list once; encoding replays those merges on new text, and
-decoding is concatenation back to bytes and UTF-8.
+decoding is concatenation back to bytes and UTF-8. Every prompt, schema and tool result your agent sends
+goes through the lower half.
 
 ```mermaid
 flowchart TD
@@ -187,9 +203,41 @@ print(encode("lowest"), encode("slowest"))
 For real counting use the model's own tokenizer: `tiktoken.get_encoding("cl100k_base").encode(text)`
 for OpenAI models, `AutoTokenizer.from_pretrained(name)(text).input_ids` for open models.
 
+### Agent scenario: what the tool list costs per run
+Tool schemas are re-sent on every step. This estimates their token cost with `tiktoken` and projects it
+over a run. Providers wrap schemas in their own formatting, so treat the count as an estimate and check
+it against the usage fields.
+
+```python
+import json, tiktoken
+
+enc = tiktoken.get_encoding("cl100k_base")       # use the tokenizer of the model you actually call
+tools = [
+    {"name": "search_orders", "description": "Find a customer's orders by email or order id.",
+     "parameters": {"type": "object", "properties": {
+         "email": {"type": "string"}, "order_id": {"type": "string"}}}},
+    {"name": "refund_order", "description": "Refund an order. Requires order_id and reason.",
+     "parameters": {"type": "object", "properties": {
+         "order_id": {"type": "string"}, "reason": {"type": "string"}},
+         "required": ["order_id", "reason"]}},
+]
+
+schema_tokens = sum(len(enc.encode(json.dumps(t))) for t in tools)
+uuid_tokens = len(enc.encode("3f2b8c1e-9a4d-4e7b-8f21-6c0d5a9e7b13"))
+steps, n_tools = 12, 40                           # a 12-step run with 40 similar tools
+print(f"2 tools: {schema_tokens} tokens; one UUID: {uuid_tokens} tokens")
+print(f"~{schema_tokens / 2 * n_tools * steps:,.0f} schema tokens per run before any caching")
+```
+
+- **Reading the output:** a UUID costs far more tokens than its 36 characters suggest in prose terms, and
+  40 schemas re-sent for 12 steps can dominate input cost.
+- **Levers:** retrieve only relevant tools per step, shorten descriptions, keep the tool block stable for
+  prefix caching, and replace raw IDs in results with short aliases mapped back in code.
+
 ### Streaming without replacement characters
 Byte-level tokens can end mid-character, so decoding each token on its own leaks `U+FFFD` into streamed
-text. An incremental UTF-8 decoder buffers the incomplete bytes; this runs with the standard library.
+text, including streamed agent answers in a chat UI. An incremental UTF-8 decoder buffers the incomplete
+bytes; this runs with the standard library.
 
 ```python
 import codecs
@@ -206,8 +254,9 @@ print(streamed == "café 日本", streamed)          # True café 日本
 ```
 
 ### Worked scenario: a chunker tuned on English truncates other content
-A RAG pipeline sized chunks at 2,048 characters, assuming about four characters per token, to stay under
-a 512-token embedding limit. The per-language ratios below are illustrative, not measured.
+A RAG pipeline feeding an agent sized chunks at 2,048 characters, assuming about four characters per
+token, to stay under a 512-token embedding limit. The per-language ratios below are illustrative, not
+measured.
 
 | Content | Characters per token (illustrative) | Tokens in a 2,048-character chunk | Result |
 |---|---|---|---|
@@ -219,25 +268,35 @@ The fix: chunk by counting tokens with the embedding model's own tokenizer, then
 recall per language.
 
 ## Production patterns
+- **Keep a per-step token budget.** Before every model call, count the rendered prompt (system prompt,
+  tool schemas, transcript) with the serving model's tokenizer and compact or truncate tool results when
+  it nears the limit. Log estimated versus reported usage per step and alert on drift.
 - **Count tokens with the serving model's tokenizer.** Use `tiktoken` for OpenAI models and the model's
-  `AutoTokenizer` for open models, applied to the fully rendered chat template, before every call. Log
-  estimated versus billed or reported token counts and alert on drift.
+  `AutoTokenizer` for open models, applied to the fully rendered chat template, before every call. Where
+  the provider offers a token-counting endpoint, use it for tool-heavy prompts.
+- **Trim tool schemas and results.** Short descriptions, only the fields the model needs, and results
+  projected to the relevant keys instead of raw API JSON. Track input tokens per step and task success
+  before and after.
 - **Measure tokens per character per language before choosing a model.** Run a sample of the real corpus
   through each candidate tokenizer and put the ratio into the cost model alongside eval scores. Monitor
   cost per conversation by language after launch.
 - **Chunk by tokens, not characters.** Split documents using the embedding model's tokenizer and its
   maximum input length. Monitor the share of chunks at or over the limit.
 - **Render prompts with the model's chat template.** Use `tokenizer.apply_chat_template` so special
-  tokens match training, and keep the same template for fine-tuning and serving. Monitor stop-token
-  rates and runaway generations.
-- **Stream by decoding the accumulated text.** Decode the ids generated so far and emit only the new
-  suffix, or buffer incomplete UTF-8 bytes as above. Alert on replacement characters in streamed output.
+  tokens match training, and keep the same template for fine-tuning on agent traces and serving. Monitor
+  stop-token rates and runaway generations; stream by decoding the accumulated text and alert on
+  replacement characters.
 
 ## Trade-offs
 - **Larger vocabulary vs bigger layers.** Fewer tokens per text means lower cost, longer effective
   context and faster generation, but a bigger embedding and output layer (128k × 4096 in fp16 is about
   1 GB per untied matrix) and rarer tokens that are undertrained. It pays off when the workload is
   multilingual or code-heavy.
+- **Rich tool schemas vs per-step cost.** Detailed descriptions and examples improve tool choice but are
+  paid on every step of every run. Keep detail where evals show it changes decisions; cut the rest.
+- **Raw tool output vs projected output.** Raw JSON keeps every field the agent might need but is
+  token-dense and dilutes attention; projecting to a few fields is cheaper but can hide something a later
+  step needed. Project, and let the agent re-fetch details by id.
 - **Byte-level BPE vs character-level SentencePiece.** Byte-level BPE encodes anything and never emits
   unknown tokens, but scripts whose merges were underrepresented fall apart into byte fragments.
   Character-level SentencePiece with byte fallback handles CJK more gracefully at the cost of
@@ -252,6 +311,11 @@ recall per language.
 - **Counting tokens with the wrong tokenizer**, such as `cl100k_base` for a Llama model. Symptom:
   context-overflow errors or silently truncated prompts in production although the estimate said they fit.
   Fix: count with the serving model's own tokenizer on the rendered template.
+- **Ignoring the tool block in the budget.** Symptom: the agent overflows or truncates earlier than the
+  transcript length suggests. Fix: count system prompt plus all schemas plus transcript as one rendered
+  prompt.
+- **Making the model copy long IDs or hashes.** Symptom: tool calls with an off-by-one-character order id
+  or UUID. Fix: give results short aliases and map them back to real IDs in code.
 - **Ending a prompt with a trailing space or stitching completions at a non-token boundary.** Symptom: a
   first generated token that starts mid-word, doubles a space or is otherwise odd. Fix: strip trailing
   whitespace and let the model emit the space with the next word.
@@ -273,10 +337,14 @@ recall per language.
 
 ## When to use
 You do not choose a tokenizer per request, but it shapes several decisions you do make.
+- **Budgeting an agent:** count schemas, prompts and results with the model's own tokenizer, never a
+  character heuristic, and set compaction thresholds in tokens.
+- **Designing tools:** prefer short schemas, projected results and short aliases for IDs, because every
+  token is paid on every step.
 - **Selecting a model for a market:** measure tokens per character on a sample of your real corpus across
   candidate tokenizers; the ratio can differ by multiples between languages and drives cost and latency
   directly.
-- **Budgeting and chunking:** use the model's own tokenizer, never a character heuristic.
+- **Chunking:** use the embedding model's tokenizer and its input limit.
 - **Training a new tokenizer:** only when also training a model from scratch on a domain whose symbols
   existing vocabularies handle badly, such as DNA, logs or a new programming language.
 - **Interviews:** walk through the merge loop, contrast byte-level BPE with SentencePiece and unigram, and
@@ -311,24 +379,22 @@ probably truncating Hindi content.
 - **Encoding:** replay the merges in learned order on the new word's bytes; an unseen word such as
   "slowest" still splits into known pieces, so there is no `<unk>`.
 
+### Your agent's input cost per run doubled after adding tools, though transcripts are the same length. Why, and what do you do?
+- **Schemas are re-sent every step.** Each tool's JSON schema is token-dense, and 40 tools across 12 steps
+  multiplies that cost by every step.
+- **Fix:** retrieve only relevant tools per step, shorten descriptions, keep the tool block byte-stable so
+  prefix caching applies, and confirm with per-step usage fields.
+
+### Your agent sometimes calls tools with an order id that is one character off. What is going on?
+- **Long IDs split into many short tokens**, so copying them exactly is error-prone for the model.
+- **Fix:** give each result a short alias in the transcript and map aliases back to real IDs in code, and
+  validate IDs before executing the tool.
+
 ### Prompts that "fit" by your estimate are overflowing the context in production. What do you check?
 - **Which tokenizer did the estimate use?** Counting with `cl100k_base` for a Llama model, or counting raw
   text instead of the rendered chat template, undercounts.
 - **Then content mix:** code and non-English text cost more tokens per character, so a characters-based
   heuristic breaks on exactly those requests.
-
-### When would a bigger vocabulary not be worth it?
-- **For small models or narrow English workloads.** A 128k × 4096 fp16 matrix is about 1 GB per untied
-  copy, a large share of a small model, and rare tokens stay undertrained.
-- **It pays off for multilingual or code-heavy traffic**, where fewer tokens per text cuts cost, latency
-  and context use.
-
-### How do BPE, unigram and WordPiece differ?
-- **BPE** grows bottom-up by greedy frequency merges and encodes by replaying merges.
-- **Unigram** prunes a large candidate vocabulary by likelihood, segments with Viterbi and can sample
-  segmentations (subword regularization).
-- **WordPiece** picks merges by likelihood gain, marks word-internal pieces with `##` and encodes by
-  greedy longest-match.
 
 ### Streamed responses show replacement characters that vanish in the final text. Why?
 - **Byte-level tokens can split a multi-byte UTF-8 character**, so decoding each token on its own yields
@@ -360,3 +426,24 @@ probably truncating Hindi content.
 - [ ] Because the tokenizer removes repeated letters
 > A word like "strawberry" arrives as a few chunks whose internal spelling is only indirectly learned.
 > Character-level questions ask the model to recover information the tokenizer collapsed.
+
+## Use cases & projects
+### Use cases
+- **Per-step context budgets.** Agents count the rendered prompt in tokens before each call and compact
+  tool results when they near the limit.
+- **Tool design and cost control.** Schema length, result projection and ID aliases are tuned in tokens
+  because they are paid on every step.
+- **Multilingual agents.** Tokens per character by language sets cost per conversation and decides
+  between candidate models.
+- **RAG chunking.** Chunks are sized with the embedding model's tokenizer so code and non-English
+  documents are not silently truncated.
+
+### Mini project
+**Build a token ledger for an agent run (1-2 hours).**
+- **Goal:** show where an agent's input tokens go across a run and cut the total by at least a third.
+- **Steps:** build a small agent with 10 tools and a fake API that returns verbose JSON; log, per step,
+  tokens in the system prompt, tool schemas, transcript and newest tool result using the model's
+  tokenizer; compare with the API usage fields; then shorten schemas, project results to needed keys and
+  alias long IDs, and rerun.
+- **Done when:** you have a per-step stacked table before and after, estimated versus reported tokens
+  within a few percent, and the same task success rate on a 10-task eval.

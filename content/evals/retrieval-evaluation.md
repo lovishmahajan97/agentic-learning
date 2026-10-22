@@ -24,7 +24,7 @@ sources:
 ## TL;DR
 An agent's answer is only as good as what its search or memory tool returns, so score the retriever
 alone: recall@k (did evidence get in?), MRR (first hit how high?), NDCG (graded ranking right?).
-Matching k to the context budget matters more than formulas.
+Matching k to the context budget matters most.
 
 ## For agent builders
 - **Why it matters for agents.** When a RAG agent answers wrongly, the first question is whether the
@@ -422,3 +422,23 @@ queries with a paired bootstrap.
 - [ ] k = 10 is too small to measure a dense retriever
 > Judgments made from the old system's results cannot credit passages only the new system finds. Pooling
 > the top results of both systems and judging the union is the standard remedy.
+
+## Use cases & projects
+### Use cases
+- **Changing chunking or embeddings.** recall@k on a versioned qrels file shows in seconds whether a new
+  index config still brings the evidence in, before any LLM call.
+- **Debugging a wrong RAG answer.** Checking whether the relevant chunk was in the search tool's results
+  splits retrieval failures from generation failures.
+- **Tuning the agent's search tool.** k per call, a reranker and hybrid search are compared with paired
+  intervals on the agent's own logged queries.
+- **Memory lookup in long-running agents.** The same metrics score whether a memory tool returns the
+  facts the agent stored earlier.
+
+### Mini project
+**Evaluate a RAG agent's search tool from its own queries (2-3 hours).**
+- **Goal:** measure recall@k, MRR and NDCG for the queries your agent actually sends to its search tool.
+- **Steps:** log the search-tool arguments from 30-50 agent runs; judge the top results for relevance to
+  build qrels; compute the three metrics per call and recall at run level; try one change (a different
+  k, chunk size or a reranker) and compare with a paired bootstrap.
+- **Done when:** you have a table of per-call and run-level metrics for both configs, the interval on the
+  difference, and a ship or no-ship call.

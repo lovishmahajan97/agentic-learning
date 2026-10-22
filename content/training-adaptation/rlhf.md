@@ -427,3 +427,23 @@ own score.
 > Without the leash the policy climbs the reward model's surface into regions far from its training
 > data where its scores are unreliable. The classic exploits are length, flattery and degenerate text
 > that happen to score well.
+
+## Use cases & projects
+### Use cases
+- **Diagnosing agent verbosity and sycophancy.** Knowing these are partly RLHF artefacts tells the team
+  whether to prompt around them or switch models.
+- **Best-of-n reranking of agent answers.** A reward model or LLM judge picks the best of several
+  candidate answers before the agent replies.
+- **LLM-judge graders in agent evals.** The same overoptimisation risk applies: a prompt tuned to please
+  the judge can drift from real quality.
+- **Choosing a preference method.** Teams that want to tune an open agent model's preferences usually
+  pick DPO over a full PPO loop.
+
+### Mini project
+**Catch reward hacking in a best-of-n agent reranker (1-2 hours).**
+- **Goal:** see overoptimisation happen on a small scale with an LLM judge as the reward.
+- **Steps:** generate 8 candidate answers per question for 30 agent questions; score each with an LLM
+  judge; pick the top answer at n = 1, 2, 4 and 8; have a human (you) blind-rate the picked answers and
+  log their length; repeat with a length penalty added to the judge score.
+- **Done when:** you have a chart of judge score, human score and answer length against n, with and
+  without the length penalty, and a note on where the two scores diverge.

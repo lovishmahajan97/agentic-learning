@@ -5,7 +5,8 @@ name: API versioning & backward compatibility
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - backend-fundamentals/rest-graphql-api-design
   - fastapi-for-ai/openapi-contract-testing
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-Once others depend on your API, every change is a negotiation with clients you cannot redeploy. Make
-additive changes and tolerant readers the default; version only for rare breaks, with announced
-deprecation and sunset. The same applies to models, prompts and tool schemas.
+Agents depend on contracts they cannot renegotiate: tool schemas in prompts, pinned models, your run API.
+Make additive changes and tolerant readers the default; version only for rare breaks, with announced
+deprecation and sunset, for APIs, models, prompts and tools alike.
+
+## For agent builders
+- **Why it matters for agents.** An agent learns a tool's argument names from its schema, prompt and
+  few-shot examples, and its outputs depend on the pinned model and prompt. Renaming an argument,
+  swapping a model snapshot or editing a prompt is a breaking change for every deployed agent and every
+  downstream parser.
+- **Where it shows up in your stack.** Provider API versions (path versions, the `anthropic-version`
+  header), model snapshot names and deprecation notices, prompt and tool-schema version ids in config,
+  MCP tool lists that change under a running client, and your own `/v1` agent-run API.
+- **What you control.** Additive tool-schema changes, tolerant tool argument parsing, expand-and-contract
+  renames, pinned model and prompt versions with evals before switching, and version tags in traces.
+- **What you can skip.** Picking between every versioning style in the abstract. Know the breaking list,
+  expand and contract, and the deprecation headers.
 
 ## Why it exists
 - **Clients are distributed in time as well as space.** A mobile app users never update, a partner
@@ -41,8 +55,9 @@ deprecation and sunset. The same applies to models, prompts and tool schemas.
   optional and a strict client starts throwing.
 - **The working discipline sits between.** Additive, compatible changes are the normal path so versions
   are rare; an unavoidable break is versioned deliberately, deprecated with dates, measured, and removed
-  on schedule. AI services need it twice over, because a model or prompt change can alter outputs for the
-  same input, which is also a breaking change from the client's point of view.
+  on schedule.
+- **AI services need it twice over.** A model or prompt change can alter outputs for the same input,
+  which is also a breaking change from the client's point of view.
 
 ## How it works
 ### What counts as breaking
@@ -54,13 +69,16 @@ deprecation and sunset. The same applies to models, prompts and tool schemas.
   endpoint, relaxing validation.
 - **Contested:** adding an enum value, which breaks clients that switch exhaustively. Document that
   enums are open and clients must handle unknowns.
+- **For tools, the same list applies to arguments**, plus one more: changing a tool's description can
+  change when the model calls it, so treat it as a behaviour change and run evals.
 
 ### Tolerant readers
 - **Compatibility is a two-sided contract.** Clients ignore unknown response fields and treat enums as
   open; servers accept missing optional fields and ignore unknown request fields unless the endpoint is
   security-sensitive.
 - **Pydantic's default of ignoring extra fields is the tolerant choice.** `extra="forbid"` is stricter
-  and turns a client's harmless new field into a 422, so choose it knowingly.
+  and turns a client's harmless new field into a 422, so choose it knowingly. For model-generated tool
+  arguments, a 422 sent back to the model is often the right strictness.
 - **Postel's principle, applied with judgement**, *because* total leniency hides bugs.
 
 ### Versioning strategies
@@ -71,6 +89,7 @@ deprecation and sunset. The same applies to models, prompts and tool schemas.
 | Pinned date per account | Stripe: pinned to the version current at the account's first call, overridable per request with `Stripe-Version` | maximum compatibility | a chain of server-side transformations renders new behaviour in old shapes |
 | Query parameter | `?version=2` | simple | mixes with filters and cache keys |
 | Evolution only | GraphQL: add fields, mark old ones `@deprecated`, remove after usage reaches zero | no versions at all | needs field-level usage telemetry |
+| Versioned tool name | `search_v2` alongside `search` | old agents keep working | the model sees both unless you filter per agent version |
 
 - **Keep one implementation and render versions at the edge as representations**, *because* two forked
   code paths drift and the old one stops getting fixes.
@@ -93,6 +112,9 @@ Review by eye misses breaks, so make them mechanical with two complementary CI c
 - **Consumer-driven contract tests (Pact style).** Each client publishes the requests it sends and the
   fields it reads, and the provider's build replays them. This catches Hyrum's-law dependencies the
   schema never promised, such as a client relying on list order.
+- **For agents, add an eval run.** Replay recorded agent traces against the new tool schemas, prompt or
+  model and compare task success and tool-call validity, because no schema diff catches a model that
+  now calls the wrong tool.
 
 ### SDKs and client libraries
 - **An SDK has its own compatibility surface** on top of the wire API: method names, exception classes,
@@ -109,7 +131,8 @@ Review by eye misses breaks, so make them mechanical with two complementary CI c
 
 - **The order matters** *because* at every point each deployed producer and consumer, old or new, still
   sees a field it understands, which lets the two sides deploy independently.
-- **Same pattern** for message schemas and tool arguments.
+- **Same pattern** for message schemas and tool arguments: accept both argument names, advertise only
+  the new one, and drop the old one when traces show no agent sends it.
 
 ### AI-specific contracts
 - **Model versions retire.** Pin exact snapshot names and track provider deprecation notices.
@@ -118,11 +141,11 @@ Review by eye misses breaks, so make them mechanical with two complementary CI c
 - **Tool schemas are contracts.** A change can break an agent that learned the old arguments from its
   prompt or few-shot examples.
 - **Embeddings are versioned data.** Re-embedding with a new model invalidates an index built with the
-  old one.
+  old one, so a RAG agent's retriever and index must switch together.
 
 ## Diagram
 Most changes take the additive path; only an unavoidable break enters the versioned deprecation
-lifecycle, and it leaves only when telemetry says nobody is left.
+lifecycle, and it leaves only when telemetry (including agent traces) says nobody is left.
 
 ```mermaid
 flowchart TD
@@ -181,6 +204,37 @@ app.include_router(v1)
 app.include_router(v2)
 ```
 
+### Renaming a tool argument without breaking deployed agents
+The `search_tickets` tool renames `q` to `query`. Expand phase: the schema advertises only `query`, the
+parser still accepts `q` from agents running older prompts, and every use of the old name is counted.
+
+```python
+from pydantic import BaseModel, Field, AliasChoices, ConfigDict
+
+LEGACY_ARG_USES = {"search_tickets.q": 0}             # export as a metric in real code
+
+class SearchTicketsArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")         # unknown args go back to the model as errors
+    query: str = Field(validation_alias=AliasChoices("query", "q"),
+                       description="Free-text search over ticket titles and bodies")
+    limit: int = Field(10, ge=1, le=50)
+
+def parse_args(raw: dict) -> SearchTicketsArgs:
+    if "q" in raw:
+        LEGACY_ARG_USES["search_tickets.q"] += 1      # who still sends the old name?
+    return SearchTicketsArgs.model_validate(raw)
+
+tool_def = {
+    "name": "search_tickets",
+    "description": "Search support tickets. Use before answering questions about past issues.",
+    "input_schema": SearchTicketsArgs.model_json_schema(by_alias=False),  # advertises `query` only
+}
+
+print(parse_args({"q": "refund failed", "limit": 5}).query)   # old agent: still works
+print(parse_args({"query": "refund failed"}).limit)          # new agent: default limit 10
+print(LEGACY_ARG_USES)                                       # {'search_tickets.q': 1}
+```
+
 ### A tolerant reader on the client side
 Runnable with the standard library. The client survives a new enum value, a new field and the
 `summary` to `text` rename during the expand phase.
@@ -220,16 +274,30 @@ Rename `summary` to `text` on an endpoint with three integrators. Dates are illu
 | 9 (brownout) | `text` only for two one-hour windows | new only | no errors from the remaining clients |
 | 10 (contract) | `text` only | new only | announced date reached, usage at zero |
 
+### Worked scenario: swapping the model behind an extraction agent
+An agent's final step returns JSON that three services parse. Numbers are illustrative.
+
+| Stage | Traffic on new snapshot | Gate |
+|---|---|---|
+| Offline eval on 500 recorded runs | 0% | parse failures and task success no worse than the pinned snapshot |
+| Shadow: run both, serve the old | 0% served | field-level diff rate reviewed |
+| Canary | 5% | downstream parse-failure rate flat for 48 hours |
+| Full rollout, old pin kept in config | 100% | rollback is a config change |
+
 ## Production patterns
+- **Version tools, prompts and models together.** Store the tool-schema version, prompt version and model
+  snapshot as one release record, and stamp all three on every agent trace. Monitor task success and
+  tool-call validation failures per release record.
 - **Breaking-change gate in CI.** Generate the OpenAPI document on every build and diff it against the
   published one with a tool such as oasdiff (its `breaking` command), failing the build on removals,
-  narrowed types or new required inputs. Track deliberate breaks per release.
+  narrowed types or new required inputs. Run the same diff over tool JSON Schemas. Track deliberate
+  breaks per release.
 - **Consumer contracts before deploy.** With Pact, consumers publish contracts to a broker and the
   provider verifies them in CI; gate deploys with the broker's `can-i-deploy` check. Monitor contract
   verification failures per consumer.
 - **Version usage telemetry.** Tag every request metric with API version and client id, and build a
-  "who is still on v1" dashboard before announcing a sunset. Alert when a deprecated version's traffic
-  rises instead of falls.
+  "who is still on v1" dashboard before announcing a sunset; for tools, count legacy argument names in
+  agent traces. Alert when a deprecated version's traffic rises instead of falls.
 - **Scheduled brownouts.** Before removal, return `410 Gone` (or the error your docs promise) from the old
   version for short announced windows, with a body linking the migration guide. Watch support tickets
   and the error rate of remaining clients.
@@ -247,11 +315,17 @@ Rename `summary` to `text` on an endpoint with three integrators. Dates are illu
 - **Per-account pinning vs server cost.** Stripe-style pinning gives clients indefinite stability, but
   every change adds a transformation layer the server must maintain and test forever.
 - **Strict validation vs tolerance.** `extra="forbid"` catches client typos early but turns harmless
-  additive changes by clients into outages; loosen it on public endpoints, keep it on internal ones.
+  additive changes by clients into outages; loosen it on public endpoints, keep it on internal ones and
+  on model-generated tool arguments, where the model can fix the error.
+- **Pinned models vs improvements.** Pinning keeps outputs stable but leaves quality gains unused and
+  ends at the provider's retirement date; each upgrade costs an eval cycle.
 
 ## Pitfalls
 - **A field rename shipped as a "small cleanup".** Symptom: a partner integration fails days later with
   `KeyError` on a field you removed. Fix: expand and contract, gated by a schema diff in CI.
+- **Renaming a tool argument in one deploy.** Symptom: agents running cached prompts or old few-shot
+  examples start failing validation on every call. Fix: accept both names, advertise the new one, remove
+  the old after traces show zero use.
 - **Forking the codebase per version.** Symptom: a bug fixed in v2 still ships in v1, and a security
   patch reaches only one of them. Fix: one implementation, versions rendered at the edge.
 - **Announcing a deprecation without measuring usage.** Symptom: v1 is removed on the date and the
@@ -263,10 +337,10 @@ Rename `summary` to `text` on an endpoint with three integrators. Dates are illu
 
 ## When to use
 - **Every change to a published interface:** review each diff of a request or response model against the
-  breaking list, and give prompt and model changes the same review.
+  breaking list, and give prompt, model and tool-schema changes the same review.
 - **Introduce a version** only when a break is unavoidable, and then exactly one.
 - **Measure** requests per version per client, error rates after a release, and time-to-migrate for
-  deprecated versions.
+  deprecated versions; for agents, task success per release record.
 - **Day to day:** contract tests in CI that fail on breaking schema diffs, and release notes written for
   integrators.
 - **Interviews:** list what breaks, pick a strategy with reasons, and describe a deprecation lifecycle
@@ -297,9 +371,16 @@ in CI should fail on the type change so it cannot ship by accident.
 - **Definition:** with enough users, every observable behaviour of an interface, documented or not,
   becomes something somebody depends on.
 - **Consequence:** the schema is not the whole contract; list order, error wording and timing can all
-  be load-bearing for someone.
+  be load-bearing for someone, including an agent whose prompt relies on them.
 - **Response:** consumer-driven contract tests and per-client telemetry reveal the dependencies the
   schema never promised, before a change ships.
+
+### You need to rename an argument on a tool that many deployed agents call. How do you ship it?
+- **Expand:** accept both names in the parser, advertise only the new one in the tool schema, and count
+  uses of the old name in traces.
+- **Migrate:** update prompts and few-shot examples, and run the eval set to confirm the model uses the
+  new name and still picks the tool correctly.
+- **Contract:** drop the old name once traces show zero use for an agreed window.
 
 ### A partner reports `KeyError` failures the day after your release, but your schema diff passed. How do you investigate?
 - **Find the change:** diff actual responses before and after the release for the partner's calls; an
@@ -323,7 +404,7 @@ in CI should fail on the type change so it cannot ship by accident.
   response for the whole window.
 - **Brownouts:** short planned outages flush out stragglers before the hard cutoff.
 
-### Your provider retires the model snapshot behind a structured-extraction endpoint. How do you migrate without breaking clients?
+### Your provider retires the model snapshot behind a structured-extraction agent. How do you migrate without breaking clients?
 - **Treat it as a contract change:** output format and quality can shift for the same input.
 - **Pin and evaluate:** run the candidate snapshot through the eval and format-parsing suite, and adjust
   the prompt version together with the model.
@@ -354,3 +435,28 @@ in CI should fail on the type change so it cannot ship by accident.
 - [ ] Silently redirect old-version requests to the new one
 > Removal is safe only when you know who is left and they have been warned in-band and out-of-band.
 > Brownouts surface stragglers before the hard cutoff; silent redirects hide breaking shape changes.
+
+## Use cases & projects
+### Use cases
+- **Evolving tool schemas.** Renaming or tightening tool arguments while agents with older prompts are
+  still running, using aliases and trace counts.
+- **Model snapshot retirement.** Moving an extraction or support agent to a new snapshot through evals,
+  shadow traffic and a canary, with the old pin kept for rollback.
+- **Versioned agent-run APIs.** Shipping a new run-event format under `/v2` while the UI and partners on
+  `/v1` keep working from one implementation.
+- **Re-embedding a RAG index.** Building the new index beside the old one and switching retriever and
+  index together, because embeddings from two models are not comparable.
+
+### Mini project
+**Ship a breaking tool change safely (1-2 hours).**
+- **Goal:** rename a tool argument and change a model or prompt version without failing a single agent
+  run.
+- **Steps:** build a two-tool agent with a recorded set of 20 tasks; rename one argument using an alias
+  as in the example; stamp tool-schema, prompt and model versions on each trace; replay the 20 tasks with
+  the old prompt and the new prompt; add a CI check that diffs tool JSON Schemas and fails on removals.
+- **Done when:** both prompt versions pass all 20 tasks, the legacy-name counter is non-zero only for the
+  old prompt, and the CI check fails when you delete the alias.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): DocBrief's CI checks its OpenAPI document
+for breaking changes against the previous release, and its `/v1` contract must survive model upgrades.

@@ -447,3 +447,25 @@ query per conversation). Add `raiseload` in tests so the regression cannot retur
 - [ ] The read is converted into an awaitable automatically
 > Commit expires loaded instances so the next access reloads. That reload is implicit IO the async
 > bridge cannot perform, which is why async sessions set `expire_on_commit=False` or call `refresh()`.
+
+## Use cases & projects
+### Use cases
+- **Conversation and run storage.** Conversations, messages with JSON tool-call payloads and run steps
+  map to tables, loaded eagerly when building the model's context.
+- **Safe DB tools for agents.** Core `select()` with bound parameters lets a model fill in filters without
+  any path to SQL injection.
+- **RAG chunk tables.** A `Vector(dim)` column from `pgvector` stores embeddings next to chunk text, with
+  bulk inserts for ingestion.
+- **Agent APIs with clean schemas.** The Create/Read/table split stops clients from setting ids or
+  timestamps on stored messages.
+
+### Mini project
+**Agent memory store with a safe lookup tool (2-3 hours).**
+- **Goal:** model an agent's conversations and messages, and expose one read-only DB tool to the model.
+- **Steps:** define conversation and message tables (SQLModel or SQLAlchemy 2.0) with a JSON tool-calls
+  column; add separate Create and Read schemas; write a context loader that fetches a conversation with
+  its messages in a fixed number of queries; write a tool function that takes model-supplied arguments
+  and runs a Core `select()` with bound parameters and a row limit.
+- **Done when:** loading a 50-message conversation issues a constant number of queries (log them to
+  check), and passing an injection string as a tool argument returns no rows instead of changing the
+  query.

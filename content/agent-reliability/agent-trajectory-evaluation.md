@@ -5,7 +5,8 @@ name: Agent trajectory evaluation
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - agent-reliability/task-completion-rate
   - agent-reliability/tool-call-success-rate
@@ -24,6 +25,19 @@ sources:
 Final-answer scoring misses forbidden actions, forty-step paths and lucky wins. Trajectory evaluation
 scores the whole path of decisions, tool calls and observations with outcome, process and policy checks
 over many runs per task, so you learn where and why the agent fails.
+
+## For agent builders
+- **Why it matters for agents.** Every prompt, tool-description, model or policy change can move your
+  agent onto a different path. Trajectory evals are how you find out before users do, and how you tell
+  a forbidden shortcut or a lucky win from a reliable success.
+- **Where it shows up in your stack.** Your eval harness and CI job, recorded or simulated tools, the
+  event stream that supplies trajectories, LLM judges for what cannot be computed, and benchmarks such as
+  τ-bench for simulated-user tasks.
+- **What you control.** Task specs (initial state, goal, success predicate, required actions, policy),
+  runs per task, which aggregate gates a release (pass rate, pass^k), judge calibration and the failure
+  taxonomy you label against.
+- **What you can skip.** Exact-match trajectory baselines and leaderboard chasing. Outcome on end state,
+  ordered required actions, policy checks and enough repeats beat clever scoring.
 
 ## Why it exists
 - **An agent produces a trajectory, not an output.** Single-turn evaluation compares an output to a
@@ -376,3 +390,24 @@ figures.
 - [ ] It allows forbidden actions as long as the required ones are present
 > Many trajectories are valid; the subsequence check encodes the constraints that matter (lookup before
 > refund) without penalizing a shorter or different path.
+
+## Use cases & projects
+### Use cases
+- **Release gates for agent changes.** Outcome and policy over N runs per task, with pass^3 and zero
+  violations, decide whether a new prompt or model ships.
+- **Choosing which task classes to automate.** pass^k per task shows which classes are consistent
+  enough to run unattended and which to route to humans.
+- **Diagnosing a regression.** Diffing failure-class histograms between two suite runs names the class
+  that grew, such as wrong arguments after a tool-description edit.
+- **Conversational agents.** Simulated users make multi-turn support or booking flows repeatable enough
+  to test on every change.
+
+### Mini project
+**Trajectory eval suite for a small refund agent (2-3 hours).**
+- **Goal:** score a tool-calling agent on outcome, process and policy, not on its final message.
+- **Steps:** write 10 tasks with initial state, goal, success predicate and required actions (for example
+  `lookup_order` before `refund`); run each task 5 times against fake tools; implement outcome,
+  ordered-subsequence, redundant-call and forbidden-tool scorers; compute per-run pass rate and pass^3
+  per task; label the first failing step of each failure.
+- **Done when:** you have a per-task table with pass rate and pass^3, a failure-class histogram, and at
+  least one run that a final-answer check would pass but your policy check fails.

@@ -5,7 +5,8 @@ name: Promises & async error propagation
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - node-ts-for-ai/event-loop-and-microtask-queue
   - node-ts-for-ai/abortcontroller-and-cancellation
@@ -19,9 +20,21 @@ sources:
 ---
 
 ## TL;DR
-A promise settles once, and `await` re-throws a rejection at the awaiting site, so async errors travel up
-like sync ones. Unawaited promises, combinators that hide failures and lost causes are what make
-multi-provider LLM calls fail silently instead of loudly and recoverably.
+An agent step is a bundle of concurrent promises: model call, tool calls, logging. `await` re-throws a
+rejection where you wait, so errors travel up like sync ones; floating promises, lossy combinators and lost
+causes make agents crash or retry the wrong thing.
+
+## For agent builders
+- **Why it matters for agents.** Each step fans out (parallel tool calls, multi-provider fallback, trace
+  writes). How you combine and classify those promises decides whether one failed tool becomes a message
+  the model can react to, a correct retry, a duplicated side effect, or a crash that kills every session.
+- **Where it shows up in your stack.** Parallel tool execution, provider SDK calls, retry wrappers,
+  fire-and-forget trace and audit sinks, and the process-level `'unhandledRejection'` behaviour of your
+  agent server.
+- **What you control.** `allSettled` versus `all` per fan-out, error classes with `status`, `retryable` and
+  `cause`, lint for floating promises, and which errors go back to the model versus end the run.
+- **What you can skip.** The spec's job-queue internals; know that handlers run as microtasks and that a
+  rejection needs a handler attached before it happens.
 
 ## Why it exists
 - **Callbacks made errors easy to forget.** Callback-style Node passed errors as the first argument, so a
@@ -219,6 +232,37 @@ async function combined() {
 await (process.argv[2] === "staggered" ? staggered() : combined());
 ```
 
+### Agent scenario: tool failures become tool results
+In a tool-calling loop, a failed tool should usually be reported to the model, not thrown out of the loop.
+`allSettled` gives one outcome per call, and classification decides what the model sees.
+
+```ts
+// ProviderError is the class from the first example; exec retries transient failures itself.
+type ToolCall = { id: string; name: string; args: unknown };
+type ToolResult = { toolCallId: string; content: string; isError: boolean };
+
+async function runToolBatch(
+  calls: ToolCall[],
+  exec: (c: ToolCall, signal: AbortSignal) => Promise<string>,
+  signal: AbortSignal,
+): Promise<ToolResult[]> {
+  const settled = await Promise.allSettled(calls.map((c) => exec(c, signal)));
+  return settled.map((r, i) => {
+    const id = calls[i]!.id;
+    if (r.status === "fulfilled") return { toolCallId: id, content: r.value, isError: false };
+    const e: unknown = r.reason;
+    if (signal.aborted) throw e;                         // the run was cancelled: stop the loop
+    if (e instanceof ProviderError && !e.retryable) {    // permanent: tell the model, let it adapt
+      return { toolCallId: id, content: `error ${e.status}: ${e.message}`, isError: true };
+    }
+    return { toolCallId: id, content: "temporary failure after retries", isError: true };
+  });
+}
+```
+
+- **Why this shape:** one tool's rejection cannot lose the other results, cancellation still ends the run,
+  and the model gets a message per tool call it made (most tool-calling APIs expect one result per call).
+
 ### Worked scenario: sequential vs concurrent latency
 An agent step needs a model call, a tool call and an embedding lookup that do not depend on each other
 (illustrative timings).
@@ -230,6 +274,10 @@ An agent step needs a model call, a tool call and an embedding lookup that do no
 | Start all, `await Promise.allSettled([...])` | 1.2 s, the max | Every outcome known; retry only what failed |
 
 ## Production patterns
+- **Errors as tool results, cancellations as stops.** Agent teams settle each tool batch with `allSettled`,
+  return permanent tool errors to the model as error tool results, retry transient ones within a budget,
+  and rethrow only aborts and loop-level failures. Monitor error-result rate per tool and runs ended by
+  errors versus by the model.
 - **Lint floating promises in CI.** Enable `@typescript-eslint/no-floating-promises` (it needs type
   information) as an error, and require an explicit `void` plus `.catch` for intentional fire-and-forget.
   By default the rule accepts a bare `void p` (`ignoreVoid`), which still crashes if `p` rejects, so review
@@ -262,6 +310,9 @@ An agent step needs a model call, a tool call and an embedding lookup that do no
   one by one, so every rejection has a handler from the start.
 
 ## Pitfalls
+- **Letting one tool rejection end the agent run.** Symptom: a whole conversation fails because a search
+  tool returned 404, and the other tool results are lost. Fix: settle the batch and send the error to the
+  model as that call's tool result.
 - **Forgetting `await` on a call whose result you ignore** (logging, metrics, cache writes). Symptom: a crash
   whose stack points into a logging or cache helper rather than the request that started it (or
   `ERR_UNHANDLED_REJECTION` with no stack when a non-Error was thrown), or data that never arrives. Fix:
@@ -340,6 +391,14 @@ can decide whether a retry is even appropriate.
 - **Wrap with `cause`** at each higher layer instead of creating a fresh error, so the retry loop and the
   logs still see the original status and body.
 
+### In an agent loop, which tool failures go back to the model and which end the run?
+- **Back to the model:** permanent, argument-related errors (a 400, not-found, a validation failure), as an
+  error tool result, so it can fix arguments or pick another tool.
+- **Retry first:** retryable ones (429, 5xx, transport) within a budget, with idempotency keys for side
+  effects.
+- **End the run:** cancellation, budget exhaustion and failures of the loop itself (the model call), which
+  the model cannot act on.
+
 ### Your fan-out of five tool calls takes as long as their sum. What changed, and how do you fix it safely?
 - **Likely cause:** someone wrote sequential `await`s, so latency is the sum rather than the max.
 - **Safe fix:** start all five, then `await Promise.allSettled(...)` so every rejection has a handler from the
@@ -373,3 +432,24 @@ can decide whether a retry is even appropriate.
 > is to raise it as a fatal exception. Floating promises from fire-and-forget calls are the usual source.
 > `allSettled` never rejects, and a non-Error reason only changes how the crash is reported
 > (`ERR_UNHANDLED_REJECTION` without a stack), not whether it happens.
+
+## Use cases & projects
+### Use cases
+- **Parallel tool calls.** When a model requests several tools in one turn, `allSettled` runs them together
+  and returns one result per call, failed or not.
+- **Multi-provider fallback.** `Promise.any` plus an `AbortController` races equivalent models and stops the
+  losers from burning tokens.
+- **Safe retries of side-effecting tools.** Classified errors and idempotency keys let an agent retry the one
+  failed email or charge without repeating the ones that worked.
+- **Trace and audit sinks.** Fire-and-forget writes with an explicit `.catch` keep an observability outage
+  from crashing the agent server.
+
+### Mini project
+**Build a crash-proof tool batch for an agent loop (1-2 hours).**
+- **Goal:** an agent step that runs three tools concurrently and survives any mix of failures correctly.
+- **Steps:** write three fake tools (one slow, one that returns a 400, one that fails with a 503 on its first
+  attempt); implement `runToolBatch` with `allSettled`, a `ProviderError` with `retryable` and `cause`, and
+  one retry for retryable errors; add a fire-and-forget trace write that sometimes rejects; enable
+  `no-floating-promises`.
+- **Done when:** a test run shows the 400 returned to the model as an error result, the 503 retried once
+  and succeeding, the trace failure logged without a crash, and lint passing with zero floating promises.

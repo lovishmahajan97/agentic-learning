@@ -474,3 +474,24 @@ both user and agent.
 - [ ] JWTs can be revoked by sending a DELETE to the token
 > Local verification never consults a store, so an issued access token stays valid until exp. That is
 > why access tokens are short-lived, refresh tokens are revocable, and sensitive routes may introspect.
+
+## Use cases & projects
+### Use cases
+- **Agent APIs sold to developers.** Customers call `POST /runs` with hashed, revocable API keys scoped to
+  a tenant, and leaked keys can be rotated without downtime.
+- **Chat UIs signed in through an IdP.** The browser sends an IdP-issued JWT, and the API pins algorithm,
+  issuer and audience before any agent step runs.
+- **Agents acting in a user's Gmail, Slack or CRM.** OAuth tokens live in the tool executor, keyed by user,
+  so the model never sees or chooses a credential.
+- **MCP and internal tool servers.** Each tool server accepts only tokens with its own audience and
+  scopes, which limits what a prompt-injected agent can reach.
+
+### Mini project
+**Keep credentials out of the agent's hands (2-3 hours).**
+- **Goal:** an agent whose tools act as the signed-in user, with no credential ever in the prompt or tool
+  arguments.
+- **Steps:** add one FastAPI dependency that accepts either an API key or a JWT and yields a principal;
+  pass the principal into the run context; build a tool executor that looks up a per-tool token for that
+  user and injects it into the outbound call; test a prompt that asks the agent to act as another user.
+- **Done when:** tests show a 401 for a bad token and a 403 for a missing scope, the tool call carries
+  only the caller's token, and the injection attempt reaches no other user's data.

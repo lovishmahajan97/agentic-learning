@@ -443,3 +443,25 @@ different model. Finally gate on false abstention too, or the fix will be a mode
 > Consistency checks rely on confabulated details varying between samples. A false belief the model holds
 > firmly is reproduced identically every time and looks exactly like real knowledge, so only a reference
 > corpus or human check can catch it.
+
+## Use cases & projects
+### Use cases
+- **Gating a RAG support agent release.** Claim precision against retrieved chunks, plus a ceiling on
+  false abstention, decides whether a new prompt or retriever ships.
+- **Catching action hallucinations.** Comparing the final message with the tool-call trace flags replies
+  that say "refund issued" or "email sent" when no such call succeeded.
+- **Auditing production traces.** A weekly sample of live conversations, decomposed and verified, tracks
+  the fabrication rate per intent after launch.
+- **Testing abstention on unanswerable requests.** A false-premise and out-of-KB slice shows whether the
+  agent says it does not know instead of inventing an answer.
+
+### Mini project
+**Build a claim-level groundedness checker for a RAG agent (2-3 hours).**
+- **Goal:** score how many of an agent's claims are supported by the context and tool results in its own
+  trace.
+- **Steps:** collect 30 agent traces (question, retrieved chunks, tool outputs, final answer), including
+  5 unanswerable questions; use an LLM to split each answer into atomic claims; ask a verifier model to
+  label each claim supported, contradicted or unverifiable against that trace only; check whether any
+  claimed action matches a successful tool call; hand-label 40 claims to measure verifier agreement.
+- **Done when:** a script prints claim precision, response rate and abstention on the unanswerable
+  slice, lists every unsupported claim with its trace ID, and reports verifier agreement with your labels.

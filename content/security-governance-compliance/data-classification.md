@@ -5,7 +5,8 @@ name: Data classification
 kind: practice
 difficulty: intro
 est_minutes: 13
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - security-governance-compliance/pii-protection-dlp
   - security-governance-compliance/data-residency
@@ -20,9 +21,21 @@ sources:
 ---
 
 ## TL;DR
-Data classification gives every dataset a sensitivity label (Public, Internal, Confidential, Restricted)
-so controls are decided once per label. In AI the hard part is propagation: chunks, embeddings,
-summaries, caches and fine-tuned weights must inherit the source's label.
+Classification gives every dataset a sensitivity label (Public, Internal, Confidential, Restricted) so
+your agent's routing, logging and tool limits are decided once per label. The hard part is propagation
+into chunks, embeddings, memory, summaries and fine-tuned weights.
+
+## For agent builders
+- **Why it matters for agents.** An agent with broad data access decides, every step, which model
+  endpoint, tool and memory store receives what it just read. Labels turn that into a lookup instead of a
+  judgement the model makes, and they stop a confidential chunk riding a public tool call out.
+- **Where it shows up in your stack.** Label fields in vector payloads and tool results, a session label
+  in the orchestrator, label-aware routing in the AI gateway, labels on memory entries and traces, and
+  training-data labels on model registry entries.
+- **What you control.** The high-water-mark rule per session, which sinks each label may reach, explicit
+  labels for cross-source agent outputs, and the reviewed path for declassifying redacted data.
+- **What you can skip.** Designing a scheme from scratch. Reuse the organisation's existing labels and spend
+  the effort mapping agent artifacts and sinks onto them.
 
 ## Why it exists
 - **Every control asks the same question.** How bad would it be if this leaked, was altered, or was
@@ -206,6 +219,55 @@ print(a.name, b.name, c.name, "->", label_summary([a, b, c]).name)
 - **The detector list is a toy;** in production the raise step calls your DLP detectors, and the point is
   the direction of the rule, not the patterns.
 
+### Agent scenario: a session label that rises with every tool result
+In an agent the "prompt" is rebuilt every step, so the high-water mark lives on the session. Each tool
+result carries its source's label, and every sink (model endpoint, outbound tool, memory write) is
+checked against the label of what is now in context.
+
+```python
+from enum import IntEnum
+
+class Label(IntEnum):
+    PUBLIC = 0; INTERNAL = 1; CONFIDENTIAL = 2; RESTRICTED = 3
+
+SINK_MAX = {  # highest label each sink may receive; illustrative policy
+    "llm:external-api-zdr-eu": Label.CONFIDENTIAL,
+    "tool:web_search": Label.PUBLIC,              # the query leaves for a third party
+    "tool:post_slack_public": Label.INTERNAL,
+    "memory:write": Label.CONFIDENTIAL,
+}
+
+class Session:
+    def __init__(self, user_label=Label.INTERNAL):
+        self.label = user_label                   # high-water mark of everything in context
+
+    def ingest(self, result_label):               # every tool result carries its source's label
+        self.label = max(self.label, result_label)
+
+    def check(self, sink):
+        if SINK_MAX[sink] < self.label:
+            raise PermissionError(f"{sink} approved up to {SINK_MAX[sink].name}, context is {self.label.name}")
+
+s = Session()
+s.ingest(Label.PUBLIC)                            # read the public FAQ
+s.check("tool:post_slack_public")                 # fine: context is INTERNAL
+s.ingest(Label.CONFIDENTIAL)                      # read a customer contract
+s.check("llm:external-api-zdr-eu")                # fine: endpoint approved for CONFIDENTIAL
+for sink in ("tool:post_slack_public", "tool:web_search"):
+    try:
+        s.check(sink)
+    except PermissionError as e:
+        print(e)
+# tool:post_slack_public approved up to INTERNAL, context is CONFIDENTIAL
+# tool:web_search approved up to PUBLIC, context is CONFIDENTIAL
+```
+
+- **Session labels are coarse, like session taint.** Here web search is blocked even for a harmless query,
+  because the user's own turn is Internal. Labelling each argument by where its value came from is more
+  permissive and much harder to get right.
+- **Order the work to keep the session low:** run public lookups before the agent reads confidential
+  data, or split them into a separate session.
+
 ### Worked control matrix
 | Label | Allowed model endpoints | Prompt logging | Retention | Retrieval | Approval |
 |---|---|---|---|---|---|
@@ -229,6 +291,9 @@ print(a.name, b.name, c.name, "->", label_summary([a, b, c]).name)
 - **Explicit labels for aggregates.** Agent outputs, exports and cross-source reports get a labelled
   output type set by the feature owner, not the computed maximum. Monitor aggregate outputs carrying only a
   computed label.
+- **Session labels in the agent orchestrator.** Tools return their result's label alongside the data, the
+  orchestrator keeps the session's high-water mark, and every model call, outbound tool and memory write
+  is checked against it. Monitor tool calls refused by label and sessions that end Restricted.
 - **Reviewed declassification workflow.** A ticketed path with owner, reason and redaction evidence for any
   downgrade, recorded in the catalogue. Monitor the age of downgrade requests and the drift of stores
   toward Restricted.
@@ -315,6 +380,13 @@ Otherwise the model may only run where Confidential data is allowed.
 - **Enforcement:** share of gateway requests carrying a label, and reroute or block counts by label.
 - **Health:** age of declassification requests and the drift of stores toward Restricted over time.
 
+### Your agent reads a Confidential contract, then wants to call a public web-search tool. How should the system decide?
+- **By the session label, not the model's judgement.** After the contract, the context is Confidential,
+  and a search query is egress to a third party approved only for Public, so the orchestrator refuses.
+- **Then design around it:** run public lookups before reading confidential data, split research into a
+  separate session, or build the query from trusted fields so a per-argument label can allow it.
+- **Log the refusal with both labels,** so the product team sees where the policy bites.
+
 ## Quiz
 ### Q: Under high-water-mark propagation, what label does a summary of one Public, one Internal and one Restricted document carry?
 - [ ] Internal, the median of the inputs
@@ -339,3 +411,23 @@ Otherwise the model may only run where Confidential data is allowed.
 - [x] Mapping each label to enforced controls such as allowed endpoints, retention and logging
 > Labels only matter when gateways, retrievers and stores read them and enforce different behaviour.
 > Without a control matrix, labelling is documentation that nothing checks.
+
+## Use cases & projects
+### Use cases
+- **Enterprise RAG assistants.** One Confidential chunk among ten Public ones moves the request to an
+  approved endpoint and the redacted logging row.
+- **Agents mixing internal and external tools.** The session label stops a confidential context from
+  flowing into a public search, a public channel or a third-party API.
+- **Fine-tuning on agent traces.** Adapters inherit the highest label in their training set, so the
+  registry blocks deployment to targets approved for less.
+- **Cross-source agent reports.** Account summaries and exports get an explicit label from the feature
+  owner, closing the aggregation blind spot.
+
+### Mini project
+**Label-aware routing for a small RAG agent (2-3 hours).**
+- **Goal:** an agent whose endpoint and tool choices follow the labels of what it has read.
+- **Steps:** label 20 documents with `label_chunk` and store the label in each chunk's metadata; add the
+  `Session` class from this lesson to a tool-calling loop with a retriever, a public search tool and a
+  memory write; route model calls with `route`; write five tasks that mix public and confidential reads.
+- **Done when:** every task's trace shows the session label after each step, the right endpoint per call,
+  and at least one public-tool call refused after a confidential read.

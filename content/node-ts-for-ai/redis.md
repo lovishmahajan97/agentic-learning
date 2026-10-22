@@ -5,7 +5,8 @@ name: Redis
 kind: tool
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - backend-fundamentals/redis
   - fastapi-for-ai/redis-caching
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-Redis is an in-memory data-structure server that runs commands one at a time, so each is atomic and
-sub-millisecond. For replicated Node AI services it holds shared, expiring state: completion cache,
-rate limits, locks, cross-replica streaming and BullMQ's store.
+Redis is an in-memory data-structure server whose commands run one at a time, so each is atomic and
+sub-millisecond. Replicated agent services keep shared, expiring state there: caches, provider rate
+limits, run locks, short-term memory, token streams and BullMQ's store.
+
+## For agent builders
+- **Why it matters for agents.** Agents run on several replicas and workers at once. The run lock that
+  stops two workers driving one agent, the limiter that keeps every agent under the provider's
+  tokens-per-minute, and the stream a reconnecting chat UI resumes from all need shared, atomic, fast state.
+- **Where it shows up in your stack.** BullMQ queues for agent steps, ioredis or node-redis clients in
+  your API, LLM and tool-result caches, short-term conversation windows, and Streams relaying tokens to
+  the replica holding the SSE connection.
+- **What you control.** Key design (tenant and run in the key, hash tags on Cluster), TTLs, eviction and
+  persistence per instance, and whether each Redis call fails open or fails fast.
+- **What you can skip.** Redis internals, replication protocol details and most data structures. Strings,
+  hashes, lists, sorted sets, Streams and Lua scripts cover nearly every agent use.
 
 ## Why it exists
 - **In-process state breaks at two replicas.** Every `Map` becomes a bug: the rate limiter counts half
@@ -215,6 +228,43 @@ export async function withRunLock<T>(runId: string, work: () => Promise<T>, ttlM
 }
 ```
 
+### Agent scenario: short-term memory and a tool-result cache
+An agent keeps the last 20 turns per conversation in a capped list that expires after a day of
+inactivity, and caches read-only tool results for 5 minutes so repeated steps in a run, or parallel
+runs, do not re-hit the same API.
+
+```ts
+import Redis from "ioredis";
+import { createHash } from "node:crypto";
+const redis = new Redis(process.env.REDIS_URL!, { maxRetriesPerRequest: 1, enableOfflineQueue: false });
+redis.on("error", (e) => console.error("redis", e.message));
+
+export async function remember(tenant: string, convo: string, turn: object) {
+  const key = `t:{${tenant}}:mem:${convo}`;
+  await redis.multi()
+    .lpush(key, JSON.stringify(turn))   // newest first
+    .ltrim(key, 0, 19)                  // keep the last 20 turns
+    .expire(key, 86_400)                // forget after a day idle
+    .exec();
+}
+export async function recall(tenant: string, convo: string): Promise<object[]> {
+  try { return (await redis.lrange(`t:{${tenant}}:mem:${convo}`, 0, -1)).reverse().map((s) => JSON.parse(s)); }
+  catch { return []; }                  // Redis down: run without short-term memory
+}
+
+// Only for read-only, idempotent tools: never cache a tool that sends, pays or writes.
+export async function cachedTool(tenant: string, name: string, args: unknown, run: () => Promise<string>, ttlSec = 300) {
+  const key = `t:{${tenant}}:tool:${name}:` + createHash("sha256").update(JSON.stringify(args)).digest("hex");
+  try { const hit = await redis.get(key); if (hit !== null) return hit; } catch { /* fall through */ }
+  const out = await run();
+  redis.set(key, out, "EX", ttlSec).catch(() => {});
+  return out;
+}
+```
+
+- **Caveat on argument hashing.** `JSON.stringify` keeps insertion order, so normalise tool arguments
+  (sorted keys) before hashing, or the same call produces different keys.
+
 ### Worked scenario: sizing and a stampede
 Illustrative numbers for a completion cache, using the entry size from the trade-offs below.
 
@@ -226,6 +276,12 @@ Illustrative numbers for a completion cache, using the entry size from the trade
 | Same expiry with the `NX` fill key | 1 caller fills, 199 poll | 1 paid completion, if the fill lands before the pollers time out |
 
 ## Production patterns
+- **Shared provider budget for all agents.** When many workers run agents against one provider key, keep
+  a Lua token bucket per provider and model in Redis and have each agent step take tokens before calling.
+  Monitor bucket denials and the provider's own 429 rate; the second should stay near zero.
+- **Resumable agent token streams.** When agent output streams to a UI through any replica, write chunks
+  to a Stream per run with a TTL and a final sentinel entry, and let the SSE replica `XREAD BLOCK` from the
+  client's last id. Monitor stream length and runs whose stream never got a sentinel.
 - **Separate instances by role.** Run the cache with `maxmemory-policy allkeys-lru` and no persistence,
   and the BullMQ / lock instance with `noeviction` and `appendonly yes` plus `appendfsync everysec`.
   Monitor `evicted_keys` from `INFO stats`: it must stay zero on the queue instance.
@@ -318,6 +374,13 @@ complete rather than stalled.
   in-process `Map` of in-flight promises per replica, and jittered TTLs.
 - **Verify** by graphing provider calls per minute around deploys.
 
+### Ten agent workers share one provider key and keep hitting 429s. How would you use Redis to fix it?
+- **Central token bucket:** a Lua script keyed by provider and model that refills at the vendor's
+  requests-per-minute and tokens-per-minute and is debited atomically before each model call.
+- **Why Lua:** read, check and debit must be one unit, or two workers both see capacity and both spend it.
+- **Degrade deliberately:** when the bucket is empty, delay the step (BullMQ backoff) rather than fail the
+  run, and decide whether a Redis outage fails open or closed.
+
 ### Would you put BullMQ on the same Redis instance as your completion cache?
 - **No:** the cache wants `allkeys-lru` and no persistence; the queue needs `noeviction` and AOF,
   because an evicted job key is silently lost work.
@@ -361,3 +424,27 @@ complete rather than stalled.
 - [ ] A new connection per request to avoid head-of-line blocking
 - [ ] A connection pool of at least one per CPU core
 > A connection that has issued `SUBSCRIBE` can only run subscriber commands, so `GET`/`SET` on it fail; a separate subscriber connection is required, while normal commands pipeline fine on one shared connection.
+
+## Use cases & projects
+### Use cases
+- **One worker per agent run.** A token-guarded `NX PX` lock stops two workers from driving the same run
+  after a redelivery.
+- **Staying under provider limits.** A shared Lua token bucket keeps dozens of concurrent agents under
+  one key's requests-per-minute and tokens-per-minute.
+- **Short-term agent memory.** A capped, expiring list holds the last N turns; long-term memory stays in
+  Postgres or a vector store.
+- **Resumable streaming UIs.** Streams let a chat client reconnect to any replica and continue an agent's
+  output from its last chunk.
+- **Cutting repeated tool calls.** A short-TTL cache for read-only tools stops a looping agent from
+  hitting the same search or lookup API again and again.
+
+### Mini project
+**Redis-backed agent runtime helpers (2 hours).**
+- **Goal:** give a small tool-calling agent a run lock, a provider rate limit, short-term memory and a
+  tool-result cache, all in Redis.
+- **Steps:** run Redis locally; implement `withRunLock`, a Lua limiter, `remember`/`recall` and
+  `cachedTool`; start two worker processes that try to run the same run id; fire 50 agent steps through
+  the limiter with a limit of 10 per minute; stop Redis mid-run and observe the fail-open paths.
+- **Done when:** only one worker ever holds a given run, the limiter admits no more than 10 per window,
+  repeated tool calls show cache hits in logs, and the agent keeps answering (without memory) while Redis
+  is down.

@@ -464,3 +464,23 @@ one bucket. Key by API key or tenant, and if IPs are needed, put the ALB's range
 - [ ] slowapi cannot return 429 for POST requests
 > A long-document request can cost thousands of times a short one. Budgeting estimated and actual
 > tokens per caller bounds both spend and provider quota, which a pure request count cannot do.
+
+## Use cases & projects
+### Use cases
+- **Multi-tenant agent platforms.** Runs per minute and concurrent runs per tenant stop one customer's
+  looping agent from draining the shared provider quota.
+- **Spend control on paid models.** A Redis-backed token budget reserved per model step caps cost per
+  tenant, which a request count alone cannot do.
+- **Agents hitting upstream 429s.** The loop waits for `Retry-After` when it fits the run budget, and
+  otherwise stops and reports, instead of hammering the provider.
+- **Free tiers and public demos.** Per-key or per-IP limits with slowapi keep an open agent endpoint from
+  being scripted into an unpaid compute pool.
+
+### Mini project
+**Admission plus token budgets for an agent API (2-3 hours).**
+- **Goal:** cap both how many runs a tenant starts and how many tokens those runs consume.
+- **Steps:** put a slowapi limit with Redis storage on `POST /runs`; add a per-tenant token bucket in
+  Redis that reserves an estimate before each model step and settles the actual usage after; run a fake
+  agent loop for two tenants, one of them aggressive.
+- **Done when:** the aggressive tenant receives 429s with `Retry-After` or a budget-exhausted stop, the
+  other tenant's runs are unaffected, and limits hold across several uvicorn workers.

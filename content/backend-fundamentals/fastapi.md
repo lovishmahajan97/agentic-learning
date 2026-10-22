@@ -23,7 +23,7 @@ sources:
 ---
 
 ## TL;DR
-FastAPI is the usual way to put a Python agent behind HTTP: async ASGI that holds long agent runs, Pydantic
+FastAPI is the usual way to put a Python agent behind HTTP: async ASGI holding long agent runs, Pydantic
 contracts, SSE streaming of steps, and DI for shared clients. Sharp edge: one blocking call in
 `async def` stalls the worker. (Deep dive: `fastapi-for-ai`.)
 
@@ -430,19 +430,15 @@ so a regression is visible, and treat a slow health check as the first sign of a
   with retries and idempotency.
 - **Client contract:** a `GET /jobs/{id}` status resource, or a webhook or SSE notification on completion.
 
-### When would you choose `def` over `async def` for a handler?
-- **When the only client is blocking** (a sync SDK or DB driver) and switching is not possible yet:
-  `def` runs it in the threadpool so the loop stays free.
-- **The cost is a concurrency cap:** AnyIO's default 40 threads means 8 rps per worker at 5 s per call.
-- **Never mix:** a blocking call inside `async def` is worse than either option, because it stalls the
-  whole worker.
-
-### How many uvicorn workers would you run, and what changes when you go from one to four?
-- **Sizing:** roughly one per core, because each worker is one event loop on one core and the CPU work is
+### When would you choose `def` over `async def`, and how many uvicorn workers would you run?
+- **`def` only when the client is blocking** (a sync SDK or DB driver you cannot switch yet): it runs in
+  the threadpool so the loop stays free, but AnyIO's default 40 threads means 8 rps per worker at 5 s per
+  call. A blocking call inside `async def` is worse than either, because it stalls the whole worker.
+- **Workers: roughly one per core,** because each worker is one event loop on one core and the CPU work is
   parsing, validation and serialisation.
-- **What breaks:** any in-process state, such as rate-limit counters, caches or open-stream tracking,
-  now exists four times; move it to Redis or the database.
-- **Monitor:** per-worker CPU and loop lag; more workers do not help if the upstream is the bottleneck.
+- **Going from one to four breaks in-process state:** rate-limit counters, caches or open-stream tracking
+  now exist four times; move them to Redis or the database.
+- **Monitor** per-worker CPU and loop lag; more workers do not help if the upstream is the bottleneck.
 
 ## Quiz
 ### Q: Why does FastAPI run a plain `def` handler in a threadpool but an `async def` handler on the loop?
@@ -468,3 +464,29 @@ so a regression is visible, and treat a slow health check as the first sign of a
 - [ ] When the provider SDK is async-only
 > FastAPI's strengths are async I/O and typed contracts; Django's are batteries for conventional web
 > apps. If the bulk of the work is CRUD and admin, Django's ecosystem outweighs async purity.
+
+## Use cases & projects
+### Use cases
+- **Agent run API.** A `POST` endpoint takes a validated task with step and token budgets and streams
+  each tool call and partial answer back as server-sent events.
+- **Tool server for agents.** Internal tools (search, ticket lookup, database reads) are exposed as typed
+  routes whose OpenAPI schema can be turned into tool definitions.
+- **Webhook-triggered agents.** A receiver verifies an incoming event, records it and hands it to a
+  worker that runs the agent, returning quickly to the sender.
+- **Shared clients via lifespan.** One provider client and one HTTP pool per worker process, injected
+  into every agent route through dependencies.
+
+### Mini project
+**Stream an agent run over HTTP (1-2 hours).**
+- **Goal:** wrap a two-tool agent loop in a FastAPI endpoint that streams step events and stops cleanly
+  when the client disconnects.
+- **Steps:** create the provider client in `lifespan`; define a Pydantic request with a max-steps field;
+  return a `StreamingResponse` that yields one event per model call and tool result; check for client
+  disconnect between steps and stop the loop; add a test that the endpoint rejects a request over the
+  step budget with 422.
+- **Done when:** `curl -N` shows events arriving step by step, closing curl mid-run stops further model
+  calls in the logs, and the test passes.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): DocBrief's REST API is a FastAPI app with
+`/v1` routes, `202` job submission, OpenAPI contracts and lifespan-managed clients.

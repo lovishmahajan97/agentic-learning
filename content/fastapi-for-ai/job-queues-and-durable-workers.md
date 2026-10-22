@@ -453,3 +453,24 @@ cases the row, not the broker, is what the status endpoint and the on-call engin
 - [ ] The organisation already runs Celery for other services
 > ARQ's async task bodies let one process keep many model calls in flight. Celery's prefork pool and
 > broker breadth are the better fit for CPU-bound work, RabbitMQ features, and existing Celery estates.
+
+## Use cases & projects
+### Use cases
+- **Long research agents.** A run that loops for minutes is a job: the client gets `202 Accepted` with a
+  job id and polls or subscribes for step progress.
+- **Batch evals.** A nightly run over hundreds of test cases fans out as jobs, with worker concurrency set
+  by the provider rate limit.
+- **RAG ingestion.** Chunking and embedding a corpus runs on workers so uploads return at once and retries
+  do not duplicate chunks.
+- **Agents with side effects.** Idempotent job and tool bodies stop a redelivered job from sending the
+  same email or charge twice.
+
+### Mini project
+**Agent job with a status endpoint (2-3 hours).**
+- **Goal:** move a slow agent run off the request path with ARQ (or Celery) and a job row you own.
+- **Steps:** create a jobs table; in the POST route, commit the job row, then enqueue, then return 202
+  with the job id; in the worker, check the job's status before running, write per-step progress, and
+  mark success or failure; add a GET status endpoint; make the fake tool record an idempotency key.
+- **Done when:** a client can submit, poll progress to completion and see a failure reported cleanly;
+  killing the worker mid-run and restarting it finishes the job without running the side-effecting tool
+  twice.

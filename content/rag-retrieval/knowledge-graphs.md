@@ -379,3 +379,24 @@ types in the extraction schema, and better still, load ownership from the projec
 - [ ] When users only ask open-ended exploratory questions
 > Fixed, tested queries cannot hallucinate labels or write unbounded traversals. Free-form generation buys
 > flexibility for open questions, at the cost of validation work and occasional broken or slow queries.
+
+## Use cases & projects
+### Use cases
+- **Security and dependency agents.** "Which customers run a service that depends on a vulnerable
+  library?" is a multi-hop path that one graph tool call answers exactly.
+- **Supply-chain and operations assistants.** Counts and constraints over suppliers, parts and sites come
+  back as exact rows, not similar passages.
+- **Agent memory.** Facts about users and entities stored as relationships with validity dates let an
+  agent tell current facts from outdated ones.
+- **Hybrid RAG.** The agent pulls exact facts from the graph and supporting passages from vector search,
+  citing a source for each hop.
+
+### Mini project
+**Give an agent a safe graph-query tool (2-3 hours).**
+- **Goal:** answer multi-hop questions through parametrised graph tools with hard bounds.
+- **Steps:** model a small graph of customers, services and libraries in a local Neo4j or in Postgres
+  tables; write two or three parametrised query tools with a hop limit, a `LIMIT`, read-only access and a
+  timeout; register them as agent tools; ask 10 multi-hop questions and compare with a vector-search-only
+  agent on the same data.
+- **Done when:** the graph agent answers the multi-hop questions with exact rows and a source per hop,
+  every query stays within its bounds, and you have a side-by-side accuracy table against the vector agent.

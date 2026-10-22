@@ -417,3 +417,23 @@ version the result. A few hundred such items will say more than two thousand syn
 > Disagreement between qualified experts usually points at the task definition, not the people. A
 > grader cannot be more reliable than its labels, so the guideline must be sharpened, ambiguous items dropped or made multi-answer, and
 > agreement re-measured before the set is used.
+
+## Use cases & projects
+### Use cases
+- **Launching a support or operations agent.** A signed-off set of tasks per intent and tool gives the
+  first eval a fixed, agreed target instead of a handful of demo prompts.
+- **Turning production incidents into regression tasks.** Each failed trace becomes a task with its
+  starting tool state and expected outcome, so the same failure cannot silently return.
+- **Comparing agent versions over months.** A versioned set keeps last quarter's score comparable to
+  this week's, even as prompts, tools and models change.
+- **Guarding a fine-tuning run on agent traces.** A held-out split kept out of training data tells you
+  whether the tuned model learned the task or just the eval.
+
+### Mini project
+**Build a versioned golden set for a ticket-triage agent (2-3 hours).**
+- **Goal:** assemble a small, stratified, replayable task set an agent eval can run against.
+- **Steps:** define 4-5 intents and the tools each needs; write or sample 40 tasks with a quota per
+  intent; for each, record the request, the seed state of the fake backend and the expected final state
+  or answer; split into dev and held-out; save as a versioned JSONL file with a short changelog.
+- **Done when:** a script loads the file, seeds the fake backend per task, and prints counts per intent
+  and split; a second person can read any task and agree on what success means.

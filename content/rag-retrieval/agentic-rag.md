@@ -440,3 +440,26 @@ verification against retrieved IDs, and trajectory-level metrics for steps and c
 - [ ] The citations check is too expensive
 > When questions are single-hop, extra iterations add model calls without new evidence. Routing simple
 > queries to a fixed pipeline, or tightening sufficiency checks and budgets, recovers latency.
+
+## Use cases & projects
+### Use cases
+- **Internal research assistants.** Multi-hop questions across wikis, tickets and incident data need
+  sequential searches where each query depends on the last result.
+- **Multi-source support agents.** The agent picks between a docs index, a ticket system and a SQL tool
+  instead of forcing every question through one vector store.
+- **Due-diligence and compliance review.** The agent searches until a sufficiency check passes, then
+  answers with citations that a checker verifies against retrieved text.
+- **Routing in front of fixed RAG.** Simple lookups go to a one-shot pipeline and only ambiguous or
+  multi-hop questions enter the agent loop, keeping latency down.
+
+### Mini project
+**Build a bounded agentic RAG loop with a citation check (2-3 hours).**
+- **Goal:** answer multi-hop questions over a small corpus with a tool-calling loop that stops on
+  sufficient evidence or on a step budget.
+- **Steps:** index a few dozen documents; expose `search_docs(query, filters)` and a fetch-document tool
+  to a tool-calling model; cap the loop at a fixed number of steps and a token budget; require every
+  answer sentence to cite a retrieved chunk id and reject answers whose citations are not in the
+  retrieved set; run 10 single-hop and 10 multi-hop questions against both the loop and a one-shot RAG
+  baseline.
+- **Done when:** you have a table of accuracy, steps, tokens and latency for both systems on both
+  question types, and traces showing at least one run where the second query used a fact from the first.

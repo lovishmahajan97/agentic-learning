@@ -5,7 +5,8 @@ name: Continuous batching
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - serving-inference/batching-and-concurrency-limits
   - serving-inference/prefill-vs-decode
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Continuous batching schedules per decode iteration, not per request: finished sequences leave and waiting
-ones join every step, so the GPU stays full. One weight read serves dozens of tokens, giving throughput an
-order of magnitude above naive servers.
+Continuous batching lets a serving engine admit and retire sequences every decode step, so hundreds of
+agent runs firing short, uneven tool-call steps share one GPU efficiently. It sets your fleet's throughput
+and every step's TPOT.
+
+## For agent builders
+- **Why it matters for agents.** Agent traffic is the skewed mix this was built for: a 30-token tool call
+  next to a 2,000-token final report, long prompts on every step, and runs that pause for tools. Each step
+  waits in the engine's queue, so scheduler dials multiply across a 10-step task.
+- **Where it shows up in your stack.** Self-hosted engines (vLLM, SGLang, TGI) do it for you; you set
+  `--max-num-seqs`, `--max-num-batched-tokens` and `--enable-chunked-prefill` in vLLM, and read
+  `vllm:num_requests_waiting`. Hosted APIs do it behind rate limits and latency you observe.
+- **What you control.** Per-step `max_tokens` and stop conditions (short steps retire fast), cancelling
+  abandoned steps, prefix stability (less prefill per iteration), concurrency per agent run, and priority
+  between interactive agents and batch eval runs.
+- **What you can skip.** Kernel-level batching of attention. Know the scheduler loop, the two budgets,
+  chunked prefill and Little's law.
 
 ## Why it exists
 - **Decode needs many tokens per weight read.** It is memory-bandwidth-bound, one token per full read of the
@@ -33,6 +47,8 @@ order of magnitude above naive servers.
 - **Static request-level batching breaks on generation.** Collect *B* requests, run until all finish, then
   collect the next *B*: fine for fixed-cost models. But one request stops after 20 tokens and another runs
   to 2,000, and the early finisher's slot idles, padded with nothing useful, until the longest ends.
+- **Agent steps make the skew worse.** A tool call is tens of tokens; a final answer or code file is
+  thousands. A static batch of agent steps would wait on the one run writing its report.
 - **The cost is twofold.** Utilization collapses toward that of the single longest sequence, and arrivals
   wait for the remaining life of the current batch, because no new request can start until it drains.
 - **Smaller or time-boxed batches trade one waste for another.** Small batches lose the bandwidth
@@ -51,11 +67,12 @@ order of magnitude above naive servers.
 Each iteration the engine does roughly this:
 
 1. **Retire.** Remove sequences that emitted a stop token, reached `max_tokens`, or were cancelled; free
-   their KV blocks.
+   their KV blocks. An agent step ending in a tool call retires here and frees its slot during the tool wait.
 2. **Admit.** Pull waiting requests, oldest first (or by priority), while two budgets hold:
    - running sequences stay under `max_num_seqs`;
    - tokens processed this iteration stay under `max_num_batched_tokens`. A newcomer's prompt counts its
-     full length, because its prefill runs this step; a running request counts one token.
+     full length (minus any prefix-cache hit), because its prefill runs this step; a running request
+     counts one token.
 3. **Check memory.** Ensure every running sequence can get at least one more block; if not, preempt the most
    recently admitted ones (recompute or swap) until the rest fit.
 4. **Run one forward pass** over the union: prefill tokens for newcomers and one decode token per running
@@ -71,7 +88,8 @@ Each iteration the engine does roughly this:
 
 ### The interference problem and chunked prefill
 - **Mixing has a cost.** A 10k-token newcomer makes the iteration as long as its prefill, and all 60
-  decoding users see a pause.
+  decoding users see a pause. In an agent fleet that newcomer is often a late step with an uncached
+  transcript.
 - **Early implementations picked a policy:** prefill-first (admit eagerly, accept TPOT spikes, minimize
   TTFT) or decode-first (defer admissions until decode is quiet, accept TTFT growth).
 - **Chunked prefill removes the dilemma.** Cap prefill tokens per iteration and split a long prompt across
@@ -83,7 +101,7 @@ Each iteration the engine does roughly this:
   while tokens per step grow linearly. Throughput rises steeply until the step becomes compute- or
   cache-bound, and every user's TPOT rises along the way.
 - **Two dials:** `max_num_seqs` and the token budget. Raise them to sell throughput, lower them to sell
-  latency.
+  latency. For agents, every point of TPOT is paid on every step of every run.
 - **Little's law sizes the batch you need** in front of the loop:
 
 ```
@@ -92,17 +110,20 @@ running sequences ≈ arrival rate × time each spends generating
 ```
 
 - **So a `max_num_seqs` of 16 guarantees a growing queue** however fast each step is.
+- **For an agent fleet, count generating steps, not runs.** A run waiting on a tool holds no slot, so in
+  flight ≈ active runs × (decode time per step ÷ total time per step).
 - **If arrivals exceed what the loop retires,** the queue grows without bound and TTFT explodes: the signal
   for backpressure or more replicas.
 
 ### What it does not fix
-- **Single-request decode** stays at the bandwidth floor; nothing makes a batch of one efficient.
+- **Single-request decode** stays at the bandwidth floor; nothing makes a batch of one efficient. A lone
+  agent run on an idle replica is no faster than the floor.
 - **Memory becomes the binding constraint,** because the batch is limited by how many caches fit, not a
   fixed batch size. That is why this lesson and the KV-cache lessons are inseparable.
 
 ## Diagram
 One pass of the iteration-level scheduler; the loop runs once per decode step, so batch membership changes
-every step.
+every step and agent steps that end in a tool call leave immediately.
 
 ```mermaid
 flowchart TD
@@ -118,6 +139,32 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: how many slots does a 100-run agent fleet need?
+Each step decodes a 150-token tool call at ~25 ms TPOT, then waits on a tool. Illustrative numbers.
+
+```python
+def agent_fleet(active_runs, out_tokens, tpot_ms, tool_wait_s, new_prompt_tokens):
+    gen_s = out_tokens * tpot_ms / 1000                 # time one step spends decoding
+    step_s = gen_s + tool_wait_s                        # one loop iteration of one agent run
+    in_flight = active_runs * gen_s / step_s            # Little's law: only generating steps hold a slot
+    steps_per_s = active_runs / step_s
+    return round(in_flight), round(steps_per_s, 1), round(steps_per_s * new_prompt_tokens)
+
+print(agent_fleet(100, 150, 25, 2.0, 1_500))    # (65, 17.4, 26087)  prefix hits: newest tool result only
+print(agent_fleet(100, 150, 25, 2.0, 20_000))   # (65, 17.4, 347826) misses: whole transcript every step
+print(agent_fleet(100, 150, 25, 0.2, 1_500))    # (95, 25.3, 37975)  fast tools: runs come back sooner
+```
+
+| Case | Sequences in flight | Steps admitted per s | Prefill tokens per s |
+|---|---|---|---|
+| 2 s tools, prefix cache hits | 65 | 17.4 | ~26k |
+| 2 s tools, cache misses | 65 | 17.4 | ~348k |
+| 0.2 s tools, prefix cache hits | 95 | 25.3 | ~38k |
+
+- **Read it as:** a `max_num_seqs` of 32 would queue these steps; and cache misses multiply prefill work
+  per iteration about 13x, which is what turns admissions into TPOT stalls without chunked prefill.
+- **Faster tools raise demand,** because runs spend less time off the GPU.
+
 ### Static versus continuous batching, simulated
 Same workload, an illustrative step-time model (a fixed weight-read time plus a small per-token cost), and
 deliberately skewed output lengths, as real traffic is.
@@ -191,44 +238,53 @@ for cap in (16, 32, 48):
   The cap you can afford is set by the TPOT budget; beyond it, add replicas.
 
 ## Production patterns
-- **Pick dials from a load-test knee.** Sweep `--max-num-seqs` and `--max-num-batched-tokens` (vLLM) under
-  the production length mix, record TTFT, TPOT and tokens/s together, and choose the highest concurrency
+- **Pick dials from a load-test knee on agent traces.** Sweep `--max-num-seqs` and
+  `--max-num-batched-tokens` (vLLM) while replaying recorded agent runs (real prompt lengths, output
+  lengths and tool waits), record TTFT, TPOT and tokens/s together, and choose the highest concurrency
   whose TPOT p95 is inside budget. Re-run on every model or hardware change.
 - **Chunked prefill on mixed workloads.** Keep `--enable-chunked-prefill` on (the default in recent vLLM)
-  unless prompts are uniformly short. Monitor per-step time and TPOT p99 when long prompts arrive.
+  unless prompts are uniformly short; agent steps rarely are. Monitor per-step time and TPOT p99 when long
+  prompts arrive.
+- **Short steps retire fast.** Set a per-step `max_tokens` sized to the tool-call schema and stop at the end
+  of the call, and cancel requests the agent abandons (a timed-out step, a losing parallel branch) so their
+  slots and blocks free at once. Monitor output-length p99 per step type.
 - **Backpressure at the gateway.** Reject or shed load (HTTP 429 or 503 with `Retry-After`) when the engine's
   waiting-queue depth (vLLM's `vllm:num_requests_waiting`) passes a threshold derived from the TTFT budget.
-  Monitor rejection rate and TTFT p99 together.
+  Agent clients should back off with jitter rather than retry instantly. Monitor rejection rate and TTFT p99.
 - **Scale on the queue, not CPU.** Autoscale replicas when waiting requests stay above zero for a sustained
   window or arrivals approach the retirement rate. Monitor queue depth trend and preemptions per replica.
-- **Priority for interactive traffic.** Where the engine supports a priority scheduling policy (vLLM has a
-  priority mode alongside first-come-first-served), give interactive requests precedence over batch jobs
-  sharing the replica. Monitor TTFT per priority class.
+- **Priority for interactive agents over eval sweeps.** Where the engine supports a priority scheduling
+  policy (vLLM has a priority mode alongside first-come-first-served), give interactive agent steps
+  precedence over batch jobs and offline eval runs sharing the replica. Monitor TTFT per priority class.
 
 ## Trade-offs
 - **Saturated GPU vs per-user TPOT.** It multiplies throughput, but every admitted request lengthens each
-  step and every user's TPOT. The balance flips toward smaller `max_num_seqs` for interactive products.
+  step and every user's TPOT. The balance flips toward smaller `max_num_seqs` for interactive products, and
+  agents pay that TPOT once per step.
 - **Eager vs deferred admission.** Eager admission minimizes TTFT but injects prefill into decode steps;
   deferring does the opposite. Chunked prefill blunts the trade at the cost of slightly longer TTFT on
   long prompts.
 - **Memory as the limit vs preemption risk.** Iteration-level scheduling makes memory, not batch size, the
   limit, which packs far more requests but introduces preemption as a failure mode when the sequence-length
-  tail is long.
+  tail is long, as with late steps of long agent runs.
 - **Large vs small token budget.** A large per-iteration budget raises utilization on long-prompt workloads
   but makes each step heavier; on chat with short prompts a smaller budget gives smoother streaming.
 
 ## Pitfalls
 - **Benchmarking with uniform output lengths.** Symptom: little gain over static batching in the load test,
   then surprise when production's skewed lengths behave completely differently. Fix: replay output lengths
-  sampled from production logs.
+  sampled from production logs or recorded agent traces.
 - **Raising `max_num_seqs` until throughput peaks and shipping that.** Symptom: excellent tokens/sec with
-  complaints that text streams slowly, because TPOT was never on the dashboard. Fix: cap it where TPOT p95
-  meets the budget.
+  complaints that text streams slowly and agent tasks take longer, because TPOT was never on the dashboard.
+  Fix: cap it where TPOT p95 meets the budget.
 - **Chunked prefill disabled on a mixed workload.** Symptom: periodic stalls across all streams that
   correlate with long-prompt arrivals rather than request rate. Fix: enable it with a token budget.
 - **An unbounded waiting queue.** Symptom: TTFT climbing linearly over minutes under steady overload,
   because the loop retires fewer sequences per second than arrive. Fix: backpressure at the gateway and
   scale on queue depth.
+- **Sizing the fleet by active agent runs.** Symptom: slots sit idle or the queue explodes when tool
+  latency changes. Fix: size by generating steps (runs × decode share of each step) and re-check when
+  tools get faster.
 - **Expecting better single-request latency.** Symptom: disappointment when a lightly loaded server's TPOT
   equals the bandwidth floor regardless of settings. Fix: use per-request levers such as weight
   quantization or speculative decoding.
@@ -236,12 +292,12 @@ for cap in (16, 32, 48):
 ## When to use
 Every production LLM engine does this; what you choose is the dials.
 - **Set the dials from a load test:** `max_num_seqs` and the token budget, recording TTFT, TPOT and
-  tokens/sec together, at the point where TPOT is still inside the product's budget.
+  tokens/sec together, at the point where TPOT is still inside the product's (or agent step's) budget.
 - **Enable chunked prefill** unless the workload is purely short prompts.
 - **Watch overload signals:** queue depth and preemptions; add replicas or backpressure when the queue grows
   faster than it drains.
 - **Building on a raw model library instead of an engine?** This is the first feature you are missing, and
-  the reason to switch.
+  the reason to switch before you serve any agent fleet.
 - **Interviews:** why static batching wastes slots, how iteration-level scheduling fixes it, why it needs
   paged memory, and what chunked prefill adds.
 
@@ -291,10 +347,19 @@ enter the conversation.
 - **Fix:** enable chunked prefill with a token budget, and cap `max_num_seqs` at the TPOT budget rather than
   at peak throughput.
 
-### When would you deliberately run smaller batches than the GPU could hold?
-- **Interactive products with a TPOT budget:** every admitted sequence lengthens each step for everyone.
-- **Long-tailed lengths:** optimistic admission near the memory limit invites preemption storms.
-- **The cost** is lower tokens per GPU and more replicas, so do it per endpoint class, not fleet-wide.
+### You run 100 concurrent agents on one self-hosted replica. How do you size `max_num_seqs`?
+- **Count generating steps, not runs:** with 150-token tool calls at ~25 ms TPOT and 2 s tool waits, about
+  65 sequences are in flight on average.
+- **Check the TPOT knee there:** if TPOT p95 at ~65 sequences breaks the step budget, add a replica rather
+  than raising the cap.
+- **Recheck when tools speed up,** because runs return sooner and demand rises (about 95 with 0.2 s tools).
+
+### Interactive agents and a nightly eval sweep share a replica, and users complain during the sweep. What do you do?
+- **Diagnosis:** the sweep fills the waiting queue and the batch, so interactive steps wait longer for
+  admission and every step decodes at a higher TPOT.
+- **Fixes:** a priority scheduling policy where the engine offers one, a concurrency cap on the eval runner,
+  or a separate replica class for batch work.
+- **Measure** TTFT and TPOT per traffic class before and after.
 
 ### Arrivals are 5 requests/s, outputs average 300 tokens at ~20 ms TPOT. Is `max_num_seqs` 16 enough?
 - **Little's law:** 5 × 6 s ≈ 30 sequences must be in flight on average.
@@ -329,3 +394,23 @@ enter the conversation.
 > Mixing a long prefill into one step stretches that step for everyone. Chunking spreads the prefill
 > across several steps, each still carrying all decode tokens, so TPOT stays smooth. Total work and
 > context limits are unchanged.
+
+## Use cases & projects
+### Use cases
+- **Self-hosted agent platforms.** Continuous batching is why one replica can serve dozens of agent runs
+  whose steps start and finish at different times.
+- **Mixed tool-call and long-answer traffic.** Short tool calls retire within a few hundred steps while a
+  long report keeps decoding, without either waiting for the other.
+- **Sharing GPUs between live agents and eval sweeps.** Priority scheduling and per-class caps keep batch
+  evaluation from inflating interactive step latency.
+- **Capacity planning for agent fleets.** Little's law on generating steps turns run counts and tool
+  latency into a `max_num_seqs` target and a replica count.
+
+### Mini project
+**Load-test an engine with agent-shaped traffic (2-3 hours).**
+- **Goal:** find the `max_num_seqs` knee for an agent workload and see chunked prefill's effect.
+- **Steps:** serve a small model with vLLM; write an async client that runs N fake agents, each looping
+  10 steps of a growing prompt, a short capped generation and a sleep standing in for a tool; sweep N and
+  `--max-num-seqs`, then repeat with chunked prefill off; record TTFT, TPOT and task time per run.
+- **Done when:** you have a chart of task time and TPOT p95 against concurrency, the knee is marked, and a
+  short note compares your measured in-flight count with the Little's-law estimate.

@@ -444,3 +444,29 @@ the change by exporting the schema and diffing it.
 - [ ] It prevents two routes from sharing the same path
 > Default IDs combine the function name, path and method, so they are long and change when paths change.
 > A custom function keyed on tag and name keeps SDK method names readable and stable across refactors.
+
+## Use cases & projects
+### Use cases
+- **Exposing a service as agent tools.** Agent frameworks and platforms that import OpenAPI turn each
+  operation into a tool, so `operation_id`, `summary` and field descriptions become the model's view.
+- **Wrapping a REST API in an MCP server.** The OpenAPI document is the starting inventory of tools,
+  arguments and error shapes the MCP server exposes.
+- **Typed SDKs for agent code.** Generated clients give the agent loop typed calls to your run, retrieval
+  and tool endpoints, with stable method names from stable operation IDs.
+- **Hiding internal routes from the model.** `include_in_schema` keeps admin and eval routes out of the
+  schema, so they never become callable tools.
+
+### Mini project
+**Turn a FastAPI service into a clean tool catalogue (1-2 hours).**
+- **Goal:** make three endpoints read well as agent tools and prove it by converting the schema into tool
+  definitions.
+- **Steps:** build `search_docs`, `get_ticket` and `create_ticket` routes; set readable `operation_id`
+  values, a `summary` and `description` per route, `Field(description=..., examples=...)` on every
+  argument, `Literal` types for fixed choices and declared error `responses`; write a short script that
+  reads `/openapi.json` and prints one tool definition per operation.
+- **Done when:** every printed tool has a short name, a one-line description and fully described
+  arguments, and an admin route marked `include_in_schema=False` is absent from the list.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide), whose endpoints are published at `/docs`
+with Pydantic request and response models and one consistent error envelope.

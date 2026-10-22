@@ -5,7 +5,8 @@ name: API & SDK integration
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/openai-sdk
   - python-for-ai/anthropic-sdk
@@ -23,9 +24,23 @@ sources:
 ---
 
 ## TL;DR
-Most of an AI system is glue to APIs you do not control. Use the SDK, but own a thin
-integration layer with explicit timeouts, one retry policy, idempotency, an error taxonomy and
-observability, because SDK defaults suit the average caller, not your latency budget.
+An agent is mostly calls to APIs you do not control: the model provider and every tool. Use the SDK,
+but own a thin adapter with explicit timeouts, one retry policy, idempotency, an error taxonomy and
+observability, because SDK defaults ignore your run budget.
+
+## For agent builders
+- **Why it matters for agents.** One agent run makes many model calls and tool calls in sequence, so
+  per-call failure modes compound: a hung tool stalls the run, a retried side effect acts twice, and
+  retries in two layers multiply cost. The adapter turns each failure into a clear signal the loop or
+  the model can act on.
+- **Where it shows up in your stack.** The OpenAI and Anthropic SDK clients (`timeout`, `max_retries`),
+  httpx clients behind each tool, retry helpers such as tenacity, the agent framework's own retry
+  settings, and tracing that records each call's vendor request id and token usage.
+- **What you control.** A run deadline split into per-step budgets, which layer retries, which tool
+  errors go back to the model versus stop the run, idempotency keys derived from run id and step, and a
+  breaker with a fallback model.
+- **What you can skip.** Writing your own HTTP client or SSE parser. Know the timeout phases, the error
+  classes and the `a·t + S` arithmetic.
 
 ## Why it exists
 - **Every remote system misbehaves on schedule.** A model provider, vector database, CRM or payment
@@ -53,18 +68,20 @@ observability, because SDK defaults suit the average caller, not your latency bu
 | SSE parsing into events; auto-pagination iterators | the mapping from HTTP status to exception class |
 | matching sync and async clients | |
 
-- **Read the constructor before shipping.** `timeout` and `max_retries` define your worst-case latency.
+- **Read the constructor before shipping.** `timeout` and `max_retries` define your worst-case latency
+  per model call, and so per agent step.
 
 ### The adapter: one module owns the vendor
 - **Wrap each external system in one module** that exposes your own types and raises your own exceptions,
   *because* vendor types and errors leak otherwise, and swapping or adding a provider becomes a rewrite.
+  In an agent, each tool gets one adapter and the model provider gets one.
 - **Classify every failure:**
 
-| Class | Examples | Action |
-|---|---|---|
-| Retryable | 429, 5xx (most often 502/503/504), connection errors, timeouts, truncated streams | back off and retry |
-| Terminal | 400/422 (your request is wrong), 401/403 (credentials), 404, content-policy refusals | fail now |
-| Ambiguous | a timeout on a non-idempotent call; the request may have completed | retry only with an idempotency key |
+| Class | Examples | Action | In an agent loop |
+|---|---|---|---|
+| Retryable | 429, 5xx (most often 502/503/504), connection errors, timeouts, truncated streams | back off and retry | the adapter retries; the model never sees it |
+| Terminal | 400/422 (your request is wrong), 401/403 (credentials), 404, content-policy refusals | fail now | 400/422/404 go to the model as a tool error; 401/403 stop the run |
+| Ambiguous | a timeout on a non-idempotent call; the request may have completed | retry only with an idempotency key | never let the model "try again" without the key |
 
 ### Timeouts
 - **Set connect, read and total timeouts separately.**
@@ -75,7 +92,7 @@ observability, because SDK defaults suit the average caller, not your latency bu
 - **A stream may run for minutes** while each chunk arrives within a second, so the read timeout is a
   per-chunk budget.
 - **A total deadline needs a separate wrapper** (`asyncio.timeout` around the call). Tie it to what the
-  user-facing request can afford, not to what the provider allows.
+  user-facing request or agent run can afford, not to what the provider allows.
 
 ### Retries, idempotency and budgets
 - **Backoff with full jitter.** Sleep a uniform random time in `[0, min(cap, base × 2^n)]` and honour
@@ -90,7 +107,8 @@ outage load on the vendor           up to a × normal traffic
 ```
 
 - **The arithmetic is `a·t + S`**, and layering multiplies it: 3 adapter attempts around an SDK making 3
-  per call (its default of 2 retries) turn one user request into 9 upstream calls.
+  per call (its default of 2 retries) turn one user request into 9 upstream calls. An agent framework
+  that retries failed steps adds a third layer.
 - **Retry in exactly one layer** and switch the others off (`max_retries=0` on the SDK client).
 
 ### Streams fail differently
@@ -98,30 +116,31 @@ outage load on the vendor           up to a × normal traffic
    or the provider hit an internal error mid-generation.
 2. **The status already said success**, so the only signal is the missing terminal event: a final
    `finish_reason`, a stop event or a `[DONE]` sentinel, depending on the provider.
-3. **Treat a stream that ends without its terminal event as a retryable failure**, not a short answer.
+3. **Treat a stream that ends without its terminal event as a retryable failure**, not a short answer;
+   a truncated tool-call stream yields half-written JSON arguments.
 4. **Retrying a stream affects the user.** Tokens already shown cannot be unshown: restart and replace the
    partial text, or surface the truncation and let the user retry.
 
 ### Circuit breakers, fallbacks and connection reuse
 - **Circuit breaker.** After N consecutive failures, stop calling the vendor for a cool-down and fail
   fast or route to a fallback model; this protects your latency and the vendor's recovery.
-- **One client per process**, so TLS handshakes and connections are reused; a client per request is a
-  common source of socket exhaustion.
+- **One client per process**, so TLS handshakes and connections are reused; a client per request (or per
+  tool call) is a common source of socket exhaustion.
 
 ### Configuration, observability and tests
 - **Keys** come from a secret store or environment, never source.
 - **Log every call:** the vendor's request id, status, latency, attempt count and token usage, with a
-  correlation id.
+  correlation id; in an agent, the run id and step number are that correlation.
 - **Pin** SDK versions and any API-version header.
 - **Test** happy paths with recorded responses and failure paths with injected 429/timeout/truncation;
   run a small contract test against the live sandbox on a schedule.
 
 ## Diagram
-Each attempt is classified; only retryable failures loop, and only while the total budget allows.
+Each attempt is classified; only retryable failures loop, and only while the step's budget allows.
 
 ```mermaid
 flowchart TD
-    C["Caller"] --> B{"Breaker open?"}
+    C["Agent step"] --> B{"Breaker open?"}
     B -->|"yes"| F["Fail fast or fallback model"]
     B -->|"no"| A["Attempt with per-phase timeouts"]
     A --> K{"Classify result"}
@@ -187,6 +206,35 @@ async def complete(payload: dict, idem_key: str, attempts: int = 3, budget_s: fl
     raise RuntimeError("unreachable")
 ```
 
+### Turning adapter errors into tool results
+In the agent loop, the tool runner calls the adapter with the step's share of the run budget and an
+idempotency key from run id plus step, then decides what the model sees.
+
+```python
+import asyncio
+
+class StopRun(Exception): ...                         # credentials or policy: a human must act
+
+async def run_tool(tool, args: dict, run_id: str, step: int, run_deadline: float) -> dict:
+    loop = asyncio.get_running_loop()
+    remaining = run_deadline - loop.time()
+    if remaining <= 1.0:
+        return {"error": "run budget exhausted; answer with what you have"}
+    key = f"{run_id}:{step}:{tool.name}"              # same key if this step is replayed
+    try:
+        async with asyncio.timeout(min(remaining, tool.max_s)):
+            return {"ok": await tool.call(args, idem_key=key)}   # adapter retries inside
+    except TimeoutError:
+        return {"error": f"{tool.name} timed out; do not repeat the same call"}
+    except TerminalError as e:
+        msg = str(e)
+        if msg.startswith(("HTTP 401", "HTTP 403")):
+            raise StopRun(msg)                         # never let the model loop on auth errors
+        return {"error": msg[:300]}                    # 400/404/422: the model can fix its arguments
+    except RetryableError as e:                        # retries were exhausted inside the adapter
+        return {"error": f"{tool.name} unavailable ({e}); try another approach"}
+```
+
 ### A circuit breaker in front of the adapter
 Runnable with the standard library. After `threshold` consecutive failures calls fail fast; after the
 cool-down they probe again, and one failed probe re-opens it.
@@ -239,10 +287,23 @@ attempts) wrapped in an adapter that also makes 3 attempts. The provider starts 
 | Worst case per request, ten-minute SDK timeout | up to 9 × 10 min of waiting, plus sleeps | capped by the 20 s total deadline |
 | What users see | requests hang, then fail | a clear error or fallback within 20 s |
 
+### Worked scenario: a 6-step agent run under a 60-second budget
+Each step is one model call plus one tool call; figures are illustrative.
+
+| Design | One slow tool at step 3 | Run outcome |
+|---|---|---|
+| No per-step budget, tool on library defaults | step 3 waits minutes | user abandons; the run keeps billing |
+| Run deadline 60 s, tool capped at 10 s | step 3 returns a timeout tool result at 10 s | the model picks another tool or answers by ~60 s |
+| Plus a framework that also retries failed steps | step 3 repeats up to 3 times under one key | one side effect, at most 30 s spent on it |
+
 ## Production patterns
+- **Budget the whole agent run, then each step.** Set a run deadline, pass the remaining time to every
+  model and tool call, and cap each tool with its own maximum. Monitor runs ending on budget exhaustion
+  and time per step.
 - **Retry in one layer only.** Set `max_retries=0` and an explicit `timeout` on the SDK client, and own
-  the policy in the adapter (or the reverse, but never both). Monitor a histogram of attempts per
-  request; the mean sits just above 1 when healthy, so alert when it climbs well past that baseline.
+  the policy in the adapter (or the reverse, but never both), and turn off step-level retries in the
+  framework if the adapter already retries. Monitor a histogram of attempts per request; the mean sits
+  just above 1 when healthy, so alert when it climbs well past that baseline.
 - **A total deadline per user request.** Wrap every vendor call in `asyncio.timeout` sized from the
   user-facing budget, and pass the remaining budget down to nested calls. Monitor p99 latency including
   retries and the deadline-exceeded count.
@@ -250,8 +311,8 @@ attempts) wrapped in an adapter that also makes 3 attempts. The provider starts 
   secondary provider or smaller model, and probe after a cool-down. Monitor breaker state changes and
   the share of traffic served by the fallback.
 - **Log the vendor's request id on every call.** Providers return a request-id response header (named
-  differently per provider); log it with your correlation id, status, attempts and token usage. It is
-  what the vendor's support team asks for during an incident.
+  differently per provider); log it with your correlation id (run id and step), status, attempts and
+  token usage. It is what the vendor's support team asks for during an incident.
 - **Fault-injected tests plus a scheduled sandbox contract test.** Mock the transport (for example
   `httpx.MockTransport` or the respx library) to inject 429s, timeouts and truncated streams in CI, and
   run a few live calls against the vendor sandbox on a schedule. Alert when the contract test fails.
@@ -263,6 +324,9 @@ attempts) wrapped in an adapter that also makes 3 attempts. The provider starts 
 - **Hidden failures vs amplified outages.** Automatic retries hide transient failures, but each costs
   money and latency and can amplify an outage; it flips when the operation is non-idempotent or the
   budget is tight.
+- **Retry in code vs let the model retry.** Code retries are cheap and predictable for transient errors;
+  sending errors to the model costs a full model call but lets it fix bad arguments. Use code for
+  retryable errors, the model for terminal input errors.
 - **Adapter layer vs ceremony.** A thin adapter per vendor adds types and mapping, but makes provider
   swaps, fallbacks and tests cheap; for a single-vendor prototype it can feel like ceremony.
 - **Aggressive timeouts vs slow successes.** They protect your latency budget, but turn slow successes
@@ -274,7 +338,8 @@ attempts) wrapped in an adapter that also makes 3 attempts. The provider starts 
 - **Retrying everything, including 400 and 401.** Symptom: the same invalid request hammers the vendor
   four times, with a rate-limit ban on top of the original bug. Fix: retry only the retryable class.
 - **Retrying a non-idempotent `POST` after a timeout without an idempotency key.** Symptom: duplicate
-  records, double charges or two emails sent. Fix: send an idempotency key, or do not retry.
+  records, double charges or two emails sent, often because the model re-issued the tool call. Fix: send
+  an idempotency key, or do not retry.
 - **Retrying in two layers** (your wrapper and the SDK, or a gateway and the app). Symptom: vendor-side
   request counts several times your own during an incident. Fix: `max_retries=0` in all but one layer.
 - **Treating a stream without its terminal event as complete.** Symptom: answers stop mid-sentence and
@@ -287,6 +352,7 @@ attempts) wrapped in an adapter that also makes 3 attempts. The provider starts 
 ## When to use
 - **Scale the adapter to blast radius.** A model provider on the request path gets timeouts, retries,
   idempotency keys, a breaker and metrics; a nightly report API can live with a timeout and a retry.
+  Tools with side effects always get idempotency keys.
 - **Use the official SDK** when one exists and you have read its timeout and retry settings.
 - **Drop to `httpx`** when the SDK lacks a feature, blocks the event loop, or you need exact control over
   streaming.
@@ -322,9 +388,17 @@ if the call had side effects.
 - **On a stream:** it bounds time-to-first-token and each inter-chunk gap, so a healthy stream can run for
   minutes without tripping it.
 - **Consequence:** you need a separate total deadline, such as `asyncio.timeout`, sized from the
-  user-facing budget.
+  user-facing budget or the agent run's remaining time.
 
-### During a vendor incident your workers are all busy but error rates are zero. What is happening and how do you fix it?
+### An agent's `send_email` tool call times out. Should the loop retry it, and who decides?
+- **It is ambiguous:** the email may already be sent, so a blind retry, or the model re-issuing the call,
+  can send two.
+- **Decide in code, not in the model:** retry only with an idempotency key derived from run id and step,
+  so the email service returns the first outcome.
+- **Tell the model the truth:** if retries cannot run, return "timed out, outcome unknown, do not repeat"
+  and let a status check or a human resolve it.
+
+### During a vendor incident your agent workers are all busy but error rates are zero. What is happening and how do you fix it?
 - **Diagnosis:** calls are hanging, not failing; there is no timeout or a multi-minute default, so
   workers wait instead of erroring.
 - **Immediate fix:** explicit connect and read timeouts plus a total deadline, so failures surface fast.
@@ -372,3 +446,28 @@ if the call had side effects.
 - [ ] Multiple clients would share the same API key incorrectly
 > Each new client opens fresh connections and TLS handshakes, which cost latency and sockets. A shared
 > client pools connections and centralises the configuration the whole service depends on.
+
+## Use cases & projects
+### Use cases
+- **Model provider client for an agent service.** One adapter with explicit timeouts, one retry layer,
+  a breaker and a fallback model behind every agent step.
+- **Side-effecting tools.** Email, ticketing and payment tools carry idempotency keys from run id and
+  step, so replayed steps and model re-issues act once.
+- **Tool error feedback.** Terminal input errors (400, 404, 422) return to the model as tool results so
+  it can fix arguments, while auth errors stop the run.
+- **Vendor incident response.** Request ids, attempt counts and breaker state in traces show quickly
+  whether the agent, the adapter or the provider is at fault.
+
+### Mini project
+**A fault-tolerant tool layer for an agent (2-3 hours).**
+- **Goal:** wrap two tools (a read-only lookup and a side-effecting "create ticket") so a flaky backend
+  never stalls the run or duplicates a ticket.
+- **Steps:** build a fake backend with `httpx.MockTransport` that returns 503, 429 with `Retry-After`,
+  422 and slow responses at random; write the adapter and `run_tool` wrapper above; run a 6-step loop
+  with a 60-second run deadline and the SDK-style retries switched off.
+- **Done when:** a test run with 30% injected failures creates exactly one ticket per step key, no step
+  exceeds its cap, 422s reach the model as tool errors, and the trace shows attempts per call.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): DocBrief's worker calls the model
+provider through an adapter with explicit timeouts, bounded retries and a client-side token bucket.

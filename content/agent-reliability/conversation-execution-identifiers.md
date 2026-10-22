@@ -5,7 +5,8 @@ name: Conversation / execution identifiers
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - agent-reliability/state-persistence-and-conversation-recovery
   - agent-reliability/idempotent-tool-execution
@@ -23,6 +24,19 @@ sources:
 Agents need an id hierarchy, not one "session id": tenant, user, conversation, turn, run, step,
 tool call and trace. Each answers a different question (resume what, dedupe what, bill whom, trace
 which); conflating them makes retries double-act and logs impossible to join.
+
+## For agent builders
+- **Why it matters for agents.** An agent turn fans out into runs, steps, tool calls, sub-agents and
+  retries across several services. Without distinct ids you cannot resume the right run, dedupe a
+  side effect, or answer "why did the agent do it twice".
+- **Where it shows up in your stack.** The thread id your framework keys checkpoints by (LangGraph's
+  `thread_id` in the run config), the `tool_call_id` the model API pairs with results, the
+  `Idempotency-Key` header on tool requests, and OpenTelemetry trace context across services.
+- **What you control.** Who mints each id and when (the client mints turn_id, the server mints run_id,
+  keys are derived), attempt semantics, `parent_run_id` for sub-agents, propagation through
+  `contextvars`, and tenant-scoped lookups.
+- **What you can skip.** Building on the provider's conversation or thread id. Keep your own hierarchy and
+  store provider ids as attributes for support cases.
 
 ## Why it exists
 - **One session id cannot explain an incident.** Debug "the agent created two tickets": the logs show two
@@ -345,3 +359,24 @@ which are intended.
 - [ ] Run ids are issued by the model provider
 > Conversations span many turns and days; runs span one attempt lasting minutes. Resuming, leasing and
 > deriving idempotency keys all need the attempt-level id, which a conversation id cannot provide.
+
+## Use cases & projects
+### Use cases
+- **Debugging "the agent did it twice".** Turn, run, attempt and step ids in every log line tell a client
+  retry from a crash-resume from a regenerate in minutes.
+- **Durable agents with side-effecting tools.** Keys derived from (run_id, step, index) stay stable across
+  a crash-resume, so the tool dedupes the repeat.
+- **Multi-agent systems.** `parent_run_id` plus the spawning tool call lets a resumed parent find its
+  existing child and shows the delegation tree in the trace.
+- **Multi-tenant agent APIs.** `tenant_id` on every record scopes lookups, quotas, billing and deletion,
+  closing the insecure-direct-object-reference hole.
+
+### Mini project
+**Thread one id set through an agent turn (1-2 hours).**
+- **Goal:** tag every log line, event and tool request of a toy agent with tenant, conversation, turn, run,
+  step and tool call ids, and show the three retry cases behave correctly.
+- **Steps:** hold the ids in a frozen dataclass inside a `contextvars` variable; have the client mint the
+  turn id; mint a UUIDv7 or ULID run id per attempt; derive idempotency keys from run id, step and call
+  index; then simulate a client retry, a crash-resume and a regenerate.
+- **Done when:** the retry reuses the turn, the resume reuses run and keys, the regenerate gets a new run
+  with `attempt = 2`, and one log query reconstructs the whole turn.

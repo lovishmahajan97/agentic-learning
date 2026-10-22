@@ -434,3 +434,24 @@ also matters: if half the fleet is unusable, the autoscaler should be told, not 
 > The kernel driver lives on the node and must match the kernel; the toolkit's runtime hook bind-mounts
 > its user-space libraries and `/dev/nvidia*` into any container that requests GPUs. The device plugin
 > only tells the scheduler which devices exist and which ones a container was allocated.
+
+## Use cases & projects
+### Use cases
+- **Self-hosting the agent's model.** A vLLM or SGLang deployment on a GPU node pool, where driver, image
+  and device-plugin pairing decide whether the agent's model starts at all.
+- **GPU tool backends for RAG.** Embedders and rerankers that every retrieval step calls, often packed
+  onto shared or MIG-partitioned cards because they are small.
+- **Debugging "the agent is slow" tickets.** Tracing slow or failing agent steps to one bad node, a
+  throttled card or a slow weight load rather than to the prompt or the tools.
+- **Regulated or on-prem agent deployments.** Customers who cannot send data to a hosted API need the
+  full stack (hardware, drivers, scheduler, procurement) planned before the agent ships.
+
+### Mini project
+**Health-gate a self-hosted agent model (2-3 hours).**
+- **Goal:** make sure agent sessions never land on a GPU replica that is unhealthy or still loading.
+- **Steps:** run a small open model with vLLM in a container on one GPU (cloud VM or a local card);
+  record time from container start to first successful completion, split into image pull, weight load and
+  engine warm-up; add a readiness check that sends a real one-token completion instead of only checking
+  the port; write a tiny agent loop that calls the model five times per run and log per-step latency.
+- **Done when:** you have a start-up timing table by stage, a readiness check that fails while weights
+  load and passes after, and agent runs that only start once the replica reports ready.

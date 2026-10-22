@@ -5,7 +5,8 @@ name: CI/CD for prompts and models
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - backend-fundamentals/ci-cd
   - llmops-platform/evaluation-gates-for-production-releases
@@ -22,78 +23,103 @@ sources:
 ---
 
 ## TL;DR
-An LLM app ships three artifacts (code, prompts and config, model) and any one changes behaviour. CI/CD
-for them adds evals sized to each stage's blast radius, cached model calls, and promotion of one tested,
+An agent ships code, prompts, tool schemas, config and a model, and any one changes what it does. CI/CD
+for agents runs evals sized to each stage's blast radius, caches model calls, and promotes one tested,
 immutable bundle.
+
+## For agent builders
+- **Why it matters for agents.** A one-line edit to a system prompt or a tool description changes which
+  tool the agent picks, how many steps it takes and whether it finishes. Unit tests on your tool code see
+  none of that; only an eval over real agent runs does.
+- **Where it shows up in your stack.** A CI job (for example GitHub Actions) that runs your real agent
+  loop on a smoke set of tasks, a prompt registry webhook that triggers the same job, and a `release.json`
+  that pins the model snapshot, prompt versions and tool schemas together.
+- **What you control.** What goes in the bundle, the cache key at the model-client boundary, recorded
+  tool fixtures so CI never hits live systems, and which stage runs how many tasks.
+- **What you can skip.** Building a bespoke CI platform. Your existing pipeline plus one eval job, a
+  baseline file and pointer-based promotion covers most agent teams.
 
 ## Why it exists
 - **Classic CI/CD assumptions break.** A conventional pipeline assumes behaviour is determined by code,
-  tests are deterministic, and the bits that passed are the bits that run. An LLM app violates all three:
-  behaviour depends on code, prompt text, the model behind an API alias, decoding parameters and the
-  retrieval index, and outputs are sampled, not computed.
+  tests are deterministic, and the bits that passed are the bits that run. An agent violates all three:
+  behaviour depends on code, prompt text, tool definitions, the model behind an API alias, decoding
+  parameters and the retrieval index, and outputs are sampled, not computed.
 - **The model changes underneath you.** A provider updates the model behind `-latest`, a training job
   produces a new adapter, an index is re-embedded. A green unit suite says nothing about whether answers
-  got worse.
+  or tool choices got worse.
 - **The three usual shortcuts fail.** Prompts as string constants get review but no evidence: a PR fixes
   the one complaint in the ticket and regresses ten other cases that users find. Live dashboard edits are
   fast but have no review, no rollback, and no record of which prompt produced which answer.
 - **Running the whole suite on every commit is the right instinct done badly.** Thousands of model calls
-  per push cost real money and take tens of minutes, so within a month the step is marked optional and
-  skipped.
-- **What works.** Treat prompts and models as first-class release artifacts: know which artifact changed,
-  run an eval of depth proportional to the stage's risk, gate on aggregate quality rather than exact
-  strings, and promote the exact bundle that was tested.
+  per push cost real money and take tens of minutes (more for multi-step agents), so within a month the
+  step is marked optional and skipped.
+- **What works.** Treat prompts, tool schemas and models as first-class release artifacts: know which
+  changed, run an eval of depth proportional to the stage's risk, gate on aggregate quality rather than
+  exact strings, and promote the exact bundle that was tested.
 
 ## How it works
 ### Three artifacts, three cadences
 | Artifact | Changes | Evaluation | Often edited by |
 |---|---|---|---|
-| Application code | daily | deterministic tests | engineers |
-| Prompts and configuration | hourly to daily | cheap to evaluate | product managers, forward-deployed engineers |
+| Application code (agent loop, tool implementations) | daily | deterministic tests | engineers |
+| Prompts and configuration (system prompt, tool descriptions, step limits) | hourly to daily | cheap to evaluate | product managers, forward-deployed engineers |
 | Models | weekly to quarterly | expensive; capacity and cost consequences | ML / platform team |
 
 - **A release is a bundle:** `{code sha, prompt versions, model id or weights revision, decoding params, index snapshot}`.
+  For an agent, add the tool schema versions and loop settings such as the step budget.
 - **The pipeline tests and promotes bundles**, because testing a prompt against one model and deploying
   it with another tests nothing.
 
 ### The test ladder
-Depth grows with the blast radius of the stage, because cost and wall-clock time scale with model calls.
+Depth grows with the blast radius of the stage, because cost and wall-clock time scale with model calls,
+and an agent task makes several calls per run.
 
 1. **Static and unit tests (seconds, no model calls).** Every template renders with every declared
    variable; output parsers run against recorded model outputs; tool JSON schemas validate; guardrail
-   rules compile; the rendered prompt stays under its token budget.
+   rules compile; the rendered prompt (with all tool definitions) stays under its token budget.
 2. **Contract tests with recorded responses.** Replay fixtures through the real code path to check
-   plumbing (retries, streaming, parsing). They prove the wiring, not the quality.
+   plumbing (retries, streaming, parsing, tool-call dispatch). They prove the wiring, not the quality.
 3. **Smoke eval on every PR (minutes, a few dollars).** A stratified subset of the golden set, 50 to 200
-   items as an illustrative size. Score with deterministic checks where possible and an LLM judge where
-   necessary; compare with the baseline score recorded by the last green build of main.
-4. **Full eval on merge, nightly and on release candidates.** The whole golden set plus slices, cost and
-   latency, with every output stored as a build artifact so reviewers can diff behaviour.
+   items as an illustrative size. Score with deterministic checks where possible (task success, valid tool
+   arguments) and an LLM judge where necessary; compare with the baseline recorded by the last green build
+   of main.
+4. **Full eval on merge, nightly and on release candidates.** The whole golden set plus slices, cost,
+   latency and steps per task, with every output and trajectory stored as a build artifact so reviewers
+   can diff behaviour.
 5. **Deploy with a canary** and online metrics, and an automatic rollback trigger.
 
 ### Gating on distributions, not strings
-- **Exact-match assertions on free text flake**, because outputs are sampled.
+- **Exact-match assertions on free text flake**, because outputs are sampled. Asserting an exact tool-call
+  sequence flakes too, since agents often reach the same result by different valid paths.
 - **Compare score distributions instead:** a mean with a confidence interval against the champion,
   absolute floors for safety and schema validity, and per-slice floors.
 - **Stored outputs are the review artifact.** The diff between the candidate's and the champion's answers
-  on the same items is what a reviewer actually reads.
+  and trajectories on the same items is what a reviewer actually reads.
 - **Statistics:** the `evaluation-gates-for-production-releases` lesson covers them.
 
 ### Content-addressed caching
 - **Where it sits.** Eval cost is dominated by model calls, so the cache sits at the model-client boundary.
   Every call is keyed by `hash(model id, decoding params, exact rendered request)`.
 - **What "rendered request" means.** The full message list (prompt text, retrieved context, tool
-  definitions) the application actually sends.
+  definitions, earlier tool results) the application actually sends.
 - **Why not key on `(prompt version, item input)`.** A code or index change that alters retrieval or prompt
   assembly changes the request and misses the cache. A key built only from the item's input would serve
   the old output and hide the change.
 - **What it buys.** A PR that touches one prompt re-runs only the items whose requests that prompt affects.
   A code-only PR that leaves every request byte-identical re-runs nothing and just re-scores. This is what
   makes a per-PR eval affordable.
+- **Agents cache step by step.** Each step's request embeds earlier tool results, so a changed step 3
+  misses the cache for steps 3 onward while steps 1 and 2 still hit.
 - **The key must include every pin.** A key that omits the model id will happily serve stale outputs after
   a model upgrade and hide the change.
 - **Accept knowingly:** with temperature above zero, a cache hit replays one frozen sample, so the cached
   smoke eval measures that sample, not the sampling variance.
+
+### Tools in CI: record, do not call
+- **Never let CI agents hit live systems.** Replace each tool with a fixture lookup keyed by tool name and
+  arguments, because live tools are slow, flaky, cost money and may have side effects.
+- **An unrecorded call is a signal.** It means the agent took a new path; count it as a trajectory
+  deviation and surface it in the PR diff rather than failing silently.
 
 ### Promote, do not rebuild
 - **Promotion moves a pointer.** The bundle that passed the release eval goes dev → staging → production by
@@ -128,15 +154,15 @@ Depth grows with the blast radius of the stage, because cost and wall-clock time
   ladder is identical.
 
 ## Diagram
-Each artifact change enters the same ladder; only the pipeline moves the production pointer, and the
-promoted bundle is the one that was tested.
+Each artifact change (code, prompt or tool schema, model) enters the same ladder; only the pipeline moves
+the production pointer, and the promoted agent bundle is the one that was tested.
 
 ```mermaid
 flowchart TD
     C["Code PR"] --> L["Static and contract tests"]
     P["Prompt edit in registry"] -->|"webhook"| L
     M["New model snapshot"] -->|"scheduled upgrade PR"| L
-    L --> S["Smoke eval vs baseline"]
+    L --> S["Agent smoke eval vs baseline"]
     S -->|"fail"| X["Block merge"]
     S -->|"pass"| F["Full eval and gates"]
     F --> R[("Registries: immutable bundle")]
@@ -205,6 +231,38 @@ print(f"candidate={mean:.3f} baseline={base['mean']:.3f} n={len(results)}")
 sys.exit(0 if mean >= base["mean"] - 0.02 else 1)   # smoke tolerance; the release gate uses a paired CI instead
 ```
 
+### Agent smoke eval with recorded tools
+The same job for a tool-calling agent: the real loop runs with the cached model client and a fixture
+lookup in place of every tool, and records trajectory metrics next to task success. `run_agent` and
+`task_succeeded` are your loop and your outcome check.
+
+```python
+# scripts/agent_smoke.py: run the production agent loop, never live tools
+import json, pathlib
+
+fx = [json.loads(l) for l in pathlib.Path("data/tool_fixtures.jsonl").read_text().splitlines()]
+FIXTURES = {(f["tool"], json.dumps(f["args"], sort_keys=True)): f["result"] for f in fx}
+
+def make_tools(deviations):
+    def call_tool(name, args):
+        key = (name, json.dumps(args, sort_keys=True))
+        if key not in FIXTURES:                      # the agent took a path nobody recorded
+            deviations.append(key)
+            return {"error": "no recorded result for this call"}
+        return FIXTURES[key]
+    return call_tool
+
+def run_task(task):
+    deviations = []
+    trace = run_agent(task["input"], call_tool=make_tools(deviations),
+                      llm=cached_llm, max_steps=12)  # same loop and step budget as production
+    return {"id": task["id"],
+            "success": task_succeeded(task, trace),  # outcome, not the exact tool sequence
+            "steps": len(trace.steps),
+            "invalid_tool_args": sum(s.schema_error for s in trace.steps),
+            "unrecorded_calls": len(deviations)}
+```
+
 ### Worked scenario: what each kind of PR costs with a warm cache
 Same 100-item smoke set, judge calls routed through the same cache. Call counts follow from the cache key;
 they are not a benchmark.
@@ -222,24 +280,38 @@ they are not a benchmark.
 - **Judge calls follow app calls** because the judge's request embeds the candidate output: a changed answer
   is a changed judge request.
 
+### Worked scenario: a tool-description edit on a 40-task agent smoke set
+An engineer rewrites the description of a `search_orders` tool. Illustrative numbers for an agent averaging
+6 model calls per task.
+
+| Metric | Champion | Candidate | Reading |
+|---|---|---|---|
+| Model calls re-run (warm cache) | | ~90 of 240 | only steps after the first `search_orders` choice change |
+| Task success | 34 of 40 | 35 of 40 | within smoke noise, not proof of a win |
+| Mean steps per task | 6.1 | 7.4 | the agent now calls `search_orders` twice before answering |
+| Unrecorded tool calls | 0 | 9 | new paths; reviewers read these trajectories |
+
+The success rate alone would pass this PR. The step count and the unrecorded calls show a cost and latency
+regression, which is why agent smoke evals report trajectory metrics next to success.
+
 ## Production patterns
 - **Path-filtered eval triggers** — when only some PRs touch the bundle. Use the `paths` filter shown above
-  (code, prompts, `release.json`, golden data, scorers) so docs-only PRs skip model calls. Monitor eval
-  minutes and spend per PR.
+  (code, prompts, tool schemas, `release.json`, golden data, scorers) so docs-only PRs skip model calls.
+  Monitor eval minutes and spend per PR.
 - **Required status check on the smoke eval** — when people start merging around a red eval. Mark the
   smoke-eval job as a required check in branch protection so a failing eval blocks merge. Monitor how often
   admins override it.
 - **Cancel superseded runs** — when developers push several commits to one PR. In GitHub Actions set a
   `concurrency` group per PR with `cancel-in-progress: true` so only the latest commit pays for an eval.
   Monitor queued-run counts and eval wall-clock time.
-- **Eval outputs as build artifacts** — when reviewers need to read behaviour, not just a score. Upload
-  `eval_out.json` with `actions/upload-artifact` and post the candidate-versus-champion diff on the PR.
-  Monitor whether reviewers open it before approving.
+- **Eval outputs and trajectories as build artifacts** — when reviewers need to read behaviour, not just a
+  score. Upload `eval_out.json` with `actions/upload-artifact` and post the candidate-versus-champion diff,
+  including changed tool sequences, on the PR. Monitor whether reviewers open it before approving.
 - **Pipeline-only production labels** — when prompts live in a registry. Give only the CI service account
   permission to move the `production` label, triggered by the registry webhook after the gate passes.
   Alert on any label move without a linked eval run.
 - **Scheduled model-upgrade job** — when you pin provider snapshots. A cron-triggered workflow
-  (`on: schedule`) checks for new snapshots or deprecation notices and opens a PR with the full eval
+  (`on: schedule`) checks for new snapshots or deprecation notices and opens a PR with the full agent eval
   attached. Monitor days remaining before each pinned snapshot's deprecation date.
 
 ## Trade-offs
@@ -249,19 +321,22 @@ they are not a benchmark.
 - **Cheap cached evals vs hidden changes.** Caching makes evals cheap and fast, yet every omitted pin in
   the cache key becomes a way to hide a real change. The more aggressive the cache, the more disciplined
   the key must be.
+- **Recorded tools vs realism.** Fixtures make agent evals fast, free and side-effect free, but they freeze
+  the world; a tool whose real output drifted will not show up until a canary or a live-tool nightly run.
 - **Prompts-as-config vs a second deploy path.** It decouples prompt deploys from code deploys and unblocks
   non-engineers, but that path must be gated as strictly as the first or it becomes the bypass everyone
   uses.
 - **Aggregate gates vs individual catastrophes.** Gating on aggregate scores tolerates sampling noise, but
-  it also tolerates an individual catastrophic answer. Safety and schema checks therefore need absolute
-  per-item floors, not averages.
+  it also tolerates an individual catastrophic answer or tool action. Safety and schema checks therefore
+  need absolute per-item floors, not averages.
 - **Pinned snapshots vs deprecation.** Pinning gives reproducible builds, but snapshots get deprecated.
   Without a scheduled upgrade job, pinning turns into an emergency migration on the provider's timetable.
 
 ## Pitfalls
-- **Evaluating a copy of the prompt chain.** Running evals against a reimplementation inside the test
-  harness instead of the production entrypoint. Symptom: a green pipeline and a production regression
-  caused by code the eval never executed. Fix: call the real entrypoint with an injected model client.
+- **Evaluating a copy of the prompt chain or agent loop.** Running evals against a reimplementation inside
+  the test harness instead of the production entrypoint. Symptom: a green pipeline and a production
+  regression caused by code the eval never executed. Fix: call the real entrypoint with an injected model
+  client and tool layer.
 - **Comparing against a fixed threshold.** Rather than the current champion. Symptom: quality erodes a
   point per release while every release passes, and nobody notices until a customer does.
 - **Retrying a flaky eval until it goes green.** Symptom: a gate whose pass rate is uncorrelated with
@@ -273,12 +348,14 @@ they are not a benchmark.
 - **Comparing against a stale yardstick.** A baseline measured on an older golden-set or judge version.
   Symptom: every PR failing (or passing) by the same few points the day the dataset grew, with no prompt to
   blame.
+- **Gating agents on success alone.** Symptom: a release that passes the gate and doubles tokens per task
+  because the agent loops through extra tool calls. Fix: gate on steps, cost and invalid tool arguments too.
 
 ## When to use
-- **Use when** more than one person edits prompts or a prompt is deployed to real users: that is when "we
-  changed something and it got worse" becomes unanswerable.
-- **Start cheap.** Unit tests on templates and parsers plus a 50-item smoke eval against a stored
-  baseline; add the full suite and canary when release frequency or user impact justifies them.
+- **Use when** more than one person edits prompts or tool descriptions, or an agent is deployed to real
+  users: that is when "we changed something and it got worse" becomes unanswerable.
+- **Start cheap.** Unit tests on templates, parsers and tool schemas plus a 50-item smoke eval against a
+  stored baseline; add the full suite and canary when release frequency or user impact justifies them.
 - **Measure** pipeline cost per PR, eval wall-clock time, cache hit rate and, most importantly, the number
   of production regressions the pipeline would have caught.
 - **Interviews:** the expected answer to "how do you deploy a prompt change safely" is this ladder: unit,
@@ -308,9 +385,9 @@ and it writes the eval evidence next to the version. Rollback is moving the labe
 incident's cases to the golden set so the regression is a permanent test.
 
 ## Interview questions
-### Why can't a normal CI pipeline with unit tests protect an LLM application?
-- **Behaviour lives outside the code.** Prompt text, the model behind an alias, decoding params and the
-  index all change answers, and none of them is exercised by unit tests on code.
+### Why can't a normal CI pipeline with unit tests protect an LLM agent?
+- **Behaviour lives outside the code.** Prompt text, tool descriptions, the model behind an alias, decoding
+  params and the index all change answers and tool choices, and none of them is exercised by unit tests.
 - **Outputs are sampled,** so exact-match assertions flake; you need eval scores compared as distributions
   against a champion.
 - **So the unit of release is the bundle,** tested by an eval whose depth matches the stage's blast radius.
@@ -322,6 +399,14 @@ incident's cases to the golden set so the regression is a permanent test.
   boundary, so any change in what the app sends misses the cache.
 - **Verify** by asserting the miss count is non-zero on a PR known to change retrieval.
 
+### How do you run a tool-calling agent in CI without touching production systems?
+- **Swap the tool layer, not the loop.** Run the production agent entrypoint with an injected model client
+  (cached) and tool functions that look up recorded results by tool name and arguments.
+- **Treat unrecorded calls as signal.** They mean the agent took a new path; count them and show those
+  trajectories in the PR diff.
+- **Score outcomes plus trajectory metrics** (success, steps, invalid tool arguments), not an exact call
+  sequence, and run live-tool checks in a nightly job or canary.
+
 ### When would you not run an eval on every PR?
 - **When the PR cannot change the bundle,** such as docs or infra-only changes; path filters skip them.
 - **When the eval is too expensive to stay fast,** run a stratified smoke subset per PR and the full suite
@@ -329,11 +414,11 @@ incident's cases to the golden set so the regression is a permanent test.
 - **The cost:** a 100-item subset cannot resolve a one- or two-point change, so small regressions wait for
   the full eval or canary.
 
-### How do you handle a provider deprecating the model snapshot you pinned?
+### How do you handle a provider deprecating the model snapshot your agent pins?
 - **Pin and schedule.** The bundle pins the snapshot; a scheduled upgrade job opens a PR with the new
   snapshot as soon as a new version or deprecation is announced.
-- **Same ladder:** the full eval runs against the champion, the cache misses on every item because the
-  model id is in the key, and promotion is a pointer move.
+- **Same ladder:** the full agent eval runs against the champion, the cache misses on every item because
+  the model id is in the key, and promotion is a pointer move.
 - **Monitor** days left before each pinned snapshot is retired, so the migration is never on the
   provider's emergency timetable.
 
@@ -368,3 +453,24 @@ incident's cases to the golden set so the regression is a permanent test.
 - [ ] Hashing is cheaper when the key is longer
 > The cache exists to skip calls whose inputs have not changed. If the model id is not part of the key,
 > swapping the model counts as "unchanged" and the eval silently measures the old model's cached outputs.
+
+## Use cases & projects
+### Use cases
+- **Shipping system-prompt and tool-description edits.** Every edit runs the agent smoke set before merge,
+  so a wording change that breaks tool selection is caught in minutes.
+- **Letting non-engineers tune an agent.** Product managers edit prompts in a registry while the pipeline
+  alone moves the `production` label after the eval gate passes.
+- **Model snapshot upgrades.** A scheduled job opens a PR with the new snapshot and the full agent eval,
+  long before the old snapshot is retired.
+- **Adding a new tool.** The bundle's tool schemas change, so the same ladder checks that existing tasks
+  still succeed and that the new tool is chosen where it should be.
+
+### Mini project
+**Put a tool-calling agent behind a PR eval gate (2-3 hours).**
+- **Goal:** a CI job that blocks a PR when an agent change lowers task success or inflates steps per task.
+- **Steps:** build a small agent with two tools; record 20 tasks' tool results into a fixtures file; write a
+  script that runs the real loop with a cached model client and fixture tools, and writes success, steps
+  and unrecorded calls per task; save a baseline from `main`; wire it into a GitHub Actions job with a
+  `paths` filter.
+- **Done when:** a PR that degrades a tool description fails the job with a per-task diff of trajectories,
+  a docs-only PR skips it, and a re-run with no changes makes zero model calls.

@@ -5,7 +5,8 @@ name: Workflows vs agents
 kind: decision
 difficulty: intro
 est_minutes: 12
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/agent-loop
   - agents/state-machines
@@ -23,6 +24,18 @@ sources:
 A workflow runs LLM calls along paths your code defines; an agent lets the model pick each next step.
 If you can draw the flowchart, build the workflow: cheaper, bounded, testable. Most production systems
 are workflows with small agentic islands where the path is unforeseeable.
+
+## For agent builders
+- **Why it matters for agents.** This is the first design decision on every agent project: how much of
+  the path the model chooses. Get it wrong one way and you pay agent prices and tails for a flowchart;
+  get it wrong the other way and the system cannot handle the cases it was built for.
+- **Where it shows up in your stack.** Plain code with structured outputs for workflow steps, routers and
+  parallel calls, an agent loop for the agentic island, an orchestrator (Temporal, AWS Step Functions or
+  a LangGraph graph) for the skeleton, and traces tagged by route.
+- **What you control.** Which steps are code and which are agentic, each island's step budget, tool set
+  and gates, the per-run cost cap, and when trace data moves the boundary.
+- **What you can skip.** Debating what counts as a "real" agent. The useful question is only who
+  chooses the next step, your code or the model.
 
 ## Why it exists
 - **"Agent" hides the real decision.** The word covers everything from a prompt template to a fully
@@ -323,3 +336,24 @@ workflow cannot handle, and widen autonomy only as those metrics and human agree
 - [ ] Two agents that check each other's work
 > Autonomy is spent where the environment is unpredictable and nowhere else. Surrounding a small
 > agentic island with deterministic code keeps cost bounded and lets each part be tested appropriately.
+
+## Use cases & projects
+### Use cases
+- **Invoice and document processing.** A workflow handles the clean majority and an exception agent with
+  read-only tools and approval handles the strange cases.
+- **Customer support automation.** Intake, routing, retrieval and drafting are a workflow, while
+  investigating anomalous accounts is a budgeted agentic step.
+- **Scoping a customer's "build us an agent" request.** Drawing the flowchart first shows which steps
+  actually need a model choosing the path.
+- **Cutting an existing agent's cost.** Mining traces for repeated tool sequences turns the common paths
+  into workflow branches and keeps the agent for the residue.
+
+### Mini project
+**Same task as workflow, agent and hybrid (2-3 hours).**
+- **Goal:** measure what autonomy costs and buys on one task.
+- **Steps:** create 50 synthetic invoices, 10 of them messy (two POs, renamed vendor); build a three-call
+  workflow, a tool-calling agent with a 15-step budget, and the hybrid skeleton from the examples; run
+  all three and log calls, tokens, latency and correct routes; run the trace-mining snippet on the
+  agent's tool sequences.
+- **Done when:** a table compares completion, mean and p95 cost and latency for the three designs, and
+  you can name which agent sequences you would codify next.

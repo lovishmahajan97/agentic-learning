@@ -470,3 +470,24 @@ implementations inherit for shared behaviour, which still satisfies the Protocol
 - [ ] It makes the decorator usable on async functions
 > Without `ParamSpec`, the decorator's return type is `Callable[..., Any]` and every call to a
 > decorated function loses argument checking. `ParamSpec` carries the original signature through.
+
+## Use cases & projects
+### Use cases
+- **Swapping model providers.** An `LLMClient` Protocol lets the agent core run on one vendor today and
+  another tomorrow, with each SDK wrapped in a thin adapter.
+- **Deterministic agent tests.** A scripted fake LLM that satisfies the same Protocol drives the loop
+  through tool calls and errors without network access or token cost.
+- **Pluggable tools and memory.** A `Tool` or `Store` Protocol lets new tools and vector stores join the
+  registry without inheriting from a framework base class.
+- **Typed retry and tracing wrappers.** `ParamSpec` keeps argument checking on every tool and model call
+  wrapped by a retry or span decorator.
+
+### Mini project
+**Build a provider-agnostic agent core (2-3 hours).**
+- **Goal:** an agent loop that depends only on small Protocols, so a real provider and a fake one are
+  interchangeable.
+- **Steps:** define `LLMClient` and `Tool` Protocols; write the loop against them; add one adapter for a
+  real SDK and one scripted fake that returns a tool call, then a final answer; type a retry decorator
+  with `ParamSpec`; run the checker in strict mode.
+- **Done when:** the same loop passes a unit test with the fake and runs a live query with the adapter,
+  the checker is clean, and a deliberately wrong argument to a decorated tool is flagged.

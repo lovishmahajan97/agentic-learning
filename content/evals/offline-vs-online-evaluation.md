@@ -407,3 +407,24 @@ calls the candidate flat, the evaluation stack is consistent again and the next 
 > Online truth arrives in days or weeks and exposes users to failures. Offline checks run in minutes on
 > every change, stop regressions early and point at what broke; online evaluation then confirms what only
 > users can confirm.
+
+## Use cases & projects
+### Use cases
+- **Shipping a new planner prompt.** It must pass the offline task set, then a shadow or canary rung,
+  before a full rollout is judged on task completion.
+- **Running shadow traffic safely.** A candidate agent replays live requests with side-effecting tools
+  in dry-run mode, so real-world behaviour is observed without real actions.
+- **Refreshing the golden set from traces.** Sampled production conversations, especially failures,
+  are added offline so the eval tracks this month's intent mix.
+- **Checking whether offline scores predict outcomes.** A launch log of offline deltas against online
+  results shows whether the offline gate can be trusted.
+
+### Mini project
+**Wire an offline-to-online loop for a support agent (2-3 hours).**
+- **Goal:** connect an offline eval score to a live outcome signal and see whether they agree.
+- **Steps:** run a 30-task offline eval of two agent versions; log every live (or simulated-live)
+  conversation with version, conversation ID and a resolution event; sample 20 traces per version and
+  judge them; add the 5 worst traces to the offline set; record offline delta and online delta in a
+  launch log.
+- **Done when:** a single report shows offline score, sampled online judge score and resolution rate per
+  version, and the offline set has grown from production traces.

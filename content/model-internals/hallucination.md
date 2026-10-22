@@ -5,7 +5,8 @@ name: Hallucination
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - model-internals/sampling-strategies
   - model-internals/small-language-models
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-Hallucination is fluent, confident output unsupported by the input or by reality. It follows from how
-models work, not a bug awaiting a patch, so manage it like an error rate: measure, ground in evidence,
-verify claims, and allow abstention.
+Hallucination is fluent, confident output unsupported by the input or by reality. In agents it becomes
+invented tools, arguments, IDs and results that compound over steps, so manage it as an error rate:
+ground, validate, verify, and allow abstention.
+
+## For agent builders
+- **Why it matters for agents.** A chatbot's hallucination is a wrong sentence; an agent's is a wrong
+  action. Invented tool names, made-up order IDs, fabricated "I already checked" claims and hallucinated
+  facts written to memory all execute or persist, and every later step builds on them.
+- **Where it shows up in your stack.** Tool-call validation against the live registry, RAG grounding and
+  citation checks, memory writes, final-answer verification, and the faithfulness metrics in your agent
+  evals and traces.
+- **What you control.** Schemas and validation on every call, an abstention or "need more info" state,
+  checks that IDs and facts came from tool results, verification before side-effecting actions, and
+  temperature per step.
+- **What you can skip.** The research taxonomy beyond intrinsic, extrinsic, factual and structural, and
+  vendor-side training fixes. Your levers are architectural.
 
 ## Why it exists
 - **The objective cannot tell known from unknown.** A next-token model learns p(next token | context).
@@ -49,6 +63,19 @@ verify claims, and allow abstention.
   hallucination elsewhere.
 
 ## How it works
+### How it shows up in an agent loop
+| Agent failure | Example | Cheapest guard |
+|---|---|---|
+| Invented tool or parameter | calls `issue_refund` when the tool is `refund` | validate name and arguments against the registry |
+| Invented identifier | refunds order `A9999` that no tool ever returned | check IDs against values seen in tool results |
+| Fabricated observation | "the test suite passed" without running it | require the claim to cite a tool result in the trace |
+| Snowballing plan | a wrong fact at step 3 drives steps 4-10 | verify key facts before acting on them |
+| Memory poisoning | a hallucinated preference is saved and recalled as truth | write to memory only facts with a source |
+
+- **Errors compound.** If each step has an independent error rate p, a task of n steps succeeds with
+  probability about (1 − p)ⁿ, so long agents need far lower per-step rates than chat (see the worked
+  table under Examples).
+
 ### A taxonomy that determines the fix
 | Type | What it is | Detect with | Reduce with |
 |---|---|---|---|
@@ -104,7 +131,8 @@ The durable fix is architectural: supply evidence, verify outputs, and make abst
 
 ## Diagram
 A grounded answer path with the three exits that keep hallucinations from reaching users: abstain on weak
-evidence, repair invalid structure, and verify claims before answering.
+evidence, repair invalid structure, and verify claims before answering. In an agent the same gates sit
+on every step, before a tool call executes or a fact enters memory.
 
 ```mermaid
 flowchart TD
@@ -121,6 +149,62 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: block invented tools, arguments and IDs before they execute
+Structural hallucination is the one you can almost eliminate: check every proposed call against the live
+registry, its JSON Schema, and the identifiers that actually came back from tools in this run.
+
+```python
+from jsonschema import validate, ValidationError
+
+TOOLS = {   # the live registry: name -> JSON Schema for the arguments
+    "get_order": {"type": "object", "required": ["order_id"], "additionalProperties": False,
+                  "properties": {"order_id": {"type": "string"}}},
+    "refund": {"type": "object", "required": ["order_id", "amount"], "additionalProperties": False,
+               "properties": {"order_id": {"type": "string"}, "amount": {"type": "number", "minimum": 0}}},
+}
+
+def check_call(call, seen_ids):
+    """Return an error to reflect back to the model, or None if the call may run."""
+    name, args = call.get("name"), call.get("arguments", {})
+    if name not in TOOLS:                                    # invented tool name
+        return f"unknown tool {name!r}; available: {sorted(TOOLS)}"
+    try:
+        validate(args, TOOLS[name])                          # invented or mistyped arguments
+    except ValidationError as e:
+        return f"invalid arguments for {name}: {e.message}"
+    if "order_id" in args and args["order_id"] not in seen_ids:   # invented identifier
+        return f"order_id {args['order_id']} never appeared in a tool result; look it up first"
+    return None
+
+seen = {"A1043"}                     # IDs that actually came back from tools in this run
+for call in [{"name": "issue_refund", "arguments": {"order_id": "A1043", "amount": 20}},
+             {"name": "refund", "arguments": {"order_id": "A1043", "amount": "20"}},
+             {"name": "refund", "arguments": {"order_id": "A9999", "amount": 20}},
+             {"name": "refund", "arguments": {"order_id": "A1043", "amount": 20}}]:
+    print(check_call(call, seen))
+# unknown tool 'issue_refund'; available: ['get_order', 'refund']
+# invalid arguments for refund: '20' is not of type 'number'
+# order_id A9999 never appeared in a tool result; look it up first
+# None
+```
+
+- **Reflect, then cap.** Return the error string to the model as the tool result, allow one or two
+  retries, then stop or escalate, so a confused model cannot loop forever.
+
+### Worked scenario: why per-step error rates matter more for agents
+Task success if every step must be right and steps fail independently at rate p (a simplification:
+real errors are correlated, and some are recoverable).
+
+| Per-step error rate | 1 step | 10 steps | 20 steps | 40 steps |
+|---|---|---|---|---|
+| 2% | 98% | 81.7% | 66.8% | 44.6% |
+| 1% | 99% | 90.4% | 81.8% | 66.9% |
+| 0.5% | 99.5% | 95.1% | 90.5% | 81.8% |
+
+- **Reading.** A 2% rate that looks fine in chat fails a third of 20-step tasks. Validation that removes
+  structural errors, plus verification of the few facts each action depends on, is how agent teams buy
+  the lower rows.
+
 ### Claim-level faithfulness check for a RAG answer
 - **Cost:** one call to extract claims plus one call per claim, so it runs as an offline eval on sampled
   traffic and as an online gate only for high-stakes categories.
@@ -210,6 +294,10 @@ breakdown like this (illustrative counts, the shape is typical):
   retrieval first usually gives the largest drop.
 
 ## Production patterns
+- **Ground agent claims in the trace.** Require completion claims ("tests pass", "email sent") and key
+  facts in the final answer to reference a tool result ID from this run, and check it mechanically before
+  replying. Apply the same rule to memory: store a fact only with the tool result or user message it came
+  from. Monitor the share of answers and memory writes without a source.
 - **Abstention as a schema state.** Add a status field such as `answered` or `insufficient_information` to
   the structured output, include unanswerable items in the eval set and score abstention on them as
   correct. Monitor abstention rate separately on answerable and unanswerable items, so over-refusal shows.
@@ -229,6 +317,9 @@ breakdown like this (illustrative counts, the shape is typical):
   offline on sampled traffic for everything else. Track the latency and cost it adds per tier.
 
 ## Trade-offs
+- **Verification per step vs agent latency.** Checking every fact before acting makes long agents
+  reliable but adds calls to each step; verify only the facts a side-effecting action depends on, and
+  verify everything only when actions are irreversible.
 - **Grounding vs retrieval dependence.** Retrieval cuts factual hallucination sharply but moves the failure
   to retrieval quality; when the corpus lacks the answer, a model told to "answer from context" either
   abstains or bridges the gap, so a check is still needed.
@@ -245,6 +336,9 @@ breakdown like this (illustrative counts, the shape is typical):
   chat turn.
 
 ## Pitfalls
+- **Trusting the agent's own report of what it did.** Symptom: final answers say "I verified the
+  balance" or "tests pass" with no matching tool call in the trace. Fix: check completion claims against
+  the trace before replying, and fail the eval case when they do not match.
 - **Blaming the model for a retrieval failure.** Symptom: hallucinations cluster on questions whose top-k
   passages have low relevance scores or whose answers are not in the corpus at all. Fix: log retrieval
   scores and label whether the answer passage was retrieved before touching the prompt.
@@ -310,12 +404,21 @@ hallucinate" to the prompt and call it done.
 - **Incentives:** preference tuning and binary-graded benchmarks score guesses above abstentions, and
   calibration measurably worsens after RLHF.
 
-### Explain faithfulness versus factuality, with an example of each.
-- **Faithfulness** is judged against the given source: a summary that reverses a figure is intrinsic; one
-  that adds an invented figure is extrinsic.
-- **Factuality** is judged against the world: a wrong date in a closed-book answer.
-- **They are independent axes:** a faithful summary of a wrong document is factually wrong, and an
-  extrinsic addition can happen to be true.
+### Your support agent refunded an order that does not exist. How do you stop this class of error?
+- **Name the type:** a structural or identifier hallucination; the model produced a plausible ID instead of
+  one returned by a lookup tool.
+- **Guard mechanically:** validate tool names and arguments against the schema, and reject any ID that did
+  not appear in a tool result this run, returning the error to the model.
+- **Gate the action:** side-effecting tools such as refunds get a verification step or human approval, and
+  the eval set gains cases that tempt the agent to guess an ID.
+
+### Why is hallucination a bigger problem for a 20-step agent than for a chatbot?
+- **Errors compound:** at a 2% independent per-step error rate, about two thirds of 20-step tasks
+  succeed, versus 98% of single answers.
+- **Errors act:** a wrong fact becomes a wrong tool call, a wrong memory or a wrong change, not just a
+  wrong sentence.
+- **Errors snowball:** later steps condition on earlier outputs, so one invented fact can steer the whole
+  plan; verify the facts each action depends on.
 
 ### There are no source documents for a closed-book QA feature. How would you detect likely hallucinations?
 - **Sample several answers** and measure agreement, or better, semantic entropy over meaning clusters, so
@@ -364,3 +467,23 @@ hallucinate" to the prompt and call it done.
 > When an abstention earns zero and a guess earns a reward whenever it happens to be right, the optimal
 > policy guesses. Calibration measurably worsens under such training, which is why evals must give credit
 > for correct abstention on unanswerable items.
+
+## Use cases & projects
+### Use cases
+- **Tool-calling agents with side effects.** Refund, booking and ticketing agents validate every call and
+  every identifier before anything executes.
+- **RAG assistants and research agents.** Claim-level faithfulness checks and citation verification on
+  answers built from retrieved passages.
+- **Coding agents.** Running the code or tests is the verification; claims of success must match a real
+  tool result.
+- **Agent memory.** Only source-backed facts are written, so a single hallucination does not become a
+  permanent "user preference".
+
+### Mini project
+**Hallucination guardrails for a small tool-calling agent (2-3 hours).**
+- **Goal:** measure and cut structural and identifier hallucinations in a 3-tool support agent.
+- **Steps:** build an agent with `get_order`, `refund` and `search_faq` over a fake order table; write 30
+  tasks, including ones that mention non-existent orders or tempt guessing; run it once without guards and
+  once with the `check_call` validator plus a trace check on completion claims; log every rejected call.
+- **Done when:** a table compares invalid-call rate, invented-ID rate and task success with and without
+  guards, and you can point to three traces where a guard stopped a wrong action.

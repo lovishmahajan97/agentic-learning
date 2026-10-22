@@ -372,3 +372,25 @@ transcript from the model.
 > Caching works by matching the prefix byte for byte, so an edit at position *i* invalidates everything
 > after it. Compaction is done as an explicit operation precisely because it is the one place where the
 > prefix is allowed to change.
+
+## Use cases & projects
+### Use cases
+- **Coding agents.** Read files, run tests, edit and re-run until the suite passes, with a step budget so
+  a flaky test cannot keep the loop spinning.
+- **Support and operations agents.** Look up an account, check policy and draft or execute an action,
+  with approval gates on the steps that change state.
+- **Research agents.** Search, fetch and read across many sources, compacting old results so a 40-step
+  run still fits the context window.
+- **Debugging framework agents.** When a LangGraph or Agents SDK run misbehaves, mapping its trace back
+  to this loop's steps tells you whether the model, a tool or a budget caused it.
+
+### Mini project
+**Write an agent loop by hand (2-3 hours).**
+- **Goal:** build a working tool-calling loop on a provider SDK with no agent framework, and make every
+  way it can stop explicit.
+- **Steps:** declare three small tools (a calculator, a fake order lookup, a fake refund that needs
+  approval); write the loop that appends the assistant turn, executes each tool call, turns exceptions
+  into error results and calls again; add step, token and wall-clock budgets; return a status such as
+  done, budget exceeded or awaiting approval; log one line per iteration.
+- **Done when:** five scripted tasks each end with the expected status, one task trips the step budget on
+  purpose, and the log shows the transcript only ever grew by appending.

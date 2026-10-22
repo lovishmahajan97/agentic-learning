@@ -349,3 +349,23 @@ streaming engine.
 - [x] Row-wise Python functions via `map_elements` force interpreter-speed execution
 > Expressions run in native, parallel code, but a Python UDF must be called per element under the GIL.
 > Rewriting the logic as built-in expressions such as `when/then` or string methods restores the speedup.
+
+## Use cases & projects
+### Use cases
+- **Nightly trace rollups.** Daily tokens, cost and error rate per model and per tool over gigabytes of
+  step-level traces, reading only the columns the query needs.
+- **Fine-tuning set curation.** Filter last month's successful agent runs, deduplicate by prompt and
+  write the selected transcripts out for SFT.
+- **RAG corpus cleaning.** Drop empty and duplicate documents and normalize text before chunking and
+  embedding.
+- **Large eval aggregation.** Combine results from thousands of eval runs into per-model, per-category
+  scores without loading everything into memory.
+
+### Mini project
+**Lazy daily rollup over agent traces (1-2 hours).**
+- **Goal:** compute daily cost and tool error rates from a large trace dataset with a lazy Polars query.
+- **Steps:** generate or export a few million step rows to Parquet (run ID, date, model, tool, status,
+  tokens, prompt text); write a `scan_parquet` query with an explicit schema that groups by date, model
+  and tool; check with `explain()` that the prompt text column is not read; run it with `collect`.
+- **Done when:** the rollup is deterministic across two runs, `explain()` shows only the needed columns,
+  and you have timed it against the same query in eager pandas on the same files.

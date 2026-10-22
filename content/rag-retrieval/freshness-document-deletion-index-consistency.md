@@ -489,3 +489,26 @@ monitoring so the next leak pages someone instead of waiting for a customer.
 > A deleted document never appears in a listing again, so `modified_at` filters never see it. Only the
 > set difference between what was indexed and what exists now reveals it. TTLs are a fallback that
 > bounds damage but cannot distinguish deleted from merely unchanged documents.
+
+## Use cases & projects
+### Use cases
+- **Support agents quoting prices and policies.** A pricing page edited this morning must stop being
+  retrieved before the agent quotes the old number to a customer.
+- **Offboarding and erasure requests.** When a user's files or personal data are removed, every chunk,
+  embedding, cached answer and agent memory derived from them has to go, and a probe proves it.
+- **Agents with long-term memory.** Memories written from a document that later changed or was deleted
+  need the same versioning and delete fan-out as the main index.
+- **Contract and HR assistants.** Terminated contracts and replaced policies must disappear from search
+  results, or the agent plans on rules that no longer apply.
+
+### Mini project
+**Build a fresh, deletable index behind an agent search tool (2-3 hours).**
+- **Goal:** show that an agent's `search_docs` tool never returns an edited-away or deleted passage after
+  one sync cycle.
+- **Steps:** put 20 small text files in a folder; index them with deterministic chunk ids derived from
+  `doc_id` and version; write a sync job that upserts new versions before deleting old ones and
+  reconciles a manifest of indexed `doc_id`s against the folder listing; wrap search as a tool that
+  returns `version` and `modified_at`; edit 3 files, delete 2, run the sync, then ask the agent questions
+  whose old answers are now wrong.
+- **Done when:** a probe query for each deleted document returns nothing, the agent's answers cite only
+  current versions, and a log shows the reconciliation step found exactly the 2 deletions.

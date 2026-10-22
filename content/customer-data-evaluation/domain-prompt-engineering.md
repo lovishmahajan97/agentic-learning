@@ -5,7 +5,8 @@ name: Domain prompt engineering
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - prompting/prompt-engineering
   - prompting/few-shot
@@ -18,31 +19,45 @@ related:
 ---
 
 ## TL;DR
-Domain prompt engineering turns one customer's tacit expertise (vocabulary, policies, exceptions, output
-conventions) into explicit definitions, ordered rules and examples. It is elicitation and testing, not
-wordsmithing: every rule traces to an SME decision and an eval case.
+A customer's agent must act by that customer's private definitions, rule precedence and exceptions.
+Domain prompt engineering turns SME expertise into a versioned system prompt, tool policy and escalation
+path, each rule traced to an SME decision and eval case.
+
+## For agent builders
+- **Why it matters for agents.** An agent does not just label; it acts on its reading of a term. If
+  "late" means the public meaning, it calls `file_claim` on shipments the customer would never credit,
+  and the mistake is an action in their system, not a wrong string in a report.
+- **Where it shows up in your stack.** The agent's system prompt (glossary, ordered rules, boundary
+  examples), tool descriptions that say when each tool applies, a structured final-answer or
+  escalation tool with a closed enum, and the prompt version id logged on every trace.
+- **What you control.** Which knowledge sits in the cached system prompt versus a retrieval tool, the
+  rule order the agent checks before acting, the abstention exit (an `escalate_to_human` style tool),
+  and the eval gate every prompt change must pass.
+- **What you can skip.** Clever phrasing and persona tricks. The work is elicitation from SMEs, explicit
+  definitions and testing on held-out customer cases.
 
 ## Why it exists
 - **The model knows the public domain, not this customer.** A frontier model has read plenty about
   insurance, logistics or clinical coding, but never the internal policy manual, the exceptions senior
   staff apply from memory, or that here "active account" means "billed in the last 90 days" rather than
-  "logged in recently". Deployments win or lose on these private definitions, because the customer's
-  experts judge outputs against them, not textbook knowledge.
+  "logged in recently". Agents win or lose on these private definitions, because experts judge against them.
 - **A persona prompt adds no information.** "You are an expert claims adjuster with 20 years of
   experience" changes tone and confidence only, so the model fills gaps with the most common public
-  interpretation. The output sounds expert and is wrong exactly where the customer cares, which is worse
-  than sounding uncertain.
+  interpretation. The agent sounds expert and acts wrongly exactly where the customer cares, which is
+  worse than sounding uncertain.
 - **Pasting the whole manual fails differently.** A 200-page policy manual is written for humans who
   already share context, contradicts itself across versions, and buries the three rules that decide most
-  cases under fifty that rarely matter.
+  cases under fifty that rarely matter. In an agent it also bloats every step's context.
 - **What this buys.** Extract the decision-relevant knowledge, make it explicit and unambiguous, and prove
-  each piece earns its place on real customer cases. Behaviour becomes predictable, auditable and
+  each piece earns its place on real customer cases. Agent behaviour becomes predictable, auditable and
   traceable to a prompt version.
 
 ## How it works
 ### 1. Elicit the decision procedure, not the domain
 - **Interview around concrete cases.** Hand SMEs ten real inputs and ask "what would you do, and why?"
   People cannot list their own rules from memory, but they can explain a decision on a case in front of them.
+- **Ask what they would look up.** For an agent, the SME's lookups ("I check the POD, then the reschedule
+  log") become the tool sequence the agent should follow.
 - **Record each reason as a candidate rule with its triggering case,** because the case later becomes an
   eval item that proves the rule works.
 - **Ask which reason decided each case.** That annotation ("rule R3 decided this") is what later lets you
@@ -51,7 +66,7 @@ wordsmithing: every rule traces to an SME decision and an eval case.
 ### 2. Write a glossary of contested terms
 - **Most domain errors are definitional.** List every term whose customer meaning differs from the common one.
 - **Define it operationally:** which data field, which threshold, which time window, and the default when
-  the input is ambiguous.
+  the input is ambiguous. In an agent, name the tool result field the term reads from.
 - **Example entry:** "Late: delivered after the promised window, where the window is extended by any
   customer-requested reschedule." It removes a whole class of disagreements, because the model resolves
   undefined terms toward the public meaning.
@@ -62,12 +77,13 @@ wordsmithing: every rule traces to an SME decision and an eval case.
 - **Domain policies have precedence:** regulatory rules override contract terms, which override house
   preferences. Write rules in check order and state which wins on conflict.
 - **Data-validity checks go first** ("delivery time missing"), because a rule evaluated on missing data
-  invites the model to invent the value.
+  invites the model to invent the value. For an agent, the rule says which tool to call to fetch it.
 - **Avoid unordered bullet lists,** because the model then weights rules by how prominent they look, which
   is not the customer's precedence.
 
 ### 4. Choose examples at the boundaries
-- **Use the customer's own data:** few-shot examples teach format and judgement at once.
+- **Use the customer's own data:** few-shot examples teach format and judgement at once. For agents, a
+  short example trajectory (tool call, result, decision) teaches the procedure too.
 - **Pick cases where the decision flips** (just inside and just outside a threshold, the exception that
   overrides the default), because easy central examples teach nothing the instructions did not already say.
 - **Pairs that differ in one field are strongest,** because they isolate the feature the rule turns on.
@@ -75,12 +91,13 @@ wordsmithing: every rule traces to an SME decision and an eval case.
 - **Watch the label mix,** because models tend to drift toward labels over-represented in the shots.
 
 ### 5. Specify abstention and escalation
-- **Domain work always has out-of-policy cases.** Give the model a legitimate exit ("needs_review" with the
-  reason) and say when to use it.
-- **Without one, it is forced to guess,** and guesses on out-of-policy cases are where customers lose trust fastest.
+- **Domain work always has out-of-policy cases.** Give the agent a legitimate exit ("needs_review" with the
+  reason, or an escalation tool) and say when to use it.
+- **Without one, it is forced to guess,** and guesses on out-of-policy cases are where customers lose trust
+  fastest, especially when the guess triggers a write action.
 
 ### 6. Fix the output contract
-- **State the closed label set and a machine-checkable format.**
+- **State the closed label set and a machine-checkable format,** typically the schema of a final-answer tool.
 - **Ask the output to name the deciding rule and the glossary terms it relied on.**
 - **The citation is not proof of reasoning** (a self-reported rule can be a post-hoc rationalisation), but it
   makes failures diagnosable:
@@ -89,18 +106,21 @@ wordsmithing: every rule traces to an SME decision and an eval case.
 |---|---|
 | Wrong label, cites the wrong rule | precedence or rule wording |
 | Wrong label, cites the right rule | a term definition |
+| Right label, wrong or missing tool call | tool description or procedure step |
 
 ### 7. Separate stable knowledge from per-request context
 - **Versioned system prompt:** policies and glossary.
-- **User turn or retrieval:** facts that change per request (the account, the contract, the retrieved clause).
-- **When knowledge outgrows a prompt,** move the long tail into retrieval and keep only the core procedure inline.
+- **User turn, tool results or retrieval:** facts that change per request (the account, the contract, the
+  retrieved clause).
+- **When knowledge outgrows a prompt,** move the long tail into a retrieval tool and keep only the core
+  procedure inline.
 - **Cost:** a stable prefix can be served from a prompt cache where the provider supports it, while
-  per-request content cannot.
+  per-request content cannot. In a multi-step agent the prefix is re-sent every step, so this compounds.
 
 ### 8. Test every change, on a split you did not tune on
 1. **Split the data.** The cases SMEs used to elicit rules are, by construction, the ones the prompt fits
    best, so iterate on an iteration split and keep a holdout nobody reads while writing rules.
-2. **After each change,** run the iteration split and review failures with SMEs.
+2. **After each change,** run the agent on the iteration split and review failures with SMEs.
 3. **At milestones,** run the holdout.
 4. **Read the movement:** a rule that moves no case is redundant or untested (ablate it: drop it and
    re-run); a rule that fixes three cases and breaks two needs rewording.
@@ -115,8 +135,8 @@ precedence, right rule cited means fix the glossary.
 ```mermaid
 flowchart TD
     S["SME case interviews"] --> R["Candidate rules plus cases"]
-    R --> P["Versioned prompt: glossary, rules, examples"]
-    P --> I["Run iteration split"]
+    R --> P["Versioned agent prompt and tools"]
+    P --> I["Run agent on iteration split"]
     I --> D{"Diagnose each failure"}
     D -->|"wrong rule cited"| O["Reorder or reword rules"]
     D -->|"right rule, wrong label"| G["Fix glossary definition"]
@@ -128,10 +148,10 @@ flowchart TD
 ```
 
 ## Examples
-### Prompt assembled from SME-owned parts
-A freight customer wants shipment exceptions classified. The prompt is built from versioned components so
-each piece can be tested separately, and the output cites the rule that fired so failures can be sorted
-into precedence errors and definition errors.
+### Agent prompt and final-answer tool built from SME-owned parts
+A freight customer wants an agent that triages shipment exceptions. The prompt is built from versioned
+components so each piece can be tested separately, and the final-answer tool forces the agent to cite
+the rule that fired so failures can be sorted into precedence errors and definition errors.
 
 ```python
 import json
@@ -142,28 +162,28 @@ GLOSSARY = {
 }
 RULES = [  # checked in order; the first matching rule wins
     ("R1", "hazmat flag set and any exception exists -> needs_review (regulatory)"),
-    ("R2", "delivery_ts missing -> needs_review; never infer a delivery time"),
+    ("R2", "delivery_ts missing -> call get_shipment once; if still missing -> needs_review"),
     ("R3", "both late and damaged apply -> damaged (claims outrank SLA credits)"),
     ("R4", "otherwise apply the definitions -> late, damaged or on_time"),
 ]
-EXAMPLES = [  # SME boundary pair, differs only in who rescheduled; excluded from the golden set
-    ({"promised_end": "10:00", "delivery_ts": "10:20", "reschedule_by": "consignee",
-      "new_end": "12:00"}, {"label": "on_time", "rule": "R4"}),
-    ({"promised_end": "10:00", "delivery_ts": "10:20", "reschedule_by": "carrier",
-      "new_end": "12:00"}, {"label": "late", "rule": "R4"}),
-]
+FINAL_ANSWER_TOOL = {   # the agent ends every run by calling this; enums make the contract checkable
+    "name": "submit_triage",
+    "description": "Submit the final triage label. Call exactly once, after any lookups.",
+    "input_schema": {"type": "object", "required": ["label", "rule"], "properties": {
+        "label": {"type": "string", "enum": ["on_time", "late", "damaged", "needs_review"]},
+        "rule": {"type": "string", "enum": [rid for rid, _ in RULES]},
+        "reason": {"type": "string"}}},
+}
 
-def build_prompt(version="acme-freight-v7"):
+def build_system_prompt(version="acme-freight-v7"):
     terms = "\n".join(f"- {k}: {v}" for k, v in GLOSSARY.items())
     rules = "\n".join(f"{rid}. {text}" for rid, text in RULES)
-    shots = "\n".join(f"Input: {json.dumps(x)}\nOutput: {json.dumps(y)}" for x, y in EXAMPLES)
-    return (f"[prompt {version}]\nClassify the shipment. Use these definitions, not general "
+    return (f"[prompt {version}]\nYou triage shipment exceptions. Use these definitions, not general "
             f"meanings:\n{terms}\nRules, in priority order:\n{rules}\n"
-            'Reply only with JSON: {"label": on_time|late|damaged|needs_review, "rule": "R1".."R4"}\n'
-            f"Examples:\n{shots}")
+            "Never infer a delivery time. Finish by calling submit_triage.")
 
 def diagnose(results):
-    """results: dicts with the SME's gold_label and gold_rule, and the model's label and rule."""
+    """results: dicts with the SME's gold_label and gold_rule, and the agent's label and rule."""
     out = {"correct": 0, "precedence": 0, "definition": 0}
     for r in results:
         if r["label"] == r["gold_label"]:
@@ -173,20 +193,29 @@ def diagnose(results):
         else:
             out["definition"] += 1      # right rule, wrong reading of a term: fix the glossary
     return out
-```
 
-Calling `diagnose` on three toy results shows each bucket:
-
-```python
 results = [
     {"gold_label": "late",    "gold_rule": "R4", "label": "late", "rule": "R4"},  # correct
     {"gold_label": "damaged", "gold_rule": "R3", "label": "late", "rule": "R4"},  # wrong rule fired
     {"gold_label": "on_time", "gold_rule": "R4", "label": "late", "rule": "R4"},  # term misread
 ]
 print(diagnose(results))   # {'correct': 1, 'precedence': 1, 'definition': 1}
+print(json.dumps(FINAL_ANSWER_TOOL["input_schema"]["properties"]["rule"]))
 ```
 
-### Worked iteration: v6 to v7 (numbers illustrative)
+The boundary pair below goes in the prompt as examples and is excluded from the golden set: it differs
+only in who rescheduled.
+
+```python
+EXAMPLES = [
+    ({"promised_end": "10:00", "delivery_ts": "10:20", "reschedule_by": "consignee",
+      "new_end": "12:00"}, {"label": "on_time", "rule": "R4"}),
+    ({"promised_end": "10:00", "delivery_ts": "10:20", "reschedule_by": "carrier",
+      "new_end": "12:00"}, {"label": "late", "rule": "R4"}),
+]
+```
+
+### Worked iteration: v6 to v7 of the triage agent (numbers illustrative)
 Prompt v6 defined "late" as "after the promised window" with no reschedule clause.
 
 | Step | Iteration split (160 cases) | Holdout (80 cases) |
@@ -198,29 +227,33 @@ Prompt v6 defined "late" as "after the promised window" with no reschedule claus
 - **The holdout moved too,** so the fix generalises rather than memorising the 24 cases.
 - **The 9 precedence errors are a separate problem:** most are damaged-and-late shipments labelled late, so
   the next change targets R3's wording, not the glossary.
+- **Why it matters more for an agent:** in v6 each of those 24 wrong "late" calls would have issued an SLA
+  credit through a write tool; a mislabel in a batch report is cheap, a mis-action is not.
 
 ## Production patterns
-- **Shared base plus customer overlays.** When several customers share most rules, keep one base prompt
-  and a small per-customer overlay (glossary additions, rule overrides) in version control, composed at
-  build time with a version id like `acme-freight-v7`. Monitor every customer's golden-set score whenever
-  the base changes, because one base edit touches all of them.
-- **Eval gate on prompt changes.** Treat glossary, rule and example files as code: each pull request
-  runs the iteration split and reports per-term and per-rule failure counts, and milestones run the
-  holdout. Block the merge when any customer's score drops beyond an agreed tolerance.
-- **Stable prefix first for prompt caching.** Put the glossary, rules and examples at the start and the
-  per-request facts last. On Anthropic mark the system block with `cache_control`; OpenAI caches long
-  repeated prefixes automatically. Monitor cached input tokens in the usage fields of each response.
-- **Constrained output with a closed label set.** Use the provider's JSON-schema structured output with
-  an enum for the label and rule id, then validate the cited rule exists. Monitor parse-failure rate and
-  the share of outputs citing each rule; a rule that is never cited is an ablation candidate.
-- **Abstention rate as a production metric.** Track the "needs_review" share per day and per customer
-  against the review team's capacity. A rising rate signals new out-of-policy inputs or a broken data
-  field; a falling one can mean the model has started guessing.
+- **Shared base plus customer overlays.** When several customers share most rules, keep one base agent
+  prompt and a small per-customer overlay (glossary additions, rule overrides) in version control,
+  composed at build time with a version id like `acme-freight-v7`. Monitor every customer's golden-set
+  score whenever the base changes, because one base edit touches all of them.
+- **Eval gate on prompt changes.** Treat glossary, rule, tool-description and example files as code: each
+  pull request runs the agent on the iteration split and reports per-term and per-rule failure counts,
+  and milestones run the holdout. Block the merge when any customer's score drops beyond an agreed tolerance.
+- **Stable prefix first for prompt caching.** Put the glossary, rules, tool schemas and examples at the
+  start and the per-request facts last. On Anthropic mark the system block with `cache_control`; OpenAI
+  caches long repeated prefixes automatically. Monitor cached input tokens in the usage fields of each step.
+- **Constrained output with a closed label set.** Use a final-answer tool or the provider's JSON-schema
+  structured output with an enum for the label and rule id, then validate the cited rule exists. Monitor
+  parse-failure rate and the share of outputs citing each rule; a never-cited rule is an ablation candidate.
+- **Abstention rate as a production metric.** Track the "needs_review" or escalation share per day and per
+  customer against the review team's capacity. A rising rate signals new out-of-policy inputs or a broken
+  data field; a falling one can mean the agent has started guessing.
+- **Log the prompt version on every trace.** Store the composed prompt id with each agent run so a
+  production complaint maps to the exact rules the agent had.
 
 ## Trade-offs
-- **Explicit rules vs prompt size.** Rules make behaviour predictable and auditable, but each adds tokens
-  and a chance of conflict; once rules number in the dozens, retrieving the relevant subset usually beats
-  inlining all.
+- **Explicit rules vs prompt size.** Rules make agent behaviour predictable and auditable, but each adds
+  tokens to every step and a chance of conflict; once rules number in the dozens, a retrieval tool that
+  returns the relevant subset usually beats inlining all.
 - **Customer few-shot examples vs bias.** They teach judgement fast, but leak format quirks and can bias
   the label distribution; when examples skew toward one class, predictions skew with them.
 - **Per-customer prompt vs maintenance.** It fits each client precisely but multiplies upkeep; once three
@@ -231,7 +264,7 @@ Prompt v6 defined "late" as "after the promised window" with no reschedule claus
 ## Pitfalls
 - **Writing rules from the policy manual instead of from cases.** Symptom: a long prompt that scores no
   better than the short one, because the manual rules were not the ones deciding outcomes.
-- **Leaving a contested term undefined.** Symptom: SMEs and model disagree on the same subset of cases over
+- **Leaving a contested term undefined.** Symptom: SMEs and agent disagree on the same subset of cases over
   and over, all containing that word.
 - **Reusing few-shot examples inside the golden set.** Symptom: an eval score that drops sharply when a
   fresh sample of production cases is labelled.
@@ -241,11 +274,14 @@ Prompt v6 defined "late" as "after the promised window" with no reschedule claus
   and seeing no change, because the citation was rationalised after the label.
 - **Encoding one SME's personal preference as policy.** Symptom: a second SME rejects outputs the first
   approved; the rule needs the policy owner's decision, not more prompting.
+- **Putting domain rules only in tool descriptions.** Symptom: the agent follows a rule when it happens to
+  consider that tool and ignores it otherwise. Fix: keep the procedure in the system prompt and let tool
+  descriptions say only when the tool applies.
 
 ## When to use
-- **Use when** a general model's outputs are fluent but judged wrong by the customer's experts, and errors
-  cluster around definitions, precedence or exceptions. It is the first lever before retrieval or
-  fine-tuning, because it is cheap, reversible and inspectable.
+- **Use when** a general model's outputs or actions are fluent but judged wrong by the customer's experts,
+  and errors cluster around definitions, precedence or exceptions. It is the first lever before retrieval
+  or fine-tuning, because it is cheap, reversible and inspectable.
 - **Move to retrieval when** the needed knowledge is too large or changes too often for a prompt.
 - **Consider fine-tuning when** the behaviour is a style or skill that instructions cannot pin down after
   several rounds.
@@ -297,12 +333,19 @@ disagree with each other, I escalate to the policy owner rather than prompting a
 - **Stay with prompts** while errors cluster on definitions and precedence, because those are cheap,
   reversible and inspectable fixes.
 
-### How would you structure prompts for ten customers in the same vertical?
-- **Shared base prompt** with the procedure, output contract and common glossary, plus a per-customer
-  overlay for their definitions and rule overrides.
-- **Versioning:** each customer's composed prompt gets its own version id, so a regression traces to a base
-  or overlay change.
+### How would you structure agent prompts for ten customers in the same vertical?
+- **Shared base prompt** with the procedure, tool schemas, output contract and common glossary, plus a
+  per-customer overlay for their definitions and rule overrides.
+- **Versioning:** each customer's composed prompt gets its own version id logged on every trace, so a
+  regression traces to a base or overlay change.
 - **Gate:** any base change runs every customer's golden set, because one edit affects all ten.
+
+### Your triage agent picks the right label but calls a write tool before checking a required field. Where do you fix it?
+- **Procedure, not glossary:** the definition is right, so the failure is in rule order or the tool policy;
+  put the data-validity check first and say which lookup tool fetches the missing field.
+- **Guard in code too:** make the write tool reject calls missing required fields, because a prompt rule
+  lowers the rate but does not guarantee it.
+- **Add eval cases** for that path that assert on the tool sequence, not only on the final label.
 
 ### How do you tell whether a wrong label is a precedence error or a definition error?
 - **Make the output cite its rule,** and have SMEs record the deciding rule on each gold case.
@@ -335,3 +378,23 @@ disagree with each other, I escalate to the policy owner rather than prompting a
 - [x] Escalate to the policy owner for an operational definition, then encode it in the glossary
 > Persistent SME disagreement means the policy itself is undefined. Prompting cannot resolve it; only
 > the person who owns the policy can, and the decision then becomes a glossary entry and eval cases.
+
+## Use cases & projects
+### Use cases
+- **Claims and exception triage agents.** Insurance or freight agents that must apply the customer's
+  definition of "late", "damaged" or "pre-existing" before calling a write tool.
+- **Support agents with policy-bound actions.** Refund or credit agents whose eligibility rules, and their
+  precedence, come from the customer's policy owner rather than public norms.
+- **Multi-customer agent platforms.** A shared base prompt with per-customer overlays, each version gated
+  by that customer's golden set.
+- **Compliance-sensitive workflows.** Agents that must escalate out-of-policy cases instead of guessing, with
+  the escalation rate tracked against human review capacity.
+
+### Mini project
+**Domain-prompt a triage agent and measure the fix (2-3 hours).**
+- **Goal:** show that an explicit glossary and ordered rules fix an agent's domain errors on a held-out split.
+- **Steps:** write 40 synthetic shipment cases with gold label and gold rule, split 25 iteration and 15
+  holdout; build a small agent with a `get_shipment` lookup tool and a `submit_triage` final-answer tool;
+  run a persona-only prompt, then a glossary-plus-rules prompt; bucket failures with `diagnose`.
+- **Done when:** you have a table of correct, precedence and definition counts on both splits for both
+  prompt versions, and a short note on which rule change moved the holdout.

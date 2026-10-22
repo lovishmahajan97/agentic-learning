@@ -434,3 +434,24 @@ slice.
 - [ ] About 97%, since later hops can correct earlier ones
 > Each hop must succeed for the chain to succeed, so 0.9 × 0.9 × 0.9 ≈ 0.73; this is why per-hop precision
 > via reranking and minimal hop counts matter more in multi-hop than in single-shot RAG.
+
+## Use cases & projects
+### Use cases
+- **Research and due-diligence agents.** "Who owns the supplier of X, and what did they report?" needs the
+  first result to form the second query.
+- **Incident and debugging agents.** An error points to a service, the service points to a runbook, the
+  runbook points to a config; each hop is a new search.
+- **Enterprise knowledge agents.** Answers that join an org chart, a project page and a policy doc need
+  chained lookups, bounded by a hop cap.
+- **Cost and loop control.** Teams set a tool-call cap and a no-progress rule because unbounded loops
+  repeat the same query and burn budget.
+
+### Mini project
+**A bounded multi-hop search agent (2-3 hours).**
+- **Goal:** answer two-hop questions with a capped loop that stops on no progress and cites every hop.
+- **Steps:** build a small corpus where answers need two linked documents and write about 15 such
+  questions; implement a ReAct-style loop over a `search` tool with a hop cap of 4 and a rule that stops
+  when a query repeats or returns no new chunks; require the final answer to cite one chunk per hop or
+  refuse; log hops, tokens and correctness per question.
+- **Done when:** you have per-question traces, a table of accuracy against hop count, and at least one
+  example where the no-progress rule stopped a loop.

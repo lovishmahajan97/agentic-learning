@@ -456,3 +456,24 @@ presses; if everything upstream is right and they do not, the serving layer is n
 > The point of propagating cancellation is to reclaim capacity now. The engine drops the sequence at
 > the next scheduling step and frees its memory, which is why abandoned requests only cost capacity
 > when the abort never reaches the engine.
+
+## Use cases & projects
+### Use cases
+- **Stop buttons in agent UIs.** A user's stop must end decoding, pending tool calls and sub-agents, not
+  just hide the stream.
+- **Parallel tools and speculative branches.** When one branch wins, the others are cancelled so they
+  stop billing and free capacity.
+- **Agents with write tools.** Idempotency keys and a "cancelled" run status make an interrupted email,
+  payment or ticket update safe to inspect and retry.
+- **Deadlines and disconnects.** Timeouts and dropped connections reuse the same cancellation path, so
+  abandoned runs do not keep spending.
+
+### Mini project
+**Make stop actually stop an agent (1-2 hours).**
+- **Goal:** prove that cancelling a run ends every model stream and tool call within a second.
+- **Steps:** build a FastAPI agent endpoint that streams a run with two parallel tools in an
+  `asyncio.TaskGroup`; check `request.is_disconnected()` in the loop; close the provider stream in
+  `finally`; log a line from every tool and stream when it starts, finishes or is cancelled; disconnect
+  the client mid-run.
+- **Done when:** the log shows every task cancelled shortly after the disconnect, no tool logs work after
+  it, and the run is stored with a "cancelled" status.

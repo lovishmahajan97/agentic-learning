@@ -389,3 +389,25 @@ revisit when one changes.
 - [ ] Use whatever fits within the per-request rate limit
 > Effective context depends on the model and the task; recall varies with position and with distractors.
 > Only an eval on your data at increasing lengths tells you where quality starts to drop.
+
+## Use cases & projects
+### Use cases
+- **Agents over one small, static manual.** A product guide that rarely changes and fits comfortably
+  sits in a cached prefix, so the agent needs no search tool at all.
+- **Enterprise knowledge agents.** Large, changing and permissioned corpora go behind a retrieval tool,
+  because re-sending them on every step is unaffordable and leaks across users.
+- **Whole-document review.** Contract or code review that needs cross-references loads the full
+  document, often through a `read_document` tool, rather than top-k chunks.
+- **Agent memory design.** Keeping full conversation history versus retrieving past memories on demand
+  is the same decision, made with the same per-step token arithmetic.
+
+### Mini project
+**Measure preload versus search for a multi-step agent (2-3 hours).**
+- **Goal:** compare cost, latency and accuracy of preloading a corpus versus a search tool in a 10-step
+  agent run.
+- **Steps:** pick a corpus of a few dozen documents and 20 questions with known answers, including some
+  that need two facts; build variant A with the corpus in the system prompt (with provider prompt
+  caching on) and variant B with a `search` tool returning a few thousand tokens; log input, cached-input
+  and output tokens per step plus end-to-end latency.
+- **Done when:** you have a per-variant table of tokens per run, cost per run, latency and accuracy, and
+  a one-paragraph recommendation stating which corpus size or change rate would flip the choice.

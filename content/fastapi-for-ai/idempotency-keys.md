@@ -448,3 +448,23 @@ reused key with a different body.
 - [ ] Return 409 Conflict and ask the client to retry later
 > A key identifies one operation. A different body means the client misused it. Replaying would return
 > an unrelated result and overwriting would break the earlier retry, so reject it (the draft suggests 422).
+
+## Use cases & projects
+### Use cases
+- **Agents that send messages.** An email or Slack tool keyed by run id plus tool call id sends once, even
+  when the step is retried after a timeout.
+- **Agents that create records or charge money.** Ticketing, CRM and payment tools pass a derived key
+  downstream, so a resumed run replays the stored result instead of filing or charging again.
+- **Durable agent runtimes.** When a run resumes from a checkpoint, already-completed side effects are
+  replayed from the claim store, not re-executed.
+- **Client retries on `POST /runs`.** A UI or SDK that retries after a dropped connection gets the same run
+  back instead of starting, and paying for, a second one.
+
+### Mini project
+**Make an agent's side-effecting tool safe to retry (1-2 hours).**
+- **Goal:** prove a retried or resumed agent step cannot perform its side effect twice.
+- **Steps:** build a fake `create_ticket` tool server in FastAPI that honours an `Idempotency-Key` header
+  with an atomic claim in Redis or Postgres; have a small agent executor derive the key from run id and
+  tool call id; inject a timeout after the server commits but before the reply arrives, then retry.
+- **Done when:** the retry gets the replayed response, the ticket store holds exactly one ticket, and a
+  reused key with a different body is rejected as a client error.

@@ -380,3 +380,23 @@ turn would pay prefill over it unless it is prefix-cached, so transcribing once 
 - [ ] Open-ended summarization in a conversation
 > Scoring is a read-and-rate task with no generation; an encoder with a classification head, or a
 > cross-encoder reranker, does it at a fraction of the cost per pair.
+
+## Use cases & projects
+### Use cases
+- **Choosing models per agent component.** A decoder-only LLM plans and calls tools, an encoder embeds and
+  reranks for RAG, and an encoder–decoder transcribes speech for a voice agent.
+- **Offloading bulk scoring from the agent LLM.** Relevance filtering or classification over thousands of
+  items goes to a cheap encoder, so the planner only sees the shortlist.
+- **Prompt layout for a causal reader.** Because each token only sees what came before, agent teams state
+  the task before long documents and restate it after them.
+- **Costing long agent loops.** Decoder-only models append and reuse their cache, so an append-only
+  transcript keeps per-step cost low; re-encoding the transcript each step would not.
+
+### Mini project
+**Split an agent's work across model families (1-2 hours).**
+- **Goal:** show the cost and latency difference between scoring with the agent LLM and with an encoder.
+- **Steps:** take 200 query-document pairs; score relevance once by prompting a decoder-only chat model and
+  once with a cross-encoder reranker; log latency, tokens and agreement with a small set of hand labels;
+  wire the faster option in as the agent's filter step.
+- **Done when:** you have a table of time, cost and accuracy for both approaches and a short note on which
+  one the agent should use for this step and why.

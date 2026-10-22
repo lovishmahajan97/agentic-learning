@@ -386,3 +386,24 @@ pays off.
 > Mean plus 1.645 standard deviations only works for Gaussian, constant-variance residuals; latency
 > residuals are skewed and grow with request size. The pinball loss estimates the 95th percentile
 > directly without that assumption.
+
+## Use cases & projects
+### Use cases
+- **Model-tier routing by predicted cost.** Predict a run's token cost before it starts and send cheap,
+  short tasks to a smaller model while long ones get a budget and a stronger model.
+- **Step and timeout budgets.** A high-quantile prediction of step count or wall time sets a per-run
+  cap that stops loops without killing legitimate long runs.
+- **Reward models and judge scores.** A scalar head trained on preferences, or a 1-5 judge score, is a
+  regression target whose noise and scale you must understand before optimising against it.
+- **Capacity planning for agent traffic.** Forecasting tokens per hour drives GPU or rate-limit
+  provisioning, where the tail matters more than the mean.
+
+### Mini project
+**Predict agent run cost before it starts (2-3 hours).**
+- **Goal:** predict the token cost of an agent run from features available at request time, and use
+  the p90 prediction as a budget.
+- **Steps:** log (or simulate) 500 runs with request length, task type, tool count and final tokens;
+  fit a mean baseline, an MSE model on log tokens and a quantile model at 0.9; evaluate on a time-based
+  split with MAE and quantile coverage.
+- **Done when:** you show the model beats the baseline, the p90 budget covers about 90% of held-out
+  runs, and you name one feature you rejected because it would leak the future.

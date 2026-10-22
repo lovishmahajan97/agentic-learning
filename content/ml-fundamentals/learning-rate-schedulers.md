@@ -367,3 +367,24 @@ changing the schedule.
 > WSD keeps the learning rate constant for most of the run, so any stable-phase checkpoint can be annealed
 > with a short decay to get the final-loss benefit. Cosine's shape is anchored to a fixed end point, and
 > inverse-square-root never anneals sharply.
+
+## Use cases & projects
+### Use cases
+- **Fine-tuning a tool-calling format.** A few thousand traces teach the model your function-call JSON;
+  the horizon must be counted in optimizer steps or the decay never happens.
+- **Router and classifier heads for agents.** Small models that pick a tool or a sub-agent are trained in
+  short runs where linear or cosine decay with a brief warmup is the default.
+- **Trajectory imitation from good agent runs.** Supervised fine-tuning on successful transcripts, where a
+  learning-rate trace in the run logs is the first thing to check when the eval does not move.
+- **Debugging a hosted fine-tune.** When a provider only exposes a learning-rate multiplier and epochs,
+  knowing the schedule shape explains why changing epochs also changes the decay.
+
+### Mini project
+**Schedule audit for a tool-call fine-tune (2-3 hours).**
+- **Goal:** show how the horizon unit changes what a short LoRA run on agent traces actually learns.
+- **Steps:** take a small open model and a few hundred tool-call traces; run two short fine-tunes with
+  cosine decay, one with the horizon set correctly in optimizer steps and one set as if counted in
+  micro-batches; log the learning rate and loss every step; score both on a held-out set of tool calls
+  for valid JSON and correct tool choice.
+- **Done when:** you have a plot of both learning-rate curves, both loss curves and a small table of
+  tool-call accuracy, plus two sentences on why the mis-sized run behaved as it did.

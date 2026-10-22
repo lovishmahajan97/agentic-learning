@@ -404,3 +404,23 @@ turn a slogan into a point on a curve I can place my workload on.
 > Higher concurrency shares each weight read among more sequences, raising total output while each
 > step takes slightly longer. Quantisation and more bandwidth raise both numbers, and speculative
 > decoding at batch 1 raises per-stream speed.
+
+## Use cases & projects
+### Use cases
+- **Choosing the agent's model.** Teams convert vendor speed claims into seconds per completed task on
+  their own prompts, not on a generic benchmark.
+- **Sizing self-hosted replicas.** Aggregate tokens/s at the target latency, measured with prompt-heavy
+  agent traffic, sets how many replicas a launch needs.
+- **Cost per successful task.** Input and output token counts from usage fields, priced and divided by
+  successful runs, are the number finance and product teams compare.
+- **Comparing models with different tokenizers.** Teams normalise to characters or tasks so a tokenizer
+  that splits text finer does not look faster.
+
+### Mini project
+**Turn tokens/s into seconds and dollars per task (1-2 hours).**
+- **Goal:** compare two models for one agent by time and cost per completed task, not raw tokens/s.
+- **Steps:** run the same small tool-calling agent on 10 tasks with each model; log input tokens, output
+  tokens, wall time and success per run from usage fields; compute per-stream output tokens/s, seconds
+  per task and cost per successful task using the provider's published prices.
+- **Done when:** you have one table per model with all three numbers and a short note on whether the
+  faster tokens/s model also wins per task.

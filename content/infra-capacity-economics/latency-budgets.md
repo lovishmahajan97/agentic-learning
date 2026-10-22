@@ -432,3 +432,24 @@ jitter.
 - [ ] Extend the deadline because the model step is required
 > A 300 ms timeout on a 700 ms p95 call fails a large share of the time while still consuming GPU time. Degrading
 > or failing fast keeps the SLO honest and avoids wasted work.
+
+## Use cases & projects
+### Use cases
+- **Support and booking agents with a task deadline.** The budget sets how many tool-calling steps fit
+  before the agent must answer with what it has.
+- **RAG chat with a first-token target.** Splitting the TTFT target across retrieval, reranking, prompt
+  assembly and prefill shows which stage to cut when the p95 slips.
+- **Multi-service agent platforms.** Propagated deadlines stop downstream tools and model calls from
+  working after the caller has given up.
+- **Choosing degraded paths.** A budget decides when to skip the reranker, use a smaller model or stream a
+  partial answer instead of timing out.
+
+### Mini project
+**Build a deadline-aware agent loop (1-3 hours).**
+- **Goal:** keep a tool-calling agent inside a fixed task deadline by checking the remaining budget before
+  every step.
+- **Steps:** build a small agent with three fake tools that sleep for random durations; pass an absolute
+  deadline into the loop; before each model or tool call, compare the remaining time with that step's p95
+  and take a degraded path (skip an optional tool or answer now) when it does not fit; log per-step spans.
+- **Done when:** over 100 runs the task-level p95 stays under the deadline, you have a per-step latency
+  table, and you can show the runs where the loop chose to stop early and why.

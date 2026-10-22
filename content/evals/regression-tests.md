@@ -425,3 +425,24 @@ whether any expectations were edited in the same change, which would be a prompt
 > Free-text outputs vary in wording even when the behaviour is identical, so snapshot equality flags
 > every run. The practical response is to replace it with behavioural assertions, schema checks and
 > narrow reference-based judges.
+
+## Use cases & projects
+### Use cases
+- **Gating prompt and tool-schema edits in CI.** Every pull request that touches the system prompt or a
+  tool description re-runs the pinned tasks and blocks on new failures in critical cases.
+- **Approving a model snapshot swap.** Running the suite on the old and new model in the same job gives a
+  flip list that shows exactly which tasks broke before the switch.
+- **Locking in incident fixes.** Each production failure becomes a case with its stubbed tool responses,
+  so a later fix elsewhere cannot silently reintroduce it.
+- **Detecting drift with no commit.** A scheduled run with no code diff catches provider-side model
+  updates, index rebuilds and dependency bumps.
+
+### Mini project
+**Build a CI regression gate for a tool-calling agent (2-3 hours).**
+- **Goal:** fail a change when tasks that passed on the baseline now fail, without failing on noise.
+- **Steps:** write 25 cases for a small agent with 2-3 tools, each with input, recorded tool responses
+  and an expected end state or tool trajectory; tag 5 as critical; run each case *k* times on the
+  baseline and the candidate in the same job; compute per-case pass rates and a flip list; fail on any
+  critical-case regression or a significant paired drop.
+- **Done when:** changing one tool description in a way that breaks tool choice fails the gate with the
+  flipped cases named, and a harmless rewording of the final answer passes.

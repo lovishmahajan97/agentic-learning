@@ -439,3 +439,25 @@ Fail closed if the directory lookup fails, and key any answer cache on the princ
 - [ ] Embed the group name into the chunk text so the embedding carries it
 > Group principals keep payloads small and make membership changes instant through query-time
 > expansion. Listing users forces a re-index on every change, and embeddings cannot enforce a predicate.
+
+## Use cases & projects
+### Use cases
+- **Enterprise knowledge agents.** An assistant over a company drive and wiki must answer each employee
+  only from documents that employee can open in the source system.
+- **MCP document-search servers.** A search server shared by many agents receives the user's identity
+  on each call and filters by it, rather than searching with its own service account.
+- **HR and legal assistants.** Restricted files (salary reviews, investigations) sit in the same index as
+  public policies, and the predicate keeps them out of everyone else's context.
+- **Agent memory and semantic caches.** Stored answers derived from restricted chunks are tagged with the
+  principals that could read them, so a cache hit never leaks across users.
+
+### Mini project
+**Prove an agent's search tool cannot leak (2-3 hours).**
+- **Goal:** build a search tool that takes identity from the session, expands groups, and fails closed.
+- **Steps:** index 50 documents with allowed-principal lists using user and group IDs; write a group
+  expansion function; build the tool so identity comes from the request context, not tool arguments; add
+  a prompt-injection test where a document tells the agent to search as an admin; revoke a group
+  membership and rerun.
+- **Done when:** a test suite shows each of three users sees only their documents, the injected request
+  returns nothing extra, the revoked user loses access with no re-index, and an identity-service outage
+  returns an error instead of unfiltered results.

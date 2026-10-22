@@ -470,3 +470,25 @@ version so future scores are comparable.
 - [ ] Switch completeness to a 1–10 scale to capture nuance
 > Low agreement isolated to one criterion points at that criterion's definition. Annotators agree fine
 > elsewhere, so replacing them or widening the scale would not fix the ambiguity.
+
+## Use cases & projects
+### Use cases
+- **Acceptance criteria for a customer agent.** A versioned rubric turns a statement of work ("refunds
+  only with confirmation, cites the order") into checks both sides can audit.
+- **Debugging a regression to one component.** Separate outcome, trajectory and reply criteria show
+  whether a drop came from the planner, a tool or the final message.
+- **Safety gates on destructive tools.** Gating criteria such as "no delete without confirmation" fail
+  a run outright, whatever its other scores.
+- **Annotation queues for trace review.** Reviewers label against the same binary criteria the judge
+  uses, so human and judge pass rates are comparable per criterion.
+
+### Mini project
+**Write and run a rubric for an order-refund agent (2-3 hours).**
+- **Goal:** score 30-50 agent runs with a rubric that mixes code checks over the trajectory and judge
+  calls for the reply.
+- **Steps:** list the agent's failure modes from a handful of traces; turn each into a binary criterion
+  with an applicability condition; mark one or two as gates; implement trajectory checks in code and
+  one judge call per reply criterion; aggregate per-criterion pass rates with N/A excluded from the
+  denominator.
+- **Done when:** a report shows per-criterion pass rates, gate failures listed separately, the rubric
+  version stamped on every result, and one criterion you rewrote after spotting disagreement.

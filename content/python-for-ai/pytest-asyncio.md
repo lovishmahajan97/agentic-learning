@@ -451,3 +451,24 @@ the loop they were made on, so fixture lifetime and loop lifetime must match.
 - [ ] The fixture was declared with pytest_asyncio.fixture
 > A blocking sleep stops the loop from switching tasks, so the test never produced concurrent calls
 > to count. Loop scope and plugin mode affect which loop runs the test, not whether calls overlap.
+
+## Use cases & projects
+### Use cases
+- **Parallel tool calls.** Tests check that a step running tools with `asyncio.gather` respects its
+  concurrency cap and returns results in the order the model asked for them.
+- **Per-tool timeouts.** A fake tool that never returns proves the timeout fires, the task is cancelled
+  and the model receives a timeout message instead of the loop hanging.
+- **Streaming and abort.** Tests of a streaming endpoint check that a user abort closes the upstream
+  stream and that `CancelledError` is not swallowed by a retry wrapper.
+- **Async clients and servers.** MCP clients, async SDK wrappers and FastAPI agent endpoints are tested
+  with shared async fixtures that open and close their connections cleanly.
+
+### Mini project
+**Test the concurrency of an async agent step (1-2 hours).**
+- **Goal:** prove that one agent step runs tool calls concurrently, caps them and handles a slow tool.
+- **Steps:** write an async step function that fans out tool calls behind a semaphore; build fake tools
+  that `await asyncio.sleep` and record peak concurrency; add tests for the cap, for result ordering,
+  for a tool that exceeds its timeout, and for cancellation of the whole step; set `asyncio_mode`
+  explicitly in config.
+- **Done when:** all tests pass in well under a second, raising the semaphore limit makes the cap test
+  fail, and replacing an `await asyncio.sleep` with `time.sleep` makes the concurrency test fail.

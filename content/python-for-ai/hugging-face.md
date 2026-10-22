@@ -437,3 +437,23 @@ metric on held-out conversations, since falling training loss says little about 
 - [ ] It automatically removes prompt-injection attempts from user messages
 > Chat models are trained on one specific format of role markers and end-of-turn tokens. Deviating keeps
 > the model running but off-distribution, which degrades quality and stopping behaviour without any error.
+
+## Use cases & projects
+### Use cases
+- **Replacing a hosted model with an open one.** When cost, latency or data rules rule out a hosted API,
+  teams load an open model from the Hub and make it call tools with its own chat template.
+- **Fine-tuning on agent traces.** PEFT and TRL turn successful tool-calling transcripts into a LoRA
+  adapter that calls your tools more reliably than the base model.
+- **Offline agent evals.** `datasets` holds trace corpora and eval sets, and `transformers` runs candidate
+  models over them before a model swap ships.
+- **Per-tenant adapters.** One base model with swapped LoRA adapters serves several agents or customers
+  from the same GPUs.
+
+### Mini project
+**Render and test tool calls with an open model (2-3 hours).**
+- **Goal:** get a small open instruct model to emit parseable tool calls for two tools.
+- **Steps:** pick a Hub model whose chat template supports tools and pin its `revision`; define two tool
+  schemas; render prompts with `apply_chat_template` and inspect the raw string; generate for 20 test
+  requests; parse the tool calls and count how many are valid against the schema.
+- **Done when:** you have a parse-rate number, examples of failures, and a note on whether the template,
+  the prompt or the model caused them.

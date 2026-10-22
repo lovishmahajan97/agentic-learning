@@ -5,7 +5,8 @@ name: Break-even analysis (hosted API vs self-hosting)
 kind: decision
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - system-design/self-host-vs-api
   - system-design/open-weight-vs-proprietary
@@ -18,21 +19,34 @@ related:
 ---
 
 ## TL;DR
-A hosted API is variable cost, nothing when idle; self-hosting is mostly fixed GPU and people cost. Break-even is the monthly
-volume where the curves cross, and it hinges on achievable utilization and team cost far more than on GPU
-list price.
+An agent fleet on a hosted API is variable cost; self-hosting it is mostly fixed GPU and people cost.
+Break-even is the monthly token volume where the curves cross, set by achievable utilization and team
+cost more than GPU list price.
+
+## For agent builders
+- **Why it matters for agents.** Agents multiply tokens: every step re-sends the transcript, so one run
+  can be tens of thousands of tokens and the API bill grows with steps times runs. That is when someone
+  asks "should we self-host the agent's model?", and this lesson is how to answer with numbers.
+- **Where it shows up in your stack.** Your traces (tokens per run, steps per run, input/output split), the
+  provider's usage fields and cached-token pricing, a candidate serving engine such as vLLM for an
+  open-weight model, and the gateway that would route between the two.
+- **What you control.** Steps per run, prompt caching on a stable prefix, which agent steps need a frontier
+  model, and which workloads are interactive versus flat (evals, batch backfills, offline agents). Each one
+  moves `V`, `p` or `u` in the formulas below.
+- **What you can skip.** Building the GPU cluster yourself to "find out". Run the sign test on a
+  spreadsheet first; most agent teams stay on an API or a managed open-weight endpoint.
 
 ## Why it exists
 - **The question arrives with the first five-figure API invoice:** "would it not be cheaper to run this
   ourselves?" The back-of-envelope answer divides a GPU's hourly price by its benchmark tokens per second
   times 3,600, gets a cost per million tokens far below the API's list price, and concludes self-hosting is
   several times cheaper.
-- **Wrong assumption 1: the GPU is saturated 24 hours a day.** Real interactive traffic is diurnal and
-  bursty. You provision for the peak with headroom to protect latency, so average utilization is a
-  fraction, and the effective cost per token is the list cost divided by that fraction.
+- **Wrong assumption 1: the GPU is saturated 24 hours a day.** Real interactive traffic, including users
+  waiting on an agent, is diurnal and bursty. You provision for the peak with headroom to protect latency,
+  so average utilization is a fraction, and the effective cost per token is the list cost divided by it.
 - **Wrong assumption 2: the GPU is the biggest line.** It is only the visible one. Someone has to build and
-  run the serving stack, carry the pager, upgrade the model and prove on your evals that an open-weight
-  model matches the hosted one.
+  run the serving stack, carry the pager, upgrade the model and prove on your agent evals that an
+  open-weight model matches the hosted one at tool calling and planning.
 - **Wrong assumption 3: the comparison is like for like.** It compares a hosted frontier model against an
   open-weight model, at different quality.
 - **"Never self-host, it is a distraction" is equally lazy.** At sustained high volume the fixed cost
@@ -44,7 +58,8 @@ list price.
 
 ## How it works
 ### Two cost curves
-Write monthly cost as a function of monthly volume *V* in tokens.
+Write monthly cost as a function of monthly volume *V* in tokens. For an agent, `V = runs × steps per run ×
+tokens per step`.
 
 ```
 Cost_api(V)  = p_in · V_in + p_out · V_out          ≈ p · V   for a stable input/output mix
@@ -53,7 +68,7 @@ Cost_self(V) = F + N(V) · G
 
 | Symbol | Meaning |
 |---|---|
-| `p` | blended price per token at *your* mix; output tokens usually cost several times input tokens, so blend per feature, not per company |
+| `p` | blended price per token at *your* mix; output tokens usually cost several times input tokens, so blend per feature, not per company; for agents, cached input tokens lower it further |
 | `F` | fixed monthly cost that does not scale with volume: people, platform tooling, eval upkeep |
 | `G` | monthly cost of one GPU replica |
 | `N(V)` | replicas needed to serve *V*; a step function, because you cannot buy a third of a GPU |
@@ -71,7 +86,8 @@ N(V)      = ceil(peak_rate / T_slo)
   gives a p95 nobody would ship.
 - **Measure it for your request *shape*** (typical input and output lengths), not as a generic
   tokens-per-second figure, *because* a prompt token is processed in parallel during prefill and costs far
-  less GPU time than an output token generated one at a time in decode.
+  less GPU time than an output token generated one at a time in decode. Agent traffic is input-heavy and
+  repeats its prefix every step, so replay real agent traces.
 - **The API's input/output price ratio is not your GPU's cost ratio,** so blend both sides on the same mix.
 - **Peak-to-average comes from your traffic logs.** Headroom covers failover and the fact that a replica
   at 100% load is already past its latency target.
@@ -79,9 +95,10 @@ N(V)      = ceil(peak_rate / T_slo)
 ### Utilization is the single most important number
 - **Achieved utilization** is `u = avg_rate / (N · T_slo)`, roughly `1 / (peak_to_average · (1 + headroom))`
   once N is large.
-- **Interactive traffic** with a peak-to-average of 2–3 and 20% headroom lands around a third.
-- **Batch or offline workloads** can be scheduled flat and push *u* toward one, which is why self-hosting
-  pays off far earlier for them.
+- **Interactive traffic** (chat agents, copilots) with a peak-to-average of 2–3 and 20% headroom lands
+  around a third.
+- **Batch or offline workloads** (nightly eval suites, backfill agents, document-processing pipelines) can
+  be scheduled flat and push *u* toward one, which is why self-hosting pays off far earlier for them.
 
 ### Effective cost per token and the sign test
 ```
@@ -94,11 +111,12 @@ c_self = G / (T_slo · seconds_per_month · u)
 3. **If `c_self < p`,** the continuous approximation of the crossover is `V* ≈ F / (p − c_self)`; the step
    function makes the real crossover slightly later.
 4. **An API price cut attacks the sign test.** Halve `p` and a workload comfortably past break-even can be
-   on the wrong side of it permanently.
+   on the wrong side of it permanently. Turning on prompt caching for an agent's stable prefix lowers your
+   effective `p` the same way.
 
 ### Payback on the switch
 - **Moving is a one-off cost `M`:** building the serving path, evaluating and possibly fine-tuning the
-  open-weight model, load testing, migrating traffic.
+  open-weight model (for agents, on tool-calling trajectories), load testing, migrating traffic.
 - **Even past break-even,** the switch pays back only after `M / (Cost_api − Cost_self)` months.
 - **Compare with the horizon.** Put payback next to the reservation term and the expected life of the
   model choice: a 14-month payback on a decision you expect to revisit within a year is a loss.
@@ -117,20 +135,24 @@ write down.
 - **If the open-weight model scores below the hosted one on your evals,** either pay to close the gap
   (fine-tuning: a one-off cost plus a recurring maintenance line in `F`) or accept lower quality and price
   it through cost per successful task.
+- **Agents amplify small gaps.** A slightly worse tool-call accuracy compounds over many steps into failed
+  runs, retries and extra steps, which add tokens back to `V`.
 - **Either way, compare at equal quality** or convert the gap into money; comparing at unequal quality is
   comparing nothing.
 
 ### Sensitivity, not a point
 - **Vary utilization** between the batch-flat and interactive-bursty cases.
-- **Vary `p`** across list and committed-use pricing and a plausible future price cut.
+- **Vary `p`** across list and committed-use pricing, cached-input pricing and a plausible future price cut.
 - **Vary `G`** between on-demand and reserved.
+- **Vary `V` through the agent design:** fewer steps per run or a compacted transcript cuts volume as
+  surely as losing traffic.
 - **Time matters.** A reservation locks `G` for its term, while hosted prices have tended to fall and hosted
   models to improve, so a marginal decision today is a bet on the next twelve months of price movement.
 
 ### Non-cost factors that can decide it alone
 - **The list:** regulated data that cannot leave a region or a building; rate limits and quotas that cap
-  bursts during your peak; latency control through co-location; a specific open-weight or custom
-  fine-tuned model the vendor does not serve; deprecation and lock-in risk.
+  bursts during your peak (an agent fan-out can hit them fast); latency control through co-location; a
+  specific open-weight or custom fine-tuned model the vendor does not serve; deprecation and lock-in risk.
 - **Run the arithmetic anyway,** so the premium being paid for the constraint is known and owned.
 
 ### Separate the model choice from the operating model
@@ -146,7 +168,8 @@ write down.
 ### The usual answer is hybrid
 - **By load:** self-host the predictable base load, where utilization is high and fixed cost amortizes
   well; send bursts and rare high-complexity requests to the API, which prices variable demand well.
-- **By task:** high-volume simple tasks on a self-hosted small model, frontier-quality tasks on the API.
+- **By agent step:** high-volume simple steps (routing, extraction, classification) on a self-hosted small
+  model, planning and frontier-quality steps on the API.
 - **Why it wins:** it puts each cost structure on the traffic shape it is built for, at the price of two
   serving paths and two quality baselines.
 
@@ -217,6 +240,26 @@ Read the three blocks together, starting with the sign test:
 - **The GPU price never changed** across the three runs; utilization and the competitor's price did all
   the work.
 
+### Worked scenario: a support agent's monthly volume
+Turn agent traces into `V` before touching the calculator. Illustrative inputs: 200,000 runs a month, 8
+steps per run, ~12,000 input and ~300 output tokens per step (the transcript is re-sent every step).
+
+| Quantity | Arithmetic | Result |
+|---|---|---|
+| Tokens per run | 8 × (12,000 + 300) | ≈ 98,400 |
+| Tokens per month | 200,000 × 98,400 | ≈ 19.7 billion |
+| API cost at $2 blended | 19,680M × $2 | ≈ $39,360 |
+| Average rate | 19.7 billion / 2,592,000 s | ≈ 7,600 tokens per second |
+| Interactive peak (2.5 × 1.2) | ≈ 22,800 tokens per second | 12 replicas, $36,000 + $16,000 `F` = $52,000 |
+| Same agent with 4 steps per run | half the volume, ≈ 9.8 billion | API ≈ $19,680; self-host 6 replicas, $34,000 |
+
+- **Agent design moved the answer more than hardware did.** Halving steps (better planning, fewer retries)
+  halves the API bill and leaves self-hosting even further behind.
+- **Caching moves `p`.** If prompt caching on the stable prefix brought the effective blended price to $1,
+  the interactive `c_self` of $1.74 fails the sign test outright.
+- **Measure `T_slo` on this shape.** The mix is ~98% input tokens, so the 2,000 tokens per second
+  assumption may be far off in either direction; replay the traces before trusting it.
+
 ### Worked scenario: payback on the switch
 Same illustrative inputs, plus a one-off migration cost `M` of $140,000 (serving path, evals, load tests,
 traffic migration).
@@ -235,22 +278,28 @@ traffic migration).
 - **Just past break-even is fragile:** a small monthly saving turns a one-off cost into years of payback.
 
 ## Production patterns
+- **Derive `V` from agent traces, not request counts.** When: before any break-even discussion. How: sum
+  input, cached-input and output tokens per run from the provider usage fields, multiply by runs per month
+  per agent, and keep the split by step type. Monitor tokens per run weekly; it drifts as tools and
+  prompts change.
 - **Measure `T_slo` with a shaped load test.** When: before any GPU commitment. How: replay your real
-  input/output length mix at rising concurrency against the candidate server (vLLM ships a serving
-  benchmark), and record the highest throughput where p95 TTFT and time per output token still meet the
-  target. Monitor the same latencies in production.
+  input/output length mix, including multi-step agent transcripts with a shared prefix, at rising
+  concurrency against the candidate server (vLLM ships a serving benchmark), and record the highest
+  throughput where p95 TTFT and time per output token still meet the target. Monitor the same latencies in
+  production.
 - **Derive peak-to-average from logs, not intuition.** When: building `N(V)`. How: take per-minute token
   counts over several weeks and divide a high percentile of the per-minute rate by the mean. Re-check it
   monthly, because launches and new tenants change the shape.
-- **Reserve only the base load.** When: you do self-host. How: size reserved replicas to the overnight
-  floor of the daily curve and serve the rest on demand or via the API. Monitor reserved-replica
-  utilization; if it sits low, the reservation is too big.
+- **Self-host the flat agent workloads first.** When: you do self-host. How: put nightly eval runs, batch
+  backfills and offline agents on reserved replicas sized to the overnight floor of the daily curve, and
+  serve interactive agents on demand or via the API. Monitor reserved-replica utilization; if it sits low,
+  the reservation is too big.
 - **Spillover routing in the gateway.** When: running hybrid. How: send traffic to the self-hosted pool
   until queue depth or p95 crosses a threshold, then route the overflow to the hosted API. Monitor the
-  spill fraction and the self-hosted utilization together.
+  spill fraction and the self-hosted utilization together, and run agent evals on both paths.
 - **Price a managed open-weight endpoint as a control row.** When: the case rests on a cheaper open model.
-  How: run the same evals and price the same model per token on a hosting provider. If it captures most of
-  the saving, there is no `F` to pay.
+  How: run the same agent evals and price the same model per token on a hosting provider. If it captures
+  most of the saving, there is no `F` to pay.
 - **Keep the calculator live.** When: always after the decision. How: store it in the repo with inputs fed
   from production metrics and re-run it on every provider price change and each quarter. Alert when
   achieved utilization falls below the assumption the decision used.
@@ -258,14 +307,14 @@ traffic migration).
 ## Trade-offs
 - **Fixed commitments vs variable spend.** Self-hosting wins when load is high and flat and loses when load
   is small or spiky; the flip is governed by achievable utilization, not by GPU price.
-- **Reserved pricing vs flexibility.** It cuts `G` substantially but locks a term; if traffic falls or a
-  better hosted model appears you keep paying for idle capacity. Only worth it with confidence in a year or
-  more of demand.
+- **Reserved pricing vs flexibility.** It cuts `G` substantially but locks a term; if traffic falls, an
+  agent redesign halves its steps, or a better hosted model appears, you keep paying for idle capacity.
+  Only worth it with confidence in a year or more of demand.
 - **Hosted API: frontier quality, zero platform work vs vendor control.** Prices, quotas, regions and
   deprecations are the vendor's decisions; the trade flips when a quota or residency rule blocks you
   outright.
 - **Hybrid serving: best cost per traffic shape vs double surface area.** Two serving paths, two eval
-  baselines and a routing layer that must keep them consistent.
+  baselines and a routing layer that must keep them consistent, including tool-call formats.
 - **Open-weight quality parity vs recurring fine-tuning.** Matching hosted quality often needs fine-tuning;
   that cost is front-loaded and recurs with each base-model generation, which favours the API when model
   turnover is fast.
@@ -276,12 +325,15 @@ traffic migration).
 - **Omitting people and platform cost.** Symptom: a GPU bill below the API bill and a total cost above it,
   discovered when the headcount request lands. Fix: write `F` down as FTE fractions at loaded cost.
 - **Comparing against API list price when committed-use discounts exist.** Symptom: a break-even computed
-  against a price nobody at your volume actually pays. Fix: get a committed-use quote and use it as `p`.
+  against a price nobody at your volume actually pays. Fix: get a committed-use quote and use it as `p`,
+  and include cached-input pricing for agent prefixes.
 - **Treating the crossover as permanent.** Symptom: a decision that looked right at one price per million
   tokens looks wrong after the next provider price cut. Fix: re-run the sign test on every price change.
 - **Ignoring the input/output mix.** Symptom: decode-heavy traffic achieves far less than the measured
   throughput, because decode is bandwidth-bound while the benchmark was prefill-heavy. Fix: load-test
   with your real length mix.
+- **Sizing from today's agent loop.** Symptom: GPUs reserved for a 10-step agent that a prompt change cut
+  to 5 steps. Fix: treat steps per run as a sensitivity input and reserve only the base load.
 - **Framing it as "frontier API versus our own GPUs".** Symptom: a self-hosting project whose whole saving
   came from the cheaper model, which a managed per-token open-weight endpoint would have delivered without
   the platform team.
@@ -292,9 +344,12 @@ traffic migration).
 - **Use when** monthly API spend becomes material (a useful threshold: it approaches the fully loaded cost
   of one engineer), and again whenever a non-cost driver appears: a residency requirement, a quota ceiling
   during peaks, a vendor deprecation notice.
-- **Collect inputs first:** tokens per month by feature with the input/output split, peak-to-average from
-  logs, the latency target, throughput per replica at that target on a candidate open-weight model with
-  your sequence lengths, the quality delta on your evals, reserved GPU quotes, and a realistic people plan.
+- **Collect inputs first:** tokens per month by feature or agent with the input/output split, peak-to-average
+  from logs, the latency target, throughput per replica at that target on a candidate open-weight model
+  with your sequence lengths, the quality delta on your evals, reserved GPU quotes, and a realistic people
+  plan.
+- **Avoid when** the agent design is still changing weekly: steps per run and tokens per step will move
+  `V` more than any infrastructure choice.
 - **Output:** a break-even band under sensitivity and a recommendation that names the premium being paid
   for whichever side is chosen.
 - **Interviews:** the structural answer is expected: fixed versus variable cost, the utilization-driven
@@ -332,6 +387,14 @@ to the API.
 - **Interactive traffic forces low u,** because you provision for the peak with headroom; flat batch work
   can run near full, which is why it crosses break-even far earlier.
 
+### Your agent fleet's API bill doubled and leadership asks whether to self-host. How do you answer?
+- **Decompose `V` first:** runs per month times steps per run times tokens per step, from traces. If steps
+  or tokens per step grew, fix the agent (caching, compaction, step budgets) before buying GPUs.
+- **Then run the sign test** at the effective price after prompt caching and committed-use discounts, with
+  utilization from real peak-to-average logs.
+- **Check the middle options:** a managed open-weight endpoint, or self-hosting only flat agent workloads
+  such as evals and backfills, often captures the saving without a full platform.
+
 ### A self-hosted pilot costs three times per token what the spreadsheet promised. How do you debug it?
 - **Check how `T_slo` was measured:** a max-batch benchmark overstates throughput at the latency target.
 - **Check the request shape:** decode-heavy production traffic delivers far fewer tokens per second than a
@@ -340,12 +403,12 @@ to the API.
   explain most of the gap.
 - **Check `F`:** on-call, upgrades and eval work may have been left out of the spreadsheet entirely.
 
-### When would you self-host even though the arithmetic says the API is cheaper?
-- **When a non-cost driver decides it:** data that cannot leave a region or building, quotas that cap your
-  peak, co-location for latency, or a custom fine-tuned model the vendor will not serve.
-- **Still run the numbers,** so the premium being paid for the constraint is explicit and owned.
-- **Check the middle options first:** a managed open-weight endpoint or provisioned capacity may satisfy
-  the constraint without running the stack.
+### Which parts of an agent system would you move to self-hosting first, and why?
+- **Flat, high-volume, simple work:** nightly eval suites, batch document agents and routing or extraction
+  steps on a small model, because utilization can approach one and quality parity is easier to prove.
+- **Keep interactive planning on the API:** it is bursty (low u) and most sensitive to frontier quality,
+  where a small tool-calling gap compounds into failed runs.
+- **Route with a gateway** so either path can take traffic and both are covered by the same agent evals.
 
 ### One replica does 2,000 tokens per second at SLO for $3,000 a month, and the API charges $2 per million tokens. What utilization do you need just to pass the sign test?
 - **At full load** the replica serves about 5.2 billion tokens a month, so `c_self` ≈ $0.58 per million at
@@ -390,3 +453,25 @@ to the API.
 > Each cost structure is matched to the traffic shape it suits: the reserved GPUs run near full
 > utilization on the steady base, and the API absorbs the spiky remainder without idle capacity being
 > paid for. The price is two serving paths to keep consistent.
+
+## Use cases & projects
+### Use cases
+- **The first big agent invoice.** A team with a busy support or coding agent decides between the API, a
+  managed open-weight endpoint and self-hosting, using the sign test instead of a GPU-price slide.
+- **Moving eval and batch agents to owned capacity.** Flat nightly workloads reach high utilization, so
+  they are usually the first agent traffic to cross break-even.
+- **Hybrid routing per agent step.** Cheap, high-volume steps go to a self-hosted small model while
+  planning stays on a frontier API behind one gateway.
+- **Re-checking after a price cut or agent redesign.** A provider price change, prompt caching or a cut in
+  steps per run triggers a re-run of the calculator before reservations renew.
+
+### Mini project
+**Break-even calculator fed by agent traces (1-2 hours).**
+- **Goal:** decide, with a sensitivity band, whether one of your agents should stay on a hosted API.
+- **Steps:** run a small tool-calling agent on 20-30 tasks and log input, cached-input and output tokens per
+  step from the usage fields; scale to an assumed monthly run count; feed `V` into the calculator above with
+  interactive and flat peak-to-average values; repeat with half the steps and with a lower effective `p`
+  for cached input.
+- **Done when:** you have a table of API versus self-host cost across at least four scenarios, the
+  utilization needed to pass the sign test, and a one-paragraph recommendation naming the assumption that
+  flips it.

@@ -385,3 +385,24 @@ recall baseline.
 - [ ] It handles NaN scores while argsort cannot
 > A full sort is O(N log N) work for an answer that needs only k items. Partitioning is linear and leaves
 > the top k unordered, so you sort just those k afterwards, which is cheap.
+
+## Use cases & projects
+### Use cases
+- **Tool selection.** Embed the user request and 200 tool descriptions, score them with one matrix
+  product, and expose only the top 5 tools to the model.
+- **In-process semantic memory.** A prototype agent keeps past facts as a normalized `float32` matrix and
+  recalls the top-k by dot product before each step.
+- **Retrieval evals.** Recall@k over a labelled query set is a few array operations once scores and
+  gold IDs are arrays.
+- **Deduplicating memories or chunks.** Pairwise cosine similarity above a threshold flags near-duplicate
+  entries before they crowd the context window.
+
+### Mini project
+**Embedding-based tool router (1-2 hours).**
+- **Goal:** pick the most relevant tools for a request using NumPy alone, and measure how often the right
+  tool makes the shortlist.
+- **Steps:** write 30 short tool descriptions and 50 labelled requests; embed both and store them as
+  `float32`; normalize once; score requests against tools with one matrix product; take the top 5 with
+  `argpartition` and sort only those; assert shapes at each boundary.
+- **Done when:** you report recall@5 for the 50 requests, the scoring step runs without Python loops,
+  and you can name which requests failed and why their descriptions overlap.

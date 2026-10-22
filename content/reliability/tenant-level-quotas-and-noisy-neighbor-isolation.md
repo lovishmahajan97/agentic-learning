@@ -5,7 +5,8 @@ name: Tenant-level quotas & noisy-neighbor isolation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - reliability/bulkheads
   - reliability/backpressure-and-load-shedding
@@ -20,9 +21,22 @@ sources:
 ---
 
 ## TL;DR
-Tenant-level quotas cap what each tenant may consume of shared pools (provider tokens, GPU concurrency,
-workers); isolation (per-tenant lanes, fair queuing, separate pools) makes a tenant at its cap degrade
-only itself, turning a shared failure into a local one.
+One looping agent can burn a shared provider key. Tenant-level quotas cap each tenant's tokens,
+concurrency and spend; per-tenant lanes and fair queuing make a tenant at its cap degrade only itself, not
+the whole platform.
+
+## For agent builders
+- **Why it matters for agents.** Agents fan out: one user action becomes fifty model and tool calls, and a
+  loop or retry storm multiplies that. On a shared key or GPU pool, one tenant's agent fills the queue and
+  every other tenant's chat slows while the provider dashboard stays green.
+- **Where it shows up in your stack.** The LLM gateway in front of your provider keys, the agent runtime's
+  per-run budgets, Redis-backed token buckets, provider tokens-per-minute limits and 429s, and per-tenant
+  cost dashboards.
+- **What you control.** Metering in tokens and concurrency (not requests), reserving prompt plus
+  `max_tokens` before each agent step, fair draining across tenants, separate lanes for batch agents, and
+  dedicated keys for premium tenants.
+- **What you can skip.** Proofs about weighted fair queuing. Know deficit round robin well enough to see why
+  round-robin by request is unfair for LLM traffic.
 
 ## Why it exists
 - **Shared pools, one bursty tenant.** Every tenant draws on the same scarce pools: provider
@@ -30,14 +44,15 @@ only itself, turning a shared failure into a local one.
   backfill, a looping agent, a retry storm) fills a pool so everyone else's latency and errors rise.
 - **The opening incident.** A gateway fronts one provider key rated, illustratively, at one million tokens
   per minute, shared by forty customers. Tenant A re-embeds 50,000 documents as fast as its client can. The
-  global limiter keeps upstream healthy, but its FIFO queue is now 20,000 deep with A's requests. B's
-  support chat (400 tokens, needs a two-second answer) waits behind them, B's p95 triples, and dashboards
-  show the provider perfectly healthy.
+  global limiter keeps upstream healthy, but its FIFO queue is now 20,000 deep with A's requests.
+- **The neighbor pays.** B's support agent (400-token turns, needs a two-second answer) waits behind A's
+  queue, B's p95 triples, and dashboards show the provider perfectly healthy.
 - **The naive fixes fail.** "Add a global rate limit" protects the upstream, not the neighbors: it bounds
   the total but not its division. "Scale up" fails when the scarce resource is a vendor quota or a fixed GPU
-  pool, and it rewards the misbehaving tenant with everyone's money. "Ask tenants to behave" ignores that
-  agents loop, clients retry, and a tenant's bug becomes your incident.
-- **AI workloads make it sharper than classic SaaS.** Work per request spans three or more orders of
+  pool, and it rewards the misbehaving tenant with everyone's money.
+- **"Ask tenants to behave" fails too,** because agents loop, clients retry, and a tenant's bug becomes your
+  incident.
+- **Agent workloads make it sharper than classic SaaS.** Work per request spans three or more orders of
   magnitude (a 20-token classification versus a 100k-token summary), so counting requests measures almost
   nothing. Agents fan out, so one user action can become fifty calls.
 - **You can only allocate, not add.** The binding resource often belongs to a vendor, so you cannot
@@ -47,21 +62,22 @@ only itself, turning a shared failure into a local one.
 ### Choose the units you meter
 | Unit | What it tracks | Failure it catches |
 |---|---|---|
-| Tokens per minute (input plus output) | provider limits and cost | large-prompt tenants |
+| Tokens per minute (input plus output) | provider limits and cost | large-prompt tenants, long agent transcripts |
 | Requests per minute | request rate | chatty clients |
 | Concurrent in-flight requests | provider concurrency, KV-cache memory, worker slots | whatever is actually saturating |
-| Spend per day | the bill | runaway cost |
+| Spend per day | the bill | runaway cost, looping agents |
 
 - **Meter tokens and concurrency at minimum,** because a tenant can stay under any request count while
-  consuming the whole token budget with large prompts.
+  consuming the whole token budget with large prompts. Agent steps re-send a growing transcript, so tokens
+  per call climb as a run goes on.
 - **Concurrency matters for latency,** because latency collapse is a function of concurrency, not of
-  request rate.
+  request rate. Parallel tool calls and sub-agents raise one tenant's in-flight count quickly.
 
 ### Enforce at admission with a token bucket per tenant
 1. **Give each tenant its own bucket.** Capacity is the burst it tolerates; refill rate is the sustained
    allowance.
 2. **Reserve the worst case.** Output size is unknown until the call finishes, so reserve prompt tokens
-   plus `max_tokens`.
+   plus `max_tokens` before every agent step.
 3. **Make the call, then reconcile** by refunding the unused part. Charging after the fact would let a
    tenant go arbitrarily far over quota inside a single minute.
 4. **Reject immediately when the bucket cannot cover the reservation,** with 429 and a `Retry-After`
@@ -73,7 +89,7 @@ only itself, turning a shared failure into a local one.
   provider allows, and a FIFO dispatcher still serves them in arrival order.
 - **One queue per tenant, drained round-robin** (or weighted by tier), a simple form of weighted fair
   queuing. A tenant with 20,000 queued requests gets one turn per cycle, the same as a tenant with one.
-- **Add a per-tenant concurrency semaphore,** so a single tenant cannot hold every in-flight slot.
+- **Add a per-tenant concurrency semaphore,** so a single tenant's agents cannot hold every in-flight slot.
 - **Fair scheduling is work-conserving:** when only one tenant is active it receives everything, which hard
   caps alone can never offer.
 
@@ -91,9 +107,11 @@ only itself, turning a shared failure into a local one.
 - **A tenant is rarely one actor.** An enterprise customer has teams, end users and agents inside its
   quota, and one of them can starve the rest exactly as one tenant starves the fleet.
 - **The same mechanisms nest:** a bucket per organization, and inside it a bucket or fair-share lane per
-  user or API key. A request is admitted only if every level can cover it.
+  user, API key or agent run. A request is admitted only if every level can cover it.
 - **Keep the levels few** (organization, then user or workload), because each one is another counter on the
   hot path.
+- **A per-run budget is the innermost level.** A step and token budget on each agent run stops one loop
+  before it reaches the tenant bucket at all.
 
 ### Tier the isolation
 | Tier | Mechanism | What it isolates |
@@ -111,24 +129,25 @@ only itself, turning a shared failure into a local one.
   rather than dividing capacity fairly, and it avoids the cost of dedicated capacity.
 
 ### Degrade before you deny
-- **A downgrade is often cheaper than a 429:** route to a smaller model, shed the tenant's batch-class
-  traffic while keeping interactive traffic, or lower its `max_tokens`.
+- **A downgrade is often cheaper than a 429:** route the tenant's agent to a smaller model, shed its
+  batch-class traffic while keeping interactive traffic, or lower its `max_tokens`.
 - **This requires classifying traffic at the edge** (interactive versus batch, user-initiated versus
   agent-initiated) so the scheduler can shed the right thing first.
 
 ### Make it observable and billable
-- **Tag every request, span and cost record with `tenant_id`.**
+- **Tag every request, span and cost record with `tenant_id`** (and the agent run id), so one trace shows
+  which tenant and which run spent the tokens.
 - **Watch per-tenant signals:** queue wait, in-flight count, tokens consumed and 429 counts tell you whether
   isolation is working, and they settle the "you throttled us" conversation with data.
 - **Quota disputes are a commercial problem,** and the only defense is a measurement both sides trust.
 
 ## Diagram
-Each request passes the tenant's bucket before it can queue, then the dispatcher drains per-tenant queues
-fairly and the tenant's lane bounds its in-flight calls; the reconcile step refunds unused tokens.
+Each agent step passes the tenant's bucket before it can queue, then the dispatcher drains per-tenant
+queues fairly and the tenant's lane bounds its in-flight calls; the reconcile step refunds unused tokens.
 
 ```mermaid
 flowchart TD
-    R["Request with tenant_id"] --> C["Classify: interactive or batch"]
+    R["Agent step with tenant_id"] --> C["Classify: interactive or batch"]
     C --> B{"Tenant bucket covers worst case?"}
     B -->|"no"| E["429 with Retry-After"]
     B -->|"yes, reserve"| Q["Per-tenant queue"]
@@ -142,8 +161,9 @@ flowchart TD
 ## Examples
 ### Admission layer: per-tenant token bucket and concurrency lane
 A single-process sketch: a per-tenant token bucket for tokens per minute with reserve-then-reconcile, plus a
-per-tenant semaphore for concurrency. In production the bucket state lives in Redis behind an atomic Lua
-script so every gateway replica sees the same level; the logic is identical.
+per-tenant semaphore for concurrency. Every agent step calls `call_llm`. In production the bucket state
+lives in Redis behind an atomic Lua script so every gateway replica sees the same level; the logic is
+identical.
 
 ```python
 import asyncio, time
@@ -195,7 +215,7 @@ async def call_llm(limiter, tenant, prompt_tokens, max_output_tokens, call):
 - **Failed calls still charge the prompt tokens,** so a retry storm counts against the tenant that caused it
   rather than against the shared pool.
 - **The 429 carries an honest wait:** `retry_after` is computed from the refill rate, so well-behaved
-  clients get a real wait instead of a guess.
+  clients get a real wait instead of a guess. An agent loop should surface it as a pause, not retry at once.
 - **Oversized requests are a client error.** A request larger than the whole bucket is rejected as a 400,
   because a 429 for it would promise a retry that can never succeed and invite the client to loop.
 
@@ -235,6 +255,20 @@ print("round robin:", round_robin(backlog(), rounds=30))   # A: 600000, B: 12000
 print("DRR:        ", drr(backlog(), quantum=8_000, rounds=30))  # A: 240000, B: 240000
 ```
 
+### Worked scenario: a looping agent on a shared key
+Illustrative numbers. Tenant C's research agent hits a tool that keeps returning an error the model
+cannot fix, so it retries the same step. Each step re-sends a ~15k-token transcript plus `max_tokens` of
+1,000.
+
+| Control in place | What happens in the first 10 minutes |
+|---|---|
+| Global limit only | C's loop sends ~60 steps a minute, ~960k TPM, nearly the whole one-million-TPM key; every other tenant's agent queues |
+| Per-tenant bucket of 50k TPM | C is admitted ~3 steps a minute, then gets 429 with `Retry-After`; other tenants are untouched |
+| Plus a per-run step budget of 25 | C's run stops at step 25 with a clear "budget exhausted" result after ~8 minutes |
+| Plus a daily spend cap | a bug that starts many such runs is bounded by the tenant's spend, not the platform's |
+
+The per-tenant bucket protects neighbors; the per-run budget protects the tenant from its own agent.
+
 ### Worked scenario: hard caps vs fair share for the backfill
 Illustrative numbers: the one-million-TPM key, forty tenants, and an assumed ~500 tokens per document for
 A's 50,000-document re-embed (25M tokens).
@@ -253,11 +287,14 @@ sold to specific customers.
   update it with one Lua script (`EVAL`) that refills, checks and decrements atomically, keyed by tenant.
   Monitor per-tenant 429 rate, Redis latency on the hot path, and provider 429s after scale-out events.
 - **Concurrency leases, not bare counters.** For a distributed per-tenant semaphore, store each in-flight
-  slot with an expiry so a crashed worker's slot frees itself. Monitor in-flight per tenant against its
+  slot with an expiry so a crashed agent worker's slot frees itself. Monitor in-flight per tenant against its
   limit and slots reclaimed by expiry, which flag crashing workers.
-- **Separate batch and interactive lanes.** Classify at the edge; send backfills to a bounded batch queue
-  or a provider's asynchronous batch endpoint, and give interactive traffic its own lane. Monitor batch
-  lag and interactive p95 queue wait per tenant.
+- **Separate batch and interactive lanes.** Classify at the edge; send backfills and offline agent jobs to a
+  bounded batch queue or a provider's asynchronous batch endpoint, and give interactive agents their own
+  lane. Monitor batch lag and interactive p95 queue wait per tenant.
+- **Per-run budgets inside per-tenant quotas.** Give every agent run a step, token and spend budget that
+  sits inside the tenant bucket. Monitor runs ending on budget per tenant; a spike usually means a tool or
+  prompt regression, not heavy legitimate use.
 - **Dedicated keys or deployments for premium tiers.** When a contract promises capacity, give that tenant
   its own provider key or model deployment so the vendor limit is isolated too. Monitor provider-side 429s
   per key and idle capacity cost.
@@ -268,21 +305,23 @@ sold to specific customers.
 ## Trade-offs
 - **Hard caps vs fair share.** Hard per-tenant caps guarantee isolation but strand capacity: if the caps sum
   to the provider limit, each tenant gets 1/N even when the others are idle. This flips toward soft caps
-  with fair-share scheduling when tenants are many and bursts are uncorrelated, and back toward hard caps
-  when you have sold specific capacity to specific customers.
+  with fair-share scheduling when tenants are many and bursts are uncorrelated.
+- **When hard caps win back.** Return to hard caps when you have sold specific capacity to specific
+  customers and must guarantee it.
 - **Dedicated pools vs cost.** Dedicated pools and provider keys per tenant give the strongest isolation,
   including against vendor limits, but carry per-tenant minimum cost and operational surface. Worth it when
   a tenant's revenue or contractual commitments exceed the cost of the idle capacity.
 - **Token metering vs simplicity.** Metering tokens is accurate but requires reserve-then-reconcile and a
   tokenizer at admission; metering requests is nearly free but gameable with large prompts. Request
-  counting is adequate only when a schema bounds prompt size.
+  counting is adequate only when a schema bounds prompt size, which agent transcripts rarely do.
 - **Reject vs queue.** Rejecting at the cap pushes work back to the client's retry logic and keeps latency
   honest; queueing smooths bursts but hides overload and raises everyone's latency. Queue only batch
   traffic, and only with a bounded depth.
 
 ## Pitfalls
 - **Relying on a single global rate limit.** Symptom: the provider never returns 429, yet small tenants'
-  p99 spikes precisely while one tenant runs a batch job. Fix: per-tenant buckets plus fair draining.
+  p99 spikes precisely while one tenant runs a batch job or a looping agent. Fix: per-tenant buckets plus
+  fair draining.
 - **Counting requests instead of tokens.** Symptom: one tenant with 100k-token prompts stays inside its
   request quota while the cost report attributes most of the monthly spend to a few percent of calls.
 - **Keeping limiter state per replica.** Symptom: effective quota equals cap times replica count and
@@ -296,13 +335,16 @@ sold to specific customers.
   a single quota. Fix: a nested per-user level.
 - **Not reserving output tokens.** Symptom: your bucket says the tenant is under quota while the provider
   rejects for exceeding tokens-per-minute, because long completions were never counted until they finished.
+- **Letting the agent retry a 429 immediately.** Symptom: a throttled tenant's 429 count explodes while its
+  useful throughput stays flat. Fix: the agent runtime honors `Retry-After` and counts waits against the
+  run's time budget.
 
 ## When to use
 - **Use when** more than one tenant shares a provider key, GPU pool or worker fleet, or when a single
-  tenant mixes workload classes (batch backfills next to interactive chat).
+  tenant mixes workload classes (batch backfills and offline agents next to interactive chat).
 - **Start small:** a Redis token bucket keyed by tenant for tokens per minute plus a per-tenant concurrency
-  semaphore covers most early-stage services. Add per-tenant queues with fair draining when batch jobs
-  appear, and dedicated pools when a contract promises capacity.
+  semaphore covers most early-stage agent platforms. Add per-tenant queues with fair draining when batch
+  jobs appear, and dedicated pools when a contract promises capacity.
 - **Measure** per-tenant queue wait, share of tokens by tenant, and 429s split by tenant and by upstream;
   isolation is working when one tenant's spike moves only that tenant's lines.
 - **Interviews:** the prompt is usually "a customer's batch job slowed everyone down; what do you change?",
@@ -337,6 +379,14 @@ with per-tenant queue-wait metrics: after the change, A's wait rises and B's is 
   still charge the prompt so retry storms land on the tenant that caused them.
 - **Reject oversized requests as a 400,** because a 429 would promise a retry that can never succeed.
 
+### One customer's agent got stuck in a loop and every other customer's agents slowed down. What do you build?
+- **Per-tenant admission first:** a token bucket and concurrency lane per tenant, so the looping tenant hits
+  429 with `Retry-After` while neighbors keep their share.
+- **Per-run budgets inside it:** a step, token and spend cap on each agent run, so the loop ends with a
+  clear budget-exhausted result instead of draining the tenant's whole quota.
+- **Then detect it:** alert on runs ending on budget and on per-tenant token share, and trace the loop to
+  the tool or prompt that caused it.
+
 ### After autoscaling the gateway from 3 to 12 replicas, provider 429s appear. What happened?
 - **Limiter state is probably per replica,** so each replica allows the full cap and effective quota is
   cap times replica count, here four times what it was.
@@ -357,9 +407,9 @@ with per-tenant queue-wait metrics: after the change, A's wait rises and B's is 
 - **Limit:** it bounds blast radius from crashes or pathological inputs, but does not divide capacity
   fairly, so quotas are still needed.
 
-### Why is round-robin across per-tenant queues still unfair for LLM traffic, and what replaces it?
+### Why is round-robin across per-tenant queues still unfair for LLM and agent traffic, and what replaces it?
 - **Request sizes differ by orders of magnitude,** so one turn each gives a 20k-token tenant fifty times
-  the token share of a 400-token tenant.
+  the token share of a 400-token tenant; long agent transcripts make this worse step by step.
 - **Deficit round robin** gives each queue a token quantum per cycle and dispatches while the deficit
   covers the head request, so shares equalize in tokens; tier weights become larger quanta.
 
@@ -390,3 +440,25 @@ with per-tenant queue-wait metrics: after the change, A's wait rises and B's is 
 > Round-robin or weighted draining of per-tenant queues gives each active tenant an equal turn while a
 > lone active tenant receives the whole pool. Hard 1/N caps leave capacity unused when others are idle,
 > and per-replica limiters break isolation on scale-out.
+
+## Use cases & projects
+### Use cases
+- **Multi-tenant agent platforms.** One shared provider key serves many customers' agents; per-tenant
+  buckets and fair queues stop one customer's loop from slowing everyone.
+- **Internal agent platforms in an enterprise.** Departments share one gateway; nested quotas per team and
+  per user end "your agent ate our budget" disputes with data.
+- **Batch agents next to interactive ones.** Nightly document-processing agents run in a batch lane on
+  leftover capacity while support agents keep a protected interactive lane.
+- **Cost control for agent products.** Daily spend caps per tenant and per run bound the bill when a
+  prompt or tool regression makes agents run long.
+
+### Mini project
+**Protect neighbors from a looping agent (2-3 hours).**
+- **Goal:** show that per-tenant buckets plus deficit round robin keep one tenant's runaway agent from
+  raising another tenant's queue wait.
+- **Steps:** simulate two tenants against a fake model with a fixed tokens-per-minute capacity; tenant A
+  runs a looping agent with 15k-token steps, tenant B sends 400-token chat turns; run three policies
+  (global FIFO, per-tenant bucket, bucket plus DRR plus a per-run step budget) and log per-tenant queue wait
+  and tokens served.
+- **Done when:** you have a table showing B's p95 queue wait under each policy, A's run ending on its step
+  budget in the last policy, and a short note explaining which control protected whom.

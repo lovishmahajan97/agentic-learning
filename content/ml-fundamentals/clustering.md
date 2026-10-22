@@ -5,7 +5,8 @@ name: Clustering
 kind: concept
 difficulty: core
 est_minutes: 13
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - ml-fundamentals/supervised-vs-unsupervised-vs-self-supervised-learning
   - ml-fundamentals/classification
@@ -23,35 +24,50 @@ sources:
 ---
 
 ## TL;DR
-Clustering groups items by similarity without labels, answering "what kinds of things are in this data?"
-In AI engineering it runs on embeddings to find intents, deduplicate and sample evals. The distance
-metric and the question matter more than the algorithm.
+Clustering groups items by similarity without labels. For agent builders it runs on embeddings of user
+requests and agent traces to find intents, recurring failure modes, duplicates and diverse eval samples;
+the distance metric and the question matter more than the algorithm.
+
+## For agent builders
+- **Why it matters for agents.** You cannot read 50,000 agent runs a week. Clustering their embeddings
+  tells you what users actually ask for (which tools and sub-agents to build), which failures repeat
+  (what to fix first) and which request types your eval set is missing.
+- **Where it shows up in your stack.** Offline notebooks over trace exports, observability tools that
+  group traces or topics, dataset deduplication before fine-tuning, stratified eval sampling, and drift
+  watches on production request embeddings.
+- **What you control.** What you embed (raw request, request plus final tool error, an LLM summary of
+  the trace), the embedding model, normalisation, k or the density settings, and who reads the clusters.
+- **What you can skip.** Convergence proofs and exotic algorithms. Know k-means and its assumptions,
+  HDBSCAN for outliers, why you L2-normalise, and that reading central examples is the real evaluation.
 
 ## Why it exists
-- **No taxonomy, too much data.** You have 500,000 chat transcripts and no taxonomy. Reading them all is
-  impossible, keyword search requires knowing what to search for, and a classifier requires the categories
-  you do not have.
+- **No taxonomy, too much data.** You have 500,000 chat transcripts or agent traces and no taxonomy.
+  Reading them all is impossible, keyword search requires knowing what to search for, and a classifier
+  requires the categories you do not have.
 - **One fact makes it work.** Similar items are close together in some feature space, and with modern
   embeddings "close" means "about the same thing".
 - **The naive alternatives fail.** Random sampling misses rare groups and cannot tell you how large any
   group is. Asking an LLM to summarise everything hits context and cost limits long before 500,000
-  documents, and summarising a random subset inherits the sampling problem. Counting by existing metadata
-  (product, region) only confirms the categories you already knew.
+  documents, and summarising a random subset inherits the sampling problem.
+- **Metadata only confirms what you knew.** Counting by existing metadata (product, region, tool name)
+  only confirms the categories you already had.
 - **What clustering buys.** It partitions by content, scales to the whole corpus, and reports group sizes
   so attention goes where the volume is. Clustering plus an LLM to name each cluster is the production
   version, and it is cheap because the LLM reads a few central examples per cluster, not every document.
 - **Two more jobs from the same machinery.** Near-duplicate detection is clustering with a very tight
-  threshold, essential for cleaning training data and evaluation sets. Watching for a new dense region in
-  production-traffic embeddings is the simplest useful drift detector.
+  threshold, essential for cleaning fine-tuning data and evaluation sets. Watching for a new dense region
+  in production-traffic embeddings is the simplest useful drift detector.
 
 ## How it works
 ### The space and the distance come first
 1. **Vectorise every item:** TF-IDF counts, hand-built features, or an embedding from a pre-trained
-   encoder.
+   encoder. For agent traces, embed a short text that captures the failure: the user request plus the
+   last tool call and its error, or an LLM-written one-line summary of the run.
 2. **Pick a distance.** For embeddings the standard is cosine similarity. The usual trick is to
    L2-normalise and run Euclidean algorithms, because for unit vectors ||a − b||² = 2 − 2·cos(a, b):
    Euclidean distance on normalised vectors ranks pairs exactly as cosine does.
-3. **Scale hand-built features,** or the feature with the largest range decides the clusters by itself.
+3. **Scale hand-built features,** such as step count, tokens and latency, or the feature with the
+   largest range decides the clusters by itself.
 4. **Mind high dimensions.** Pairwise distances concentrate, which is why density-based methods are often
    preceded by dimensionality reduction (PCA or UMAP). k-means on embeddings usually works directly,
    because the encoder was trained to make cosine meaningful.
@@ -68,7 +84,7 @@ metric and the question matter more than the algorithm.
 - **Cost:** O(n·k·d) per iteration, so it scales to millions of points; mini-batch variants scale further.
 - **Assumptions are the price:** clusters are roughly spherical, similar in size, and you choose k.
 - **Choosing k:** the elbow of the objective curve, silhouette, or, most honestly, what the result is
-  for: 20 for a taxonomy draft, 2,000 for deduplication buckets.
+  for: 20 for a taxonomy draft or a failure-mode review, 2,000 for deduplication buckets.
 
 ### Lloyd's algorithm by hand, and why seeding matters
 Six 1-D points in three obvious pairs, {0, 1}, {10, 11}, {20, 21}, and k = 3, seeded badly at 0, 1 and 15.
@@ -91,14 +107,15 @@ Six 1-D points in three obvious pairs, {0, 1}, {10, 11}, {20, 21}, and k = 3, se
   linkage rule: single (nearest members), complete (farthest members), average, or Ward (smallest increase
   in within-cluster variance, which chases the k-means objective).
 - **Output: a dendrogram** you can cut at any height, so no k is fixed in advance and the same run gives
-  coarse and fine views.
+  coarse and fine views, for example "billing failures" splitting into "refund tool timeout" and "wrong
+  invoice id".
 - **Cost:** O(n²) memory for the distance matrix, which caps it at tens of thousands of points in practice.
 
 ### Density-based (DBSCAN, HDBSCAN)
 - **Rule:** a point is a core point if at least `min_samples` neighbours lie within radius `eps`.
   Clusters are connected sets of core points plus their border points; everything else is labelled noise.
 - **Strengths:** arbitrary cluster shapes, the number of clusters is decided by the data, and explicit
-  outliers, which is exactly what "show me the weird requests" needs.
+  outliers, which is exactly what "show me the weird requests" or "show me the novel agent failures" needs.
 - **Weakness:** one global `eps` on data whose density varies, so sparse regions become noise or dense
   regions merge.
 - **HDBSCAN removes `eps`** by building a hierarchy over density levels and extracting the most stable
@@ -126,14 +143,15 @@ Six 1-D points in three obvious pairs, {0, 1}, {10, 11}, {20, 21}, and k = 3, se
 - **Stability across seeds and subsamples:** a cluster that disappears when you reshuffle was never there.
 - **With labels for a sample,** adjusted Rand index or normalised mutual information compare partitions.
 - **Read the ten most central examples of each cluster.** None of the metrics replaces this; it is the
-  only test of whether a cluster means anything.
+  only test of whether a cluster means anything, for intents and agent failures alike.
 
 ## Diagram
-The production pipeline: clean, embed, cluster, then let humans and an LLM read the centre of each group.
+The production pipeline for agent traffic: clean, embed, cluster, then let humans and an LLM read the
+centre of each group and turn it into fixes, eval cases and labels.
 
 ```mermaid
 flowchart TD
-    R["Raw texts"] --> DD["Deduplicate, strip boilerplate"]
+    R["Requests or failed traces"] --> DD["Deduplicate, strip boilerplate"]
     DD --> E["Embed with encoder"]
     E --> N["L2-normalise"]
     N --> Q{"Need outliers or varying density?"}
@@ -143,22 +161,26 @@ flowchart TD
     UH --> C
     C --> RD["Read central examples"]
     RD --> NM["Name clusters, LLM draft plus human"]
-    NM --> USE["Label queue, eval sample, drift watch"]
+    NM --> USE["Fix queue, eval sample, drift watch"]
 ```
 
 ## Examples
-### Discovering intents in chat logs
-Embed, normalise, sweep k with a silhouette check, then print the most central messages per cluster. The
-silhouette picks a k; the printed examples tell you whether the clusters are real.
+### Finding failure modes in agent traces
+Embed a one-line description of each failed run, normalise, sweep k with a silhouette check, then print
+the most central runs per cluster. The silhouette picks a k; the printed examples tell you whether the
+clusters are real failure modes.
 
 ```python
+import json
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import normalize
 
-texts = [line.strip() for line in open("messages.txt") if line.strip()]   # e.g. 20k user messages
+# one JSON object per failed agent run: {"request": ..., "last_tool": ..., "error": ...}
+runs = [json.loads(line) for line in open("failed_runs.jsonl") if line.strip()]
+texts = [f"{r['request'][:200]} | tool={r['last_tool']} | error={r['error'][:200]}" for r in runs]
 model = SentenceTransformer("all-MiniLM-L6-v2")
 E = normalize(model.encode(texts, batch_size=256))     # unit vectors: Euclidean k-means == cosine geometry
 
@@ -172,13 +194,30 @@ for k in (10, 20, 40, 80):
 
 s, k, km = best
 sizes = np.bincount(km.labels_)
-for c in np.argsort(-sizes)[:5]:                               # five largest clusters
+for c in np.argsort(-sizes)[:5]:                               # five largest failure clusters
     members = np.where(km.labels_ == c)[0]
     d = np.linalg.norm(E[members] - km.cluster_centers_[c], axis=1)
-    print(f"\ncluster {c}: {sizes[c]} messages ({sizes[c] / len(texts):.1%})")
-    for i in members[np.argsort(d)[:3]]:                       # most central examples: read these
+    print(f"\ncluster {c}: {sizes[c]} runs ({sizes[c] / len(texts):.1%})")
+    for i in members[np.argsort(d)[:3]]:                       # most central runs: read these
         print("  -", texts[i][:100])
 ```
+
+### Worked scenario: a week of failed support-agent runs
+A support agent handles 40,000 runs a week; 9% (3,600) end in a failure flag or a thumbs down. The team
+clusters them with k = 20 and reads ten central runs per cluster. Figures are illustrative.
+
+| Cluster (named after reading) | Runs | Share | Action |
+|---|---|---|---|
+| Refund tool called with an order id from the wrong account | 1,050 | 29% | fix the tool schema and add an account check |
+| Loops calling the search tool with the same query | 700 | 19% | add a repeated-call guard and a step budget |
+| Asks about a product the knowledge base lacks | 540 | 15% | add documents to the RAG index |
+| Greeting-template boilerplate (not a real failure) | 430 | 12% | strip the template, re-cluster |
+| Remaining 16 clusters | 880 | 25% | sample 5 each into the eval set |
+
+- **Two fixes cover about half the failures,** found in an afternoon instead of reading 3,600 traces.
+- **The boilerplate cluster is a warning,** not a finding: cleaning should have removed it before embedding.
+- **Stratified sampling** of 5 runs from each of the 16 smaller clusters adds 80 eval cases that a random
+  sample of 80 would mostly have drawn from the top three clusters.
 
 ### Bad seeds in pure Python
 The hand-worked example from How it works, runnable with no libraries. Same algorithm, same data; only the
@@ -204,61 +243,67 @@ print(lloyd(pts, [0, 11, 21]))     # ([0.5, 10.5, 20.5], 1.5): k-means++-style s
 ```
 
 ## Production patterns
-- **Clean before you embed.** Exact-dedupe on normalised text, strip greetings, signatures and templates,
-  then embed. Monitor the share of the largest cluster; one cluster holding a large fraction of the data
-  usually means boilerplate survived.
+- **Weekly failure-mode review.** Export failed or low-rated agent runs, cluster them, and review the top
+  clusters in a standing meeting; each named cluster becomes a ticket and a set of eval cases. Monitor the
+  share of failures in the top three clusters week over week; it should fall as fixes land.
+- **Clean before you embed.** Exact-dedupe on normalised text, strip greetings, signatures, system-prompt
+  echoes and templates, then embed. Monitor the share of the largest cluster; one cluster holding a large
+  fraction of the data usually means boilerplate survived.
 - **Mini-batch k-means for large corpora.** Use scikit-learn `MiniBatchKMeans` on normalised embeddings
   when full k-means is too slow, with several restarts. Monitor inertia and cluster sizes across seeds.
-- **Name clusters from central examples.** Send the 10 to 20 messages nearest each centroid to an LLM to
-  draft a name and description, then have a human verify. Monitor purity by sampling 50 members per top
-  cluster and counting how many match the name.
-- **Stable categories go into a classifier, not cluster ids.** Once clusters are named and reviewed, label
-  a sample and train a classifier for the production path, because re-running clustering renumbers and
-  reshapes clusters.
-- **Drift watch on production embeddings.** Each week, assign new traffic to existing centroids and
-  cluster the poorly fitting remainder; a new dense group is an emerging issue. Monitor the share of
-  traffic far from every centroid.
-- **Diverse eval and labelling samples.** Sample a fixed number per cluster (stratified) instead of
-  uniformly, so rare groups are represented. Monitor per-cluster coverage in the eval set.
+- **Name clusters from central examples.** Send the 10 to 20 messages or runs nearest each centroid to an
+  LLM to draft a name and description, then have a human verify. Monitor purity by sampling 50 members per
+  top cluster and counting how many match the name.
+- **Stable categories go into a classifier, not cluster ids.** Once intent clusters are named and
+  reviewed, label a sample and train a router or classifier for the production path, because re-running
+  clustering renumbers and reshapes clusters.
+- **Drift watch and stratified eval sampling.** Each week, assign new traffic to existing centroids and
+  cluster the poorly fitting remainder; a new dense group is an emerging use case or failure. Sample a
+  fixed number per cluster (stratified) for eval and labelling sets, so rare groups are represented.
+  Monitor the share of traffic far from every centroid and per-cluster coverage in the eval set.
 
 ## Trade-offs
 - **k-means speed vs shape assumptions.** Fast and scales to millions of vectors, but needs k and assumes
   convex, similar-sized clusters. Density-based methods win as soon as clusters vary in density or shape,
-  or you need outliers.
+  or you need outliers such as novel agent failures.
 - **Hierarchical granularity vs memory.** No k and every granularity at once, but quadratic memory makes it
   impractical beyond tens of thousands of points without sampling first.
 - **Embeddings vs encoder bias.** Embeddings capture meaning that TF-IDF misses, but inherit the encoder's
   notion of similarity: a topic-oriented model puts "cancel my subscription" and "how do I upgrade"
-  together because both are about accounts. Choosing or fine-tuning the encoder for the facet you care
-  about (intent, sentiment, product) changes the clusters more than any algorithm choice.
+  together because both are about accounts.
+- **Choosing what to embed beats choosing the algorithm.** Picking or fine-tuning the encoder, or the
+  text you embed (request only versus request plus tool error), for the facet you care about (intent,
+  failure cause, product) changes the clusters more than any algorithm choice.
 - **More clusters vs reviewability.** More clusters are purer but more to review; fewer are coarser but
   digestible. The right number is set by the downstream use, not by a statistic.
 
 ## Pitfalls
 - **Euclidean k-means on unnormalised embeddings.** Symptom: clusters organised by vector norm, which often
-  tracks text length, rather than by meaning.
+  tracks text length, rather than by meaning. Fix: L2-normalise first.
 - **Treating cluster labels as categories without inspection.** Symptom: a "cluster" that mixes three
-  intents united by shared boilerplate such as a greeting template.
+  intents united by shared boilerplate such as a greeting template. Fix: read central examples.
 - **Publishing cluster ids as stable production categories.** Symptom: next week's "cluster 7" is a
-  different thing after a re-run, and dashboards built on it silently break.
+  different thing after a re-run, and dashboards or routing rules built on it silently break.
 - **Choosing k by the elbow when there is no elbow.** That is the normal case for embeddings: a smooth
   curve and an arbitrary choice. Use silhouette plus reading, or a hierarchical view.
 - **Letting templated or duplicated messages dominate.** Symptom: one giant cluster holding 40% of the
   data. Fix by deduplicating and stripping boilerplate before embedding.
 - **DBSCAN with a single `eps` on data of varying density.** Symptom: either one cluster containing
-  everything or almost everything labelled noise.
+  everything or almost everything labelled noise. Fix: HDBSCAN or reduce dimensions first.
+- **Embedding whole agent traces.** Symptom: clusters follow the shared system prompt or tool schemas, not
+  the failure. Fix: embed only the request and the distinguishing step, or a short summary.
 
 ## When to use
-- **Use when** you need to understand data before categories exist, sample diverse items for labelling
-  and evaluation sets, deduplicate, detect emerging issues as new dense regions in production embeddings,
-  or summarise large logs cluster by cluster with an LLM.
+- **Use when** you need to understand agent traffic before categories exist, find recurring failure modes,
+  sample diverse items for labelling and evaluation sets, deduplicate fine-tuning data, detect emerging
+  issues as new dense regions in production embeddings, or summarise large logs cluster by cluster with an LLM.
 - **Avoid when** you already have a taxonomy and labels (train a classifier), or you need stable,
-  auditable categories in a production path, because clusters drift and renumber.
+  auditable categories in a production path such as a router, because clusters drift and renumber.
 - **Measure** silhouette and seed stability as sanity checks, but the real test is whether the clusters
   changed a decision: which categories were added, which examples were labelled, which failure mode was
   found.
 - **Interviews:** questions centre on how you choose k, what k-means assumes, and how you would find out
-  what users are asking about.
+  what users are asking about or where an agent fails.
 
 ## Role lens
 - **Engineer:** Runs embed, normalise, k-means or HDBSCAN over logs in a notebook that prints central
@@ -290,6 +335,13 @@ seeds, and comparing against any tags the customer already has.
 - **Consequence:** it converges only to a local minimum, so k-means++ seeding and several restarts are
   standard.
 
+### Your agent's failure rate is 9% and nobody knows why. How do you find what to fix first?
+- **Collect** failed and thumbs-down runs and build a short text per run: request, last tool call, error.
+- **Clean, embed, normalise and cluster,** with k around 20 for a reviewable list, or HDBSCAN to surface
+  novel outliers.
+- **Read and rank:** name clusters from central runs, rank by share of failures, and turn the top ones into
+  tickets and eval cases; re-cluster after fixes to confirm the share dropped.
+
 ### Your clusters of support messages seem to group by message length, not topic. What went wrong?
 - **Likely cause:** Euclidean k-means on unnormalised embeddings, where vector norm tracks text length.
 - **Fix:** L2-normalise so Euclidean distance matches cosine similarity.
@@ -308,10 +360,12 @@ seeds, and comparing against any tags the customer already has.
 - **Outcome:** did it change a decision, such as a new category, a labelling sample or a found failure
   mode?
 
-### Should cluster ids be used as features or categories in production?
-- **Not directly:** re-running clustering renumbers and reshapes clusters, silently breaking dashboards.
-- **Instead:** name and review clusters, label a sample, and train a classifier with a stable label set.
-- **Keep clustering offline** for exploration, deduplication and drift detection.
+### Should cluster ids be used to route requests between sub-agents in production?
+- **Not directly:** re-running clustering renumbers and reshapes clusters, silently breaking dashboards
+  and routing rules.
+- **Instead:** name and review clusters, label a sample, and train a router or classifier with a stable
+  label set and an abstain path.
+- **Keep clustering offline** for exploration, deduplication, eval sampling and drift detection.
 
 ## Quiz
 ### Q: Why L2-normalise embeddings before running k-means with Euclidean distance?
@@ -338,3 +392,25 @@ seeds, and comparing against any tags the customer already has.
 - [ ] The maximum possible silhouette score for that k
 > Each Lloyd step is non-increasing in the objective, so the algorithm stops at a fixed point, but that
 > fixed point depends on initialisation. This is why k-means++ seeding and multiple restarts are standard.
+
+## Use cases & projects
+### Use cases
+- **Failure-mode triage.** Cluster failed or thumbs-down agent runs weekly and fix the largest clusters
+  first, instead of reading traces at random.
+- **Deciding which tools and sub-agents to build.** Cluster incoming requests to see which intents carry
+  the volume and which the agent cannot serve yet.
+- **Diverse eval sets.** Sample a fixed number of cases per cluster so rare but important request types
+  are covered, not just the dominant ones.
+- **Cleaning fine-tuning data.** Near-duplicate clustering removes repeated trajectories that would
+  otherwise over-weight one pattern in supervised fine-tuning.
+- **Drift detection.** A new dense cluster in this week's requests flags a new use case or an incident
+  before it shows up in aggregate metrics.
+
+### Mini project
+**Failure-mode report from agent traces (2-3 hours).**
+- **Goal:** turn a pile of failed agent runs into a ranked list of named failure modes with eval cases.
+- **Steps:** collect or simulate 300-1,000 failed runs (request, last tool, error); strip boilerplate and
+  deduplicate; embed, L2-normalise and run k-means for k in 10, 20 and 40; read central runs and have an
+  LLM draft names you verify; sample 50 members of each top cluster to measure purity.
+- **Done when:** you have a table of the top five failure modes with share, purity and a proposed fix,
+  plus five eval cases per failure mode saved to a file your eval harness can load.

@@ -5,7 +5,8 @@ name: Audit logs / execution traces
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - agent-reliability/structured-event-streams
   - agent-reliability/deterministic-replay-and-reproducibility
@@ -24,6 +25,19 @@ sources:
 A trace tells engineers what the agent did and why; an audit log tells security and compliance who did
 what with whose authority. Both derive from one event stream but differ in contents, retention, access
 and mutability, so build both on purpose.
+
+## For agent builders
+- **Why it matters for agents.** An agent makes decisions you did not write, from inputs you did not
+  see. When a refund is wrong, you need the trace to see which prompt and tool result led to it, and the
+  audit row to show whose authority it ran under.
+- **Where it shows up in your stack.** Span trees in Langfuse, LangSmith or Phoenix, OpenTelemetry
+  collectors and their sampling policies, and an append-only audit table or store next to your tool
+  executor.
+- **What you control.** Span attributes and payload references, tail-based sampling that keeps every
+  failure, the audit record shape, write ordering around side effects, fail-closed behaviour, hash
+  chaining and retention.
+- **What you can skip.** Building your own trace viewer or log-management platform. Emit spans and
+  audit rows from the event stream and let existing backends store and render them.
 
 ## Why it exists
 - **Incidents ask a fixed set of questions.** An agent refunds a customer 4,000 instead of 40. Which user
@@ -388,3 +402,24 @@ head hashes. The identifiers are shared, so a row leads to the trace while it ex
 - [ ] Runs from internal users only
 > The purpose of a trace is to debug what went wrong; sampling out the failures defeats it. Successful
 > runs are the safe place to save cost.
+
+## Use cases & projects
+### Use cases
+- **Incident review for a wrong action.** The trace shows the prompt, model and tool results before the
+  decision; the audit row shows the user, policy version and approval behind it.
+- **Regulated agents.** Payment, healthcare and HR agents need a complete, tamper-evident record of
+  every authority-bearing action, kept far longer than traces.
+- **Debugging cost and latency.** Span attributes for tokens, cache hits and latency show which step or
+  tool drives a slow or expensive run.
+- **Detecting bypasses.** Audit rows whose `run_id` has no trace reveal effects that did not go through
+  the agent runtime.
+
+### Mini project
+**Trace and audit a refund agent (2-3 hours).**
+- **Goal:** produce both artifacts from one tool wrapper and prove the audit log is complete and
+  tamper-evident.
+- **Steps:** wrap two tools (`lookup_order`, `refund`) so each call emits a span and, for `refund`, an
+  `authorized` row before and a `completed` row after; key the argument hash with an HMAC; chain rows
+  with `prev_hash`; crash the process between the two writes once; write a verifier.
+- **Done when:** every refund has an `authorized` row even after the crash, editing one row makes the
+  verifier fail, and a single `run_id` query jumps from an audit row to its full trace.

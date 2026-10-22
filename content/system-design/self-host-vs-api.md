@@ -393,3 +393,23 @@ on-call, and record the decision and its assumptions in an ADR so it can be revi
 > Retention and regional processing are routinely covered by enterprise agreements and in-cloud
 > platforms, and APIs can deliver fast first tokens. An air gap removes the network path the API needs,
 > so hosting is the only option.
+
+## Use cases & projects
+### Use cases
+- **High-volume extraction or routing steps.** A classifier or argument-filling step that runs on every
+  agent turn is the usual first candidate to move to a self-hosted small model once volume is steady.
+- **Air-gapped or regulated agents.** Agents inside a network with no outbound path must run on hosted
+  open-weight models, whatever the cost comparison says.
+- **Hybrid agent platforms.** Keep the planner on a frontier API and run cheap executor steps on vLLM
+  behind the same OpenAI-compatible `base_url`, so either side can move.
+- **Budget reviews.** Per-step token traces feed the break-even model that decides whether a GPU
+  reservation pays for itself at the agent's real utilisation.
+
+### Mini project
+**Build a break-even sheet from real agent traces (1-2 hours).**
+- **Goal:** decide, with your own numbers, whether one agent step should move from an API to self-hosting.
+- **Steps:** run a small tool-calling agent on 20 tasks and log input, cached-input and output tokens per
+  step; total them per step type; price each step at API rates and at a GPU hourly rate divided by
+  measured or assumed throughput at three utilisation levels.
+- **Done when:** you have a table of cost per 1,000 tasks per step for API versus self-hosted at each
+  utilisation level, and a one-paragraph recommendation naming the step to move first, if any.

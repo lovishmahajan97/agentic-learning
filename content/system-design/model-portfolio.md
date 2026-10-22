@@ -414,3 +414,24 @@ entry an owner and a retirement date, and publish spend share and frontier-tier 
 > Vectors produced by different embedding models live in different spaces, so queries embedded with
 > the new model cannot be compared against documents embedded with the old one. The whole corpus must
 > be re-indexed and retrieval quality re-measured before any switch.
+
+## Use cases & projects
+### Use cases
+- **Cutting agent spend.** Routing routine agent steps (summarising tool results, formatting) to a
+  cheaper tier while the planner stays on the strong tier.
+- **Surviving a provider outage.** A logical model name with a fallback on a second provider keeps
+  agents running when one vendor is down.
+- **Meeting a customer's residency rule.** The registry record of data classes and regions shows which
+  tier an agent may use for that customer.
+- **Rotating a model safely.** Eval baselines per task family tell you whether a replacement can enter
+  the portfolio and which agents depend on the retiring version.
+
+### Mini project
+**Build a tiny portfolio router (2-3 hours).**
+- **Goal:** let an agent call logical model names and route each step type to a tier.
+- **Steps:** define a registry file with two or three logical names (for example `workhorse`,
+  `classifier-small`), each with a pinned model, owner, cost card and fallback; make your agent call
+  logical names per step; log tokens and cost per step; run 20 tasks with everything on the strong tier,
+  then with routine steps routed down.
+- **Done when:** a table compares cost and success rate for both runs, a forced failure of the primary
+  provider falls back cleanly, and changing a model needs only a registry edit.

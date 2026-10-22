@@ -5,7 +5,8 @@ name: Tracing
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - observability/spans
   - observability/distributed-tracing-across-services
@@ -19,9 +20,22 @@ sources:
 ---
 
 ## TL;DR
-A trace is the timed tree of one request through an LLM app: every retrieval, model call, tool call and
-retry as nested spans. LLM systems fail *semantically*, not by crashing, so you need each step's inputs
-and outputs in order.
+A trace is the timed tree of one agent turn: every model call, tool call, retrieval and retry as nested
+spans. Agents fail *semantically*, not by crashing, so you need each step's inputs, outputs and decisions
+in order to debug them.
+
+## For agent builders
+- **Why it matters for agents.** An agent run is a loop of decisions you did not write: which tool, which
+  arguments, when to stop. When it goes wrong there is no stack trace, only a plausible answer. The trace
+  is the only record of what the model saw and chose at each step.
+- **Where it shows up in your stack.** LLM tracing backends (Langfuse, LangSmith, Phoenix) or an
+  OpenTelemetry collector, fed by provider-client auto-instrumentation, framework callbacks (LangGraph,
+  LlamaIndex) and your own spans around tools and prompt building.
+- **What you control.** The span boundaries (one per loop iteration, tool call and generation), what
+  payloads are captured by value or by reference, the session id that links turns, and the sampling
+  policy that keeps every failed run.
+- **What you can skip.** Building a tracer yourself or the internals of the collector pipeline. Know the
+  data model, self time, the critical path and context propagation; that is enough to debug agents.
 
 ## Why it exists
 - **LLM failures do not throw.** "The assistant told the customer their order shipped, but it hadn't."
@@ -94,6 +108,19 @@ Three mechanisms, usually combined:
 - **So** shaving 200 ms off a child not on the critical path changes nothing the user sees.
 - **Both are computable only because** every span has a parent and exact start and end times.
 
+### What an agent run looks like as a trace
+| Level | Span | What to put on it |
+|---|---|---|
+| Root | `agent.run` (one user task or turn) | session id, user tier, final status, stopping reason, total steps |
+| Child | `agent.step` per loop iteration | iteration number, decision (tool or final answer), context tokens |
+| Grandchild | `generation` inside the step | model, tokens, finish reason, the tool call it emitted |
+| Grandchild | `tool.<name>` inside the step | arguments, result size or hash, error, attempt number |
+
+- **Nest tools under the step that chose them,** because "why was this tool called" is answered by the
+  sibling generation span, not by the tool span itself.
+- **Record the stopping reason on the root** (final answer, step budget hit, loop detected, error), since
+  that one attribute separates healthy runs from runaway ones in every dashboard built on traces.
+
 ### Turns, sessions and trace size
 - **Backends assume a trace finishes within minutes,** because they render it as one waterfall and
   tail-based samplers must buffer it until it ends. Conversations last days and agent tasks hours.
@@ -119,17 +146,19 @@ Three mechanisms, usually combined:
   analysis usually starts by reading traces.
 
 ## Diagram
-One chat turn as a span tree: the root owns every step, and the gap between children is self time.
+One agent turn as a span tree: the root owns each loop step, each step owns the generation that decided
+and the tool it called, and the gap between children is self time.
 
 ```mermaid
 flowchart TD
-    R["chat.turn (root span)"] --> Q["query rewrite"]
-    R --> RT["retrieval: chunk ids, scores"]
-    R --> PB["prompt build (often untraced)"]
-    R --> T["tool call: args, result"]
-    R --> G["generation: prompt, tokens"]
+    R["agent.run (root span)"] --> S1["agent.step 1"]
+    R --> S2["agent.step 2"]
     R --> GR["output guardrail"]
-    T -->|"retry"| T2["tool call retry"]
+    S1 --> G1["generation: picks tool"]
+    S1 --> T1["tool call: args, result"]
+    T1 -->|"retry"| T2["tool call retry"]
+    S2 --> RT["retrieval: chunk ids, scores"]
+    S2 --> G2["generation: final answer"]
     R -.->|"export async"| B[("Trace backend")]
     B -.->|"bad trace"| E["Eval dataset"]
 ```
@@ -200,6 +229,50 @@ A user reports a slow answer. The waterfall for that turn (illustrative numbers)
 - **What logs alone would show:** "request took 9 s" and three interleaved retry lines with no link to
   this turn.
 
+### Tracing a tool-calling agent loop
+- **What it shows:** the `span` helper from the first example wrapped around each loop iteration, the
+  model call and the tool call, with the stopping reason set on the root.
+- **Why the shape matters:** every tool span is a child of the step whose generation chose it, so the
+  waterfall reads as "decided, called, read result, decided again".
+- **`call_model` and `TOOLS`** are stand-ins for your provider client and tool registry.
+
+```python
+MAX_STEPS = 8
+
+def run_agent(task, call_model, TOOLS):
+    with span("agent.run", session_id="conv-17", task=task) as root:
+        messages = [{"role": "user", "content": task}]
+        for step in range(1, MAX_STEPS + 1):
+            with span("agent.step", iteration=step):
+                with span("generation", model="example-model") as g:
+                    reply = call_model(messages)             # returns text or a tool call
+                    g["attrs"].update(finish=reply["type"], context_msgs=len(messages))
+                if reply["type"] == "final":
+                    root["attrs"].update(stop_reason="final_answer", steps=step)
+                    return reply["text"]
+                with span(f'tool.{reply["name"]}', args=reply["args"]) as t:
+                    result = TOOLS[reply["name"]](**reply["args"])
+                    t["attrs"]["result_chars"] = len(str(result))
+                messages += [reply["message"], {"role": "tool", "content": str(result)}]
+        root["attrs"].update(stop_reason="step_budget", steps=MAX_STEPS)
+        return "Stopped: step budget reached."
+```
+
+### Worked scenario: an agent that looped on one tool
+A support agent's turn took 41 s and returned "I could not find your order" (illustrative numbers).
+
+| Span | Count | Reading |
+|---|---|---|
+| `agent.run` | 1 | `stop_reason=step_budget`, `steps=8` |
+| `generation` | 8 | each emits the same `tool.order_lookup` call |
+| `tool.order_lookup` | 8 | identical args `order_id="A-1O3"`: letter O, not zero |
+| `retrieval` | 0 | never called |
+
+- **Diagnosis:** the model copied a typo from the user and retried the same failing lookup until the
+  8-step budget ran out. Fix the tool to return "no such order, ask the user to confirm the id" and add
+  loop detection on repeated identical tool calls.
+- **What logs alone would show:** eight "order not found" lines with no link to the decision behind each.
+
 ## Production patterns
 - **One trace per turn, linked by session.** For chat and agents, open the root span per user turn or
   task and set a session or conversation id attribute on it. Monitor trace duration p99 and the count of
@@ -214,6 +287,9 @@ A user reports a slow answer. The waterfall for that turn (illustrative numbers)
 - **Wrap the client, then fill the gaps manually.** Turn on auto-instrumentation of the provider client
   for token counts, then add manual spans for prompt build, retrieval and tool-result handling wherever
   parent self time is large. Monitor trace completeness: the share of turns with every expected child.
+- **Span per agent step with a stopping reason.** Wrap each loop iteration in its own span and set
+  `stop_reason` and step count on the root. Monitor the share of runs that stop on the step budget or
+  loop detection rather than a final answer, and the step-count p95 per task type.
 - **Trace-to-dataset loop.** Route flagged traces (thumbs-down, guardrail trips, judge failures) into a
   review queue and promote confirmed bad ones to the regression set. Monitor how many new cases each
   week comes from production traces.
@@ -228,6 +304,9 @@ A user reports a slow answer. The waterfall for that turn (illustrative numbers)
 - **Head-based vs tail-based sampling.** Head-based is cheap and keeps traces complete but discards slow
   and failed requests at the same rate as healthy ones. Tail-based keeps the interesting minority at the
   price of buffering every span until the trace ends.
+- **Fine-grained agent spans vs readable waterfalls.** A span per step, tool and generation makes loops
+  and bad decisions obvious, but a 40-step agent run becomes a long tree. It flips toward coarser spans
+  (one per step, payloads by reference) once runs regularly exceed a few dozen steps.
 - **Coverage vs overhead.** Tracing every step adds a little latency and a background export thread:
   negligible around a 3 s model call, noticeable if you wrap a function called ten thousand times per
   request.
@@ -244,6 +323,9 @@ A user reports a slow answer. The waterfall for that turn (illustrative numbers)
   cardinality warnings, then a privacy review that halts the project. Fix: reference payloads, hash ids.
 - **One trace for a whole conversation or long agent task.** Symptom: traces that never "finish", so tail
   sampling drops or truncates them and the waterfall is too long to read. Fix: one trace per turn.
+- **Flat tool spans with no step parent.** Symptom: twenty tool spans under the root and no way to tell
+  which generation chose which call or why. Fix: open an `agent.step` span per iteration and nest the
+  generation and tool calls inside it.
 - **Reading traces only when something breaks.** Teams that never sample healthy traces miss slow drift
   in prompt size, tool usage and retry rates until the cost or latency graph moves.
 
@@ -252,7 +334,7 @@ A user reports a slow answer. The waterfall for that turn (illustrative numbers)
   practice means every RAG or agent system. Do it before an incident, because what to capture is hard to
   retrofit.
 - **Reach for a trace** when the question is about one request: why was this answer wrong, where did
-  these 9 seconds go, which tool call did the agent repeat.
+  these 9 seconds go, which tool call did the agent repeat, why did the run stop.
 - **Avoid for "how often" questions;** that is monitoring over aggregated span data.
 - **Measure** trace completeness (fraction of requests with a root span and all expected children) and
   the export drop rate.
@@ -316,6 +398,14 @@ later so every flagged or slow turn is kept, and feed bad traces into the eval s
 - **Link turns with a session or conversation id attribute,** and keep a durable execution id for resumed
   work, since the trace store expires early turns first.
 
+### Your agent sometimes burns its whole step budget and gives up. How do you use traces to fix it?
+- **Filter first:** query traces where the root's stopping reason is the step budget, and group them by
+  the tool name and arguments repeated across steps.
+- **Read a few end to end:** check whether the model is retrying an identical failing call, misreading a
+  tool result, or never receiving the context it needs.
+- **Then fix and guard:** improve the tool's error message or schema, add loop detection on repeated
+  identical calls, and add the failing traces to the eval set so the fix is regression-tested.
+
 ## Quiz
 ### Q: Why is a trace organised as a tree of spans rather than an ordered list of events?
 - [ ] Trees compress better in storage than flat event lists
@@ -343,3 +433,23 @@ later so every flagged or slow turn is kept, and feed bad traces into the eval s
 > Client wrappers see the request as sent. The templating, truncation, retrieval and tool-result
 > handling that decide what goes into that request happen before it and stay invisible unless
 > instrumented manually.
+
+## Use cases & projects
+### Use cases
+- **Debugging a confident wrong answer.** Walk the trace to see whether retrieval, a tool result or the
+  model's reading of it introduced the error.
+- **Finding runaway agent loops.** Query traces by stopping reason and repeated tool arguments to catch
+  agents that burn their step budget.
+- **Latency work on multi-step agents.** Self time and the critical path show whether a slow turn is the
+  model, one retrying tool or untraced prompt assembly.
+- **Building the eval set from production.** Flagged traces become regression cases with the exact
+  inputs, tool results and outputs of the failing run.
+
+### Mini project
+**Trace a small tool-calling agent end to end (2-3 hours).**
+- **Goal:** see every decision, tool call and retry of an agent run as one span tree.
+- **Steps:** build an agent with two tools (one that fails on bad input); wrap the run, each step, each
+  generation and each tool call in spans using the in-memory tracer or an OpenTelemetry SDK; set
+  `stop_reason` on the root; run ten tasks, including two designed to trigger a loop.
+- **Done when:** you can print or view a waterfall per run, list runs by stopping reason, and point to the
+  step where each looping run first repeated an identical tool call.

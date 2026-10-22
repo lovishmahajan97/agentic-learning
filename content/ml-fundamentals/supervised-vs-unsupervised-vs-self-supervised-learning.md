@@ -392,3 +392,24 @@ categories theirs; the unsupervised step makes the labelling cheap.
 > Two views of the same item, or a naturally paired query and document, give a known correct match; the
 > model is trained to identify it among the other items in the batch. That target is a label, just one
 > that cost nothing to create.
+
+## Use cases & projects
+### Use cases
+- **Failure-mode discovery on agent traces.** Teams embed failed or low-rated runs and cluster them
+  (unsupervised) to find the handful of recurring problems worth labelling and fixing first.
+- **Turning logs into supervised data.** Implicit labels such as the tool a user accepted, the ticket
+  category on close or an approved draft become (input, target) pairs for routers and fine-tunes.
+- **Domain-adapting a retriever.** Pairs mined from the corpus itself (title and body, question and the
+  answer that resolved it) give a self-supervised contrastive signal for tuning an embedding model.
+- **Building an eval set.** A small, carefully labelled set with measured annotator agreement is the
+  supervised signal every prompt, model or tool change is judged against.
+
+### Mini project
+**Signal audit for an agent's logs (2-3 hours).**
+- **Goal:** classify every signal your agent already produces as supervised, unsupervised or
+  self-supervised, and turn one of them into a usable training or eval set.
+- **Steps:** export 200-500 agent traces (real or synthetic); list the implicit labels in them (tool
+  chosen, success flag, thumbs, edits); embed the user requests and cluster them; hand-label 50 traces
+  from the largest clusters and measure agreement with a second labeller.
+- **Done when:** you have a table of signals with their paradigm and noise level, a labelled set of 50
+  with an agreement figure, and one recommendation: prompt, fine-tune, train a router or keep clustering.

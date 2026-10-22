@@ -5,7 +5,8 @@ name: Cost modeling (cost per request, token economics)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - infra-capacity-economics/unit-economics-per-successful-task
   - infra-capacity-economics/cost-optimization
@@ -20,9 +21,21 @@ sources:
 ---
 
 ## TL;DR
-A cost model turns request shape into dollars: fresh, cached and output tokens (including hidden
-reasoning) times prices, plus non-model calls. Output costs more because decode is sequential, agent
-cost grows roughly quadratically with turns, and the heavy tail sets the bill.
+A cost model turns an agent run's shape into dollars: fresh, cached and output tokens (including hidden
+reasoning) times prices, plus tool calls. Output costs more, cost grows roughly quadratically with turns,
+and runaway runs in the tail set the bill.
+
+## For agent builders
+- **Why it matters for agents.** An agent run is a loop of model calls that re-send a growing transcript,
+  plus tool, retrieval and guardrail calls. Its cost depends on turns per run and tokens added per turn,
+  which you decide in design, so the model tells you before launch whether the agent is affordable.
+- **Where it shows up in your stack.** Provider usage fields on every response, the provider's pricing
+  page, token counters such as `tiktoken`, per-run cost in tracing tools (LangSmith, Langfuse or your own
+  OpenTelemetry spans), and the step-limit and budget settings of your agent framework.
+- **What you control.** Prefix size (system prompt plus tool schemas), how much of each tool result
+  enters context, turns per run, output and reasoning caps, prompt caching, and which model each step uses.
+- **What you can skip.** Provider-specific billing edge cases until you are near launch. The per-call
+  formula, the T² growth term and the tail share cover most agent cost decisions.
 
 ## Why it exists
 - **Spend is metered per token.** Cost is set by the shape of each request, not by servers running.
@@ -38,7 +51,7 @@ cost grows roughly quadratically with turns, and the heavy tail sets the bill.
 - **It works before launch,** when you can still change the design (cap turns, cache prefixes, route to a
   smaller model) instead of explaining an invoice.
 - **It feeds everything else:** break-even analysis, pricing and unit economics all need a defensible
-  cost per request.
+  cost per request, and for agents a defensible cost per run.
 
 ## How it works
 ### The per-call formula
@@ -48,6 +61,7 @@ cost = fresh_input_tokens × p_in
      + output_tokens × p_out            # includes reasoning/thinking tokens where billed
      + non-model costs (embeddings, rerank, vector search, tool APIs, guardrail models)
 ```
+- **Per agent run,** sum this over every turn and every tool call in the run.
 - **Other price terms exist:** some providers charge a premium to *write* a prompt-cache entry, discount
   asynchronous batch processing, or use different rates above a context-length threshold.
 - **Read prices from configuration, never hard-code them,** because pricing is vendor- and
@@ -61,11 +75,13 @@ cost = fresh_input_tokens × p_in
 
 - **Providers price that:** output is commonly several times the input price.
 - **Design consequence:** verbosity is expensive, and a reasoning model that "thinks" for thousands of
-  tokens can cost more than a larger model that answers directly.
+  tokens can cost more than a larger model that answers directly. In an agent, reasoning tokens are
+  paid on every turn where reasoning is enabled.
 
 ### Tokens are not words, and not portable
 - **Counts depend on the tokenizer.** The same text yields different counts on different model families.
-- **Code, non-English text and JSON** tend to tokenize less efficiently than English prose.
+- **Code, non-English text and JSON** tend to tokenize less efficiently than English prose. Tool schemas
+  and JSON tool results are exactly this kind of text.
 - **So** a per-word estimate built on one model is wrong on another; measure with the target model's
   tokenizer.
 
@@ -76,13 +92,15 @@ Turn t sends the system prompt, tool schemas and every earlier message. If each 
 total input over T turns ≈ T·prefix + d·T²/2
 ```
 
-- **The quadratic term dominates long sessions.**
+- **The quadratic term dominates long sessions.** In an agent, d is the tool call plus its result, so a
+  verbose tool raises the coefficient of the T² term.
 - **Prompt (prefix) caching** bills repeated prefixes at a discount. It leaves the T² shape intact but
   multiplies its coefficient by the cached-to-fresh price ratio (0.1 in the example below).
 - **Context compaction** shrinks the history itself, capping how large it can grow and turning the
   quadratic back into roughly linear growth once the cap is reached.
 - **Caching needs the next turn within the cache lifetime.** Human think time between turns can exceed
-  it, so measure the cached-token share rather than assuming it.
+  it, so measure the cached-token share rather than assuming it. Autonomous agent turns usually follow
+  within seconds; slow tools or human approval steps can break that.
 
 ### Self-hosted token cost
 ```
@@ -101,16 +119,16 @@ cost per token = (GPU $/hour) / (tokens produced per hour at the utilization you
    must bound.
 
 ## Diagram
-From traces to a forecast: per-call costs roll up into per-session costs, whose distribution gives both
+From traces to a forecast: per-call costs roll up into per-run costs, whose distribution gives both
 the forecast (mean) and the risk (tail) that caps must bound.
 
 ```mermaid
 flowchart TD
-    T[("Logged traces per feature")] --> K["Tokens by type per call"]
+    T[("Logged agent traces")] --> K["Tokens by type per call"]
     P["Price config by model"] --> C["Per-call cost"]
     K --> C
-    N["Non-model costs"] --> C
-    C --> S["Per-session cost: sum over turns"]
+    N["Tool and retrieval costs"] --> C
+    C --> S["Per-run cost: sum over turns"]
     S --> D["Distribution: p50, p95, p99"]
     D --> F["Forecast: volume x mean"]
     D --> R["Tail share: top 1 percent"]
@@ -158,6 +176,27 @@ for util in (0.9, 0.3):
 - **Caching:** cuts the 24-turn run by more than 4×.
 - **Self-hosted:** utilization, not GPU list price, decides whether owning hardware is cheap.
 
+### Worked scenario: pre-launch cost of a research agent
+A research agent averages 8 turns (the `agent_run` shape above, with prefix caching) and per run makes 3
+web-search tool calls, 2 retrieval queries and one guardrail check. Tool prices are illustrative
+placeholders; use your vendors' rates.
+
+| Line item per run | Cost |
+|---|---|
+| Model: 8 turns, cached prefix (`agent_run(8, cache=True)`) | $0.0662 |
+| Web search tool: 3 calls × $0.005 | $0.0150 |
+| Embeddings plus vector search: 2 queries | ~$0.0005 |
+| Guardrail model on the final answer | ~$0.0020 |
+| **Typical run** | **~$0.0837** (non-model ~21%) |
+| Runaway run: 30 turns, same tools | ~$0.3213 |
+
+- **Forecast with the mix:** if 5% of runs run away, the mean is 0.95 × $0.0837 + 0.05 × $0.3213 ≈
+  $0.096, so 100k runs a month cost ~$9,560, and that 5% of runs is ~17% of spend.
+- **Without caching** the same 30-turn run costs $1.494 in model tokens alone, which is why caps and
+  caching are decided together.
+- **Design response:** a turn cap near the p95 turn count and a per-run cost cap bound the tail before
+  launch.
+
 ### Forecasting from a heavy-tailed distribution
 Synthetic lognormal token counts stand in for logged traces; with your own logs, replace the loop with
 real per-request token counts.
@@ -192,18 +231,20 @@ print(f"forecast at 2M req/month: ${mean * 2_000_000:,.0f} "                 # ~
 
 ## Production patterns
 - **Price table as versioned config.** Keep per-model prices (input, cached input, cache write, output,
-  batch) in a config file with an effective date, and compute cost from it at query time. Monitor for
-  calls to models missing from the table.
+  batch) and per-tool prices in a config file with an effective date, and compute cost from it at query
+  time. Monitor for calls to models or tools missing from the table.
 - **Log provider usage fields, not estimates.** Record the token counts each response returns (for
   example Anthropic's `cache_read_input_tokens` and `cache_creation_input_tokens`, OpenAI's
-  `reasoning_tokens` under completion token details) tagged with feature and request IDs. Monitor billed
-  tokens against visible text length to catch hidden reasoning or schema bloat.
+  `reasoning_tokens` under completion token details) tagged with feature, agent run and step IDs.
+  Monitor billed tokens against visible text length to catch hidden reasoning or schema bloat.
 - **Count tokens with the target tokenizer before launch.** Use the provider's counter (for example
-  `tiktoken` for OpenAI models or Anthropic's token-counting endpoint) on real sample documents, not a
-  words-to-tokens ratio. Re-run it on every model switch.
+  `tiktoken` for OpenAI models or Anthropic's token-counting endpoint) on real sample documents, tool
+  schemas and tool results, not a words-to-tokens ratio. Re-run it on every model switch.
 - **Per-session budget guards.** Enforce maximum turns, maximum tokens and a cumulative-cost cap per
   agent session, stopping or escalating when hit. Monitor how often caps fire and the p99 cost per
   session.
+- **Cost per run as a trace attribute.** Agent teams roll call costs up to the run in their tracing tool
+  so the most expensive runs can be opened and read. Monitor the top-1% share of spend by run.
 - **Monthly forecast review from traces.** Recompute volume × mean cost per feature and the top-1% share,
   and compare with the invoice. Monitor forecast error; a growing gap usually means a new tail.
 
@@ -215,6 +256,8 @@ print(f"forecast at 2M req/month: ${mean * 2_000_000:,.0f} "                 # ~
   premium and reuse is rare.
 - **Reasoning models vs output tokens.** They raise output tokens per task, but can lower total cost when
   they replace several retries or a multi-step chain; measure cost per *successful* task, not per call.
+- **Tight turn caps vs task success.** Caps bound the tail, but a cap below what hard tasks need turns
+  cost into failures; set it from the turn distribution of successful runs.
 - **Self-hosting vs fixed cost.** It lowers marginal token cost at high utilization, but turns cost fixed;
   it flips to more expensive than an API when traffic is low or spiky.
 
@@ -226,16 +269,17 @@ print(f"forecast at 2M req/month: ${mean * 2_000_000:,.0f} "                 # ~
   output counts far above what the visible text suggests. Fix: log provider usage fields.
 - **Reusing a token-per-word ratio from one model family on another.** Symptom: the forecast drifts after
   a model switch even though traffic did not change. Fix: re-count with the new tokenizer.
-- **Ignoring non-model costs** such as embeddings, reranking, guardrail models and trace storage.
-  Symptom: total spend per request well above the LLM line item. Fix: include them in the formula.
+- **Ignoring non-model costs** such as embeddings, reranking, guardrail models, paid tool APIs and trace
+  storage. Symptom: total spend per request well above the LLM line item. Fix: include them in the
+  formula.
 
 ## When to use
 - **Use before** committing to any design that calls a model in a loop, ingests user-supplied documents,
   or will run at volume; rebuild it from real traces after launch.
 - **Use it to** set max-turn and max-token limits, decide where prompt caching and smaller models pay off,
   and feed pricing and break-even decisions.
-- **Measure** tokens by type (fresh, cached, output, reasoning) per feature and per request, and watch the
-  p95 and p99, not only the mean.
+- **Measure** tokens by type (fresh, cached, output, reasoning) per feature and per request, turns per
+  run, and watch the p95 and p99, not only the mean.
 - **Interviews:** deriving the quadratic growth of agent cost and the utilization term in self-hosted cost
   shows real understanding.
 
@@ -269,6 +313,14 @@ smaller model, then track p95 cost per resolved ticket rather than per call.
 - **In the illustrative example** 6× the turns is about 14× the cost.
 - **Levers:** prefix caching lowers the quadratic coefficient; compaction caps history growth so cost
   becomes roughly linear; turn caps bound the tail.
+
+### You are asked to price a new agent feature before it exists. How do you build the estimate?
+- **Prototype and trace:** run the agent on 20-50 realistic tasks and log tokens by type, turns and tool
+  calls per run.
+- **Build the per-run distribution:** model cost per turn, plus tool and retrieval costs, then the mean
+  and the tail share, not a single typical run.
+- **Turn it into decisions:** a turn cap and per-run cost cap from the distribution, caching for the
+  stable prefix, and a forecast of volume × mean with the tail stated.
 
 ### When is a reasoning model cheaper than a non-reasoning one despite more output tokens?
 - **When it replaces retries or chains:** one longer call that succeeds can beat several short calls that
@@ -314,3 +366,23 @@ smaller model, then track p95 cost per resolved ticket rather than per call.
 - [ ] Whether the prompt uses JSON output
 > Fixed hourly cost spread over fewer tokens raises the per-token price; a fleet at 30% utilization pays
 > three times more per token than the same fleet at 90%.
+
+## Use cases & projects
+### Use cases
+- **Go or no-go on a new agent feature.** A per-run cost estimate from prototype traces shows whether the
+  agent fits the price the product can charge.
+- **Setting turn and budget caps.** The turn and cost distributions of successful runs give caps that
+  bound runaway loops without cutting off hard tasks.
+- **Explaining an invoice gap.** Comparing a median-based forecast with the trace mean and tail share
+  shows where the missing money went.
+- **API versus self-hosted for an agent's model.** The utilization term decides whether owning GPUs
+  beats per-token pricing at the agent's real traffic.
+
+### Mini project
+**Cost model for your own agent (1-2 hours).**
+- **Goal:** forecast the monthly cost of a small tool-calling agent from its own traces.
+- **Steps:** run an agent with two tools on 30 varied tasks; log tokens by type, turns and tool calls per
+  run from the provider usage fields; compute cost per run from a versioned price config; report p50,
+  p95, p99, the mean and the top-10% share; forecast 100k runs a month.
+- **Done when:** you have the distribution table, a forecast using the mean, the median-based forecast for
+  contrast, and a proposed turn cap and per-run cost cap justified by the numbers.

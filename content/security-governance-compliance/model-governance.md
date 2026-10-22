@@ -5,7 +5,8 @@ name: Model governance
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - security-governance-compliance/ai-inventory-and-use-case-risk-classification
   - security-governance-compliance/model-cards
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-Model governance controls which models may be used, for what, on what evidence, and how changes are
-approved, monitored and retired. Models change without code changes and fail statistically, so good
-governance is automated: a registry, risk-tiered approval, a gateway refusing unapproved models.
+Model governance controls which models your agents may call, for what use, on what evidence, and how
+changes are approved, monitored and retired. Models change without code changes, so it is automated: a
+registry, risk-tiered approval, a gateway refusing unapproved models.
+
+## For agent builders
+- **Why it matters for agents.** An agent can call several models (planner, worker, judge) and its
+  behaviour also shifts with prompts, tools and retrieval. A provider repointing an alias, or a teammate
+  adding a tool, changes what the agent does with no model deploy at all.
+- **Where it shows up in your stack.** The model reference in your agent config (pinned snapshot or
+  alias), the AI gateway's registry check on every call, the release pipeline that runs your agent eval
+  suite, and the registry entry that links eval and red-team evidence to a version.
+- **What you control.** Pinning snapshots, which agent changes count as material, the eval and red-team
+  evidence each release produces, and whether every model in a multi-model agent is approved for this
+  use case.
+- **What you can skip.** Writing the governance policy. Risk and compliance own the tiers; you own making
+  your agent's releases produce the evidence automatically and making the gateway enforce the result.
 
 ## Why it exists
 - **Banks learned this first.** A wrong pricing or credit model does not crash; it quietly makes bad
@@ -203,6 +217,42 @@ print(required_review({"temperature"}, "medium"))
 # classify first: ['temperature'] not on the list
 ```
 
+### Agent scenario: the governed unit is the whole agent
+An agent's behaviour comes from several models plus prompt, tools and retrieval, so the release check
+diffs an agent manifest and feeds the changed fields to `required_review` above. Here v15 adds a
+`send_letter` tool to a high-tier claims agent and raises a timeout. Model names are invented.
+
+```python
+import hashlib
+
+def manifest(agent):                      # every field that can change what the agent does
+    return {
+        "model_snapshot": tuple(sorted(agent["models"].items())),   # planner and worker models
+        "prompt": hashlib.sha256(agent["system_prompt"].encode()).hexdigest()[:12],
+        "tools": tuple(sorted(agent["tools"])),
+        "retrieval_sources": tuple(sorted(agent["sources"])),
+        "timeout": agent["timeout_s"],
+    }
+
+def diff(old, new):
+    a, b = manifest(old), manifest(new)
+    return {k for k in a if a[k] != b[k]}
+
+v14 = {"models": {"planner": "provider-x/large-2025-06-01", "worker": "provider-x/small-2025-05-12"},
+       "system_prompt": "You are the claims assistant...", "tools": ["lookup_policy", "draft_letter"],
+       "sources": ["policy-docs-v3"], "timeout_s": 30}
+v15 = {**v14, "tools": ["lookup_policy", "draft_letter", "send_letter"], "timeout_s": 45}
+
+changed = diff(v14, v15)
+print(sorted(changed), "->", required_review(changed, "high"))
+# ['timeout', 'tools'] -> rerun evals, red-team, independent validator sign-off, canary rollout
+```
+
+- **A new tool is a material change** even with no model swap, because it changes what a steered or
+  mistaken agent can do: here it moves the agent from drafting letters to sending them.
+- **Every model in the agent needs its own registry approval** for this use case, including the cheap
+  worker model, because the gateway check runs per call.
+
 ### Worked scenario: one model, three use cases
 | Use case | Tier | Evidence required | Gateway result with the support-drafting approval only |
 |---|---|---|---|
@@ -226,6 +276,9 @@ print(required_review({"temperature"}, "medium"))
 - **Expiring approvals with automated re-runs.** Each approval has an expiry; the pipeline re-runs the
   tier's evals ahead of it so renewal is a review, not a rebuild. Monitor approvals past expiry and time
   from request to approval per tier.
+- **Agent manifests as the release unit.** Version each agent as one manifest (models, prompt hash, tool
+  list, retrieval sources) and diff it in CI to decide the review depth, as in the agent scenario. Monitor
+  releases whose manifest changed a material field without a linked eval run.
 - **Sandbox tier for exploration.** A separate environment with synthetic or public data where any model
   may be tried without approval, and no route to production data. Monitor sandbox-to-production promotions
   that skip registration.
@@ -318,6 +371,14 @@ is refused until the new approval exists.
 - **Tests:** the validator does not report to the product owner, can block a release rather than just
   comment, and reviews evidence tied to the exact version being deployed.
 
+### Your approved agent uses a large planner model. To cut cost, a team routes simple steps to a small model. What governance does that need?
+- **The small model needs its own approval for this use case,** with evidence from the agent eval suite on
+  the steps it will handle, because the approval was for the large model only.
+- **The routing rule is itself a material change:** it alters which model produces which outputs, so the
+  tier's evals rerun on the whole agent, not just on the small model in isolation.
+- **The gateway enforces it per call,** so an unregistered worker model is refused even if the agent code
+  ships first.
+
 ## Quiz
 ### Q: Why should model approvals be tied to use cases rather than to models alone?
 - [ ] Use cases are easier to name in a registry than model versions
@@ -342,3 +403,24 @@ is refused until the new approval exists.
 - [x] A gateway or pipeline check that refuses models not registered and approved for the use case
 > Without enforcement in the request or release path, actual usage drifts from approved usage. Reviews
 > and model cards are evidence and oversight; the refusal is the control.
+
+## Use cases & projects
+### Use cases
+- **Agents in regulated decisions.** A claims or credit agent gets high-tier approval tied to its use case,
+  with independent validation before it ships and on every material change.
+- **Multi-model agents.** Planner, worker and judge models are each registered and approved for the use
+  case, and the gateway checks every call.
+- **Provider deprecations.** Pinned snapshots plus deprecation tracking turn a forced model migration into a
+  planned re-validation of the agent.
+- **Platform teams serving many agent teams.** Registration as a side effect of gateway access gives
+  auditors one view without a separate form.
+
+### Mini project
+**Governed release pipeline for an agent (2-3 hours).**
+- **Goal:** a CI step that decides, from an agent's manifest diff, whether a release ships, needs evals, or
+  needs a validator.
+- **Steps:** write manifests for two versions of a small agent; implement `manifest`, `diff` and
+  `required_review` from this lesson; add the `authorise` registry check for every model in the manifest;
+  run the agent eval suite when a material field changed and attach its result to the registry entry.
+- **Done when:** a timeout-only change ships with no re-approval, a new tool triggers the tier's review, an
+  unregistered worker model is denied, and an alias in the manifest fails the build.

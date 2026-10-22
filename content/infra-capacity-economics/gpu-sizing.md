@@ -419,3 +419,25 @@ contexts will be bandwidth-bound on one card, so latency targets need checking t
 > With ~4.5 GB of cache room, int4 weights (~4.4 GB instead of 16 GB) more than triple the space for
 > KV blocks. Multi-head attention would multiply KV per token by four and reduce concurrency; a larger
 > `max_model_len` changes the worst case per request, not the total capacity.
+
+## Use cases & projects
+### Use cases
+- **Concurrency planning for an agent platform.** Turning "how many agent sessions per GPU" into a number
+  from weights, KV bytes per token and the typical transcript length at the last step.
+- **Choosing a context cap per agent type.** A coding agent with long transcripts and a short FAQ agent
+  need different `max_model_len` and concurrency limits, often on different deployments.
+- **Picking the card for fine-tuning on agent traces.** The 16-bytes-per-parameter rule for full
+  fine-tunes versus LoRA or QLoRA decides whether one card is enough.
+- **Deciding quantisation before buying GPUs.** int4 or fp8 weights free memory for KV cache, which for
+  agents usually buys more concurrent sessions than a bigger card would.
+
+### Mini project
+**Build a VRAM calculator for agent sessions (1-2 hours).**
+- **Goal:** predict how many concurrent agent sessions a given model and card can hold, then check it
+  against a real engine.
+- **Steps:** write a Python function that takes parameter count, precision, layers, KV heads, head dim,
+  card memory and a per-session token profile (prefix plus tokens per step times steps); compute weights,
+  KV per token and sessions that fit with headroom; compare the result with the KV capacity line vLLM
+  prints at start-up for the same model and settings, if you have a GPU.
+- **Done when:** the calculator prints sessions-per-card for at least three agent profiles, and you can
+  explain any gap between its estimate and the engine's reported capacity.

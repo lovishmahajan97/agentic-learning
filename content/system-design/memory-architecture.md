@@ -409,3 +409,24 @@ no retrieval, summary or extraction can surface it afterwards.
 - [ ] Limiting memories to the last seven days
 > Leakage comes from wrong keys and post-filtering, not from encryption or recency. Scope must be part of
 > the row and enforced where candidates are selected.
+
+## Use cases & projects
+### Use cases
+- **Personal assistants.** The agent remembers preferences and standing instructions across sessions, and
+  updates a fact when the user corrects it instead of storing both versions.
+- **Account-aware support agents.** Past issues, decisions and open tasks for a customer are retrieved at
+  the start of a session, scoped by tenant and user.
+- **Long-running project agents.** Working memory is summarized into episodes and decisions, so the
+  context window holds the current task instead of the whole history.
+- **Regulated deployments.** Memory rows carry lineage and TTLs, so a deletion request removes every
+  derived memory as well as the source.
+
+### Mini project
+**Add scoped, updatable memory to a chat agent (2-3 hours).**
+- **Goal:** give an agent long-term memory that updates facts, respects user scope and can be deleted.
+- **Steps:** create a typed-slot table for profile facts and a vector table for episodes, both keyed by
+  tenant and user; extract candidate memories after each session; overwrite a slot when a new fact
+  contradicts it; retrieve under a fixed token budget with the scope filters inside the query; add a
+  delete-by-user command.
+- **Done when:** a scripted three-session test shows the corrected fact winning, a second user never sees
+  the first user's memories, and deletion leaves no rows for that user.

@@ -429,3 +429,24 @@ those queries.
 > SPLADE keeps the sparse, vocabulary-dimensional representation and inverted-index serving, but learns
 > the weights and expands documents with related terms, which addresses vocabulary mismatch without a
 > vector database. The index structure is unchanged.
+
+## Use cases & projects
+### Use cases
+- **Coding and DevOps agents.** Queries copied from tool output (error codes, function names, ticket ids)
+  need the sparse arm; "why does login time out" needs the dense one.
+- **Customer-support agents.** Paraphrased customer questions favor dense retrieval, while order numbers
+  and product SKUs favor exact term matching.
+- **Tool design decisions.** Teams decide whether the agent gets one fused search tool or separate
+  keyword and semantic tools, based on which query types dominate their traces.
+- **Out-of-domain corpora.** Legal, medical or internal jargon where an off-the-shelf embedding model
+  underperforms is where a BM25 baseline earns its place.
+
+### Mini project
+**Slice an agent's queries by retrieval family (1-2 hours).**
+- **Goal:** find which agent query types each retrieval family misses on your own corpus.
+- **Steps:** index 1k-5k docs in both a BM25 retriever and a vector store; write 30 queries split into
+  identifier lookups, paraphrased questions and mixed queries, each with one labeled relevant doc;
+  measure recall@5 per family per slice; expose the better setup as tools to a small agent and run the
+  mixed slice through it.
+- **Done when:** you have a recall table per slice showing where each family fails, and a decision on
+  one fused tool versus two separate tools backed by those numbers.

@@ -5,7 +5,8 @@ name: Trade-off analysis
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - system-design/nfrs
   - system-design/adrs
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Trade-off analysis chooses between options when none dominates: filter by hard constraints, score real
-options on NFR evidence, find where the ranking flips, weigh reversibility, then record. In AI it is
-usually quality vs latency vs cost, plus vendor risk.
+Trade-off analysis picks an agent design when no option dominates: filter by hard constraints, score real
+options on golden-set evidence, find where the ranking flips, weigh reversibility, record. For agents it
+is usually task success vs latency vs cost per task.
+
+## For agent builders
+- **Why it matters for agents.** Every agent design choice is a trade: large model or small, one agent or
+  planner plus executors, long context or retrieval, hosted or self-hosted, framework or plain loop. The
+  answer depends on your tasks, volume and quality floor, and it changes when a new model ships.
+- **Where it shows up in your stack.** The golden set and eval harness that fill the quality cells, the
+  token and cost meter that fills the cost cells, load tests for latency, the gateway or retriever
+  interface that keeps a fragile choice switchable, and the ADR that records it.
+- **What you control.** Which constraints filter options out, the dimensions taken from your NFR priority,
+  the evidence grade of each cell, the flip input you put on a dashboard, and how reversible you keep the
+  choice.
+- **What you can skip.** Formal ATAM workshops and twelve-column matrices. Constraints, three options,
+  graded evidence, one flip condition and a reversibility note decide most agent choices.
 
 ## Why it exists
 - **Everything is a trade-off.** Richards and Ford's first law; their corollary is that if you think a
@@ -37,7 +51,7 @@ usually quality vs latency vs cost, plus vendor risk.
   - **Best-practice and vendor-benchmark decisions** import someone else's context, the one thing a
     trade-off is sensitive to.
   - **Analysis paralysis:** with no method, every decision is a debate won by the loudest voice.
-- **AI makes it worse.** Options change monthly and published benchmarks do not transfer to your data.
+- **Agents make it worse.** Options change monthly and published benchmarks do not transfer to your tasks.
   Hosted or self-hosted, large or small model, long context or retrieval, fine-tune or prompt: the honest
   answer is "it depends on volume, quality threshold and how often you will need to switch".
 - **What a good analysis outputs.** Not "we picked X", but what the choice depends on, at what value the
@@ -47,8 +61,8 @@ usually quality vs latency vs cost, plus vendor risk.
 ### 1. Frame the decision
 - **One sentence:** the decision, its scope, who decides, by when.
 - **Separate hard constraints from dimensions.** Constraints (EU residency, a licence forbidding
-  commercial use, a budget ceiling, a launch date) are filters: an option violating one is removed before
-  scoring.
+  commercial use, a budget ceiling, a task-success floor, a launch date) are filters: an option violating
+  one is removed before scoring.
 - **Why filter first:** treating a constraint as a weighted dimension is how a disqualified option "wins
   on points".
 - **Constraints come from the NFRs**, which is why trade-off analysis without written NFRs degrades into
@@ -58,12 +72,13 @@ usually quality vs latency vs cost, plus vendor risk.
 - **At least three**, including "do nothing or defer", and usually a hybrid.
 - **Why:** one option is a ratification; two is often a false dichotomy.
 - **The hybrid is frequently the answer** (hosted model for generation, self-hosted for embeddings; small
-  model escalating to a large one), but only found if it is on the list.
+  model escalating to a large one; a large planner with small executors), but only found if it is on the
+  list.
 
 ### 3. Choose the dimensions from the NFR priorities
 - **Four to seven dimensions**, drawn from the architecturally significant requirements, not a generic
-  template: quality on your golden set, p95 latency, cost per successful task, operational burden, vendor
-  or lock-in risk, time to deliver, reversibility.
+  template: task success on your golden set, p95 latency or run time, cost per successful task,
+  operational burden, vendor or lock-in risk, time to deliver, reversibility.
 - **Fewer dimensions with real evidence** beat a twelve-column matrix of guesses.
 - **The priority order is the one the business already agreed in the NFRs**, so the tie-breaker is not
   invented during the analysis.
@@ -78,25 +93,27 @@ usually quality vs latency vs cost, plus vendor risk.
 
 - **Write the grade next to the number.**
 - **Spend a prototyping day on the two cells with the highest weight and lowest grade**, *because* they
-  decide the outcome and are the most likely to be wrong.
+  decide the outcome and are the most likely to be wrong. For agents that is usually task success and
+  steps per task, which only a run over your golden set can measure.
 - **Carry ranges, not points:** "cost per 1k conversations $30–55 depending on cache hit rate" beats
   "$42".
 
 ### 5. Find the sensitivity points and the flip conditions
 This step distinguishes analysis from scoring.
 - **For each important input, ask at what value the ranking changes:** monthly volume, GPU utilisation,
-  provider price, the quality threshold, team size.
+  provider price, the quality threshold, escalation share in a router, team size.
 - **ATAM vocabulary:** these are sensitivity points; a parameter that moves two quality attributes in
-  opposite directions is a trade-off point.
+  opposite directions is a trade-off point (the step cap raises task success and cost together).
 - **A flip condition close to your expected operating point means the decision is fragile.** The right
   output is then not a winner but a design that makes switching cheap (an abstraction such as a gateway)
   plus a trigger to re-run the analysis.
 
 ### 6. Weigh reversibility and the cost of being wrong
-- **Two-way doors** (swap the model behind a gateway, change a chunking strategy) can be decided quickly on
-  thin evidence, because the cost of error is small.
+- **Two-way doors** (swap the model behind a gateway, change a chunking strategy, change a step cap) can
+  be decided quickly on thin evidence, because the cost of error is small.
 - **One-way doors** (train on customer data, commit to an embedding model that fixes a billion-vector
-  index, sign a multi-year commitment) deserve prototypes, ranges and a pre-mortem.
+  index, sign a multi-year commitment, give an agent autonomous writes) deserve prototypes, ranges and a
+  pre-mortem.
 - **Under uncertainty, reversibility has option value** that a static matrix does not show, so give it
   explicit credit.
 
@@ -126,8 +143,8 @@ This is a defensible rule when nobody can honestly narrow the range, and the tab
 scenario each option is betting on.
 
 ## Diagram
-The seven steps as a pipeline; the sensitivity check decides whether you pick a winner or design for cheap
-switching, and the revisit trigger loops back to the start.
+The seven steps as a pipeline; the sensitivity check decides whether you pick a winning agent design or
+design for cheap switching, and the revisit trigger loops back to the start.
 
 ```mermaid
 flowchart TD
@@ -145,13 +162,55 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: one large model, one small model, or a router
+A support agent must reach task success of at least 0.80 on its golden set (a constraint) and stay under
+$0.08 per successful task (an NFR). All figures are illustrative; the shape of the reasoning is the point.
+
+```python
+# Illustrative: one support agent, three designs, scored on a golden set.
+LARGE = {"steps": 8, "per_step": 0.020, "success": 0.86}
+SMALL = {"steps": 11, "per_step": 0.002, "success": 0.70}
+HYBRID_SUCCESS = 0.84          # measured on the golden set at 25% escalation (illustrative)
+MIN_SUCCESS, CEILING = 0.80, 0.08   # NFRs: task success floor, $ per successful task
+
+def run_cost(o): return o["steps"] * o["per_step"]
+
+def hybrid_cost(escalation):
+    return (1 - escalation) * run_cost(SMALL) + escalation * run_cost(LARGE)
+
+options = {
+    "large every step": (run_cost(LARGE), LARGE["success"]),
+    "small every step": (run_cost(SMALL), SMALL["success"]),
+    "small, escalate 25%": (hybrid_cost(0.25), HYBRID_SUCCESS),
+}
+for name, (cost, success) in options.items():
+    verdict = "filtered: below success floor" if success < MIN_SUCCESS else f"${cost / success:.3f} per success"
+    print(f"{name:<20} ${cost:.3f}/run  success {success:.2f}  {verdict}")
+
+flip = (CEILING * HYBRID_SUCCESS - run_cost(SMALL)) / (run_cost(LARGE) - run_cost(SMALL))
+print(f"hybrid breaks the ${CEILING} ceiling above {flip:.0%} escalation")
+# large every step     $0.160/run  success 0.86  $0.186 per success
+# small every step     $0.022/run  success 0.70  filtered: below success floor
+# small, escalate 25%  $0.057/run  success 0.84  $0.067 per success
+# hybrid breaks the $0.08 ceiling above 33% escalation
+```
+
+- **The constraint filters first.** The small model is cheapest per run but fails the 0.80 floor, so it
+  never reaches scoring, however good its cost looks.
+- **Cost per successful task decides between the rest.** The router costs about a third of the large model
+  per success.
+- **The flip input is escalation share.** Above about 33% the router breaks the ceiling, so it goes on a
+  dashboard and into the ADR as a revisit trigger. The model treats success as fixed, a simplification to
+  re-measure as escalation changes.
+
 ### Break-even: the cost cell of hosted vs self-hosted
 - **Illustrative figures only:** replace them with your own quotes and a load-tested throughput number.
   The script is the shape of the reasoning, not a benchmark.
 - **The finding:** at these inputs self-hosting only wins above roughly 18 billion tokens a month, and a
   drop in utilisation from 50% to 40% makes it never win, *because* idle GPUs still bill.
 - **That utilisation sensitivity belongs in the ADR**, alongside the quality and risk dimensions this cell
-  says nothing about.
+  says nothing about. Agent traffic reaches such volumes sooner than chat, because every run makes many
+  model calls.
 
 ```python
 # Illustrative figures only. Replace with your provider quote and your measured throughput.
@@ -239,14 +298,16 @@ for high in (30e9, 50e9):
   (measured, prototyped, estimated, asserted), and the ADR template has a column for both. Monitor the
   share of high-weight cells still graded "asserted" at decision time.
 - **Time-boxed spike on the riskiest cells.** Use when the two highest-weight, lowest-grade cells could
-  flip the result. Run the spike on your golden set and your traffic shape, not a vendor demo. Monitor
-  whether spike results changed the ranking; if they never do, the matrix is being built backwards.
+  flip the result. Run each candidate agent design over your golden set and your traffic shape, not a
+  vendor demo, and record task success, steps and cost per run. Monitor whether spike results changed the
+  ranking; if they never do, the matrix is being built backwards.
 - **Pin priorities before scoring.** Use in every review. Commit the NFR priority order and the dimension
   list before any option is scored, so the history shows weights did not move afterwards. Monitor weight
   changes after the first scoring pass.
 - **Gateway plus flip-input dashboard.** Use when the flip condition is near the operating point. Put the
-  choice behind an abstraction (an LLM gateway, a retriever interface) and chart the flip input (monthly
-  tokens, utilisation, price) against its threshold. Alert when it crosses and link the ADR.
+  choice behind an abstraction (an LLM gateway, a model router, a retriever interface) and chart the flip
+  input (monthly tokens, utilisation, price, escalation share) against its threshold. Alert when it
+  crosses and link the ADR.
 - **Pre-mortem and halving test in the review agenda.** Use for one-way doors. Ask "a year later this
   failed, why?" and "would we still choose this at half or double the volume?" before deciding. Monitor
   risks raised there that later appear in incidents.
@@ -259,8 +320,8 @@ for high in (30e9, 50e9):
 - **Explicit weights: arguable priorities vs tuning toward a favourite.** The defence is fixing the
   priority order in the NFRs before any option is scored.
 - **Optimising for reversibility: open options vs abstraction cost.** Every switching abstraction costs
-  something and can hide capabilities of what sits behind it. It pays off when the flip condition is near,
-  not when one option clearly dominates.
+  something and can hide capabilities of what sits behind it, such as a provider's native tool-calling
+  features. It pays off when the flip condition is near, not when one option clearly dominates.
 - **Sensitivity analysis: knowing what matters vs needing real inputs.** It needs volume forecasts,
   utilisation and prices; with none, say so and set a short revisit date instead of inventing them.
 
@@ -272,7 +333,9 @@ for high in (30e9, 50e9):
 - **Point estimates with false precision.** Symptom: a decision resting on a 7.4 versus 7.1 total that no
   one can reproduce.
 - **A provider's or paper's benchmark as the quality cell.** Symptom: a model wins on the leaderboard and
-  loses on your golden set after the contract is signed.
+  loses on your agent golden set after the contract is signed.
+- **Scoring cost per call instead of per successful task.** Symptom: a cheap model chosen for an agent
+  that then takes more steps and fails more tasks, so the bill and the complaint rate both rise.
 - **Forgetting the fixed operational cost of running things yourself.** Symptom: a self-hosting plan
   whose per-token cost looked lower and whose monthly bill is higher.
 - **Typing in a utilisation figure instead of deriving it from the traffic profile.** Symptom: a GPU bill
@@ -285,12 +348,12 @@ for high in (30e9, 50e9):
 ## When to use
 - **Full method:** one-way doors and any choice whose flip condition is plausibly near your operating
   point: hosted versus self-hosted, embedding model and vector store, tenancy model, fine-tune versus
-  retrieval, build versus buy on a core capability.
+  retrieval, single agent versus multi-agent, build versus buy on a core capability.
 - **Short form for everything else:** constraints, three options, one flip condition, a reversibility
   note.
 - **Skip it** for decisions that are cheap to undo.
-- **Measure:** your own quality on your own golden set, your own throughput under your own load, and your
-  own volume forecast with a range.
+- **Measure:** your own task success on your own golden set, your own throughput under your own load, and
+  your own volume forecast with a range.
 - **Interviews:** the strongest answers to "would you use X or Y" name the dimensions, state the deciding
   assumption, give the value at which the answer flips, and say how they keep the choice reversible until
   the data arrives.
@@ -325,11 +388,18 @@ measured pilot rather than a bet.
 - **Fix:** fix the priority order from the NFRs before scoring, grade every cell's evidence, carry ranges,
   and run a sensitivity analysis instead of trusting the total.
 
-### Walk me through deciding between a large hosted model and a small self-hosted one.
+### How would you choose between a large model on every step and a small model with escalation for an agent?
+- **Filter:** drop any option below the task-success floor on your golden set, however cheap it is.
+- **Score on cost per successful task:** cost per run divided by task success, because a small model that
+  takes more steps or fails more tasks can cost more per outcome.
+- **Name the flip:** in a router the escalation share is the flip input; in the illustrative example the
+  router breaks an $0.08 ceiling above about 33% escalation, so chart it and record it as a trigger.
+
+### Walk me through deciding between a large hosted model and a small self-hosted one for an agent platform.
 - **Filter:** residency, licence, security review, and whether anyone can operate GPUs.
 - **Options:** hosted large, self-hosted small, and a hybrid where the small model escalates hard cases.
-- **Evidence:** quality on your golden set, p95 latency under load, cost per successful task, operational
-  burden, each graded.
+- **Evidence:** task success on your golden set, p95 latency under load, cost per successful task,
+  operational burden, each graded.
 - **Decide on the flip:** compute break-even volume and utilisation, compare with the forecast range, and
   keep the choice behind a gateway.
 
@@ -342,8 +412,8 @@ measured pilot rather than a bet.
   the hosted price.
 
 ### When would you not run a full trade-off analysis?
-- **For two-way doors**, such as swapping a model behind a gateway or changing a chunking strategy: the cost
-  of being wrong is small, so a paragraph with one flip condition is enough.
+- **For two-way doors**, such as swapping a model behind a gateway, changing a chunking strategy or
+  adjusting a step cap: the cost of being wrong is small, so a paragraph with one flip condition is enough.
 - **When inputs do not exist yet:** say so, choose the most reversible option, and set a short revisit date
   rather than inventing numbers.
 
@@ -380,3 +450,24 @@ measured pilot rather than a bet.
 > Self-hosted cost per token is GPU cost per hour divided by tokens actually served per hour; serving
 > fewer tokens on the same billed hardware raises it. Once it exceeds the hosted price per token, no
 > volume recovers the fixed costs.
+
+## Use cases & projects
+### Use cases
+- **Model tier for an agent.** Teams compare a large model, a small model and a router on task success and
+  cost per successful task, then watch escalation share as the flip input.
+- **Single agent versus planner plus executors.** The analysis weighs task success on long tasks against
+  extra steps, latency and debugging cost before adopting a multi-agent design.
+- **Long context versus retrieval.** Cost per run, latency and faithfulness on the golden set decide
+  whether to stuff documents into context or add a retrieval step.
+- **Hosted versus self-hosted serving.** Break-even volume and utilisation decide when an agent platform's
+  token volume justifies its own GPUs, kept reversible behind a gateway.
+
+### Mini project
+**Run a graded trade-off for your agent's model tier (2-3 hours).**
+- **Goal:** pick between three agent designs with evidence, a flip condition and an ADR.
+- **Steps:** take a small tool-calling agent and a 30-case golden set; run it with a large model, a small
+  model and a small model that escalates on failure; record task success, steps and token cost per run;
+  filter by a success floor; compute cost per successful task; find the escalation share or volume at
+  which the ranking flips.
+- **Done when:** you have a matrix with every cell graded, a named flip condition with its threshold, and
+  a one-page ADR with a revisit trigger wired to a number you can monitor.

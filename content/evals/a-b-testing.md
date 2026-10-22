@@ -408,3 +408,24 @@ guardrails (latency, cost, escalations) are checked before anyone reads the prim
 > A mismatch this large under a 50/50 split is very unlikely by chance and usually means one arm drops
 > users (errors, logging failures), which biases who remains. Any result computed on biased arms is
 > untrustworthy, so fix the pipeline first.
+
+## Use cases & projects
+### Use cases
+- **Choosing between two agent models.** Users are bucketed to each model snapshot and compared on task
+  completion, with cost per task and steps per task as guardrails.
+- **Testing a new tool or retriever.** A candidate tool set ships to one arm, and resolution and
+  escalation rates decide whether it stays.
+- **Catching costly wins.** A guardrail on tokens per conversation shows when a quality gain costs more
+  than it is worth.
+- **Validating offline gains.** An A/B test confirms whether an offline eval improvement moves a real
+  user outcome.
+
+### Mini project
+**Analyse a simulated A/B test of two agent versions (2-3 hours).**
+- **Goal:** run the full analysis an agent team does before calling a winner.
+- **Steps:** simulate users assigned 50/50 by hashing user ID; generate conversations with a completion
+  outcome, steps and token cost per arm; fix the sample size up front with a power calculation; run a
+  sample ratio mismatch check; compare the primary outcome with a confidence interval and report the
+  guardrails; then inject a logging bug that drops failed sessions in one arm and re-run.
+- **Done when:** the report gives the primary effect with its interval and guardrail deltas, and the
+  injected bug is caught by the sample ratio check before any effect is reported.

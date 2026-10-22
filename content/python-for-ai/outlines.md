@@ -411,3 +411,25 @@ cache indexes and avoid generating schemas on the fly.
 - [ ] Declaring all fields as required
 > The constraint allows any length string, so a looping model keeps emitting valid characters until the
 > token limit, leaving the JSON unclosed. Bounding length with maxLength prevents it.
+
+## Use cases & projects
+### Use cases
+- **Local tool-calling agents.** A small open model on a laptop or single GPU emits tool calls that
+  always parse, so the loop never stalls on malformed arguments.
+- **Self-hosted agent platforms.** Teams serving open models behind vLLM use guided decoding through the
+  OpenAI-compatible `response_format` so every agent step returns schema-shaped JSON.
+- **Routing and classification steps.** A choice list constrains a router to the exact labels the agent
+  branches on, with no free-text drift.
+- **Offline batch steps.** Bulk extraction or labelling feeding an agent's knowledge base runs with no
+  parse-and-retry pass.
+
+### Mini project
+**Constrained versus unconstrained tool calls on a small model (2-3 hours).**
+- **Goal:** measure how constrained decoding changes tool-call validity for a small local model in a
+  short agent loop.
+- **Steps:** pick a small open model you can run locally; define a tool-call schema with a `Literal`
+  tool name and bounded string arguments; run 50 prompts unconstrained and parse the output, then run the
+  same prompts with Outlines constraining to the schema; record parse rate, correct-tool rate and latency
+  including the first-request compile cost.
+- **Done when:** you have a table comparing both runs and a short note separating syntax gains (parse
+  rate) from correctness (right tool, right arguments), which the constraint does not fix.

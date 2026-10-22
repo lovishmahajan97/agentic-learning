@@ -371,3 +371,24 @@ credentials. Clean scanner output narrows risk; it does not certify the system.
 - [ ] Adding nosec comments to import statements
 > pip-audit only reports known advisories, and Bandit scans your code, not packages. Controlling what
 > enters the lock, and verifying hashes from trusted sources, is what stops an unknown malicious package.
+
+## Use cases & projects
+### Use cases
+- **Auditing an agent's dependency graph.** pip-audit on the lock catches known CVEs in framework
+  integrations, MCP server packages, document parsers and provider SDKs before deploy.
+- **Reviewing tool code that runs model output.** Bandit or Ruff `S` rules flag `shell=True`, `eval` and
+  string-built SQL in exactly the tools where model output becomes execution.
+- **Keeping agent API keys out of the repo.** A secret scanner in pre-commit and CI stops provider and tool
+  credentials from being committed.
+- **Admitting new integrations.** A review gate for new tool and integration packages limits what a
+  compromised or typosquatted package can reach.
+
+### Mini project
+**Add a security gate to an agent repo (1-2 hours).**
+- **Goal:** fail CI on known-vulnerable dependencies and unsafe tool code in a small agent project.
+- **Steps:** write one deliberately unsafe tool that passes model output to a shell with `shell=True`;
+  add pip-audit against the lock and Bandit on the tools package to CI; add a suppression that must name a
+  reason and an expiry; fix the tool by passing an argument list and validating input against an
+  allowlist; add a secret scanner to pre-commit.
+- **Done when:** CI fails on the unsafe tool and passes after the fix, a planted fake key is blocked, and
+  every suppression in the repo has a reason and an expiry date.

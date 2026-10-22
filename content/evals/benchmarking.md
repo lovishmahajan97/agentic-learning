@@ -425,3 +425,23 @@ nothing more.
 > The task requires navigating a repository, editing files and running tests; how the harness exposes
 > those actions, how many attempts it allows and what it costs all move the result. The same model in
 > a different scaffold produces a different number.
+
+## Use cases & projects
+### Use cases
+- **Shortlisting the model behind a new agent.** Public coding, reasoning and tool-calling benchmarks
+  narrow the field to two or three candidates worth running on your own tasks.
+- **Reading a vendor launch table.** Checking protocol, scaffold and interval tells you whether a "lead"
+  is a real gap or a tie.
+- **Choosing a model for a coding agent.** Agentic benchmarks such as SWE-bench show model plus scaffold;
+  running the candidate through your own scaffold shows what you will actually get.
+- **Cost-aware model selection.** Logging cost per task alongside score shows when a cheaper model is
+  good enough for the agent's job.
+
+### Mini project
+**Re-run a small benchmark slice through your own agent scaffold (2-3 hours).**
+- **Goal:** see how much the scaffold and protocol move a benchmark-style score for two candidate models.
+- **Steps:** pick 30-50 public tool-calling or coding tasks with automatic scoring; run each candidate
+  model once with a plain prompt and once inside your own tool-calling loop; keep sampling settings fixed;
+  log pass/fail, steps and cost per task; compute pass rates with a rough interval.
+- **Done when:** you have a table of score and cost per model and setup, and a short note on whether the
+  ranking changed between the plain prompt and your scaffold.

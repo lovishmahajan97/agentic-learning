@@ -448,3 +448,24 @@ land in the costly category.
 > Deployment and residency constraints are binary: a model that cannot legally or technically process
 > the data is not a candidate regardless of quality or price. Price and recency are inputs to the
 > later optimisation step, not gates.
+
+## Use cases & projects
+### Use cases
+- **Choosing the model for a new agent.** The funnel removes models that fail hard constraints (tool
+  calling, context at the last step, residency) before any quality testing is spent on them.
+- **Picking per-role models.** A planner, a tool caller and a summariser can each get the cheapest model
+  that clears their own bar.
+- **Evaluating a newly released model.** A paired comparison on your agent tasks answers whether to
+  switch, instead of a leaderboard headline.
+- **Responding to a deprecation notice.** The same eval harness re-qualifies a replacement model and
+  shows how much prompt re-tuning it needs.
+
+### Mini project
+**Run a whole-run model bake-off (2-3 hours).**
+- **Goal:** pick a model for a small tool-calling agent on run-level success, not per-call quality.
+- **Steps:** build a 3-tool agent and 20 tasks with checkable end states; run each task with two or
+  three candidate models (several repeats each); log run success, tool-call validity, steps per run,
+  tokens and latency from provider usage fields; compute cost per successful run.
+- **Done when:** you have a table per model with success rate plus an interval, cost per successful run
+  and p95 latency, and a one-paragraph choice naming the cheapest model that clears your bar with a
+  margin.

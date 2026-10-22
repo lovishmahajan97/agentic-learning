@@ -368,3 +368,23 @@ evaluation before deployment.
 - [ ] Because safetensors loads slower than pickle in every case
 > safetensors deliberately stores only named tensors. Training-resume checkpoints often include non-tensor
 > state, so `torch.save` remains common internally, as long as those files never come from untrusted sources.
+
+## Use cases & projects
+### Use cases
+- **Self-hosted agent models.** Model servers load `model.safetensors` shards, and memory-mapping speeds
+  cold starts when agent traffic scales out.
+- **Per-tenant LoRA adapters.** PEFT writes `adapter_model.safetensors`, so accepting adapters from teams or
+  customers does not mean running their code on load.
+- **Model intake policy.** Agent platforms that pull from a hub can require safetensors and reject pickle
+  checkpoints as a supply-chain control.
+- **Provenance tracking.** Header metadata can record which trace dataset and run produced a fine-tuned
+  agent model.
+
+### Mini project
+**Write a safe model intake check for an agent platform (1-2 hours).**
+- **Goal:** accept only safe, traceable weights before an agent model server loads them.
+- **Steps:** write a script that rejects `.bin`, `.pt` and `.pkl` files in a model folder; for each
+  safetensors file, read the header only and list tensor names, dtypes and shapes; require a provenance
+  key in the metadata; load the model with `use_safetensors=True`.
+- **Done when:** the script passes a clean folder, fails a folder containing a pickle file, and prints a
+  short manifest you could attach to a deployment.

@@ -451,3 +451,24 @@ client or SDK also retries, so attempts are not multiplied across layers.
 - [ ] before_sleep_log suppresses the final exception
 > When the stop condition fires, tenacity raises RetryError by default. Setting reraise=True re-raises the
 > last underlying exception, so existing except clauses for the SDK's error types keep working.
+
+## Use cases & projects
+### Use cases
+- **Flaky tool APIs inside agent runs.** Retrying transient search, CRM or database errors keeps a long
+  run from failing on one bad call, while permanent errors go back to the model as a tool result.
+- **Rate-limited model calls under load.** Jittered exponential backoff that honours `Retry-After` spreads
+  retries from many concurrent agent sessions instead of hammering the provider in sync.
+- **Write tools with side effects.** Retrying a "create ticket" or "send email" tool only with an
+  idempotency key prevents duplicates when the first attempt actually succeeded.
+- **Step budgets under a run deadline.** A stop on total delay keeps one retried step from consuming the
+  whole run's latency budget.
+
+### Mini project
+**Add a retry policy to an agent's tool layer (1-2 hours).**
+- **Goal:** make a two-tool agent survive injected transient failures without duplicate side effects.
+- **Steps:** wrap a fake search tool that fails randomly with a timeout or a 429, and a fake "create
+  ticket" tool; add tenacity with `wait_random_exponential`, a stop on attempts and total delay,
+  `reraise=True` and retry only on transient types; give the write tool an idempotency key; log each retry
+  with the run and step; run 100 simulated agent runs with and without the policy.
+- **Done when:** you have a table of run success rate and total retries for both settings, no run creates
+  a duplicate ticket, and permanent errors reach the model instead of being retried.

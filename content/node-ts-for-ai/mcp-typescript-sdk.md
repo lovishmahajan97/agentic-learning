@@ -5,7 +5,8 @@ name: MCP TypeScript SDK
 kind: tool
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - agents/model-context-protocol
   - agents/mcp-authentication-authorization-transport-security
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-`@modelcontextprotocol/sdk` is the reference TypeScript MCP implementation: servers turn Zod-typed handlers
-into JSON-RPC tool, resource and prompt endpoints; clients connect, discover and call them, over stdio or
-Streamable HTTP. It never calls a model.
+Write an agent's tools once, use them from any host: `@modelcontextprotocol/sdk` turns Zod-typed handlers
+into JSON-RPC tool, resource and prompt endpoints; its client lets your agent loop discover and call them
+over stdio or Streamable HTTP. It never calls a model.
+
+## For agent builders
+- **Why it matters for agents.** MCP is how an agent gets tools it did not ship with: an IDE agent reads your
+  repo through one server, a support agent reads tickets through another. Writing a server makes your system
+  usable by every MCP host; writing a client makes your own agent loop able to use every MCP server.
+- **Where it shows up in your stack.** `McpServer` plus `registerTool` on the tool side; `Client`,
+  `listTools()` and `callTool()` inside your agent loop; stdio for local hosts such as IDEs and desktop
+  apps, Streamable HTTP for shared remote tool servers.
+- **What you control.** Tool names, descriptions and Zod schemas (what the model reads to choose a tool),
+  `isError` messages (what the model reads when a call fails), which tools each agent sees, timeouts for
+  slow tools, and transport plus auth.
+- **What you can skip.** Hand-writing JSON-RPC framing, the handshake and SSE parsing; the SDK owns them.
+  The low-level `Server` matters only for custom capabilities or fully dynamic tool lists.
 
 ## Why it exists
 - **MCP is a real wire protocol.** JSON-RPC 2.0 messages with an `initialize` handshake, capability
@@ -151,9 +165,24 @@ Nothing in the SDK calls a language model. The host does the mapping:
 - **Keep the exposed tool set small.** A host forwarding forty tools from three servers pays in tokens and
   tool-selection accuracy on every turn.
 
+### From one round trip to an agent loop
+A real agent repeats the bridge until the model stops asking for tools. The SDK gives you the calls; the
+loop's policy is yours:
+1. **Connect once per run (or per process)** to each server, list tools, and build one prefixed, allow-listed
+   tool table.
+2. **Call the model; for every tool call, route by prefix** to the right `Client` and `callTool`.
+3. **Return every result for the turn together**, `isError` mapped to the provider's error flag, so the model
+   can retry with better arguments or pick another tool.
+4. **Stop on a final answer, a step budget, or a policy gate** (for example a write tool that needs human
+   approval before the host forwards the call).
+
+- **The server cannot enforce agent policy.** It sees one call at a time; step budgets, approvals and
+  per-user permissions live in the host loop, because only the host sees the whole run.
+
 ## Diagram
 The host drives everything: the handshake, discovery, and every tool call the model asks for. The SDK
-handles the protocol on both ends; the model only ever talks to the host.
+handles the protocol on both ends; the model only ever talks to the host, and the host repeats the last
+four messages once per agent step.
 
 ```mermaid
 sequenceDiagram
@@ -230,6 +259,62 @@ messages.push({ role: "assistant", content: reply.content }, { role: "user", con
 const final = await ask(messages);                 // the model now answers from the tool result
 ```
 
+### Agent loop over two MCP servers with a budget and an approval gate
+The host example above does one round. A production agent loops, talks to several servers and enforces
+policy the servers cannot see.
+- **Prefixed tool table:** `orders_lookup_order` and `docs_search` route back to the right `Client` by the
+  text before the first underscore, so prefixes must not contain one.
+- **Approval gate:** a write tool is forwarded only after `approve` resolves true; a denial goes back to the
+  model as an error result it can explain to the user.
+- **Step budget:** the loop throws after `maxSteps` model calls instead of running until the bill stops it.
+
+```ts
+// agent.ts — several MCP servers behind one tool table, a step budget and a human approval gate.
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import Anthropic from "@anthropic-ai/sdk";
+
+const servers: Record<string, string[]> = { orders: ["dist/orders.js"], docs: ["dist/docs.js"] };
+const NEEDS_APPROVAL = new Set(["orders_refund_order"]);         // write tools the host gates
+const clients = new Map<string, Client>();
+const tools: Anthropic.Tool[] = [];
+for (const [prefix, args] of Object.entries(servers)) {
+  const c = new Client({ name: "support-agent", version: "1.0.0" });
+  await c.connect(new StdioClientTransport({ command: "node", args }));
+  clients.set(prefix, c);
+  for (const t of (await c.listTools()).tools)
+    tools.push({ name: `${prefix}_${t.name}`, description: t.description ?? "",
+                 input_schema: t.inputSchema as Anthropic.Tool.InputSchema });
+}
+
+type Approve = (tool: string, args: unknown) => Promise<boolean>;
+export async function runAgent(task: string, approve: Approve, maxSteps = 8) {
+  const anthropic = new Anthropic();
+  const messages: Anthropic.MessageParam[] = [{ role: "user", content: task }];
+  for (let step = 0; step < maxSteps; step++) {
+    const reply = await anthropic.messages.create({ model: "claude-opus-5-5", max_tokens: 1024, tools, messages });
+    messages.push({ role: "assistant", content: reply.content });
+    if (reply.stop_reason !== "tool_use") return reply;         // final answer, or a stop reason to handle
+    const results: Anthropic.ToolResultBlockParam[] = [];
+    for (const b of reply.content) {
+      if (b.type !== "tool_use") continue;
+      const cut = b.name.indexOf("_");
+      if (NEEDS_APPROVAL.has(b.name) && !(await approve(b.name, b.input))) {
+        results.push({ type: "tool_result", tool_use_id: b.id, is_error: true, content: "Denied by the user." });
+        continue;
+      }
+      const r = await clients.get(b.name.slice(0, cut))!.callTool(
+        { name: b.name.slice(cut + 1), arguments: b.input as Record<string, unknown> });
+      const text = (r.content as { type: string; text?: string }[])
+        .filter((c) => c.type === "text").map((c) => c.text ?? "").join("\n");
+      results.push({ type: "tool_result", tool_use_id: b.id, is_error: r.isError === true, content: text });
+    }
+    messages.push({ role: "user", content: results });          // every result for this turn, one message
+  }
+  throw new Error(`step budget of ${maxSteps} exhausted`);
+}
+```
+
 ### Stateless Streamable HTTP behind a load balancer
 The same server object served over HTTP, one fresh transport per request and no session id, so any replica
 can answer any request. `buildServer()` is assumed to create the `McpServer` and register its tools as above.
@@ -254,13 +339,17 @@ app.listen(3000, "127.0.0.1");   // put authentication (OAuth) and Origin checks
 ```
 
 ### Worked scenario: the cost of forwarding every tool
-A host connects to three servers and forwards all forty of their tools. Token figures are illustrative
+A support agent's host connects to three servers and forwards all forty of their tools. Over a 10-step run
+the definitions are resent on every step. Token figures are illustrative
 orders of magnitude, not measurements; count your own with the provider's token counter.
 
-| Setup | Tools sent per turn | Definition tokens per turn (illustrative) | Effect |
-|---|---|---|---|
-| Forward everything | 40 | ~40 × 150 = ~6,000 | paid on every turn, more similar names to confuse |
-| Curated per host, prefixed | 8 | ~8 × 150 = ~1,200 | cheaper turns, clearer tool choice |
+| Setup | Tools sent per turn | Definition tokens per turn (illustrative) | Over a 10-step run | Effect |
+|---|---|---|---|---|
+| Forward everything | 40 | ~40 × 150 = ~6,000 | ~60,000 | paid on every turn, more similar names to confuse |
+| Curated per host, prefixed | 8 | ~8 × 150 = ~1,200 | ~12,000 | cheaper turns, clearer tool choice |
+
+- **Prompt caching softens the bill, not the confusion.** A stable tool list caches well, but the model still
+  chooses among forty similar names on every step.
 
 - **Collisions:** two servers each exposing `search` collide unless the host prefixes them, for example
   `docs_search` and `tickets_search`.
@@ -280,9 +369,9 @@ orders of magnitude, not measurements; count your own with the provider's token 
   only in server logs on stderr. Split the error rate by `isError` versus protocol error.
 - **Lock down local HTTP servers.** Bind to `127.0.0.1`, enable the transport's host and origin checks, and
   require OAuth before any non-local exposure. Alert on rejected origins and unauthenticated requests.
-- **Clean child-process lifecycle.** Call `await mcp.close()` from the host's shutdown handler so stdio
-  servers exit with it, and run the host with an init process if it spawns many. Watch for orphaned server
-  processes on developer machines and CI runners.
+- **Host-side gates for write tools.** Keep a list of tools that change state (refunds, emails, deletes) in
+  the agent host and require human approval or a policy check before forwarding the `callTool`; return a
+  denial as an `isError` result. Monitor approvals requested, denied and timed out per tool.
 
 ## Trade-offs
 - **Shared protocol code vs release cadence.** The SDK handles handshake, schemas and transports so a
@@ -318,14 +407,19 @@ orders of magnitude, not measurements; count your own with the provider's token 
   about a minute while the server keeps working. Pass a longer `timeout` in the request options, or send
   progress notifications and set `resetTimeoutOnProgress`.
 - **Leaving the child process running when the host exits.** Symptom: orphaned server processes accumulate
-  on developer machines.
+  on developer machines and CI runners. Fix: call `await mcp.close()` from the host's shutdown handler so
+  stdio servers exit with it, and run the host with an init process if it spawns many.
+- **Trusting the server to enforce agent policy.** Symptom: an agent loops on a write tool or acts without
+  approval, because each server only sees single calls. Fix: step budgets, approvals and per-user tool
+  allow-lists live in the host loop.
 
 ## When to use
 - **Write an MCP server** when a system should be usable by more than one host or agent framework, a
   customer or vendor already speaks MCP, or you want tools, resources and prompts described once, typed.
 - **Pick the transport:** stdio for local developer tooling and anything an IDE launches; Streamable HTTP,
   stateless where possible, with OAuth, for shared or remote servers.
-- **Write a client** when your own agent must consume third-party servers.
+- **Write a client** when your own agent must consume third-party servers; the agent loop, budgets and
+  approval gates then sit around `callTool` in your host.
 - **Avoid MCP** for a single in-process tool used by one service; a plain function with a Zod schema is
   less code.
 - **Measure** tools exposed per host, tool-call error rate split by `isError` versus protocol error, and p95
@@ -385,6 +479,13 @@ elicitation, so stateless is the usual answer, together with OAuth now that the 
 - **Fix:** pass a longer `timeout` in the request options, or send progress notifications from the server
   and set `resetTimeoutOnProgress` so progress extends the deadline.
 
+### After connecting a third MCP server, your agent starts picking the wrong tools. What do you change?
+- **Count what the model sees:** every forwarded tool's name, description and schema is resent on every
+  step, so forty tools with overlapping names both cost tokens and blur the choice.
+- **Curate per agent:** forward an allow-listed subset with server prefixes, and rewrite vague descriptions
+  so each says when to use the tool and when not to.
+- **Measure:** wrong-tool calls in traces and task success on an eval set before and after the change.
+
 ## Quiz
 ### Q: Why must an MCP server using the stdio transport never write logs with `console.log`?
 - [ ] Because the SDK disables `console` for performance reasons
@@ -414,3 +515,36 @@ elicitation, so stateless is the usual answer, together with OAuth now that the 
 > The SDK implements the protocol on both sides and manages transports. Bridging to a model, mapping
 > tool definitions into the provider's format, sending the model's tool call to `callTool` and
 > returning the result, is the host's code, or a provider-side connector if one is used.
+
+## Use cases & projects
+### Use cases
+- **Coding agents in IDEs.** A stdio server exposes repo search, test runs or a build log, and every MCP-capable
+  IDE agent can use it without a plugin per editor.
+- **Internal tool platforms.** One stateless Streamable HTTP server per system (tickets, CRM, docs), behind
+  OAuth, shared by every agent team instead of each writing its own connector.
+- **Customer-facing agents over a customer's APIs.** An FDE wraps the customer's internal API as an MCP
+  server so their existing hosts, and your agent, call it with typed inputs.
+- **Agents that consume third-party servers.** Your host connects to vendor servers, prefixes and curates
+  their tools, and gates write tools behind approval.
+
+### Mini project
+**Build an MCP tool server and drive it from your own agent loop (2-3 hours).**
+- **Goal:** a stdio MCP server with two read tools and one write tool, consumed by a small host that runs a
+  budgeted agent loop against a model.
+- **Steps:** register `search_notes`, `get_note` and `create_note` with Zod inputs and descriptions; return
+  `isError` results for not-found; log only to stderr; write the host with `Client`, `listTools()` and
+  `callTool()`, a step budget of 6 and an approval prompt for `create_note`; then connect the same server
+  to an existing MCP host such as an IDE.
+- **Done when:** the agent answers a question that needs two tool calls, a bad id comes back as an
+  `isError` result the model recovers from, `create_note` waits for approval, and the IDE lists and calls
+  the same tools unchanged.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): the document Q&A service exposes its
+retrieval and citation tools as an MCP server over stdio and stateless Streamable HTTP.
+- **Scope (multi-day):** the same tool code backs both transports, with OAuth and `Origin` checks on HTTP,
+  per-request timeouts with progress for slow retrieval, and a host agent that bridges the tools to a model
+  with a step budget.
+- **Done when:** an IDE host and your own agent both list and call the retrieval tool, bad arguments return
+  `isError` results rather than protocol errors, nothing but JSON-RPC reaches stdout, and three HTTP replicas
+  behind a balancer serve calls with zero "session not found" errors.

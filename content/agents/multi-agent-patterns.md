@@ -5,7 +5,8 @@ name: Multi-agent patterns (orchestrator-worker, handoffs)
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/task-decomposition
   - agents/planning
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Multi-agent systems split work across model loops with their own context, prompt and tools.
-Orchestrator-worker delegates to parallel workers; handoffs pass control to one specialist at a time.
-Isolation costs coordination and tokens, so one good agent is the default.
+Split your agent into several model loops only when one loop's context, tool list or permissions break.
+Orchestrator-worker fans out to parallel workers; handoffs pass the conversation to one specialist.
+Both cost tokens and coordination, so one good agent is the default.
+
+## For agent builders
+- **Why it matters for agents.** Past a dozen tools or a context full of search output, a single loop
+  picks wrong tools and holds credentials it should not. Splitting fixes that structurally, but every
+  boundary loses context and multiplies tokens, so the decision is an engineering trade, not a style.
+- **Where it shows up in your stack.** The OpenAI Agents SDK's handoffs and agents-as-tools, LangGraph
+  supervisor and subgraph patterns, sub-agents in coding agents such as Claude Code, CrewAI crews, and
+  A2A when the peer agent belongs to another team.
+- **What you control.** The split (which roles exist), the brief and output schema at each boundary, how
+  history is filtered on a handoff, transfer caps, per-agent credentials, the global budget and who owns
+  the stopping rule.
+- **What you can skip.** Debate and group-chat research setups unless you have a judge you trust; most
+  production systems are an orchestrator-worker core with handoffs at the user-facing edge.
 
 ## Why it exists
 - **One loop has one context and one tool set, and three things break as a task grows.**
@@ -392,3 +406,29 @@ rate and transfer loops before and after.
 - [ ] The tool list has grown large enough to hurt selection accuracy
 > Every agent boundary loses context. When pieces share nearly all their context, partitioning costs
 > more than it saves; the other options are precisely the conditions where multi-agent pays off.
+
+## Use cases & projects
+### Use cases
+- **Customer support with specialists.** A triage agent with only transfer tools hands the conversation
+  to billing or tech agents, each with its own short tool list and credential.
+- **Deep research.** An orchestrator sends distinct sub-questions to parallel workers that return
+  structured findings and sources, then synthesises one report with honest gaps.
+- **Large code changes.** A lead coding agent dispatches sub-agents per module, each in its own context,
+  and checks their results against tests before merging.
+- **Least-privilege operations.** Read-only investigation agents never hold the write credential; only
+  an execution agent behind approval can change state.
+
+### Mini project
+**Split a fourteen-tool support bot into triage plus two specialists (2-3 hours).**
+- **Goal:** measure whether handoffs cut wrong-tool calls and remove the refund-during-bug path.
+- **Steps:** build a single agent with all tools on mock services; label 20 support requests with the
+  correct tool; rebuild it as triage, billing and tech agents with transfer tools, filtered history and a
+  structured brief; cap transfers at 3 and log every handoff with a trace id; run both versions on the
+  same requests.
+- **Done when:** a table compares wrong-tool rate, transfers per conversation and tokens per run, and no
+  run of the tech agent can reach `issue_refund`.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): the billing-dispute agent separates
+read-only investigation from the gated refund step, so the credential that can move money is never in
+the investigating loop's tool list.

@@ -350,3 +350,23 @@ retrieval, then confirm on a golden set with recall@k rather than on the intuiti
 > Overlap repeats only the tail of the previous chunk, so it repairs local damage near the boundary.
 > Context far away, like a heading pages earlier, needs structure-aware chunking, contextual prefixes
 > or parent retrieval.
+
+## Use cases & projects
+### Use cases
+- **Policy and contract agents.** Qualifiers such as "this limit does not apply" often straddle a boundary;
+  overlap keeps the sentence and its subject together in at least one hit.
+- **Search tools with a small top-k.** Collapsing overlapping neighbours before returning results stops
+  three copies of one passage filling a top-5 and pushing out the evidence the agent needed.
+- **Citation-heavy agents.** Start offsets (`add_start_index=True`) let the tool merge overlapping hits
+  into one span and cite it once.
+- **Fixed-size splitting on messy text.** Where structure-aware splitting is not possible, a 10–20%
+  overlap is the cheap hedge teams reach for first.
+
+### Mini project
+**Measure overlap and dedup in an agent retrieval tool (1-2 hours).**
+- **Goal:** show what overlap buys in recall and what it costs in duplicate context.
+- **Steps:** index one document set with zero overlap and with about 15% overlap; write 15 questions whose
+  answers sit near a chunk boundary; run a `search_docs` tool with and without an over-fetch, merge-by-offset
+  and cut-to-k step; log hits, duplicates and tokens returned per call.
+- **Done when:** a table shows recall, duplicates per top-5 and tokens for all four combinations, with a
+  recommendation for your corpus.

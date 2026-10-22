@@ -5,7 +5,8 @@ name: Durable workflow execution
 kind: pattern
 difficulty: advanced
 est_minutes: 18
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/state-and-checkpoint-stores
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Durable workflow execution persists a multi-step process as an append-only event history and replays
-it to resume after crashes, deploys and days-long waits. Orchestration code stays deterministic; side
-effects live in retried, idempotent activities. It suits slow, flaky, expensive agent loops.
+Durable workflow execution records each agent step (model call, tool call, approval wait) in an
+append-only history and replays it to resume after crashes, deploys and days-long waits, without
+re-calling the model or repeating tools.
+
+## For agent builders
+- **Why it matters for agents.** Agent runs are slow, flaky and expensive: many model calls, tools that
+  act on the world, and waits on humans. Durable execution resumes a run at the interrupted step, so a
+  deploy at step 14 costs one step, not 14 model calls and duplicated side effects.
+- **Where it shows up in your stack.** Temporal, Restate, Inngest, DBOS, AWS Step Functions or Azure
+  Durable Functions as the runtime; agent frameworks' checkpointers play a lighter version of the same
+  role for graph state.
+- **What you control.** The split between workflow code (the loop's decisions) and activities (every
+  model and tool call), retry policies and non-retryable errors, idempotency keys from workflow and step
+  identity, step budgets with continue-as-new, and payload size.
+- **What you can skip.** The engine's internal history store and sharding. Learn replay, determinism and
+  at-least-once activities; that explains every bug you will meet.
 
 ## Why it exists
 - **Real processes span time and systems.** Draft a reply with a model, wait for a human to approve,
@@ -107,6 +121,20 @@ Workflows and activities are dispatched through named task queues that workers p
 - **Compensations are activities too,** so they are retried and must be idempotent.
 - **This is forward recovery:** the external world cannot be rolled back, only corrected, so the workflow
   encodes how to correct it.
+
+### Mapping an agent loop onto a workflow
+| Agent concept | Workflow construct | Why |
+|---|---|---|
+| Model call that picks the next action | activity | non-deterministic; its recorded result drives replay |
+| Tool call | activity with an idempotency key | side effect, retried at least once |
+| "Stop after N steps" | counter in workflow state | deterministic, survives replay |
+| Human approval of an action | signal plus durable timer | no worker blocked while waiting |
+| Transcript and memory | blob or database reference passed between activities | keeps history small |
+| Very long run | continue-as-new carrying a compact summary | bounds replay time |
+
+- **The loop itself is ordinary control flow** in the workflow: while not done and under budget, call the
+  model activity, then run the tool activity it chose. Branching on model output is fine, because on
+  replay that output comes from history.
 
 ### Compared with the alternatives
 | Approach | Gives | Lacks |
@@ -191,6 +219,41 @@ class TicketReplyWorkflow:
   result is what the replayed workflow sees.
 - **The idempotency key comes from workflow and step identity, not the ticket,** *because* a ticket may
   legitimately get a second reply from a later workflow, while a retry of this step must never send twice.
+
+### A durable tool-calling agent loop
+The same conventions applied to a whole agent loop: one activity asks the model for the next action, one
+runs the chosen tool, and the step budget lives in workflow state. `start_transcript`, `call_model` and
+`run_tool` are your own activities; check SDK names against the current Temporal docs.
+
+```python
+from datetime import timedelta
+from temporalio import workflow
+from temporalio.common import RetryPolicy
+
+STEP = dict(start_to_close_timeout=timedelta(minutes=2),
+            retry_policy=RetryPolicy(maximum_attempts=3,
+                                     non_retryable_error_types=["ValidationError"]))
+
+@workflow.defn
+class AgentRun:
+    @workflow.run
+    async def run(self, task: str, transcript_ref: str | None = None, steps: int = 0) -> str:
+        ref = transcript_ref or await workflow.execute_activity(start_transcript, task, **STEP)
+        while steps < 200:                       # step budget: deterministic, survives replay
+            action = await workflow.execute_activity(call_model, ref, **STEP)
+            if action["type"] == "final":
+                return action["answer"]
+            ref = await workflow.execute_activity(run_tool, args=[ref, action], **STEP)
+            steps += 1
+            if steps % 50 == 0:                  # keep history small on long runs
+                workflow.continue_as_new(args=[task, ref, steps])
+        return "step budget exhausted"
+```
+
+- **A crash anywhere replays to the last recorded step:** earlier `call_model` results come from history,
+  so no tokens are re-spent and the model's earlier choices cannot change.
+- **`run_tool` derives its idempotency key** from workflow ID and activity ID, as in `send_reply` above.
+- **The transcript lives behind `ref`,** so the history holds references, not tens of thousands of tokens.
 
 ### Trace one run through a redeploy
 The reviewer is slow, and the worker is redeployed on day one. The history so far (simplified; real
@@ -278,6 +341,9 @@ print(research(ctx, "kv"), ctx.executed)
   replay latency.
 - **References, not payloads.** Store full documents and long transcripts in blob storage and pass keys
   between activities, keeping history small. Monitor per-event payload size.
+- **Approval gates as signals.** Before a consequential tool call, the agent workflow waits on an
+  approval signal with a durable timeout and an escalation branch, so no worker is held for hours.
+  Monitor approval wait time and the share of runs that expire waiting.
 
 ## Trade-offs
 - **Crash-proof resumption vs determinism rules.** You get readable straight-line orchestration in
@@ -292,6 +358,9 @@ print(research(ctx, "kv"), ctx.executed)
   patch stays until old histories drain; short-lived workflows can skip it, multi-week ones cannot.
 - **Declarative state machines vs branching.** They need no determinism discipline and integrate natively
   with cloud services, but become painful when branching is data-dependent, as in agent loops.
+- **Durable engine vs framework checkpointer.** A full engine gives timers, signals, retries and task
+  queues across services, at the cost of running it; a framework's graph checkpointer is lighter and
+  enough when runs are short and waits are rare.
 
 ## Pitfalls
 - **Calling the model or a tool directly from workflow code.** It works in tests, then replays into a
@@ -307,6 +376,8 @@ print(research(ctx, "kv"), ctx.executed)
   auth errors non-retryable and set a maximum attempts or expiry.
 - **Missing heartbeats on long activities.** A dead worker's multi-minute inference is not rescheduled
   until the full timeout expires, inflating latency on every infrastructure hiccup.
+- **Putting the whole transcript in workflow history.** Each step appends tens of thousands of tokens, so
+  history hits size limits and replay slows; pass a reference to blob storage instead.
 
 ## When to use
 - **Use when** a process spans more than one side-effecting step, waits on timers or humans, or must
@@ -374,6 +445,13 @@ continue-as-new and add heartbeats to long model calls.
 - **Shrink payloads:** store transcripts and documents in blob storage and pass references.
 - **Monitor history size and replay latency** so the budget is set from data, not guessed.
 
+### How would you structure a tool-calling agent on a durable workflow engine?
+- **Workflow holds decisions:** the loop, the step budget and branching on the model's chosen action.
+- **Activities hold the world:** one for the model call, one per tool call, each with timeouts, bounded
+  retries, non-retryable validation errors and an idempotency key from workflow and step identity.
+- **Human approval is a signal with a timer;** long runs use continue-as-new and pass the transcript by
+  reference.
+
 ## Quiz
 ### Q: Why must durable workflow code be deterministic?
 - [ ] Because the engine executes it on a single thread for performance
@@ -398,3 +476,24 @@ continue-as-new and add heartbeats to long model calls.
 - [ ] The engine rolls back the payment using the recorded history
 > Durable execution gives at-least-once activity execution; the engine cannot see external side effects.
 > Exactly-once effects come from idempotency keys the receiver deduplicates on, not from the engine.
+
+## Use cases & projects
+### Use cases
+- **Long-running research and coding agents.** Runs survive deploys and worker crashes at the
+  interrupted step, with no re-spent tokens on earlier steps.
+- **Agents with human approval.** Drafts wait days for review on a durable timer and signal, then send
+  exactly once with an idempotency key.
+- **Multi-step business processes run by agents.** Onboarding, refunds and procurement get sagas with
+  compensations when a later step fails for good.
+- **Document and ingestion pipelines feeding RAG.** Each chunk-embed-index step is an activity with
+  retries, so a provider blip does not restart the whole batch.
+
+### Mini project
+**Make a tool-calling agent crash-proof (2-3 hours).**
+- **Goal:** show that a durable agent loop resumes mid-run without repeating model or tool calls.
+- **Steps:** extend the toy replay engine above into a 6-step agent loop with a fake model that picks
+  tools and a fake "create document" tool that counts calls; kill the process at a random step, restart
+  it against the saved history (a JSON file), then repeat with the real SDK in a local Temporal dev server
+  if you have one.
+- **Done when:** across 20 random crashes, the model call count equals the number of steps and the tool
+  created exactly one document per intended action.

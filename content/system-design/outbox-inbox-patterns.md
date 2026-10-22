@@ -483,3 +483,24 @@ unpublished outbox row and on inbox duplicate rate.
 > Outbox and inbox give effectively-once effects between databases; an external side effect that happens
 > before the commit is outside the transaction and repeats on redelivery. External calls need their own
 > idempotency key at the provider or must be moved after the commit with their own at-least-once loop.
+
+## Use cases & projects
+### Use cases
+- **Emitting run events reliably.** `RunCompleted` is written as an outbox row in the same transaction as
+  the final run state, so billing and eval sampling never miss a finished run.
+- **Deferring agent side effects.** An agent's decision to email a customer is committed as a pending row
+  with its checkpoint, and a relay sends it afterwards with a stable idempotency key.
+- **Deduplicating webhook-triggered runs.** An inbox keyed on the sender's event id stops a retried
+  webhook from starting a second agent run.
+- **Applying slow tool callbacks.** A long-running tool that calls back hours later is applied once,
+  because the inbox row and the run-state update commit together.
+
+### Mini project
+**Add an outbox and an inbox to a small agent runtime (2-3 hours).**
+- **Goal:** prove that run events are never lost and triggering events never start two runs.
+- **Steps:** in Postgres or SQLite, create runs, outbox and inbox tables; when a stub agent finishes,
+  update the run and insert a `RunCompleted` outbox row in one transaction; write a relay that selects
+  rows with `published_at IS NULL`, publishes to a local queue and marks them; in the consumer, insert the
+  event id into the inbox and apply the effect in one transaction; kill the relay between publish and mark.
+- **Done when:** every completed run has exactly one applied event downstream after crashes and restarts,
+  and duplicate deliveries are visible in logs but change nothing.

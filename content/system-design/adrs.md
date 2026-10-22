@@ -5,7 +5,8 @@ name: ADRs (architecture decision records)
 kind: practice
 difficulty: intro
 est_minutes: 12
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - system-design/trade-off-analysis
   - system-design/nfrs
@@ -21,23 +22,36 @@ sources:
 ---
 
 ## TL;DR
-An ADR is a short, numbered, immutable record of one significant decision: context, options, choice and
-consequences. Decisions outlive the people who made them; in AI systems an ADR also captures the evidence
-at decision time and the trigger for revisiting.
+An ADR is a short, numbered, immutable record of one significant decision. For an agent it records why
+you chose this model, these tools, this autonomy level and this memory design, with the eval evidence of
+the day and the trigger for revisiting.
+
+## For agent builders
+- **Why it matters for agents.** Agent decisions go stale fast: the model, the framework, the step cap,
+  which tools need human approval. Without the eval scores and prices behind each choice, nobody can tell
+  a still-right decision from a merely old one when a new model ships.
+- **Where it shows up in your stack.** A `docs/adr/` folder next to the agent code, the pull request that
+  adds a tool or changes the model, CI checks that enforce the decision (only the gateway imports a
+  provider SDK, write tools require approval), and dashboards wired to revisit triggers.
+- **What you control.** Which agent choices are significant enough to record, the evidence snapshot
+  (golden set version, task success, cost per run, p95 latency), the automated confirmation, and the
+  numeric triggers that force a re-run.
+- **What you can skip.** ADR tooling debates and heavyweight templates for two-way doors. A numbered
+  Markdown file with context, options, decision, consequences, evidence and triggers is enough.
 
 ## Why it exists
-- **Decisions are rarely written down.** Six months on, a new engineer finds the vector store is
+- **Decisions are rarely written down.** Six months on, a new engineer finds the agent's vector store is
   PostgreSQL with pgvector rather than a dedicated database, the context window is capped at 32k tokens,
   and every LLM call goes through a gateway. Nobody knows why.
 - **Two bad outcomes follow.**
   - **Blind acceptance:** nobody dares change the choice because nobody knows what it protects, so the
-    system calcifies around constraints that may no longer exist.
-  - **Blind reversal:** someone "fixes" it and the original incident recurs, because the reason lived in
-    the head of someone who left.
+    agent calcifies around constraints that may no longer exist.
+  - **Blind reversal:** someone "fixes" it, for example lets the agent call a write tool without approval,
+    and the original incident recurs, because the reason lived in the head of someone who left.
 - **Existing artefacts do not record decisions.** Wiki pages describe current state and are edited in
   place, so reasoning and alternatives vanish. Design documents are long proposals written before the
   decision. Commit messages record *what* changed, not what was weighed.
-- **AI systems move faster than the system.** "We chose model X because it scored best on our eval" is
+- **Agent stacks move faster than the system.** "We chose model X because it scored best on our eval" is
   true on the day and unknowable a year later unless eval version, scores, prices and assumptions were
   captured. Without them the team cannot tell whether a decision is still right or merely old.
 - **What the ADR buys.** The cheapest artefact that makes decisions inspectable, reversible on purpose,
@@ -47,9 +61,10 @@ at decision time and the trigger for revisiting.
 ### What deserves one
 - **The test is architectural significance:** would reversing it be expensive, or would someone later
   need to know why it was made?
-- **Yes:** the vector store, tenancy model, gateway, retrieval strategy, model tier for a workload,
-  evaluation gate for releases, data-residency approach.
-- **No:** a logging library's formatter.
+- **Yes, for an agent:** the vector store, tenancy model, gateway, retrieval strategy, model tier for a
+  workload, agent framework, autonomy level and approval rules for write tools, memory design, evaluation
+  gate for releases, data-residency approach.
+- **No:** a logging library's formatter, or a one-line wording change to a tool description.
 - **Calibration:** an ADR a week is probably recording tasks; three ADRs after a year is probably not
   recording decisions.
 
@@ -59,7 +74,7 @@ at decision time and the trigger for revisiting.
 | **Title and number** | `ADR-0007: Serve v1 through a hosted model API behind our gateway` | Numbers give a stable reference; the title states the decision, not the topic |
 | **Status** | Proposed, Accepted, Deprecated, or Superseded by ADR-NNNN | The only field that changes after acceptance, *because* the record must stay an honest snapshot |
 | **Context** | Forces stated neutrally: NFRs, constraints, team size, deadlines, costs, risks, uncertainties | Lets a future reader judge whether the decision still applies, so it describes conditions, not advocacy |
-| **Decision** | "We will …" in full sentences, including what is explicitly *not* being done | Removes ambiguity about scope |
+| **Decision** | "We will …" in full sentences, including what is explicitly *not* being done | Removes ambiguity about scope, for example which tools the agent may *not* call |
 | **Consequences** | What gets easier, what gets harder, new risks, follow-up work | Every real decision has downsides; a record without them was written to justify, not to decide |
 
 ### MADR extensions
@@ -70,12 +85,12 @@ at decision time and the trigger for revisiting.
   achieve …, accepting …".
 
 ### Lifecycle and mechanics
-1. **Lives in the repository**, typically `docs/adr/NNNN-title.md`, next to the code it governs,
+1. **Lives in the repository**, typically `docs/adr/NNNN-title.md`, next to the agent code it governs,
    *because* that is where engineers look and where pull-request review already happens.
 2. **Opened as *Proposed* in a pull request**, argued in review, and *Accepted* when merged.
 3. **Never edited after that except for status.** Changing a decision means a new ADR that supersedes the
    old one, linked both ways. Immutability is the feature: the chain of records is the history of why the
-   system looks the way it does.
+   agent looks the way it does.
 4. **One or two pages, written at decision time.** An ADR reconstructed months later is a story, not a
    record.
 5. **Linked from the C4 diagrams and README**, so the "why" is one click from the "what".
@@ -92,23 +107,27 @@ at decision time and the trigger for revisiting.
   evidence that advice was sought. Either works if it is written down; what fails is an unstated rule that
   surfaces as a veto after merge.
 - **Unchecked decisions decay quietly.** Six months later someone imports the provider SDK directly "just
-  for this one feature", and the gateway decision is void without anyone deciding so.
+  for this one feature", or registers a new write tool without the approval flag, and the decision is void
+  without anyone deciding so.
 - **MADR's confirmation section exists for this.** Prefer an automated check, what *Building Evolutionary
-  Architectures* calls a fitness function: an import-lint rule, a CI test, a policy-as-code rule or a
-  dashboard alert. With automated confirmation a decision is enforced; without, it is a suggestion.
+  Architectures* calls a fitness function: an import-lint rule, a CI test over the tool registry, a
+  policy-as-code rule or a dashboard alert. With automated confirmation a decision is enforced; without,
+  it is a suggestion.
 
-### What AI systems add to the template
-- **Evidence snapshot.** Eval set version, scores, latency percentiles and cost per request for each option
-  at decision time, so the decision can be re-run, not just re-argued.
+### What agent systems add to the template
+- **Evidence snapshot.** Eval set version, task success or faithfulness scores, latency percentiles and
+  cost per request or per agent run for each option at decision time, so the decision can be re-run, not
+  just re-argued.
 - **Assumptions with expiry.** Provider pricing, rate limits, context limits, licence terms and expected
   traffic, each labelled with the date it was checked.
 - **Revisit triggers.** Concrete conditions that force re-evaluation: a volume threshold, an open-weight
   model reaching eval parity, a residency requirement, a price change. Without one, an ADR becomes a
   reason never to look again.
-- **Reversibility.** A two-way door (swap a model behind the gateway) or a one-way door (train on customer
-  data, choose an embedding model that fixes the index).
-- **Compliance and data flow implications.** Where customer data goes under this decision, and which
-  approvals it needed.
+- **Reversibility.** A two-way door (swap a model behind the gateway, change a step cap) or a one-way door
+  (train on customer data, choose an embedding model that fixes the index, give an agent autonomous write
+  access to a customer system).
+- **Compliance and data flow implications.** Where customer data goes under this decision, which tools
+  receive it, and which approvals it needed.
 
 ### How it fits with the rest of the design toolkit
 | Artefact | Role |
@@ -122,8 +141,8 @@ When one is missing the others degrade: an ADR with no NFRs behind it is an opin
 no ADRs behind it is a snapshot nobody can question.
 
 ## Diagram
-An ADR's content is frozen at acceptance; only its status moves, and a changed decision is a new record
-that supersedes the old one.
+An ADR's content is frozen at acceptance; only its status moves, and a changed agent decision (new model,
+new autonomy level) is a new record that supersedes the old one.
 
 ```mermaid
 stateDiagram-v2
@@ -179,6 +198,57 @@ open-weight candidate 0.84; p95 TTFT 0.9 s vs 1.3 s on a single GPU under load t
 provider price changes by more than 30%.
 ```
 
+### Agent scenario: an autonomy ADR and the test that confirms it
+A support agent can look up orders and issue refunds. The ADR records the autonomy decision; the test is
+its confirmation, so a new write tool registered without approval fails CI. Figures are illustrative.
+
+```markdown
+# ADR-0012: The support agent drafts refunds; a human approves every refund write
+
+**Status:** Accepted  **Supersedes:** none  **Deciders:** support lead, platform lead, security
+
+**Context.** Agent has read tools (lookup_order, search_kb) and one write tool (issue_refund).
+On agent golden set v2 (illustrative), the agent picked the correct refund amount in most
+but not all cases; a wrong refund is real money and hard to claw back.
+
+**Options.** 1. Fully autonomous refunds. 2. Human approval for every write tool call.
+3. Autonomous below a small amount, approval above it.
+
+**Decision.** Option 2 for v1. Every tool marked as a write requires human approval
+before it executes. Read tools run without approval.
+
+**Consequences.** Safer; slower resolution; a reviewer queue to staff.
+
+**Confirmation.** CI test over the tool registry: every write tool requires approval.
+
+**Revisit when:** refund-amount accuracy on golden set v3 or later is high enough that option 3
+passes the eval gate, or reviewer queue time breaches its SLO for a month.
+```
+
+```python
+# CI fitness function for ADR-0012: the tool registry must match the decision.
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Tool:
+    name: str
+    writes: bool
+    requires_approval: bool
+
+REGISTRY = [
+    Tool("lookup_order", writes=False, requires_approval=False),
+    Tool("search_kb", writes=False, requires_approval=False),
+    Tool("issue_refund", writes=True, requires_approval=True),
+    Tool("cancel_order", writes=True, requires_approval=False),   # added last sprint
+]
+
+def adr_0012_violations(registry):
+    return [t.name for t in registry if t.writes and not t.requires_approval]
+
+print(adr_0012_violations(REGISTRY))
+# ['cancel_order']  -> CI fails, citing ADR-0012, until approval is added or a new ADR supersedes it
+```
+
 ### Runnable: a CI check that supersede links go both ways
 Immutability only works if the chain is navigable. This check fails the build when a new record
 supersedes an old one that was never marked *Superseded*.
@@ -225,37 +295,38 @@ The triggers make the review a checklist instead of a debate. Observed values ar
 | Provider price change > 30% | List price down 12% | No |
 
 - **Outcome:** one trigger fired, so the team re-runs the cost comparison for option 3 (hybrid) at the new
-  volume, with fresh evidence.
+  volume, with fresh evidence. Agent traffic is usually what pushes volume over such a threshold, because
+  each run makes many model calls.
 - **If it wins:** write a new ADR that supersedes ADR-0007 and records the new evidence; ADR-0007's status
   becomes *Superseded*, its text untouched.
 
 ## Production patterns
-- **ADR in the same pull request as the change.** Use for every architecturally significant change. Add a
-  pull-request template question ("Does this need an ADR?") and a code-owner rule on `docs/adr/` so the
-  architect or deciders review it. Monitor significant PRs (new datastore, new provider, new deployable)
-  merged without a linked ADR.
+- **ADR in the same pull request as the change.** Use for every architecturally significant agent change:
+  a new model tier, a new write tool, a new memory store. Add a pull-request template question ("Does this
+  need an ADR?") and a code-owner rule on `docs/adr/` so the architect or deciders review it. Monitor
+  significant PRs (new datastore, new provider, new deployable) merged without a linked ADR.
 - **Confirmation as a fitness function.** Use whenever a decision can be checked by a machine. For the
   gateway decision, an `import-linter` `forbidden` contract stops any module outside `gateway/` from
-  importing a provider SDK, run as a required CI check. Monitor contract exceptions; each one is an
-  undocumented reversal.
+  importing a provider SDK, run as a required CI check; for autonomy decisions, a test over the tool
+  registry. Monitor contract exceptions; each one is an undocumented reversal.
 - **Generated index with current status.** Use once the log passes a dozen records. Generate an index
   page (number, title, status, superseded-by) from the files in CI, as adr-tools or log4brains can, and
   publish it where non-engineers can read it. Monitor records stuck in *Proposed* for weeks.
-- **Revisit triggers wired to dashboards.** Use for AI decisions with expiring assumptions. Turn each
-  numeric trigger (monthly token volume, eval score of the best alternative, price) into a dashboard alert
-  whose description names the ADR number. Monitor fired triggers that have no follow-up record.
-- **Quarterly review of AI decisions.** Use for model, vendor and retrieval ADRs. Walk each record's
-  dated assumptions and triggers, re-run the golden set where needed, and either note "still holds" in
-  the review log or open a superseding ADR.
+- **Revisit triggers wired to dashboards.** Use for agent decisions with expiring assumptions. Turn each
+  numeric trigger (monthly token volume, eval score of the best alternative model, price) into a dashboard
+  alert whose description names the ADR number. Monitor fired triggers that have no follow-up record.
+- **Quarterly review of agent decisions.** Use for model, vendor, framework and retrieval ADRs. Walk each
+  record's dated assumptions and triggers, re-run the agent golden set where needed, and either note
+  "still holds" in the review log or open a superseding ADR.
 
 ## Trade-offs
 - **An hour or two of writing vs repeated re-litigation.** The ADR saves debating the same choice again;
-  not worth it for decisions that are cheap to reverse and nobody will ask about.
+  not worth it for decisions that are cheap to reverse and nobody will ask about, such as a prompt tweak.
 - **Immutability: honest history vs chains to follow.** Superseding records form chains a reader must
   follow; an index page with current status keeps this navigable.
 - **Rich template (MADR): real alternatives vs writing friction.** It forces alternatives and evidence
   into the open, but discourages writing anything for medium-sized decisions. Many teams use the full
-  template for one-way doors and the short Nygard form otherwise.
+  template for one-way doors (autonomous writes, embedding model) and the short Nygard form otherwise.
 - **In the repository: under review vs invisible to non-engineers.** ADRs sit where engineers look, but
   other stakeholders never see them unless they are also published or summarised.
 
@@ -268,23 +339,24 @@ The triggers make the review a checklist instead of a debate. Observed values ar
   `docs/adr/` and a review norm that only the status line of an accepted record may change.
 - **Recording decisions about trivia.** Symptom: eighty ADRs in a year and no one able to find the five
   that matter. Fix: apply the significance test (expensive to reverse, or someone will ask why) and log
-  smaller choices in the PR description instead.
-- **Omitting evidence and assumptions in AI decisions.** Symptom: a team still on a model two generations
-  old because "there is an ADR", with no way to tell whether its reasons still hold. Fix: an evidence
-  section with eval version, scores, cost and latency, and every assumption dated.
+  smaller choices, like tool description wording, in the PR description instead.
+- **Omitting evidence and assumptions in agent decisions.** Symptom: a team still on a model two
+  generations old because "there is an ADR", with no way to tell whether its reasons still hold. Fix: an
+  evidence section with eval version, scores, cost and latency, and every assumption dated.
 - **No revisit trigger.** Same symptom, discovered only when a competitor's cost per conversation is a
   third of yours. Fix: write numeric revisit triggers and wire them to dashboard alerts.
 - **Accepting a decision with no confirmation mechanism.** Symptom: code contradicting an accepted ADR (a
-  direct provider call, a second vector store) discovered months later during an incident. Fix: a
-  confirmation section backed by an automated check (import rule, CI test, policy-as-code).
+  direct provider call, a second vector store, a write tool without approval) discovered months later
+  during an incident. Fix: a confirmation section backed by an automated check (import rule, CI test,
+  policy-as-code).
 - **Storing ADRs in a wiki away from the code.** Symptom: nobody updates status, and engineers learn about
   a decision from the code rather than the record. Fix: keep them in `docs/adr/` in the repository and
   publish a generated index for non-engineers.
 
 ## When to use
-- **Write one whenever a choice shapes structure, cost, risk or data flow** and would be expensive to
-  reverse: tenancy model, vector store, gateway, retrieval strategy, model tier per workload, evaluation
-  gates, residency approach, build versus buy.
+- **Write one whenever an agent choice shapes structure, cost, risk or data flow** and would be expensive
+  to reverse: tenancy model, vector store, gateway, retrieval strategy, model tier per workload, autonomy
+  and approval rules, memory design, evaluation gates, residency approach, build versus buy.
 - **Write it as the decision is made**, in the pull request where it is argued, and link it from the
   diagram and the README.
 - **Measure the practice:** do new engineers cite ADR numbers in design discussions, and do superseding
@@ -322,12 +394,21 @@ the cost achieves parity", which would have made this review routine rather than
 - **Versus a design doc:** a design doc or RFC explores the space before the decision and can run to ten
   pages; the ADR records what was finally chosen and why the alternatives lost, and links back to the doc.
 
-### Which decisions in an AI product would you write ADRs for, and which not?
+### Which decisions in an agent product would you write ADRs for, and which not?
 - **Yes:** anything expensive to reverse or likely to be questioned: vector store, tenancy model, gateway,
-  retrieval strategy, model tier per workload, eval release gate, residency approach.
-- **No:** cheap, reversible, local choices such as a log formatter.
+  retrieval strategy, model tier per workload, autonomy level for write tools, memory design, eval release
+  gate, residency approach.
+- **No:** cheap, reversible, local choices such as a log formatter or a tool description's wording.
 - **Calibrate:** an ADR a week probably means you are logging tasks; three after a year probably means you
   are missing decisions.
+
+### An ADR says write tools need human approval, but an agent just cancelled orders on its own. What happened?
+- **Likely cause:** the decision had no confirmation mechanism, so a new write tool was registered
+  without the approval flag and the decision was voided silently.
+- **Immediate:** stop the tool, then decide whether the code or the decision is wrong; if the decision,
+  write a superseding ADR rather than editing the old one.
+- **Lasting:** add a CI test over the tool registry that fails when any write tool lacks approval, and
+  cite the ADR number in the failure message.
 
 ### Code in production contradicts an accepted ADR. What happened and what do you change?
 - **Likely cause:** the decision had no confirmation mechanism, so a "just this once" shortcut, such as a
@@ -337,8 +418,9 @@ the cost achieves parity", which would have made this review routine rather than
 - **Lasting:** add an automated fitness function (import rule, CI test, policy-as-code) so the next
   violation fails the build.
 
-### What does an ADR for choosing an LLM need that a database ADR usually does not?
-- **An evidence snapshot:** eval set version, scores, latency percentiles and cost per request per option.
+### What does an ADR for choosing an agent's model need that a database ADR usually does not?
+- **An evidence snapshot:** eval set version, task success or faithfulness scores, latency percentiles
+  and cost per request or per run, per option.
 - **Dated assumptions:** pricing, rate limits, context limits, licence terms, expected traffic.
 - **Revisit triggers with numbers:** for example volume over 2B tokens a month for three months, or an
   open-weight model reaching parity on the golden set, because the model landscape moves monthly.
@@ -374,3 +456,24 @@ the cost achieves parity", which would have made this review routine rather than
 > Model quality, pricing and limits change far faster than database characteristics, so the decision must
 > carry the data to be re-run and the conditions under which it should be. Without them the ADR becomes a
 > reason never to re-evaluate.
+
+## Use cases & projects
+### Use cases
+- **Choosing the agent's model and gateway.** The ADR keeps the golden-set scores, cost per run and
+  revisit triggers, so a new model release becomes a checklist rather than a debate.
+- **Setting autonomy levels.** Which tools run unattended and which need human approval is a one-way-door
+  decision for customers; the ADR records it and a registry test enforces it.
+- **Picking an agent framework or memory design.** Recording why you chose a framework, or a checkpoint
+  store over in-context memory, stops a rewrite driven only by fashion.
+- **Customer-specific deployments.** An FDE records residency or on-prem model serving deviations so the
+  next engineer inherits the reasoning behind that customer's agent setup.
+
+### Mini project
+**Write and enforce two ADRs for a small agent (1-2 hours).**
+- **Goal:** turn two agent decisions into immutable records with automated confirmation.
+- **Steps:** in a sample agent repo create `docs/adr/`; write one ADR for the model choice with an
+  evidence snapshot from a small golden set and numeric revisit triggers; write one ADR for tool autonomy;
+  add a CI test that fails when a write tool lacks approval; then supersede the model ADR with a new one
+  and run the link check from the examples.
+- **Done when:** both ADRs pass review against the five-part anatomy, the registry test fails on a
+  deliberately unapproved write tool, and the supersede chain links both ways.

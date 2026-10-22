@@ -449,3 +449,28 @@ streams, part of that time is token streaming that a manual span closed early.
 - [ ] Sampling is always disabled under Gunicorn
 > Workers inherit SDK state created before fork: an export thread that did not survive it (older SDKs) or
 > a gRPC exporter channel that is not fork-safe, so spans are not sent. Initialise per worker in `post_fork` or lifespan.
+
+## Use cases & projects
+### Use cases
+- **Finding the slow step.** One trace per run, with spans per model call, tool call and retrieval step,
+  shows which step made a 40-second run slow.
+- **Following runs across services.** Context propagation links the agent API, a retrieval service and
+  tool or MCP servers into one trace.
+- **Token and model accounting.** GenAI attributes such as `gen_ai.request.model` and
+  `gen_ai.usage.input_tokens` let a backend aggregate usage by model and step.
+- **Switching backends without re-instrumenting.** OTLP lets the same spans go to a general tracing tool
+  or an LLM observability tool such as Langfuse.
+
+### Mini project
+**Trace an agent run end to end (2-3 hours).**
+- **Goal:** see one agent run as a span tree in a local tracing backend.
+- **Steps:** run a collector and a local trace viewer in Docker; add the OTel SDK with a batch processor
+  and the FastAPI and httpx instrumentors to an agent stub; wrap the run, each step, each model call and
+  each tool call in manual spans with the model name, token counts and tool name as attributes; make one
+  fake tool sleep 3 seconds.
+- **Done when:** the viewer shows one trace per run with nested step, model and tool spans, the slow tool
+  span is obvious at a glance, and no prompt text appears in any attribute.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide), whose traces must show separate spans for
+retrieval, the LLM call and database work.

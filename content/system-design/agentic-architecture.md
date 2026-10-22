@@ -419,3 +419,25 @@ disappearing runs become visible as "interrupted at step n" instead of silence.
 - [ ] Never, because agents can emulate any workflow
 > Agents trade predictability and cost for flexibility on unknown paths. If the path is known, that
 > flexibility buys nothing and you pay for it in latency, cost and harder evaluation.
+
+## Use cases & projects
+### Use cases
+- **Support agents that take actions.** The agent looks up orders, drafts refunds and pauses for human
+  approval before any money moves, with every step traced.
+- **Operations and on-call agents.** The agent reads dashboards and logs through read-only tools and
+  proposes a remediation that a human approves, keeping write tools behind a gate.
+- **Coding agents.** A loop of read, edit and test tools runs inside a sandbox with a step budget, so a
+  stuck run ends instead of burning tokens.
+- **Back-office automation with unknown paths.** Exception handling in invoices or claims, where the next
+  step depends on what the documents say, suits a loop better than a fixed workflow.
+
+### Mini project
+**Wrap a bare agent loop in production guardrails (2-3 hours).**
+- **Goal:** turn a minimal tool-calling loop into one with typed tools, a budget, an approval gate and a
+  trace.
+- **Steps:** build a loop with three tools (one read, one search, one write such as `issue_refund`);
+  validate tool arguments against a schema; cap steps and tokens per run; store state outside the
+  process so a run can resume; pause the write tool for an explicit approval; log every model call and
+  tool call with a run id.
+- **Done when:** a run that hits the step cap stops cleanly, a killed run resumes from saved state without
+  repeating the write, and you can replay one run's full trace step by step.

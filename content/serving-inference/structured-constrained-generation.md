@@ -5,7 +5,8 @@ name: Structured / constrained generation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - prompting/structured-outputs-json-mode
   - prompting/function-tool-calling
@@ -23,16 +24,30 @@ sources:
 ---
 
 ## TL;DR
-Constrained decoding masks the logits of illegal tokens each step, so output matches a
-schema, regex, grammar or choice set by construction. It removes parse-and-retry loops but guarantees
-shape, not truth, costs a grammar compile, and can shift what the model says.
+Every agent tool call must parse. Constrained decoding masks illegal tokens' logits each step, so
+output matches a schema, regex, grammar or choice set by construction. It ends parse-and-retry loops
+but guarantees shape, not truth, and can shift what the model says.
+
+## For agent builders
+- **Why it matters for agents.** An agent loop breaks on the first unparseable tool call or routing
+  decision. Constrained decoding is the mechanism under strict tool calling and structured outputs, so it
+  decides whether step 12 of a run can crash on a stray Markdown fence.
+- **Where it shows up in your stack.** Hosted "structured outputs" and strict tool-calling modes, the
+  `response_format` JSON Schema on vLLM's OpenAI-compatible server (with XGrammar as a backend), SGLang,
+  llama.cpp GBNF grammars, and libraries such as Outlines and Instructor on top.
+- **What you control.** Tool and output schemas (flat, static, versioned), field order (reasoning before
+  answer), whitespace rules, the semantic validators behind the parser, and the retry budget per step.
+- **What you can skip.** Writing your own logits processor or automaton compiler. Know that masking
+  happens at the logits, that grammars are compiled and cached, and what the guarantee does not cover.
 
 ## Why it exists
-- **Code needs parseable output.** A JSON object with known fields, a function call with typed arguments,
-  one of five labels.
+- **Agent code needs parseable output.** A JSON object with known fields, a function call with typed
+  arguments, one of five labels for a router.
 - **"Mostly complies" is the problem.** Models wrap JSON in Markdown fences, add a trailing comma, rename a
   field, emit a comment, or start with "Sure, here is the JSON". At a 2% failure rate, a million calls a
   day break twenty thousand times, clustered on the hardest inputs.
+- **Agents compound the rate.** A run makes many tool calls in sequence, so a small per-call failure rate
+  becomes a large per-run one (see the worked table below).
 - **Validate-and-retry is not enough.** Still worth having for semantic checks, but each retry doubles
   latency and cost on requests that were already slow, the failure rate never reaches zero, and small or
   heavily quantized models can loop without converging.
@@ -51,6 +66,12 @@ shape, not truth, costs a grammar compile, and can shift what the model says.
    allowed ones.
 
 The model is never asked to do anything; it is simply not permitted to make certain moves.
+
+### Tool calling is the same mechanism
+- **Schema per tool plus a choice of tool.** Function-calling APIs are structured generation: the tool
+  name is an enum and the arguments follow that tool's schema.
+- **Same automaton idea** over the argument schema in hosted "strict" tool modes and open engines' tool
+  parsers, which is why argument validity is high while argument *correctness* still needs checks.
 
 ### The token-versus-character problem
 - **Grammars are over characters; models emit tokens.** A vocabulary of 100k+ entries has many tokens that
@@ -83,7 +104,8 @@ without walking each token.
 ### Regular vs context-free grammars
 - **Non-recursive JSON schemas** compile to regexes.
 - **Recursive or deeply nested grammars** need a pushdown automaton (a context-free grammar): llama.cpp's
-  GBNF grammars and XGrammar implement this.
+  GBNF grammars and XGrammar implement this. Nested tool arguments (a list of objects with sub-objects)
+  land here.
 - **XGrammar caches** the tokens whose legality does not depend on the stack, so most steps are still a
   lookup.
 
@@ -92,7 +114,7 @@ without walking each token.
 - **Forced tokens.** When exactly one token is legal (a closing brace, a fixed key name), some engines skip
   sampling and append it directly, saving decode steps on boilerplate.
 - **Hard enums, ranges and patterns.** A `"status"` field declared as `enum: ["open", "closed"]` cannot
-  come back as `"Closed"`.
+  come back as `"Closed"`; a tool name cannot be one the agent does not have.
 
 ### The cost at serving time
 - **Overlap with the forward pass.** Grammar state advance and mask computation run on the CPU while the
@@ -102,13 +124,15 @@ without walking each token.
   per output token.
 - **Jump-forward.** Appending runs of forced tokens without sampling is what SGLang calls jump-forward
   decoding.
-- **Scaling.** Every sequence in a batch can carry a different grammar, so CPU-side work (compiling
-  grammars, computing each mask) must scale with concurrency; applying the mask on the GPU is cheap.
+- **Scaling.** Every sequence in a batch can carry a different grammar (each agent has its own tool set),
+  so CPU-side work (compiling grammars, computing each mask) must scale with concurrency; applying the
+  mask on the GPU is cheap.
 
 ### What it does not control
 - **Truth.** A valid schema says nothing about whether values are true; a hallucinated invoice number
-  passes a regex for invoice numbers. Semantic validation (Pydantic validators, cross-field rules,
-  database lookups) still belongs after generation, with retry-with-feedback for *those* failures.
+  passes a regex for invoice numbers, and a well-formed tool call can target the wrong record. Semantic
+  validation (Pydantic validators, cross-field rules, database lookups) still belongs after generation,
+  with retry-with-feedback for *those* failures.
 - **The distribution.** Where the model wanted to write prose, it must choose whitespace or a quote, and
   may take a low-probability path.
 - **Not true conditional sampling.** Masking and renormalising each step is not sampling from the model's
@@ -131,18 +155,14 @@ without walking each token.
   Schema (for example requiring every field and forbidding additional properties), so validate the schema
   against the backend before relying on a feature.
 
-### Tool calling is the same mechanism
-- **Schema per tool plus a choice of tool.** Function-calling APIs are structured generation.
-- **Same automaton idea** over the argument schema in hosted "strict" tool modes and open engines' tool
-  parsers, which is why argument validity is high while argument *correctness* still needs checks.
-
 ## Diagram
-One constrained decode step: the CPU computes the grammar mask while the GPU runs the forward pass, the
-mask is applied to the logits, and the sampled token advances the automaton.
+One constrained decode step inside an agent's tool call: the CPU computes the grammar mask while the GPU
+runs the forward pass, the mask is applied to the logits, and the sampled token advances the automaton
+until the call is complete and goes to semantic validation.
 
 ```mermaid
 flowchart TD
-    G["Schema, regex or grammar"] --> C["Compile once: state to token table"]
+    G["Tool or output schema"] --> C["Compile once: state to token table"]
     C --> K[("Grammar cache by schema hash")]
     K --> M["CPU: allowed-token mask for state"]
     F["GPU: forward pass, logits"] --> A["Add minus infinity to illegal tokens"]
@@ -151,10 +171,62 @@ flowchart TD
     S --> N["Advance automaton state"]
     N --> E{"Accepting state and EOS?"}
     E -->|"no"| M
-    E -->|"yes"| V["Parse, then semantic validation"]
+    E -->|"yes"| V["Parse, semantic check, run tool"]
 ```
 
 ## Examples
+### Worked scenario: parse failures across an agent run
+A 10-step agent makes one tool call per step. Illustrative rates; the point is how per-call rates
+compound per run (run failure = 1 − (1 − p)^10).
+
+| Setup | Per-call failure | Runs with at least one failure | Extra calls per 1,000 runs |
+|---|---|---|---|
+| Prompt-only JSON, 2% parse failures | 2% | about 18% | about 200 retries, more if retries fail |
+| Prompt-only JSON, 2% parse plus semantic retries | higher | higher still | each retry a full extra call |
+| Constrained decoding, shape guaranteed | 0% parse | 0% from shape | 0 for shape |
+| Constrained plus semantic validators (say 1% wrong values) | 1% semantic | about 10% | about 100, spent only on meaning |
+
+Constrained decoding removes the shape column entirely; the remaining retry budget goes to errors no
+grammar can express. Check `finish_reason` too: output cut at `max_tokens` is the one way a constrained
+call still fails to parse.
+
+### Agent router step: schema-constrained tool choice
+A router picks one of the agent's tools under a JSON Schema via `response_format`, with reasoning first.
+The enum makes an unknown tool name impossible; Pydantic and a lookup catch wrong-but-valid values.
+
+```python
+from typing import Literal
+from openai import OpenAI
+from pydantic import BaseModel
+
+TOOLS = {"search_orders": lambda q: f"orders matching {q}", "refund": lambda q: f"refund for {q}"}
+
+class Route(BaseModel):
+    reasoning: str                                        # free text FIRST
+    tool: Literal["search_orders", "refund", "ask_human"]
+    query: str
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
+
+def route(user_msg: str, retries: int = 1) -> str:
+    msgs = [{"role": "system", "content": "Pick the next tool for this support agent."},
+            {"role": "user", "content": user_msg}]
+    for _ in range(retries + 1):
+        resp = client.chat.completions.create(
+            model="Qwen/Qwen2.5-7B-Instruct", messages=msgs, temperature=0,
+            response_format={"type": "json_schema",
+                             "json_schema": {"name": "route", "schema": Route.model_json_schema()}})
+        r = Route.model_validate_json(resp.choices[0].message.content)   # shape is guaranteed
+        if r.tool == "ask_human":
+            return "escalated"
+        if r.query.strip():                                              # semantic check, not shape
+            return TOOLS[r.tool](r.query)
+        msgs.append({"role": "user", "content": "query was empty; give a concrete query"})
+    return "escalated"
+
+print(route("I was charged twice for order 1182, please fix it."))
+```
+
 ### A choice constraint from scratch
 The output must be exactly one of a fixed set of choices, then stop. The allowed-token table is a trie
 built once from the tokenizer, so each step is a lookup rather than a vocabulary scan: the structure
@@ -245,7 +317,7 @@ print(constrained_greedy(fake_logits, index))   # -> 427
 ### Production call: schema-constrained output plus semantic validation
 Against vLLM's OpenAI-compatible server (hosted providers accept the same `response_format` shape). The
 reasoning field comes first, and Pydantic re-validates after generation because some backends ignore
-numeric bounds.
+numeric bounds. In an agent this is the extraction step that fills a ticket before a tool files it.
 
 ```python
 from typing import Literal
@@ -270,29 +342,31 @@ print(ticket.category, ticket.priority)
 ```
 
 ## Production patterns
-- **Native structured outputs, not hand-rolled processors.** When output feeds code, pass a JSON Schema
-  via `response_format` (or the engine's grammar or choice mode) and let the engine's backend, such as
-  XGrammar in vLLM, do the masking. Monitor validity rate; it should sit at 100%, and anything less
-  usually means output truncated at `max_tokens` (check `finish_reason`) or a schema feature the backend
-  does not enforce.
-- **Static schemas, cached grammars.** Keep schemas versioned in code and identical across requests, with
-  no request ids or dates inside enums, so compiled grammars are reused. Monitor TTFT for first-seen
-  schemas versus cached ones.
-- **Think, then extract.** For reasoning-heavy tasks, put an `analysis` field first or split into a free
-  call plus a constrained extraction call. Monitor task accuracy against an unconstrained baseline, not
-  just validity.
-- **Validate semantics with bounded retries.** Parse with Pydantic `model_validate_json`, enforce
-  cross-field rules and lookups, and retry at most once or twice with the error message. Monitor retry
-  rate and the share of requests that exhaust retries.
-- **Schema compatibility test in CI.** Run every schema through the target backend with a few fixture
-  prompts, asserting that unsupported keywords (`format: date`, `minimum`, `pattern`) are either
-  enforced or re-checked after generation.
+- **Strict tool calling and native structured outputs, not hand-rolled processors.** When output feeds
+  agent code, pass a JSON Schema via `response_format` or the tool definitions (or the engine's grammar or
+  choice mode) and let the engine's backend, such as XGrammar in vLLM, do the masking. Monitor validity
+  rate; it should sit at 100%, and anything less usually means output truncated at `max_tokens` (check
+  `finish_reason`) or a schema feature the backend does not enforce.
+- **Static tool schemas, cached grammars.** Keep tool and output schemas versioned in code and identical
+  across requests and agent steps, with no request ids or dates inside enums, so compiled grammars are
+  reused. Monitor TTFT for first-seen schemas versus cached ones.
+- **Think, then extract.** For planning and reasoning-heavy steps, put an `analysis` field first or split
+  into a free call plus a constrained extraction call. Monitor task accuracy and agent run success against
+  an unconstrained baseline, not just validity.
+- **Validate semantics with bounded retries per step.** Parse with Pydantic `model_validate_json`, enforce
+  cross-field rules and lookups (does that order id exist?), and retry at most once or twice with the
+  error message fed back into the transcript. Monitor retry rate and the share of steps that exhaust
+  retries and escalate.
+- **Schema compatibility test in CI.** Run every tool and output schema through the target backend with a
+  few fixture prompts, asserting that unsupported keywords (`format: date`, `minimum`, `pattern`) are
+  either enforced or re-checked after generation.
 
 ## Trade-offs
 - **Guaranteed validity vs distribution shift.** Retries vanish, but the constraint can push the model
   down low-probability paths; the cost is small for flat schemas and grows with rigid, deeply nested ones.
 - **Compile-once tables vs dynamic schemas.** Per-step masking becomes nearly free, but a new schema per
-  request pays compilation each time; the win flips to a loss without a grammar cache.
+  request (tool lists rebuilt per user) pays compilation each time; the win flips to a loss without a
+  grammar cache.
 - **Hosted strict modes vs open engines.** Hosted modes are zero-effort, yet support a schema subset and
   hide the mechanism; open engines expose regex, grammar and choice modes but you own backend selection
   and version drift.
@@ -300,8 +374,9 @@ print(ticket.category, ticket.priority)
   extra call per failure; combining both gives shape for free and spends retries only on meaning.
 
 ## Pitfalls
-- **Trusting schema-valid output as correct.** Symptom: clean JSON with invented identifiers or wrong
-  numbers that no parser will ever flag. Fix: semantic validators and lookups after parsing.
+- **Trusting schema-valid tool calls as correct.** Symptom: clean JSON with invented identifiers or wrong
+  numbers that no parser will ever flag, and the agent acts on them. Fix: semantic validators and lookups
+  after parsing, before the tool runs.
 - **Answer field first, `reasoning` last.** The model commits to an answer before it has "thought";
   accuracy on reasoning tasks drops compared with unconstrained prompting. Fix: reasoning field first.
 - **A fresh, slightly different schema per request** (a timestamp or request id baked into an enum).
@@ -314,12 +389,12 @@ print(ticket.category, ticket.priority)
   training. Set the whitespace pattern deliberately.
 
 ## When to use
-- **Use when** output is consumed by code: extraction, classification into a fixed label set, tool
-  arguments, routing decisions, batch data transformation.
-- **Prefer** the engine's or provider's native structured-output mode over hand-rolled logits processors,
-  and keep Pydantic (or equivalent) validation plus bounded retries for semantics.
-- **Avoid** for free-form writing; be careful with reasoning-heavy tasks, where a two-stage design keeps
-  accuracy.
+- **Use when** output is consumed by code: tool arguments, routing decisions, extraction, classification
+  into a fixed label set, memory writes, batch data transformation.
+- **Prefer** the engine's or provider's native structured-output or strict tool mode over hand-rolled
+  logits processors, and keep Pydantic (or equivalent) validation plus bounded retries for semantics.
+- **Avoid** for free-form writing such as the agent's final answer to a user; be careful with
+  reasoning-heavy planning steps, where a two-stage design keeps accuracy.
 - **Measure** validity rate, retry rate, time to first token with and without the grammar, and task
   accuracy against an unconstrained baseline.
 - **Interviews:** explain why masking happens at the logits, how compile-time precomputation solves the
@@ -353,20 +428,29 @@ quantify the gap, and keep semantic validators and bounded retries for the resid
 - **Why the logits:** it is the last point before sampling where the engine can remove choices, so
   validity holds by construction instead of being checked and retried afterwards.
 
+### Your agent's tool calls always parse now, but it still takes wrong actions. What do you add?
+- **Shape is not truth:** strict mode guarantees the call matches the schema, not that the order id
+  exists or the amount is right.
+- **Semantic validators before the tool runs:** Pydantic rules, cross-field checks and lookups against the
+  system of record, with the error fed back for one or two bounded retries, then escalation.
+- **Schema design:** enums for closed sets, a reasoning field first, and a run-level eval of action
+  correctness, not just validity rate.
+
 ### Why can't you just check each vocabulary token against the grammar at every step?
 - **Cost:** 100k+ tokens, each needing a grammar walk, per step per sequence, far beyond a millisecond
   decode budget.
 - **Fix:** precompute, per automaton state, the legal tokens and their next states once per grammar and
   tokenizer; runtime is a lookup, and XGrammar extends this to context-free grammars.
 
-### TTFT jumped after you added structured outputs. What do you look at?
-- **Grammar compilation:** is each request sending a slightly different schema, defeating the cache?
+### TTFT jumped after you enabled structured outputs for a self-hosted agent fleet. What do you look at?
+- **Grammar compilation:** is each request or agent step sending a slightly different schema (tool lists
+  rebuilt per user, dates in enums), defeating the cache?
 - **Schema size and nesting:** large or recursive schemas compile slowly; flatten or version them.
 - **CPU saturation:** mask computation runs on the CPU per sequence, so check CPU utilisation under
   concurrency and TPOT as well as TTFT.
 
 ### When would you not use constrained decoding?
-- **Free-form writing,** where no consumer parses the output.
+- **Free-form writing,** where no consumer parses the output, such as the agent's reply to the user.
 - **Reasoning-heavy answers** unless the schema lets the model reason first or you extract in a second
   call, because strict formats can degrade reasoning.
 - **When only semantics matter:** the grammar cannot catch wrong values, so validation is still needed.
@@ -402,3 +486,24 @@ quantify the gap, and keep semantic validators and bounded retries for the resid
 > Forcing an immediate answer removes the model's chance to work through the problem in prose. Letting
 > it reason first, then constraining the final fields, restores the behaviour that unconstrained
 > prompting had.
+
+## Use cases & projects
+### Use cases
+- **Tool-calling agents.** Strict tool modes guarantee every call names a real tool and matches its
+  argument schema, so the loop never crashes on a parse error.
+- **Routers and planners.** An enum-constrained routing step picks the next tool, subagent or model with
+  no free-text parsing.
+- **Extraction into agent memory.** Facts written to a memory store or database come out in a fixed schema
+  that downstream retrieval can rely on.
+- **Small self-hosted agent models.** Constraints make 7B-class models usable for tool calls they would
+  otherwise format wrong a few percent of the time.
+
+### Mini project
+**Constrained versus prompted tool calls in a tiny agent (2-3 hours).**
+- **Goal:** measure what constrained decoding removes and what it leaves for semantic validation.
+- **Steps:** build a 3-tool support agent (search orders, refund, ask human) against vLLM or a hosted API;
+  run 50 scripted tasks with prompt-only JSON and again with a JSON Schema in `response_format`; log
+  parse failures, semantic failures (unknown order id, empty query), retries and TTFT per step; add a
+  Pydantic validator with one retry.
+- **Done when:** you have a per-setup table of parse failures, semantic failures, retries and task
+  success, with parse failures at zero under constraints and a note on which errors remained.

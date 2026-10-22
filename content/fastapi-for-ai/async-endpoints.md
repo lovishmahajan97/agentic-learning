@@ -433,3 +433,24 @@ than by CPU time spent on the loop.
 - [ ] Never; gather only orders the results
 > Overlap comes from both coroutines yielding while sockets are idle; CPU-bound work does not overlap on
 > a single loop thread, and the gain is capped by the slower of the two calls.
+
+## Use cases & projects
+### Use cases
+- **Serving many concurrent agent runs per process.** Awaited LLM and tool calls let one worker hold
+  hundreds of runs that are mostly waiting on the network.
+- **Parallel tool calls in one step.** When the model asks for several independent tools, `asyncio.gather`
+  overlaps their waits so the step takes about as long as the slowest tool.
+- **Wrapping sync-only tools safely.** A legacy SDK or CPU-heavy parser goes through
+  `anyio.to_thread.run_sync` so it cannot freeze every other run on the loop.
+- **Respecting provider quotas.** A semaphore sized to the rate limit caps in-flight LLM calls across all
+  runs in the process.
+
+### Mini project
+**Find and fix a loop-blocking tool (1-2 hours).**
+- **Goal:** show how one blocking tool stalls every agent run, then fix it.
+- **Steps:** build an `async def /agent/run` route whose fake agent calls two tools, one awaiting
+  `asyncio.sleep(1)` and one calling `time.sleep(1)`; fire 50 concurrent requests with an async load
+  script and record total time and `/health` latency; move the blocking tool to a thread with
+  `anyio.to_thread.run_sync`, then run its two tools with `asyncio.gather`.
+- **Done when:** you have a before-and-after table of total time and health-check latency, and can
+  explain each change in one sentence.

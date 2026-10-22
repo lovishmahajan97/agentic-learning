@@ -470,3 +470,27 @@ change.
 > Test plans built from "what might a user type" ignore that every retrieved chunk and tool result is
 > also an input the model may obey. Indirect injection through those channels is the common path to
 > data exfiltration and unauthorised actions.
+
+## Use cases & projects
+### Use cases
+- **Pre-launch review of an agent with write tools.** Before an agent can issue refunds, send email or
+  edit records, a red-team pass checks whether injected or social-engineered inputs can trigger those
+  actions without authorisation.
+- **RAG and browsing agents.** Planting instructions in retrieved documents, web pages and tool outputs
+  tests indirect prompt injection, the channel test plans built only from user messages miss.
+- **Prompt and data leakage checks.** Canary strings in the system prompt and records reveal whether an
+  attacker can extract hidden instructions or another user's data.
+- **Regression gates after model or prompt upgrades.** Every past successful attack stays in the
+  adversarial suite, so a new model or prompt that reopens a hole fails CI.
+
+### Mini project
+**Red-team a small agent for indirect prompt injection (2-3 hours).**
+- **Goal:** measure how often an agent obeys instructions hidden in tool output, and show that a
+  server-side control lowers that rate without breaking benign tasks.
+- **Steps:** build an agent with a fake `read_document` tool and a fake `send_email` tool that only logs
+  calls; plant a canary string in the system prompt; write 10-20 documents carrying hidden instructions
+  (send data out, reveal the prompt) plus 10 benign tasks; run each several times and grade the logged
+  tool-call arguments, not the reply text; then add a confirmation gate or recipient allowlist inside the
+  tool handler and re-run.
+- **Done when:** you have a table of attack success rate and benign task success before and after the
+  control, and every successful attack is saved as a regression test.

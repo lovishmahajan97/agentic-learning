@@ -436,3 +436,24 @@ time.
 > Fusion merges whatever each arm returns; a filter missing from one arm lets forbidden documents into
 > the candidate pool, and a strong lexical match can carry one to the top. Filters and ACLs must be
 > enforced identically in both arms.
+
+## Use cases & projects
+### Use cases
+- **Default retrieval for RAG agents.** Hybrid is the common first-stage choice when an agent's queries
+  mix copied identifiers with paraphrased questions.
+- **Multi-tenant agent platforms.** A shared tenant and ACL filter applied identically to both arms keeps
+  fusion from surfacing another tenant's documents.
+- **Recall-bound agent tasks.** Planning, troubleshooting and compliance agents whose answers depend on
+  finding one specific chunk benefit most from the recall lift.
+- **Debugging retrieval misses.** Tracing which arm produced each chunk shows whether a failure was
+  lexical, semantic or a fusion problem.
+
+### Mini project
+**Build and evaluate a fused search tool for an agent (2-3 hours).**
+- **Goal:** show the recall gain of RRF fusion over each arm alone on agent-style queries.
+- **Steps:** index the same 1k-5k chunks in a BM25 retriever and a vector store with a shared
+  `tenant_id` field; implement RRF over the top 50 of each arm; label 30 queries mixing ids and
+  paraphrases; measure recall@10 for BM25, dense and fused results; wrap the fused search as one tool and
+  log which arm contributed each returned chunk.
+- **Done when:** you have a recall table for the three setups, a test proving no cross-tenant chunk is
+  returned, and trace logs attributing chunks to arms.

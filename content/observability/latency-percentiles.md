@@ -5,7 +5,8 @@ name: Latency percentiles (p50/p95/p99)
 kind: metric
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - observability/monitoring
   - observability/tracing
@@ -20,9 +21,20 @@ sources:
 ---
 
 ## TL;DR
-Latency is a distribution, not a number: p50 is the typical request, p95 and p99 are the tail users notice
-and fan-out amplifies. For LLM systems, measure per phase (TTFT, per-token, total) and merge histograms
-before taking quantiles, never average percentiles.
+An agent task is a chain of model and tool calls, so its latency is a distribution whose tail compounds
+with every step. Track p50/p95/p99 per phase (TTFT, per-token, total) and per step, merge histograms
+before taking quantiles, and never average percentiles.
+
+## For agent builders
+- **Why it matters for agents.** A task that makes 20 model and tool calls is slow whenever any one call is
+  slow, so a dependency's p99 becomes your users' typical experience. The mean hides this completely.
+- **Where it shows up in your stack.** Histograms from your LLM gateway or `prometheus_client`, span
+  durations in OpenTelemetry-based tracing (Langfuse, LangSmith, Phoenix), and provider usage logs that
+  give TTFT and output tokens per call.
+- **What you control.** Step count, `max_tokens`, streaming, per-call timeouts and retries, hedging of
+  idempotent tool calls, and the bucket edges you put on SLO thresholds.
+- **What you can skip.** Sketch internals (t-digest, DDSketch maths). Know that they are mergeable with
+  bounded relative error, and that per-process summaries are not.
 
 ## Why it exists
 - **The mean describes nobody.** Latency has a hard floor (network round trip plus minimum compute) and no
@@ -210,6 +222,51 @@ print(f"under 2 s  {merged[2] / merged[-1]:.1%}")   # exact at an edge: the SLO 
 - **The SLO ratio is exact** because 2 s is a bucket edge; the p99 values are only as precise as the bucket
   widths (5 to 10 s here). B's p99 falls in the +Inf bucket, so it is clamped to the last finite edge.
 
+### Worked scenario: latency budget for a 12-step support agent
+An agent answers a ticket with a planning call, retrieval, several tool calls and a final answer. Per-call
+numbers below are illustrative, chosen to show the shape.
+
+| Step type | Calls per task | p50 per call | p99 per call |
+|---|---|---|---|
+| Model call (plan or decide) | 6 | 1.2 s | 4 s |
+| Retrieval | 2 | 0.15 s | 0.8 s |
+| External tool (CRM, billing) | 3 | 0.4 s | 5 s |
+| Final answer, streamed | 1 | 3 s | 9 s |
+| **Task total (sequential)** | **12** | **about 12 s (sum of p50s, a rough guide)** | **far above the 9 s of any single call** |
+
+- **Tails compound.** With 12 calls, the chance at least one hits its own p99 is 1 − 0.99^12, about 11%,
+  so roughly one task in nine contains a "rare" slow call.
+- **The fix is structural.** Cut steps (merge the two retrievals), run independent tool calls in
+  parallel, put a timeout plus one retry on the 5 s CRM tail, and stream the final answer so perceived
+  latency is TTFT, not total.
+
+### Timing every agent step with a status label
+Wrap each model and tool call in one histogram so the step and the outcome are both recorded, including
+timeouts. Label values stay low-cardinality: step type and tool name, never task IDs.
+
+```python
+import time
+from prometheus_client import Histogram
+
+STEP = Histogram("agent_step_seconds", "Agent step latency", ["step", "tool", "status"],
+                 buckets=[0.25, 0.5, 1, 2, 5, 10, 30])
+
+def timed_step(step, tool, fn, *args, **kwargs):
+    t0, status = time.perf_counter(), "ok"
+    try:
+        return fn(*args, **kwargs)
+    except TimeoutError:
+        status = "timeout"; raise
+    except Exception:
+        status = "error"; raise
+    finally:   # failures are timed too, so an incident cannot improve the tail
+        STEP.labels(step, tool, status).observe(time.perf_counter() - t0)
+
+# In the agent loop:
+# result = timed_step("tool", "crm_lookup", crm.lookup, customer_id)
+# reply  = timed_step("model", "none", client.chat, messages)
+```
+
 ### Worked incident: a p99 that improved during an outage
 | Time | Successes timed | Timeouts (not timed) | Reported p99 |
 |---|---|---|---|
@@ -236,6 +293,9 @@ alerting on the fraction under the threshold.
   ~5%) and backend utilisation.
 - **Time every outcome.** Record errors and timeouts with elapsed time and a `status` label so incidents
   cannot improve the tail. Monitor the timeout count next to p99.
+- **Per-step and per-task histograms for agents.** Record one histogram per step type (model, retrieval,
+  each tool) and one for whole tasks, plus a histogram of steps per task. Monitor task p95 next to steps
+  per task, because a planner that starts taking 15 steps instead of 8 looks like a latency regression.
 - **Low-traffic fallback.** For endpoints below a few hundred requests per window, show p90 plus the
   sample count, or widen the window.
 
@@ -267,6 +327,9 @@ alerting on the fraction under the threshold.
   p99 that turns out to be the 3% of traffic routed to a slower model.
 - **Treating an end-to-end regression as an infrastructure problem.** Symptom: unchanged TTFT and tokens/s
   while the median output length doubled after a prompt edit.
+- **Reporting one p99 across agent tasks of very different length.** Symptom: task p99 jumps although
+  no call got slower, because a new feature routes more multi-step tasks. Fix: slice task latency by
+  steps per task or task type, and track the step-count distribution.
 - **Measuring only server-side.** Symptom: a server p99 of 300 ms against customer reports of 4 s, the gap
   being load-balancer queueing, SDK retries or provider-side queueing nobody instrumented.
 
@@ -322,6 +385,13 @@ step. Report which segment and which phase moved, the fraction of requests affec
 - **Sequential calls add up,** so task latency is the sum of per-call latencies and its tail is fatter still.
 - **Response:** tighten per-call targets, hedge idempotent calls at the p95 delay, and cut the call count.
 
+### How would you set a latency SLO for an agent whose tasks take between 3 and 30 steps?
+- **Do not put one end-to-end number on all tasks.** Task latency scales with step count, so set the SLO
+  per task type, or on time to first visible progress (first streamed token or status update).
+- **Budget per step.** Give model calls, retrieval and each tool a p95 target that sums to the task budget,
+  and alert on the per-step histograms that break it.
+- **Track steps per task as its own metric,** because planner drift adds latency without any slow call.
+
 ### When would you not hedge requests to cut tail latency?
 - **Near saturation.** Hedging adds load exactly when queueing causes the tail, so the ρ/(1−ρ) term gets
   worse; admission control is the better lever there.
@@ -359,3 +429,24 @@ step. Report which segment and which phase moved, the fraction of requests affec
 - [ ] About 99%
 > The page is slow if any call is slow: 1 − 0.99^30 ≈ 0.26. This is the tail-at-scale effect; the
 > per-dependency p99 becomes a common user experience once fan-out is wide enough.
+
+## Use cases & projects
+### Use cases
+- **Agent latency SLOs.** Teams set per-task-type targets and per-step budgets, then alert on the ratio of
+  tasks finishing under the threshold.
+- **Diagnosing a slow agent release.** Splitting task latency into steps per task, TTFT, per-token speed
+  and tool latency shows whether the planner, the model or a tool regressed.
+- **Choosing parallel vs sequential tool calls.** Fan-out arithmetic (1 − 0.99^N) tells you when parallel
+  calls need hedging or tighter per-call timeouts.
+- **Provider and model comparisons.** Comparing p50 and p99 TTFT per model and route, not averages,
+  before switching the model behind an agent.
+
+### Mini project
+**Latency dashboard for a toy agent (2-3 hours).**
+- **Goal:** see how per-call tails compound into agent task latency.
+- **Steps:** build a 6-10 step agent with fake tools that sleep for log-normal durations and fail 1% of
+  the time with a timeout; wrap every step in a labelled histogram with SLO bucket edges; run 1,000 tasks;
+  compute task and per-step p50/p95/p99 from merged buckets; then parallelise two independent tools and
+  add one retry on the slowest tool.
+- **Done when:** you have a before/after table of task p50 and p99, the measured share of tasks containing
+  at least one slow call next to the 1 − 0.99^N prediction, and timeouts visible in the histogram.

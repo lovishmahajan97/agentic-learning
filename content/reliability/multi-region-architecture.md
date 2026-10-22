@@ -5,7 +5,8 @@ name: Multi-region architecture
 kind: pattern
 difficulty: advanced
 est_minutes: 17
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - reliability/high-availability
   - reliability/disaster-recovery
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-Multi-region runs a system in several cloud regions to survive region loss, cut latency and meet
-residency rules. The hard part is state: synchronous replication taxes every write, asynchronous loses
-recent writes. Start multi-AZ; go multi-region for a named reason.
+Multi-region runs your agent platform in several cloud regions to survive region loss, cut latency,
+meet residency rules and gain model quota. The hard part is agent state: transcripts, checkpoints and
+memory. Start multi-AZ; go multi-region for a named reason.
+
+## For agent builders
+- **Why it matters for agents.** Agent runs carry state (transcripts, plans, memory, vector indexes)
+  and call region-specific model endpoints. A region loss kills in-flight runs unless they are
+  checkpointed in a replicated store, and residency rules decide where the prompt itself may be sent.
+- **Where it shows up in your stack.** Per-region model endpoints and quotas, the tenant home-region
+  table that routes agent requests, replicated checkpoint and memory stores, and the embedding model
+  version used to build each region's vector index.
+- **What you control.** Which region owns each tenant's agent state, which model endpoint a
+  residency-bound tenant may call, how often runs checkpoint, and which agent workloads you shed when one
+  region must carry both.
+- **What you can skip.** Building globally consistent databases or CRDT libraries yourself. Know
+  partitioned active-active, async lag as RPO and the 50% capacity rule; buy the storage.
 
 ## Why it exists
 - **A region is one blast radius.** Even spread across availability zones, it shares a control plane and
@@ -99,7 +113,7 @@ recent writes. Start multi-AZ; go multi-region for a named reason.
   shedding on failover: which tenants and which workloads keep running.
 - **Provider quotas follow the same arithmetic** and do not move with your traffic.
 
-### What is different for AI systems
+### What is different for AI systems and agents
 - **Model availability and rollout timing vary by region;** the same model name may not be live in both
   regions on the same day, so pin versions and test in both.
 - **Embeddings must come from the same model and version in every region,** or a replicated vector index
@@ -111,6 +125,10 @@ recent writes. Start multi-AZ; go multi-region for a named reason.
   *degrade in place*, not be served from a foreign region.
 - **In-flight agent runs die with the region** unless progress is checkpointed in a replicated store,
   which is why durable execution and multi-region go together.
+- **Agent memory is tenant data.** Long-term memories and conversation summaries replicate and fail
+  over with the tenant's home region, and are bound by the same residency rules as the raw transcript.
+- **Tools have regions too.** An agent failed over to `eu-west` may still call a tool API that only
+  runs in `us-east`; list each tool's region and fallback before you claim the agent survives region loss.
 
 ## Diagram
 Partitioned active-active: each tenant's writes go to its home region, replicas trail asynchronously,
@@ -186,6 +204,29 @@ print(failover_check(utils, demand, quota, "us-east", {"us-east": 50, "eu-west":
 
 - **Use the lag tail, not the mean,** for `lag_s`: the p99 lag during peak is your real RPO.
 
+### Residency-aware model routing for an agent step
+Each agent step picks a model endpoint from the tenant's home region, falls over only where residency
+allows, and otherwise degrades in place. Region and endpoint names are placeholders.
+
+```python
+ENDPOINTS = {"us-east": "https://models.us-east.example/v1", "eu-west": "https://models.eu-west.example/v1"}
+
+def pick_endpoint(tenant, healthy):
+    home = tenant["home_region"]
+    if home in healthy:
+        return ENDPOINTS[home], "normal"
+    if tenant["residency_bound"]:
+        return None, "degraded_in_place"          # never send this tenant's prompt abroad
+    other = next((r for r in healthy if r != home), None)
+    return (ENDPOINTS[other], "failed_over") if other else (None, "unavailable")
+
+print(pick_endpoint({"home_region": "eu-west", "residency_bound": True}, healthy={"us-east"}))
+# (None, 'degraded_in_place'): the agent answers read-only or queues the run instead of calling us-east
+```
+
+- **Log the routing outcome per step** so a run that switched regions mid-way is visible in traces and
+  evals.
+
 ## Production patterns
 - **Home-region routing table.** Store each tenant's home region in a small replicated config and route
   at the edge on it; re-homing is a data change, not a deploy. Monitor requests served outside their
@@ -202,6 +243,9 @@ print(failover_check(utils, demand, quota, "us-east", {"us-east": 50, "eu-west":
 - **Replication lag as a distribution.** Alert on p99 replica lag per store (database, vector index,
   prompt registry, flags), because the tail is the data you lose. Track it alongside survivor
   utilisation and per-region provider quota headroom.
+- **Per-region agent eval gate.** Run the agent eval suite against each region's model endpoint and
+  vector index before a rollout and after any failover drill, because model versions and index builds
+  drift by region. Monitor eval score deltas between regions.
 
 ## Trade-offs
 - **Survival and latency vs cost.** Region loss survival and lower latency for distant users are paid for
@@ -217,6 +261,8 @@ print(failover_check(utils, demand, quota, "us-east", {"us-east": 50, "eu-west":
   manual data-tier promotion is slower and safer, and becomes the better choice as the data's value rises.
 - **More quota vs more validation.** A second region doubles provider quota and model-availability
   options, yet model and prompt behaviour must be validated in two places, doubling eval and rollout work.
+- **Checkpoint often vs write cost.** Checkpointing every agent step keeps failover loss to one step but
+  adds a replicated write per step; checkpoint less often only when steps are cheap and side-effect free.
 
 ## Pitfalls
 - **A standby region never failed over to.** Expired credentials, missing secrets, a model not enabled in
@@ -232,6 +278,9 @@ print(failover_check(utils, demand, quota, "us-east", {"us-east": 50, "eu-west":
 - **A failover procedure with a hidden dependency on the failed region.** Its CI/CD runner, secrets store
   or registry; drills that only fail over while the source region is healthy never reveal it, so the
   symptom is a runbook step that hangs during the real event.
+- **Failing over agents but not their tools.** The agent tier moves, but a tool API or MCP server it
+  depends on stays single-region; runs resume and then fail on every tool call. Fix: map tool regions
+  and give each a fallback or a typed "unavailable" result.
 
 ## When to use
 - **Use when you can name the driver:** a contractual requirement to survive region loss, a latency
@@ -300,6 +349,14 @@ rather than promised.
 - **Measure lag as a distribution** at peak and publish the p99 or worse as the RPO, then rehearse failover
   to confirm it.
 
+### An EU tenant's agent must keep working when eu-west is down. What can you promise?
+- **Not failover to us-east,** if the tenant is residency-bound: the prompt, memory and tool results
+  count as processed data and must stay in-jurisdiction.
+- **Promise degrade-in-place:** read-only answers from cached data, queued runs that resume when the
+  region returns, or a second in-jurisdiction region if the business funds one.
+- **Make it visible:** the routing decision is logged per agent step and the degraded mode is in the
+  contract.
+
 ## Quiz
 ### Q: In a partitioned active-active design, why does each tenant have a single home region for writes?
 - [ ] To reduce storage costs by keeping only one copy of each tenant's data
@@ -324,3 +381,23 @@ rather than promised.
 - [ ] Provider quotas shift to the surviving region to absorb the load
 > Failover moves demand, not capacity. Either run each region at or below 50% or decide in advance
 > which workloads to shed, because autoscaling and provider quotas do not react in time.
+
+## Use cases & projects
+### Use cases
+- **Enterprise agents with EU and US customers.** Tenant home regions keep agent memory, transcripts and
+  model calls in-jurisdiction while both regions serve traffic.
+- **Agents hitting provider quota ceilings.** A second region's model quota doubles headroom, with batch
+  agent work shed first when one region must carry both.
+- **Long-running agent platforms with a region-loss SLA.** Replicated checkpoints let interrupted runs
+  resume in the surviving region, re-executing only the interrupted step.
+- **Global RAG assistants.** Each region serves retrieval from an index built with the same embedding
+  model version, cutting latency for distant users.
+
+### Mini project
+**Simulate a regional failover for an agent platform (2-3 hours).**
+- **Goal:** show what an agent platform loses and keeps when one of two regions disappears.
+- **Steps:** model two regions as two SQLite files with an async copy job that lags by a configurable
+  number of seconds; run fake agent sessions that checkpoint each step to their home region; kill one
+  region mid-run, promote its replica, resume runs, and apply the residency routing rule from the example.
+- **Done when:** a report lists steps lost per run (about lag × steps per second), runs resumed, tenants
+  degraded in place, and survivor load as a share of capacity.

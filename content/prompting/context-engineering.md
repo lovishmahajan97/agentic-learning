@@ -5,7 +5,8 @@ name: Context engineering
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - prompting/system-prompt
   - prompting/prompt-caching
@@ -21,9 +22,20 @@ sources:
 ---
 
 ## TL;DR
-The context window is the model's whole working memory for a call: finite, billed per token, attended
-unevenly. Context engineering decides what goes in, in what order, form and budget; in multi-step systems
-that decides quality and cost.
+The context window is an agent's whole working memory for each step: finite, billed per token, attended
+unevenly. Context engineering decides which tools, documents, history and tool results go in, in what
+order and budget; in agent loops that decides quality and cost.
+
+## For agent builders
+- **Why it matters for agents.** An agent's context grows every step with tool calls and results, so the
+  failure is rarely overflow on step 1; it is a confused agent on step 40 acting on stale results while
+  its plan sits in the middle of the window.
+- **Where it shows up in your stack.** Your request builder, tool-result clearing and compaction in
+  agent frameworks, token-count endpoints, memory stores, and sub-agent boundaries.
+- **What you control.** Per-layer budgets, placement order, when consumed tool results are stubbed, the
+  compaction threshold and state-note schema, just-in-time fetching, and what sub-agents return.
+- **What you can skip.** Attention internals. Know that the middle of a long context is used worst and
+  that edits to earlier history break the prompt cache.
 
 ## Why it exists
 - **More material than the model can use well.** A single chat turn fits any modern window. Problems
@@ -308,7 +320,7 @@ against step count to confirm the curve flattens.
 - **Why it matters:** in multi-step systems the non-instruction material dominates the tokens, so it
   decides quality and cost.
 
-### Your RAG answers ignore a policy clause that was definitely retrieved. What do you check?
+### Your RAG agent ignores a policy clause that was definitely retrieved. What do you check?
 - **Position:** was the chunk in the middle of a long context? Reorder so the best chunks sit at the
   edges and the question comes last.
 - **Noise:** were forty chunks sent when five were relevant? Tighten the retrieval budget or rerank.
@@ -359,3 +371,24 @@ against step count to confirm the curve flattens.
 - [ ] When tool results are included in the summary
 > Compaction is lossy by design. It is safe when decisions and state are preserved and the raw log is
 > retrievable; it fails when precision mattered and the detail is simply gone.
+
+## Use cases & projects
+### Use cases
+- **Long-running coding agents.** Stubbing consumed file reads and test output, plus a state note, keeps
+  step 60 as sharp as step 6.
+- **RAG agents.** Retrieval budgets and best-at-the-edges ordering decide whether the retrieved clause is
+  actually used.
+- **Research agents with sub-agents.** Each sub-agent surveys sources in its own context and returns a
+  capped summary to the orchestrator.
+- **Agents with large tool catalogues.** Progressive disclosure and a tool-search tool keep definitions
+  from dwarfing the task.
+
+### Mini project
+**Keep a 50-step agent within budget (2-3 hours).**
+- **Goal:** show that budgets, batch stubbing and threshold compaction keep an agent's tokens per step
+  flat without losing state.
+- **Steps:** build a toy agent that reads 50 fake files of ~2k tokens each and must report three facts
+  planted early; run it with no management, then with the `assemble` function above, batch stubbing and
+  compaction at 70% of a reduced window; log tokens per step and cache reads.
+- **Done when:** a chart shows tokens per step for both runs, the managed run still reports all three
+  planted facts, and you can point to the one cache re-write per compaction event.

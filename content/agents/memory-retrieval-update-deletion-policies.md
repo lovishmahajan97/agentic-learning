@@ -5,7 +5,8 @@ name: Memory retrieval / update / deletion policies
 kind: practice
 difficulty: advanced
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/agent-memory
   - agents/context-compaction-summarization
@@ -21,9 +22,23 @@ sources:
 ---
 
 ## TL;DR
-Without policies a memory store becomes stale, contradictory, sometimes poisoned text. Retrieval
+Without policies your agent's memory becomes stale, contradictory, sometimes poisoned text. Retrieval
 decides what enters the context, update decides add, supersede or ignore, and deletion expires and
 erases memories everywhere, including indexes and backups.
+
+## For agent builders
+- **Why it matters for agents.** Memory is the one part of an agent that silently gets worse with use:
+  contradictions pile up, old look-alikes outrank current facts, and one browsing task can plant a
+  permanent instruction. These policies are what keep a memory-enabled agent correct and passable in a
+  privacy review.
+- **Where it shows up in your stack.** Metadata filters in your vector store's search call, the
+  extraction and upsert step (hand-written or a library such as LangMem or Mem0), scheduled retention
+  jobs, and the erasure runbook that spans the raw store, the index and compaction summaries.
+- **What you control.** The scope filter, the scoring weights and token budget, the trusted-source list,
+  the add/update/ignore/delete decision, TTL by kind and per-user caps, tombstones and the post-erasure
+  count check.
+- **What you can skip.** Tuning recency and importance weights before you have stale-retrieval evidence;
+  start with scoping, write gating, timestamps and a verified erasure path.
 
 ## Why it exists
 - **The first implementation is always append-and-search:** store every extracted fact, retrieve the
@@ -413,3 +428,30 @@ inspect.
 - [x] Text found in a web page retrieved during a browsing task
 > Retrieved third-party content can contain injected instructions. If it can write memory, an attack
 > persists across sessions; gating writes to trusted sources is the defence.
+
+## Use cases & projects
+### Use cases
+- **Support agents handling changed details.** A customer's new address supersedes the old one, so the
+  agent ships to the current address while history stays available for audit.
+- **Browsing and research agents.** Write gating keeps instructions found on web pages out of long-term
+  memory, so one malicious page cannot steer every later session.
+- **Privacy and offboarding requests.** An erasure job removes a user's memories from the raw store, the
+  vector index, summaries and caches, then proves it with per-store counts.
+- **Keeping memory cheap at scale.** TTL by kind and per-user caps stop stores from growing until
+  retrieval returns near-duplicates instead of the useful fact.
+
+### Mini project
+**Build the full lifecycle for one agent's memory store (2-3 hours).**
+- **Goal:** an upsert path, a retention pass and an erasure routine for a small memory store, each covered
+  by a test.
+- **Steps:** implement source gating and the add/update/ignore/delete decision with an `active` flag and
+  `superseded_by`; run retrieval with a scope filter and active-only by default; add a scheduled TTL and
+  cap pass; write `erase_user` across a raw store, an in-memory index and a summary table with a
+  tombstone; restore an old snapshot and replay tombstones.
+- **Done when:** "I moved to Berlin" leaves exactly one active address, a web-page fact is rejected, and
+  after erasure and a snapshot restore every per-store count for the user is zero.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): the billing-dispute agent's memory note
+covers retrieval scoping and scoring, supersession of contradictory facts, TTLs and an erasure procedure
+across the raw store, the vector index and compaction summaries.

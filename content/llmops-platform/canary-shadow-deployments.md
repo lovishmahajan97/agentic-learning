@@ -5,7 +5,8 @@ name: Canary / shadow deployments
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - llmops-platform/rollback
   - llmops-platform/evaluation-gates-for-production-releases
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-Shadow runs a candidate model, prompt or agent on copied live traffic without serving it; canary serves
-it to a small sticky slice and ramps while guard metrics hold. Together they turn "ship and hope" into
-measured exposure.
+Shadow runs a candidate agent bundle (model, prompt, tools) on copied live traffic with side effects off;
+canary serves it to a small sticky slice of sessions and ramps while guard metrics hold. Together they
+turn "ship the new agent and hope" into measured exposure.
+
+## For agent builders
+- **Why it matters for agents.** Every agent change (new model, edited system prompt, a tightened tool
+  schema, a new retrieval index) shifts behaviour on every task at once. Shadow and canary are how you
+  learn what the new agent does on real tasks before all users depend on it.
+- **Where it shows up in your stack.** The AI gateway or router in front of your agent, feature-flag
+  percentage rollouts keyed on session id, and trace tags carrying the bundle id so evals and dashboards
+  can split by version.
+- **What you control.** What goes in the bundle, which tools are stubbed in shadow, the hash key and
+  salt, the ramp steps, and the guard metrics: task completion, steps per task, tool-call error rate,
+  cost per task, escalation rate.
+- **What you can skip.** Service-mesh internals and statistics beyond the `n ≈ 16 · σ² / δ²` rule of
+  thumb; that is enough to plan a ramp.
 
 ## Why it exists
 - **Offline evals only say "probably better".** They score a few hundred curated cases; they cannot tell
@@ -136,6 +150,17 @@ These are often conflated.
 - **Routing, hashing, mirroring and the rollout percentage** belong in the AI gateway or control plane as
   configuration, not in application code, so a rollout or rollback is a config change with no deploy.
 
+### Agent-specific guard metrics
+A chat model is judged per response; an agent is judged per task. Guard both arms on task-level signals:
+
+| Signal | Why it catches agent regressions |
+|---|---|
+| Task completion rate | the outcome users care about; needs the larger ramp steps to resolve |
+| Steps (LLM calls) per task | a looping or confused agent spends more steps before failing |
+| Tool-call error rate | bad arguments against a changed schema show up here first |
+| Cost and tokens per task | longer loops multiply cost even when each call looks normal |
+| Human escalation or approval-reject rate | the agent proposing actions people refuse |
+
 ## Diagram
 Every request is bucketed by a salted user hash; incumbent-served requests may also be mirrored to the
 shadow candidate with side effects off, and guard metrics on both arms drive the ramp or rollback.
@@ -229,6 +254,23 @@ for pct in (1, 5, 25):
 | 5% | the same within hours; judge shifts of 0.1 in about a day | early quality read |
 | 25% and up | 0.1-point judge shifts within an afternoon | promotion decision |
 
+### Worked scenario: canarying a new model inside a support agent
+A support agent (search, read-order and refund tools) moves from bundle-v12 to bundle-v13, which swaps
+the model. Figures are illustrative.
+
+| Metric at the 5% step (1 day) | v12 (control) | v13 (canary) | Read |
+|---|---|---|---|
+| Sessions | 19,000 | 1,000 | enough for hard errors, thin for quality |
+| Tool-call error rate | 1.2% | 1.4% | within noise |
+| Steps per task (mean) | 4.1 | 6.3 | alarm: the loop got longer |
+| Cost per task | $0.031 | $0.052 | follows the step count |
+| Task completion | 81% | 79% | not yet resolvable at this sample |
+
+- **Diagnosis from traces:** v13 calls the search tool repeatedly with near-identical queries before
+  answering, so each task burns two extra steps.
+- **Action:** the steps-per-task guard rolls back automatically; the fix is a prompt change telling the
+  model when search results are sufficient, then a fresh shadow run before re-canarying.
+
 ## Production patterns
 - **Mesh-level mirroring for stateless calls.** When the candidate has no side effects, mirror at the
   proxy: Istio's `VirtualService` supports a `mirror` destination with a `mirrorPercentage`, and Envoy has
@@ -246,6 +288,12 @@ for pct in (1, 5, 25):
 - **Percentage flags keyed on a salted user id.** Feature-flag systems with percentage rollouts by user
   attribute (LaunchDarkly, Unleash and similar) give sticky assignment and a one-click kill switch without
   a deploy. Monitor the actual cohort size against the configured percentage.
+- **Dry-run tools in the agent's shadow arm.** Give the shadow agent tool adapters that validate
+  arguments and return recorded or synthetic results instead of acting, and log the intended call. Compare
+  intended tool calls against the incumbent's real ones. Monitor validation failures per tool.
+- **Per-task guards, not per-call guards.** Aggregate traces by task or session id and gate the ramp on
+  steps per task, cost per task and completion, since a longer loop can hide behind normal per-call
+  latency. Monitor the p95 of steps per task on both arms.
 
 ## Trade-offs
 - **Shadow: zero exposure vs double cost and blind spots.** You get a like-for-like comparison, but pay
@@ -267,6 +315,8 @@ for pct in (1, 5, 25):
   "changed personality" mid-conversation while aggregate metrics look fine. Fix: hash user or session id.
 - **Comparing the canary to a historical baseline.** Symptom: a "regression" that disappears once you
   notice the canary window included a product launch. Fix: a concurrent control on the same window.
+- **Guarding per call while the agent loops.** Symptom: per-call latency and errors look flat, yet cost
+  per task climbs and users wait longer. Fix: guard on steps and cost per task.
 - **Judging quality after 150 samples.** Symptom: rollbacks and promotions that flip day to day with no
   change in the system. Fix: compute the required sample first.
 - **Ignoring warm-up effects.** The candidate has a cold prompt cache and a fresh rate-limit bucket.
@@ -349,6 +399,14 @@ B's refund behaviour in canary is the one thing shadow could not test, so it get
 - **Example:** choosing between two prompt styles that both pass safety; you need a success metric and a
   sample size committed in advance, otherwise you are peeking at noise.
 
+### Which guard metrics would you put on a canary of a new agent version, and why not just latency and errors?
+- **Task-level metrics:** completion rate, steps per task and cost per task, because an agent that loops
+  or picks the wrong tool can keep every individual call fast and error-free.
+- **Tool metrics:** tool-call error and argument-validation rates per tool, which catch schema drift
+  between the model and your tool definitions first.
+- **Human signals:** escalations and rejected approvals, the earliest sign the agent proposes actions
+  people would not take.
+
 ## Quiz
 ### Q: Why is a shadow deployment unable to evaluate a multi-turn conversational agent properly?
 - [ ] Because shadow traffic cannot be logged alongside the served response
@@ -371,3 +429,24 @@ B's refund behaviour in canary is the one thing shadow could not test, so it get
 - [x] Per-session stickiness keeps conversations coherent and prevents the arms from contaminating each other's results
 - [ ] Hashing lets the canary cohort be chosen from internal users only
 > If consecutive turns of one conversation hit different versions, users see inconsistent behaviour and each arm's metrics include context produced by the other arm, which invalidates the comparison.
+
+## Use cases & projects
+### Use cases
+- **Model migration inside an agent.** Moving a tool-calling agent to a new provider or model snapshot:
+  shadow with dry-run tools, then canary by session.
+- **System prompt or tool-schema edits.** Small text changes alter tool choice on every task, so they
+  ship behind a canary like code does.
+- **New retrieval index for a RAG agent.** Shadow both indexes and compare answers and citations before
+  any user sees the new one.
+- **Agents with consequential actions.** Refund, email or ticketing agents get the smallest first step
+  and the tightest guard on the action rate shadow could not observe.
+
+### Mini project
+**Shadow and canary a toy agent (2-3 hours).**
+- **Goal:** route a tool-calling agent between two bundles and detect a deliberately worse one.
+- **Steps:** build a two-tool agent (search, create_ticket); make bundle B with a vaguer system prompt;
+  add a router that hashes session id with a salt into a 10% canary; run B in shadow with
+  `create_ticket` stubbed to log intended calls; replay 300 synthetic tasks and record steps, tool errors
+  and cost per task by bundle.
+- **Done when:** a per-bundle table shows the difference, a guard on steps per task triggers a rollback
+  to A automatically, and no stubbed shadow call created a real ticket.

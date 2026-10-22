@@ -500,3 +500,25 @@ numbers are components, not the verdict.
 > A packaged metric is a prompt, a model and a parser; its agreement with your definition of a
 > hallucination is unknown until measured. Pinning the judge keeps the gate stable across environments
 > and upgrades.
+
+## Use cases & projects
+### Use cases
+- **Choosing an eval stack for a new agent team.** Starting from where the framework already sends traces
+  (LangSmith for LangChain and LangGraph, or Langfuse) avoids hand-copying trajectories into sheets.
+- **CI gates on agent changes.** A library such as Promptfoo or DeepEval runs the golden set on each PR
+  and fails the build when scores drop.
+- **Scoring the retrieval step of a RAG agent.** RAGAS-style metrics grade retrieved context separately
+  from the final answer, once calibrated against human labels.
+- **Online evaluation of production traffic.** Platform evaluators sample live traces, score them and
+  route low scorers into annotation queues and new dataset items.
+
+### Mini project
+**Wire one agent into a trace platform and a CI eval library (2-3 hours).**
+- **Goal:** run the same small golden set against an agent both locally in CI and as a stored experiment
+  you can compare in a platform UI.
+- **Steps:** take a small tool-calling agent and instrument it with LangSmith's `@traceable`, Langfuse's
+  decorator or OpenTelemetry; write a target adapter that runs the agent per dataset item; add one
+  outcome scorer and one trajectory scorer (for example, was the right tool called); run 15-20 items
+  through a CI library and log the run to the platform; pin the judge model and library version.
+- **Done when:** two runs of different prompt versions appear side by side in the platform with per-item
+  scores and full trajectories, and the CI job fails when you break the agent on purpose.

@@ -5,7 +5,8 @@ name: FlashAttention
 kind: concept
 difficulty: advanced
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - model-internals/self-attention
   - model-internals/multi-head-attention
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-FlashAttention computes exact softmax attention without writing the n×n scores to GPU memory, streaming
-K/V blocks through SRAM with a running softmax. Attention was slow from memory traffic, not FLOPs, so it
-runs faster and long contexts fit.
+FlashAttention computes exact attention without writing the n×n scores to GPU memory. It is why
+self-hosted models can serve long agent transcripts and fine-tune on long agent traces; your job is to
+make sure it is actually on.
+
+## For agent builders
+- **Why it matters for agents.** Agent transcripts and training traces run to tens of thousands of
+  tokens. Without fused attention, the n² score matrix makes those lengths run out of memory or crawl;
+  with it, memory grows linearly with transcript length.
+- **Where it shows up in your stack.** `attn_implementation` when loading Hugging Face models for
+  fine-tuning on agent traces, `F.scaled_dot_product_attention` in custom code, and the attention
+  backends inside vLLM and SGLang when you serve agents yourself.
+- **What you control.** Dtype (bf16 or fp16), mask form (`is_causal` rather than dense tensors), packing
+  instead of padding, and GPU generation (Ampere or newer).
+- **What you can skip.** The CUDA tiling details and IO-complexity proof. Keep "exact, memory-bound win,
+  silent fallbacks exist, still quadratic in FLOPs". On hosted APIs this is the provider's concern.
 
 ## Why it exists
 - **Standard attention round-trips through HBM.** It runs `S = Q·Kᵀ`, `P = softmax(S)`, `O = P·V` as
@@ -37,14 +50,14 @@ runs faster and long contexts fit.
   only about 1.5–2 TB/s from HBM, so an operation needs well over a hundred FLOPs per byte to be
   compute-bound. Softmax, masking and dropout do about one FLOP per byte.
 - **So n² traffic set the time and n² memory set the length.** Models of that era trained at
-  512–2,048 tokens.
+  512–2,048 tokens, far short of a modern agent transcript.
 - **Approximations missed the point.** Sparse patterns, low-rank projections and kernel feature maps
   reduce FLOPs but often not wall-clock time, because the memory traffic stayed, and they changed the
   model's behaviour. FlashAttention optimized the number of HBM reads and writes, as external-memory
   algorithms do, while leaving the math exact.
 
 ## How it works
-### The memory hierarchy the kernel is written for
+### Background: the memory hierarchy the kernel is written for
 | Memory | Size | Speed |
 |---|---|---|
 | HBM | tens of gigabytes | a few TB/s, slow relative to compute |
@@ -78,16 +91,17 @@ O_new = exp(m - m_new) · O + exp(S_ij - m_new) · V_j
 - **Why the rescale works.** Everything accumulated so far was computed relative to the old max;
   multiplying by `exp(m − m_new)` re-expresses it relative to the new one.
 - **Exact, not approximate.** After the last block, `O / l` is the exact softmax-weighted sum, a
-  re-association of the same sum.
+  re-association of the same sum, so agent evals do not shift when you switch it on.
 - **FlashAttention-2 defers the division** by *l* to the very end to cut non-matmul work.
 
-### Backward pass by recomputation
+### Backward pass by recomputation (fine-tuning)
 - **Standard backward stores P**, n² per head, from the forward pass.
 - **FlashAttention stores only O and one number per row**, the log-sum-exp `L = m + log l`, then
   recomputes tiles of **S** and **P** from **Q**, **K** and *L* on the fly inside SRAM.
 - **More FLOPs, less time.** It costs roughly one more matmul's worth of FLOPs, yet is faster than the
   standard backward because recomputation is cheaper than reading n² values from HBM.
-- **Same idea as gradient checkpointing**, applied at the kernel level.
+- **Same idea as gradient checkpointing**, applied at the kernel level; it is what lets you fine-tune on
+  long multi-step agent trajectories.
 
 ### IO complexity
 | Algorithm | HBM accesses |
@@ -116,7 +130,8 @@ Exact figures vary by shape and hardware, so measure on yours.
   cache.
 - **A final reduction combines them** with exactly the online-softmax rule above. The same algebra that
   lets one block stream over keys lets many blocks work on disjoint key ranges in parallel.
-- **So serving engines ship decode-specific kernels.**
+- **So serving engines ship decode-specific kernels**, which matters for agents because each step decodes
+  a short tool call against a long cached transcript.
 
 ### Where you meet it
 - **PyTorch:** `F.scaled_dot_product_attention` dispatches to a flash kernel when dtype, head dimension
@@ -156,7 +171,8 @@ flowchart TD
 
 ## Examples
 ### Naive attention against the flash backend on one GPU
-Naive attention against the flash backend on one GPU, comparing peak memory, time and the outputs.
+Naive attention against the flash backend on one GPU, comparing peak memory, time and the outputs, at
+8,192 tokens, a modest agent transcript.
 
 - **Naive** allocates three ~4.3 GB tensors in sequence (scores, masked scores, probabilities), which are
   all live at once at the softmax.
@@ -225,6 +241,21 @@ Q, K, V = (rng.normal(size=(64, 32)) for _ in range(3))
 print(np.allclose(naive(Q, K, V), tiled(Q, K, V)))     # True: exact, just re-associated
 ```
 
+### Agent scenario: fine-tuning on agent trajectories, padded versus packed
+A team fine-tunes a model on recorded agent trajectories (tool calls plus results). One batch of 8 traces
+has lengths 1k, 2k, 2k, 3k, 4k, 6k, 8k and 16k tokens (illustrative).
+
+| Setup | Tokens processed | Real tokens | Waste |
+|---|---|---|---|
+| Padded to the longest trace | 8 × 16k = 128k | 42k | about 3× the needed work |
+| Packed with variable-length flash attention | about 42k | 42k | near zero |
+| Naive eager attention on the 16k trace | n² scores ≈ 4× those at 8k per layer | — | likely OOM before any waste matters |
+
+- **Why the last row matters:** at 16k the score matrix per layer is four times the 4.3 GB of the 8k case,
+  so eager attention cannot even hold one long trace on most cards.
+- **Takeaway:** for agent-trace fine-tuning, flash attention plus packing decides whether long
+  trajectories are trainable at all, and at what cost.
+
 ### Worked scenario: what the naive path moves per layer
 32 heads, n = 8,192, fp16, on a GPU with about 2 TB/s of HBM bandwidth (illustrative arithmetic, not a
 benchmark).
@@ -244,18 +275,18 @@ tracks IO, not FLOPs.
 - **Prove the fast path is active.** In tests, wrap attention in `sdpa_kernel(SDPBackend.FLASH_ATTENTION)`
   so a fallback raises. In staging, check that profiler kernel names contain flash and that peak memory
   grows linearly with sequence length.
-- **Select the kernel explicitly in Hugging Face.** Load with `attn_implementation="flash_attention_2"`
-  (needs the flash-attn package) or `"sdpa"`, never `"eager"` in production, and keep
-  `output_attentions` off. Monitor throughput and OOM counts per context bucket.
+- **Select the kernel explicitly for agent-trace fine-tuning.** Load with
+  `attn_implementation="flash_attention_2"` (needs the flash-attn package) or `"sdpa"`, never `"eager"`,
+  and keep `output_attentions` off. Monitor throughput and OOM counts per sequence-length bucket.
 - **Pack sequences instead of padding.** Use variable-length attention (for example the flash-attn
-  package's varlen interface) in training, and a continuous-batching engine such as vLLM or SGLang in
-  serving. Monitor GPU time per real token rather than per padded token.
-- **Check the hardware before promising long context.** FlashAttention-2 needs Ampere or newer and
+  package's varlen interface) when training on agent trajectories, and a continuous-batching engine such
+  as vLLM or SGLang when serving agents. Monitor GPU time per real token rather than per padded token.
+- **Check the hardware before promising long agent context.** FlashAttention-2 needs Ampere or newer and
   FlashAttention-3 targets H100-class parts. On older cards, cap context or fall back to a
   memory-efficient backend. Track OOMs by GPU type.
-- **Use FlexAttention for unusual masks.** When you need a custom pattern (document masks, prefix-LM),
-  express it as a FlexAttention mask function rather than a dense mask tensor, which would disable flash.
-  Monitor step time against the plain causal kernel.
+- **Use FlexAttention for unusual masks.** When you need a custom pattern (document masks between packed
+  traces, prefix-LM), express it as a FlexAttention mask function rather than a dense mask tensor, which
+  would disable flash. Monitor step time against the plain causal kernel.
 
 ## Trade-offs
 - **O(n) memory vs constraints.** Exact results with O(n) extra memory instead of O(n²), paid for with
@@ -266,8 +297,8 @@ tracks IO, not FLOPs.
   good fused baseline is modest.
 - **Speed vs visibility.** The fused kernel never materializes attention weights, so interpretability
   and debugging that need the maps must run a separate, slow eager path.
-- **Fits vs cheap.** It makes long contexts fit but not cheap: compute is still quadratic, so beyond
-  roughly 100k tokens you still need windowing, sparsity, sequence parallelism or retrieval.
+- **Fits vs cheap.** It makes long agent contexts fit but not cheap: compute is still quadratic, so
+  beyond roughly 100k tokens you still need windowing, sparsity, sequence parallelism or retrieval.
 
 ## Pitfalls
 - **Believing the flash path is active when it silently fell back.** Causes: fp32 inputs, an odd head
@@ -280,11 +311,12 @@ tracks IO, not FLOPs.
   caused by the different summation order under fp16 rounding. Fix: compare with fp16-level tolerances
   such as `atol=2e-3`, or against an fp32 reference.
 - **Leaving `output_attentions=True` or an eager attention implementation in a production config.**
-  Symptom: throughput that collapses and OOMs at lengths the model handled in testing. Fix: pin
-  `attn_implementation` in the serving config and assert it at startup.
+  Symptom: throughput that collapses and OOMs at lengths the model handled in testing, often only when a
+  long agent session arrives. Fix: pin `attn_implementation` in the serving config and assert it at
+  startup.
 - **Padding batches to the longest sequence and running flash on dense tensors.** Symptom: GPU time that
-  scales with the longest prompt rather than the total number of real tokens. Use variable-length
-  (packed) attention or a continuous-batching engine.
+  scales with the longest prompt or trace rather than the total number of real tokens. Use
+  variable-length (packed) attention or a continuous-batching engine.
 
 ## When to use
 Use it whenever it is available, which in practice means ensuring you have not accidentally disabled it.
@@ -294,7 +326,8 @@ Use it whenever it is available, which in practice means ensuring you have not a
 - **Verify with a profiler** that attention kernels carry flash names and that peak memory grows linearly
   with sequence length.
 - **Plan hardware:** FlashAttention-2 needs Ampere or newer and the Hopper-specific version needs
-  H100-class parts, which affects whether a customer's older GPUs can run long-context workloads.
+  H100-class parts, which affects whether a customer's older GPUs can run long-context agent workloads.
+- **Skip worrying** when you only call hosted APIs; there it is the provider's job.
 - **Interviews:** attention was memory-bound, tiling plus online softmax avoids the n² matrix,
   recomputation makes backward fit, and all of it is exact.
 
@@ -326,18 +359,24 @@ The speedup is a bandwidth saving, not a FLOP saving.
 - **Differences versus eager are rounding only**, from a different summation order in fp16 or bf16, so
   compare with fp16-level tolerances.
 
-### You enabled FlashAttention but memory still grows with n² and nothing got faster. How do you debug it?
+### Your self-hosted agent server OOMs only when a long session arrives, though tests passed. How do you debug it?
 - **Assume a silent fallback.** Check for fp32 inputs, an unsupported head dimension, an explicit dense
   mask instead of `is_causal=True`, `output_attentions=True`, or a pre-Ampere GPU.
-- **Make it loud:** force `SDPBackend.FLASH_ATTENTION` in a test, then confirm in the profiler that kernel
-  names contain flash and the memory curve is linear.
+- **Make it loud:** force `SDPBackend.FLASH_ATTENTION` in a test with a transcript at your maximum
+  context, then confirm in the profiler that kernel names contain flash and the memory curve is linear.
+
+### You are fine-tuning on agent trajectories from 1k to 16k tokens. How do you keep it affordable?
+- **Flash attention on**, via `attn_implementation`, so a 16k trace does not materialize n² scores.
+- **Pack, do not pad.** Padding a batch to its longest trace can triple the work; variable-length
+  attention processes only real tokens.
+- **Measure** GPU time per real token and peak memory per length bucket.
 
 ### Why does recomputing attention in the backward pass make it faster rather than slower?
 - **The alternative is reading n² values from HBM**, which is bandwidth-bound and slow.
 - **Recomputation from Q, K and one log-sum-exp per row** happens in SRAM on tensor cores; it adds about a
   matmul's worth of FLOPs but saves far more time in memory traffic.
 
-### When does FlashAttention not solve your long-context problem?
+### When does FlashAttention not solve your long-context agent problem?
 - **When compute, not memory, is the wall.** FLOPs stay quadratic, so beyond roughly 100k tokens you
   still need windowing, sparsity, sequence parallelism or retrieval.
 - **When the hardware or mask does not qualify**, such as T4 or V100 cards, fp32 requirements or dense
@@ -373,3 +412,23 @@ The speedup is a bandwidth saving, not a FLOP saving.
 - [ ] Only the attention scores of the diagonal blocks
 > Keeping O and the per-row log-sum-exp L is enough to regenerate any tile of P from Q and K inside
 > SRAM, which costs some FLOPs but avoids storing and reading n² values from memory.
+
+## Use cases & projects
+### Use cases
+- **Fine-tuning on long agent trajectories.** Flash attention plus packing makes 10k-plus-token traces
+  trainable on one GPU without padding waste.
+- **Self-hosting long-context agents.** Linear attention memory lets the serving engine hold long
+  transcripts; a silent fallback shows up as OOMs on the longest sessions.
+- **Hardware planning for customer deployments.** Older GPUs without flash kernels cap how long an agent's
+  context can be.
+- **Custom masks for packed traces.** FlexAttention keeps document masks between packed trajectories on a
+  fused kernel.
+
+### Mini project
+**Make a long-context agent model fail loudly instead of silently (1-2 hours).**
+- **Goal:** prove your agent model's attention stays on the fast path at its maximum transcript length.
+- **Steps:** load a small open model in bf16 with `attn_implementation="sdpa"`; build prompts of 2k, 8k
+  and 16k tokens from a recorded agent transcript; measure peak memory and latency per length; repeat with
+  `"eager"`; add a test that runs one forward pass under `sdpa_kernel(SDPBackend.FLASH_ATTENTION)`.
+- **Done when:** you have a table showing linear versus quadratic memory growth across the two settings,
+  and the test fails when you switch the model to fp32.

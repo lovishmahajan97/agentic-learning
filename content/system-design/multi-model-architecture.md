@@ -449,3 +449,23 @@ and a feature flag, regardless of what the public benchmark says.
 > combine: the total can only exceed the sum of the p99s when at least one stage exceeds its own p99, which
 > by a union bound happens on at most about 4% of requests, so the sum of the p99s is guaranteed only to be
 > at least the p96 of the total, and the true p99 can be higher still.
+
+## Use cases & projects
+### Use cases
+- **Planner plus executors.** A strong model decomposes the task and smaller models run each tool step,
+  passing typed outputs between them.
+- **Agentic RAG.** An embedding model, a reranker and a generator each serve one stage of the retrieval
+  tool the agent calls.
+- **Guarded agents.** A small guard model screens user input and tool results for injection before they
+  reach the planner.
+- **Eval pipelines.** A sampled judge model scores agent runs offline, kept separate from the models that
+  produced the run.
+
+### Mini project
+**Trace a three-stage agent pipeline end to end (2-3 hours).**
+- **Goal:** see where latency and failures come from when several models serve one agent turn.
+- **Steps:** build a turn with a guard check, a retrieval tool (embed then rerank) and a generator; pass
+  Pydantic or Zod objects between stages; record model, version and latency per stage in a trace; give
+  each stage a timeout and a degraded mode; run 50 queries.
+- **Done when:** you have per-stage p50 and p99 plus the measured end-to-end p99, and can show the
+  end-to-end p99 is not the sum of stage p50s.

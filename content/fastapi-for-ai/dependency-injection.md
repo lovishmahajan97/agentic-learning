@@ -463,3 +463,24 @@ session and one transaction, which is the intended scope.
 - [ ] Subclass `FastAPI` and override `__call__`
 > Overrides are keyed by the dependency callable and apply everywhere it is used, including nested
 > dependencies, which makes them the designated seam for test doubles.
+
+## Use cases & projects
+### Use cases
+- **Per-user toolsets.** A dependency builds the tool list from the caller's scopes, so the model never
+  sees a tool the user is not allowed to run.
+- **Per-run spend caps.** A `yield` dependency hands the agent a token or cost budget and records actual
+  spend after the run, even when it fails.
+- **Deterministic agent tests.** `dependency_overrides` swaps the LLM for a scripted fake that returns
+  fixed tool calls, so tests are fast, free and repeatable.
+- **Shared auth across agent routes.** Router-level dependencies apply authentication and tenant checks to
+  every agent endpoint without repeating them.
+
+### Mini project
+**Wire an agent endpoint through dependencies (1-2 hours).**
+- **Goal:** an `/agent/run` route whose LLM client, tools and budget all arrive through `Depends`, with a
+  test suite that never calls a real model.
+- **Steps:** write `get_llm` (returning a client from `app.state`), `get_tools` (filtering a tool registry
+  by a fake principal's scopes) and a `yield` budget dependency that logs spend in its teardown; write a
+  fake LLM that requests one tool and then answers; override `get_llm` in tests.
+- **Done when:** tests prove a low-scope user's model never sees the admin tool, the budget teardown runs
+  on success and on error, and the suite passes with no network access.

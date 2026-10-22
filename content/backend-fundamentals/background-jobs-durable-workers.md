@@ -5,7 +5,8 @@ name: Background jobs / durable workers
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - backend-fundamentals/message-queues
   - backend-fundamentals/redis
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-A durable worker keeps each background job's state in a store that outlives both the enqueuing and the
-running process, so deploys and crashes never lose work. Its lease-and-acknowledge protocol means a job
-can run twice, so handlers must be idempotent.
+A long agent run is a background job: a durable worker keeps its state in a store that outlives every
+process, so deploys and crashes never lose a run. Leases mean a job can run twice, so agent steps and
+tools must be idempotent.
+
+## For agent builders
+- **Why it matters for agents.** A twenty-step agent with tool calls runs for minutes, far past any HTTP
+  timeout, and your team deploys several times a day. Running it as a durable job with a checkpoint per
+  step is what lets a run survive a deploy, resume at step 15 instead of step 1, and avoid repeating a
+  side-effecting tool call.
+- **Where it shows up in your stack.** Celery, RQ, BullMQ or a Postgres jobs table running agent runs and
+  RAG ingestion, LangGraph checkpointers that persist state per step, and durable execution engines such
+  as Temporal for long, branching agent workflows.
+- **What you control.** What a job is (a whole run, or one step), the lease length against real model
+  latency, the checkpoint granularity, which provider errors are retryable, and per-tenant concurrency caps.
+- **What you can skip.** Writing your own workflow engine. Know leases, fencing, idempotency, Little's law
+  and when a table stops being enough.
 
 ## Why it exists
 - **Some work outlasts any client's patience.** Embedding a 300-page PDF, running a twenty-step agent,
@@ -128,6 +142,21 @@ within a Postgres table on modest hardware.
 - **Deploys are the most frequent "crash".** On SIGTERM a worker stops claiming, finishes or checkpoints the
   current job within the grace period, and exits. Anything unfinished is recovered by lease expiry, which is
   why the lease, not the shutdown handler, is the correctness mechanism.
+
+### An agent run as a durable job
+| Design choice | Recommendation | Because |
+|---|---|---|
+| **Unit of work** | the run is the job; each step is a checkpoint row | resume needs step-level progress, not a restart |
+| **Lease** | a few minutes, heartbeated around each model and tool call | model calls are slow and vary widely in latency |
+| **Checkpoint** | after every step: messages, tool result, tokens used | a retry replays from the last committed step |
+| **Side-effecting tools** | step id as the idempotency key | the step can run again after a lease expiry |
+| **Waiting for a human** | park the run (a waiting state, or `run_at` far ahead) and release the worker | approvals can take hours |
+| **Budget** | stop the run, mark it `failed`, keep it inspectable | a looping agent is a poison job |
+
+- **Retry the step, not the run.** A provider 429 at step 12 reschedules from step 12 with backoff; it
+  should not re-run steps 1 to 11 and their tool calls.
+- **Model calls are not deterministic.** A re-run step may choose a different tool, so recorded steps are
+  replayed from the checkpoint, never regenerated.
 
 ### What to measure
 - **Queue depth and age of the oldest queued job** detect a stalled worker fleet.
@@ -269,6 +298,18 @@ Uploads average 0.5 per second with 4-minute embedding jobs; then one tenant bul
 The cap trades the bulk tenant's completion time for everyone else's latency, which is usually the right
 product call; make it explicit in the tier's terms.
 
+### Agent scenario: a deploy lands at step 14 of a 20-step run
+A research agent takes ~30 s and ~6k tokens per step (illustrative). A deploy sends SIGTERM to the worker
+during step 14.
+
+| Design | What happens | Lost work | Duplicate side effects |
+|---|---|---|---|
+| In-process task | run vanishes; user sees nothing | everything, no record | none, but no result either |
+| Durable job, no checkpoints | lease expires, run restarts at step 1 | 13 steps: ~6.5 min, ~78k tokens | every tool call in steps 1-13 runs again |
+| Durable job, checkpoint per step | new worker resumes at step 14 | one step: ~30 s, ~6k tokens | none, if step 14's tool uses the step id as its idempotency key |
+
+The checkpointed design costs one row write per step; the cost of skipping it scales with run length.
+
 ## Production patterns
 - **Partial index plus archival.** Create `CREATE INDEX jobs_claimable ON jobs (run_at) WHERE state IN
   ('queued','running')` and move finished rows older than a retention window to an archive table nightly,
@@ -285,6 +326,11 @@ product call; make it explicit in the tier's terms.
 - **Graceful shutdown sized to the platform.** Handle SIGTERM by stopping claims and checkpointing, and set
   the platform grace period (for example Kubernetes `terminationGracePeriodSeconds`) above the checkpoint
   interval. Monitor jobs reclaimed by lease expiry after each deploy; it should be near zero.
+- **Checkpoint every agent step.** Commit messages, tool results and token counts after each step, keyed
+  by `(run_id, step)`, and have the claim resume from the last committed step. Monitor steps re-executed
+  per resumed run; anything above one means checkpoints are missing or late.
+- **Separate pools for interactive and batch agents.** User-facing runs and nightly eval or backfill runs
+  claim from different queues or priority classes. Monitor oldest-queued-run age per class.
 
 ## Trade-offs
 - **Job table vs broker.** A table in the main database gains transactional enqueue and zero new
@@ -320,10 +366,17 @@ product call; make it explicit in the tier's terms.
   though the backlog is small.
 - **Assuming the library acks after the work.** Some default to acknowledging before execution (Celery's
   `acks_late` is off by default); the symptom is lost jobs on worker crash despite a "durable" broker.
+- **Regenerating completed agent steps on retry.** Symptom: a resumed run takes a different path, calls
+  different tools, and its trace no longer matches what the user saw. Fix: replay recorded steps from the
+  checkpoint and only call the model for the first unfinished step.
+- **Holding a worker while the agent waits for human approval.** Symptom: worker slots full of idle runs
+  and a growing queue. Fix: park the run in a waiting state and enqueue a resume when approval arrives.
 
 ## When to use
 - **Use when:** work must survive the request: anything longer than a few seconds, any external side effect
   that must happen exactly once from the user's view, anything needing retry, scheduling or a pollable status.
+- **Agent fits:** any agent run longer than a request timeout, RAG ingestion, scheduled agents and eval
+  batches; stream progress to the user from checkpoints while the job runs.
 - **Avoid when:** it is a fast read the user is waiting on; use in-process tasks only for best-effort work
   you can lose, such as a metrics sample.
 - **Start simple:** a table in the database you already run; move to a broker or execution engine when
@@ -374,7 +427,14 @@ of the oldest queued job and the dead count.
 - **Fix:** heartbeat the lease with a maximum duration, fence completions on `locked_by`, and have a sweeper
   move crash-loopers to `dead` for inspection.
 
-### When would you move from a Postgres jobs table to a broker or Temporal?
+### How would you make a 20-step tool-calling agent survive deploys without repeating tool calls?
+- **Run it as a durable job** claimed with a lease and heartbeated around each model and tool call.
+- **Checkpoint each step** (messages, tool result, tokens) under a unique `(run_id, step)` key, so a new
+  worker replays recorded steps and calls the model only for the first unfinished one.
+- **Make tools idempotent** with the step id as the key, and fence completions on `locked_by` so a
+  pre-empted worker cannot write a stale result.
+
+### When would you move an agent platform from a Postgres jobs table to a broker or Temporal?
 - **Broker:** at thousands of jobs per second, many idle pollers, or fan-out to several consumer services.
 - **Durable execution engine:** when workflows are long, branching and multi-step, and you need resume
   from the last step with full history.
@@ -410,3 +470,25 @@ of the oldest queued job and the dead count.
 - [ ] Enqueue from a background thread after the response is sent
 > Only a write in the same transaction is atomic with the business change. Any order of two separate
 > writes can be interrupted between them, producing either an orphan job or a change with no job.
+
+## Use cases & projects
+### Use cases
+- **Long-running agent runs.** Research, coding and report agents run as jobs with per-step checkpoints,
+  so a deploy or OOM kill resumes the run instead of losing it.
+- **RAG ingestion.** Uploads become chunk-and-embed jobs with per-chunk resume and per-tenant caps, so one
+  bulk import does not starve everyone else.
+- **Scheduled and triggered agents.** Nightly triage agents, inbox monitors and follow-up agents use
+  `run_at` scheduling and the same retry and dead-letter policy.
+- **Human-in-the-loop pauses.** A run waiting for approval is parked as a job state and resumed by a new
+  job when the human answers, freeing workers in the meantime.
+
+### Mini project
+**Make an agent run survive kill -9 (2-3 hours).**
+- **Goal:** a Postgres-backed worker that runs a multi-step agent as a durable job and resumes it after a
+  crash without repeating tool calls.
+- **Steps:** create `jobs` and `run_steps` tables; adapt the worker above so the handler loops over agent
+  steps, checkpointing each into `run_steps` with a unique `(run_id, step)`; give the agent a fake
+  side-effecting tool that writes to a ledger with the step id as an idempotency key; start two workers,
+  `kill -9` one mid-run, and let the lease expire.
+- **Done when:** the run completes on the surviving worker, the ledger has exactly one entry per tool
+  step, steps re-executed after the crash is at most one, and a job that always crashes ends in `dead`.

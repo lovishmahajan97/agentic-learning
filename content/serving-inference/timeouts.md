@@ -431,3 +431,24 @@ work earlier accordingly.
 > Retrying a long, timed-out call under overload doubles the load that caused the timeout and may
 > duplicate work still running upstream. Cancelling frees capacity, and a cheaper fallback or an
 > honest failure respects the user's budget.
+
+## Use cases & projects
+### Use cases
+- **User-facing agents with an SLO.** One run deadline passed to every step keeps a chain of model and
+  tool calls inside the promised response time.
+- **Agents calling flaky tools.** Per-tool timeouts from measured latency percentiles stop one hung API
+  from stalling the whole loop.
+- **Streaming agents behind proxies.** First-token and idle timers catch a stuck stream early, and
+  heartbeats keep slow tools from tripping proxy idle limits.
+- **Graceful degradation.** When the budget runs low the agent returns a partial answer or a cheaper
+  fallback instead of a bare error.
+
+### Mini project
+**Put one deadline on an agent run (1-2 hours).**
+- **Goal:** make a tool-calling agent finish or fail clearly within a fixed run budget.
+- **Steps:** build a small agent with one fast tool and one tool that sometimes hangs; pass an absolute
+  deadline into the loop; give each model call connect, first-token, idle and total timers derived from
+  the remaining budget; wrap tools in `asyncio.timeout`; cancel the in-flight call on expiry and return a
+  partial answer.
+- **Done when:** across 20 runs no run exceeds the deadline, hung tools are logged as timeouts, and
+  retries happen only when the remaining budget allows.

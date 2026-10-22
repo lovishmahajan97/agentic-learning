@@ -370,3 +370,30 @@ raw text when needed. Measure recall per clause type before and after, and token
 - [ ] Never; dynamic decomposition is always more capable
 > Dynamic decomposition is the least reliable step in an agent. If the phases are known, encoding them
 > in code gives testability and cost control; keep dynamic splitting for the genuinely open parts.
+
+## Use cases & projects
+### Use cases
+- **Document extraction at scale.** A contract-review agent fans out one subtask per clause type, each
+  with a typed output schema, then merges results in code rather than in one giant prompt.
+- **Research agents.** A lead agent splits a question into independent sub-questions handled by
+  sub-agents that return short summaries and sources, not their full transcripts.
+- **Code migrations.** A migration agent decomposes by file or module, verifies each piece with tests and
+  retries only the pieces that fail.
+- **Fixed business workflows.** Known phases such as intake, lookup and draft are encoded as a static
+  graph, keeping model-driven splitting for the open-ended step.
+
+### Mini project
+**Map-reduce a long task with verified subtasks (2-3 hours).**
+- **Goal:** answer a question over 20 short documents by fanning out one subtask per document and merging
+  the results, then compare with a single-call baseline.
+- **Steps:** define a Pydantic output schema per subtask (answer, quote, confidence); run subtasks in
+  parallel with a concurrency limit; validate each output and retry failures once; merge in code and let
+  one final call write the answer; record tokens, wall-clock time and accuracy against hand-labelled
+  answers.
+- **Done when:** a table compares accuracy, tokens and latency for both approaches, and a corrupted
+  subtask output is caught by its validator instead of reaching the final answer.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): the billing-dispute agent splits its run
+into intake, investigation with parallel lookups, reconciliation and proposal, each with its own
+contract and check.

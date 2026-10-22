@@ -426,3 +426,23 @@ because they need different fixes.
 - [ ] The SDK sends the tool result back to the model on the next request automatically
 > The client only transports the model's request to call a tool. Parsing arguments, running the tool and
 > sending results back with the call ID is the agent loop you write and must guard.
+
+## Use cases & projects
+### Use cases
+- **Hand-written tool-calling agents.** The SDK carries every step of the loop: send history and tool
+  schemas, read tool calls, append results with their call IDs, repeat.
+- **Structured extraction steps.** Strict schemas with `additionalProperties: false` give parseable output
+  for planners, classifiers and form-filling agents.
+- **One client for many backends.** Changing `base_url` points the same agent code at vLLM, Ollama or a
+  gateway for cheaper or private steps.
+- **Agent observability.** Logging request ID, usage and tool calls per step turns a failed run into a
+  readable trace.
+
+### Mini project
+**Build a guarded tool-calling agent (2-3 hours).**
+- **Goal:** a small agent that answers questions with two tools and never runs away.
+- **Steps:** define two tools with strict schemas; write the loop yourself; validate arguments before
+  running a tool and return errors as tool results; add a step limit, a per-call timeout and
+  `max_retries`; log request ID, usage and tool calls per step.
+- **Done when:** 10 test questions complete within the step limit, a malformed argument is recovered
+  from, and you have a per-step log with total tokens per run.

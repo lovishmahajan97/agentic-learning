@@ -508,3 +508,24 @@ crashed worker resumes rather than rebooking.
 > Once the pivot has committed the saga has promised its outcome; earlier steps may be uncompensatable.
 > Post-pivot steps are designed to be retriable and idempotent so the saga completes forward, with a
 > dead-letter path to a human only when a participant stays unavailable.
+
+## Use cases & projects
+### Use cases
+- **Travel or booking agents.** Hold a seat, hold a room, then charge: the holds are compensatable, the
+  charge is the pivot, and confirmation emails after it are retriable.
+- **Refund and support agents.** Creating a ticket and reserving credit can be undone, but issuing the
+  refund cannot, so it sits behind a human-approval gate as the pivot.
+- **Account provisioning agents.** Creating users across several SaaS tools has no shared transaction,
+  so each create step records an id the compensation needs to delete it.
+- **Multi-agent handoffs.** When a planner hands work to sub-agents, the saga log records which steps
+  committed, so a failed sub-agent triggers compensation instead of an orphaned half-result.
+
+### Mini project
+**Build a compensating saga for a three-tool booking agent (2-3 hours).**
+- **Goal:** an agent run that either completes all steps or undoes the ones it committed.
+- **Steps:** write fake `hold_flight`, `hold_hotel` and `charge_card` tools, each accepting an
+  idempotency key of the form `{saga_id}:{step}`; classify them as compensatable or pivot; store each
+  step's arguments and result in a saga log; add a failure injector; on failure before the pivot, run
+  compensations in reverse; on an unknown outcome, query status before retrying.
+- **Done when:** injected failures at each step leave no held resources, a retried step never creates a
+  second hold, and the log alone explains what happened in every run.

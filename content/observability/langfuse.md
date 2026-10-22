@@ -5,7 +5,8 @@ name: Langfuse
 kind: tool
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - observability/tracing
   - observability/token-cost-tracking
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-Langfuse is an open-source, self-hostable LLM engineering platform: traces of prompts, completions, tokens
-and cost, plus scores, datasets, experiments and versioned prompts. Choose it for the trace-to-eval-to-prompt
-loop in one framework-independent tool you can run yourself.
+Langfuse is an open-source, self-hostable platform that records every agent run as a trace of model calls,
+tool calls, tokens and cost, then scores, datasets and versioned prompts close the loop from a bad run to
+a tested fix.
+
+## For agent builders
+- **Why it matters for agents.** A wrong agent answer is usually a bad tool result, a misread one or a
+  wasted step. Langfuse shows the run as a nested tree with each generation's prompt, output, tokens and
+  cost, grouped by `session_id` for multi-turn agents and by `user_id` for cost.
+- **Where it shows up in your stack.** `@observe()` around the agent and its tools, the OpenAI drop-in or
+  LangChain, LlamaIndex and LiteLLM integrations, or its OTLP endpoint fed by any OpenTelemetry
+  instrumentation.
+- **What you control.** Observation boundaries (run, step, tool), trace attributes, masking, sample rate,
+  custom model prices, which prompts live in prompt management, and which scores you attach.
+- **What you can skip.** The server internals (ClickHouse, Redis, object storage) unless you self-host.
+  Know the data model and that the SDK ships events in background batches.
 
 ## Why it exists
 - **APM sees the wrong thing.** A generic APM sees a model call as a three-second `POST` to a provider that
@@ -179,6 +192,60 @@ langfuse.flush()                            # required in scripts and serverless
   version. The trace's input and output default to the outermost function's arguments and return value.
 - **Rollups:** the session view shows the whole conversation `s_9`; the user view sums cost for `u_42`.
 
+### Tracing a tool-calling agent loop
+Each tool is its own observation, the agent loop is the trace, and a per-run score records whether the
+step budget was hit. `TOOLS` and `TOOL_SCHEMAS` stand for your registry; the `as_type` values for agent
+and tool observations exist in recent SDK versions, so drop the argument on older ones.
+
+```python
+import json
+from langfuse import observe, get_client
+from langfuse.openai import openai           # every model call becomes a generation
+
+langfuse = get_client()
+
+@observe(as_type="tool")
+def call_tool(name: str, args: dict):
+    return TOOLS[name](**args)               # input and output are captured on the observation
+
+@observe(as_type="agent")
+def run_agent(task: str, user_id: str, session_id: str, max_steps: int = 8) -> str:
+    langfuse.update_current_trace(user_id=user_id, session_id=session_id, tags=["agent"])
+    messages = [{"role": "user", "content": task}]
+    for step in range(max_steps):
+        msg = openai.chat.completions.create(model="gpt-4o-mini", messages=messages,
+                                             tools=TOOL_SCHEMAS).choices[0].message
+        if not msg.tool_calls:
+            langfuse.score_current_trace(name="steps_used", value=step + 1)
+            return msg.content
+        messages.append(msg)
+        for c in msg.tool_calls:
+            result = call_tool(c.function.name, json.loads(c.function.arguments))
+            messages.append({"role": "tool", "tool_call_id": c.id, "content": json.dumps(result)})
+    langfuse.score_current_trace(name="hit_step_budget", value=1)
+    return "Sorry, I could not finish this task."
+
+run_agent("Refund order 1182 if it shipped late", user_id="u_42", session_id="s_9")
+langfuse.flush()
+```
+
+- **Trace tree:** `run_agent` → generation, `call_tool`, generation, … in order, so a reviewer reads the run
+  step by step and sees exactly which tool output the model acted on.
+- **Filter by score:** traces with `hit_step_budget` are the first place to look for loops and bad tools.
+
+### Worked scenario: cost of one agent task
+Illustrative prices as in the next example ($0.15 per million input tokens, $0.60 per million output).
+
+| Step | Input tokens | Output tokens | Cost |
+|---|---|---|---|
+| Turn 1 (plan, pick a tool) | 2,400 | 80 | ≈ $0.00041 |
+| Turn 2 (after order lookup) | 3,100 | 60 | ≈ $0.00050 |
+| Turn 3 (after refund tool) | 3,700 | 150 | ≈ $0.00065 |
+| **Task total** | **9,200** | **290** | **≈ $0.0016** |
+
+- **Input dominates** because every turn re-sends the growing transcript; the trace's per-generation
+  usage makes that visible, and a runaway 20-turn run shows up as an outlier in cost per trace.
+
 ### Following one turn through the cost machinery
 Illustrative prices: $0.15 per million input tokens, $0.60 per million output tokens.
 
@@ -219,6 +286,10 @@ Illustrative prices: $0.15 per million input tokens, $0.60 per million output to
 - **Judge on a sample, calibrate with humans.** Run a managed LLM-as-a-judge evaluator on a small share of
   production traces and a weekly annotation queue of about a hundred traces. Monitor judge-human agreement and
   judge token spend.
+- **Agent runs as traces, conversations as sessions.** Make the outermost `@observe` the agent run, each
+  tool its own observation, and set `session_id` to the conversation id so a multi-turn agent reads in
+  order. Attach run-level scores (task success, steps used, step budget hit) and monitor cost and steps per
+  trace by prompt version.
 - **Sample only when storage binds.** Keep 100% while affordable; then set the client `sample_rate` and
   scale cost and score totals by its inverse. Monitor ingestion lag and volume.
 
@@ -313,11 +384,21 @@ separate projects.
   a first successful fetch or with a supplied default.
 - **Otherwise** it pays off, because wording edits become versioned, measurable releases without a deploy.
 
-### How would you size judge evaluation on 50,000 traces a day?
+### How would you size judge evaluation on 50,000 agent runs (traces) a day?
 - **Judge cost scales with sample rate.** At 2%, about 1,000 judged traces a day; multiply by judge prompt plus
   trace tokens and the judge model price to get the daily spend (rough planning figures, not a benchmark).
+- **Agent traces are long,** with many turns and tool outputs, so judge the final answer plus a compact
+  step summary rather than the full transcript, or judge per step only on sampled failures.
 - **Calibrate** with a weekly human annotation queue and track agreement, because an uncalibrated judge drifts
   from what product means by quality.
+
+### Your agent's cost per task doubled after a prompt change. How would you investigate with Langfuse?
+- **Break cost down by prompt version** using the generation-to-prompt link, then compare steps per trace
+  and input tokens per generation between versions.
+- **Open outlier traces:** more turns usually means the model now calls tools it does not need or repeats
+  a failing call; larger inputs per turn mean bigger tool results or context.
+- **Fix and verify** with a dataset run of both versions, comparing scores, cost and steps before moving the
+  `production` label back or forward.
 
 ### Why does self-hosted Langfuse need ClickHouse and not just Postgres?
 - **Workload shape:** trace analytics are large scans and aggregations over millions of observations, which a
@@ -349,3 +430,23 @@ separate projects.
 - [ ] Cost is only computed for traces that received a score
 > Cost is tokens multiplied by a per-model price. Deployment aliases, fine-tune ids and self-hosted models are
 > not in the built-in table; define a custom model that matches the name and the cost appears.
+
+## Use cases & projects
+### Use cases
+- **Debugging a customer's bad agent run.** Find the session, read the trace step by step and see which
+  tool output or prompt version led the agent astray.
+- **Cost per customer for an agent product.** `user_id` on every trace plus matched model prices give a
+  per-tenant cost rollup across all agent steps.
+- **Regression-testing agent prompt changes.** Build a dataset from failed runs, run the new prompt version
+  against it with the same evaluators, then promote the label.
+- **Continuous quality on production agents.** A sampled LLM-as-a-judge evaluator plus a weekly annotation
+  queue gives a calibrated quality number per release.
+
+### Mini project
+**From a failing agent run to a promoted fix (2-3 hours).**
+- **Goal:** close the trace, dataset, experiment, promote loop for a small agent.
+- **Steps:** run Langfuse locally with Docker Compose; build a two-tool agent with `@observe` and the
+  OpenAI drop-in; move its system prompt into prompt management; run 30 tasks and score each for success;
+  add the failures to a dataset; edit a new prompt version and run a dataset experiment.
+- **Done when:** the UI shows both dataset runs side by side with success, cost and steps per task, and the
+  `production` label points at the better version with generations recording it.

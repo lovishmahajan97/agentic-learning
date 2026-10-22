@@ -5,7 +5,8 @@ name: AI security
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - security-governance-compliance/threat-modeling
   - security-governance-compliance/prompt-injection-defense
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-AI security is application security plus a model that obeys instructions in its data and cannot be
-patched like a parser. Treat it as an untrusted interpreter: least privilege, isolation, output handling,
-approval gates and monitoring hold; cleverer prompts do not.
+An agent is an untrusted interpreter holding your credentials: it obeys instructions hidden in pages,
+emails and tool results, and cannot be patched like a parser. Secure it with least privilege, isolation,
+output handling, approval gates and monitoring, not cleverer prompts.
+
+## For agent builders
+- **Why it matters for agents.** Every tool you add widens what a steered model can do. A chatbot that
+  misbehaves is embarrassing; an agent that reads a poisoned page and then calls `send_email` with your
+  credentials is a breach.
+- **Where it shows up in your stack.** The tool dispatcher (allowlists, ceilings, taint), the identity the
+  agent's tools run as, the sandbox's egress policy, the chat UI's markdown renderer, memory writes, and
+  the logs and traces that copy every prompt.
+- **What you control.** Which tools a session gets, what each tool's code refuses regardless of the model,
+  which calls need a human with the real arguments, and per-session budgets on tokens, tool calls and
+  loop steps.
+- **What you can skip.** Memorising every OWASP or ATLAS entry. Learn the three facts and the trifecta
+  test; they let you review any agent design in minutes and pick the deeper lessons that apply.
 
 ## Why it exists
 Three things changed when an LLM went into the system.
@@ -352,6 +366,14 @@ classifier and prompt as defence in depth, with logging to detect attempts.
 - **Cost outliers** per user or session, which signal denial of wallet or recursive agent loops triggered
   by injected content.
 
+### Your agent gained long-term memory last sprint. What new risk did that add, and how do you contain it?
+- **Persistence became a sink.** One injected page can make the agent write an instruction into memory,
+  which is then loaded into every later session, so the attack outlives the turn that carried it.
+- **Contain it in code:** gate memory writes on tainted turns, record each entry's provenance, and taint
+  any turn that loads memory untrusted content could have written.
+- **Make it observable:** log memory writes with their source, and give users and operators a way to list
+  and delete entries.
+
 ## Quiz
 ### Q: Why can't prompt injection be fixed the way SQL injection was fixed with parameterised queries?
 - [ ] Models are too large to retrain with a fixed grammar
@@ -379,3 +401,24 @@ classifier and prompt as defence in depth, with logging to detect attempts.
 > Pickle-based checkpoints deserialise arbitrary objects, so loading a model from an untrusted hub can
 > execute attacker code; safetensors stores only tensors. The other three are ordinary software
 > supply-chain issues that AI systems also inherit.
+
+## Use cases & projects
+### Use cases
+- **Launch review of a customer support agent.** Run the trifecta table over its tools before go-live and
+  remove one leg in code for each path from untrusted content to a channel out.
+- **Browsing and research agents.** Default-deny egress plus taint tracking stops a fetched page from
+  turning the agent into an exfiltration client.
+- **Internal copilots over company data.** On-behalf-of identity keeps the assistant from returning
+  records the asking employee could not open themselves.
+- **Agent platforms hosting third-party tools.** Safe weight loading, pinned artifacts and per-session
+  budgets bound supply-chain and denial-of-wallet exposure across every tenant.
+
+### Mini project
+**Harden a three-tool agent against indirect injection (2-3 hours).**
+- **Goal:** show that a steered model cannot exfiltrate data once the tool boundary is in code.
+- **Steps:** build an agent with `read_url`, `query_orders` and `send_email` (fakes are fine); plant an
+  injected instruction in a test page; run it once with no boundary and log the leak; then add the
+  `run_tool` checks from this lesson (recipient allowlist, taint, approval keyed on exact arguments) and
+  the markdown sanitiser, and rerun.
+- **Done when:** the unprotected run leaks and the protected run blocks the send with a logged reason,
+  and you can name which trifecta leg each control removed.

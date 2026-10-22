@@ -460,3 +460,24 @@ absent from the serialised response.
 - [ ] The body must be sent as form data, not JSON
 > `loc` is the path from the request source down to the offending value, so clients can fix the precise
 > field instead of guessing from a generic error message.
+
+## Use cases & projects
+### Use cases
+- **Validating tool-call arguments from the model.** One Pydantic model per tool gives the JSON schema the
+  model sees and checks the arguments it returns, turning bad calls into a retry message.
+- **Bounding agent cost at the front door.** `Field` limits on steps, tokens and message counts reject an
+  expensive request with a 422 before any LLM call.
+- **Typed streaming step events.** A discriminated union of event types (step, tool call, final answer)
+  gives clients one schema to parse every SSE event against.
+- **Keeping internals private.** Separate public and internal models stop the scratchpad, system prompt
+  and raw tool output from reaching the client.
+
+### Mini project
+**Type an agent API end to end (1-3 hours).**
+- **Goal:** one set of Pydantic models that guards the client request, the model's tool arguments and the
+  response.
+- **Steps:** define `RunRequest` with `extra="forbid"` and a bounded `max_steps`; define two tool argument
+  models and pass their `model_json_schema()` to your LLM as tool parameters; validate each tool call the
+  model returns and send validation errors back to it as a tool result; return a public `RunOut` model.
+- **Done when:** a typo in the request returns a 422 naming the field, a malformed tool call is corrected
+  by the model on retry, and the response contains no internal fields.

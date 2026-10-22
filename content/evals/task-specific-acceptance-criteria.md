@@ -402,3 +402,24 @@ I would get the support lead to sign the list, encode every check as a grader, a
 - [ ] Re-run with more samples until the slice reaches 90%
 > Per-slice floors exist precisely so that an average cannot mask a failing segment. Re-running does not
 > fix a real 71%; the slice must be investigated and the fix measured.
+
+## Use cases & projects
+### Use cases
+- **Agents that take write actions.** Refund, cancel or email tools get hard criteria (confirmation
+  required, amount within policy) that block a release and are also enforced at runtime.
+- **Structured-output agents.** Schema validity on tool arguments and final output is a hard criterion
+  checked in code on every item.
+- **Agreeing on "done" with a customer or product owner.** A written list of criteria, thresholds and
+  slice floors replaces argument over anecdotes at sign-off.
+- **Budget control.** Step-count and cost-per-task criteria catch an agent that got more accurate by
+  looping three times longer.
+
+### Mini project
+**Write and enforce acceptance criteria for a refund agent (1-3 hours).**
+- **Goal:** turn "the refund agent should work well" into checkable criteria and an automated gate.
+- **Steps:** list 6-8 criteria split into hard (schema-valid tool arguments, no refund above the policy
+  limit without confirmation, no personal data in replies) and soft (correct decision rate with a
+  per-slice floor, step budget); write a code check or grader for each; run them over 30 tasks; make a
+  script that exits non-zero on any hard failure or floor breach.
+- **Done when:** the gate blocks a deliberately broken prompt, passes the baseline, and the report shows
+  which criterion and which slice failed.

@@ -5,7 +5,8 @@ name: Excessive agency
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - safety-security/tool-privilege-escalation
   - agents/approval-gates-for-consequential-actions
@@ -20,9 +21,22 @@ sources:
 ---
 
 ## TL;DR
-Excessive agency is an LLM system that can do more than its task needs: too many functions, permissions
-or autonomy. The fix is a smaller blast radius: minimal tools, user-scoped credentials enforced outside
-the model, and human checkpoints.
+Excessive agency is an agent that can do more than its task needs: too many tools, permissions or
+autonomy. The fix is a smaller blast radius: minimal tools, user-scoped credentials enforced outside the
+model, budgets and human checkpoints.
+
+## For agent builders
+- **Why it matters for agents.** Every tool you register is a capability a hallucination, a loop or an
+  injected email can use. The agent's worst day is bounded by its tool list, its credentials and its
+  budgets, not by its prompt.
+- **Where it shows up in your stack.** The tool list you pass to the model, MCP servers you connect, the
+  credentials the tool executor holds, approval gates in your orchestration framework, and step and spend
+  limits in the agent loop.
+- **What you control.** Tool selection per workflow, read versus write split, consequence tiers,
+  delegated per-user tokens, row-level security, approval with exact arguments, budgets and the kill
+  switch.
+- **What you can skip.** Debating whether the model is "aligned enough" to hold broad tools; assume any
+  call can be wrong and size the blast radius with the arithmetic below.
 
 ## Why it exists
 - **Tool calls are probabilistic outputs.** The decision to call a tool is sampled like a sentence, with
@@ -354,3 +368,25 @@ rejection rate, and enable submission only when the numbers justify it.
 - [ ] Reducing max_tokens so the agent cannot read large results
 > Tenant isolation must hold regardless of what the model decides, so it belongs in authorisation and
 > row-level security that the agent's credential cannot bypass; a prompt instruction is advisory.
+
+## Use cases & projects
+### Use cases
+- **Customer-support agents with refunds.** First-line tokens can read orders but not refund; refunds
+  are tier 2 with approval and a spend cap.
+- **Procurement and payments agents.** Draft-only launch, exact-argument approval for submission, and a
+  separate verification step for vendor bank changes.
+- **Coding agents.** One broad shell tool inside a disposable sandbox with no production credentials,
+  restricted egress and step budgets.
+- **Agents built on third-party MCP servers.** Expose only the few functions a workflow needs, pin the
+  server version and diff its tool list on every update.
+
+### Mini project
+**Policy-enforcing executor with a blast-radius report (2-3 hours).**
+- **Goal:** put every tool call of a small agent through a registry with tiers, scopes, budgets and
+  approval, and show the worst case before and after.
+- **Steps:** build an agent with four stub tools (read order, draft email, send email, issue refund);
+  give each a tier and required scopes; write an executor that enforces user scopes, a step budget, a
+  spend cap and approval for tier 2, auditing denials too; run 20 tasks including injected tickets asking
+  for refunds and mass emails; compute worst-case calls per tool with the blast-radius calculator.
+- **Done when:** no tier-2 call runs without approval, the audit log shows every denied attempt, and you
+  have a before and after blast-radius table per tool.

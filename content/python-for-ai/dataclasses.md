@@ -411,3 +411,23 @@ explicit immutable key (a tuple of the fields) and cache on that instead.
 - [ ] Support inheritance
 > Dataclasses generate methods from annotations but never check them; `Config(temperature="hot")`
 > succeeds. Pydantic validates, coerces and reports structured errors, which is why it owns boundaries.
+
+## Use cases & projects
+### Use cases
+- **Step and run records.** A frozen `Step` holding tool name, arguments, output and token cost makes
+  each run a readable, shareable trace.
+- **Loop detection and caching.** Hashable frozen records of (tool, arguments) let the loop spot a
+  repeated call and serve cached tool results.
+- **Run budgets and generation configs.** Small dataclasses carry max steps, token limits, model and
+  temperature through the loop with one readable repr.
+- **Retrieved chunks.** A `RetrievedChunk` with text, score and source moves between retrieval, reranking
+  and prompt assembly with checkable field names.
+
+### Mini project
+**Trace an agent run with frozen records (1-2 hours).**
+- **Goal:** record every step of a tool-calling loop as dataclasses and use them to stop loops.
+- **Steps:** define a frozen, slotted `Step` with `repr=False` on the tool output and a `Run` with a
+  `default_factory` list of steps and a budget; append a `Step` per tool call; keep a set of
+  (tool, arguments) keys and stop when one repeats three times; export the run as JSON.
+- **Done when:** a scripted run that repeats a call stops at the third repeat, the repr stays short with
+  large outputs, and the exported trace lists every step with its cost.

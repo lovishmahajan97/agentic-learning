@@ -420,3 +420,24 @@ would not move with any retrieval change.
 - [ ] The reranker randomly drops candidates; add a seed
 > Documents are synced and re-chunked continuously, so reproducing later tests a different system. Logging
 > what was actually retrieved, with the index version, makes diagnosis a lookup on the real state.
+
+## Use cases & projects
+### Use cases
+- **Triage of thumbs-down agent answers.** Each bad answer is traced to the first stage that lost the
+  gold evidence, so the fix goes to parsing, indexing, the search query or the prompt, not to a guess.
+- **Gating index, model or prompt changes.** Per-stage regression tests show whether a change moved
+  recall at retrieval, at reranking or only at generation.
+- **Diagnosing agent search behaviour.** Traces reveal runs where the agent never called search, wrote a
+  query that dropped the key term, or stopped after one weak result.
+- **Weekly failure reviews.** A labelled set of a few dozen failures and a counting script tell the team
+  which stage to invest in next.
+
+### Mini project
+**Build a first-lost-stage report for an agent's failures (2-3 hours).**
+- **Goal:** for 20 failing agent questions, name the first stage where the gold evidence disappeared.
+- **Steps:** take a small RAG agent with a `search` tool; log each tool call's arguments, returned chunk
+  IDs, scores and index version; label each failing question with its gold document and answer span;
+  write a script that checks, in order, whether the gold was ingested, chunked intact, retrievable by
+  the agent's actual query, ranked into the kept set, present in the final prompt and used in the answer.
+- **Done when:** you have a table of 20 failures with one first-lost stage each, a count per stage, and
+  one targeted fix whose re-run moves at least some failures out of the top stage.

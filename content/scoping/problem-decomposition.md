@@ -5,7 +5,8 @@ name: Problem decomposition
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - scoping/workflow-analysis
   - scoping/domain-modeling
@@ -17,20 +18,33 @@ related:
 ---
 
 ## TL;DR
-Problem decomposition breaks a fuzzy business goal into sub-problems, each with an input, output,
-technique and test. It shows which parts need a model, which are plain code, and where the chain fails,
-because errors in chained probabilistic steps multiply.
+Problem decomposition breaks a fuzzy goal into sub-problems, each with an input, output, technique and
+test. For an agent it decides which steps become deterministic tools, which stay model calls, and where
+checks go, because errors in chained probabilistic steps multiply.
+
+## For agent builders
+- **Why it matters for agents.** An agent is a chain of probabilistic steps. Ten steps at 95% each
+  succeed together only about 60% of the time, so you must know the steps, push exact work into tools,
+  and put validators where errors start.
+- **Where it shows up in your stack.** The tool list and each tool's typed schema, the validators between
+  steps, confidence-gated handoffs to a human, per-step trace spans and per-node eval suites.
+- **What you control.** Where the seams go, which nodes are code versus model, what each node's contract
+  says, and which node you spike first.
+- **What you can skip.** Formal consulting frameworks beyond the MECE check; a node table with contracts
+  and an end-to-end multiplication is enough to design and debug an agent.
 
 ## Why it exists
-- **One big prompt cannot be debugged.** "Automate invoice exception handling" as a single prompt works on
-  the three invoices you tried and fails opaquely on the fourth. You cannot tell whether the PDF was
-  misread, the wrong field extracted, the purchase order lookup missed, or the model reasoned badly, so
-  every fix is a prompt tweak that might break something else.
+- **One big prompt cannot be debugged.** "Automate invoice exception handling" as a single prompt or a
+  one-line agent instruction works on the three invoices you tried and fails opaquely on the fourth. You
+  cannot tell whether the PDF was misread, the wrong field extracted, the purchase order lookup missed, or
+  the model reasoned badly.
+- **Every fix becomes a prompt tweak** that might break something else.
 - **Errors compound.** If a task silently requires five steps that each succeed 95% of the time
   independently, the chain succeeds about 0.95⁵ ≈ 77% of the time. You only see this, and only know which
   step to improve, if the steps are explicit.
 - **Most of a business process is not a model problem.** Lookups, joins, threshold checks and API calls are
-  deterministic; putting them inside a prompt makes exact operations approximate.
+  deterministic; putting them inside a prompt makes exact operations approximate. In an agent they belong
+  in tools.
 - **Run-time planning does not replace design-time decomposition.** Letting an agent work out the steps
   moves decomposition from design time, where you can test it, to run time, where it varies per request.
   Agent planning has its place (see task decomposition in the agents module), but you still need to know
@@ -41,28 +55,29 @@ because errors in chained probabilistic steps multiply.
 - **Write what exists when the problem is solved:** "each invoice exception is routed to the right owner
   with a reason code and a drafted resolution, within one business day".
 - **An observable output can be tested;** an aspiration ("streamline AP") cannot.
+- **For an agent this is the stopping condition**, and the final-output schema it must produce.
 
 ### 2. Work backwards from the output
 - **Ask what must be true immediately before the output can be produced, and repeat.**
 - **Backwards keeps every sub-problem tied to the goal**, because forward brainstorming produces steps
-  nobody needs.
+  nobody needs, and tools nobody calls.
 
 ### 3. Split at natural seams
-| Seam | Example |
-|---|---|
-| **Data type changes** | Scanned image to text, text to structured fields |
-| **A decision is made** | Classify the exception reason |
-| **A system boundary is crossed** | Reading the ERP, sending an email |
-| **Responsibility passes between people** | AP clerk to purchasing owner |
+| Seam | Example | In an agent |
+|---|---|---|
+| **Data type changes** | Scanned image to text, text to structured fields | A parse tool returns structured output |
+| **A decision is made** | Classify the exception reason | A model step with an enum output |
+| **A system boundary is crossed** | Reading the ERP, sending an email | A tool call with its own permissions |
+| **Responsibility passes between people** | AP clerk to purchasing owner | A human handoff or approval step |
 
 - **Seams are where you put a test and an interface**, because the artefact passed across them is concrete
-  and inspectable.
+  and inspectable, and in a trace it is one span you can replay.
 
 ### 4. Write a contract for each node
 Record for each sub-problem: input schema, output schema, technique, owner and acceptance test. The
 technique choice is the heart of the exercise, in order of preference:
 
-1. **Deterministic code** for lookups, joins, arithmetic, rules and API calls.
+1. **Deterministic code** for lookups, joins, arithmetic, rules and API calls; in an agent, a tool.
 2. **Classical ML or a classifier** for high-volume, fixed-label decisions with labelled history.
 3. **Retrieval** where the answer exists in a corpus and must be cited.
 4. **LLM generation or extraction** for unstructured input and open-ended output.
@@ -77,8 +92,9 @@ technique choice is the heart of the exercise, in order of preference:
 ### 5. Check coverage and independence
 - **MECE test** (from consulting: mutually exclusive, collectively exhaustive): sub-problems cover the goal
   with no gaps and little overlap.
-- **Gaps** show up as "and then somehow" in the walkthrough.
-- **Overlaps** show up as two components that both decide the same thing.
+- **Gaps** show up as "and then somehow" in the walkthrough, or as an agent improvising a step no tool
+  supports.
+- **Overlaps** show up as two components, or two tools, that both decide the same thing.
 
 ### 6. Estimate per-node quality and find the critical node
 - **Give each probabilistic node a rough expected accuracy**, multiply along the chain, and see which node
@@ -105,23 +121,25 @@ technique choice is the heart of the exercise, in order of preference:
 ### 7. Prototype the riskiest node first
 - **The node with the most uncertainty**, usually the one with the messiest input, gets a spike before
   anything else is built.
-- **Because** if it cannot reach the required quality, the whole design changes.
+- **Because** if it cannot reach the required quality, the whole design changes, including the agent's
+  tool list.
 
 ### 8. Keep the tree as a living artefact
-- **It becomes the backbone** of the statement of work, the requirements trace and the evaluation plan.
+- **It becomes the backbone** of the statement of work, the requirements trace, the tool catalogue and the
+  evaluation plan.
 - **Tests follow the tree:** one test suite per node plus an end-to-end suite.
 
 ## Diagram
-The invoice-exception chain: deterministic and probabilistic nodes alternate, and a validator or
-threshold at a seam turns silent errors into escalations to a person.
+The invoice-exception chain: deterministic tools and model steps alternate, and a validator or threshold at
+a seam turns silent errors into escalations to a person.
 
 ```mermaid
 flowchart TD
-    I["Invoice PDF"] --> P["Parse PDF to text"]
+    I["Invoice PDF"] --> P["Tool: parse PDF to text"]
     P --> E["LLM: extract vendor, amount, PO"]
     E --> V{"Validator: amount equals line items?"}
     V -->|"fails"| H["Human queue"]
-    V -->|"passes"| J["Deterministic join to PO in ERP"]
+    V -->|"passes"| J["Tool: join to PO in ERP"]
     J --> C["LLM: classify exception reason"]
     C --> T{"Confidence above threshold?"}
     T -->|"no"| H
@@ -197,28 +215,44 @@ for name, n in (("no checks", base), ("validator + threshold", guarded)):
 - **Simplifications:** no false flags on correct items, and errors caught at one node are not counted again
   later; real numbers come from labelled runs.
 
+### Worked scenario: one free-roaming agent vs a decomposed agent
+All figures illustrative. The same invoice task built two ways, measured on 200 labelled invoices.
+
+| Design | Model-decided steps per invoice | Rough end-to-end | What a failure looks like |
+|---|---|---|---|
+| One agent, generic tools (`read_file`, `sql`), told "handle the exception" | About 10, each about 95% | 0.95¹⁰ ≈ 60% | A plausible email with a wrong PO; no idea which step failed |
+| Agent whose tools are the nodes above: `parse_invoice`, `match_po`, `route_to_owner` | 2 (extract, classify) plus a draft | About 75%, with validators catching more | Validator or threshold escalation, logged on the failing span |
+
+- **Decomposition shrank the model's decisions**, because joins, routing and parsing moved into tools with
+  typed outputs.
+- **The agent still plans**, but over a small, testable tool set; each tool has its own suite.
+
 ## Production patterns
-- **Typed contract per node** — define each node's input and output as a schema (for example a Pydantic
-  model or JSON Schema) and validate at every seam, so a rephrased model output fails loudly instead of
-  breaking a downstream regex. Monitor schema-validation failures per node.
+- **Typed contract per node and per tool** — define each node's input and output as a schema (for example a
+  Pydantic model or JSON Schema) and use the same schema as the agent's tool definition, validating at
+  every seam, so a rephrased model output fails loudly instead of breaking a downstream regex. Monitor
+  schema-validation failures per node.
 - **Deterministic validators at seams** — after extraction, check invariants in code: amount equals the sum
-  of line items, PO number exists in the ERP, dates are in range. Route failures to a review queue.
-  Monitor catch rate and how many flagged items were actually correct.
+  of line items, PO number exists in the ERP, dates are in range. Route failures to a review queue rather
+  than letting the agent retry indefinitely. Monitor catch rate and how many flagged items were actually
+  correct.
 - **Confidence-gated routing** — send classifier outputs below a tuned threshold to a person, and tune the
   threshold on labelled data against reviewer capacity. Monitor escalation volume against queue capacity
   and the silent-error rate on audited samples.
 - **Per-node plus end-to-end eval suites** — keep one evaluation set per probabilistic node and one
-  end-to-end set in CI, run on every prompt or model change. Monitor both, because node metrics can all
-  look fine while the end-to-end result is poor.
-- **Per-node trace logging** — log each node's input, output and outcome (correct, escalated, error) under
-  one request ID, so error analysis can attribute a bad final result to the node where it started.
+  end-to-end set in CI, run on every prompt, tool or model change. Monitor both, because node metrics can
+  all look fine while the end-to-end result is poor.
+- **Per-node trace logging** — log each node's or tool call's input, output and outcome (correct,
+  escalated, error) as spans under one request ID, so error analysis can attribute a bad final result to
+  the node where it started.
 
 ## Trade-offs
 - **Testability vs integration cost.** Fine-grained decomposition makes each node testable and replaceable,
   but adds interfaces, latency and integration code. When one model call handles two steps reliably,
   merging them is simpler.
-- **Exactness vs brittleness.** Moving logic into deterministic code gives exactness and auditability, but
-  brittle rules break on variation. It flips when the inputs are too varied to enumerate rules for.
+- **Exactness vs brittleness.** Moving logic into deterministic code or tools gives exactness and
+  auditability, but brittle rules break on variation. It flips when the inputs are too varied to enumerate
+  rules for.
 - **Predictability vs adaptability.** Explicit pipelines are predictable and debuggable, but cannot adapt to
   cases the designer did not foresee. When the space of paths is genuinely open-ended, an agent with tools
   fits better.
@@ -230,7 +264,7 @@ for name, n in (("no checks", base), ("validator + threshold", guarded)):
 - **Decomposing by org chart or by existing system instead of by data flow.** Symptom: nodes whose outputs
   nobody consumes and handoffs that recreate today's delays.
 - **Putting deterministic steps inside the prompt.** Symptom: arithmetic errors, invented IDs or wrong dates
-  in otherwise fluent output.
+  in otherwise fluent output. Fix: make them tools.
 - **Treating per-node accuracy as end-to-end accuracy.** Symptom: a team reporting 90%+ on every component
   while users see a large share of cases go wrong.
 - **Leaving node outputs unstructured.** Symptom: downstream code parsing free text with regexes and failing
@@ -240,10 +274,13 @@ for name, n in (("no checks", base), ("validator + threshold", guarded)):
   off because they were never measured separately.
 - **Building the easy nodes first.** Symptom: a mostly finished pipeline blocked for weeks on the one hard
   extraction that should have been spiked on day one.
+- **Giving an agent generic tools instead of node-shaped ones.** Symptom: long, varied traces where the
+  agent writes its own SQL and joins, with failures nobody can localise.
 
 ## When to use
-- **Use before** estimating, before writing a statement of work and before choosing a model. It is worth
-  doing even for small builds, because the output (nodes with contracts and tests) is the evaluation plan.
+- **Use before** estimating, before writing a statement of work, before choosing a model and before writing
+  any tool definitions. It is worth doing even for small builds, because the output (nodes with contracts
+  and tests) is the evaluation plan.
 - **Avoid heavy decomposition** only for a genuinely single-step task, such as summarising one document type
   for internal reading.
 - **Measure:** every node has an owner, a technique and a test, and you can name the node that dominates
@@ -284,6 +321,13 @@ because everything else depends on them and scanned legal documents are where qu
 - **Trace a sample of bad cases** through per-node logs to find where each error started, and check for
   correlated failures such as bad scans hurting parsing and extraction together.
 - **Add an end-to-end eval set** if none exists, and fix the node that dominates the loss first.
+
+### How does decomposition shape the tools you give an agent?
+- **Deterministic nodes become tools** with typed input and output schemas, such as `match_po` instead of a
+  generic SQL tool, so the model cannot get an exact operation approximately right.
+- **Fewer model-decided steps means less compounding:** ten free steps at 95% give about 60%, while two
+  model steps plus tools stay near the pipeline's 75% and fail at a known span.
+- **Each tool gets its own test suite**, and the agent gets an end-to-end one.
 
 ### When would you merge nodes or let an agent plan instead of an explicit pipeline?
 - **Merge** when one model call handles two steps reliably, because each extra seam adds interface code and
@@ -327,3 +371,27 @@ because everything else depends on them and scanned legal documents are where qu
 - [ ] Because ERP systems forbid access from LLMs
 > A join or lookup has one correct answer that code returns every time. Inside a prompt it gains error
 > rate, cost and latency while adding nothing, and becomes a compounding failure point.
+
+## Use cases & projects
+### Use cases
+- **Designing an agent's tool catalogue.** Deterministic nodes become typed tools, so the model only decides
+  what genuinely needs judgement.
+- **Debugging a flaky agent.** Per-node trace spans and the multiplication show which step dominates the
+  loss and where a validator would help.
+- **Scoping a statement of work.** The node tree with owners and tests becomes the scope, the requirements
+  trace and the eval plan.
+- **Choosing pipeline vs agent.** Decomposition shows whether the steps are fixed (workflow) or genuinely
+  vary per case (agent).
+
+### Mini project
+**Decompose and guard a small document agent (2-3 hours).**
+- **Goal:** take a one-prompt "handle this invoice" agent and rebuild it as a few typed tools plus two model
+  steps, then measure the difference.
+- **Steps:**
+  1. Write 20 synthetic invoices with labelled vendor, amount, PO and exception reason.
+  2. Run a single-prompt version and score end-to-end correctness.
+  3. Split it into nodes: parse, extract (Pydantic output), match PO (a dict lookup tool), classify (enum),
+     draft; add an amount validator and a confidence threshold.
+  4. Log each node's outcome per invoice and compute automated-correct, silent and escalated shares.
+- **Done when:** you have a table comparing both designs on the three numbers, and can name the node that
+  dominates remaining errors.

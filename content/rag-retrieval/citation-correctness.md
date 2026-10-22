@@ -396,3 +396,23 @@ accuracy.
 - [ ] It makes the judge agree with the generator more often
 > Citation correctness is about the specific pointer. Given the whole answer, a judge fills gaps from
 > other sentences or sources and over-credits support, inflating scores relative to human labels.
+
+## Use cases & projects
+### Use cases
+- **Release gates for agent changes.** A prompt, model or retriever change ships only if citation recall
+  and precision on the golden set stay above the thresholds.
+- **Production monitoring.** Scoring a sample of live traces catches citation drift after a corpus update
+  or provider model change.
+- **Choosing a generator model.** Two models with the same answer accuracy can differ sharply in whether
+  their citations actually support their claims.
+- **Judge calibration.** Comparing judge verdicts with human labels on a small set tells you how far to
+  trust automated scores.
+
+### Mini project
+**Score citation recall and precision for your agent (2-3 hours).**
+- **Goal:** build a per-claim citation eval and run it on your agent's answers.
+- **Steps:** collect 30 agent answers with citations and the tool results they cite; split each answer
+  into claims; ask an LLM judge whether each claim is supported by its cited passages alone, and whether
+  each citation is needed; hand-label 30 claims and compare with the judge.
+- **Done when:** you report citation recall, citation precision and judge-human agreement, list the three
+  most common failure types, and set a threshold you would use as a release gate.

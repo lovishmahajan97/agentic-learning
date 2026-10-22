@@ -5,7 +5,8 @@ name: Calibration
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - ml-fundamentals/roc-auc
   - ml-fundamentals/class-imbalance
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-A calibrated model's confidence matches its hit rate: of everything it calls "90%", about 90% is right.
-Thresholds, abstention and escalation need this; ranking does not. Modern networks are usually
-overconfident: measure on held-out data, fix post hoc, usually with temperature scaling.
+Agents act on confidence: answer or escalate, route to the big model, block a tool call. Calibration
+makes "90%" mean right about 90% of the time. Models, LLMs and judges are usually overconfident: measure
+on held-out labels, fix post hoc.
+
+## For agent builders
+- **Why it matters for agents.** Every "if confidence < c then ..." in an agent (human handoff, cascade
+  to a larger model, guardrail block, retry with more retrieval) assumes the number is a probability. If
+  it is not, the threshold escalates the wrong share of runs and lets confident mistakes through.
+- **Where it shows up in your stack.** Router and cascade thresholds, guardrail classifier scores, LLM
+  judge scores in your eval harness, log-probabilities from APIs that expose them, and self-consistency
+  (sampling agreement) when they do not.
+- **What you control.** Which confidence signal you use, a labelled calibration split drawn from real
+  agent traffic, the calibrator (temperature, Platt or isotonic), the threshold derived from costs, and
+  a weekly ECE check on fresh labels.
+- **What you can skip.** Proofs about proper scoring rules and the internals of LBFGS. Know the
+  reliability diagram, ECE, temperature scaling and the rule "verbalised confidence is not p".
 
 ## Why it exists
 - **A score and a probability are different contracts.** A score only promises an ordering. A probability
@@ -129,7 +143,9 @@ An "answer or escalate" rule asks two separate questions:
 - **Measure both before building a cascade.** If the curve is flat, the fix is a better signal (sampling
   agreement, a trained verifier), not a better calibrator.
 
-### Three confidences in an LLM
+### Three confidences in an LLM agent
+Agents built on hosted models rarely have a trained classifier's logits; they choose among these three.
+
 1. **Token probabilities.** For multiple-choice or classification formats, the probability mass on the
    answer token. Kadavath et al. report that large pretrained models are reasonably calibrated in this
    format; post-training with RLHF has been reported to degrade it, so re-check per model. Few-shot
@@ -146,18 +162,20 @@ An "answer or escalate" rule asks two separate questions:
   cost-versus-quality threshold mean anything.
 
 ## Diagram
-Three disjoint splits, then a production loop: the calibrator is fitted once but checked forever.
+Three disjoint splits, then the agent's production loop: the calibrator is fitted once but checked
+forever, and the threshold it supports decides answer versus escalate.
 
 ```mermaid
 flowchart TD
-    TR[("Training split")] --> M["Train model"]
+    TR[("Training or labelled traces")] --> M["Model or confidence signal"]
     M --> CAL["Fit T or isotonic on calibration split"]
     CAL --> REP["Report ECE and Brier on test split"]
     REP --> TH["Pick threshold from costs"]
-    TH --> P["Serve calibrated probabilities"]
-    P --> MON["Label fresh samples, per-class ECE"]
+    TH --> P["Agent step: calibrated confidence"]
+    P -->|"above threshold"| ANS["Answer or call tool"]
+    P -->|"below threshold"| ESC["Escalate to human or big model"]
+    ANS --> MON["Label fresh samples, per-class ECE"]
     MON -->|"ECE drifts up"| CAL
-    MON -->|"stable"| P
 ```
 
 ## Examples
@@ -174,6 +192,38 @@ A five-class classifier's predictions on 1,000 held-out items fall into five con
 
 - **Every bin sits below the diagonal.** ECE = 0.2 × (0.03 + 0.07 + 0.11 + 0.15 + 0.16) = 0.104.
 - **Mean confidence is 0.75 against an overall accuracy of 0.65:** a classic overconfident network.
+
+### Agent scenario: setting a support agent's handoff threshold from costs
+A support agent answers tickets or hands off to a human. A human review costs $2; a wrong answer shipped
+costs $20 (refunds, churn). Answer only when the expected cost of answering, (1 − p) × 20, is below 2,
+so the threshold is p ≥ 0.9, and that only means something if p is calibrated.
+
+```python
+import random
+random.seed(0)
+# Stand-in for 2,000 labelled validation runs: calibrated confidence per run, and whether it was right
+runs = [random.betavariate(15, 1) for _ in range(2_000)]
+labels = [random.random() < p for p in runs]        # calibrated by construction
+
+C_ESC, C_WRONG = 2.0, 20.0                           # $ per human review, $ per wrong answer shipped
+tau = 1 - C_ESC / C_WRONG                            # answer iff (1 - p) * C_WRONG < C_ESC
+kept = [(p, ok) for p, ok in zip(runs, labels) if p >= tau]
+escalation = 1 - len(kept) / len(runs)
+kept_error = sum(not ok for _, ok in kept) / len(kept)
+forecast = sum(1 - p for p, _ in kept) / len(kept)  # what calibration lets you predict before launch
+print(f"tau={tau:.2f} escalate={escalation:.1%} kept error={kept_error:.1%} forecast={forecast:.1%}")
+# This run: tau=0.90 escalate=20.2% kept error=3.9% forecast=4.0%
+```
+
+The same agent before calibration, using a raw confidence with a 0.8 cut (the Check yourself case),
+per 10,000 tickets (illustrative figures):
+
+| Setting | Escalated | Wrong answers kept | Cost |
+|---|---|---|---|
+| Raw confidence, cut at 0.8 | 500 (5%) | 30% of 9,500 = 2,850 | $1,000 + $57,000 = $58,000 |
+| Calibrated, cut at 0.9 from costs | ~2,000 (20%) | ~4% of ~8,000 ≈ 320 | ~$4,000 + ~$6,400 ≈ $10,400 |
+
+The honest escalation rate is four times higher, and total cost drops by more than 5×.
 
 ### Temperature scaling on synthetic overconfident logits
 The code fits a temperature on synthetic logits built to be exactly twice as sharp as they should be, so the
@@ -257,9 +307,13 @@ Use `method="sigmoid"` instead when the calibration data is small, because isoto
 - **Predict the escalation rate before launch.** For a cascade, pick the threshold on calibrated confidence
   from the cost of escalation versus a wrong answer, and forecast escalation rate and kept-answer error from
   validation. After launch, alert when either departs from the forecast.
-- **Sampling agreement for black-box LLMs.** When no log-probabilities are available, sample n answers at
-  non-zero temperature, use the agreement rate, and fit an isotonic map from agreement to correctness on
-  labelled data. Monitor cost per request, which grows n times.
+- **Sampling agreement for black-box LLM agents.** When no log-probabilities are available, sample n
+  answers at non-zero temperature, use the agreement rate, and fit an isotonic map from agreement to
+  correctness on labelled agent runs. Monitor cost per request, which grows n times; spend it only on
+  steps that gate an irreversible action.
+- **Calibrate the LLM judge before trusting pass rates.** Label a few hundred eval transcripts by hand,
+  plot the judge's score against human verdicts, and fit a map so "judge 0.8" means humans agree about
+  80% of the time. Re-check whenever the judge model or its prompt changes.
 
 ## Trade-offs
 - **One-parameter temperature scaling vs flexibility.** It preserves accuracy and ranking and needs little
@@ -288,13 +342,16 @@ Use `method="sigmoid"` instead when the calibration data is small, because isoto
   useless because AUC did not move, or a new model trusted because AUC rose.
 - **Trusting verbalised LLM confidence as a probability.** Symptom: a reliability diagram flat at 85–95%
   confidence across correct and incorrect answers alike.
+- **Keeping the threshold after swapping the agent's model.** Symptom: escalation rate or kept-answer
+  error jumps the day a new model version ships. Fix: confidence scales differ between models, so refit
+  the calibrator and re-pick the threshold on labelled runs before the switch.
 - **Ten equal-width bins on 200 examples.** Symptom: ECE moving by 0.05 when you change the bin count. Fix:
   fewer, equal-mass bins and a bootstrap interval.
 - **Reporting only the average ECE.** Symptom: a badly overconfident minority class hiding behind a
   calibrated majority. Fix: per-class ECE.
 
 ## When to use
-- **Calibrate whenever something consumes the probability rather than the ranking:** a cost-based threshold,
+- **Calibrate whenever an agent decision consumes the probability rather than the ranking:** a cost-based threshold,
   an abstain-or-escalate rule, a cascade to a larger model, a human-review queue sized by confidence, a
   user-facing "likely" or "unlikely", or any averaging of scores across models.
 - **Skip it when only the order matters,** as in top-k retrieval or a leaderboard.
@@ -343,7 +400,7 @@ verifier. Then monitor ECE on fresh labels, because drift will undo the fix.
   would hurt a ranking consumer.
 - **Per-class scaling** is the middle ground when miscalibration differs by class.
 
-### An LLM says it is 95% confident on every answer. How do you get a usable confidence?
+### Your agent's LLM says it is 95% confident on every answer. How do you get a usable confidence?
 - **Do not use the verbalised number as p:** it clusters in a narrow high band regardless of correctness.
 - **Use a better signal:** token probabilities on a constrained answer format if the API exposes them, or
   agreement across n samples at non-zero temperature.
@@ -354,6 +411,13 @@ verifier. Then monitor ECE on fresh labels, because drift will undo the fix.
 - **The 0.6 assumed 50/50 classes.** Prior correction gives odds 1.5 × (0.05/0.95) ≈ 0.079, so p ≈ 0.07.
 - **Operationally:** apply the correction or recalibrate on data at deployment prevalence before they set any
   threshold, and monitor base-rate drift, which breaks the correction.
+
+### You upgraded the model behind an agent and the human-handoff rate halved overnight. Good news?
+- **Not yet.** A new model has a different confidence scale, so the same threshold now means something
+  else; fewer handoffs can simply mean more confident wrong answers kept.
+- **Check:** label a sample of kept answers from both versions, draw reliability diagrams, and compare
+  kept-answer error, not handoff rate.
+- **Fix:** refit the calibrator on the new model's labelled runs and re-derive the threshold from costs.
 
 ## Quiz
 ### Q: Why does temperature scaling leave accuracy and ROC-AUC unchanged?
@@ -382,3 +446,24 @@ verifier. Then monitor ECE on fresh labels, because drift will undo the fix.
 > ECE only checks that confidence matches hit rate, which the constant base-rate predictor satisfies
 > trivially. Brier blends calibration with resolution, ECE is a binned diagnostic rather than a proper
 > scoring rule, and nothing about low ECE constrains the ranking that AUC measures.
+
+## Use cases & projects
+### Use cases
+- **Human-handoff thresholds in support agents.** A calibrated confidence turns "escalate when unsure"
+  into a threshold derived from the cost of a review versus a wrong answer, with a forecast escalation rate.
+- **Model cascades and routers.** A calibrated "probability the small model is right" decides when to pay
+  for the large model, so the cost-versus-quality trade is a number, not a guess.
+- **Guardrails on tool calls.** Blocking or confirming a risky action (refund, delete, send) at a
+  confidence that means the same thing after every model upgrade.
+- **LLM-as-judge in eval harnesses.** Mapping judge scores to agreement with human labels, so a
+  dashboard's pass rate tracks what reviewers would say.
+
+### Mini project
+**Calibrate an agent's answer-or-escalate rule (2-3 hours).**
+- **Goal:** turn a raw LLM confidence into a calibrated one and pick a handoff threshold from costs.
+- **Steps:** run a small Q&A agent on 300+ questions with known answers; record verbalised confidence and
+  agreement across 5 samples per question; label each answer right or wrong; split into calibration and
+  test halves; fit an isotonic map from agreement to correctness; draw reliability diagrams and ECE for
+  both signals; pick the threshold from two costs you choose.
+- **Done when:** you have both reliability diagrams, ECE before and after, the chosen threshold, and the
+  forecast versus observed escalation rate and kept-answer error on the test half.

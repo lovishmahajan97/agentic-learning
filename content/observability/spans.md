@@ -5,7 +5,8 @@ name: Spans
 kind: concept
 difficulty: core
 est_minutes: 12
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - observability/tracing
   - observability/distributed-tracing-across-services
@@ -18,9 +19,22 @@ sources:
 ---
 
 ## TL;DR
-A span is one named, timed operation with a parent, a status, attributes and optional events. Traces are
-only as useful as their spans, so the skill is choosing boundaries that match your questions and
-recording attributes that make each span filterable on its own.
+A span is one named, timed operation with a parent, status, attributes and events. In an agent, every
+loop step, model call and tool call is a span, so choosing boundaries and attributes decides which agent
+failures you can find.
+
+## For agent builders
+- **Why it matters for agents.** "Which tool did step 4 call, with what arguments, and did the error get
+  fed back to the model?" is answerable only if the step and the tool call are spans carrying those
+  attributes. Badly shaped spans give you a trace you cannot query.
+- **Where it shows up in your stack.** `start_as_current_span` in the OpenTelemetry SDK, the
+  `@observe`-style decorators and callbacks of LLM tracing tools, and the generation spans that provider
+  client instrumentation emits for you.
+- **What you control.** Span names (`agent.step`, `tool.<name>`, never ids), what goes into attributes,
+  events or by-reference payloads, the status of a tool error the agent recovered from, and keeping
+  streaming generation spans open until the stream ends.
+- **What you can skip.** The wire format and exporter internals. Know the fields, the lifecycle, the
+  streaming trap and the cardinality rule.
 
 ## Why it exists
 - **A trace tree needs a node unit that does three jobs.** *Timing*, so durations can be summed and
@@ -97,6 +111,19 @@ What to record follows from the questions you will ask:
 - **Conventions:** OpenTelemetry publishes generative-AI semantic conventions (attribute names prefixed
   `gen_ai.`). At the time of writing they were still marked experimental, so check exact names against
   the current specification rather than memorising them.
+
+### Spans for an agent loop
+| Span | Name | Attributes worth recording | Status rule |
+|---|---|---|---|
+| Run | `agent.run` | task type, session id, steps taken, stopping reason | `ERROR` only if the user got no usable result |
+| Step | `agent.step` | iteration number, decision (tool or final), context tokens | `OK` if the loop continued normally |
+| Tool | `tool.<name>` | arguments as produced, result size, error type, approval required | `ERROR` when the tool failed, even if the agent recovered |
+
+- **A tool error the model recovers from** is `ERROR` on the tool span and `OK` on the step and run,
+  for the same reason as a retried generation: per-tool failure rates stay visible while the run's error
+  rate counts only user-visible failures.
+- **Approval gates and guardrail decisions are events** on the step or tool span (`approval_requested`,
+  `guardrail_blocked`), unless waiting for a human is a duration you will chart; then it is a child span.
 
 ### Events versus child spans
 - **Rule:** a duration you care about on its own is a child span; an instant is an event.
@@ -216,6 +243,38 @@ def traced_stream(tracer, make_stream, model):
 | Span around the call that returns the stream | a few ms | missing: set after the span ended |
 | `traced_stream` around the iteration | full stream time | recorded |
 
+### Agent tool span: failure recorded, run continues
+The agent loop catches tool errors and hands them back to the model as an observation. The tool span
+still carries `ERROR`, so per-tool failure rates are real while the step stays `OK`. Uses the `tracer`
+from the first example; `TOOLS` is a stand-in registry.
+
+```python
+import json
+from opentelemetry.trace import Status, StatusCode
+
+def call_tool(tracer, name, args, TOOLS):
+    with tracer.start_as_current_span(f"tool.{name}") as span:   # low-cardinality name
+        span.set_attribute("app.tool.args", json.dumps(args)[:500])   # truncated, not the full payload
+        try:
+            result = TOOLS[name](**args)
+            span.set_attribute("app.tool.result_chars", len(str(result)))
+            span.set_status(Status(StatusCode.OK))
+            return {"ok": True, "content": str(result)}
+        except Exception as e:
+            span.record_exception(e)
+            span.set_status(Status(StatusCode.ERROR, type(e).__name__))
+            return {"ok": False, "content": f"Tool {name} failed: {e}. Fix the arguments or try another tool."}
+
+def agent_step(tracer, step, reply, TOOLS):
+    with tracer.start_as_current_span("agent.step") as span:
+        span.set_attribute("app.agent.iteration", step)
+        span.set_attribute("app.agent.decision", reply["name"])
+        obs = call_tool(tracer, reply["name"], reply["args"], TOOLS)
+        if not obs["ok"]:
+            span.add_event("tool_error_returned_to_model")
+        return obs                                   # the step itself succeeded
+```
+
 ## Production patterns
 - **Batch processor, flushed on shutdown.** Use `BatchSpanProcessor` in every service and call
   `provider.shutdown()` (or `force_flush()`) in the process exit hook, because the queue is in memory.
@@ -230,6 +289,10 @@ def traced_stream(tracer, make_stream, model):
 - **Attempt spans under an aggregate.** For retries, one `generation` parent with `attempts=N` and one
   child per attempt carrying its provider request id and status. Monitor attempts per generation as a
   leading indicator of provider overload.
+- **Per-tool spans with a fixed attribute set.** Give every agent tool span the same keys (arguments
+  truncated or by reference, result size, error type, approval flag) through one shared wrapper, not
+  per-tool code. Monitor failure rate and latency p95 per `tool.<name>`; a tool whose failure rate climbs
+  after a prompt change usually means the model now passes worse arguments.
 - **Status agreement check.** Periodically compare the count of `status=ERROR` spans per operation with
   your error-rate metric for the same window. Monitor the gap; it reveals missing `set_status` calls.
 
@@ -243,6 +306,9 @@ def traced_stream(tracer, make_stream, model):
 - **Rich attributes vs index cost.** Spans become filterable and aggregatable, but every indexed attribute
   costs backend resources. It flips when an attribute's cardinality approaches the number of requests; the
   value then belongs in the payload, not the index.
+- **Tool arguments on the span vs privacy.** Recording the arguments the model produced is the fastest
+  way to debug bad tool calls, but arguments often carry emails, addresses or account numbers. It flips
+  to truncated, hashed or by-reference arguments once tools touch customer data.
 - **Events vs child spans.** Events are cheaper and keep the tree readable but have no duration or status
   of their own. It flips to a child span the moment you need to chart or alert on that sub-step's latency
   or failure rate.
@@ -261,6 +327,9 @@ def traced_stream(tracer, make_stream, model):
   seconds.
 - **Shipping the simple (synchronous) span processor to production.** Symptom: latency rises whenever the
   trace backend is slow, and requests hang when it is down.
+- **Marking the whole agent run failed because one tool call failed.** Symptom: the run error rate is far
+  above the user complaint rate, because recovered tool errors are counted as user-visible. Fix: `ERROR`
+  on the tool span, `OK` on the step and run when the agent recovered.
 - **Capturing the prompt *template* instead of the rendered prompt.** Symptom: the span cannot reproduce
   the model's behaviour because variables, truncation and history are missing.
 
@@ -312,9 +381,9 @@ latency unexplainable.
 - **Fix:** hold the span in a generator around the iteration and end it in `finally`, so duration, the
   first-token event and usage are recorded.
 
-### When would you make something an event instead of a child span?
-- **Events for instants inside an operation:** first token, cache hit decided, a guardrail decision.
-  They are cheap and keep the tree readable.
+### In an agent run, when would you make something an event instead of a child span?
+- **Events for instants inside an operation:** first token, cache hit decided, a guardrail decision,
+  an approval request or a tool error handed back to the model. They are cheap and keep the tree readable.
 - **Child spans when you will chart or alert on it:** a retry attempt or a rerank call has its own
   duration, status and request id, so it needs to be a span.
 
@@ -328,6 +397,14 @@ latency unexplainable.
   request path.
 - **Switch to the batch processor,** which exports in the background and drops spans when its bounded
   queue fills instead of blocking, and flush it on shutdown so exits do not lose the queue.
+
+### How would you design spans so you can tell which of an agent's tools is hurting task success?
+- **One span per tool call, named `tool.<name>`,** nested under the `agent.step` whose generation chose
+  it, so failure rate and latency aggregate per tool.
+- **A fixed attribute set from one wrapper:** arguments (truncated or by reference), result size, error
+  type, and whether the error was returned to the model.
+- **Join with outcomes:** put the stopping reason and an eval or feedback score on the run span, then
+  compare success rates of runs that did and did not hit each tool's errors.
 
 ## Quiz
 ### Q: What single field turns a set of independently emitted spans into a trace tree?
@@ -354,3 +431,23 @@ latency unexplainable.
 > Span status is about execution failure. An empty retrieval that completed normally is OK at the
 > mechanics level; detecting that it was semantically bad requires reading recorded attributes or
 > scoring the trace, which is why traces feed evals.
+
+## Use cases & projects
+### Use cases
+- **Per-tool reliability dashboards.** Consistent `tool.<name>` spans give failure rate and latency per
+  tool across every agent that uses it.
+- **Debugging bad tool arguments.** The arguments recorded on the tool span show exactly what the model
+  produced, before validation or coercion.
+- **Streaming agent UIs.** A generation span held open across the stream gives real TTFT and token usage
+  for each agent step shown to the user.
+- **Approval and guardrail audits.** Events on step spans show when an approval gate fired or a guardrail
+  blocked an action, in context.
+
+### Mini project
+**Instrument an agent's tools with a shared span wrapper (1-2 hours).**
+- **Goal:** make tool failures visible per tool without marking recovered runs as failed.
+- **Steps:** take any small agent with three tools; route every tool call through one wrapper like
+  `call_tool` above; add `agent.step` spans with the iteration and decision; inject a 20% failure rate
+  into one tool; export spans to the console or a local collector; run 30 tasks.
+- **Done when:** you can show the failing tool's span error rate near 20%, the run error rate much lower
+  because the agent recovered, and an event marking each error that was returned to the model.

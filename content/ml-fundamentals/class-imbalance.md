@@ -441,3 +441,25 @@ review a sample so drift in either class is noticed.
 > Balanced weights make the model behave as if positives were half the data, so its probabilities are
 > systematically inflated by the odds ratio between the artificial and the real prior. The ranking may
 > be fine; the probabilities are not, until you correct them or recalibrate on unweighted data.
+
+## Use cases & projects
+### Use cases
+- **Prompt-injection guardrails on tool outputs.** Attacks are a tiny share of tool results, so the
+  threshold is set from a false-block budget and judged on precision and recall, not accuracy.
+- **Human-handoff triggers.** "Escalate to a person" fires on a few percent of conversations; the eval set
+  must hold enough real escalations to measure recall at all.
+- **Failure mining from agent logs.** Failed or unsafe runs are rare among successes, so a cheap filter
+  feeds a precise LLM judge instead of one model doing both.
+- **LLM-judge classifiers with few-shot prompts.** Balancing the few-shot demonstrations so the judge does
+  not learn to always answer the common label.
+
+### Mini project
+**Tune a guardrail threshold on a rare class (1-3 hours).**
+- **Goal:** set the operating threshold of a prompt-injection detector for tool outputs from a
+  false-block budget, and show why accuracy is the wrong metric.
+- **Steps:** assemble a labelled set of tool results with a few percent injected instructions; score each
+  with any classifier or an LLM returning a probability; report accuracy, precision, recall and average
+  precision at the default threshold; then pick the threshold on a validation split that keeps false
+  blocks under your budget and re-measure on a test split.
+- **Done when:** you have a table comparing the default and tuned thresholds on the test split, plus the
+  expected number of false blocks per 10,000 tool calls at the chosen setting.

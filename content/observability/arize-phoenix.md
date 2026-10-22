@@ -5,7 +5,8 @@ name: Arize Phoenix
 kind: tool
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - observability/opentelemetry
   - observability/tracing
@@ -22,9 +23,20 @@ sources:
 ---
 
 ## TL;DR
-Arize Phoenix is a self-hostable (source-available, Elastic License 2.0) LLM observability and evaluation
-tool built on OpenTelemetry: it stores OTel spans with OpenInference attributes, runs LLM judges over them,
-writes verdicts back onto spans and visualises embeddings.
+Arize Phoenix is a self-hostable (source-available, Elastic License 2.0) tool built on OpenTelemetry that
+stores your agent's spans with OpenInference attributes (agent, LLM, tool, retriever), runs LLM judges over
+them, writes verdicts back onto spans and visualises embeddings.
+
+## For agent builders
+- **Why it matters for agents.** RAG agents fail by retrieving the wrong chunks, ignoring good ones or
+  picking the wrong tool. Phoenix shows each `AGENT`, `LLM`, `TOOL` and `RETRIEVER` span with its documents
+  and messages, and puts a judge's label on the exact span that went wrong.
+- **Where it shows up in your stack.** `phoenix.otel.register` plus OpenInference instrumentors for OpenAI,
+  Anthropic, LangChain, LlamaIndex, DSPy and others, or an extra exporter on your OTel Collector.
+- **What you control.** Span kinds and attributes on your own agent steps, which evaluators run on which
+  spans, judge model and sample size, payload hiding, and Postgres retention.
+- **What you can skip.** UMAP internals and drift monitoring unless retrieval quality is your problem.
+  Know the ingestion path and how an evaluation joins back to a span id.
 
 ## Why it exists
 - **RAG debugging needs three answers per request:** which chunks were retrieved, were they relevant, and did
@@ -181,6 +193,55 @@ px_client.log_evaluations(SpanEvaluations(eval_name="Hallucination", dataframe=h
   span carries a `Hallucination` label with the judge's explanation, and the project view filters to the
   hallucinated ones.
 
+### Marking agent and tool spans with OpenInference kinds
+For a hand-written agent loop, set the span kind on the run and on each tool call so Phoenix renders them
+as agent and tool steps; model calls still come from the instrumentor. `decide` and `TOOLS` stand for your
+model call and tool registry.
+
+```python
+import json
+from openinference.semconv.trace import SpanAttributes, OpenInferenceSpanKindValues as Kind
+
+def run_tool(name: str, args: dict):
+    with tracer.start_as_current_span(f"tool {name}") as span:
+        span.set_attribute(SpanAttributes.OPENINFERENCE_SPAN_KIND, Kind.TOOL.value)
+        span.set_attribute("tool.name", name)
+        span.set_attribute("tool.parameters", json.dumps(args))
+        result = TOOLS[name](**args)
+        span.set_attribute(SpanAttributes.OUTPUT_VALUE, json.dumps(result))
+        return result
+
+def run_agent(task: str, max_steps: int = 6) -> str:
+    with tracer.start_as_current_span("support.agent") as span:
+        span.set_attribute(SpanAttributes.OPENINFERENCE_SPAN_KIND, Kind.AGENT.value)
+        span.set_attribute(SpanAttributes.INPUT_VALUE, task)
+        observations = []
+        for _ in range(max_steps):
+            step = decide(task, observations)          # instrumented client: an LLM span per call
+            if step["type"] == "final":
+                span.set_attribute(SpanAttributes.OUTPUT_VALUE, step["text"])
+                return step["text"]
+            observations.append(run_tool(step["tool"], step["args"]))
+        span.set_attribute(SpanAttributes.OUTPUT_VALUE, "step budget reached")
+        return "Sorry, I could not finish."
+```
+
+### Worked scenario: judging a week of agent tool calls
+Illustrative numbers for a support agent, judged by a model from another family on a sample.
+
+| Quantity | Value |
+|---|---|
+| Agent runs in the week | 8,000 |
+| `TOOL` spans in sampled runs (10% of runs) | 2,600 |
+| Judge labels "wrong tool or wrong arguments" | 182, a 7% judged rate |
+| Of those, the `search_kb` tool with an empty query | 120 |
+| Human check of 100 flagged spans | 85 agree with the judge |
+
+- **The fix was a tool description,** not a model change: `search_kb` now states that `query` is required,
+  and the next week's judged rate is the metric to watch.
+- **Labels live on the `TOOL` spans,** so filtering by the label lists exactly the bad calls with their
+  parent agent runs.
+
 ### How the join works, with a day of numbers
 The part worth understanding is how a verdict lands on exactly the right span.
 
@@ -238,6 +299,9 @@ retriever and tool steps.
   agreement.
 - **Control payload size.** Use OpenInference's trace configuration to hide or truncate inputs and messages
   where content is sensitive or large, and sample high-volume routes. Monitor storage growth per project.
+- **Span kinds on every agent step.** Agent teams set `AGENT` on the run, `TOOL` on each tool call and
+  `RETRIEVER` with documents on retrieval, so evaluators can target tool selection and retrieval relevance
+  separately. Monitor the share of agent traces with typed tool spans and the judged tool-error rate per tool.
 - **Pin `arize-phoenix` and instrumentor versions** and run the evaluation job in CI against a fixture
   project, because evaluator import paths have changed across releases.
 
@@ -331,6 +395,14 @@ evaluations. Calibrate the judge against a hundred human-labelled examples befor
 - **When you need continuous server-side scoring** without running your own scheduled job.
 - **When your legal team rejects ELv2,** for example if you intend to offer Phoenix itself as a managed service.
 
+### How would you use Phoenix to find out why a RAG agent picks the wrong tool?
+- **Make tool calls first-class spans:** `TOOL` kind with `tool.name` and `tool.parameters`, under an `AGENT`
+  span, with the instrumented `LLM` span that chose the tool next to them.
+- **Judge a sample of tool spans** with rails such as correct versus wrong tool or arguments, using a judge
+  from another model family, and log the labels back onto those spans.
+- **Group the flagged spans by tool name** and read the deciding `LLM` span's messages; clusters usually point
+  at an ambiguous tool description or a missing retrieval result.
+
 ### Why do judge templates constrain output to rails, and what do you lose?
 - **Rails make verdicts countable:** snapping to `factual` or `hallucinated` turns a column into a rate, a
   filter and a trend line.
@@ -368,3 +440,23 @@ evaluations. Calibrate the judge against a hundred human-labelled examples befor
 - [ ] A `session.id` attribute and `input.value` set to the query
 > OpenInference carries the LLM-specific role in an attribute, because OTel span kinds describe RPC roles,
 > and flattens the document list into indexed keys so each document can be labelled individually.
+
+## Use cases & projects
+### Use cases
+- **Debugging RAG agents.** See which chunks the retriever returned, judge their relevance per document and
+  check whether the answer stayed inside them.
+- **Tool-selection quality.** Judge sampled `TOOL` spans for wrong tool or wrong arguments and track the rate
+  per tool after each prompt or description change.
+- **Adding LLM views to an existing OTel stack.** A Collector fans the agent's spans out to Phoenix and the
+  team's tracing store with no new SDK.
+- **Finding corpus gaps.** Embedding views of agent queries coloured by relevance labels show clusters with
+  no good documents.
+
+### Mini project
+**Judge a RAG agent's retrieval and answers (2-3 hours).**
+- **Goal:** put hallucination and relevance labels on the spans of a small RAG agent.
+- **Steps:** run `phoenix serve`; build an agent with a `search_kb` tool over 20 short documents, an `AGENT`
+  span and `RETRIEVER` spans carrying documents; instrument the model client with OpenInference; run 50
+  questions, a few with no answer in the corpus; run hallucination and relevance evaluators and log them back.
+- **Done when:** the UI filters to hallucinated answers, the questions with no answer in the corpus show low
+  relevance labels, and you have checked 10 judge labels by hand.

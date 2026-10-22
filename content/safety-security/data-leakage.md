@@ -5,7 +5,8 @@ name: Data leakage
 kind: concept
 difficulty: core
 est_minutes: 17
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - safety-security/pii-redaction
   - safety-security/cross-tenant-data-leakage
@@ -23,19 +24,33 @@ sources:
 ---
 
 ## TL;DR
-Data leakage is any path where information crosses a boundary it should not: to a provider, another
-user, model weights, a tool call or a rendered link. Minimise what enters, control what leaves, and assume
-no boundary exists inside the prompt.
+In an agent, data leaks where information crosses a boundary it should not: to a provider, another
+user, model weights, a tool call or a rendered link. Minimise what enters the prompt, control what tools
+can send, and assume no boundary exists inside the context.
+
+## For agent builders
+- **Why it matters for agents.** Your agent concatenates user input, retrieved documents, memory and tool
+  results into one context and then acts on it. Anything in that context can come back out in a
+  completion, a tool argument, a trace or a rendered image URL, and the model has no notion of
+  confidentiality.
+- **Where it shows up in your stack.** The prompt builder, tool dispatcher, the tracing SDK of your agent
+  framework, your chat client's markdown renderer, embeddings and caches, and any fine-tuning job on agent
+  transcripts.
+- **What you control.** Field classification and tokenisation before the prompt, an output and tool-call
+  guard in the loop, an egress allow-list, no remote image rendering, trace redaction before export, and
+  canary tokens.
+- **What you can skip.** Hoping "keep this secret" in the system prompt works, and building ever-wider
+  regexes. Spend effort on prevention and containment, which do not depend on recognising the data.
 
 ## Why it exists
 - **It is not ML train/test leakage.** It is information escaping: into a third-party API, another user's
   answer, model weights, or out through a tool call or rendered link.
 - **Conventional data flows are enumerable.** Request, handler, database, response, each with a schema, so a
   privacy review can draw the diagram and sign it.
-- **An LLM app dissolves that.** It concatenates many sources into one free-text prompt, sends it to a model
-  often hosted by someone else, stores prompt and completion in an observability tool by default, derives
-  embeddings stored elsewhere, and emits output that may contain any of it in any order. The model has no
-  notion that one part of its context is confidential.
+- **An LLM app or agent dissolves that.** It concatenates many sources into one free-text prompt, sends it
+  to a model often hosted by someone else, stores prompt and completion in an observability tool by
+  default, derives embeddings stored elsewhere, and emits output that may contain any of it in any order.
+  The model has no notion that one part of its context is confidential.
 - **Three naive answers each cover a sliver.**
   - *"The provider does not train on API data"*: retention windows, subprocessors and abuse-monitoring
     logs still exist, and your own trace store, readable by every engineer, is usually the larger exposure.
@@ -79,7 +94,7 @@ no boundary exists inside the prompt.
 
 ### Channel 4: observability and logs
 - **The default is dangerous:** tracing SDKs capture full prompts and completions, ship them to a SaaS
-  backend and keep them indefinitely.
+  backend and keep them indefinitely. Agent traces are worse, because every tool result is captured too.
 - **Controls:** redact at the SDK layer before export, apply field-level access, set retention measured in
   days, and give the trace store the classification of the most sensitive thing passing through it.
 
@@ -90,9 +105,9 @@ no boundary exists inside the prompt.
 - **Memorisation rises with duplication and model scale.**
 - **Prefer retrieval over fine-tuning for per-customer data,** because a document in a store can be filtered
   and deleted while an example in the weights cannot.
-- **If you must train:** deduplicate aggressively, exclude raw secrets and identifiers, and test with
-  membership-inference and extraction probes. Differentially private training exists but costs
-  significant utility.
+- **If you must train (for example on agent transcripts):** deduplicate aggressively, exclude raw secrets
+  and identifiers, and test with membership-inference and extraction probes. Differentially private
+  training exists but costs significant utility.
 
 ### Channels 6-8: embeddings, caches, people
 - **Embeddings are not anonymisation.** Inversion recovers most of the original text from a sentence
@@ -122,8 +137,8 @@ Put the weight on controls that do not need to recognise the data.
   recognisable format.
 
 ## Diagram
-Follow sensitive data from source to every place it can land; prevention acts before the prompt,
-containment at the edges, detection last.
+Follow sensitive data through one agent step to every place it can land; prevention acts before the
+prompt, containment at the edges, detection last.
 
 ```mermaid
 flowchart TD
@@ -142,7 +157,7 @@ flowchart TD
 ```
 
 ## Examples
-### An output and tool-call guard
+### An output and tool-call guard for the agent loop
 Runs on every completion and every tool call before execution. It blocks known secret formats and planted
 canaries, strips remote markdown images (the silent-GET channel), and refuses tool arguments that would
 contact a host outside the allow-list. It is deliberately high-precision: it will not catch everything,
@@ -190,6 +205,9 @@ def guard_tool_call(name: str, args: dict) -> None:
 #   guard_tool_call(call.name, call.args); then execute the call
 ```
 
+- **On a block,** return the `LeakBlocked` message to the model as the tool result and log the call with
+  the context items that preceded it, so you can find the injection source later.
+
 ### Tracing attacks through the guard
 | Attack | What the guard does | Result |
 |---|---|---|
@@ -203,7 +221,8 @@ def guard_tool_call(name: str, args: dict) -> None:
   last line rather than the only one.
 
 ### Tokenising identifiers before the prompt
-The model sees placeholders; real values come back only on the way out. Pure Python, runnable.
+The model sees placeholders; real values come back only on the way out, for example inside the tool
+dispatcher that files the dispute. Pure Python, runnable.
 
 ```python
 import re, secrets
@@ -231,14 +250,16 @@ print(rehydrate(reply, vault))                   # real value restored on the wa
 
 - **Keep the vault per request and server-side;** it is the only place the real values live, so it must
   not be logged with the trace.
+- **Re-hydrate inside tools, not in the context:** the agent passes `<ACCT_…>` placeholders as tool
+  arguments and the tool swaps in the real value, so the account number never enters the transcript.
 
 ## Production patterns
 - **Field classification at the prompt builder.** Tag each field that can enter a prompt (public, internal,
   confidential, restricted) and have the builder drop or tokenise anything above the route's allowed
   level. Monitor the share of prompt fields that are classified.
-- **Redaction in the tracing pipeline.** Mask or drop prompt and completion bodies before export (an
-  SDK-side processor or the collector's attribute-processing step), restrict raw-body access to a small
-  group, and set retention measured in days. Monitor trace redaction coverage on sampled spans.
+- **Redaction in the tracing pipeline.** Mask or drop prompt, completion and tool-result bodies before
+  export (an SDK-side processor or the collector's attribute-processing step), restrict raw-body access to
+  a small group, and set retention measured in days. Monitor trace redaction coverage on sampled spans.
 - **Markdown sanitisation in the client.** Render model output with remote images disabled or proxied
   through an allow-listed image proxy, and apply a Content-Security-Policy `img-src` that excludes
   arbitrary hosts. Monitor CSP violation reports, which flag exfiltration attempts.
@@ -269,7 +290,7 @@ print(rehydrate(reply, vault))                   # real value restored on the wa
 - **Authorization or secrets in the system prompt** ("you may only access accounts of user 1234"). Symptom:
   a jailbreak prints the prompt and a customer now knows the trick.
 - **Tracing SDK left on full capture.** Symptom: a privacy review discovers a third-party dashboard with
-  months of customer conversations.
+  months of customer conversations and tool results.
 - **Rendering remote images from model output.** Symptom: outbound requests to unfamiliar hosts with
   suspiciously long query strings in the client's network log.
 - **Treating embeddings as safe to share** with a lower-trust vendor or region. Symptom: a data-residency
@@ -330,6 +351,14 @@ format adaptation.
   and strip images in the output guard.
 - **Then** find the injection source in traces and check what data was in that context.
 
+### Where in an agent loop do you put leak controls, and why there?
+- **Before the prompt:** classify and tokenise fields in the prompt builder, so the model and every
+  downstream copy only see placeholders.
+- **Between proposal and execution:** run the tool-call guard and egress allow-list on structured arguments
+  before the dispatcher executes anything.
+- **Before display and export:** sanitise completions in the client and redact traces in the SDK, because
+  those are separate channels the loop itself never sees.
+
 ### Why rank prevention and containment above detection?
 - **Detection must recognise the data,** and a model told to base64-encode, split or translate a secret
   defeats pattern matching.
@@ -378,3 +407,24 @@ format adaptation.
 > Extraction of the system prompt is routinely achievable, so the only robust posture is that its
 > disclosure costs nothing; permissions and secrets belong in code and tokens, not in instructions the
 > model may repeat.
+
+## Use cases & projects
+### Use cases
+- **Agents that read email, tickets or the web.** The output guard, egress allow-list and no-remote-images
+  rule close the exfiltration channels an injected message would use.
+- **Finance and support agents handling identifiers.** Tokenising account numbers keeps them out of the
+  provider, the transcript and the traces while tools still act on real values.
+- **Choosing an agent observability vendor.** The channel map decides what trace bodies may be exported,
+  who can read them and for how long.
+- **Fine-tuning on agent transcripts.** Deduplication, identifier removal and extraction probes decide
+  whether the data may enter the weights at all.
+
+### Mini project
+**Exfiltration-proof a small browsing agent (2-3 hours).**
+- **Goal:** show that a guarded agent loop stops the image, tool and encoded-secret channels.
+- **Steps:** build an agent with `fetch_url` and `post_note` tools and a fake secret in context; serve a
+  local page carrying three injections (a markdown image with data in the query string, a POST to an
+  outside host, a base64-encoded key to an allow-listed host); run it without guards, then add
+  `guard_completion`, `guard_tool_call` and an allow-list containing only a local host you control.
+- **Done when:** a table shows which injections leaked before and after, the image and outside-host
+  attacks are blocked, and you can explain why the encoded key was contained rather than detected.

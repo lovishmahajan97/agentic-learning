@@ -5,7 +5,8 @@ name: Rate limiting
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - serving-inference/backpressure
   - serving-inference/retry-strategies
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Rate limiting bounds a caller's work per unit of time: inbound to protect shared GPUs and quota, outbound
-to stay under provider request and token limits. Cost is unknown until a request
-finishes, so limiters reserve an estimate and settle on the actual.
+An agent run spends many model calls of unknown size, so rate limiting must be token-weighted: per-run
+step and token budgets inbound, a shared provider-quota bucket outbound, reserving an estimate and
+settling on actual usage.
+
+## For agent builders
+- **Why it matters for agents.** One stuck agent in a tool cycle can burn a whole organisation's tokens
+  per minute in seconds, and every other agent then sees provider 429s. A request counter misses this,
+  because each agent step re-sends a growing transcript of thousands of tokens.
+- **Where it shows up in your stack.** Provider 429s and remaining-quota headers in your SDK client, the
+  limiter in your agent gateway or FastAPI server, Redis buckets shared by replicas, and the step limit
+  your agent framework exposes (for example LangGraph's recursion limit).
+- **What you control.** Per-run budgets (steps, tokens, dollars), per-tenant buckets, one global bucket
+  per provider model at about 80% of quota, the `max_tokens` you reserve per step, and whether the loop
+  waits on `Retry-After` or stops the run.
+- **What you can skip.** Proving the GCRA equivalence or comparing sliding-window variants in depth. Use
+  a token bucket, make it atomic, and weight it in LLM tokens.
 
 ## Why it exists
 - **The resource is shared, finite and expensive.** A provider gives your organisation a quota, typically
@@ -123,9 +137,25 @@ Several replicas share one provider quota, so state must be shared or the quota 
   tenant's reservation, or the tenant is charged for work that never ran.
 - **More quota:** multiple keys, workspaces or regions multiply quota when a single bucket is not enough.
 
+### Budgets for agent runs
+A per-request bucket cannot see that twenty requests belong to one runaway run, so agent platforms add a
+third layer keyed on the run id:
+
+| Budget | Why | What happens at the limit |
+|---|---|---|
+| **Steps per run** | stops tool cycles and planner loops | end the run with a clear "step limit reached" result |
+| **Tokens per run** | each step re-sends the growing transcript, so cost per step climbs | summarise and stop, or ask the user to continue |
+| **Dollars per run or per tenant per day** | ties the limit to the bill, across models with different prices | refuse new runs, keep running ones to a safe stop |
+| **Parallel tool calls or sub-agents per run** | fan-out multiplies calls inside one step | queue the extra branches inside the run |
+
+- **Reserve per step, settle per step.** Each model call in the loop reserves prompt tokens plus
+  `max_tokens` from the tenant and global buckets and settles on the usage the provider returns.
+- **A rejection mid-run is expensive,** because earlier steps are already paid for. Check the run budget
+  and tenant headroom at admission, before step 1, so a run that cannot finish is refused up front.
+
 ## Diagram
-Each request passes the tenant bucket, then the shared global bucket, before any provider call; the
-settle step afterwards corrects the reservation using the real output length.
+Every agent step's model call passes the tenant bucket, then the shared global bucket, before any
+provider call; the settle step afterwards corrects the reservation using the real output length.
 
 ```mermaid
 flowchart TD
@@ -223,7 +253,61 @@ def settle(key, reserved, actual):
 wait = try_reserve("rl:model:tpm", 53_333, 5_333, 24_000)
 ```
 
+### Agent loop with a run budget on top of the bucket
+Each step reserves from the shared bucket, and the run carries its own step and token budget so a tool
+cycle ends cleanly instead of draining the tenant. `llm.step` stands in for one model call of your loop.
+
+```python
+class RunBudget:
+    def __init__(self, max_steps=20, max_tokens=200_000):
+        self.max_steps, self.max_tokens = max_steps, max_tokens
+        self.steps = self.tokens = 0
+    def charge(self, used: int):
+        self.steps += 1; self.tokens += used
+    def exhausted(self) -> bool:
+        return self.steps >= self.max_steps or self.tokens >= self.max_tokens
+
+def run_agent(messages, budget: RunBudget, max_tokens=1_000):
+    while not budget.exhausted():
+        prompt_tokens = count_tokens(messages)              # same tokenizer as the model
+        reserved = prompt_tokens + max_tokens
+        wait = tpm_bucket.try_reserve(reserved)
+        if wait > 0:
+            return {"status": "busy", "retry_after": round(wait, 1)}   # surface it, do not spin
+        resp = llm.step(messages, max_tokens=max_tokens)
+        used = prompt_tokens + resp.usage.output_tokens
+        tpm_bucket.settle(reserved, used)
+        budget.charge(used)
+        if resp.final:
+            return {"status": "done", "answer": resp.text}
+        messages += resp.tool_messages()                    # transcript grows every step
+    return {"status": "budget_exhausted", "steps": budget.steps, "tokens": budget.tokens}
+```
+
+### Worked scenario: one runaway agent against a shared quota
+An illustrative 400k tokens/minute key, limiter at 80% (320,000 tokens/minute). An agent stuck calling the
+same failing tool starts with a 6k-token prefix and adds ~1.5k tokens per step.
+
+| Step | Prompt tokens | Cumulative tokens | Share of one minute's 320,000 |
+|---|---|---|---|
+| 1 | 6,000 | 6,000 | 2% |
+| 10 | 19,500 | ~128,000 | 40% |
+| 20 | 34,500 | ~405,000 | over the limit |
+
+- **Without a run budget,** this one agent pushes every other tenant into 429s within its first minute if
+  its steps are fast.
+- **With a 20-step and 200,000-token budget,** it stops after step 14 at about 220,000 tokens (the budget
+  is checked before each step, so the last step overshoots), and the tenant bucket confines the damage to
+  that tenant.
+- **Tokens, not steps, bind first** here, because each step re-sends the growing transcript.
+
 ## Production patterns
+- **Run budgets as the first check.** Give every agent run a step, token and dollar budget keyed on the run
+  id, checked before each model call and before admission. Monitor runs ending on budget per agent
+  version; a jump after a prompt change usually means a new tool loop.
+- **Surface 429s to the planner, not just the SDK.** When the bucket says wait, either pause the run and
+  resume after `Retry-After`, or return a "busy" state the UI can show, instead of letting the loop retry
+  instantly. Monitor time agents spend waiting on quota.
 - **Two-layer limiter at the gateway.** Per-tenant request and token buckets inbound, one global token
   bucket per provider model outbound, both checked before retrieval or prompt assembly. Monitor
   rejection rate per tenant and upstream 429 rate, which should be near zero.
@@ -251,6 +335,8 @@ wait = try_reserve("rl:model:tpm", 53_333, 5_333, 24_000)
   even.
 - **Isolation vs utilisation.** Strict per-tenant limits guarantee fairness but block legitimate spikes;
   borrowing unused global headroom improves utilisation at the cost of weaker isolation.
+- **Tight vs loose run budgets.** A low step limit kills runaway agents early but also cuts off legitimate
+  long research tasks; set budgets per agent type from the step-count distribution of successful runs.
 
 ## Pitfalls
 - **Limiting requests only.** Symptom: provider 429s while your requests-per-minute dashboard is green,
@@ -269,6 +355,8 @@ wait = try_reserve("rl:model:tpm", 53_333, 5_333, 24_000)
   appears the day a new model is added.
 - **Treating 429 and 503 as interchangeable.** Symptom: clients back off per-caller when the problem is
   global, or hammer a saturated server believing they are under quota.
+- **Rate limiting calls but not runs.** Symptom: one agent in a tool cycle consumes most of a tenant's
+  tokens while each individual call looks normal. Fix: a per-run step and token budget.
 
 ## When to use
 - **Inbound:** in front of every LLM endpoint that serves more than one tenant or more than one
@@ -276,6 +364,8 @@ wait = try_reserve("rl:model:tpm", 53_333, 5_333, 24_000)
 - **Outbound:** in front of every provider key that more than one process uses.
 - **Start with** per-tenant request and token buckets plus one global token bucket per provider model;
   add priority borrowing and per-agent step budgets when agents appear.
+- **For agents, always:** a per-run step and token budget, because a loop multiplies calls in a way
+  per-request limits cannot see.
 - **Measure** rejection rate per tenant, quota utilisation against the provider's limit,
   reservation-to-actual ratio and upstream 429 rate; the last should be near zero if the outbound
   limiter works.
@@ -332,10 +422,21 @@ dominate the shared bucket.
 - **Settlement refunds 3,400** once the 600-token output is known.
 - **A 100,000-token request never fits,** so it must get a non-retryable error rather than `Retry-After`.
 
-### Why return 503 rather than 429 when the global bucket is empty?
-- **429 blames the caller,** who would wrongly reduce their own rate while the real problem is global.
-- **503 says the server is out of capacity,** so clients back off appropriately and engineers look at
-  global quota rather than the tenant's plan.
+### One agent in a tool loop is pushing your whole organisation into provider 429s. What do you change?
+- **Contain it now:** the run id identifies the culprit; stop that run and confirm the tenant bucket is
+  token-weighted, not request-counted.
+- **Prevent it:** a per-run step and token budget checked before each model call, plus per-tenant buckets
+  under a global bucket at about 80% of the provider limit.
+- **Detect it next time:** alert on steps per run and tokens per run outliers, and on repeated identical
+  tool calls inside a run.
+
+### How should an agent loop react when the limiter says wait?
+- **Not by spinning:** an instant retry inside the loop adds load and burns the user's patience.
+- **Short waits:** sleep for `Retry-After` and continue the run, within the run's deadline.
+- **Long waits or a global 503:** checkpoint the run and return a "busy, resuming later" state, so earlier
+  steps are not wasted and the user knows what is happening.
+- **Read 429 vs 503 correctly:** 429 means this tenant or run is over its allowance, so slow this caller;
+  503 means global capacity is short, so every caller backs off.
 
 ## Quiz
 ### Q: Why is a requests-per-minute limit insufficient for LLM traffic?
@@ -361,3 +462,24 @@ dominate the shared bucket.
 - [ ] To allow retries to reuse the original reservation
 > Input tokens can be counted up front but output tokens cannot; `max_tokens` only bounds them. Reserving
 > an estimate prevents overshoot while settling refunds unused quota so throughput is not stranded.
+
+## Use cases & projects
+### Use cases
+- **Multi-tenant agent platforms.** Per-tenant token buckets under one global bucket stop a single
+  customer's agents from exhausting the shared provider key.
+- **Runaway-agent containment.** Per-run step and token budgets end tool cycles and planner loops before
+  they cost real money.
+- **Batch agent jobs beside interactive agents.** Priority borrowing or a separate provider key keeps a
+  nightly eval or enrichment sweep from starving live user sessions.
+- **Self-hosted agent serving.** A token-per-second bucket in front of a vLLM fleet keeps admission inside
+  what the GPUs can actually generate.
+
+### Mini project
+**A token-weighted limiter for a multi-tenant agent API (2-3 hours).**
+- **Goal:** protect a shared (fake or real) provider quota from one runaway agent while other tenants keep
+  working.
+- **Steps:** put a Redis token bucket per tenant and one global bucket in front of a small tool-calling
+  loop; reserve prompt plus `max_tokens` per step and settle on reported usage; add a per-run step and
+  token budget; simulate three tenants, one of which runs an agent stuck in a tool loop.
+- **Done when:** a table per tenant shows the runaway run ended on its budget, the other two tenants saw no
+  429s, and upstream 429s stayed at zero.

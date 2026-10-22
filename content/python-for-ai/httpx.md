@@ -411,3 +411,25 @@ byte and total duration per request.
 - [ ] Retries are disabled when HTTP/2 is enabled
 > The transport retries failed connects, not error responses. Retrying on 429 or 5xx with backoff
 > and respect for Retry-After belongs in application code or the provider SDK.
+
+## Use cases & projects
+### Use cases
+- **Parallel tool calls.** An agent step fans out three tool calls through one shared `AsyncClient`,
+  with `httpx.Limits` capping concurrency and a deadline per call so one slow API cannot stall the step.
+- **Tuning provider SDK clients.** Passing a configured client as `AsyncOpenAI(http_client=...)` sets
+  pooling and per-phase timeouts for every model call the agent makes.
+- **Streaming from self-hosted models.** Agents read server-sent events from vLLM or similar servers
+  incrementally, showing tokens as they arrive and cancelling cleanly.
+- **Deterministic agent tests.** `MockTransport` returns canned tool and model responses, so agent loops
+  run in CI with no network and no spend.
+
+### Mini project
+**A resilient HTTP layer for an agent's tools (1-2 hours).**
+- **Goal:** make an agent's tool calls fast in parallel and safe when an upstream hangs or rate-limits.
+- **Steps:** create one shared `AsyncClient` with an `httpx.Timeout` per phase and `httpx.Limits` sized
+  for your concurrency; wrap each tool call in a total deadline; add application-level retries with
+  backoff for 429 and 5xx that respect Retry-After; test with `MockTransport` returning a slow response,
+  a 429 and a success.
+- **Done when:** three parallel tool calls finish in roughly the time of the slowest one, the hanging
+  call fails at its deadline instead of waiting on the read timeout, and the 429 case succeeds after a
+  backoff, all shown by passing tests.

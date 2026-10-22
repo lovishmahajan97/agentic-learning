@@ -409,3 +409,28 @@ run against the last released schema, not the previous commit.
 - [ ] FastAPI dependencies are disabled during contract tests
 > Fuzzers send many requests per operation; real model calls would be expensive and flaky. A schema-valid fake
 > isolates what the contract test is about: routing, validation and response serialization.
+
+## Use cases & projects
+### Use cases
+- **Tool APIs consumed by agents.** A snapshot diff in CI stops a renamed argument or narrowed enum from
+  silently breaking agent runs that call the tool with the old shape.
+- **Agent run APIs with many clients.** Web apps, SDKs and other agents read run payloads, so a field
+  that becomes required or disappears is caught before release.
+- **Streaming and tool-call payloads that evolve.** New content parts or `finish_reason` values are
+  classified as additive or breaking by the machine instead of a reviewer.
+- **Replay of recorded tool calls.** Arguments captured from agent traces are validated against the new
+  schema, so real model behaviour, not only invented payloads, gates the release.
+
+### Mini project
+**Add a breaking-change gate to an agent tool service (2-3 hours).**
+- **Goal:** make CI fail when a change to the tool API would break agents that call it.
+- **Steps:** snapshot `app.openapi()` into a committed baseline file; add a CI step that regenerates the
+  schema and diffs it with a breaking-change tool; run Schemathesis against the app with the LLM client
+  replaced by a schema-valid fake; replay ten recorded tool-call arguments from agent traces against the
+  new request schemas.
+- **Done when:** adding an optional field passes, renaming a required argument fails the diff, and a
+  handler that returns an undeclared field is caught by the fuzz run.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide), which requires an OpenAPI snapshot diff
+plus a Schemathesis run in CI, and a deliberately removed field that fails the contract check.

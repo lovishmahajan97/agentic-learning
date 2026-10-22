@@ -408,3 +408,23 @@ checked. If intervals overlap, buy more comparisons or move to an online A/B tes
 - [ ] Nothing can be inferred without a direct comparison
 > logit(0.73) ≈ 0.99, so β_A − β_C ≈ 1.99 and sigmoid(1.99) ≈ 0.88. A large gap between that prediction
 > and the observed A-vs-C rate is the standard check for intransitive preferences.
+
+## Use cases & projects
+### Use cases
+- **Shipping a new agent prompt or model.** The candidate is judged against the production agent on the
+  same tasks, and a win rate with a bootstrap interval decides the launch.
+- **Choosing among several agent variants.** Bradley–Terry strengths rank many prompt, model and tool-set
+  combinations from a sparse set of comparisons.
+- **SME review sessions.** Domain experts pick the better of two trajectories faster and more
+  consistently than they assign absolute scores.
+- **Preference data for tuning.** The (prompt, chosen, rejected) pairs collected during evals feed DPO or
+  a reward model trained on agent traces.
+
+### Mini project
+**Pairwise eval of two planner prompts (1-3 hours).**
+- **Goal:** decide whether a new planner prompt beats the current one on a small tool-calling agent.
+- **Steps:** run both agent versions on the same 50-100 tasks; apply outcome checks first and count a
+  run that fails them as a loss; judge the remaining pairs in both orders with ties allowed; compute the
+  win rate and a bootstrap interval; record how often the two orders disagreed.
+- **Done when:** you have a win rate with its interval, the order-disagreement rate, a ship or no-ship
+  call, and three example pairs explaining the verdict.

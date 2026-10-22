@@ -5,7 +5,8 @@ name: State machines
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/agent-loop
   - agents/workflows-vs-agents
@@ -24,6 +25,17 @@ sources:
 A state machine gives an agent named phases, per-phase tools, code-checked guards and terminal states.
 The model still chooses, but only among permitted transitions, so invariants like "never deploy before
 tests pass" hold, and (state, data) can be checkpointed and resumed.
+
+## For agent builders
+- **Why it matters for agents.** Any agent with phases, consequential tools or long runs needs rules the
+  model cannot talk past and a position it can resume from. A state machine turns "please run tests
+  first" into a guard and turns a crash into a resume instead of a restart.
+- **Where it shows up in your stack.** LangGraph graphs with checkpointers and `interrupt()`, Temporal
+  workflows, AWS Step Functions, or a fifty-line enum, table and tool map in your own harness.
+- **What you control.** The states, the tools exposed in each, the guards and which facts invalidate
+  them, the retry and rejection budgets, and when to checkpoint.
+- **What you can skip.** Formal automata theory and statechart notation. You need a transition table,
+  guards in code, terminal states and reachability tests.
 
 ## Why it exists
 - **A bare loop has one state, "running".** All control lives in the model's head. In "investigate,
@@ -395,3 +407,24 @@ NEEDS_HUMAN state for approvals.
 - [ ] Guards are unnecessary when there are many states
 > States earn their place by restricting tools or marking resume points. Thirty prompt-shaped states
 > with nothing enforced is a code-defined workflow in disguise and should be written as plain code.
+
+## Use cases & projects
+### Use cases
+- **Coding agents.** INVESTIGATE, APPLY, VERIFY and DONE with a `tests_passed` guard stop an agent from
+  finishing on code that was edited after the last green run.
+- **Deployment and infrastructure agents.** The deploy tool exists only in DEPLOY, behind an approval
+  guard, so prompt injection cannot reach it from an earlier phase.
+- **Support agents with refunds.** Triage, verify the customer, propose, approve and execute map onto
+  states, with NEEDS_HUMAN for amounts over a limit.
+- **Long-running back-office agents.** Per-transition checkpoints let a run that spans hours resume
+  after a deploy or a crash without repeating side effects.
+
+### Mini project
+**Guarded bug-fix machine with crash resume (2-3 hours).**
+- **Goal:** build a small agent whose phases, tools and guards live in a table, and prove it resumes
+  safely.
+- **Steps:** implement the six-state machine from the example with fake `edit_file` and `run_tests`
+  tools; store checkpoints in SQLite; add the reachability and guard-coverage tests; kill the process
+  mid-APPLY and restart it with the same `run_id`.
+- **Done when:** the CI-style tests pass, a scripted "test, pass, edit, finish" attempt is rejected, and
+  the resumed run reaches DONE with the fake edit applied exactly once.

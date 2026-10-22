@@ -5,7 +5,8 @@ name: PII redaction
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - security-governance-compliance/pii-protection-dlp
   - safety-security/data-leakage
@@ -20,9 +21,22 @@ sources:
 ---
 
 ## TL;DR
-PII redaction replaces personal identifiers before text reaches a vendor model, log, trace, index or the
-wrong screen. LLM systems copy text everywhere, so it matters more; typed placeholders with a short-lived
-mapping keep the model useful.
+Agents pull personal data in through tool results and copy it into prompts, traces, memory and indexes.
+PII redaction replaces identifiers at each boundary; typed placeholders with a short-lived vault keep the
+agent able to reason and act.
+
+## For agent builders
+- **Why it matters for agents.** A single agent run can fetch a CRM record, read an email thread and
+  write a memory note, so PII arrives mid-loop through tool results, not just the user turn, and every
+  step's prompt is captured by your tracing.
+- **Where it shows up in your stack.** A redaction step on tool results before they enter the context,
+  a processor in the tracing exporter, the memory and vector-index write path, and the tool executor that
+  re-hydrates placeholders in arguments.
+- **What you control.** The entity list per boundary, reversible placeholders versus irreversible
+  redaction, the vault TTL, who may see re-hydrated output, and whether long-term memory stores raw values
+  at all.
+- **What you can skip.** Training your own NER model; start with patterns plus checksums and Presidio
+  recognizers, and measure recall on your own traffic before adding an LLM detector.
 
 ## Why it exists
 - **LLM features multiply where user text lives.** The prompt goes to a vendor. Tracing tools store full
@@ -96,6 +110,15 @@ Five boundaries, each with its own policy:
   from any `<` until the placeholder closes.
 - **The model rewrites placeholders.** It may emit `EMAIL_1` or `<Email 1>`, or invent one not in the
   vault; match leniently, and leave anything unknown unresolved rather than guessing.
+
+### In an agent loop
+- **Redact tool results as they arrive.** A CRM lookup or email fetch is the main PII source in an agent,
+  so the redactor runs between the tool and the context, not only on the user turn.
+- **Re-hydrate tool arguments inside the executor.** The model writes `send_email(to="<EMAIL_1>")`; the
+  executor swaps in the real value just before the side effect, *because* the action needs the original
+  but the model, the trace and the transcript do not.
+- **Keep memory pseudonymised.** Long-term memory outlives the vault, so store facts with irreversible
+  redaction or keyed pseudonyms, never the session's numbered placeholders, which mean nothing next run.
 
 ### Redaction is not anonymisation
 - **Quasi-identifiers remain.** A handful together (birth date, postcode, sex, employer, a rare
@@ -228,6 +251,40 @@ print("".join(rehydrate_stream(["Sent to <EMA", "IL_1> and <Email 1>, not <PHONE
 # Sent to dana.k@example.com and dana.k@example.com, not <PHONE_9>.   (unknown stays unresolved)
 ```
 
+### Agent scenario: re-hydrating placeholders only at the side effect
+The model and the trace see placeholders; the executor resolves them for the one tool that needs the
+real value, and refuses placeholders it cannot resolve.
+
+```python
+import re
+
+PLACEHOLDER = re.compile(r"<([A-Z]+)_(\d+)>")
+NEEDS_REAL_VALUES = {"send_email"}               # tools whose side effect needs the original value
+
+def resolve_args(tool: str, args: dict, vault: dict) -> dict:
+    """Swap placeholders for originals just before the side effect; never log the result."""
+    if tool not in NEEDS_REAL_VALUES:
+        return args                              # read-only tools keep working on placeholders
+    def sub(v):
+        if not isinstance(v, str):
+            return v
+        def one(m):
+            if m[0] not in vault:
+                raise ValueError(f"unknown placeholder {m[0]}: refuse rather than guess")
+            return vault[m[0]]
+        return PLACEHOLDER.sub(one, v)
+    return {k: sub(v) for k, v in args.items()}
+
+vault = {"<EMAIL_1>": "dana.k@example.com"}       # per-session, TTL in minutes
+call = {"to": "<EMAIL_1>", "body": "Your refund for <CARD_1> is on its way."}
+print(call)                                       # what the transcript and the trace store
+try:
+    resolve_args("send_email", call, vault)
+except ValueError as e:
+    print(e)                                      # <CARD_1> is not in this vault: the call is refused
+print(resolve_args("send_email", {"to": "<EMAIL_1>", "body": "Refund sent."}, vault)["to"])
+```
+
 ### Worked scenario: what 99% recall means in practice
 Illustrative numbers for a support product, one day of traffic.
 
@@ -253,6 +310,9 @@ limit, and a nightly stricter-detector audit to estimate the real leak rate.
   caller.
 - **Split index text from identifiers.** Redact chunk text before embedding and keep customer ids in
   access-controlled metadata filters, so search by customer still works for authorised users.
+- **Redact at the tool boundary, re-hydrate at the executor.** Agent teams wrap each data-returning tool
+  with the redactor and resolve placeholders only inside the executor for tools that need real values.
+  Monitor unresolved-placeholder refusals per tool and raw identifiers found in agent traces by the audit.
 - **Eval and fine-tuning data only from the redacted path.** Build datasets from the redacted trace store,
   never from raw request logs, so the training corpus inherits redaction automatically.
 
@@ -283,6 +343,9 @@ limit, and a nightly stricter-detector audit to estimate the real leak rate.
   the previous paragraph" from context, and the name appears in the answer anyway.
 - **Redacting only the user turn.** Symptom: PII from a CRM lookup or an uploaded document landing in
   logs through tool results.
+- **Writing session placeholders into long-term memory.** Symptom: next week the agent recalls "<PERSON_1>
+  prefers email" and cannot tell who that was, or a new vault reuses the number for someone else. Fix:
+  store memory with keyed pseudonyms or irreversible redaction.
 - **Re-hydrating for whoever receives the output.** Symptom: one tenant's phone number in another
   tenant's shared dashboard. Fix: check authorisation first.
 - **Assuming placeholders come back verbatim.** Symptom: users see raw `EMAIL_1` or `<Email 1>` strings
@@ -297,6 +360,8 @@ limit, and a nightly stricter-detector audit to estimate the real leak rate.
   an output scan; everything else follows from data classification and vendor agreements.
 - **Decide** the entity list with the privacy owner and set the transformation per boundary, not globally.
 - **Measure:** recall per entity on a labelled sample of real traffic.
+- **In agents:** redact every data-returning tool's result, keep placeholders in the transcript, and
+  re-hydrate only in the executor for the tool that needs the real value.
 - **Interviews:** name the boundaries, explain reversible pseudonymisation with typed placeholders, and
   know why a keyed HMAC is required instead of a plain hash.
 
@@ -341,12 +406,19 @@ and extend patterns for the customer's locales.
 - **Only if the vendor agreement covers personal data;** you still redact irreversibly for logs, traces and
   indexes, because those are your own long-lived stores.
 
+### Your agent must email a customer whose address it only sees as a placeholder. How does that work?
+- **The model writes the placeholder** into the tool call, for example `to="<EMAIL_1>"`, and the
+  transcript and trace keep it that way.
+- **The executor re-hydrates from the session vault** just before the side effect, after checking the
+  run is authorised for that customer, and refuses any placeholder not in the vault.
+- **Nothing raw is logged:** the resolved arguments never go back into the context or the trace.
+
 ### Your redactor has 99% recall. Is that good enough?
 - **It depends on volume:** at 10,000 identifiers a day about 100 still land in logs every day.
 - **So redaction reduces exposure, it does not remove it:** keep access control and retention limits on
   redacted stores, and audit with a slower detector to estimate the true leak rate.
 
-### How would you redact PII from a RAG index without breaking search by customer?
+### How would you redact PII from the index your RAG agent searches without breaking search by customer?
 - **Redact the chunk text before embedding,** because the index stores text next to vectors and
   embeddings can be partially inverted.
 - **Keep identifiers in access-controlled metadata** and filter on them, so authorised users can still
@@ -376,3 +448,25 @@ and extend patterns for the customer's locales.
 - [ ] The language of the surrounding text
 > Replacing every identifier with the same token destroys the information that two mentions refer to the
 > same person and that it was a person rather than an address; typed numbering keeps both while hiding the value.
+
+## Use cases & projects
+### Use cases
+- **Support agents with CRM tools.** Customer records are redacted as tool results, and the reply or
+  refund tool re-hydrates only what it needs.
+- **Email and calendar assistants.** Threads full of names, addresses and phone numbers flow through the
+  agent while traces keep only placeholders.
+- **Agent memory.** Facts about users are stored with keyed pseudonyms so memory stays useful without
+  becoming a second customer database.
+- **Building eval sets from agent traces.** Datasets come from the redacted trace store, so every eval
+  and fine-tuning run inherits the protection.
+
+### Mini project
+**A PII-safe tool loop (2-3 hours).**
+- **Goal:** run a small agent whose context and traces never hold raw identifiers, yet it can still send
+  a real (fake-backend) email.
+- **Steps:** add a `lookup_customer` tool that returns fixture records with emails, phones and card
+  numbers; redact its results with typed placeholders and a per-session vault; log every prompt and tool
+  call to a local trace file; add a `send_email` tool whose executor re-hydrates arguments; run 15 tasks
+  and grep the trace file for raw identifiers.
+- **Done when:** the trace grep finds zero raw emails, phones or Luhn-valid cards, every `send_email`
+  reached the right fixture address, and unknown placeholders are refused.

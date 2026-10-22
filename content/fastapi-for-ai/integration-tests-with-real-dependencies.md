@@ -412,3 +412,24 @@ rollback for the many tests that stay on one connection, because it is much fast
 > Rollback works because everything happens in one uncommitted transaction on one connection. Commits on
 > the bound session can be absorbed with savepoints, but other connections escape that boundary and never
 > see the uncommitted rows, so truncation or per-test databases are needed instead.
+
+## Use cases & projects
+### Use cases
+- **RAG retrieval tools.** Tests against real pgvector catch a wrong distance operator, a missing tenant
+  filter or a vector dimension mismatch after an embedding-model change.
+- **Conversation memory.** Real Postgres proves the memory writes, JSONB queries and upserts the agent
+  relies on behave as they will in production.
+- **Caches, locks and rate limits.** A real Redis container proves keys expire and `SET NX` locks are
+  atomic, which a dict-based fake cannot.
+- **Migration safety.** Running Alembic migrations in the test container catches an ORM model that
+  disagrees with the schema before an agent tool hits it in production.
+
+### Mini project
+**Integration-test an agent's retrieval tool (2-3 hours).**
+- **Goal:** prove a RAG search tool returns the right, tenant-scoped chunks on real Postgres with pgvector.
+- **Steps:** start a session-scoped pgvector Postgres container (Testcontainers or a CI service container)
+  with an image tag matching production; run Alembic migrations; seed two tenants' chunks with small
+  fixed vectors; isolate each test with rollback; call the tool through the API with the model call
+  replaced by a recorded response.
+- **Done when:** tests pass for nearest-neighbour order, tenant isolation and a rejected wrong-dimension
+  insert, and the suite runs on every pull request.

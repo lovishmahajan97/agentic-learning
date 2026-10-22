@@ -5,7 +5,8 @@ name: Prompt injection defense
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - safety-security/prompt-injection
   - security-governance-compliance/threat-modeling
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-No prompt, classifier or fine-tune reliably stops a model obeying hidden instructions, so defence is an
-architecture: deterministic enforcement outside the model on what it can reach and cause, detection as
-an alarm, and a per-workflow policy, regression suite and risk owner.
+No prompt, classifier or fine-tune reliably stops an agent obeying hidden instructions, so defence lives
+in your tool dispatcher: deterministic rules on what the agent can reach and cause, detection as an
+alarm, and a per-workflow regression suite and risk owner.
+
+## For agent builders
+- **Why it matters for agents.** Every agent that reads web pages, emails, tickets or tool results is
+  exposed. The harm lands in tools: a forwarded inbox, an unearned refund, a pushed credential. The model
+  cannot be made trustworthy; its tools can be made to refuse.
+- **Where it shows up in your stack.** Capability flags when you register tools, session taint in the
+  orchestrator, the dispatch gate or AI gateway, markdown rendering in the UI, and an injection suite in
+  CI that runs on every prompt, model or tool change.
+- **What you control.** Which leg of the rule of two each workflow drops, the argument allowlists,
+  whether the planner ever sees untrusted text (plan then execute, dual LLM), and when a human approves.
+- **What you can skip.** Chasing the cleverest jailbreak phrasing. Wording-based defences move with every
+  model upgrade; spend the time on the gate and the suite, which do not.
 
 ## Why it exists
 - **This lesson is the defence as a program.** The attack itself (untrusted text interpreted as
@@ -341,3 +354,24 @@ alarm, and gate the release on attack success and utility under attack together.
 - [ ] Utility measures how often the classifier fires, which is the main cost
 > Security and usefulness trade against each other; reporting only attack success rewards over-blocking.
 > The pair shows whether a defence actually preserves the user's legitimate tasks under attack.
+
+## Use cases & projects
+### Use cases
+- **Email and ticket triage agents.** Replies become templated fields from the verified sender's own
+  account, or route to approval, so an injected message cannot leak another customer's data.
+- **Research agents with web and internal data.** The browsing session runs without CRM or HR access, and
+  a separate session posts the summary.
+- **Coding agents with repository and network access.** Taint after reading issues or dependencies blocks
+  pushes and outbound requests to hosts that are not allowlisted.
+- **Shared agent platforms.** One dispatch gate with capability flags gives every new feature the same
+  policy without per-feature prompt work.
+
+### Mini project
+**Build a rule-of-two gate and an injection release gate (2-3 hours).**
+- **Goal:** prove that a gate in code stops an injected exfiltration while the user's real task still
+  completes.
+- **Steps:** register `search_web`, `read_crm` and `send_email` with capability flags; wire the
+  `dispatch` gate from this lesson into a small tool-calling loop; write 20 injected cases (pages that ask
+  the agent to mail data out) plus the matching benign tasks; score them with `release_gate`.
+- **Done when:** attack success is 0% with the gate on, utility under attack is reported beside it, and
+  removing the gate makes at least one case breach.

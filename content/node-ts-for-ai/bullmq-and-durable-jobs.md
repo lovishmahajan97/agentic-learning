@@ -5,7 +5,8 @@ name: BullMQ & durable jobs
 kind: tool
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - node-ts-for-ai/redis
   - node-ts-for-ai/graceful-shutdown
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-BullMQ is a Redis-backed Node job queue with concurrency, retries, backoff, rate limits, delays and
-flows; job state survives restarts because it lives in Redis. Delivery is at-least-once, so handlers
-must be idempotent, and durability equals Redis's.
+BullMQ is the Redis-backed Node queue that runs agent work off the request path, with concurrency,
+retries, backoff, provider rate limits, delays and flows. Delivery is at-least-once, so agent steps must
+be idempotent, and durability equals Redis's.
+
+## For agent builders
+- **Why it matters for agents.** Agent runs last minutes, call the model many times and must survive
+  deploys and provider 429s. A queue turns "run this agent" into a durable job with retries, a fleet-wide
+  rate limit and visible state, instead of a fragile two-minute HTTP request.
+- **Where it shows up in your stack.** The API enqueues a run and returns a run id; workers process one
+  job per agent step; `QueueEvents` streams progress to the UI; flows fan out sub-agents or chunk
+  embeddings; job schedulers run nightly evals.
+- **What you control.** Job granularity (one per run vs one per step), deterministic job ids, `attempts`
+  and backoff, `concurrency` and `limiter`, retention, and graceful `worker.close()` on deploy.
+- **What you can skip.** The Lua scripts behind each state transition and BullMQ Pro features. Know the
+  lifecycle, the stall mechanism and at-least-once delivery; that is what breaks agent runs.
 
 ## Why it exists
 - **A request is the wrong unit for long work.** An agent run takes two minutes, calls the model eight
@@ -201,6 +214,39 @@ const events = new QueueEvents("embed", { connection: conn() });
 events.on("progress", ({ jobId, data }) => notifyClient(jobId, data));
 ```
 
+### Agent scenario: one job per agent step
+Each job runs exactly one model turn plus its tool calls, checkpoints the step in Postgres, and enqueues
+the next step with a deterministic id. A crash or retry repeats one step, never the whole run.
+
+```ts
+import { Queue, Worker } from "bullmq";
+// conn() is the ioredis factory from the previous example; loadRun, saveStep, callModel, runTools are app code
+
+const steps = new Queue("agent-steps", { connection: conn(),
+  defaultJobOptions: { attempts: 4, backoff: { type: "exponential", delay: 2_000 }, removeOnComplete: { count: 5_000 } } });
+
+export const startRun = (runId: string) =>
+  steps.add("step", { runId, step: 0 }, { jobId: `run-${runId}-step-0` });
+
+new Worker("agent-steps", async (job) => {
+  const { runId, step } = job.data as { runId: string; step: number };
+  const run = await loadRun(runId);                          // transcript and status from Postgres
+  if (run.lastStep >= step) return { skipped: true };        // already committed: a redelivery
+  if (step >= 20) { await saveStep(runId, step, { status: "budget-exhausted" }); return { done: true }; }
+  const turn = await callModel(run.messages);                // model call outside any transaction
+  const results = turn.toolCalls.length ? await runTools(turn.toolCalls, `run-${runId}-step-${step}`) : [];
+  await saveStep(runId, step, { turn, results });            // one transaction, unique (runId, step)
+  if (turn.toolCalls.length === 0) return { done: true };    // final answer
+  await steps.add("step", { runId, step: step + 1 }, { jobId: `run-${runId}-step-${step + 1}` });
+  return { next: step + 1 };
+}, { connection: conn(), concurrency: 8, limiter: { max: 50, duration: 60_000 } });
+```
+
+- **Tool idempotency keys.** The job id string passed to `runTools` lets side-effecting tools dedupe a
+  repeated step on their side.
+- **A known gap.** If the process dies after `saveStep` but before the next `add`, the run stalls; the
+  outbox pattern (write the next-step request in the same transaction) closes it.
+
 ### Worked scenario: what the settings above mean in time
 Using the queue defaults above (`attempts: 5`, exponential backoff with a 2-second base delay) and the
 worker limiter of 50 jobs per 60 seconds.
@@ -234,6 +280,12 @@ process.on("SIGTERM", async () => {
 ```
 
 ## Production patterns
+- **One job per agent step, state in Postgres.** When agent runs take many steps, make each step a job
+  with id `run-<runId>-step-<n>` and checkpoint the transcript after it, so retries and stalls repeat one
+  step. Monitor steps per run, runs with no new step for several minutes, and duplicate-step skips.
+- **Separate queues by agent workload.** Interactive chat agents, batch research agents and nightly evals
+  get their own queues and limiters, so a 5,000-case eval cannot starve user-facing runs. Monitor start
+  delay per queue.
 - **Drain workers on deploy.** Handle `SIGTERM` with `await worker.close()` and set the orchestrator's
   grace period above your typical job duration, or make jobs resumable so a cut-off job restarts
   cheaply. Monitor `stalled` events and duplicate side effects right after deploys.
@@ -324,6 +376,14 @@ resumes instead of restarting, move CPU-heavy work to a sandboxed processor, and
   visibility into waiting, active and failed work.
 - **The API then returns a run id** and streams progress via `QueueEvents` or polling.
 
+### Would you model a 15-step agent run as one job or as fifteen?
+- **One job per step** when steps are long or side-effecting: a retry or stall repeats one step, progress
+  is visible per step, and the limiter counts model turns more closely.
+- **One job per run** for short runs of a few cheap steps, where the extra enqueue and checkpoint per step
+  costs more than an occasional full rerun.
+- **Either way,** the transcript lives in Postgres and tools with side effects take an idempotency key
+  derived from run and step.
+
 ### Jobs are being processed twice even though no worker crashed. How do you debug it?
 - **Suspect stalls:** a processor blocking the event loop stops lock renewal, so the stall checker
   hands the job to another worker while the first is still running.
@@ -375,3 +435,24 @@ resumes instead of restarting, move CPU-heavy work to a sandboxed processor, and
 - [x] Make each chunk's write idempotent and check for existing chunks so a retry skips work already stored
 - [ ] Use `priority: 1` so the job is retried first
 > BullMQ retries re-run the whole processor; only application-level checkpoints (idempotent upserts plus an existence check at the start of each chunk) turn a retry into a resume. More attempts just repeat the same 499 calls.
+
+## Use cases & projects
+### Use cases
+- **Background agent runs.** The API returns a run id at once, workers drive the agent, and the UI
+  follows progress through `QueueEvents`.
+- **Staying under provider quotas.** A Worker `limiter` caps model calls across every agent worker, and
+  `queue.rateLimit` pauses the queue on a 429 without burning attempts.
+- **Fan-out research or ingestion.** A flow runs sub-agent or embedding children in parallel and a parent
+  job summarises once all of them finish.
+- **Nightly agent evals.** A job scheduler runs the regression suite once per night however many producer
+  replicas register it.
+
+### Mini project
+**Durable step-per-job agent (2-3 hours).**
+- **Goal:** run a tool-calling agent as one BullMQ job per step that survives worker kills and deploys.
+- **Steps:** create the `agent-steps` queue and worker from the example with a fake model that needs 5
+  steps; store runs and steps in Postgres with a unique (run id, step); add an HTTP endpoint that starts a
+  run and a `QueueEvents` listener that prints progress; kill the worker with `SIGKILL` mid-run and
+  restart it; then send `SIGTERM` and confirm `worker.close()` drains.
+- **Done when:** every run completes with exactly 5 step rows after random kills, no step's tool side
+  effect is applied twice, and the start delay metric stays flat under a burst of 100 runs.

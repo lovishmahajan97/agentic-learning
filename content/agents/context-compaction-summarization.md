@@ -5,7 +5,8 @@ name: Context compaction / summarization
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/agent-loop
   - agents/agent-memory
@@ -24,6 +25,18 @@ sources:
 An agent re-sends its whole growing transcript every step, so cost is quadratic and quality drops before
 the limit. Compaction replaces old material with pruned outputs, a structured summary or pointers to
 external state; the hard part is choosing what must survive.
+
+## For agent builders
+- **Why it matters for agents.** Every long-running agent (coding, research, support, operations) hits
+  the context wall or the "lost in the middle" quality drop long before it finishes; compaction decides
+  whether step 200 still knows the task, the constraints and the IDs it created.
+- **Where it shows up in your stack.** The harness step that runs before each model call, tool wrappers
+  that cap output size, a progress file or memory store, sub-agent delegation, and provider-side context
+  editing or compaction features where your provider offers them.
+- **What you control.** The trigger fraction, the keep-recent size K, the summary schema, which content
+  is pinned, how tool outputs are capped, and whether summaries are merged in code.
+- **What you can skip.** Long-context attention research and exotic token-level compression. Pruning,
+  structured summaries, anchored merges and externalized state cover almost every production agent.
 
 ## Why it exists
 - **The loop is append-only.** Each iteration adds reasoning, a tool call and its result, and the next
@@ -371,3 +384,24 @@ probe-question accuracy after compaction, not just token savings.
 - [ ] The user's stated preference for a particular library
 > File contents are cheaply re-derivable with a tool call. Constraints, created identifiers and user
 > preferences are not, and forgetting them causes wrong actions or duplicate side effects.
+
+## Use cases & projects
+### Use cases
+- **Coding agents on long refactors.** Test logs and file reads are capped and stubbed, so a 200-step run
+  stays inside the window and keeps the PR numbers and files it changed.
+- **Research agents that read dozens of sources.** Search results are delegated to sub-agents and only
+  condensed findings with source links enter the main context.
+- **Support agents in hour-long sessions.** An anchored summary keeps ticket IDs, the customer's stated
+  constraints and decisions, so the agent does not open a second ticket.
+- **Operations agents running multi-hour tasks.** A progress file holds done, next and gotchas, so a
+  compacted or resumed run picks up where it stopped.
+
+### Mini project
+**Compaction with probe questions (2-3 hours).**
+- **Goal:** add a compaction step to a small tool-calling agent and prove it keeps what matters.
+- **Steps:** build an agent with a fake `read_log` tool that returns 5,000-line logs; run a 30-step task
+  that creates two fake ticket IDs; add the prune-then-summarize step and the anchored merge from the
+  examples with a low trigger so it compacts at least twice; after each compaction ask probe questions
+  ("which tickets did you create?", "what constraint applies?").
+- **Done when:** a table shows tokens per step before and after, the number of compactions, and probe
+  accuracy of 100% after the second compaction, with the summary JSON saved for each pass.

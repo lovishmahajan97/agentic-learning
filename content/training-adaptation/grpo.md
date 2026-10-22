@@ -431,3 +431,24 @@ task.
 > A learned reward model has errors far from its training data that a policy can exploit with length
 > or tone. A verifier has no such surface, though it has its own gaps (lax checks, visible test cases)
 > that the policy will find instead.
+
+## Use cases & projects
+### Use cases
+- **Coding agents trained on test outcomes.** Hidden tests that pass or fail give a verifiable reward for
+  each rollout.
+- **API and ticketing agents.** A check that the created record has the right fields rewards correct tool
+  sequences rather than plausible-looking ones.
+- **Structured-output reliability.** A schema validator as reward pushes directly on the rare malformed
+  tool calls that SFT leaves behind.
+- **Task-set curation.** Teams keep tasks the agent solves sometimes but not always, because groups where
+  every attempt scores the same give no gradient.
+
+### Mini project
+**Write and stress-test a GRPO reward function (2-3 hours).**
+- **Goal:** build the reward for a tool-calling task and find its loopholes before any training run.
+- **Steps:** pick a task with a checkable outcome (for example, a JSON tool call that must match a schema
+  and produce the right result from a fake API); write the reward function; sample 8 attempts per task
+  for 20 tasks from a small model; compute group-relative advantages by hand; then try to write outputs
+  that score high while being wrong.
+- **Done when:** you have the reward code, a table of per-task pass rates showing which tasks give no
+  signal, and a list of loopholes you found and how you closed each one.

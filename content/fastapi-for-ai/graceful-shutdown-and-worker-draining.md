@@ -450,3 +450,28 @@ must be cut. Very long generations should become resumable or move to a job queu
 - [ ] Increase Gunicorn's `--timeout` to 300 seconds
 > Very long grace periods stall every rollout and scale-down, and still fail on node loss. Durable or
 > resumable work survives any termination. Gunicorn's `--timeout` is the heartbeat limit, not a drain setting.
+
+## Use cases & projects
+### Use cases
+- **Rolling deploys of an agent API.** Readiness goes false, in-flight runs finish or checkpoint, and the
+  pod exits before SIGKILL, so a deploy does not cut runs mid-step.
+- **Streaming agent answers.** A drained SSE stream ends with a reconnect event and a run id the client
+  can resume from, instead of a silent cut.
+- **Agents with side-effecting tools.** Checking a drain flag between steps keeps a tool call (ticket
+  created, email sent) from happening with no record of it.
+- **Autoscaling down.** Scale-down sends the same SIGTERM as a deploy, so the same drain budget protects
+  runs when traffic falls.
+
+### Mini project
+**Drain an agent loop on SIGTERM (2-3 hours).**
+- **Goal:** show that a deploy no longer loses agent runs.
+- **Steps:** build a FastAPI endpoint that runs a fake 8-step agent loop (one second per step) and writes a
+  checkpoint after each step; set a drain flag in lifespan shutdown and make `/readyz` return 503 once it
+  is set; make the loop stop and checkpoint at the next step boundary when the flag is set; start 20 runs,
+  send SIGTERM, then resume the unfinished runs from their checkpoints.
+- **Done when:** every run either finished or resumed from its last checkpoint, no step ran twice, and
+  logs show readiness failing before the process exited.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide), where a rolling restart during active
+streams must drop no in-flight answer that fits within the drain budget.

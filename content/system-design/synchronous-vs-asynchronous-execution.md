@@ -483,3 +483,24 @@ an SSE stream keyed by run id rather than lengthening the gateway timeout.
 > Streaming improves perceived latency for a human reader while keeping a synchronous connection, so it fits
 > interactive work that still completes within timeouts. Durability, machine callers and fan-out all point to
 > a persisted job with polling, push or events.
+
+## Use cases & projects
+### Use cases
+- **Chat assistants.** A short tool loop streams tokens and tool progress over SSE on the open
+  connection, because a human is waiting and the run fits inside the gateway timeout.
+- **Long research or coding agents.** A `POST /runs` returns `202` and a run id; workers execute the
+  loop and the client polls or subscribes, so a 10-minute run survives client disconnects.
+- **Batch evaluation runs.** Hundreds of eval tasks go onto a bounded queue, so the worker pool, not the
+  caller, sets the concurrency against provider rate limits.
+- **Agents called by other services.** Machine callers get a job id and a webhook on completion instead
+  of holding a connection open for an unknown duration.
+
+### Mini project
+**Turn a synchronous agent endpoint into an async run API (2-3 hours).**
+- **Goal:** move a multi-step agent off the request path without losing runs or doubling side effects.
+- **Steps:** start from an endpoint that runs a stub agent loop inline with a sleep per step; add a
+  `POST /runs` that stores the run with an idempotency key and returns `202`; run the loop in a worker
+  that saves each step's result; add `GET /runs/{id}` and an SSE progress stream; add a cancel flag the
+  loop checks between steps; kill the worker mid-run and restart it.
+- **Done when:** a duplicate submit returns the same run id, a killed worker's run resumes from its last
+  saved step, and cancelling stops the loop before its next tool call.

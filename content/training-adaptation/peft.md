@@ -442,3 +442,24 @@ trained against the quantized base.
 - [ ] It depends on whether the base was quantized during training
 > Merging adds BA into W₀, producing one dense d×k matrix, so the forward pass performs exactly the same
 > matmul as the base model. Only an *unmerged* adapter adds the extra low-rank computation.
+
+## Use cases & projects
+### Use cases
+- **Teaching a small open model your tool-call format.** When a self-hosted 7B-class model keeps
+  emitting malformed JSON or wrong argument names, a LoRA on successful trajectories fixes the format
+  without touching the base weights.
+- **Per-tenant agent behaviour on one GPU fleet.** Each customer gets an adapter for tone, policy or
+  domain vocabulary, and one base model serves them all as unmerged adapters.
+- **Cheap high-volume agent steps.** Routers, query rewriters and tool selectors run on a small base
+  plus a task adapter instead of a frontier API call on every step.
+- **Fast iteration on agent policy.** An adapter retrains in hours on one GPU, so a policy change can be
+  trained, gated on the agent eval suite and rolled back as a small file.
+
+### Mini project
+**LoRA a small model to call your tools (2-3 hours).**
+- **Goal:** raise schema-valid tool-call rate of a small open instruct model on a fixed agent task set.
+- **Steps:** write 3 tool schemas and 50 held-out tasks; collect or write a few hundred successful
+  trajectories rendered with the model's chat template; train a QLoRA adapter with assistant-only loss;
+  score base and adapter on tool-name accuracy, schema-valid arguments and task success.
+- **Done when:** you have a before/after table for the 50 tasks, the adapter directory with the pinned
+  base revision recorded next to it, and a note on the rank and learning rate you chose and why.

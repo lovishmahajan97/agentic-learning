@@ -5,7 +5,8 @@ name: FinOps
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - observability/token-cost-tracking
   - infra-capacity-economics/cost-allocation-by-tenant-and-feature
@@ -20,9 +21,22 @@ sources:
 ---
 
 ## TL;DR
-FinOps makes variable cloud and AI spend visible, attributed and owned by the teams that cause it. For LLM
-systems: meter every call at the gateway, allocate by tenant and feature, track cost per successful task,
-and run a continuous inform–optimize–operate loop.
+FinOps makes agent spend visible, attributed and owned by the teams that cause it: meter every model call
+at the gateway, tag it with run, tenant and feature, track cost per successful run, enforce step and
+token budgets, and review the loop weekly.
+
+## For agent builders
+- **Why it matters for agents.** One agent run is many model calls with a growing context, and a stuck
+  loop or a retrieval change can multiply the bill overnight with no code reviewer thinking about money.
+  Without per-run metering you cannot tell growth from a runaway loop.
+- **Where it shows up in your stack.** An AI gateway or SDK wrapper around every model call, the provider
+  response usage fields (input, cached and output tokens), trace tools that show cost per run, a
+  warehouse table of usage events, and the max-steps setting of your agent framework or loop.
+- **What you control.** Tags on every call (run id, tenant, feature, prompt version), per-run step and
+  spend limits enforced in code, separate keys for evals and development, and the cost estimate written
+  before a new agent ships.
+- **What you can skip.** Procurement work (committed-use contracts, reservations) and FOCUS billing
+  normalization unless you own the platform budget; know they exist and who owns them.
 
 ## Why it exists
 - **Cloud broke purchase-order budgeting.** Traditional budgets assume finance approves spend in advance;
@@ -30,9 +44,9 @@ and run a continuous inform–optimize–operate loop.
 - **LLM APIs break it harder.** Spend is per token, so a prompt edit, a retrieval change that doubles
   context, a retrying agent loop or a traffic spike can move the bill by a multiple with no procurement
   event and no code reviewer thinking about money.
-- **The invoice says nothing useful.** It is a single line, "API usage", with no product, customer, feature
-  or team. Finance cannot allocate it, engineering gets no feedback, and the two sides meet only when the
-  number is already alarming.
+- **The invoice says nothing useful.** It is a single line, "API usage", with no product, customer, feature,
+  agent or team. Finance cannot allocate it, engineering gets no feedback, and the two sides meet only when
+  the number is already alarming.
 - **The naive responses each fail.** Approval gates for every model or key slow delivery and get bypassed
   with personal keys, worsening attribution. A one-time "cost project" saves a slice, then the bill climbs
   back because nothing structural changed. Hard spend caps protect the budget by taking the feature down
@@ -51,14 +65,16 @@ The FinOps Foundation frames the practice as a cycle:
 | *Optimize* | act on it, through both usage and rate levers |
 | *Operate* | make the first two continuous: budgets, forecasts, reviews, owners and policy |
 
-It is a loop *because* costs drift: models are updated, prices change, features ship weekly and traffic
-mix moves. A snapshot goes stale in a month.
+It is a loop *because* costs drift: models are updated, prices change, agents and tools ship weekly and
+traffic mix moves. A snapshot goes stale in a month.
 
 ### Inform: meter at the point of call
 1. **Choose one chokepoint.** Provider invoices lack your context, so attribution happens in your own
-   code, at the single point every call passes through: an AI gateway or an SDK wrapper.
+   code, at the single point every call passes through: an AI gateway or an SDK wrapper that the agent
+   loop, the judge and every script must use.
 2. **Record one event per call:** model; input, output and cached token counts; latency; tenant; feature;
-   environment; prompt version; and a request id that joins to your traces.
+   environment; prompt version; and a request id that joins to your traces. For agents add the run id and
+   step number, so cost rolls up per run.
 3. **Price at record time from a versioned price table,** and store the price used, *because* prices change
    and a cost history that silently re-prices itself is useless for trend analysis.
 4. **Take token counts from the provider's response usage fields,** not your own tokenizer estimate,
@@ -79,7 +95,7 @@ mix moves. A snapshot goes stale in a month.
   on shaky numbers produces arguments about the numbers instead of decisions about the spend.
 
 ### Shared costs: allocate by a driver, not evenly
-Not every dollar has a natural tag: a self-hosted GPU pool serves many features; an embedding index, an
+Not every dollar has a natural tag: a self-hosted GPU pool serves many agents; an embedding index, an
 eval suite and the platform team serve everyone; a one-year reservation is paid upfront.
 
 | Shared cost | Allocation driver |
@@ -94,8 +110,8 @@ eval suite and the platform team serve everyone; a one-year reservation is paid 
   them.
 
 ### Unit economics: telling growth from waste
-- **Total spend is the wrong headline.** Ask whether cost per unit of value moved: cost per successful task,
-  per active user, per document processed, gross margin per tenant.
+- **Total spend is the wrong headline.** Ask whether cost per unit of value moved: cost per successful task
+  (for agents, per successful run), per active user, per document processed, gross margin per tenant.
 - **Growth vs regression:** a bill that doubled while cost per task stayed flat is growth; a bill that
   doubled on flat volume is a regression.
 - **Only the unit view distinguishes them,** and only the unit view lets product price the feature.
@@ -120,23 +136,26 @@ them hides which one is actually working.
   a trend.
 - **Name an owner** who reviews each cost centre weekly.
 - **Put guardrails in the gateway:** per-key spend limits, model allowlists, default output caps.
+- **Put guardrails in the agent loop:** a max-steps and max-spend limit per run, because a gateway sees
+  calls, not runs.
 - **Estimate cost in design review:** expected tokens per task times expected volume, so cost is discussed
   before the code exists.
 - **Mature gradually.** The FinOps Foundation describes it as crawl, walk, run: a daily report first, then
   budgets and showback, then forecasts, anomaly detection and chargeback.
 
-### What is specific to AI spend
+### What is specific to AI and agent spend
 - **Tokens are driven by prompt design,** so cost is a code-review concern.
 - **Agents multiply spend:** a ten-step loop is ten calls, and context grows with every step.
 - **Evaluation is real spend:** a large eval suite run against a judge model on every pull request can
   rival production traffic.
-- **Cached tokens are priced differently,** so cache hit rate is a cost KPI.
+- **Cached tokens are priced differently,** so cache hit rate is a cost KPI; a stable agent prefix is a
+  FinOps decision.
 - **For self-hosted models the waste metric is GPU idle time,** which belongs on the same dashboard as token
   spend.
 
 ## Diagram
 Every call passes one gateway that tags and prices it; the warehouse feeds reconciliation, unit-cost
-views and alerts, and owners close the loop with usage or rate changes.
+views and alerts, and owners close the loop with usage or rate changes to the agent.
 
 ```mermaid
 flowchart TD
@@ -206,9 +225,55 @@ daily_review(EVENTS, {"search": 300, "summarize": 1500}, day_of_month=10)
   budget increase.
 - **The simulation flatters the month-to-date forecast.** It runs all ten days at the new rate. If `v12`
   shipped on day eight, the average would mix in seven cheaper days and understate the overrun; a
-  trailing-days forecast shows it in full (next example).
+  trailing-days forecast shows it in full (a later example).
 - **Where the money is:** each search call costs about $0.00046, and 372 of its 462 micro-dollars are input
   tokens, so context size, not output length, is the lever for that feature.
+
+### Agent scenario: per-run metering with step and spend limits
+A gateway sees calls; only the agent loop knows a run. This meter tags each step with the run id and stops
+a stuck loop. Prices are illustrative.
+
+```python
+PRICE = {"in": 3.00, "out": 15.00, "cached_in": 0.30}   # USD per 1M tokens, illustrative
+
+class BudgetExceeded(Exception):
+    pass
+
+class RunMeter:
+    """One per agent run: tags every step with run_id and enforces step and spend limits."""
+    def __init__(self, run_id, tenant, feature, max_steps=15, max_usd=0.50):
+        self.run_id, self.tenant, self.feature = run_id, tenant, feature
+        self.max_steps, self.max_usd = max_steps, max_usd
+        self.events, self.spent = [], 0.0
+
+    def record_step(self, usage):
+        cost = sum(usage[k] * PRICE[k] for k in PRICE) / 1e6
+        self.spent += cost
+        self.events.append({"run_id": self.run_id, "tenant": self.tenant, "feature": self.feature,
+                            "step": len(self.events) + 1, **usage, "cost_usd": cost})
+        if len(self.events) >= self.max_steps or self.spent >= self.max_usd:
+            raise BudgetExceeded(f"{self.run_id}: {len(self.events)} steps, ${self.spent:.2f}")
+
+# A stuck loop: the agent retries a failing tool; the transcript (~1.5k tokens a step) is re-sent uncached
+meter = RunMeter("run-42", tenant="acme", feature="support-agent")
+try:
+    for step in range(100):
+        meter.record_step({"in": 1_500 * (step + 1), "cached_in": 6_000, "out": 300})
+except BudgetExceeded as e:
+    print("stopped:", e)
+# stopped: run-42: 14 steps, $0.56
+```
+
+| Stuck run | Steps | Cost per run | 1,000 such runs a day |
+|---|---|---|---|
+| No limits (loop until a 100-step framework default) | 100 | ≈ $23.36 | ≈ $23,355 |
+| `max_usd=0.50` in the meter | 14 | ≈ $0.56 | ≈ $560 |
+
+- **The spend limit fired before the step limit,** because context growth makes later steps expensive:
+  step 1 costs about $0.011, step 14 about $0.069.
+- **The 100-step ceiling is illustrative;** check what your framework actually defaults to, and set your
+  own limit explicitly.
+- **Log the stop as an event,** so "runs stopped by budget" becomes a daily metric, not a silent failure.
 
 ### Worked scenario: month-to-date vs trailing-days forecast
 Illustrative: search costs $10 a day until `v12` ships on day eight, then $25 a day. The budget is $500.
@@ -237,8 +302,15 @@ Run both and alert on either: the average resists noise, the trailing window cat
 
 ## Production patterns
 - **Gateway as the only egress, tags mandatory.** When: from the first shared key. How: route every
-  provider call through one gateway or SDK wrapper, issue per-team or per-feature keys, and reject or
-  quarantine calls missing tenant and feature tags. Monitor the unallocated share of spend weekly.
+  provider call, including judge and eval calls, through one gateway or SDK wrapper, issue per-team or
+  per-feature keys, and reject or quarantine calls missing tenant and feature tags. Monitor the
+  unallocated share of spend weekly.
+- **Cost per run as a trace field.** When: from the first agent in production. How: carry a run id through
+  every step, sum `cost_usd` per run, and join it to the run's eval or success label. Monitor cost per
+  successful run and its p95 per agent; a fat tail is usually loops.
+- **Step and spend limits in the loop.** When: every agent, before launch. How: a max-steps and max-spend
+  per run enforced in code (as in the meter above), returning a graceful "could not finish" instead of
+  looping. Monitor the share of runs stopped by budget.
 - **Monthly invoice reconciliation.** When: every billing cycle. How: sum metered `cost_usd` per provider
   and compare with the invoice line. Monitor the gap as a KPI; a rising gap means a bypass path or a stale
   price version.
@@ -251,8 +323,9 @@ Run both and alert on either: the average resists noise, the trailing window cat
 - **Hard caps for non-production, soft limits for production.** When: dev, eval and load-test keys. How:
   per-key spend limits in the gateway for non-production keys; forecast alerts plus rate limiting for
   customer-facing keys. Monitor non-production spend as its own line with an owner.
-- **Cost estimate as a design-review field.** When: every new feature. How: expected tokens per task times
-  expected volume times the current price table, reviewed again after launch against metered numbers.
+- **Cost estimate as a design-review field.** When: every new feature or agent. How: expected steps per run
+  times tokens per step times expected volume times the current price table, reviewed again after launch
+  against metered numbers.
 
 ## Trade-offs
 - **Gateway chokepoint: complete attribution and enforcement vs one more hop.** It adds latency and a
@@ -263,6 +336,8 @@ Run both and alert on either: the average resists noise, the trailing window cat
 - **Hard per-key caps: stop runaway bills vs outages.** They can take a customer-facing feature down
   mid-month. Soft forecast alerts plus rate limiting suit production paths; hard caps suit development and
   evaluation keys.
+- **Tight per-run limits: no runaway loops vs unfinished hard tasks.** A low step or spend limit stops
+  legitimate long runs too; set it from the cost distribution of successful runs, not a guess.
 - **Commitments (reserved GPUs, provisioned throughput): lower unit price vs locked volume.** They pay off
   only when the baseline is predictable for the whole term.
 - **Fine-grained tags vs call-site discipline.** Tenant, feature and prompt-version tags answer "which
@@ -286,10 +361,13 @@ Run both and alert on either: the average resists noise, the trailing window cat
   written driver such as GPU-seconds.
 - **Agents without step and token budgets.** Symptom: a single stuck loop becomes the largest line item of
   the day. Fix: a max-steps and max-tokens limit per run, enforced in code.
+- **Metering calls but not runs.** Symptom: cost per call looks flat while cost per run doubled because the
+  agent takes more steps. Fix: a run id on every event and a per-run rollup.
 
 ## When to use
 - **Start** the day there is a bill worth caring about: for most teams the first month the API invoice
-  exceeds a few hundred dollars, or the first GPU reservation.
+  exceeds a few hundred dollars, or the first GPU reservation. For agents, add per-run limits before the
+  first production run regardless of the bill.
 - **Minimum viable version:** one structured event per call with tags, a versioned price table and a daily
   report by feature. Budgets, forecasts, anomaly detection and showback follow as spend grows; chargeback
   comes last.
@@ -322,12 +400,6 @@ with burn-rate forecasts, daily anomaly alerts on tokens per task, per-key limit
 design review, so the next jump is caught in a day rather than on the invoice.
 
 ## Interview questions
-### What is the difference between showback and chargeback, and when do you move from one to the other?
-- **Showback** shows each team its own attributed spend; **chargeback** actually debits internal budgets.
-- **Move only once allocation is trusted,** meaning the unallocated bucket is small and shared-cost rules
-  are written down. Chargeback on shaky numbers produces arguments about the numbers instead of decisions
-  about the spend.
-
 ### Thirty teams call three LLM providers with a handful of shared keys. How would you make spend attributable?
 - **One chokepoint:** route every call through an AI gateway or SDK wrapper, with per-team or per-feature
   keys and mandatory tenant, feature, environment and prompt-version tags.
@@ -335,6 +407,22 @@ design review, so the next jump is caught in a day rather than on the invoice.
   and store the price version with each event.
 - **Land it with business data:** events go to the warehouse; reconcile monthly against each invoice and
   normalize sources into one schema (FOCUS) once GPU and SaaS spend join in.
+
+### One agent's daily cost tripled overnight while its run count stayed flat. How do you find the cause?
+- **Roll up by run first:** compare steps per run, tokens per step and cached-token share against the
+  previous day, split by prompt version and tool.
+- **Look at the tail:** a few runs hitting the step limit points to a loop (a failing tool, a bad stop
+  condition); a uniform rise points to a prompt or retrieval change that grew context.
+- **Fix and guard:** roll back or fix the change, and add or lower the per-run spend limit so the next
+  regression is bounded.
+
+### How would you set step and spend limits for a production agent?
+- **From data, not a guess:** take the distribution of steps and cost for successful runs on your eval set
+  and production traces, and set limits above a high percentile so legitimate runs finish.
+- **Enforce in code per run,** return a graceful partial answer or escalation, and log the stop as an
+  event.
+- **Watch both sides:** the share of runs stopped by budget and the success rate; if stops rise while
+  success falls, the limit or the agent needs work.
 
 ### When would you not use hard spend caps?
 - **On customer-facing production paths,** because a cap that trips mid-month takes the feature down for
@@ -383,3 +471,25 @@ design review, so the next jump is caught in a day rather than on the invoice.
 > Flat unit cost with doubled total means twice as many successful tasks were delivered at the same
 > efficiency. That is growth, and the decision belongs to product and pricing, not to a cost cut that would
 > reduce the value delivered.
+
+## Use cases & projects
+### Use cases
+- **Catching a runaway agent loop.** Per-run cost rollups and a tokens-per-task anomaly alert flag the day a
+  failing tool makes an agent retry, and per-run limits bound the damage.
+- **Pricing an agent product per tenant.** Tags on every step let the team compute cost per successful run
+  per customer and set plan limits or prices that keep margin positive.
+- **Keeping eval spend in check.** Separate keys and budgets for judge-model eval runs on pull requests stop
+  CI from quietly rivalling production traffic.
+- **Explaining a bill jump to leadership.** Attribution by feature, prompt version and run separates growth
+  from regression before anyone cuts a feature.
+
+### Mini project
+**Per-run cost meter and daily report for an agent (2-3 hours).**
+- **Goal:** know what every run of a small tool-calling agent costs, and stop runaway runs automatically.
+- **Steps:** wrap the agent's model client so each call records a usage event (run id, step, tenant,
+  feature, prompt version, tokens from the usage fields, cost from a versioned price table) to SQLite or a
+  CSV; add a max-steps and max-spend limit per run; run 30 tasks including a few that force a failing tool;
+  write a daily report of cost per run, cost per successful run and runs stopped by budget.
+- **Done when:** the report shows per-run cost with the stuck runs capped, a burn-rate forecast for the
+  month against a stated budget, and the metered total matches the provider's own usage view within a few
+  percent.

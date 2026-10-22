@@ -454,3 +454,23 @@ what I would act on.
 > A unique random string has no reason to appear in a model's output unless the file containing it was
 > in the training data. It does not stop crawling or leaking; it makes the leak detectable after the
 > fact.
+
+## Use cases & projects
+### Use cases
+- **Fine-tuning a model on agent traces.** An overlap check against the golden set before each training
+  job keeps eval tasks out of the training data.
+- **Evaluating a web-browsing or research agent.** Restricting or auditing search during evals stops the
+  agent from fetching a benchmark's published answer.
+- **Agents with long-term memory.** A fresh memory store per eval task prevents one task's answer from
+  leaking into the next.
+- **Trusting a vendor's benchmark claim.** Cutoff dates and behavioural probes on recent items tell you
+  how much of a score might be memorization.
+
+### Mini project
+**Add leak guards to an agent eval (1-3 hours).**
+- **Goal:** detect and block the main ways golden tasks can leak into a tool-calling agent's runs.
+- **Steps:** add a canary string to the golden set file; write an n-gram overlap check between the golden
+  set and a fine-tuning file and few-shot bank; reset the agent's memory and sandbox per task; log every
+  search-tool query and URL during eval runs and flag any that hit a list of known answer sources.
+- **Done when:** a planted duplicate in the training file, a carried-over memory entry and a flagged
+  search URL are each caught and reported by the checks.

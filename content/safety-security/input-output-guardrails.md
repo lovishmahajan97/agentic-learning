@@ -5,7 +5,8 @@ name: Input / output guardrails
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - safety-security/prompt-injection
   - safety-security/output-validation
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Guardrails are deterministic checkpoints around a probabilistic model: input rails inspect what reaches
-it, output rails inspect what leaves it and allow, block, rewrite, retry or escalate, because a system
+In an agent, guardrails are deterministic checkpoints on every hop of the loop: input rails inspect user
+turns, retrieved text and tool results; output rails inspect answers and tool calls, because a system
 prompt is an instruction, not an enforcement boundary.
+
+## For agent builders
+- **Why it matters for agents.** An agent turns text into actions. Every tool result is fresh untrusted
+  input and every tool call is a consequential output, so rails must wrap each step of the loop, not just
+  the first user turn and the final answer.
+- **Where it shows up in your stack.** Middleware around the model call and the tool executor, a tool
+  gateway, NeMo Guardrails `rails.input.flows` and `rails.output.flows`, Guardrails AI validators, or a
+  hand-rolled policy table with a decision log.
+- **What you control.** Which rails run on which hop, their order (deterministic first), fail-open or
+  fail-closed per rail, block versus flag thresholds, and whether a failed output retries with feedback.
+- **What you can skip.** Building your own safety classifier from scratch; start with size limits, schema
+  checks, a canary and an off-the-shelf moderation model, and add rails only when a measured failure
+  justifies them.
 
 ## Why it exists
 - **LLM features add a new trust boundary.** Apps already validate web forms, API payloads and file
@@ -246,6 +260,20 @@ print("hard-block" if p > 0.9 else "flag for review")  # -> flag for review
 The decision: route this rail's hits to a review queue or stricter mode instead of hard-blocking, and
 keep hard blocks for the canary and schema checks.
 
+### Worked scenario: rails inside a 10-step agent run
+A support agent makes about 10 tool calls per task. Each step passes an input rail on the tool result and
+an output rail on the next tool call. Illustrative per-check false-positive rates from a labelled set:
+
+| Quantity | Per check | Per task (20 checks) |
+|---|---|---|
+| Input rail on tool results, 0.5% FP | 10 checks | 1 − 0.995¹⁰ ≈ 4.9% tasks interrupted |
+| Output rail on tool calls, 0.5% FP | 10 checks | ≈ 4.9% tasks interrupted |
+| Both together | 20 checks | 1 − 0.995²⁰ ≈ 9.5% tasks interrupted |
+| Same rails with flag-and-continue for low-risk tools | hard block only on writes | interruptions fall to the write steps only |
+
+The lesson: per-check rates that look harmless in chat compound across agent steps, so agents hard-block
+only consequential tool calls and flag the rest.
+
 ## Production patterns
 - **Shadow mode before enforce.** Ship every new rail as log-only, compare its verdicts against a
   reviewed sample for a week or two, then enforce. In NeMo Guardrails, rails are declared in `config.yml`
@@ -260,6 +288,9 @@ keep hard blocks for the canary and schema checks.
 - **One chokepoint for tool calls.** Route every tool execution through the same gateway or middleware as
   the output rails, so allowlists and approval gates cannot be bypassed by a new code path. Monitor
   denied calls per tool.
+- **Rails per hop, keyed by tool risk.** Agent teams attach a rail profile to each tool: read-only tools
+  get cheap input rails on their results, write tools get argument validation plus an approval gate. Monitor
+  rail interruptions per task, not only per request, because tasks span many checks.
 - **Weekly block-log triage.** Sample blocked and flagged requests, label them, and track per-rail
   false-positive rate and block precision; re-run the red-team suite after every prompt or model change.
 
@@ -295,6 +326,9 @@ keep hard blocks for the canary and schema checks.
   support tickets about blocked legitimate requests with no false-positive number to defend.
 - **Defaulting to fail-open on timeout.** During a classifier outage the block rate drops to zero and
   nobody notices, because zero is also what "no attacks today" looks like.
+- **Rails only at the chat boundary of an agent.** Symptom: the first user turn is checked, but a poisoned
+  web page fetched at step 6 steers the step-7 tool call. Fix: run input rails on every tool result and
+  output rails on every tool call inside the loop.
 - **Blocking with a generic error.** Users rephrase and retry, which looks like attack traffic in logs,
   burns budget and hides the real false-positive rate. Return a specific, honest refusal.
 
@@ -309,6 +343,9 @@ keep hard blocks for the canary and schema checks.
   re-run the red-team suite after every prompt or model change.
 - **Interviews:** answer "how would you stop the bot doing X" with layered rails plus the measurement
   loop, not with a sentence in the system prompt.
+
+- **In agents:** decide rails per tool and per hop; measure interruptions per task, since a 20-step run
+  multiplies every per-check false-positive rate.
 
 ## Role lens
 - **Engineer:** Implements rails as middleware around the model call, keeps each one a pure function
@@ -351,6 +388,12 @@ on a dashboard so the trade-off is explicit and the next tuning decision is made
 - **So flag, not block:** route hits to stricter handling or review, and keep hard blocks for near-zero
   false-positive checks such as canary matches and schema failures.
 
+### Your agent's tasks fail far more often after you add rails, though each rail looks precise. Why?
+- **Rails compound across steps.** A 0.5% false-positive rail checked on 20 hops interrupts about 9.5% of
+  tasks, even though it blocks only 0.5% of individual checks.
+- **Fix by risk tier:** hard-block only on write tools and near-zero false-positive checks, flag and
+  continue elsewhere, and track interruptions per task on the dashboard.
+
 ### When would you choose fail-open for a rail?
 - **Only for low-harm rails,** such as brand tone for internal users, where a missed check costs little and
   an outage would otherwise take the product down.
@@ -391,3 +434,24 @@ on a dashboard so the trade-off is explicit and the next tuning decision is made
 > Fail-open versus fail-closed is set per rail by the asymmetry of harm. For a vulnerable audience the
 > worst case is an unsafe reply, so the checker's outage should degrade to a refusal, with alerting on
 > the checker so the outage is noticed.
+
+## Use cases & projects
+### Use cases
+- **Support agents with refund or account tools.** Input rails on customer emails, argument validation and
+  approval gates on the refund call.
+- **Browsing and research agents.** Injection rails on every fetched page before it reaches the model, and
+  a canary check on every answer.
+- **Internal copilots over company data.** PII and secret rails on retrieved documents and on outputs, so
+  nothing leaves the data boundary by accident.
+- **Regulated assistants.** Policy rails for medical, legal or financial advice that fail closed and log
+  every verdict for audit.
+
+### Mini project
+**Wrap a tool-calling agent in rails (2-3 hours).**
+- **Goal:** add input and output rails to a small agent and measure what they cost per task.
+- **Steps:** build an agent with one read tool (fetch a page from a local fixture folder) and one write
+  tool (a fake `send_email`); add a size limit, an injection regex and a canary check on tool results, and
+  an allowlist plus argument validation on tool calls; run 30 benign and 10 poisoned tasks with every rail
+  in log-only mode, then in enforce mode.
+- **Done when:** you have a table of blocks, false positives and interruptions per task for both modes,
+  every verdict is in a decision log with a trace id, and no poisoned task triggers `send_email`.

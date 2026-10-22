@@ -454,3 +454,24 @@ control for a different problem.
 > Once wait time exceeds client timeouts, every completed request is wasted and every timed-out client
 > retries, so useful throughput falls as load rises. Waiting requests do not yet hold KV memory; the
 > damage is the wasted GPU time and the feedback loop.
+
+## Use cases & projects
+### Use cases
+- **Self-hosted agent backends on vLLM.** Admission caps and queue-wait budgets keep a burst of agent runs
+  from pushing every run past its client timeout at once.
+- **Multi-tenant agent platforms.** Per-tenant run caps stop one customer's batch job of 500 agent runs from
+  starving everyone else's interactive sessions.
+- **Agents with parallel tool calls or sub-agents.** A fan-out cap per run bounds how many model and tool
+  calls a single user turn can put in flight.
+- **Agents calling hosted providers.** Turning provider 429s into a fast "busy, retry after N seconds" at
+  your own front door, instead of letting each agent loop retry blindly.
+
+### Mini project
+**Shed load at the run level, not the call level (2-3 hours).**
+- **Goal:** show that admitting whole agent runs keeps completed runs high under overload, while
+  per-call admission wastes work on runs that fail midway.
+- **Steps:** build a FastAPI endpoint that runs a fake 8-step agent (each step sleeps to mimic a model
+  call); add a semaphore that admits runs, a queue-wait budget, and a 503 with `Retry-After` when the
+  budget is exceeded; load-test it at 2× capacity with and without run-level admission.
+- **Done when:** you have a table of completed runs, rejected runs and wasted steps for both modes, and
+  run-level admission shows near-zero wasted steps.

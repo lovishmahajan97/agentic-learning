@@ -5,7 +5,8 @@ name: Faithfulness / groundedness
 kind: metric
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - evals/hallucination-evaluation
   - evals/retrieval-evaluation
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-Faithfulness (groundedness) measures whether every claim in an answer is supported by the context the
-model was given, not whether it is true. Split the answer into atomic claims and verify each; no
-reference is needed, so it runs on production traffic.
+Faithfulness (groundedness) asks whether every claim in an agent's reply is supported by what it was
+given, retrieved chunks and tool results, not whether it is true. Verify atomic claims one by one; no
+reference is needed, so it runs on live traces.
+
+## For agent builders
+- **Why it matters for agents.** An agent's reply summarises what its tools returned and what it did.
+  The worst unfaithful claims are about actions ("I have issued the refund") or figures copied wrongly
+  from a tool result, and both read exactly like grounded prose.
+- **Where it shows up in your stack.** Faithfulness or groundedness evaluators in RAG and eval tools
+  (Ragas defines the metric; LangSmith, Braintrust and similar tools run judge-based versions), online
+  scoring of sampled traces, and a guard step that checks the draft reply before the agent sends it.
+- **What you control.** What counts as context (retrieved chunks, tool results, the record of tool
+  calls made), claim granularity, NLI versus LLM verifier, the contradiction gate, and the sampling rate
+  on production traffic.
+- **What you can skip.** Training your own NLI model or reproducing FActScore. A decomposition prompt,
+  a context-only verifier, a number guard and a labeled claim set cover agent work.
 
 ## Why it exists
 - **RAG's promise is not enforced.** "The answer comes from your documents" is the promise, but nothing
@@ -31,6 +45,9 @@ reference is needed, so it runs on production traffic.
   blend memory with context, misread the context (a wrong number, the wrong entity, a dropped negation),
   or turn a specific statement into a general one. All of these produce confident prose that looks
   grounded.
+- **Agents add a second promise.** "I did what the tools say I did." A reply can claim a refund, a
+  booking or a file change that no tool call ever made, and nothing but a check against the trace
+  catches it.
 - **Fluent, even correct, answers can be unsupported,** and those break when the documents change.
 - **Correctness and faithfulness are different axes,** and the 2×2 below is diagnostic. An end-to-end
   correctness score collapses it into one number and points you at the wrong fix.
@@ -48,6 +65,10 @@ reference is needed, so it runs on production traffic.
 | **Correct** | the goal | answered from memory: right today, unverifiable, uncitable, drifts when facts change |
 | **Wrong** | the context itself is wrong or stale: an ingestion or freshness problem | the classic hallucination |
 
+- **For an agent, "context" is the whole evidence of the run:** retrieved chunks, every tool result,
+  and the list of tool calls actually made. A faithful-but-wrong reply often means a tool returned stale
+  data, so the fix is in the tool or its source, not the prompt.
+
 ### Step 1: decompose the answer into atomic claims
 - **An LLM splits the answer into self-contained factual statements,** one fact each, with pronouns and
   references resolved so every claim can be judged in isolation.
@@ -55,6 +76,8 @@ reference is needed, so it runs on production traffic.
   failure and give a ratio.
 - **Granularity is a design choice:** too coarse and errors hide inside compound claims; too fine and
   trivial claims ("the policy exists") inflate the score.
+- **Action claims count too.** "I cancelled your order" is a claim whose support is a matching tool call
+  with a success result in the trace.
 - **Lineage:** FActScore applied the same atomic-fact idea to long-form factuality against a knowledge
   source; faithfulness applies it against the retrieved context.
 
@@ -78,6 +101,8 @@ Two families of verifier:
 | **LLM judge** | use only the context, quote the supporting or contradicting span, then give a verdict | long multi-passage contexts and reasoning | higher cost; the usual judge biases, notably leniency toward paraphrases that quietly change scope ("all" became "most", a figure got rounded) |
 
 - **A hybrid is common:** NLI first, LLM only on uncertain claims.
+- **Agent traces favour the LLM judge,** because support often spans several tool results (an order
+  record plus a policy chunk), which is the multi-sentence case NLI handles worst.
 
 ### Step 3: aggregate
 - **faithfulness = supported claims / total claims,** which is the RAGAS definition.
@@ -94,6 +119,8 @@ Two families of verifier:
   and answer relevance.
 - **Pair it with retrieval recall** to separate "answered from memory because retrieval failed" from
   "answered from memory despite good context".
+- **For agents, pair it with task success** too: an agent that stops calling tools and hedges scores
+  well on faithfulness while resolving nothing.
 
 ### Calibrating the verifier
 1. **Treat it as a judge:** build a human-labeled set of (claim, context, label) triples.
@@ -102,12 +129,12 @@ Two families of verifier:
    judge is using its own knowledge rather than the context.
 
 ## Diagram
-Extract-then-verify: the answer becomes claims, each claim is checked against the context alone, and the
-aggregate keeps contradictions visible as a gate rather than averaging them away.
+Extract-then-verify on an agent run: the reply becomes claims, each claim is checked only against the
+run's tool results and retrieved chunks, and contradictions stay visible as a gate.
 
 ```mermaid
 flowchart TD
-    A["Answer plus retrieved context"] --> D["Decompose into atomic claims"]
+    A["Agent reply plus tool results"] --> D["Decompose into atomic claims"]
     D --> N["NLI check: claim vs context"]
     N -->|"confident"| V["Verdict per claim"]
     N -->|"uncertain"| J["LLM judge: quote span, then verdict"]
@@ -194,6 +221,44 @@ print(unsupported_numbers(bad, context))    # ['2000']  -> gate: regenerate, abs
 - **Limits:** it misses figures written as words ("thirty days") and flags legitimate reformatting
   ("1.5k"), so it is a gate in front of the judge, not a replacement for it.
 
+### Agent scenario: grounding a support agent's reply in its own trace
+The context is built from the run itself: tool results are the evidence, and the tool calls made are the
+only support for claims about actions. Reuses `unsupported_numbers` from the guard above.
+
+```python
+def grounding_context(trace: list[dict]) -> str:
+    """Only what the tools returned this run counts as evidence."""
+    return "\n".join(m["content"] for m in trace if m["role"] == "tool")
+
+def actions_taken(trace: list[dict]) -> list[str]:
+    return [m["tool_call"] for m in trace if m.get("tool_call")]
+
+trace = [
+    {"role": "user", "content": "Can I get a refund on order 8812?"},
+    {"role": "assistant", "content": "", "tool_call": "get_order(8812)"},
+    {"role": "tool", "content": "order 8812: Standard plan, purchased 12 days ago, $240"},
+    {"role": "assistant", "content": "", "tool_call": "search_policy('refund window')"},
+    {"role": "tool", "content": "Standard plans may be refunded within 30 days of purchase."},
+    {"role": "assistant", "content": "Yes: order 8812 is 12 days old, inside the 30-day window. "
+                                     "I have issued a $240 refund to your card."},
+]
+reply, ctx = trace[-1]["content"], grounding_context(trace)
+print(unsupported_numbers(reply, ctx))   # []  every figure is in a tool result
+print(actions_taken(trace))              # ['get_order(8812)', "search_policy('refund window')"]
+# Claim "a $240 refund was issued" -> NOT_FOUND: no refund tool was ever called.
+# Claim "refunded to your card"    -> NOT_FOUND: no tool result mentions the payment method.
+```
+
+| Check | Result | What it says |
+|---|---|---|
+| Number guard | passes | figures were copied correctly from tool results |
+| Claim verification | 3 of 5 claims supported, 0.6 | two claims have no support in the trace |
+| Action claims vs tool calls | 1 unsupported action | the agent says it refunded but never called a refund tool |
+| Decision | block the reply | regenerate with the instruction to call the refund tool or say a refund is possible |
+
+- **The lesson:** a cheap number guard is necessary but not sufficient. Action claims need their own
+  check against the tool-call record, and they belong behind a hard gate (illustrative numbers above).
+
 ### Worked scenario: reading a faithfulness report
 An eval run over 400 answers (illustrative numbers).
 
@@ -209,20 +274,24 @@ An eval run over 400 answers (illustrative numbers).
   answer relevance before crediting the gain.
 
 ## Production patterns
-- **Sampled online faithfulness.** Run extract-then-verify asynchronously on a sample of production traces,
-  off the request path, and attach the per-claim log to the trace. Monitor the contradiction rate and the
-  unsupported-claim rate per route and per document source.
+- **Sampled online faithfulness on agent traces.** Run extract-then-verify asynchronously on a sample of
+  production traces, off the request path, with tool results as context, and attach the per-claim log to
+  the trace. Monitor the contradiction rate and the unsupported-claim rate per route, per tool and per
+  document source.
 - **Contradiction gate in release evals.** Any contradicted claim fails the item, and the release is
   blocked when the share of answers with a contradiction rises above the agreed threshold. Monitor the
   gate rate separately from mean faithfulness.
 - **Cheap guards on the serve path.** Apply a deterministic check for numbers, dates and amounts before
-  returning an answer; on failure, regenerate, abstain or route to human review. Monitor how often the
-  guard fires and what share of fired answers humans confirm as wrong.
+  the agent returns a reply; on failure, regenerate, abstain or route to human review. Monitor how often
+  the guard fires and what share of fired answers humans confirm as wrong.
+- **Action-claim check against the tool log.** Before sending, match claims of completed actions
+  (refunded, booked, deleted, emailed) against successful tool calls in the trace. Block on any mismatch
+  and monitor the rate per action type.
 - **NLI-first cascade.** Score claims with a small NLI model and send only low-confidence claims to an LLM
   judge to cut cost. Monitor the escalated share and the cascade's agreement with the labeled claim set.
-- **Shuffled-context canary.** On a schedule, run the verifier with contexts shuffled across items; the
-  score should collapse toward zero. Alert when it does not, because the judge is answering from memory.
-- **One dashboard for the triad.** Show faithfulness, answer relevance and abstention rate side by side,
+- **Shuffled-context canary and one triad dashboard.** On a schedule, run the verifier with contexts
+  shuffled across items; the score should collapse toward zero, so alert when it does not, because the
+  judge is answering from memory. Show faithfulness, answer relevance and abstention rate side by side,
   so a faithfulness gain from saying less is visible immediately.
 
 ## Trade-offs
@@ -231,17 +300,23 @@ An eval run over 400 answers (illustrative numbers).
   back to a single-pass NLI check.
 - **NLI vs LLM verifier.** NLI verifiers are cheap and deterministic but short-context and weak on
   multi-sentence support; LLM judges handle long contexts and reasoning but add cost and bias; the
-  crossover is set by context length and volume.
+  crossover is set by context length and volume, and long agent traces push it toward the judge.
 - **Strictness vs helpfulness.** Strict faithfulness penalises helpful additions such as unit conversions
   or a plain-language gloss; if the product wants the model to add general knowledge, define the allowed
   class of "world knowledge" claims explicitly rather than loosening the metric.
 - **Reference-free vs blind to bad context.** Being reference-free lets the metric run on live traffic,
-  but it cannot tell whether the context itself is wrong; pair it with ingestion freshness checks and
-  retrieval evaluation.
+  but it cannot tell whether the context itself is wrong; pair it with ingestion freshness checks,
+  tool-output validation and retrieval evaluation.
+- **Pre-send guard vs latency.** Checking a reply before the agent sends it stops bad claims reaching
+  users but adds a model call to every turn; keep only deterministic and action checks inline and move
+  full claim verification to async sampling.
 
 ## Pitfalls
 - **Scoring at answer level instead of claim level.** Symptom: 95% "grounded" answers while a slice of
   them carry wrong numbers or dates. Fix: atomic claims.
+- **Leaving tool results out of the context.** Symptom: correct agent replies about order status scored
+  NOT_FOUND because the verifier saw only retrieved chunks. Fix: build the context from every tool
+  result in the run.
 - **Optimising faithfulness in isolation.** Symptom: a rising abstention rate and falling answer relevance
   as the assistant learns that silence is safe. Fix: report the triad.
 - **Collapsing NOT_FOUND and CONTRADICTED into one "unsupported" bucket.** Symptom: an answer that
@@ -260,6 +335,8 @@ An eval run over 400 answers (illustrative numbers).
   document extraction, agent reports built from tool outputs.
 - **It is the core metric for the generation step,** always reported with retrieval recall and answer
   relevance, with a hard gate on contradictions and a sampled run on production traffic.
+- **Use it on every agent that reports what it did,** with the tool-call record as context for action
+  claims.
 - **Avoid for tasks meant to draw on parametric knowledge,** such as open-domain creative writing, where
   it is not meaningful.
 - **Day to day,** it is the per-claim log attached to a trace.
@@ -297,12 +374,20 @@ or to human review.
 - **The distinction picks the fix:** faithful-but-wrong points at ingestion and freshness; unfaithful
   points at the generator or prompt.
 
-### How would you implement a faithfulness metric for a RAG system from scratch?
+### How would you implement a faithfulness metric for a RAG agent from scratch?
 - **Decompose** each answer into atomic, self-contained claims with an LLM and structured output.
-- **Verify each claim against the context only,** with three verdicts and a quoted span, using NLI first
-  and an LLM judge for uncertain claims.
+- **Verify each claim against the context only,** meaning the retrieved chunks and tool results of that
+  run, with three verdicts and a quoted span, using NLI first and an LLM judge for uncertain claims.
 - **Aggregate** supported / total per answer, plus the share of answers with any contradiction, and
   calibrate the verifier on a labeled claim set with a shuffled-context test.
+
+### Your support agent tells users "your refund has been issued", but finance finds no refund. How do you catch this before users see it?
+- **Treat action statements as claims** whose only valid support is a successful matching tool call in
+  the same trace, not a policy chunk saying refunds are allowed.
+- **Add a pre-send check** that matches completed-action claims against the tool log and blocks or
+  regenerates the reply on a mismatch.
+- **Measure it offline too:** add these traces to the eval set and track unsupported action claims per
+  action type as a gated metric.
 
 ### A user reports a wrong refund window, but that trace scored faithfulness 1.0. How do you debug it?
 - **Read the retrieved context first:** if it states the wrong window, the answer is faithful but wrong,
@@ -320,12 +405,13 @@ or to human review.
 - **Never as the only metric:** it cannot detect a wrong context, so pair it with retrieval evaluation and
   freshness checks.
 
-### How do you afford claim-level checking on a million answers a day?
+### How do you afford claim-level checking on a million agent replies a day?
 - **Sample:** run the full pipeline asynchronously on a fraction of traces, stratified by route, rather
   than on every request.
 - **Cascade:** cheap deterministic guards (numbers, dates) and an NLI model handle most claims, and the
   LLM judge sees only uncertain ones; at five to fifteen claims per answer, judge calls dominate cost.
-- **Gate where it matters:** keep the serve-path checks for high-risk fields such as amounts and limits.
+- **Gate where it matters:** keep the serve-path checks for high-risk fields such as amounts and limits,
+  and for claims that an action was completed.
 
 ## Quiz
 ### Q: An answer matches the gold label exactly, but none of its claims appear in the retrieved context. What is its faithfulness, and how should it be treated?
@@ -351,3 +437,26 @@ or to human review.
 - [ ] The judge's sampling temperature
 > An answer with no claims is perfectly faithful, so the cheapest way to improve the metric is to say
 > less. Relevance and completeness are the counterweights that keep the gain honest.
+
+## Use cases & projects
+### Use cases
+- **RAG agents over company documents.** Faithfulness on sampled traces shows whether answers come from
+  the indexed policies or from the model's memory.
+- **Support and operations agents that take actions.** Action claims checked against the tool log stop
+  replies that promise refunds, bookings or cancellations that never happened.
+- **Agents that summarise tool output.** Research and reporting agents are scored on whether every
+  figure and finding in the report appears in what their tools returned.
+- **Release gates for prompt and model changes.** A contradiction gate and the triad dashboard keep a
+  "more faithful" release from simply saying less.
+
+### Mini project
+**Groundedness checker for a tool-calling support agent (2-3 hours).**
+- **Goal:** score 30-50 agent traces for faithfulness to their own tool results and catch unsupported
+  action claims.
+- **Steps:** build a small agent with an order-lookup tool, a policy-search tool and a refund tool; log
+  full traces; implement the number guard, an action-claim check against tool calls and an
+  extract-then-verify judge with tool results as context; hand-label the claims of 10 traces to
+  calibrate the judge; run the shuffled-context test.
+- **Done when:** a report lists mean faithfulness, the share of replies with a contradiction, unsupported
+  numbers and unsupported action claims, the judge's agreement with your labels, and the shuffled-context
+  score.

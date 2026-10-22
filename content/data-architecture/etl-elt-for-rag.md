@@ -5,7 +5,8 @@ name: ETL / ELT for RAG
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - data-architecture/ingestion-pipelines
   - data-architecture/document-processing-pipelines
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-ETL transforms before loading; ELT loads raw first and transforms after. For RAG, load raw, then run a
-staged DAG (parse, clean, chunk, enrich, embed, index) of materialized, content-addressed tables. The
-vector index is a rebuildable projection, never the system of record.
+ETL transforms before loading; ELT loads raw first. For an agent's retrieval tools, load raw, then run a
+staged DAG (parse, clean, chunk, enrich, embed, index) of versioned tables, so the index is a rebuildable
+projection you can re-tune without re-crawling.
+
+## For agent builders
+- **Why it matters for agents.** When an agent picks the wrong tool argument or cites a bad passage, the cause
+  is often a chunk. Stored stages let you trace a tool result back to parsed text and raw bytes, and fix
+  one stage instead of rebuilding everything.
+- **Where it shows up in your stack.** The pipeline behind every `search_docs` or `retrieve` tool: Dagster,
+  Airflow or dbt over a lakehouse, an embedding cache table, and a vector store with collection or index
+  aliases.
+- **What you control.** Chunker and embedding versions, which stages are cached by content hash, the quality
+  gates that block promotion, the metadata path for ACL changes, and the alias cutover gated on a retrieval
+  eval.
+- **What you can skip.** Warehouse modelling theory (star schemas, slowly changing dimensions). The agent
+  builder needs versioned stage tables, a cache and a reconciliation step.
 
 ## Why it exists
 - **The terms come from data warehousing.** ETL was the norm when warehouse storage and compute were
@@ -117,9 +131,19 @@ Nothing has to track "what changed"; the missing keys are the work list.
 - **Without the metadata path,** a permission change either triggers an expensive full re-run or never
   reaches the index, and the second outcome is a security bug.
 
+### Shaping chunks for agent tools
+- **Carry what the agent cites.** Keep `doc_id`, `doc_version`, `section_path` and a source URI in the index
+  payload, so a retrieval tool result can be quoted with a citation the user can open.
+- **Carry what the agent filters on.** Product, region, tenant and ACL groups belong in payload fields, because
+  an agent passes them as tool arguments (for example `search_docs(query, product="billing")`).
+- **Stamp the pipeline version into results.** Returning `chunker_version` and the embedding model in tool
+  output makes agent traces explain which index build produced an answer.
+- **Eval the agent, not only retrieval.** A chunker that wins recall@k can still lose on task completion if
+  chunks split the steps an agent needs in one tool result.
+
 ## Diagram
 Each stage is a stored table keyed by input hash plus version; the content path runs every stage, while
-metadata-only changes skip straight to the index payload.
+metadata-only changes skip straight to the index payload that the agent's retrieval tool reads.
 
 ```mermaid
 flowchart TD
@@ -132,6 +156,7 @@ flowchart TD
     D -.->|"ACL or label change only"| U["Payload update by doc_id"]
     U --> I
     I -.->|"rebuildable from tables"| C
+    I --> T["Agent retrieval tool"]
 ```
 
 ## Examples
@@ -235,6 +260,35 @@ chunks each.
 - **A content-hash cache** means a chunker change does not repeat enrichment for text that did not move.
 - **Run this arithmetic** before choosing which stages to re-run and how often.
 
+### Agent scenario: tracing a bad tool result back through the stages
+An agent's `search_docs` call returned a chunk that cut a refund procedure in half, so the agent skipped a
+step. Because every stage is a stored table, the trace is a few lookups, and the tool result itself carries
+the keys to start from.
+
+```python
+def trace_tool_result(result, tables):
+    """result: one item from the agent's search_docs output (payload fields from the index)."""
+    chunk = tables["chunks"].get(result["chunk_id"])
+    parsed = tables["parsed"].get((chunk["doc_id"], chunk["doc_version"], chunk["parser_version"]))
+    raw = tables["documents"].get((chunk["doc_id"], chunk["doc_version"]))
+    return {
+        "chunker_version": chunk["chunker_version"],
+        "position": chunk["position"],
+        "chunk_chars": len(chunk["text"]),
+        "section_path": chunk["section_path"],
+        "parsed_section": parsed["sections"][chunk["section_path"]][:200],   # what the chunker saw
+        "raw_uri": raw["uri"],                                                # what the source holds
+    }
+# If the parsed section is whole but the chunk is cut, the chunker is at fault: bump CHUNKER_VERSION,
+# re-run from `parsed`, eval the agent on the refund tasks, then cut the alias over.
+```
+
+| Fix | Stages re-run | Cost at 2 M documents (from the table above) |
+|---|---|---|
+| Re-crawl and rebuild (no stored stages) | all, plus source fetches | full fetch, parse and ≈ 10 billion embedding tokens |
+| New chunker from `parsed` | chunks, embeddings, index | ≈ 10 billion tokens at worst, less with the text-hash cache |
+| Payload-only fix (missing `section_path`) | index payload | no embedding calls |
+
 ## Production patterns
 - **Embedding cache as a table, not a dict.** When any stage is re-run, look up `(embedding_model,
   text_hash)` in a lakehouse table before calling the provider and write misses back. Monitor cache hit
@@ -251,6 +305,9 @@ chunks each.
   prompts so prompt caching applies. Monitor tokens and spend per run against the arithmetic above.
 - **Separate metadata path.** Route ACL and label changes to a payload update keyed by `doc_id` instead of
   the content DAG. Monitor the lag between a source permission change and the index payload update.
+- **Agent-eval gate on alias cutover.** Agent teams run the agent's task suite (not only recall@k) against the
+  candidate index before flipping the alias, and log the index version in every tool-call trace. Monitor task
+  completion rate and citation accuracy per index version, and roll the alias back on regression.
 
 ## Trade-offs
 - **Materialized stages vs storage.** Every stage costs storage and one extra write, but it flips to a clear
@@ -282,8 +339,8 @@ chunks each.
   re-crawling every source because the chunk tables never existed.
 
 ## When to use
-- **Use** staged ELT for any RAG corpus you expect to re-chunk, re-embed or audit, which is every corpus
-  that lives longer than a prototype.
+- **Use** staged ELT for any corpus behind an agent's retrieval tools that you expect to re-chunk, re-embed or
+  audit, which is every corpus that lives longer than a prototype.
 - **The signal you need it:** "what would it cost to try a different chunk size?" is answered in weeks
   rather than hours.
 - **Measure** embedding cache hit rate, re-run time per stage, orphan count after reconciliation and parse
@@ -323,7 +380,7 @@ users do, and the vector index is treated as a projection that can always be reb
   re-transforming from stored raw or parsed data is the operation you run most.
 - **The exception** is compliance: PII that may not be persisted must be redacted before the load.
 
-### After a chunker change, answers cite duplicated passages. How do you debug it?
+### After a chunker change, your agent's answers cite duplicated passages. How do you debug it?
 - **Check chunk ids:** if they come from `(doc_id, position)` only, the new chunker overwrote some rows and
   left the old tail live.
 - **Check reconciliation:** count indexed ids per document that are absent from the current `chunks`; a
@@ -350,6 +407,14 @@ users do, and the vector index is treated as a projection that can always be reb
 - **Why a separate path matters:** without it, the change either triggers a full re-run or never reaches the
   index, and the second outcome is a security bug.
 - **Monitor** the lag from source permission change to index payload update.
+
+### How would you ship a new chunker for a production agent without breaking it?
+- **Build beside, not over:** run the new `chunker_version` from `parsed` into a second index version, with
+  the embedding cache absorbing unchanged text.
+- **Gate on the agent's evals:** run the agent's task suite and retrieval eval against both versions, and
+  compare task completion and citation accuracy, not only recall.
+- **Cut over by alias and keep rollback:** flip the read alias, log the index version in tool-call traces,
+  and keep the old index until the new one has held for a release cycle.
 
 ## Quiz
 ### Q: In a RAG pipeline, why is the vector index treated as a derived structure rather than the system of record?
@@ -378,3 +443,24 @@ users do, and the vector index is treated as a projection that can always be reb
 > When ids depend only on document and position, a new chunker overwrites some old rows and leaves others
 > (the tail beyond its own chunk count) live. Versioned ids plus a reconciliation step that deletes every
 > indexed id for the document not in the current chunk set make the old chunks discoverable and removable.
+
+## Use cases & projects
+### Use cases
+- **Re-tuning a support agent's knowledge base.** Trying a semantic chunker or section-path prefixes is a
+  re-run from `parsed`, compared on the agent's task evals, instead of a re-crawl.
+- **Embedding-model upgrades under a live agent.** A second index built from stored chunks, an agent-eval
+  gate and an alias flip let the team upgrade without downtime and roll back in seconds.
+- **Debugging agent citations.** A wrong or truncated tool result traces through `chunks`, `parsed` and
+  `documents` to the stage that broke it.
+- **Contextual retrieval at scale.** Caching enrichment by content hash and prompt-caching the document
+  prefix keep the per-chunk LLM call affordable for a large agent corpus.
+
+### Mini project
+**Version a RAG pipeline and A/B two chunkers on an agent (2-3 hours).**
+- **Goal:** show that a chunker change is a bounded re-run judged by an agent's task results.
+- **Steps:** take 50-100 Markdown docs; store `documents`, `parsed`, `chunks` and an embedding cache as
+  local tables (SQLite or Parquet); build two index versions with different `chunker_version` values; wire
+  a small tool-calling agent to a `search_docs` tool pointed at an alias; run 20 scripted questions against
+  each version.
+- **Done when:** you have a table of cache hit rate, orphans deleted, recall@5 and agent answer accuracy per
+  chunker version, the alias points at the winner, and each tool-call trace logs the index version it used.

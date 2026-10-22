@@ -347,3 +347,24 @@ eval set so a regression is caught before it ships.
 > Instructions inside retrieved content have no authority; the model cannot reliably judge that on its
 > own, which is why the gate must live in the harness. Labelling helps, but the approval gate is what
 > holds when the model is fooled.
+
+## Use cases & projects
+### Use cases
+- **Search and retrieval tools.** Explicit counts, "no results" status and truncation flags stop the
+  model from treating an empty or partial result as the full answer.
+- **Web-browsing and email agents.** Labelling fetched content as untrusted data, plus harness gates,
+  limits what an injected instruction can make the agent do.
+- **Long-running agents.** Size budgets and clearing old results keep transcript growth and cost under
+  control over many steps.
+- **Error recovery.** Results that say what failed and whether a retry can help let the model recover
+  instead of guessing.
+
+### Mini project
+**Write a tool-result normalizer (1-2 hours).**
+- **Goal:** route every tool's output through one function the model can always read the same way.
+- **Steps:** define a result envelope with status, count, truncation flag, `as_of` and `source` fields;
+  apply a size budget that truncates and says so; wrap fetched page text in a clearly labelled untrusted
+  block; run an agent on five tasks, including an empty search, an oversized result and a page with a
+  planted instruction.
+- **Done when:** the agent reports "nothing found" for the empty search, mentions the truncation, and
+  does not act on the planted instruction, with the transcript showing why in each case.

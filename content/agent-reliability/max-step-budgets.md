@@ -5,7 +5,8 @@ name: Max-step budgets
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - agent-reliability/stopping-conditions-termination
   - agent-reliability/loop-detection
@@ -20,6 +21,19 @@ related:
 A max-step budget caps the model calls, tokens, seconds and dollars one run may spend. It is a backstop,
 not a target: set it from successful runs, warn before it fires, return a labelled partial, and treat
 every exhaustion as a stuck-agent signal.
+
+## For agent builders
+- **Why it matters for agents.** A stuck tool-calling loop re-sends a growing transcript every step, so
+  cost and latency climb faster than the step count. The budget is the one guard that works even when the
+  model, the tools and your other checks are all wrong.
+- **Where it shows up in your stack.** `max_turns` on `Runner.run` in the OpenAI Agents SDK
+  (`MaxTurnsExceeded`), `recursion_limit` in LangGraph (`GraphRecursionError`), usage fields on every
+  model response, per-call tool timeouts, and tenant quotas in a shared counter.
+- **What you control.** Which dimensions you cap (steps, tool calls, tokens, wall-clock, money, depth),
+  the number per task class, the soft warning, the projection before each call, the wrap-up reserve and
+  the sub-budgets handed to child agents.
+- **What you can skip.** Tuning one global step count by feel. Derive numbers from successful-run traces
+  and spend the effort on the exhaustion path instead.
 
 ## Why it exists
 - **Stuck models never stop themselves.** A stuck model keeps calling tools until something external
@@ -363,3 +377,24 @@ larger payloads. Report the exhaustion rate by task class rather than lowering t
 - [ ] Double the budget and continue
 > Exhaustion must be visible to callers and metrics, and the state must survive so a human or a retry
 > can resume. Returning the last message as success hides the failure; discarding loses the work.
+
+## Use cases & projects
+### Use cases
+- **Customer-facing chat agents.** A wall-clock budget with per-call timeouts keeps a slow tool from
+  turning one answer into a minutes-long spinner.
+- **Coding and browsing agents.** Token and per-tool caps ("no more than five web searches") bound the
+  quadratic growth of long runs and stop runaway search loops.
+- **Multi-agent research systems.** Parents hand sub-budgets to children and debit actual usage on return,
+  so one sub-agent cannot spend the whole allowance.
+- **Multi-tenant agent platforms.** Tenant daily quotas and a global concurrency cap stop a tool outage
+  from turning thousands of in-budget runs into one large bill.
+
+### Mini project
+**Build a multi-dimension budget for a tool loop (2-3 hours).**
+- **Goal:** wrap an existing agent loop in a budget that caps steps, tokens and wall-clock, warns at about
+  80%, and ends with a labelled `partial` built from a no-tools wrap-up call.
+- **Steps:** collect step and token counts from 30 successful runs of one task class; set the hard limit
+  near their p95 plus margin; charge from response usage fields; project `used + context + max_tokens`
+  before each call; reserve one call for the wrap-up; then force a stuck run with a tool that always fails.
+- **Done when:** the stuck run ends `partial` with a summary and checkpointed counters, no run overshoots
+  its token limit, and a short table compares exhaustion rate before and after the change.

@@ -414,3 +414,23 @@ failure cases, and only then decide whether adaptation of the weights is justifi
 > A list of questions is a perfectly likely continuation of a question in web text. The fact may well be
 > encoded; eliciting it as an answer rather than a continuation is what instruction tuning and preference
 > training provide.
+
+## Use cases & projects
+### Use cases
+- **Picking a base for an open-weight agent.** Teams compare candidate checkpoints on their own agent
+  transcripts before any fine-tuning, because a weak base caps tool-calling quality.
+- **Estimating agent token cost.** Tokenizer efficiency on tool schemas, JSON arguments and tool results
+  decides how many tokens every agent step costs.
+- **Domain agents with a large private corpus.** Legal, medical or code-heavy teams weigh continued
+  pre-training against RAG before building the agent on top.
+- **Explaining base-model behaviour.** When a base checkpoint continues a prompt instead of answering,
+  the team knows the fix is post-training, not prompt tweaking.
+
+### Mini project
+**Score two base checkpoints on your agent traffic (1-2 hours).**
+- **Goal:** pick the better base for an agent from data, not from leaderboards.
+- **Steps:** collect 50 agent transcripts (system prompt, tool definitions, tool calls and results); load
+  two small open-weight base models; measure tokens per word and average loss on the transcripts for each;
+  then give each a 3-shot prompt asking for one JSON tool call and check how many outputs parse.
+- **Done when:** you have a table with tokens per word, loss and JSON parse rate per model, and a short
+  recommendation of which base to fine-tune for the agent and why.

@@ -5,7 +5,8 @@ name: Tool adapters / service interfaces
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - agent-reliability/tool-permissions-and-least-privilege
   - agent-reliability/idempotent-tool-execution
@@ -24,6 +25,17 @@ sources:
 A tool adapter translates between small typed model calls and real services with auth, pagination, rate
 limits and 40-field responses. It validates, enforces policy, injects credentials, bounds retries and
 returns every outcome as a compact structured result, making tools testable, swappable and safe.
+
+## For agent builders
+- **Why it matters for agents.** The model only ever sees your tool contract and the result you hand
+  back. Whether it picks the right tool, fills arguments correctly and recovers from failures depends
+  more on the adapter's shape than on the prompt.
+- **Where it shows up in your stack.** Every tool definition you register with a provider API or agent
+  framework, every MCP server you write, and the fake service interfaces your eval harness swaps in.
+- **What you control.** Argument count and enums, the error taxonomy and `retryable` flag, which retries
+  happen inside the adapter, idempotency keys, response projection and where large payloads go.
+- **What you can skip.** Generic API-gateway theory and full hexagonal-architecture ceremony. One base
+  class with validation, timeout, error envelope and projection is enough to start.
 
 ## Why it exists
 - **Raw vendor APIs break three ways at once.** Hand a model the OpenAPI spec of a ticketing system and the
@@ -371,3 +383,23 @@ with its error class so success rate per tool is visible from day one.
 - [ ] It allows the model to call the vendor API directly when the adapter is down
 > Enums the model can read reduce argument errors and decouple the contract from vendor IDs that can
 > change; the adapter owns the translation.
+
+## Use cases & projects
+### Use cases
+- **Agents over SaaS systems.** Ticketing, CRM and billing tools get intent-level contracts and projected
+  results instead of a vendor's 60-endpoint spec.
+- **FDE integrations with legacy systems.** The adapter hides the customer's data model behind a contract
+  the standard agent already understands.
+- **Offline evals.** Swapping the service interface for recorded responses lets the same agent run
+  deterministically in CI.
+- **Shared tools across agents.** Packaging adapters as MCP servers gives several teams one contract and
+  one place for auth and error handling.
+
+### Mini project
+**Wrap a real API as an agent tool (2-3 hours).**
+- **Goal:** turn a public or internal HTTP API into one tool an agent can use reliably.
+- **Steps:** pick an API with a large response; write a Pydantic argument model with enums; implement
+  validate, translate, timeout, error normalization and projection; add contract tests with
+  `httpx.MockTransport` for a 201, a 429 and a 502; mount the tool in a small agent loop and run ten tasks.
+- **Done when:** every outcome reaches the model in the `ok/error/retryable` envelope, results stay under
+  a few hundred tokens, the contract tests pass, and you can report success rate per error class.

@@ -458,3 +458,25 @@ that awaits the call, decorated with `functools.wraps(fn)` so name, docstring an
 - [x] Only the time to create the coroutine object, since the call runs later when it is awaited
 > Calling an async function returns a coroutine without executing its body. Timing, retries and
 > exception handling must happen in an async wrapper that awaits the call.
+
+## Use cases & projects
+### Use cases
+- **Registering agent tools.** `@mcp.tool()` and framework `@tool` decorators read the name, signature and
+  docstring to build the schema the model sees.
+- **Uniform tool wrapping.** One decorator adds retry, timeout and error-to-result conversion to every
+  tool, so a failing tool returns a message the model can act on.
+- **Tracing agent steps.** A tracing decorator records latency, inputs and token counts per model and tool
+  call without touching the tool body.
+- **Approval gates.** A decorator marks risky tools (send email, run code) as needing human approval before
+  the call goes through.
+
+### Mini project
+**Build a tool registry with an async-aware wrapper (1-2 hours).**
+- **Goal:** register tools with a decorator, generate their schemas, and wrap every call with timing and
+  retry that works for async tools.
+- **Steps:** write a `@tool` decorator that stores each function in a registry and builds a JSON schema
+  from `inspect.signature` and the docstring; write a `@traced` decorator using `functools.wraps` that
+  awaits async tools and records duration; stack them on three tools; then remove `wraps` and watch the
+  schemas break.
+- **Done when:** the generated schemas show real tool names and docstrings, timings reflect real awaited
+  durations, and you can explain why the stacking order you chose is correct.

@@ -5,7 +5,8 @@ name: Tool privilege escalation
 kind: concept
 difficulty: core
 est_minutes: 17
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - safety-security/excessive-agency
   - safety-security/prompt-injection
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Tool privilege escalation is low-trust input (a user, a fetched page, a document) exercising a
-high-trust capability (a service account, a shell, a payment API) through the model. The fix: each tool
-call carries only the requester's authority.
+In an agent, low-trust text (a user, a fetched page, a document) can drive high-trust tools (a service
+account, a shell, a payment API) through the model. The fix lives in your tool layer: each call carries
+only the requester's authority.
+
+## For agent builders
+- **Why it matters for agents.** Your agent's privilege is the union of its tools, and the model picking
+  the next call can be steered by any text in its context. A wrong token is no longer a bad answer; it is
+  a `DELETE`, a refund or an outbound email.
+- **Where it shows up in your stack.** The tool registry or dispatcher in your framework, the credentials
+  each tool loads, MCP servers you connect to, sub-agent hand-offs, and the approval step before
+  consequential writes.
+- **What you control.** Where each tool's credential comes from (delegated per user, not a shared service
+  account), typed tool arguments, ownership checks, a taint flag that drops egress tools, sandboxes and
+  pinned tool manifests. All of it runs outside the model.
+- **What you can skip.** Trying to make the model "refuse better". Prompt rules and reviewer LLMs are
+  probabilistic signals; spend the effort on authorization code the model never sees.
 
 ## Why it exists
 - **An agent's privilege is the union of its tools.** The model picks the next tool call and can be
@@ -45,7 +59,7 @@ call carries only the requester's authority.
 
 ## How it works
 ### Where a tool's authority comes from
-There are three sources, and the choice decides your blast radius.
+There are three sources, and the choice decides your agent's blast radius.
 
 | Source | Example | Authority equals |
 |---|---|---|
@@ -69,7 +83,7 @@ There are three sources, and the choice decides your blast radius.
   *their* order?") were never written.
 - **You need both checks, enforced outside the model,** because each passes what the other blocks.
 
-### The escalation paths
+### The escalation paths in an agent loop
 - **Over-scoped credentials.** `query_db` uses a role that can write because that was easier to set up.
 - **Argument injection.** A free-text parameter interpreted by another engine: `run_shell(cmd)`,
   `sql(query)`, `http_request(method, url, body)`. The model becomes a thin wrapper around arbitrary
@@ -118,8 +132,8 @@ Each defence attacks one link in the chain; you need several because no single o
   Treat it as the direction of travel rather than an off-the-shelf control.
 
 ## Diagram
-Follow a proposed tool call: the model can be steered by untrusted text, so every decision happens in
-the authorizer, using the principal from the verified token, never the model's prose.
+Follow a proposed tool call through the agent loop: the model can be steered by untrusted text, so every
+decision happens in the authorizer, using the principal from the verified token, never the model's prose.
 
 ```mermaid
 flowchart TD
@@ -181,6 +195,7 @@ def authorize(ctx: Context, name: str, args: dict) -> None:
         require_human_approval(ctx.principal, name, args)       # blocks until approved
 
 def run_tool(ctx: Context, name: str, args: dict):
+    spec = TOOLS[name]
     authorize(ctx, name, args)
     result = TOOLS_IMPL[name](**args, as_user=ctx.principal.user_id)  # user-scoped credential
     if spec.get("untrusted"):
@@ -188,8 +203,10 @@ def run_tool(ctx: Context, name: str, args: dict):
     return result
 ```
 
-- **Note:** `run_tool` reads `spec` without defining it; in real code add `spec = TOOLS[name]` at the top
-  of `run_tool`, or the taint flag is never set.
+- **Note:** `run_tool` must look up `spec = TOOLS[name]` itself (an earlier draft of this code read
+  `spec` without defining it), or the taint flag is never set.
+- **Wire it into the loop:** your agent loop calls `run_tool` for every model-proposed call and returns a
+  `PermissionError` to the model as a tool result, so the agent can explain the refusal instead of crashing.
 
 ### Walking three requests through it
 A customer with scopes `{orders:read, orders:refund}`:
@@ -228,6 +245,9 @@ Three questions per tool, filled in for a typical first draft (illustrative):
 - **Approval gates rendered from arguments.** Show the reviewer the structured call (`issue_refund`,
   order ID, amount), not the model's summary, and require approval only for irreversible or high-value
   actions. Monitor approval rate and median time-to-approve to catch rubber-stamping and fatigue.
+- **Attenuated sub-agent hand-offs.** When an orchestrator delegates to a sub-agent, pass the original
+  principal and a subset of its scopes in the hand-off, and have the sub-agent's tools authorize against
+  that, not their own service identity. Monitor calls where the recorded principal is an agent identity.
 
 ## Trade-offs
 - **Per-user delegated credentials vs plumbing.** They give the smallest blast radius but need token
@@ -266,7 +286,8 @@ Three questions per tool, filled in for a typical first draft (illustrative):
 - **Measure:** the share of calls attributed to a real principal, the number of tools with free-text
   executable arguments (target: zero in production), and red-team pass rates for injection-to-action
   chains.
-- **Day to day:** it shows up as a code review question, "where does this token come from?".
+- **Day to day:** it shows up as a code review question on every new agent tool, "where does this token
+  come from?".
 - **Interviews:** expect to threat-model an agent with a shell tool and to explain why a system-prompt
   instruction is not a control.
 
@@ -324,6 +345,13 @@ log every call with the principal and the source of the instruction.
   becomes every user's ceiling.
 - **Either way,** log the triggering job or user in every call so actions stay attributable.
 
+### How do you keep authority intact when an orchestrator agent delegates to sub-agents?
+- **Carry the principal, not the agent:** the hand-off includes the original user and a subset of their
+  scopes, and each sub-agent tool authorizes against that context.
+- **Attenuate, never widen:** each hop can drop scopes but not add them, so a sub-agent with broad tools
+  still cannot exceed what the intern behind the request could do.
+- **Audit per hop:** log the principal and the delegating agent on every call to spot re-derived identities.
+
 ### What would you measure to show an agent's tool layer is getting safer over time?
 - **Attribution:** the share of tool calls tied to a real principal, aiming for all of them.
 - **Attack surface:** the number of tools with free-text executable arguments, target zero in production.
@@ -356,3 +384,25 @@ log every call with the principal and the source of the instruction.
 > The attack is a composition of a read and an outbound send. Taint-based restriction breaks exactly that
 > composition while leaving reads and internal actions usable; moderation classifiers do not detect
 > injected instructions reliably, and approving every call is unworkable.
+
+## Use cases & projects
+### Use cases
+- **Customer support agents with refunds.** Ownership checks and amount caps keep "refund order 88213"
+  from touching another customer's order or exceeding policy.
+- **DevOps and SRE copilots.** Replacing a cluster-admin shell with typed, user-scoped read tools plus gated
+  mutations is the standard hardening step before rollout.
+- **Agents that browse or read email.** Taint flags drop egress tools once fetched or inbound text is in
+  context, breaking read-then-exfiltrate chains.
+- **Platforms connecting third-party MCP servers.** Pinned, hashed tool manifests and per-user tokens stop a
+  poisoned tool description from steering the agent.
+
+### Mini project
+**Break and fix a tool-calling support agent (2-3 hours).**
+- **Goal:** show that authorization in the tool layer, not the prompt, stops vertical, horizontal and
+  composition attacks.
+- **Steps:** build a small agent with `lookup_order`, `issue_refund`, `fetch_url` and `send_email` backed by
+  fake data; run five attack prompts (another user's order, over-cap refund, a fetched page asking to email
+  data out, a rephrased variant, a follow-up turn after the fetch) against a prompt-only version; then add
+  the `authorize` and taint logic from the example and rerun.
+- **Done when:** you have a table of attack versus outcome for both versions, every attack is blocked in
+  the second, the audit log names the principal and source of each call, and legitimate requests still work.

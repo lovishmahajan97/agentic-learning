@@ -5,7 +5,8 @@ name: NoSQL
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - backend-fundamentals/database-design
   - backend-fundamentals/sql
@@ -23,8 +24,22 @@ sources:
 
 ## TL;DR
 NoSQL stores give up joins and cross-record transactions to partition data by key with predictable
-latency at any size. You design around exact queries and accept weaker reads. Choose one for a known,
-narrow access pattern at scale, not because "schemaless" sounds easier.
+latency at any size. They suit agent session state and step logs keyed by session, if keys follow the
+agent's exact queries and you accept weaker reads.
+
+## For agent builders
+- **Why it matters for agents.** Agent sessions are naturally key-shaped: load this thread's state, append
+  this step, list this user's recent sessions. A key-value or document store serves those in one
+  single-partition call at any scale, which is why many agent platforms keep session state and
+  transcripts there.
+- **Where it shows up in your stack.** DynamoDB or MongoDB as a session and checkpoint store, Redis as a
+  short-lived key-value layer, change streams feeding traces into a warehouse for evals, and vector
+  databases, which behave like document stores with a different index.
+- **What you control.** The partition and sort keys (session id, zero-padded step number), embed versus
+  reference for tool results, conditional writes so a retried step cannot overwrite, TTL on ephemeral
+  state, and which reads must be strongly consistent.
+- **What you can skip.** Dynamo paper internals and LSM compaction tuning. Know quorums, hot partitions,
+  item size limits and access-pattern-first modelling; that is what agent state stores need.
 
 ## Why it exists
 - **One machine has a ceiling.** A relational database answers any SQL question, but only within one
@@ -129,6 +144,20 @@ Cassandra, ScyllaDB and Bigtable use a log-structured merge tree (LSM), not an u
   per transaction at the time of writing). They cost more capacity and are limited in scope.
 - **Every secondary index is a copy** maintained on every write. In DynamoDB each GSI also consumes its own
   write capacity and storage, so "index everything" shows up directly on the bill.
+
+### Agent state in a key-value or document store
+| Agent data | Shape | Why |
+|---|---|---|
+| **Session header** (user, title, status) | one item per session under the user's partition | "my recent sessions" is one query |
+| **Steps and messages** | one item per step, partition = session, sort = zero-padded step | unbounded, appended in order |
+| **Small tool results** | embedded in the step item | read together with the step |
+| **Large tool results** (fetched pages, files) | object storage, pointer in the step item | a single page can exceed 400 KB |
+| **Scratch state** (plans, locks, caches) | item with a TTL attribute | expires without a cleanup job |
+
+- **Resuming after a crash** is a strongly consistent query for the session's last step, because an
+  eventually consistent read could miss the step just written and redo a side effect.
+- **Analytics and evals do not belong here.** "Failure rate per tool across all tenants" is a scan; stream
+  the items into a warehouse or Postgres and ask there.
 
 ## Diagram
 Every request either carries the partition key and goes to one replica set, or it fans out to every node;
@@ -241,6 +270,21 @@ per-partition limit above; arithmetic only, not a benchmark.
 
 Raising table capacity does not help, because the limit is per partition.
 
+### Agent scenario: a research agent's step log hits the item limit
+An agent stores each run as one document with an embedded `steps` array, and every step embeds the raw
+tool result. Sizes are illustrative.
+
+| Steps into the run | Embedded tool results | Item size | Effect |
+|---|---|---|---|
+| 5 | 5 search results, ~8 KB each | ~40 KB | fine, but every append rewrites 40 KB |
+| 20 | plus 3 fetched pages, ~60 KB each | ~340 KB | appends slow, write units per step climb |
+| 25 | one more fetched page | over 400 KB | DynamoDB rejects the write, the run cannot checkpoint |
+
+- **Fix:** one item per step (partition `RUN#<id>`, sort `STEP#00000025`), large results in object
+  storage with a pointer, and a small run header item for status.
+- **After the fix,** each append writes only the new step, and resume reads the last step with one
+  strongly consistent `Query` with `ScanIndexForward=False, Limit=1`.
+
 ## Production patterns
 - **Find hot keys before they page you.** Enable CloudWatch Contributor Insights on DynamoDB tables to see
   the most-accessed and most-throttled keys, and alarm on `WriteThrottleEvents` and `ReadThrottleEvents`.
@@ -256,6 +300,10 @@ Raising table capacity does not help, because the limit is per partition.
   failures by version to know when old shapes can be retired.
 - **Stream changes to the stores that answer other questions.** Feed DynamoDB Streams or MongoDB change
   streams into search, analytics or the warehouse instead of scanning. Monitor consumer lag (iterator age).
+  Agent teams use this to land every step in the warehouse where eval and cost queries run.
+- **One item per agent step, payloads offloaded.** Key steps by session and zero-padded step number,
+  store large tool outputs in object storage, and keep a pointer. Monitor p99 item size per table; growth
+  toward the limit means something is embedding unbounded data again.
 
 ## Trade-offs
 - **Horizontal scale vs query freedom.** Single-partition operations scale with no ceiling in practice,
@@ -287,12 +335,17 @@ Raising table capacity does not help, because the limit is per partition.
   full of defensive `get` calls and analytics that undercount.
 - **Treating secondary indexes as free.** Symptom: write cost multiplying with each index, and GSI reads
   that lag the base table.
+- **Resuming an agent from an eventually consistent read.** Symptom: after a worker restart, the agent
+  repeats a tool call it had already made, because the read missed the last step. Fix: strongly
+  consistent reads on the resume path, plus a conditional put per step number.
 
 ## When to use
 - **Use when:** you can write down the handful of access patterns up front, each keys to a single
   partition, and write rate, data volume or availability needs exceed one relational node comfortably.
 - **Typical AI fits:** per-session agent state and message logs keyed by session, high-volume event and
   trace ingestion, feature or cache lookups by id.
+- **Keep agent analytics elsewhere:** cost, failure-rate and eval queries go to SQL or a warehouse fed by
+  change streams, because they never carry a single partition key.
 - **Avoid when:** the data fits one machine and the questions are still changing; stay relational and add
   a specialised store (search, vector, key-value cache) beside PostgreSQL rather than replacing it.
 - **Measure:** partition heat and consistent-read usage once live.
@@ -350,6 +403,12 @@ load, not just identify ownership.
 - **Costs:** reads may check several files (bloom filters help), compaction uses background disk bandwidth,
   and deletes leave tombstones that slow reads on queue-like partitions until compaction.
 
+### Your agent sometimes repeats a tool call after a worker restart. The state store is DynamoDB. Why?
+- **Stale resume read.** The restarted worker read the session's last step with a default, eventually
+  consistent read and missed the step that recorded the tool call, so it ran the call again.
+- **Fix:** strongly consistent `Query` for the last step on the resume path, a conditional put keyed by
+  step number so a duplicate step cannot be written, and an idempotency key on the side-effecting tool.
+
 ## Quiz
 ### Q: Why does a document store make joins across collections expensive or unsupported?
 - [ ] JSON documents cannot contain foreign keys
@@ -374,3 +433,24 @@ load, not just identify ownership.
 - [ ] Any setting, because replication is synchronous by default
 > Overlap requires W + R > N. With W = 2 and R = 2 (a strict quorum), at least one replica consulted by the
 > read holds the write. W = 1 with R = 2 can read the two replicas that both missed it.
+
+## Use cases & projects
+### Use cases
+- **Session and checkpoint stores.** Agent platforms keep per-session state and step logs keyed by
+  session id, so load and append stay one call at any number of users.
+- **High-volume trace ingestion.** Every model call and tool call is an event; a wide-column or key-value
+  store absorbs the write rate, and a stream feeds the warehouse.
+- **Ephemeral agent memory.** Short-lived plans, scratchpads and per-session caches with TTL expire on
+  their own instead of needing a cleanup job.
+- **Multi-tenant agent SaaS.** Keys that combine tenant and session spread a large customer's traffic
+  across partitions instead of throttling one.
+
+### Mini project
+**Build a DynamoDB-style step store for a resumable agent (2-3 hours).**
+- **Goal:** store an agent's sessions and steps by key so a crashed run resumes without repeating a step.
+- **Steps:** use DynamoDB Local or a dict-backed fake with the same key layout; write `append_step` with a
+  conditional put on the step key, `last_step` with a consistent read, and `recent_sessions`; run a fake
+  four-step agent, kill it after step 2, restart and resume; push a large tool result through the
+  pointer path.
+- **Done when:** the resumed run produces exactly four step items, a forced duplicate append raises a
+  conditional-check failure, and no item exceeds a size cap you assert in a test.

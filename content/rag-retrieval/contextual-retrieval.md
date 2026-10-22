@@ -427,3 +427,25 @@ baseline.
 - [ ] Chunk overlap was set too high
 > The context is meant to add a few disambiguating facts, not to replace the chunk's own content; when it
 > dominates, all chunks of a document collapse toward one vector and intra-document discrimination is lost.
+
+## Use cases & projects
+### Use cases
+- **Knowledge bases full of ambiguous chunks.** "Revenue grew 3% over the prior quarter" is unfindable
+  without the company and period, which the generated context adds.
+- **Agent memory writes.** Saving a note with who, when and which task it came from makes it retrievable
+  in later sessions.
+- **Hybrid search behind an agent tool.** Adding the context to both the dense and BM25 legs helps
+  keyword-style queries find chunks whose own text lacks the entity name.
+- **Cheap retrieval wins for multi-search agents.** The cost is paid once at ingestion instead of on every
+  agent search call.
+
+### Mini project
+**Contextualise chunks and measure the agent's retrieval (2-3 hours).**
+- **Goal:** show whether generated chunk contexts improve retrieval for an agent's search tool on your
+  documents.
+- **Steps:** pick a few long documents whose chunks lose meaning out of context and write about 30
+  questions with labelled chunks; build three indexes: plain chunks, title and heading prefix, and an
+  LLM-generated short context per chunk with the document as a cached prefix; index each into dense and
+  BM25; compare recall@k and record ingestion tokens and time.
+- **Done when:** you have a recall table for the three variants, the ingestion cost of each, and three
+  generated contexts you checked by hand for accuracy.

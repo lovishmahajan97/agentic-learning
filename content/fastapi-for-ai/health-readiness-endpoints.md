@@ -469,3 +469,28 @@ endpoint serves dashboards.
 - [ ] A redirect to another replica
 > Draining means "alive but should not get new traffic", which is exactly readiness semantics. In-flight
 > requests continue; a 500 or restart would cut them off.
+
+## Use cases & projects
+### Use cases
+- **Agent services on Kubernetes.** Separate `/livez` and `/readyz` routes keep a flaky tool backend from
+  restarting every replica mid-run.
+- **Slow model or prompt loading.** A startup probe covers lifespan work (loading models, prompts and the
+  tool registry) without loosening liveness for the rest of the pod's life.
+- **Degraded mode instead of outage.** When one tool backend or the primary model provider is down, the
+  agent answers with fewer tools or a fallback model rather than failing readiness everywhere.
+- **Draining before shutdown.** Readiness turning false is the signal that stops new runs while in-flight
+  runs finish.
+
+### Mini project
+**Probe an agent service without self-inflicted outages (1-2 hours).**
+- **Goal:** build probes that restart only broken processes and route around only broken instances.
+- **Steps:** add `/livez` (process only) and `/readyz` (checkpoint store reachable, tool registry loaded,
+  drain flag clear) to a FastAPI agent stub; run it locally with a fake tool backend; stop the tool
+  backend and confirm both probes stay healthy while the agent reports the tool as unavailable; stop the
+  checkpoint store and confirm only readiness fails.
+- **Done when:** a written table lists each dependency failure and the probe result you observed, and no
+  shared dependency appears in the liveness check.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide), which needs separate liveness and
+readiness probes, with readiness going false before the process stops accepting.

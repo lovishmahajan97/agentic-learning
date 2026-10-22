@@ -424,3 +424,24 @@ small structure that actually changes and makes the sharing impossible rather th
 - [ ] A `ValueError` was raised because views cannot be modified in place
 > Basic slicing and indexing in NumPy return views, so an in-place operation on the view writes into
 > the original buffer. `emb[0].copy()` or an out-of-place expression avoids the side effect.
+
+## Use cases & projects
+### Use cases
+- **Forking agent runs.** Branching a run to try two plans needs its own message list, or one branch's
+  tool results leak into the other.
+- **Multi-tenant prompt templates.** A shared system prompt and tool list must stay immutable, or one
+  tenant's edit changes every other tenant's agent.
+- **History compaction.** Summarising old turns should build a new list, so traces and checkpoints keep
+  the original transcript.
+- **Graph nodes returning updates.** Nodes that return new values instead of editing received state keep
+  parallel branches and checkpoints consistent.
+
+### Mini project
+**Find and fix shared-state bugs in an agent (1-2 hours).**
+- **Goal:** reproduce the mutable-default and shallow-copy bugs in a small agent, then fix them.
+- **Steps:** write an `ask` function with a `history=[]` default and a template dict holding a `tools`
+  list; run two simulated users and show their histories merge; give one tenant a `.copy()` of the
+  template and edit its tools; fix with `None` defaults, tuples or frozen records and `copy.deepcopy`
+  where needed.
+- **Done when:** a test with two users and two tenants fails before the fix, passes after it, and an `is`
+  check proves no list is shared between runs.

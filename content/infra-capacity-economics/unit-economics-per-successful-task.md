@@ -5,7 +5,8 @@ name: Unit economics per successful task
 kind: metric
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - infra-capacity-economics/cost-modeling
   - infra-capacity-economics/cost-optimization
@@ -17,9 +18,21 @@ related:
 ---
 
 ## TL;DR
-Cost per successful task divides everything a unit of work costs (failed attempts, retries,
+Cost per successful task divides everything an agent spends on a unit of work (failed runs, retries,
 verification, human fallback, damage from missed errors) by tasks meeting an agreed acceptance bar.
-Compare it with task value to know whether the product makes money.
+Compare it with task value to know whether the agent makes money.
+
+## For agent builders
+- **Why it matters for agents.** Agents fail expensively: a run can loop for 40 steps and still fail, and
+  a confident wrong answer can pass every check. Cost per call or per run hides both, so it is the wrong
+  number for choosing models, step limits, retry policies or human-in-the-loop designs.
+- **Where it shows up in your stack.** A task or run ID on every span in your traces, the verifier or
+  LLM-as-judge step after the agent, the escalation path to a human queue, and the eval suite that
+  defines acceptance per task category.
+- **What you control.** The acceptance definition, the verifier and its detection rate, the retry budget
+  k, the step cap, which model each step uses, and when the agent hands off to a human.
+- **What you can skip.** Full product accounting with amortized fixed costs when choosing between agent
+  designs; marginal cost per successful task is enough for that comparison.
 
 ## Why it exists
 - **Dashboards show cost per call because providers bill per token.** That answers the wrong question.
@@ -40,14 +53,16 @@ Compare it with task value to know whether the product makes money.
 - **In terms the customer would accept:** ticket resolved and not reopened within a set window;
   extraction matching the source on all required fields; code change passing tests and merged.
 - **Decide how it is measured:** automated checks, sampled human review, or a downstream signal. A metric
-  without a fixed definition drifts toward whatever is easy to count.
+  without a fixed definition drifts toward whatever is easy to count. "The agent returned a final
+  answer" is not success.
 - **Use closed cohorts.** Downstream signals arrive late (a ticket counts as resolved only once the reopen
   window has passed), so compute on cohorts whose window has closed, or this week's number looks better
   than it is.
 
 ### 2. Count all the cost
 For a period or a cohort of tasks, sum:
-- **Model tokens for every attempt,** including failed and abandoned ones, and reasoning tokens.
+- **Model tokens for every attempt,** including failed and abandoned ones, and reasoning tokens. For an
+  agent that means every step of every run, including runs that hit the step cap.
 - **Non-model calls:** retrieval, tools, guardrails, verifier or judge models.
 - **Human time** for review, escalation and correction, at a loaded hourly rate.
 - **Expected cost of undetected errors:** rate of silent failure × cost per incident.
@@ -85,12 +100,12 @@ c + (1 − p)·(d·h + (1 − d)·e)  <  h     →     p  >  1 − (h − c) / (
 - **The task mix shifts over time,** so recompute per task category, not one global number.
 
 ## Diagram
-One task's paths: only caught failures can be retried; missed failures skip straight to the error cost,
-which is why detection rate matters so much.
+One agent task's paths: only caught failures can be retried; missed failures skip straight to the error
+cost, which is why detection rate matters so much.
 
 ```mermaid
 flowchart TD
-    T["Task arrives"] --> A["AI attempt: cost c"]
+    T["Task arrives"] --> A["Agent run: cost c"]
     A --> V{"Verifier passes?"}
     V -->|"yes, correct"| S["Success"]
     V -->|"yes, but wrong"| E["Silent error: cost e"]
@@ -142,6 +157,61 @@ for name, c, p in (("small", 0.02, 0.60), ("large", 0.08, 0.90)):
 - **Break-even:** against the all-human $4.00, the formula gives p > 1 − 3.975 / 7.2 ≈ 0.45 for the small
   model. At 60% it beats doing everything by hand, but by a thin margin a small rise in silent-error cost
   would erase.
+
+### Computing it from agent traces
+Group every attempt by task ID, charge failed runs, escalations and silent errors, then divide by
+accepted tasks. The rows are illustrative; in production they come from your trace export.
+
+```python
+from collections import defaultdict
+
+# One row per agent attempt, exported from traces (illustrative values).
+attempts = [
+    {"task": "T1", "cost": 0.31, "verifier_pass": True,  "accepted": True},
+    {"task": "T2", "cost": 0.95, "verifier_pass": False, "accepted": False},  # looped, caught
+    {"task": "T2", "cost": 0.40, "verifier_pass": True,  "accepted": True},   # retry worked
+    {"task": "T3", "cost": 2.10, "verifier_pass": False, "accepted": False},  # hit step cap
+    {"task": "T4", "cost": 0.28, "verifier_pass": True,  "accepted": False},  # silent error
+]
+HUMAN, ERROR = 4.00, 20.00                     # $ per escalation, $ per silent error
+
+tasks = defaultdict(list)
+for a in attempts:
+    tasks[a["task"]].append(a)
+
+total = successes = 0.0
+for rows in tasks.values():
+    total += sum(r["cost"] for r in rows)      # every attempt counts, failed ones too
+    last = rows[-1]
+    if last["accepted"]:
+        successes += 1
+    elif last["verifier_pass"]:
+        total += ERROR                         # passed the verifier but was wrong
+    else:
+        total += HUMAN; successes += 1         # escalated, a human finished it
+
+print(f"AI spend ${sum(a['cost'] for a in attempts):.2f}, fully loaded ${total:.2f}")
+print(f"cost per successful task ${total / successes:.2f} over {successes:.0f} successes")
+# AI spend $4.04, fully loaded $28.04
+# cost per successful task $9.35 over 3 successes
+```
+
+- **The step-capped run (T3) cost more tokens than any success** and still needed a human.
+- **The silent error (T4) is the largest single line**, though its tokens were the cheapest.
+
+### Worked scenario: choosing a step cap for a coding agent
+Illustrative numbers: a human engineer finishes any failed task at $25; every failure is caught by the
+test suite.
+
+| Step cap | Success rate | Mean AI cost per run | AI spend per success | Fully loaded per task |
+|---|---|---|---|---|
+| 40 steps | 78% | $0.90 | $1.15 | 0.90 + 0.22 × 25 = $6.40 |
+| 15 steps | 74% | $0.45 | $0.61 | 0.45 + 0.26 × 25 = $6.95 |
+
+- **The tighter cap halves AI spend per success** and still loses, because 4 more points of failures cost
+  $1.00 of engineer time per task against $0.45 of tokens saved, a net loss of $0.55 per task.
+- **The cap is a success-rate decision first** and a token decision second whenever human fallback is
+  expensive.
 
 ### How detection moves the break-even bar
 The same formula as a function, for the small model (c = $0.02 + $0.005 verifier).
@@ -196,6 +266,9 @@ An illustrative month of 10,000 tickets whose 7-day reopen window has closed.
 - **Retry budget tied to detection.** Allow retries only after a verifier rejects an output, cap them at a
   small k, then route to a human. Monitor success on the second attempt; if it is far below the first,
   failures are correlated and retries are wasted.
+- **Step caps chosen from fully loaded cost.** Agent teams sweep the step limit on the eval set and pick
+  the cap with the lowest fully loaded cost per task, not the lowest token spend. Monitor the share of
+  runs that hit the cap per category.
 - **Break-even check before rollout.** For each new model or prompt, compute required p from c, h, d and e
   and compare with the eval success rate per category. Ship only where the margin is comfortably
   positive.
@@ -208,6 +281,8 @@ An illustrative month of 10,000 tickets whose 7-day reopen window has closed.
   silent failure costs much more than verification; for low-stakes tasks it can be pure overhead.
 - **More retries vs tokens and latency.** Retries raise automation rate, but each costs tokens and
   latency and helps only when failures are detected and not strongly correlated across attempts.
+- **Tighter step caps vs success.** They bound runaway token spend, but each task they cut off becomes an
+  escalation; the trade flips when human fallback is cheap relative to long runs.
 - **Fully loaded vs marginal cost.** Including amortized fixed costs gives the true product margin but
   blurs comparisons between designs; use marginal cost to choose designs and fully loaded cost to price.
 
@@ -222,8 +297,8 @@ An illustrative month of 10,000 tickets whose 7-day reopen window has closed.
   predicted rate because the same hard inputs keep failing. Fix: measure second-attempt success.
 
 ## When to use
-- **Use when** comparing models, prompts, retry policies or human-in-the-loop designs, and when pricing an
-  AI feature or arguing for its ROI.
+- **Use when** comparing models, prompts, retry policies, step caps or human-in-the-loop designs, and when
+  pricing an AI feature or arguing for its ROI.
 - **Measure** per task category and per tenant rather than globally; track weekly next to success rate
   and escalation rate, and validate the success definition with sampled human review.
 - **Avoid** during early prototyping, before there is a stable task definition.
@@ -261,6 +336,14 @@ ticket category.
 - **Each attempt is another chance for a silent miss,** so the silent-error term grows; in the
   illustrative example it rises from $1.60 to about $2.28 per task.
 - **Fix detection first:** a better verifier lowers both escalation and silent-error terms.
+
+### How would you choose the step limit for a production agent?
+- **Sweep it on the eval set:** run the agent at several caps and record success rate, mean cost per run
+  and escalations per category.
+- **Pick on fully loaded cost per task:** a tighter cap saves tokens but every task it cuts off becomes a
+  human escalation, which often costs far more.
+- **Then monitor** the share of runs hitting the cap in production; a rising share means the task mix or a
+  tool changed.
 
 ### When would you not add a verifier step?
 - **When silent failures are cheap:** for low-stakes tasks the verifier is pure overhead on every task.
@@ -307,3 +390,26 @@ ticket category.
 > Retries only act on failures the verifier detects, so they shift work from human escalation to
 > automation. Missed failures never trigger a retry, and each extra attempt is another chance of a
 > silent miss, so the silent-error term does not fall and can even grow; it needs better detection.
+
+## Use cases & projects
+### Use cases
+- **Choosing the model for a support or triage agent.** Fully loaded cost per resolved ticket shows when
+  the pricier, more accurate model is the cheaper one.
+- **Deciding whether to add a verifier or judge step.** The break-even formula weighs verifier cost on
+  every task against the silent errors it catches.
+- **Setting retry budgets and step caps.** Both are chosen on cost per successful task, because each
+  shifts cost between tokens, escalations and silent errors.
+- **Making the ROI case to a customer.** Their human handling cost and success definition turn agent
+  metrics into a margin per task finance can check.
+
+### Mini project
+**Cost per successful task dashboard for an agent (2-3 hours).**
+- **Goal:** compute fully loaded cost per successful task for a small agent under two designs and pick the
+  better one.
+- **Steps:** run an agent over a 30-task eval set with a task ID on every attempt; add a simple verifier
+  (tests or a rubric check); export attempts with cost, verifier result and ground-truth acceptance; charge
+  an assumed human cost for escalations and an error cost for silent failures; repeat with a different
+  model or step cap.
+- **Done when:** you have a table per design with AI spend per success, detection rate, escalation rate
+  and fully loaded cost per successful task, and a one-paragraph recommendation that names the dominant
+  cost term.

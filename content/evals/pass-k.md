@@ -403,3 +403,24 @@ rerun similar queries daily, report pass^k as well, since reliability is what th
 - [ ] recall@k
 > pass@k needs only one success among k tries, maj@k needs a majority to agree, and recall@k is a
 > retrieval metric; pass^k is p^k per problem and is the reliability figure for repeated use.
+
+## Use cases & projects
+### Use cases
+- **Reliability reports for customer agents.** pass^k shows how often a task that users repeat daily
+  works every time, which single-run accuracy hides.
+- **Sizing retry and best-of-n loops.** The gap between pass@1 and pass@k says how much a verifier plus
+  retries can recover, and at what cost in runs.
+- **Coding agents with test suites.** Retry-until-tests-pass loops deliver roughly pass@k because the
+  tests act as the verifier.
+- **Finding flaky tasks.** Per-task pass counts over n runs separate tasks that always fail from tasks
+  the agent solves only sometimes.
+
+### Mini project
+**Repeated-trial reliability report for a small agent (2-3 hours).**
+- **Goal:** measure pass@1, pass@k and pass^k for a tool-calling agent on 20-30 tasks with executable
+  checks.
+- **Steps:** write tasks whose success is checked in code (final state or tool arguments); reset state
+  between runs; run each task n times at your shipping temperature; compute per-task estimates with the
+  unbiased formulas and average over tasks, never pooling.
+- **Done when:** a table lists pass@1, pass@k and pass^k for two values of k, flags the flakiest tasks,
+  and states which number you would put on a release report and why.

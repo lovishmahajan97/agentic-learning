@@ -5,7 +5,8 @@ name: Productionization
 kind: practice
 difficulty: advanced
 est_minutes: 17
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - scoping/pilot-to-production-plan
   - scoping/rapid-prototyping-poc
@@ -18,9 +19,21 @@ related:
 ---
 
 ## TL;DR
-Productionization turns a happy-path prototype into a system that survives real traffic, bad inputs,
-outages, model changes, adversaries and audits. The model call is a small part; plan reliability, eval
-gates, observability, security, cost and ownership as risk-ordered hardening.
+Productionizing an agent turns a happy-path loop into a system that survives real traffic, bad inputs,
+outages, model changes, prompt injection and audits. Plan reliability, step and cost limits, eval gates,
+traces, tool security and ownership as risk-ordered hardening.
+
+## For agent builders
+- **Why it matters for agents.** An agent multiplies every model-call risk by its step count, and adds new
+  ones: loops that never finish, tool calls that repeat side effects on retry, and injected instructions in
+  tool results that steer later steps.
+- **Where it shows up in your stack.** The LLM gateway (timeouts, retries, quotas), the agent loop (step,
+  token and spend limits), tool wrappers (authorization, idempotency keys, schemas), the trace store and the
+  eval gate in CI.
+- **What you control.** Which layer retries, the per-task step and cost budget, which tools need approval,
+  the identity each tool call runs as, model pinning, and what gets logged and redacted.
+- **What you can skip.** Building your own gateway or tracing backend on day one; a shared library or an
+  existing platform covers it, as long as the concerns above are handled somewhere.
 
 ## Why it exists
 - **A prototype makes every time-saving assumption.** One user, clean inputs, a provider that always
@@ -48,7 +61,7 @@ Organize the work by what can go wrong, because that makes gaps visible and lets
   and cap total attempts, because unbounded retries multiply cost and load during an outage.
 - **Validate structured output against a schema** and handle failure. A schema failure is a middle case:
   outputs are sampled, so one bounded re-try (or a repair prompt) often succeeds, but count it separately so
-  a prompt regression is not hidden by retries.
+  a prompt regression is not hidden by retries. For agents, validate tool-call arguments the same way.
 - **Define a fallback:** a secondary model, a cached answer, or a graceful "cannot answer, routing to a
   person".
 
@@ -62,25 +75,36 @@ Two retry details decide whether this helps or hurts during an incident:
 - **Only retry what is safe to repeat.** Re-sending a classification is harmless; re-running a tool call that
   sends an email or files a refund duplicates it unless the action carries an idempotency key.
 
-### 2. Quality as a release gate
+### 2. Bounding the agent loop
+- **Step limit per task,** because a model can loop on a failing tool; stop and hand off at the cap.
+- **Token and spend budget per task,** because each step re-sends a growing transcript, so a looping task
+  costs far more than its step count suggests.
+- **Overall deadline,** passed into each model and tool call so the whole task, not each call, fits what the
+  user will wait.
+- **Approval gates on consequential tools,** so a write action pauses for a human where the risk warrants.
+
+### 3. Quality as a release gate
 - **Regression suite:** the PoC eval set runs on every change to prompts, models, retrieval or tools.
 - **Version prompts and pin model versions** where the provider allows, because an unpinned alias can change
-  behavior with no deployment on your side.
+  behavior with no deployment on your side. Version tool definitions too, since a renamed tool or reworded
+  description changes tool choice.
 - **Roll out changes** through canary or shadow traffic.
 
-### 3. Observability
+### 4. Observability
 - **Trace each request end to end:** inputs, retrieved context, prompt version, model, outputs, latency,
-  token counts and cost, tied to a request ID. Without traces, debugging a bad answer means guessing.
+  token counts and cost, tied to a request ID. For agents, record every step: tool name, arguments, result
+  and the step count. Without traces, debugging a bad answer means guessing.
 - **Monitor** latency percentiles, error rates, cost per request, and online quality signals such as user
-  feedback or sampled human review.
+  feedback or sampled human review; for agents add steps per task and step-limit hits.
 
-### 4. Security and data handling
+### 5. Security and data handling
 - **Authorize with the user's own permissions** on retrieved data and tool calls, because the model will
   happily summarize documents the user should not see.
-- **Treat retrieved and user-supplied text as untrusted** input that may contain prompt injection.
+- **Treat retrieved and user-supplied text as untrusted** input that may contain prompt injection, and tool
+  results the same way, since they enter the transcript and steer later steps.
 - **Decide logging policy:** what gets logged, how PII is redacted, and how long data is kept.
 
-### 5. Cost and capacity
+### 6. Cost and capacity
 - **Set limits:** per-user and per-tenant quotas, maximum input and output tokens, and budget alerts.
 - **Estimate cost at expected volume,** because PoC cost per call times production volume is often the first
   surprise:
@@ -92,17 +116,18 @@ tokens/minute ≈ requests/minute × (tokens_in + tokens_out)
 ```
 
 - **Check the last two lines against provider rate limits,** which are usually set per minute in both
-  requests and tokens.
+  requests and tokens. For an agent, a "request" is one model call, so multiply by steps per task.
 - **Worked numbers (illustrative):** 20 requests/second with 6 seconds of latency is about 120 calls in
   flight; at 3,500 tokens each that is over 4 million tokens per minute. A PoC that never ran more than one
   call at a time tells you nothing about whether that fits your quota tier.
 - **Cap output length.** Long outputs dominate latency (generated token by token) and usually cost more per
   token than input, so this is often the strongest cost and latency lever.
 
-### 6. Operations and ownership
+### 7. Operations and ownership
 - **Define SLOs,** write runbooks for known failure modes (provider outage, quality regression, cost spike),
   set up on-call, and name the owning team.
 - **Plan for model deprecation,** because the model you shipped on has a finite lifetime.
+- **Kill switches per tool,** so one misbehaving integration can be disabled without taking the agent down.
 
 ## Diagram
 One request through the hardened path: authorization and limits first, a circuit breaker before the
@@ -180,6 +205,42 @@ def production(ticket: str, user_id: str, max_attempts: int = 3) -> Triage | Non
 - **Deliberately omitted:** a circuit breaker and cost quotas belong in a shared gateway rather than in every
   call site.
 
+### A bounded agent loop with safe tool calls
+The model and tools are abstracted. The point is the budget checks around each step and the idempotency
+key that makes a retried write safe.
+
+```python
+import hashlib, time
+
+MAX_STEPS, MAX_COST_USD, DEADLINE_S = 12, 0.50, 60
+WRITE_TOOLS = {"issue_refund", "send_email"}             # side-effecting: need keys and approval
+
+def run_agent(task_id, messages, call_model, tools, approve, log):
+    cost, t_end = 0.0, time.monotonic() + DEADLINE_S
+    for step in range(1, MAX_STEPS + 1):
+        if cost > MAX_COST_USD or time.monotonic() > t_end:
+            return log("budget_exhausted", task_id, step, cost) or None   # hand off to a human
+        reply, step_cost = call_model(messages, timeout_s=max(1, t_end - time.monotonic()))
+        cost += step_cost
+        if reply.tool is None:
+            log("done", task_id, step, cost)
+            return reply.text
+        args = reply.args                                 # already schema-validated by the wrapper
+        if reply.tool in WRITE_TOOLS:
+            if not approve(task_id, reply.tool, args):
+                messages.append({"role": "tool", "content": "rejected by reviewer"})
+                continue
+            key = hashlib.sha256(f"{task_id}:{reply.tool}:{sorted(args.items())}".encode()).hexdigest()
+            args = {**args, "idempotency_key": key}       # same action on retry -> same key
+        result = tools[reply.tool](**args)                # runs with the end user's permissions
+        messages.append({"role": "tool", "content": str(result)})   # untrusted text from here on
+        log("step", task_id, step, cost, tool=reply.tool)
+    return log("step_limit", task_id, MAX_STEPS, cost) or None
+```
+
+- **The limits are illustrative;** set them from the step and cost distribution in your eval traces.
+- **The tool must honour the key:** the idempotency key only helps if the receiving service rejects repeats.
+
 ### Capacity, cost and retry-budget calculator
 Run this before launch with your own volumes and your provider's current prices and quota tier.
 
@@ -216,11 +277,14 @@ print("app x gateway x SDK retries:", retry_amplification([3, 3, 3]), "calls")  
 | One retry layer instead of three | worst-case calls per request from 27 to 3 |
 | Shorter latency | fewer calls in flight for the same traffic, by Little's law |
 
+- **Agent reading:** if each user task averages 5 model calls, 4 user tasks per second already produce the
+  20 calls per second above.
+
 ## Production patterns
 - **One retry owner, everything else off** — always. How: retry in the gateway or the app, not both, and set
   the SDK's own retry count to zero or one (for example the OpenAI and Anthropic Python clients accept
-  `max_retries`). Monitor: provider calls per user request, which should sit near 1 in steady state; a multiple during
-  incidents means retries are stacking.
+  `max_retries`). Monitor: provider calls per user request, which should sit near 1 in steady state; a
+  multiple during incidents means retries are stacking.
 - **Shared LLM gateway** — once more than one service calls models. How: one internal service owns timeouts,
   circuit breaking, per-tenant quotas, token caps, model pinning and cost attribution, so call sites stay
   thin. Monitor: breaker state, quota rejections, and cost per tenant per day.
@@ -235,6 +299,9 @@ print("app x gateway x SDK retries:", retry_amplification([3, 3, 3]), "calls")  
   should line up with timeout spikes.
 - **Deprecation calendar** — from launch day. How: record the pinned model's announced retirement date and
   schedule a migration eval well before it. Monitor: days remaining on every pinned model in production.
+- **Per-task step and spend budgets** — for every agent. How: enforce a maximum step count, token or dollar
+  budget and overall deadline in the loop, ending in a human hand-off. Monitor: share of tasks hitting a
+  limit and the p95 steps per task, which rise when a tool or prompt regresses.
 
 ## Trade-offs
 - **Retries vs latency and load.** They improve success rates during transient faults, but add latency and
@@ -248,6 +315,8 @@ print("app x gateway x SDK retries:", retry_amplification([3, 3, 3]), "calls")  
   staffing and a queue; for low-stakes features, returning a clear error may be the cheaper fallback.
 - **Strict gates vs bypass.** Strict regression gates prevent quality backsliding, but a slow or flaky eval
   suite will be bypassed; keep the gating suite fast and run the expensive one nightly.
+- **Tight step limits vs task completion.** Low caps stop runaway loops and cost, but cut off legitimately
+  long tasks; set the cap from the eval step distribution and review tasks that hit it.
 
 ## Pitfalls
 - **Deploying the prototype as-is** because it worked in the pilot; the symptom is the first provider outage
@@ -264,10 +333,13 @@ print("app x gateway x SDK retries:", retry_amplification([3, 3, 3]), "calls")  
   the request volume during an incident, with rate-limit errors that persist after the provider recovers.
 - **Retrying side-effecting tool calls without idempotency keys;** the symptom is duplicate emails, tickets
   or refunds that line up with timeout spikes in the traces.
+- **No step limit on the agent loop;** the symptom is a few tasks with dozens of steps dominating the daily
+  bill. Fix: per-task step and spend budgets with a hand-off.
 
 ## When to use
 - **Start** when a pilot shows the system is worth running, and scope it by risk.
-- **Full treatment:** a customer-facing, regulated or tool-using system needs every section above.
+- **Full treatment:** a customer-facing, regulated or tool-using system needs every section above; an agent
+  with write tools always counts.
 - **Light treatment:** an internal summarizer with easy fallback may need only timeouts, quotas, basic
   tracing and a regression set.
 - **Silent failures first** (quality regression, data exposure, cost), because loud failures get fixed
@@ -320,11 +392,17 @@ so remaining gaps surface on a small population first.
   the tier's per-minute request and token limits; capping output length is the strongest lever if it does not
   fit.
 
-### When would you pin a model version, and when would a floating alias be acceptable?
-- **Pin** when behavior must be reproducible and gated by a regression suite, because an alias can change
-  quality with no deploy on your side.
-- **Accept an alias** only for low-stakes features with a fast eval running on a schedule, and plan migrations
-  either way, because pinned snapshots carry deprecation dates.
+### Your production agent sent the same refund twice during a provider slowdown. What happened and how do you fix it?
+- **Likely cause:** a timeout fired after the refund tool had already succeeded, and a retry (in the loop,
+  gateway or SDK) re-ran the call.
+- **Fix:** an idempotency key derived from task and action that the refund service enforces, one retry owner,
+  and an approval gate or spend cap on refunds; check traces for other duplicates.
+
+### What limits would you put on an agent loop before launch, and how do you pick the numbers?
+- **Limits:** maximum steps, a token or dollar budget per task, and an overall deadline, each ending in a
+  human hand-off rather than a silent failure.
+- **Numbers:** read the step and cost distribution of successful eval traces and set caps above their p95;
+  then monitor the share of production tasks hitting each limit.
 
 ## Quiz
 ### Q: Why should retries be limited to transient errors such as timeouts and rate limits?
@@ -350,3 +428,23 @@ so remaining gaps surface on a small population first.
 - [ ] Building a dashboard of daily active users
 > Data exposure through retrieval is severe, often silent and hard to reverse. Latency, cost and usage
 > analytics matter, but they do not leak data to the wrong people.
+
+## Use cases & projects
+### Use cases
+- **Launching a support or operations agent.** Step budgets, idempotent write tools and approval gates turn
+  a pilot loop into something on-call can own.
+- **Agents over internal documents.** User-scoped retrieval and tool authorization stop the agent from
+  surfacing content the user cannot open.
+- **Platform teams serving many agents.** A shared gateway owns retries, quotas, pinning and cost
+  attribution so each agent team does not rebuild them.
+- **Model migrations.** The regression gate and canary let a team move an agent to a new model before the
+  old one's deprecation date.
+
+### Mini project
+**Harden a toy agent for production (2-3 hours).**
+- **Goal:** take a two-tool agent (one read tool, one fake write tool) and make it survive faults you inject.
+- **Steps:** add a step limit, a per-task cost budget and a deadline; give the write tool an idempotency key
+  it enforces; add one retry owner with backoff; log a trace per step; then inject faults: timeouts after the
+  write succeeds, malformed tool arguments, and a tool result that tells the agent to repeat the action.
+- **Done when:** a fault-injection run shows no duplicate writes, every task ends in success or a logged
+  hand-off within its limits, and the traces show which guard fired for each fault.

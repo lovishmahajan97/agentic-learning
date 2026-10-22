@@ -381,3 +381,25 @@ then `df["cost"] = df["unit"] * df["tokens"]`, both of which operate on whole co
 - [ ] Copy-on-Write duplicated the frame
 > A many-to-many match repeats each left row once per matching right row. Passing `validate="many_to_one"`
 > raises an error when the right side's keys are not unique, catching the problem at the join.
+
+## Use cases & projects
+### Use cases
+- **Agent error analysis.** Group step-level traces by tool and status to find which tool fails most,
+  then filter to those rows and read the transcripts.
+- **Model comparison.** Pass rate, p95 latency and cost per run, per model and per category, from one
+  eval results table.
+- **Cost reports.** Join token counts to a per-model price table with `validate="many_to_one"` and sum
+  cost per tenant or per day.
+- **Building eval sets.** Sample failed production runs by category into a labelled dataset for the next
+  eval round.
+
+### Mini project
+**Error analysis notebook over agent traces (1-3 hours).**
+- **Goal:** turn a JSONL trace export of an agent into a table that says where it fails and what it
+  costs.
+- **Steps:** load the traces with explicit dtypes; compute per-run steps, tokens and pass or fail; join
+  a price table with `validate=`; group by model and category with `dropna=False`; list the five tools
+  with the highest error rate; pull ten failing runs for manual reading.
+- **Done when:** one summary table shows pass rate, p95 latency and cost per model and category, the
+  join raises if the price table has duplicate keys, and you have written down two concrete fixes from
+  the failing runs.

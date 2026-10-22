@@ -5,7 +5,8 @@ name: Runtime schema validation (Zod)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - node-ts-for-ai/typescript-strict-mode-and-advanced-types
   - node-ts-for-ai/openai-anthropic-node-sdks
@@ -20,9 +21,21 @@ sources:
 ---
 
 ## TL;DR
-TypeScript types are erased at compile time, so nothing checks JSON from clients, webhooks, env vars or
-models. One Zod schema derives the type, parses untrusted input, and becomes the model's tool JSON Schema,
-so the model follows the contract you enforce.
+Agents act on JSON the model invented, and TypeScript types are erased, so nothing checks it unless you
+parse. One Zod schema derives the type, parses tool arguments and becomes the tool's JSON Schema, so the
+model follows the contract you enforce.
+
+## For agent builders
+- **Why it matters for agents.** Tool calling is a contract: the model reads a JSON Schema, sends arguments,
+  and your code acts on them, sometimes with side effects. A schema-derived parse is the gate between "the
+  model said so" and "the tool ran", and its issues are the feedback the model needs to fix a bad call.
+- **Where it shows up in your stack.** Tool definitions (`parameters` generated with `z.toJSONSchema`),
+  structured final answers, the OpenAI SDK's Zod helpers and the Vercel AI SDK's Zod-based tools, plus HTTP
+  bodies, queue messages and env config of the agent service.
+- **What you control.** `.strict()` on tool arguments, `.describe()` text the model reads, the input-side
+  schema sent to the model, the repair bound, and per-tool failure metrics.
+- **What you can skip.** Comparing every validation library in depth. Pick one (Zod here), keep one schema
+  per boundary, and never cast model output with `as`.
 
 ## Why it exists
 - **Every interesting input is untrusted.** A request body can be anything the client sent. A model's "JSON"
@@ -136,7 +149,7 @@ flowchart TD
 ```
 
 ## Examples
-### Tool schema, JSON Schema and a repair loop
+### Agent scenario: tool schema, JSON Schema and a repair loop
 A tool definition whose Zod schema produces both the TypeScript argument type and the JSON Schema sent to the
 model, with a repair loop that feeds validation issues back when the model's arguments do not parse. Unknown
 keys are rejected because an extra key from a model usually means it misread the schema.
@@ -236,6 +249,10 @@ A team tracks `safeParse` failures per tool after switching model versions (illu
 | Fix | — | `.describe()` text gives an example with offset; failures back near baseline | The schema description is part of the prompt |
 
 ## Production patterns
+- **Parse tool results before they re-enter the transcript.** Agent teams also give third-party tool
+  responses a schema (often `passthrough` or `strip`, since you forward them) and cap their size, so a
+  changed upstream API produces a clear error tool result instead of garbage the model reasons over.
+  Monitor result-parse failures per tool alongside argument failures.
 - **Validate config at boot.** Parse `process.env` with one schema in the entry module, using
   `z.coerce.number()` for ports and `z.stringbool()` or an enum transform for flags, so a bad deploy fails its
   readiness check instead of serving errors. Monitor crash-on-start in deploy dashboards.
@@ -269,6 +286,9 @@ A team tracks `safeParse` failures per tool after switching model versions (illu
   Add fields as optional with a default first, and tighten only once every producer has moved.
 
 ## Pitfalls
+- **Repairing forever, or repairing side-effecting calls blindly.** Symptom: a run burns several extra model
+  calls per step on a tool the model cannot satisfy. Fix: bound repairs (two is typical), then return a
+  final error tool result and let the model choose another path.
 - **Casting untrusted JSON with `as` instead of parsing.** Symptom: a `TypeError` on an `undefined` field deep
   in business logic, after the model call was billed. Fix: `safeParse` into a schema-derived type.
 - **A TypeScript interface and a hand-written JSON Schema kept separately.** Symptom: the model returns a field
@@ -344,6 +364,14 @@ to the model call. The constrained mode reduces repairs; it does not replace the
   descriptions.
 - **Tighten last,** and watch validation failure rates by producer version during the rollout.
 
+### In an agent, which payloads besides tool arguments should you parse, and how strictly?
+- **Structured final answers:** the run's output that downstream code consumes gets a strict schema and the
+  same bounded repair.
+- **Tool results from third-party APIs:** a forgiving (`strip` or `passthrough`) schema plus a size cap, because
+  you forward them to the model and a provider adding fields is harmless.
+- **Memory and queue records:** schemas with additive evolution, since records written by an older agent
+  version must still parse.
+
 ### What do you monitor around schema validation in production?
 - **Failure rate per boundary and per issue path:** a jump on model outputs after a deploy usually means a
   prompt or model change; on HTTP, a client bug.
@@ -377,3 +405,25 @@ to the model call. The constrained mode reduces repairs; it does not replace the
 > The issues carry the path and reason for each failure, which is exactly the feedback a model needs to
 > correct its output. Bounding the attempts prevents runaway cost, and failing explicitly beats running a
 > side-effecting tool with partial or unchecked arguments.
+
+## Use cases & projects
+### Use cases
+- **Tool definitions for tool-calling agents.** One Zod schema per tool gives the handler's argument type, the
+  model-facing JSON Schema and the runtime gate.
+- **Structured outputs.** Extraction or classification agents parse the final answer into a typed value
+  before anything downstream uses it, even with provider constrained decoding.
+- **Self-correcting tool calls.** `safeParse` issues become a bounded repair prompt, which recovers most bad
+  calls without a human.
+- **Watching model upgrades.** Parse-failure rate per tool is the earliest signal that a new model version
+  or prompt changed how it calls tools.
+
+### Mini project
+**Schema-first tools with repair metrics (1-2 hours).**
+- **Goal:** an agent with three Zod-defined tools whose arguments are always parsed, with measured repair
+  behaviour.
+- **Steps:** define three tools with `.strict()` schemas and `.describe()` text; generate `parameters` with
+  `z.toJSONSchema(..., { io: "input" })`; wire `callToolWithRepair` into a loop against a real or mocked
+  model; run 50 prompts and record parse failures, repairs and extra tokens per tool; improve one
+  `.describe()` and rerun.
+- **Done when:** no tool handler ever receives unparsed input, you have a before/after table of failure and
+  repair rates per tool, and a failed repair produces an explicit error result rather than a crash.

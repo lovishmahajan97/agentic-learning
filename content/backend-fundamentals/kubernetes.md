@@ -5,7 +5,8 @@ name: Kubernetes
 kind: tool
 difficulty: core
 est_minutes: 17
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - backend-fundamentals/docker
   - backend-fundamentals/ci-cd
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Kubernetes runs containers across many machines by reconciling declared desired state ("three replicas,
-one GPU each, ready when `/ready` returns 200") with reality. Its requests, probes and graceful termination
-make GPU-bound, slow-starting, streaming AI services deployable without dropped requests.
+Kubernetes runs your agent API, agent workers, tool servers and model servers across many machines by
+reconciling declared state ("three replicas, ready when `/ready` returns 200") with reality, so long,
+streaming agent runs survive deploys and scale on queue depth.
+
+## For agent builders
+- **Why it matters for agents.** Agent runs are long (seconds to minutes), stream tokens, call slow tools
+  and often sit on GPU-backed model servers. Probes, grace periods and queue-based autoscaling decide
+  whether deploys and spikes cut runs off mid-answer.
+- **Where it shows up in your stack.** A Deployment for the agent API, a Deployment or Jobs for queue-fed
+  agent workers, CronJobs for nightly evals, StatefulSets for the vector database, vLLM or KServe for
+  self-hosted models, and namespaced RBAC for each component's service account.
+- **What you control.** Readiness that means "model and tools reachable", `terminationGracePeriodSeconds`
+  versus your longest run, autoscaling on queue depth instead of CPU, and NetworkPolicies limiting which
+  pods the agent's tools may reach.
+- **What you can skip.** etcd, CNI internals and writing controllers. Know reconciliation, the core
+  objects, requests and limits, the three probes, termination and why GPU Pods sit Pending.
 
 ## Why it exists
 - **Docker answers "what to run", not "where and how".** Which machine fits its CPU, memory and GPU needs;
@@ -151,9 +165,26 @@ Requests and limits also set who dies first when a node runs short of memory.
 - **Distributed training or inference** runs on Ray via KubeRay.
 - **A PodDisruptionBudget** stops node maintenance from evicting every replica at once.
 
+### Mapping an agent system onto objects
+| Agent component | Object | Key settings |
+|---|---|---|
+| Agent API (chat, streaming) | Deployment + Service | Readiness on model and tool reachability, long grace period |
+| Background agent workers | Deployment scaled on queue length, or a Job per run | Checkpoint state so a killed run resumes |
+| Tool and MCP servers | Deployment per tool, own ServiceAccount | NetworkPolicy so only the agent can call them |
+| Code sandbox | Short-lived Pods on an isolated node pool, often with a gVisor RuntimeClass | No secrets, egress denied |
+| Nightly evals | CronJob | Same image digest as production |
+| Vector DB, memory store | StatefulSet or a managed service | Persistent volumes, backups |
+| Self-hosted LLM | Deployment on tainted GPU nodes | Startup probe for weight loading |
+
+- **Long agent runs should not depend on one Pod living.** Persist run state (step, transcript, pending
+  tool call) to a database or queue after each step, so a Pod killed by a drain resumes on another.
+- **Readiness for an agent API** should fail when its model endpoint is unreachable, so traffic moves to
+  replicas that can actually answer; liveness stays cheap and local.
+
 ## Diagram
 Nothing in the cluster runs your command: `apply` only edits stored state, and the loop on the right keeps
-pulling reality toward it, including after failures.
+pulling reality toward it, including after failures. The same loop recreates an agent worker that crashed
+mid-run, which is why run state must live outside the Pod.
 
 ```mermaid
 flowchart TD
@@ -264,6 +295,39 @@ Numbers come straight from the manifest and the defaults.
 | Default liveness, no startup probe | about 30 seconds of failed checks before a restart, so a 4-minute model load loops forever |
 | Rollout with 3 replicas, `maxSurge: 1` | Needs a 4th GPU free during the rollout; capacity never dips below 3 ready |
 
+### Agent workers scaled on queue length with KEDA
+Background agent runs (ticket triage, research tasks) are pushed onto a Redis list; KEDA scales the
+worker Deployment on its length. Each worker checkpoints after every agent step, so the grace period only
+needs to cover one step, not a whole run.
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata: {name: agent-workers}
+spec:
+  scaleTargetRef: {name: agent-worker}     # a Deployment of agent workers
+  minReplicaCount: 1                       # keep one warm worker
+  maxReplicaCount: 30
+  triggers:
+  - type: redis
+    metadata:
+      address: redis.agents.svc:6379
+      listName: agent-runs
+      listLength: "5"                      # target pending runs per replica
+```
+
+### Worked scenario: sizing the grace period for agent runs
+Interactive agent runs take p50 40 s and p99 6 minutes (illustrative). Each step (one model call plus one
+tool call) is at most about 60 s.
+
+| Design | Grace period needed | What happens on a node drain |
+|---|---|---|
+| Run lives only in the Pod's memory | Above 6 minutes, plus `preStop` | Drains take minutes per node; anything longer is lost |
+| Checkpoint after every step, resume elsewhere | About 60 s plus a 5 s `preStop` | Current step finishes, run resumes on another Pod |
+| Default 30 s, no checkpoint | 30 s | Every run longer than 30 s is cut off on each deploy |
+
+Checkpointing turns "raise the grace period forever" into a bounded, per-step budget.
+
 ## Production patterns
 - **PodDisruptionBudget for every serving Deployment.** Add a `policy/v1` PodDisruptionBudget with
   `minAvailable: 2` and the same label selector, so node drains and upgrades evict one replica at a time.
@@ -280,6 +344,11 @@ Numbers come straight from the manifest and the defaults.
 - **Event-first debugging.** Start every incident with `kubectl describe pod <name>` and `kubectl get events
   --sort-by=.lastTimestamp`, which show `Insufficient nvidia.com/gpu`, OOMKilled and probe failures before any
   log does. Alert on restart counts and Pods Pending beyond a few minutes.
+- **Isolate agent tools with NetworkPolicy and ServiceAccounts.** Give each tool server its own
+  ServiceAccount with minimal RBAC, and a NetworkPolicy so only agent Pods can reach it and sandbox Pods
+  can reach nothing internal. Audit denied connections after enabling.
+- **Evals as CronJobs on the production image.** Run the agent eval suite nightly as a CronJob pinned to the
+  deployed digest, writing scores to your metrics store. Alert when a score drops versus the last run.
 
 ## Trade-offs
 - **Declarative reconciliation vs operating cost.** Self-healing and repeatable deploys, paid for with a large
@@ -291,6 +360,9 @@ Numbers come straight from the manifest and the defaults.
   through the CFS quota. The common compromise: always set requests and memory limits, rarely CPU limits.
 - **Queue-depth autoscaling vs idle cost.** It tracks load correctly, but GPU node provisioning takes minutes,
   so reactive scaling needs idle headroom that costs money every hour it is not used.
+- **Job per agent run vs long-lived workers.** A Job per run gives isolation and clean resource accounting,
+  but pays Pod start time on every run and floods the API server at high volume. Queue-fed workers start
+  runs instantly but need checkpointing and careful cleanup of per-run state.
 
 ## Pitfalls
 - **No resource requests.** Symptom: nodes overloaded and Pods evicted, or, with requests set too high, Pods
@@ -311,9 +383,14 @@ Numbers come straight from the manifest and the defaults.
 - **Treating `emptyDir` or local disk as durable for an index.** Symptom: data gone after the Pod is
   rescheduled.
 - **HPA on CPU for a GPU-bound service.** Symptom: a growing queue while the autoscaler sees low CPU and never
-  adds replicas.
+  adds replicas. Agent workers have the same problem: they mostly wait on model and tool calls, so CPU
+  stays low while runs pile up.
+- **Agent run state held only in Pod memory.** Symptom: users see runs vanish or restart from scratch after
+  every deploy or node drain. Fix: checkpoint after each step and resume from the queue.
 
 ## When to use
+- **Use for agents** when the system has grown past one service: agent API plus workers, tool servers, a
+  vector DB and evals, or self-hosted models on GPUs.
 - **Use when** you run several services, need GPU scheduling, run batch jobs beside serving, share
   infrastructure across teams, or deploy into enterprises that already run it, which is most of them.
 - **Avoid when** it is a single container with modest load: a managed serverless container platform (Cloud
@@ -375,7 +452,7 @@ across a rollout.
   nodes.
 - **Always set** requests and memory limits; memory cannot be throttled, only OOM-killed.
 
-### How do you deploy an LLM service whose responses stream for up to two minutes without cutting them?
+### How do you deploy an LLM or agent service whose responses stream for up to two minutes without cutting them?
 - **Readiness** returns 200 only after the model is loaded and warm, with a startup probe covering load time.
 - **Termination:** handle SIGTERM by draining, set `terminationGracePeriodSeconds` above the longest stream
   plus the `preStop` sleep, for example 120 with a 5-second sleep.
@@ -385,6 +462,14 @@ across a rollout.
 - **The work is on the GPU,** so CPU can stay low while requests queue; the HPA never scales.
 - **Scale on demand directly:** queue depth, in-flight requests or tokens waiting, via KEDA or custom metrics.
 - **Plan for lag:** GPU nodes take minutes to boot and pull, so keep headroom or a warm pool.
+
+### Background agent runs last up to ten minutes. How do you run them on Kubernetes so deploys and drains do not lose work?
+- **Queue plus workers:** push runs onto a queue and scale a worker Deployment on queue length with KEDA,
+  not on CPU, since agents mostly wait on I/O.
+- **Checkpoint per step:** persist the transcript and next action after each model or tool call, so a
+  SIGTERM only has to finish one step and another Pod resumes the run.
+- **Bound the blast:** a PodDisruptionBudget for workers, and idempotent tool calls so a resumed step does
+  not repeat side effects.
 
 ## Quiz
 ### Q: What does `kubectl apply` of a Deployment manifest actually do?
@@ -413,3 +498,24 @@ across a rollout.
 > CPU is requested in millicores on plentiful, cheap nodes, so a CPU Pod usually fits somewhere. A GPU
 > request needs an entire unallocated device on a node whose taint the Pod tolerates; if none is free the Pod waits
 > until one is released or a new node is provisioned.
+
+## Use cases & projects
+### Use cases
+- **Serving a streaming agent API.** Readiness gated on model reachability, a long grace period and
+  `maxUnavailable: 0` keep answers flowing through deploys.
+- **Queue-fed background agents.** Workers scale on queue length with KEDA and checkpoint each step, so
+  spikes and node drains do not lose runs.
+- **Self-hosted models for agents.** vLLM on tainted GPU node pools with startup probes covering weight
+  loading.
+- **Nightly agent evals.** CronJobs run the eval suite against the deployed image digest and report score
+  drift.
+
+### Mini project
+**Deploy a resumable agent worker on a local cluster (2-3 hours).**
+- **Goal:** agent runs that survive a rolling restart of their workers.
+- **Steps:** start kind or minikube; deploy Redis and a worker Deployment that pops run ids, executes a
+  fake 10-step agent (sleep plus a fake tool call per step) and writes a checkpoint after each step; add
+  readiness and liveness probes and a SIGTERM handler that finishes the current step; enqueue 20 runs and
+  run `kubectl rollout restart` mid-way.
+- **Done when:** all 20 runs complete with exactly 10 steps each, none restarts from step 1, and
+  `kubectl get events` shows clean terminations rather than SIGKILLs.

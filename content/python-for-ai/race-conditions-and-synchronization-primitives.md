@@ -437,3 +437,23 @@ by a gateway, with the semaphore kept only to bound memory and connections. Retr
 - [ ] It becomes unbounded because the semaphore stops blocking
 > Throughput equals concurrency divided by latency. Ten slots each finishing in 0.25 seconds allow
 > about 40 requests per second, which is why semaphores cannot enforce per-minute quotas.
+
+## Use cases & projects
+### Use cases
+- **Per-run token and dollar budgets.** Parallel tool calls and sub-agents deduct from one budget, so the
+  check and the deduction must sit under one `Lock` or reserve-then-settle step.
+- **Shared auth token refresh.** Single-flight refresh stops a hundred concurrent agent sessions from each
+  hitting the auth server when a token expires.
+- **Lazy loading of indexes and models.** Double-checked locking loads a vector index or tokenizer once,
+  even when the first ten requests arrive together.
+- **Provider concurrency caps.** A `Semaphore` per model, embedding and tool provider keeps fan-out inside
+  what each provider and connection pool can take.
+
+### Mini project
+**Break and fix a shared agent budget (1-2 hours).**
+- **Goal:** reproduce a budget overrun from parallel tool calls, then fix it and cap concurrency.
+- **Steps:** give a fake agent a $1.00 budget and ten parallel "model calls" that each check the budget,
+  `await asyncio.sleep(0.1)`, then deduct $0.20; record the total spent; fix it with an `asyncio.Lock`
+  around reserve-then-deduct; then add a `Semaphore(3)` and log the peak number of calls in flight.
+- **Done when:** the unlocked run overspends, the locked run never exceeds $1.00, peak in-flight calls
+  never exceed 3, and a short note explains which `await` opened the race.

@@ -454,3 +454,24 @@ concurrent requests and asserts each line's ID matches.
 - [ ] The f-string version is not thread-safe
 > The f-string is built before logging checks the level, wasting work for disabled levels, and it produces
 > a unique message per value, which defeats grouping by message template in log tools.
+
+## Use cases & projects
+### Use cases
+- **Debugging one bad agent run among hundreds.** Filtering JSON logs by a bound `run_id` reconstructs
+  the run's steps, tool calls and retries in order.
+- **Cost and latency dashboards.** `llm_call` events carrying model, token counts and latency feed per-run
+  cost and slow-step alerts without the expense of full traces.
+- **Guardrail and safety auditing.** `guardrail_block` and tool-denial events give a searchable record of
+  what the agent tried and what was stopped.
+- **Joining logs to traces.** A trace ID on every line links a cheap log event to its LangSmith, Langfuse or
+  OpenTelemetry trace when the full prompt is needed.
+
+### Mini project
+**Instrument an agent loop with structured events (1-2 hours).**
+- **Goal:** make every run of a small tool-calling agent queryable from its logs alone.
+- **Steps:** configure structlog once for JSON on stdout and route stdlib logging from httpx and the SDK
+  into it; bind `run_id` per run and `step` and `tool` per step with context variables; emit `llm_call`,
+  `tool_call` and `run_finished` events with latency and token counts; add a processor that redacts API
+  keys and truncates prompts and tool arguments; run 20 concurrent runs.
+- **Done when:** a single `jq` filter on one `run_id` prints that run's steps in order, no secret appears in
+  the output, and you can compute total tokens per run from the log lines.

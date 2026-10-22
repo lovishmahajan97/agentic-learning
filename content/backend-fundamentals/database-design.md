@@ -487,3 +487,25 @@ transaction as the insert.
 - [ ] Only when the database does not support indexes on the child table
 > Denormalization buys read speed by taking on a consistency obligation. It is justified by measurement
 > and made safe by maintaining the copy transactionally; doing it by default reintroduces update anomalies.
+
+## Use cases & projects
+### Use cases
+- **Crash-safe agent runs.** A run row owning ordered step rows, plus a unique key per side-effecting tool
+  call, lets a restarted worker resume without sending the same email or refund twice.
+- **Multi-tenant agent platforms.** A tenant column on every row and composite foreign keys keep one
+  customer's conversations, memories and tool results out of another customer's retrieval.
+- **Cost and quality dashboards.** Real columns for model, status and token counts make "spend per tenant
+  per day" or "failure rate per tool" a cheap indexed query instead of a scan over jsonb blobs.
+- **Eval and audit trails.** Linking eval results and human feedback to the exact run and step rows lets
+  you answer "what did the agent do, and was it right?" months later.
+
+### Mini project
+**Design and stress a schema for a tool-calling agent (2-3 hours).**
+- **Goal:** a Postgres schema for tenants, conversations, agent runs, steps and tool calls that refuses
+  bad writes and survives a crash mid-tool-call.
+- **Steps:** write the DDL with foreign keys, `CHECK` constraints and a unique key on (run, step) for tool
+  calls; add the composite index for loading a run's steps in order; write a small script that runs a fake
+  three-tool agent, kills it after the second tool call, restarts it and resumes from the database.
+- **Done when:** the resumed run finishes without duplicate tool-call rows, inserting a cross-tenant or
+  orphan row fails with a constraint error, and `EXPLAIN` shows the step-loading query using the index
+  with no sort step.

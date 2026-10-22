@@ -5,7 +5,8 @@ name: Domain modeling
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - system-design/domain-driven-design-and-bounded-contexts
   - enterprise-integration/data-mapping-and-canonical-schemas
@@ -20,8 +21,21 @@ sources:
 
 ## TL;DR
 Domain modeling captures the customer's entities, relationships, lifecycles, rules and vocabulary in one
-agreed model reused by schemas, prompts, retrieval and evals. A model knows generic meanings, so unstated
-mismatches ("active", "closed") produce confident, silently wrong outputs.
+agreed model. For an agent it is the source of tool schemas, structured outputs, prompt glossary,
+retrieval filters and eval labels, so "active" or "closed" never silently mean the wrong thing.
+
+## For agent builders
+- **Why it matters for agents.** A model knows generic meanings; the customer's words have specific ones.
+  An agent acting on the wrong meaning pays the wrong amount or closes the wrong claim, fluently. The
+  domain model is what its tools and outputs are typed against.
+- **Where it shows up in your stack.** Pydantic or JSON Schema tool definitions, structured-output schemas,
+  enums for classification, the glossary section of the system prompt, retrieval metadata filters, and
+  state-machine checks inside write tools.
+- **What you control.** Which entities the agent can act on, which transitions its tools allow, which
+  invariants are enforced in code, and how identities are resolved before a tool is called.
+- **What you can skip.** Heavyweight DDD tactical patterns (repositories, domain events, full context maps)
+  unless you are building the system of record; a glossary, a few entities, one or two state machines and
+  the invariants are enough.
 
 ## Why it exists
 - **Every organisation has a private dialect.** In one insurer "claim" means a single loss event; in
@@ -32,7 +46,7 @@ mismatches ("active", "closed") produce confident, silently wrong outputs.
 - **A model brings the opposite: a broad, average sense of each word** learned from public text. Asked to
   "count active customers" or "extract the claim date", it picks a plausible generic meaning.
 - **The error is silent.** The output is fluent and well formatted, so the wrong number, or the report date
-  instead of the loss date, flows down the pipeline.
+  instead of the loss date, flows down the pipeline or into the agent's next tool call.
 - **The naive fixes fail.**
   - *Letting the model infer meaning* works only when documents are consistent, and they rarely are across
     departments.
@@ -47,7 +61,7 @@ mismatches ("active", "closed") produce confident, silently wrong outputs.
 - **List the terms** from interviews, documents and screens, each with a one-line definition, an example and
   a counter-example.
 - **Domain-driven design calls the result the *ubiquitous language*:** one vocabulary shared by experts,
-  code and documentation.
+  code, documentation and the agent's prompt.
 - **Start here** because most domain errors in AI systems are vocabulary errors, and a glossary is cheap to
   validate with SMEs.
 
@@ -57,8 +71,8 @@ mismatches ("active", "closed") produce confident, silently wrong outputs.
 | **Entity** | Identity persists while attributes change | A claim, a policy, a customer | Resolve to an existing identifier (which customer is this email about?) |
 | **Value object** | Defined only by its attributes | An address, a money amount with currency | Parse correctly |
 
-**Identity resolution deserves its own design**, because it is where extraction most often silently fails.
-Resolve in order of reliability:
+**Identity resolution deserves its own design**, because it is where extraction most often silently fails,
+and where an agent most often calls a tool with the wrong ID. Resolve in order of reliability:
 
 1. **Exact key found in the text** (a claim number matching the agreed pattern).
 2. **Deterministic lookup on strong attributes** (policy number plus loss date).
@@ -66,13 +80,13 @@ Resolve in order of reliability:
 4. **Ask a person.**
 
 - **Record which rule matched**, because a record linked by a fuzzy name match should be treated with less
-  trust than one linked by key.
+  trust than one linked by key, and should not unlock write tools on its own.
 
 ### 3. Map relationships and cardinality
 - **Record how entities relate:** a policy has many claims, a claim has many coverage lines, a customer can
   hold several policies.
 - **Cardinality decides retrieval and reasoning.** "The customer's deductible" is ambiguous when the
-  customer has three policies, so the system must ask or choose by rule.
+  customer has three policies, so the agent must ask or choose by rule.
 
 ### 4. Model lifecycles as state machines
 - **For each key entity, list its states, the permitted transitions, and who or what triggers each.**
@@ -97,24 +111,25 @@ Resolve in order of reliability:
 ### 6. Draw bounded contexts
 - **Where the same word means different things, do not force one definition.** Model each context
   separately and define the translation between them.
-- **In AI terms,** each context often gets its own schema, prompt glossary and retrieval index.
+- **In AI terms,** each context often gets its own schema, prompt glossary, retrieval index, and in
+  multi-agent systems its own agent and tool set.
 
 ### 7. Project the model into every artefact
 | Model element | Projection |
 |---|---|
-| Entities and fields | Typed schemas for structured output and extraction |
-| Allowed values | Enums that constrain classification labels |
+| Entities and fields | Typed schemas for tool arguments, structured output and extraction |
+| Allowed values | Enums that constrain classification labels and tool parameters |
 | Glossary | A glossary section in prompts |
 | Key attributes | Metadata fields for retrieval filters |
 | Relationships | Entity and relationship types, if a knowledge graph is warranted |
-| States, rules, edge cases | The label set and edge cases for evaluation |
+| States, rules, edge cases | Guards inside write tools, plus the label set and edge cases for evaluation |
 
 - **One source, many projections**, because divergence between them is where silent errors come from.
 
 ### 8. Validate with instances, not diagrams
 - **SMEs rarely critique a class diagram well**, but they spot errors instantly in concrete examples: "this
   claim would never be in that state".
-- **Walk real records through the model.**
+- **Walk real records through the model**, and replay real agent traces past an SME.
 
 ## Diagram
 The claim lifecycle from the example: only these transitions are permitted, so an agent's attempt to pay a
@@ -188,6 +203,39 @@ transition(c, ClaimStatus.PAID)   # raises: under_review -> paid is not a permit
 - **The reserve is a `Decimal` rather than a `float`** because money is a value object whose arithmetic must
   be exact; binary floats cannot represent most decimal amounts and accumulate rounding error in totals.
 
+### The same model as an agent tool
+Continuing the example above: the tool's argument schema is generated from the domain model, and the tool
+returns the guard's error to the agent as data, so the model can recover (ask, or pick another action)
+instead of crashing the loop.
+
+```python
+from pydantic import BaseModel, Field
+
+class SetClaimStatusArgs(BaseModel):
+    claim_id: str = Field(pattern=r"^CLM-\d{8}$", description="Claim number, never a policy number")
+    new_status: ClaimStatus
+
+TOOL = {"name": "set_claim_status",
+        "description": "Move a claim to its next lifecycle state. Only permitted transitions succeed.",
+        "input_schema": SetClaimStatusArgs.model_json_schema()}   # one source for the schema
+
+CLAIMS = {c.claim_id: c}                                         # stand-in for the claims system
+
+def set_claim_status(raw_args: dict) -> dict:
+    args = SetClaimStatusArgs.model_validate(raw_args)           # rejects bad IDs and unknown states
+    try:
+        CLAIMS[args.claim_id] = transition(CLAIMS[args.claim_id], args.new_status)
+        return {"ok": True, "status": CLAIMS[args.claim_id].status.value}
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}                    # goes back to the model as the tool result
+
+print(set_claim_status({"claim_id": "CLM-00412345", "new_status": "paid"}))
+# {'ok': False, 'error': 'under_review -> paid is not a permitted transition'}
+```
+
+- **The enum in the schema** means the model cannot even name a state the business does not have.
+- **Log every `ok: False`** result; it shows where the agent's plan disagrees with the business rules.
+
 ### An aggregate that guards a cross-line invariant
 The claim is the aggregate root, so the only way to pay a coverage line is through it. Each payment would
 pass a per-line check; only the root sees the total. Pure Python, amounts illustrative.
@@ -232,14 +280,15 @@ except ValueError as e:
   surface cannot express a payment that breaks the total.
 
 ### Worked scenario: resolving the claim an email is about
-Five inbound emails, resolved with the cascade from step 2 (illustrative).
+Five inbound emails to a claims agent, resolved with the cascade from step 2 before any tool acts
+(illustrative).
 
 | Email contains | Rule that matched | Trust | Action |
 |---|---|---|---|
 | "CLM-00412345" | Exact key | High | Link automatically |
 | Policy HX-778 and loss date 2 March | Strong-attribute lookup, one claim found | High | Link automatically |
 | Policy HX-778 only, customer has two open claims | Strong lookup, two candidates | Ambiguous | Ask a person |
-| Name and postcode | Fuzzy match | Low | Link with a review flag |
+| Name and postcode | Fuzzy match | Low | Link with a review flag; no write tools |
 | No identifiers | None | None | Ask a person |
 
 - **Storing the matched rule** on each record lets downstream steps, and auditors, treat fuzzy links
@@ -247,34 +296,39 @@ Five inbound emails, resolved with the cascade from step 2 (illustrative).
 
 ## Production patterns
 - **Glossary and schema in version control** — keep the glossary, enums and Pydantic models in one module
-  and generate the prompt glossary section and the structured-output schema (`model_json_schema()` in
-  Pydantic v2) from it, so they cannot drift. Review changes with SMEs like any other code change.
-- **Validate, then reject or escalate** — run every model output through the schema and invariant
-  validators before it is written anywhere; send failures to a review queue rather than retrying silently
-  forever. Monitor validation-failure rate per field, because a spike usually means a new document layout or
-  vocabulary drift.
+  and generate the prompt glossary section, the structured-output schema and the tool argument schemas
+  (`model_json_schema()` in Pydantic v2) from it, so they cannot drift. Review changes with SMEs like any
+  other code change.
+- **Validate, then reject or escalate** — run every model output and every tool argument through the schema
+  and invariant validators before it is written anywhere; send failures to a review queue rather than
+  letting the agent retry silently forever. Monitor validation-failure rate per field, because a spike
+  usually means a new document layout or vocabulary drift.
 - **Escape hatch in enums** — while the domain is still being discovered, include an explicit "other" or
   "needs review" value in classification enums. Monitor its share; a growing share signals a missing
   category to add to the model.
 - **Match provenance field** — store which identity-resolution rule linked each extracted record (key,
-  strong lookup, fuzzy, human). Monitor the fuzzy share and audit a sample of fuzzy links regularly.
+  strong lookup, fuzzy, human), and only allow write tools on key or strong links. Monitor the fuzzy share
+  and audit a sample of fuzzy links regularly.
 - **Aggregate-shaped agent tools** — give agents tools that act on aggregate roots and enforce invariants
-  inside the tool, never raw row-level writes. Log rejected tool calls; they show where the agent's plan
-  disagrees with the business rules.
+  and state transitions inside the tool, never raw row-level writes. Log rejected tool calls; they show
+  where the agent's plan disagrees with the business rules.
 - **Record walkthroughs as eval cases** — every SME correction from a walkthrough becomes a labelled
-  evaluation case, so the model's edge cases accumulate in the test set. Track remaining corrections per
-  walkthrough as the model's maturity measure.
+  evaluation case, so the model's edge cases accumulate in the agent's test set. Track remaining
+  corrections per walkthrough as the model's maturity measure.
 
 ## Trade-offs
 - **Precision vs SME time.** An explicit model prevents silent vocabulary errors, but takes SME time to
   agree. When the task is a narrow, single-team summarisation, a short glossary in the prompt may be all you
   need.
-- **Reliability vs coverage.** Strict schemas and enums make outputs reliable and testable, but reject
-  legitimate cases the model did not foresee. Add an explicit "other" or escalation path when the domain is
-  still being discovered.
+- **Reliability vs coverage.** Strict schemas and enums make outputs and tool calls reliable and testable,
+  but reject legitimate cases the model did not foresee. Add an explicit "other" or escalation path when the
+  domain is still being discovered.
 - **Separate contexts vs translation code.** Bounded contexts keep each definition precise, but require
   translation code between them. That pays off when departments genuinely disagree, and is overhead when
   they do not.
+- **Narrow tools vs agent flexibility.** Aggregate-shaped tools make invalid actions unrepresentable, but
+  the agent can only do what the tools express. Add tools deliberately rather than falling back to a
+  generic write.
 - **Graph vs maintenance.** A knowledge graph makes relationships queryable and explainable, but is costly
   to build and keep in sync. It is worth it when questions routinely traverse several relationships, not
   for flat lookups.
@@ -282,27 +336,27 @@ Five inbound emails, resolved with the cascade from step 2 (illustrative).
 ## Pitfalls
 - **Defining terms from documents alone, without SMEs.** Symptom: a glossary that reads well but gets
   corrected on almost every example walked through with the people who do the work.
-- **Letting prompts, schemas and evaluation labels drift apart.** Symptom: a model that passes its own tests
-  while users report it uses terms differently from the reporting dashboards.
+- **Letting prompts, schemas and evaluation labels drift apart.** Symptom: an agent that passes its own
+  tests while users report it uses terms differently from the reporting dashboards.
 - **Forcing one meaning across bounded contexts.** Symptom: endless debates over a field definition and
   outputs that are right for one department and wrong for another.
-- **Enforcing invariants only through prompt instructions.** Symptom: a rare but recurring output that
-  violates a rule the business considers impossible, discovered by an auditor.
+- **Enforcing invariants only through prompt instructions.** Symptom: a rare but recurring output or tool
+  call that violates a rule the business considers impossible, discovered by an auditor.
 - **Giving an agent write tools on individual records inside an aggregate.** Symptom: each update passes its
   own validation while the combination violates a cross-record rule, such as payments exceeding the
   approved total.
 - **Modelling entities without identity resolution.** Symptom: extracted records that name a customer or
-  policy but cannot be linked to the system of record, so downstream steps fail.
+  policy but cannot be linked to the system of record, so downstream steps or tool calls fail.
 
 ## When to use
-- **Use when** the AI system extracts, classifies or acts on business entities, when several teams or
-  systems share data, and when outputs feed reports or decisions.
-- **Timing:** right after discovery and workflow analysis, before writing prompts or schemas.
+- **Use when** the agent extracts, classifies or acts on business entities, when several teams or systems
+  share data, and when outputs feed reports or decisions.
+- **Timing:** right after discovery and workflow analysis, before writing prompts, schemas or tools.
 - **Keep it lightweight:** a glossary, key entities, one or two state machines and the invariants.
 - **Measure:** how many SME corrections remain when you walk real records through it, and whether every
-  schema, enum and evaluation label traces back to it.
-- **Interviews:** explaining how one domain model projects into prompts, schemas, retrieval filters and
-  evaluation labels shows architectural maturity.
+  schema, tool argument, enum and evaluation label traces back to it.
+- **Interviews:** explaining how one domain model projects into prompts, schemas, tools, retrieval filters
+  and evaluation labels shows architectural maturity.
 
 ## Role lens
 - **Engineer:** Encodes the model as typed schemas, enums and validators used for structured outputs, and
@@ -329,7 +383,8 @@ cases then include ambiguous phrasings to confirm it asks or chooses by an agree
   loss event in one insurer and a coverage line in another.
 - **Mismatches are silent:** fluent, well-formatted output with the report date instead of the loss date
   passes every format check.
-- **One agreed model** feeds schemas, prompts, retrieval filters and eval labels, so they cannot disagree.
+- **One agreed model** feeds schemas, tools, prompts, retrieval filters and eval labels, so they cannot
+  disagree.
 
 ### Extracted records keep failing to link to the claims system. How do you debug and fix it?
 - **Check identity resolution first:** what identifiers do the documents actually contain, and which
@@ -338,6 +393,13 @@ cases then include ambiguous phrasings to confirm it asks or chooses by an agree
   which rule matched.
 - **Measure the share per rule;** a high "no match" share often means a key pattern in the schema is wrong
   or documents use a different identifier.
+
+### How do you turn a domain model into an agent's tools?
+- **Generate tool argument schemas from the model** (`model_json_schema()`), so IDs carry their pattern and
+  states are enums the model cannot invent.
+- **Shape tools around aggregate roots and lifecycles:** `set_claim_status` checks the state machine and
+  `add_payment(claim_id, …)` checks the total, inside the tool.
+- **Return guard failures as tool results** so the agent can ask or re-plan, and log them as signals.
 
 ### When would you not build a formal domain model?
 - **For a narrow, single-team task** such as summarising one document type for internal reading, a short
@@ -381,3 +443,27 @@ cases then include ambiguous phrasings to confirm it asks or chooses by an agree
 - [ ] Remove the term from the glossary to avoid confusion
 > Forcing one meaning makes outputs wrong for one department, and inference fails when context is thin.
 > Separate contexts keep each definition precise, and explicit translation makes the mapping testable.
+
+## Use cases & projects
+### Use cases
+- **Typing an agent's tools.** Tool argument schemas, enums and ID patterns come from one domain module, so
+  the agent cannot name states or IDs the business does not have.
+- **Guarding write actions.** State machines and aggregate invariants inside tools stop an agent from paying
+  an unapproved claim or overpaying across lines.
+- **Grounding extraction and RAG.** Field descriptions, glossary and metadata filters make extraction and
+  retrieval use the customer's meanings, not generic ones.
+- **Multi-department assistants.** Bounded contexts give each department's "active" or "order" its own
+  definition, metric and agent behaviour.
+
+### Mini project
+**Build a state-guarded claims tool for an agent (2-3 hours).**
+- **Goal:** give an agent a small set of domain-typed tools whose schemas and guards come from one model.
+- **Steps:**
+  1. Write a glossary of eight claims terms with examples and counter-examples.
+  2. Implement the `Claim` model, lifecycle and `ClaimAggregate`; generate tool schemas with
+     `model_json_schema()` for `set_claim_status` and `add_payment`.
+  3. Wire the tools into a tool-calling loop with any provider SDK, returning guard errors as tool results.
+  4. Write 15 test instructions, including five that should be refused (pay an unapproved claim, exceed the
+     approved total), and run them.
+- **Done when:** every forbidden action is rejected by a tool guard, the agent recovers or asks on each
+  rejection, and all rejections appear in a log.

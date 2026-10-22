@@ -361,3 +361,24 @@ corrects itself. Then watch the distribution of amounts in traces to confirm the
 - [ ] The most recent tool result that mentioned a tenant
 > The model will pass any id that appears in its context, including one injected by a document or a
 > user. Authorization must be derived from who is actually calling, which only the harness knows.
+
+## Use cases & projects
+### Use cases
+- **Payment and refund tools.** Amount ranges, currency enums and order-ownership checks stop a
+  hallucinated or injected argument from moving money.
+- **Database and query tools.** Enum-restricted filters and row limits keep the model from asking for
+  unbounded or unsafe queries.
+- **Multi-tenant SaaS agents.** Tenant and user scope come from the session, so a model-supplied id can
+  never cross a tenant boundary.
+- **Self-correcting loops.** A clear validation error lets the model fix its own arguments on the next
+  turn instead of the run failing.
+
+### Mini project
+**Harden one risky tool (1-2 hours).**
+- **Goal:** take a `create_refund` tool from a loose schema to a validated, permission-checked one.
+- **Steps:** define the input with Pydantic (amount with bounds, currency enum, order id format, reason
+  enum); validate in three layers (shape, then meaning such as amount not above the order total, then
+  permission from the session); return fixable error results; cap validation retries at a small number;
+  write 15 adversarial argument sets, including a wrong tenant and a negative amount.
+- **Done when:** every adversarial case is rejected before any side effect, the error text names the
+  field and the fix, and the model recovers from at least one error on its next turn.

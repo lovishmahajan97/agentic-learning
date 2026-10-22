@@ -5,7 +5,8 @@ name: Ingestion pipelines
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - data-architecture/etl-elt-for-rag
   - data-architecture/document-processing-pipelines
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-An ingestion pipeline moves data from source systems into a durable, replayable landing store. What
-survives production: incremental change capture including deletes, an immutable raw copy keyed by source
-identity and content hash, and idempotent stages with a committed watermark.
+A RAG agent is only as current as its ingestion pipeline. Move source changes, deletes and ACLs into an
+immutable, replayable landing store with idempotent stages and a committed watermark, so the agent never
+cites deleted, stale or forbidden documents.
+
+## For agent builders
+- **Why it matters for agents.** An agent's `search_docs` or `lookup_policy` tool returns whatever the index
+  holds. A missed delete, a stale version or a dropped ACL becomes a confident, cited, wrong action, and the
+  agent cannot detect it from inside the loop.
+- **Where it shows up in your stack.** Connectors feeding the knowledge base behind retrieval tools, Debezium
+  or Graph delta queries for live systems, an Airflow or Dagster schedule, and the freshness metadata you
+  return in tool results.
+- **What you control.** Change detection per source, tombstones for deletes, the watermark commit order, ACLs
+  carried as a field, and `fetched_at` plus `source_version` passed through to the agent for citations.
+- **What you can skip.** Writing your own CDC engine or streaming platform. Use Debezium or a managed
+  connector and spend the time on deletes, ACLs and freshness alarms.
 
 ## Why it exists
 - **The first version is always a script.** List everything in Confluence or an S3 bucket, embed it,
@@ -131,9 +144,18 @@ in rising order of fidelity and cost:
   and every id changed.
 - These three numbers answer "is the index fresh?" without reading the index.
 
+### What the agent sees at the end of the pipe
+- **Retrieval tools return pipeline metadata, not just text.** Pass `source_id`, `source_version` and
+  `fetched_at` with every chunk, so the agent can cite the version it read and say when it might be stale.
+- **Tombstones must reach the tool, not only the landing store.** A delete that lands but never propagates
+  to the index still lets the agent quote a revoked contract.
+- **Freshness lag is an agent SLA.** If an operations agent acts on an orders table, its decisions are only
+  as current as `now − last_committed_watermark`; CDC keeps that in seconds, a nightly job in hours.
+
 ## Diagram
 Changes flow from the source into an immutable landing store; the watermark advances only after writes are
-durable, and a nightly snapshot diff catches deletes the cursor misses.
+durable, and a nightly snapshot diff catches deletes the cursor misses before the agent's search tool can
+return them.
 
 ```mermaid
 flowchart TD
@@ -145,6 +167,7 @@ flowchart TD
     R -->|"tombstones for vanished ids"| L
     L --> Q["Queue to parse, chunk, embed"]
     Q -.->|"poison file"| D["Dead-letter queue"]
+    Q --> T["Index behind agent search tool"]
     L -->|"flush durable"| W["Commit watermark"]
 ```
 
@@ -235,6 +258,48 @@ Illustrative orders of magnitude, not a benchmark: assume 200,000 documents aver
   about 1% of the embedding work.
 - **Deletes still need the listing.** The nightly snapshot diff touches only ids and versions, not content.
 
+### Agent scenario: a retrieval tool that exposes freshness
+The agent's search tool drops tombstoned documents, filters by the caller's ACL and returns provenance, so
+the model can cite a version and the loop can refuse to act on a source past its freshness SLA. The
+`landing` and `index` objects are the same stand-ins as in the connector loop.
+
+```python
+import datetime as dt
+
+FRESHNESS_SLA = {"orders-db": dt.timedelta(minutes=5), "wiki": dt.timedelta(hours=24)}
+
+def search_docs(query, user_groups, index, landing, state, k=5):
+    """Tool exposed to the agent. Returns chunks plus provenance and a staleness flag per source."""
+    now = dt.datetime.now(dt.timezone.utc)
+    hits = index.search(query, k=k * 3)                       # over-fetch, then filter
+    out = []
+    for hit in hits:
+        key = (hit["source"], hit["source_id"])
+        if landing.is_tombstoned(key):                       # deleted at the source: never return it
+            continue
+        if not set(hit["acl"]) & set(user_groups):           # caller may not read it at the source
+            continue
+        lag = now - state[hit["source"]]["watermark"]
+        out.append({"text": hit["text"], "source_id": hit["source_id"],
+                    "source_version": hit["source_version"], "fetched_at": hit["fetched_at"].isoformat(),
+                    "stale": lag > FRESHNESS_SLA.get(hit["source"], dt.timedelta(hours=24))})
+        if len(out) == k:
+            break
+    return out   # the system prompt tells the agent to cite source_version and warn when stale is true
+```
+
+### Worked scenario: what a missed delete costs an agent
+Illustrative numbers: an HR assistant agent answers 3,000 questions a day over a policy wiki. A policy is
+deleted at 09:00, but the pipeline only has a timestamp cursor and no snapshot reconcile.
+
+| Pipeline | When the deleted policy stops being retrieved | Answers at risk (if 1% of questions hit it) |
+|---|---|---|
+| Cursor only, no reconcile | never, until someone notices | 30 per day, indefinitely |
+| Cursor plus nightly snapshot diff | after the next nightly run | up to about 30 |
+| Graph delta query with deletes | at the next 15-minute poll | about 0 to 1 |
+
+The agent itself behaved correctly in every row; the defect, and the fix, live in ingestion.
+
 ## Production patterns
 - **Snapshot-then-stream for CDC sources.** When a database table drives decisions, run Debezium with an
   initial snapshot (its `snapshot.mode` setting, `initial` by default) so it records the log offset before
@@ -252,6 +317,10 @@ Illustrative orders of magnitude, not a benchmark: assume 200,000 documents aver
   backfill runs; it must stay inside the freshness SLA.
 - **Pipeline health dashboard.** Per connector, chart items in/out/failed per stage, `now − watermark`, and
   change ratio per run, with alarms at zero change for N runs and near 100 % change.
+- **Freshness in the agent's tool contract.** Agent teams return `fetched_at`, `source_version` and a stale
+  flag in every retrieval tool result, and instruct the agent to cite versions and to ask for confirmation
+  before acting on stale data. Monitor the share of agent answers that used a stale source and the delete
+  propagation lag from source to tool result.
 
 ## Trade-offs
 - **Snapshot diff: simplicity vs listing cost.** It catches deletes with no source cooperation, but listing
@@ -286,8 +355,10 @@ Illustrative orders of magnitude, not a benchmark: assume 200,000 documents aver
   while thousands of healthy documents go stale. Fix: a DLQ with a retry cap.
 
 ## When to use
-- **Use when** a corpus has more than one source, changes while the system is live, or must respect
-  deletions and permissions, which is to say anything beyond a demo.
+- **Use when** an agent's retrieval tools sit on a corpus that has more than one source, changes while the
+  agent is live, or must respect deletions and permissions, which is to say anything beyond a demo.
+- **Use CDC when** an agent takes actions (refunds, escalations) based on a live table, because the action is
+  only as correct as the change stream is current.
 - **Avoid** CDC for a wiki that changes twice a day, and reject a "full re-crawl nightly" design for a corpus
   whose embedding cost per full pass exceeds the monthly vector store bill.
 - **Measure** freshness lag, change ratio per run, per-stage failure counts and embedding spend per run;
@@ -338,7 +409,7 @@ re-crawling the wiki.
 - **Shared plumbing:** a queue with a DLQ before parsing, watermark committed after flush, and per-source lag
   and change-ratio alarms.
 
-### Users say an edited policy page still shows the old text in answers. How do you debug it?
+### Users say your support agent still quotes the old text of an edited policy page. How do you debug it?
 - **Check the landing store first:** is there a new version for that `source_id`? If not, the fault is in
   the connector (cursor gap, clock skew, watermark committed too early).
 - **If the version landed,** follow lineage downstream: was a `document.changed` event emitted, did parsing
@@ -358,6 +429,14 @@ re-crawling the wiki.
 - **Id churn:** a change ratio near 100 % means the source migrated and every id changed, so everything looks
   new.
 - **Backfills:** an unplanned re-ingest in the main lane re-embeds everything; move it to its own budget.
+
+### An agent retrieved a document the user cannot open in the source system. What failed, and what do you change?
+- **Treat it as a security incident first:** identify the document, its ACL at the source and the ACL stored
+  in the landing record and index payload.
+- **Likely causes:** ACLs dropped "to simplify", or a permission edit skipped because the content hash was
+  unchanged and the ACL comparison was missing.
+- **Fix:** carry ACLs as a first-class field, propagate ACL-only changes on the metadata path, filter by the
+  caller's groups inside the retrieval tool, and alarm on ACL propagation lag.
 
 ## Quiz
 ### Q: Why should the ingestion watermark be committed only after the batch's writes are durable?
@@ -384,3 +463,26 @@ re-crawling the wiki.
 - [ ] Regulators require a copy of every source document
 > The transformation steps are where experimentation and model upgrades happen. With a raw copy, a new
 > chunker is a local re-run; without it, every change becomes a full re-crawl against rate-limited sources.
+
+## Use cases & projects
+### Use cases
+- **Enterprise knowledge agents.** A support or HR agent over Confluence, SharePoint and Jira needs cursor
+  polls, snapshot reconciles and ACL propagation so it never quotes deleted or forbidden pages.
+- **Operations agents on live tables.** An agent that approves refunds or reroutes orders reads a CDC-fed
+  copy of the orders table, so its decisions lag the source by seconds, not a nightly batch.
+- **Re-indexing for a new chunker or embedding model.** The immutable raw landing store lets the agent team
+  rebuild the retrieval index without re-crawling rate-limited SaaS sources.
+- **Compliance audits of agent answers.** Lineage from tool result to `source_version` and `fetched_at`
+  shows exactly which document version an agent cited on a given day.
+
+### Mini project
+**Build a delete-safe connector behind an agent's search tool (2-3 hours).**
+- **Goal:** prove that edits, deletes and permission changes in a source reach an agent's retrieval tool
+  within one sync interval.
+- **Steps:** use a folder of Markdown files as the source; write a sync loop with a content hash, an overlap
+  window, tombstones and a watermark committed after flush; add a nightly-style snapshot diff; expose a
+  `search_docs` tool that drops tombstoned ids, filters by a user's groups and returns `source_version`
+  and `fetched_at`; wire it into a small tool-calling agent.
+- **Done when:** a scripted test edits one file, deletes another and removes a group from a third, runs one
+  sync, and the agent's next answers cite the new version, never the deleted file, and refuse the
+  restricted one, with the per-run change ratio logged.

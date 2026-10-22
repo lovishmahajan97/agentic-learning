@@ -5,7 +5,8 @@ name: Worker threads for CPU-bound tasks
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - node-ts-for-ai/event-loop-and-microtask-queue
   - node-ts-for-ai/bullmq-and-durable-jobs
@@ -18,9 +19,20 @@ sources:
 ---
 
 ## TL;DR
-`worker_threads` run JavaScript in separate V8 isolates on other threads, so tokenizing, parsing or vector
-math stops freezing the event loop. Pool them, since each has its own heap and startup cost, and transfer
-or share large data.
+Agent servers occasionally compute: token counting for context budgets, parsing uploaded documents,
+in-memory reranking. `worker_threads` run that JavaScript in separate V8 isolates so the loop keeps
+streaming; pool them and transfer or share large data.
+
+## For agent builders
+- **Why it matters for agents.** Agent loops are mostly I/O, but the CPU steps they do take (counting tokens
+  before every model call, chunking a PDF a user just dropped in, scoring retrieved candidates) run on the
+  same thread that streams every other session. A worker pool is how those steps stop freezing the server.
+- **Where it shows up in your stack.** Context packing and compaction, RAG ingestion inside the agent
+  server, local rerankers or similarity over cached embeddings, and `piscina` or a hand-rolled pool.
+- **What you control.** Which agent steps move to the pool, pool size against the container CPU quota, the
+  per-worker heap cap, and transfer versus clone for buffers.
+- **What you can skip.** `Atomics.wait` protocols and lock-free designs. Know clone, transfer and
+  `SharedArrayBuffer`, and that model and tool HTTP calls never need a worker.
 
 ## Why it exists
 - **Some AI steps are genuinely compute.** Counting tokens with a BPE tokenizer over a 200-page document,
@@ -232,6 +244,20 @@ if (!isMainThread) {
 }
 ```
 
+### Agent scenario: which agent steps go to the pool
+One turn of a document-QA agent, with illustrative timings on one core.
+
+| Step | Kind | Typical time | Where it runs |
+|---|---|---|---|
+| Model call and two tool HTTP calls | I/O | ~2 s wall | Main loop: awaiting costs nothing |
+| Count tokens of the packed context (40k tokens) | CPU | tens of ms per turn | Worker pool, since it runs every turn for every session |
+| Parse and chunk a 50 MB PDF the user uploaded | CPU | seconds | Worker pool with a heap cap, or a job queue if it must survive restarts |
+| Rerank 200 retrieved chunks by cosine against the query | CPU | a few ms | Inline is fine; measure before moving |
+| Brute-force top-k over 200k cached embeddings | CPU | hundreds of ms | Worker pool, matrix in a `SharedArrayBuffer` |
+
+- **The rule:** move a step when it is synchronous, repeats, and its time times concurrent sessions shows up
+  as event-loop lag; leave I/O and tiny steps alone.
+
 ### Worked scenario: sizing a pool in a 4-CPU, 4 GB container
 Illustrative numbers for an ingestion service that also answers chat.
 
@@ -244,6 +270,9 @@ Illustrative numbers for an ingestion service that also answers chat.
 | If the pool were sized from 64 host cores | 63 workers | Thrashing, and up to ~32 GB of worker heap allowed |
 
 ## Production patterns
+- **One CPU pool per agent server, fed by step type.** Agent teams route token counting, document chunking
+  and local similarity to a shared pool and keep orchestration on the loop. Pass the run's `AbortSignal`
+  into the pool job so a cancelled agent run frees its slot. Monitor queue wait per step type in run traces.
 - **Use a maintained pool library.** `piscina` with `maxThreads` set from the container CPU quota, a bounded
   `maxQueue`, an `idleTimeout`, and `run(task, { signal })` for cancellation. Monitor queue size, wait time
   and run time per job.
@@ -278,6 +307,9 @@ Illustrative numbers for an ingestion service that also answers chat.
   job queue.
 
 ## Pitfalls
+- **Counting tokens inline before every model call.** Symptom: loop lag that grows with the number of active
+  agent sessions and the length of their transcripts. Fix: count in the pool, or count only the appended
+  delta and cache the running total.
 - **A new `Worker` per request.** Symptom: latency dominated by worker startup and memory spikes under load,
   often worse than running the job inline. Fix: a long-lived pool created at startup.
 - **Large buffers without the transfer list.** Symptom: the main thread stalls on the copy, the very problem
@@ -355,6 +387,13 @@ Measure event-loop lag to confirm the chat path no longer stalls.
   container limit with headroom.
 - **Validate under load:** watch queue depth, per-job time and RSS, and adjust.
 
+### Your agent server streams to 300 sessions and also parses user uploads. Which steps go in workers, and how do you prove it helped?
+- **Classify steps:** model and tool calls are I/O and stay on the loop; PDF parsing, token counting over long
+  transcripts and brute-force similarity are repeated CPU work and go to a pool sized to the CPU quota.
+- **Protect runs:** cap worker heaps so a bad upload kills a worker, not every session, and pass the run's
+  abort signal so cancelled runs free their slot.
+- **Prove it:** event-loop lag p99 and longest token gap per session before and after.
+
 ### How do you cancel a job that is already running in a worker?
 - **`terminate()`** is reliable but discards the worker, so the pool pays startup for a replacement.
 - **A shared cancel flag** polled with `Atomics.load` keeps the worker alive but needs the job to cooperate;
@@ -387,3 +426,24 @@ Measure event-loop lag to confirm the chat path no longer stalls.
 > HTTP requests are I/O-bound and already non-blocking on the main thread; a worker waiting on a socket
 > adds memory and complexity with no throughput gain. Workers pay off for sustained synchronous
 > computation that would otherwise stall the loop.
+
+## Use cases & projects
+### Use cases
+- **Context budgeting.** Token counting for context packing and compaction runs in a pool so long transcripts
+  do not stall other sessions.
+- **Upload-to-RAG inside the agent server.** Parsing and chunking a user's PDF in a capped worker keeps chat
+  streaming while the document is indexed.
+- **Local retrieval and reranking.** Brute-force similarity over an in-memory embedding matrix, shared once
+  via `SharedArrayBuffer`, for small corpora that do not justify a vector database.
+- **Cancellable heavy steps.** A user who stops a run frees its worker slot through a shared cancel flag or
+  the pool's `AbortSignal` support.
+
+### Mini project
+**Move an agent's CPU steps into a pool (1-2 hours).**
+- **Goal:** keep token streaming smooth for many sessions while each turn counts tokens and scores cached
+  embeddings.
+- **Steps:** simulate 50 agent sessions streaming fake tokens; on each turn run a token count over a long
+  transcript and a top-k scan over 50k random vectors inline; then move both to a 3-worker pool (the
+  `Pool` above or `piscina`) with the matrix in a `SharedArrayBuffer`; add a cancel path for abandoned runs.
+- **Done when:** a table shows loop-lag p99 and per-turn latency for inline versus pooled, and cancelling a
+  run frees its slot within one poll interval.

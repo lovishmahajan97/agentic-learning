@@ -422,3 +422,22 @@ with `usage` numbers from a pilot week, because billed input also includes forma
 - [ ] Because it falls back to character-level encoding using Unicode code points
 > Text is converted to UTF-8 bytes and all 256 byte values are base tokens, so any input decomposes into
 > known pieces. Merges only make common sequences shorter; they are never required for coverage.
+
+## Use cases & projects
+### Use cases
+- **Context budgeting per agent step.** Count system prompt, tool schemas, history and tool results before
+  each call, and trim or compact before the request is rejected.
+- **Capping tool results.** Truncate a large JSON or log tool output to a token budget instead of letting
+  one result crowd out the rest of the transcript.
+- **Chunking for RAG tools.** Split documents by token count so chunks fit retrieval and context budgets.
+- **Pre-flight cost estimates.** Estimate input tokens for a batch eval or a fleet of agent runs before
+  spending money, then reconcile with `usage`.
+
+### Mini project
+**Add a token budgeter to an agent loop (1-2 hours).**
+- **Goal:** keep a multi-step agent transcript under a fixed budget without losing the task.
+- **Steps:** build a fake agent loop that appends a verbose JSON tool result each step; count tokens per
+  component with tiktoken before every call; when the total passes a threshold, truncate old tool results
+  first, then summarise old turns; compare your local count with the API's `usage` on a few real calls.
+- **Done when:** a 30-step run never exceeds the budget, and you have a table of local count versus
+  reported usage with the gap explained.

@@ -371,3 +371,23 @@ settings without a restart.
 - [ ] Set `APP_TOP_K=20`, since nested fields are flattened automatically
 > Without a configured delimiter, nested models are only settable as a whole JSON string. With
 > `env_nested_delimiter`, a single nested field can be overridden while the others keep their defaults.
+
+## Use cases & projects
+### Use cases
+- **Agent API servers.** A FastAPI agent service validates model name, max steps, tool timeouts and keys
+  at startup, so a bad deploy fails the health check instead of the first user run.
+- **Per-environment agent behaviour.** Staging runs a cheap model with tracing on; production runs a
+  stronger model with tighter step limits, all from the same `Settings` class.
+- **Tool feature flags.** Boolean fields enable or disable individual tools per tenant or environment,
+  parsed correctly so `"false"` really means off.
+- **Eval runners.** The eval harness reuses the agent's `Settings`, overriding only the model and dataset
+  path, so evaluated and deployed configs cannot drift apart.
+
+### Mini project
+**Typed config for a tool-calling agent (1-3 hours).**
+- **Goal:** replace scattered `os.environ.get` calls in a small agent with one validated `Settings` class.
+- **Steps:** define fields for model name, `max_steps` with `Field(gt=0)`, a nested retrieval group with
+  `top_k`, a per-tool timeout and the provider key as `SecretStr`; set an env prefix and a nested
+  delimiter; load it once and pass it into the agent loop; log the settings object at startup.
+- **Done when:** a typo or a negative step limit stops the process before any model call, the startup
+  log shows the key masked, and one nested field can be overridden from the environment alone.

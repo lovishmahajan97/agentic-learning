@@ -455,3 +455,24 @@ replaces evals of answer quality; contracts only guarantee the shape of the conv
 - [ ] Whether the service handles malformed requests
 > A schema describes what the provider offers, not what each consumer uses. Consumer-driven contracts
 > record actual usage, so a removal fails against exactly the consumers that read that field.
+
+## Use cases & projects
+### Use cases
+- **Agent and retrieval service.** A consumer contract records the fields the agent reads from search
+  hits, so a rename on the retrieval side fails the retrieval team's build.
+- **Shared tool services.** A tool gateway used by several agents runs each agent's contract, and can
+  remove a field only when no deployed agent still reads it.
+- **Tool schemas the model sees.** A snapshot test of every tool's JSON schema makes a change to what the
+  model is offered a reviewed diff, not an accident.
+- **MCP servers.** The schemas an MCP server exposes are validated in CI so clients do not discover a
+  breaking change at runtime.
+
+### Mini project
+**Add a contract between an agent and its search tool (2-3 hours).**
+- **Goal:** catch a breaking change in a search service before the agent quietly loses its context.
+- **Steps:** build a small search service and an agent client that reads `doc_id`, `score` and `text`;
+  write the consumer's expectations as a contract file from the agent's tests; verify the contract
+  against the real provider code in its own test; snapshot the agent's tool schema; then rename `text`
+  to `content` in the provider.
+- **Done when:** the rename fails the provider's check with a message naming the agent as the broken
+  consumer, and changing the tool schema shows up as a snapshot diff.

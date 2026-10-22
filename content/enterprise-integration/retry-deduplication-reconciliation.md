@@ -5,7 +5,8 @@ name: Retry / deduplication / reconciliation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - enterprise-integration/webhooks
   - enterprise-integration/incremental-synchronization-and-cdc
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-Retry handles failed calls, deduplication makes retries safe against writes that succeeded silently, and
-reconciliation (a scheduled source-versus-target comparison) catches events that never arrived. Each
-covers a failure the other two cannot see, so mature integrations run all three.
+An agent's tool calls fail, time out and get retried by the loop itself. Retry handles failed calls,
+deduplication makes repeats safe when a write succeeded silently, and reconciliation catches events that
+never arrived. Agents writing to customer systems need all three.
+
+## For agent builders
+- **Why it matters for agents.** An agent loop retries by nature: the framework retries the HTTP call, the
+  model re-plans and calls the tool again, a crashed run resumes from a checkpoint. Each one is a repeat
+  write unless the tool is idempotent, and a duplicate ticket or refund is the classic agent incident.
+- **Where it shows up in your stack.** Tool adapters that wrap customer APIs, durable-execution
+  checkpoints, webhook receivers that feed the agent's RAG index, and the scheduled jobs that keep that
+  index in step with the system of record.
+- **What you control.** Which errors the adapter retries versus returns to the model, the operation id
+  you derive per tool call, the dedupe key on inbound events, and the reconciliation window and alert.
+- **What you can skip.** Proofs about distributed consensus. Know the two-generals ambiguity, the inbox
+  and ledger patterns and the three-class diff; that is enough to build and debug agent integrations.
 
 ## Why it exists
 Take a concrete integration: your assistant ingests ServiceNow incidents into a retrieval index through

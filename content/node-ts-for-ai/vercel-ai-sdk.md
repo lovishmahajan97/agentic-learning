@@ -5,7 +5,8 @@ name: Vercel AI SDK
 kind: tool
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - node-ts-for-ai/openai-anthropic-node-sdks
   - node-ts-for-ai/streams-and-backpressure
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-The Vercel AI SDK (`ai` on npm) gives one TypeScript call shape across model providers plus a streaming
-UI protocol for `useChat`. Swapping models becomes one line and browser streaming needs no hand-rolled
-parser; provider-specific features sit behind an escape hatch.
+The Vercel AI SDK (`ai` on npm) runs a TypeScript agent's tool loop across providers with one call shape,
+and streams its steps to a `useChat` UI. Swapping models is one line; provider-specific features sit behind
+an escape hatch.
+
+## For agent builders
+- **Why it matters for agents.** `streamText` with tools and `stopWhen` *is* a small agent loop: call the
+  model, validate tool input, run `execute`, append the result, call again. Knowing what it does per step
+  is how you budget, trace and debug a TypeScript agent built on it.
+- **Where it shows up in your stack.** Route handlers that call `streamText` or `generateText` with `tool()`
+  definitions, `useChat` in the browser showing tool cards, `generateObject` for typed planner or router
+  outputs, and `wrapLanguageModel` middleware for cross-cutting policy.
+- **What you control.** The step budget (`stepCountIs(n)`), which tools have `execute` (server-run) and
+  which do not (client-run or approval-gated), `abortSignal`, per-provider `providerOptions` for caching,
+  and telemetry per step.
+- **What you can skip.** The UI stream protocol's wire format and the provider packages' internals; know
+  only that client and server versions must match.
 
 ## Why it exists
 - **Every provider has its own shape.** OpenAI returns `choices[0].message.content` and tool calls with
@@ -202,6 +216,21 @@ export async function classify(text: string) {
 - **A provider swap changes only the wire.** Swapping `anthropic(...)` for `openai(...)` changes the bytes
   (a `tool_calls` entry with string arguments instead of a `tool_use` block) and nothing in this file.
 
+### Worked scenario: what the step budget costs a research agent
+A research agent starts each request with ~3,000 tokens of system prompt and tool schemas, and each round
+appends ~1,000 tokens of tool call plus result. Illustrative numbers, not a measurement.
+
+| Budget | Steps actually run | Input tokens per step | `totalUsage` input |
+|---|---|---|---|
+| `stepCountIs(1)` (default) | 1 | 3,000 | 3,000, but no answer after the tool runs |
+| `stepCountIs(4)`, model finishes at step 4 | 4 | 3,000, 4,000, 5,000, 6,000 | 18,000 (6x the first request) |
+| `stepCountIs(10)`, model loops on one tool | 10 | 3,000 up to 12,000 | 75,000 for a question that needed 4 rounds |
+
+- **The budget is the cost ceiling.** Growth is quadratic-ish in steps because every step resends the
+  history, so a loose limit costs far more than its step count suggests.
+- **Provider caching** of the stable 3,000-token prefix cuts the price of the resent part, not the
+  token count the model reads.
+
 ### Handling a structured-output failure explicitly
 `generateObject` can still fail when the model's answer does not match the schema. Catch that error type,
 log what the model wrote, and return an explicit fallback that your metrics count as a failure.
@@ -238,6 +267,9 @@ export async function classifySafe(text: string) {
 - **Provider comparison as an eval job.** Run the golden set through the same code with the model line set
   to each candidate (`anthropic(...)`, `openai(...)`) in a scheduled job, and record quality, latency and
   cost side by side. Also run the tool schemas against each provider, since some reject schemas others accept.
+- **Per-step agent traces.** Use the `onStepFinish` callback (or the `steps` array in `onFinish`) to log
+  each step's tool calls, results, finish reason and usage under one run id. Monitor steps per run, tool
+  error rate per tool, and runs that hit the step budget instead of finishing.
 
 ## Trade-offs
 - **One call shape vs newest features.** Comparisons and fallbacks get cheap, but the newest
@@ -277,6 +309,8 @@ export async function classifySafe(text: string) {
 ## When to use
 - **Use when** you want to compare or switch providers, a browser UI needs streamed text, tool state or
   partial objects, or a small team wants typed tools and structured output without owning an agent framework.
+- **Agent fit:** short tool loops (a handful of steps) behind a chat UI are its sweet spot; long-running or
+  durable agents that must survive restarts need a job queue and your own state around it.
 - **Prefer the native SDK when** you commit to one provider and lean on its specific features (explicit
   prompt caching, batch APIs, server-side tools), need byte-level control over requests, or are writing a
   library others will consume.
@@ -335,6 +369,14 @@ provider-specific economics.
 - **Apply the renames:** `parameters` to `inputSchema`, `maxTokens` to `maxOutputTokens`, `maxSteps` to `stopWhen`.
 - **Verify** with an interception test of the route and a canary, watching empty-message and render errors.
 
+### How would you put a human approval step in front of a refund tool in an AI SDK agent?
+- **Omit `execute` on that tool,** so the SDK returns the tool call instead of running it and the loop
+  stops there.
+- **Render it in the UI** as a confirmation card from the streamed tool part; on approval, run the refund
+  on the server and send the result back as the tool's output so the next request continues the loop.
+- **Keep read tools server-run** with `execute`, so only consequential actions pause, and log approvals
+  and denials per tool.
+
 ## Quiz
 ### Q: What makes `anthropic("...")` and `openai("...")` interchangeable in a `streamText` call?
 - [ ] The SDK translates prompts into a provider-neutral language the models all understand
@@ -362,3 +404,30 @@ provider-specific economics.
 > `JSON.parse` gives you `unknown` from whatever the model wrote. `generateObject` constrains the
 > generation where the provider supports it and validates against the schema, so a non-conforming
 > value becomes an explicit error you must handle rather than a silently wrong object. It does not guarantee success, cache results or stream to the client.
+
+## Use cases & projects
+### Use cases
+- **Support and ops agents in a web app.** A `streamText` route with a few Zod-typed tools and a small step
+  budget, rendered by `useChat` as text plus tool cards.
+- **Provider bake-offs for an agent.** The same agent code runs against several models in a scheduled eval,
+  comparing task success, steps per run and cost.
+- **Typed routing and planning steps.** `generateObject` classifies intent or produces a plan object that
+  decides which tools or sub-agent run next.
+- **Approval-gated actions.** Tools without `execute` pause the loop so a user confirms refunds, emails or
+  deletes in the UI.
+
+### Mini project
+**Ship a streaming support agent with a tool card and an approval gate (2-3 hours).**
+- **Goal:** a chat page where an agent looks orders up with a server-run tool and asks the user before a
+  refund tool runs.
+- **Steps:** write a `streamText` route with `lookupOrder` (with `execute`) and `refundOrder` (without);
+  set `stopWhen: stepCountIs(4)` and `abortSignal: req.signal`; render tool parts in `useChat`; log
+  `totalUsage` and steps from `onFinish`; swap the model line to a second provider and rerun.
+- **Done when:** "Refund ord_42" shows a lookup card, then a confirmation card; approving completes the
+  refund and the answer; closing the tab mid-run stops generation; both providers pass the same three
+  scripted conversations.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): the document Q&A chat endpoint validates
+requests with Zod and streams cited answers through the Vercel AI SDK or a native SDK behind an injected
+interface, with a fallback provider when the breaker is open.

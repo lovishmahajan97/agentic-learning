@@ -5,7 +5,8 @@ name: Tool permissions & least privilege
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - agent-reliability/idempotent-tool-execution
   - agent-reliability/audit-logs-execution-traces
@@ -25,6 +26,19 @@ sources:
 Tools turn an agent's text into effects, and anything in its context can steer that text. Least
 privilege gives each run only the tools, arguments, identities and credentials its task needs, enforced
 in the runtime, so a hijacked decision has bounded blast radius.
+
+## For agent builders
+- **Why it matters for agents.** Every tool you mount is authority the model can be talked into using.
+  Prompt injection in a ticket, page or email is a matter of when, not if, so the most a hijacked run can
+  do is set by the profile you granted, not by the system prompt.
+- **Where it shows up in your stack.** The tool list you pass per request, the executor or middleware that
+  dispatches tool calls, MCP server authorization, the database role and API tokens your adapters use, and
+  the sandbox around any shell or code tool.
+- **What you control.** Which tools are mounted per task class, argument limits checked after parsing,
+  which identity each call runs as, which actions need approval, and whether one run can hold private
+  data, untrusted content and egress at once.
+- **What you can skip.** Formal access-control models and policy languages at first. A versioned profile
+  per task class, executor-side checks and an audit write per call cover most agents.
 
 ## Why it exists
 - **An agent does what its model decides.** A classical program only does what its code says. The model
@@ -356,3 +370,23 @@ have no egress tool at all, or the injection could leak orders instead of droppi
 - [ ] The restriction holds because argument validation applies to all tools uniformly
 > A shell can do anything `write_file` can and more. Argument-level constraints on one tool mean nothing
 > while an unconstrained general-purpose tool is mounted alongside it.
+
+## Use cases & projects
+### Use cases
+- **Support agents with SQL access.** A `SELECT`-only role plus on-behalf-of tokens keeps an injected
+  ticket from dropping or leaking tables.
+- **Coding agents.** A workspace-write profile with a sandboxed shell stops edits outside the task
+  directory and network calls from test code.
+- **Inbox and document assistants.** These read private data and untrusted content, so egress is removed
+  and sending becomes a gated action the user confirms.
+- **Multi-tenant agent platforms.** Profiles keyed by task class and versioned with the run record make
+  every action attributable to a user and a policy.
+
+### Mini project
+**Build and red-team a permission layer for a small agent (2-3 hours).**
+- **Goal:** prove that an injected instruction cannot cause a forbidden effect, whatever the model emits.
+- **Steps:** give a tool-calling agent `read_file`, `write_file`, `http_get` and `refund`; put the `check`
+  and `execute` functions from this lesson between the model and the tools with two profiles; plant
+  injection payloads in files the agent reads; run 20 tasks and log every verdict.
+- **Done when:** zero forbidden effects occur across all runs, every denial appears in the audit log as a
+  structured result, the policy tests pass in CI, and you can report the denial rate per profile.

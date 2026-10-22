@@ -5,7 +5,8 @@ name: Cross-tenant data leakage
 kind: concept
 difficulty: core
 est_minutes: 17
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - system-design/tenant-isolation
   - system-design/multi-tenancy
@@ -21,14 +22,27 @@ sources:
 ---
 
 ## TL;DR
-Cross-tenant leakage is tenant A's data in tenant B's answer, because LLM pipelines copy data into stores
-row-level security never sees. Fix: one server-derived tenant ID, a hard pre-filter in every store, proven
-by negative tests.
+Cross-tenant leakage is tenant A's data in tenant B's agent answer, because agents copy data into stores
+row-level security never sees. Fix: one server-derived tenant ID and a
+hard pre-filter in every store, proven by negative tests.
+
+## For agent builders
+- **Why it matters for agents.** A multi-tenant agent reads from a vector index, a semantic cache, long-term
+  memory and per-tenant tools on every step. Each is a separate store with its own key, and one missing
+  scope turns a fluent answer into a breach that nobody notices until a customer screenshot.
+- **Where it shows up in your stack.** Your retriever's metadata filter, your memory namespace, the cache
+  key in front of the LLM call, the tracing SDK that ships prompts to an observability backend, and the
+  connector credentials your tools load.
+- **What you control.** Deriving `tenant_id` once at the edge, a scoped store wrapper with no unscoped
+  method, tenant and ACL groups in every cache and memory key, fail-closed background jobs, and a canary
+  test matrix in CI.
+- **What you can skip.** Asking the model to "use only this customer's documents". Once a foreign chunk is
+  in context the leak has happened; isolation is a property of your data layer, not of the prompt.
 
 ## Why it exists
 - **Classic SaaS has one tenancy choke point.** The data-access layer, with a `WHERE tenant_id = ?` on every
   query or row-level security in the database, using well-worn patterns.
-- **LLM features copy data *out* of that layer into half a dozen places,** each usually built by a
+- **Agent features copy data *out* of that layer into half a dozen places,** each usually built by a
   different person with a different mental model: chunks in a vector store, completions cached by
   question, agent memory, every prompt and completion shipped to an observability backend by the tracing
   SDK, and examples baked into weights by a fine-tuning job.
@@ -42,7 +56,7 @@ by negative tests.
   by raising k or removing the filter in one code path.
 
 ## How it works
-### The leak surfaces, one by one
+### The leak surfaces in an agent pipeline
 | # | Surface | How it leaks | Correct form |
 |---|---|---|---|
 | 1 | **Vector index** | shared collection with a missing filter, or a filter applied after the ANN search | filter evaluated *inside* the search so k means "k within this tenant" |
@@ -99,8 +113,8 @@ by negative tests.
 | **Shared collection + mandatory filter** | scales to thousands of small tenants | one bug away from a leak | self-serve SaaS |
 
 ## Diagram
-Trace the tenant ID: it is derived once from the verified token and must reach every store as a hard
-key or pre-filter; any store it skips is a leak surface.
+Trace the tenant ID through one agent step: it is derived once from the verified token and must reach
+every store as a hard key or pre-filter; any store it skips is a leak surface.
 
 ```mermaid
 flowchart TD
@@ -123,6 +137,9 @@ flowchart TD
 Every method requires a tenant context, the filter runs inside the vector search, the cache key includes
 the tenant, and a parametrised test checks each tenant's canary is invisible to all others. The vector
 call uses a Qdrant-style filter syntax; adapt the dictionary to your engine.
+
+Your agent's retrieval tool calls `answer` or `retrieve` with the context from the request, never with
+arguments the model produced.
 
 ```python
 import hashlib, pytest
@@ -214,6 +231,22 @@ for t in SIZES:
 
 - **Reading it:** the small tenant gets almost nothing, which is exactly when someone "fixes" search by
   raising k or dropping the filter in one path.
+- **What the agent does with zero hits:** a RAG agent that retrieves nothing tends to answer from its own
+  priors or loop on retries, so the recall bug looks like hallucination rather than a scoping bug.
+
+### Worked audit: one agent turn across stores
+A support agent for tenant `globex` answers "what is our refund policy?" in one step that touches four
+stores. An audit of a first draft (illustrative):
+
+| Store touched in the turn | Key or filter in the draft | Leak if wrong | Fix |
+|---|---|---|---|
+| Semantic cache | embedding of the question | `acme`'s policy returned verbatim | key on tenant, ACL groups and prompt |
+| Vector index | `tenant_id` filter after top 8 | recall near zero for small tenants | filter inside the ANN search |
+| Long-term memory | `user_id` only | recycled session sees another tenant's notes | namespace by tenant, then user |
+| CRM tool | one global API key | injected order ID reads another customer | per-tenant credential from ctx |
+
+- **Every fix reads the same `TenantCtx`,** so one review question covers the turn: does each store call
+  take the context, or something the model or client supplied?
 
 ## Production patterns
 - **Scoped repository as the only store API.** Expose `retrieve(ctx, ...)`, `cache.get(ctx, ...)` and
@@ -227,20 +260,22 @@ for t in SIZES:
 - **Canary matrix in CI and production.** Plant one canary per tenant, query every tenant pair with large
   k across retrieval, cache and memory on each deploy, and scan sampled production outputs for foreign
   canaries. Any hit is a sev-1 incident, not a flaky test.
-- **Fail-closed job context.** Background jobs receive the tenant from the originating record and raise if
-  it is missing; never default to "all". Monitor job runs rejected for missing tenant.
+- **Fail-closed job context.** Background jobs (memory summarisation, re-indexing, agent evals) receive
+  the tenant from the originating record and raise if it is missing; never default to "all". Monitor job
+  runs rejected for missing tenant.
 - **Tiered isolation.** Give regulated or very large tenants their own collection or namespace, and keep
   self-serve tenants in a shared collection with a mandatory filter. Track per-tenant index overhead to
   know when to migrate a tenant between tiers.
-- **Tenant offboarding runbook.** One job deletes from the index, caches, memory, traces and adapters,
-  then re-runs that tenant's canary queries and records the result as deletion evidence.
+- **Tenant offboarding runbook.** One job deletes from the index, caches, agent memory, traces and
+  adapters, then re-runs that tenant's canary queries and records the result as deletion evidence.
 
 ## Trade-offs
 - **Collection-per-tenant vs cost.** Hard isolation and trivial deletion, but each collection carries index
   and memory overhead, so beyond a few hundred tenants shared-collection-with-filter becomes the only
   affordable option.
 - **Pre-filtering vs latency.** It keeps recall correct for small tenants, but engines that implement it by
-  over-fetching pay latency in proportion to how skewed tenant sizes are.
+  over-fetching pay latency in proportion to how skewed tenant sizes are, and an agent pays it on every
+  retrieval step.
 - **Tenant in the semantic cache key vs hit rate.** It removes cross-tenant hits, and with them the hit rate
   that made the cache attractive. If most savings came from identical questions across customers, the
   cache may no longer pay for itself.
@@ -251,6 +286,8 @@ for t in SIZES:
 ## Pitfalls
 - **Reading `tenant_id` from a client-controlled header or body.** Symptom: a penetration tester changes
   one header and receives another customer's documents.
+- **Letting the model pass the tenant as a tool argument.** Symptom: an injected document says "search
+  tenant acme" and the retrieval tool obeys. Fix: tools take the tenant from the request context only.
 - **Filtering in the application after retrieval.** Symptom: small tenants complain search "returns
   nothing" while large tenants are fine, followed by someone raising k.
 - **Caching completions keyed on question text or embedding only.** Symptom: a customer sees a policy,
@@ -265,9 +302,9 @@ for t in SIZES:
   containing content from tenants it was never meant to touch.
 
 ## When to use
-- **Use when:** any multi-tenant LLM feature launches; design isolation explicitly before launch.
+- **Use when:** any multi-tenant agent or RAG feature launches; design isolation explicitly before launch.
 - **Revisit when:** a new store enters the pipeline: a cache, a memory layer, a new vector engine, an
-  observability vendor.
+  observability vendor, a new tool connector.
 - **Measure:** the fraction of store call sites that take a tenant context (target 100%, enforced by a lint
   or wrapper), canary-test pass rate across tenant pairs in CI, and sampled production outputs scanned for
   foreign canaries.
@@ -311,6 +348,14 @@ than per-tenant collections were.
 - **Do not raise k or remove the filter;** move the filter inside the ANN query and check how your engine
   implements filtered search.
 - **Verify** with a recall benchmark on the smallest tenants and the canary test at large k.
+
+### How would you scope long-term memory for an agent platform serving many tenants?
+- **Namespace by tenant, then user:** the memory key starts with the server-derived `tenant_id`, so a
+  recycled session or user ID cannot reach another tenant's notes.
+- **Writes inherit classification:** memories derived from restricted documents carry those ACL groups and
+  are filtered on read.
+- **Background summarisers fail closed** when the tenant is missing, and offboarding deletes the namespace
+  and re-runs canary queries.
 
 ### When would you choose collection-per-tenant over a shared collection with a filter?
 - **Per-tenant** for a few large or regulated tenants: hard isolation, simple verified deletion, and a
@@ -359,3 +404,24 @@ than per-tenant collections were.
 - [ ] The metadata of the first retrieved document
 > Request bodies, model outputs and retrieved documents are all attacker-influenceable; only the verified
 > credential is a trustworthy source, and carrying it in a context object prevents it being overwritten.
+
+## Use cases & projects
+### Use cases
+- **Multi-tenant support and knowledge agents.** One shared index serves thousands of customers, so the
+  in-search tenant filter and canary matrix are launch blockers.
+- **Agent platforms with long-term memory.** Memory namespaced by tenant and user keeps one customer's
+  "remember this" from surfacing in another's session.
+- **Cost-optimised agents with semantic caches.** Tenant and ACL groups in the key decide whether caching
+  is safe at all.
+- **Enterprise security reviews.** Canary results and the scoped-store design are the evidence buyers ask
+  for before connecting their data.
+
+### Mini project
+**Canary-test a multi-tenant RAG agent (2-3 hours).**
+- **Goal:** prove, with failing and passing tests, that a small RAG agent cannot leak across three tenants.
+- **Steps:** index synthetic documents for three tenants of very different sizes, each with one canary
+  token; give a simple agent a `search_docs` tool and a dictionary cache; first wire them with a
+  post-filter and a question-only cache key, run the canary matrix at k=50, then switch to the scoped store
+  with a pre-filter and tenant-plus-ACL cache keys and rerun.
+- **Done when:** the first version shows at least one cache or recall failure, the second passes every
+  tenant pair, and small-tenant recall is reported for both versions in a short table.

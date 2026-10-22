@@ -460,3 +460,23 @@ check tail latency per route and that answer consistency is acceptable for the p
 > Models are poorly calibrated about their own correctness, so stated confidence is often high on wrong
 > answers. Schema checks, execution and sample agreement are external signals that do not depend on the
 > model knowing when it is wrong.
+
+## Use cases & projects
+### Use cases
+- **Per-step model choice in agent graphs.** A strong model plans while a small model fills tool arguments
+  and summarises tool results, each node pinned to its own alias.
+- **Schema-gated escalation.** A tool call that fails JSON schema validation is retried on the stronger
+  model, which catches the commonest small-model failure at no extra judge cost.
+- **Text-to-SQL and code agents.** Execution against the schema or a test run is a free external gate that
+  decides whether to escalate.
+- **Support agents at scale.** Routine intents go to a cheap model; ambiguous or high-stakes intents go
+  straight to the strong model, tuned on cost per resolved ticket.
+
+### Mini project
+**Add a schema-gated cascade to a tool-calling agent (2-3 hours).**
+- **Goal:** cut cost per successful task without losing task success.
+- **Steps:** build an agent with three tools and a labelled set of 30 tasks; run it all-strong and record
+  success and cost; then route argument-filling to a small model, validate each tool call against its
+  schema, escalate on failure with a cap of one escalation per step; log escalation rate per step.
+- **Done when:** you have a table comparing success rate, escalation rate and cost per successful task for
+  both runs, and you can name the step whose escalation rate is highest and why.

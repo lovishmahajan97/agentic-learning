@@ -409,3 +409,23 @@ and if cache utilization is pinned at 100%, either lower concurrency, quantize t
 > Batching lets one weight read serve many requests, so aggregate throughput climbs. But each decode step
 > also reads every running request's cache, so step time grows and every user's TPOT lengthens. That is
 > the expected shape of the throughput-versus-latency curve, not a fault.
+
+## Use cases & projects
+### Use cases
+- **Choosing hosted versus self-hosted for an agent product.** The five-layer view and memory arithmetic
+  decide whether a provider API or your own vLLM or SGLang deployment serves the agent's model.
+- **Debugging slow agent tasks.** Timing queueing, prefill and decode per step shows whether a 40-second
+  task is a serving problem, a prompt-size problem or a tool problem.
+- **Capacity planning an agent fleet.** Turning concurrent runs and transcript length into GPUs and
+  replicas before launch, instead of discovering the limit in production.
+- **Routing and autoscaling.** Session-affine routing by run id and queue-based autoscaling keep multi-step
+  agents on warm replicas.
+
+### Mini project
+**Self-host a model behind an agent and time every step (2-3 hours).**
+- **Goal:** see where an agent task's latency goes when you own the serving stack.
+- **Steps:** start an OpenAI-compatible engine (for example vLLM) with a small instruct model; point a
+  minimal tool-calling agent with two fake tools at it; log per step the time to first token, decode time,
+  input and output tokens; then run 1, 8 and 32 agents concurrently.
+- **Done when:** you have a per-step table at each concurrency level showing which phase grows, and a short
+  note on which engine setting or prompt change you would try first.

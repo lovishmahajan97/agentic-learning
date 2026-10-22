@@ -411,3 +411,25 @@ and misleads readers. The fix is to build stream chunks from an explicit chunk m
 - [ ] The response skips validation to save CPU
 > `exclude_unset` serialises just the fields that were set on the returned object, which suits partial
 > responses but surprises clients that expect default-valued fields to be present.
+
+## Use cases & projects
+### Use cases
+- **Returning only the answer from a big agent state.** A public output model turns a final state with
+  history, scratchpad and costs into answer, sources and run ID.
+- **Hiding other tenants' data in tool results.** Raw tool output can hold records the user should not
+  see; dropping it from the response closes that leak path.
+- **Stable contracts for agent clients.** A declared model keeps the OpenAPI document accurate, so UIs
+  and other agents can generate clients that do not break when internal state grows.
+- **Guarding streamed events too.** Because `StreamingResponse` bypasses `response_model`, an explicit
+  event model per step type keeps the same allow-list on SSE output.
+
+### Mini project
+**Plug the leaks in an agent endpoint (1-2 hours).**
+- **Goal:** make it impossible for internal agent state to reach clients, on both the JSON and streaming
+  paths.
+- **Steps:** build a route that returns a fake agent final state containing `system_prompt`,
+  `scratchpad`, `tool_outputs` and `cost_usd`; observe the leak; add a `RunOut` `response_model`; add a
+  streaming variant and serialise each event through its own event model; write a contract test that pins
+  the exact key set of both.
+- **Done when:** the contract tests pass, and adding a new field to the internal state does not change
+  either response.

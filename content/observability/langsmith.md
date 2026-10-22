@@ -5,7 +5,8 @@ name: LangSmith
 kind: tool
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - observability/tracing
   - observability/langfuse
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-LangSmith is LangChain Inc.'s closed-source platform for tracing, evaluating and monitoring LLM apps: run
-trees with tokens, latency and cost, feedback, online evaluators and dataset experiments. Any code can use
-`@traceable`, but for LangChain and LangGraph tracing is an environment-variable switch.
+LangSmith is LangChain Inc.'s closed-source platform for tracing, evaluating and monitoring agents: run
+trees of every node, model call and tool call, feedback, online evaluators and dataset experiments. Any
+code can use `@traceable`; for LangGraph agents tracing is an environment-variable switch.
+
+## For agent builders
+- **Why it matters for agents.** A LangGraph agent's behaviour lives in node state and tool choices.
+  LangSmith shows each node, the `llm` run that chose the next action and every `tool` run, so loops,
+  wrong tool picks and slow steps are visible without extra instrumentation.
+- **Where it shows up in your stack.** `LANGSMITH_TRACING=true` for LangChain and LangGraph, `@traceable`
+  and `wrap_openai` for plain Python agents, run-tree headers for remote tool services, and `evaluate`
+  in CI for agent regression tests.
+- **What you control.** Project per environment, thread keys on the root run, `run_type` on tools and
+  retrievers, input and output hiding, online evaluator sampling, and the evaluators that score trajectories.
+- **What you can skip.** The deployment side of the LangSmith brand and the transport internals. Know that
+  runs post on start and end, and that `dotted_order` rebuilds the tree.
 
 ## Why it exists
 - **Abstractions hid the model input.** A LangChain chain composed prompt templates, retrievers and parsers;
@@ -210,6 +223,50 @@ async def run(request: Request):
 
 If a proxy strips unknown headers, the callee's runs appear as separate root traces.
 
+### Evaluating an agent's trajectory, not just its answer
+A plain-Python agent whose tools are `tool` runs, evaluated on whether it answered correctly and whether it
+repeated a tool call. The target returns the tool sequence so code evaluators can read it. `decide` stands
+for one model call (through a wrapped client) that returns either a tool request or a final answer.
+
+```python
+from langsmith import traceable, evaluate
+
+@traceable(run_type="tool")
+def lookup_order(order_id: str) -> dict:
+    return {"order_id": order_id, "status": "shipped", "days_late": 3}
+
+@traceable(run_type="tool")
+def issue_refund(order_id: str) -> dict:
+    return {"order_id": order_id, "refunded": True}
+
+TOOLS = {"lookup_order": lookup_order, "issue_refund": issue_refund}
+
+@traceable(run_type="chain", name="refund_agent")
+def refund_agent(task: str, max_steps: int = 6) -> dict:
+    calls, observations = [], []
+    for _ in range(max_steps):
+        step = decide(task, observations)                 # an 'llm' run under this trace
+        if step["type"] == "final":
+            return {"answer": step["text"], "tool_calls": calls}
+        calls.append(f'{step["tool"]}:{step["args"]}')
+        observations.append(TOOLS[step["tool"]](**step["args"]))
+    return {"answer": None, "tool_calls": calls}
+
+def no_repeated_calls(outputs: dict) -> bool:             # trajectory evaluator
+    return len(outputs["tool_calls"]) == len(set(outputs["tool_calls"]))
+
+def answered(outputs: dict) -> bool:
+    return outputs["answer"] is not None
+
+evaluate(lambda inputs: refund_agent(inputs["task"]), data="refund-tasks",
+         evaluators=[no_repeated_calls, answered], experiment_prefix="refund-agent-v3")
+```
+
+- **Each example is one traced agent run,** so a failing `no_repeated_calls` score links straight to the
+  run tree where the repeat happened.
+- **The answer can be right while the trajectory is wrong;** scoring both catches agents that succeed by
+  brute force and would be slow and expensive in production.
+
 ### Worked comparison: reading two experiments
 Illustrative numbers for a 200-example golden set, baseline versus `system-prompt-v2`.
 
@@ -233,6 +290,10 @@ broke 3" a readable statement rather than an average. Open the 3 regressions bef
   annotation queue and a dataset, so the golden set tracks real failures. Monitor queue backlog.
 - **Sampled online judges, calibrated.** Apply online evaluators to a small percentage of production traces
   and compare with annotation-queue labels weekly. Monitor judge-human agreement and judge cost.
+- **Trajectory evaluators for agents.** Alongside answer checks, score tool-call count, repeated calls and
+  whether required tools ran, using code evaluators over the agent's output or run tree. Monitor tool runs
+  per trace and the repeated-call rate in production dashboards, because loops show up there before users
+  complain.
 - **Hide sensitive payloads.** Configure the client's `hide_inputs` and `hide_outputs` processors to redact
   personal data before runs are posted. Monitor a sampled audit of stored runs.
 - **Drain in serverless.** Call `wait_for_all_tracers()` or the client's flush at the end of each handler.
@@ -324,13 +385,21 @@ canary project, and keep an online evaluator or feedback key tracking the loop r
 - **When the stack is not LangChain,** the integration advantage shrinks, so compare Langfuse or Phoenix on
   cost and residency.
 
-### Some runs show inputs but never an output or end time. What happened?
+### Some agent tool and step runs show inputs but never an output or end time. What happened?
 - **Runs are posted twice,** once on start and once on end, so a run with only a start record means the end
   post never arrived.
 - **Likely causes:** the process crashed or was killed mid-step, or a serverless handler returned before the
   background queue drained.
 - **Fix:** wait for tracers or flush at the end of each handler, and treat persistent pending runs as a crash
   signal worth alerting on.
+
+### How would you build a regression gate for a LangGraph agent before each release?
+- **Dataset of real tasks:** grow it from production failures through automation rules and annotation, with
+  reference answers and, where it matters, the tools that must or must not be called.
+- **Evaluators on answer and trajectory:** correctness, tool-call count, repeated calls and step budget hits,
+  run with `evaluate` in CI against the candidate graph.
+- **Gate on regressions,** not only averages: fail the build when tagged critical examples flip from pass to
+  fail, and open those run trees before shipping.
 
 ### How would you size online judge evaluation for 20,000 traces a day?
 - **Pick a sampled percentage,** for example 5% gives about 1,000 judged traces a day; multiply by judge prompt
@@ -362,3 +431,23 @@ canary project, and keep an online evaluator or feedback key tracking the loop r
 - [ ] They are the same mechanism with different names in Python and JavaScript
 > Online evaluation answers "how is production doing right now" on traffic you did not choose; offline
 > experiments answer "is this change better" on a fixed dataset. Both can use code or judge evaluators.
+
+## Use cases & projects
+### Use cases
+- **Debugging LangGraph agents.** Node-level run trees show the state and the `llm` run behind every tool
+  choice, so a loop or a wrong tool pick is traced to its step.
+- **Agent regression gates in CI.** `evaluate` over a dataset of real tasks, with answer and trajectory
+  evaluators, blocks releases that break critical examples.
+- **Multi-turn agent review.** Threads reassemble a customer's conversation so a reviewer reads every turn
+  and tool call as the user experienced it.
+- **Growing the eval set from production.** Automation rules route low-feedback or long agent traces into
+  annotation queues and datasets.
+
+### Mini project
+**Catch a looping agent with a trajectory eval (2-3 hours).**
+- **Goal:** detect and fix an agent that repeats tool calls, with evidence from experiments.
+- **Steps:** build a small agent with two `@traceable(run_type="tool")` tools and a vague tool description
+  that invites repeats; create a 20-task dataset; write `no_repeated_calls` and `answered` evaluators; run a
+  baseline experiment; tighten the tool descriptions or add a step budget; run a second experiment.
+- **Done when:** the comparison view shows the repeated-call failures falling between experiments, with at
+  least one run tree opened to explain the original loop, and no example that passed before now failing.

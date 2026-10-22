@@ -5,7 +5,8 @@ name: Pilot → production plan
 kind: practice
 difficulty: advanced
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - scoping/rapid-prototyping-poc
   - scoping/productionization
@@ -18,9 +19,21 @@ related:
 ---
 
 ## TL;DR
-A pilot puts real users on real work at limited scope to measure impact against a baseline. The pilot →
-production plan fixes stages, entry and exit criteria, owners and the production-gap work, so a successful
-pilot does not stall.
+An agent pilot puts real users on real work at limited scope and autonomy to measure impact against a
+baseline. The pilot → production plan fixes stages, autonomy steps, criteria, owners and production-gap
+work, so a successful pilot does not stall.
+
+## For agent builders
+- **Why it matters for agents.** Agents add an axis chatbots lack: autonomy. Moving from "drafts for a
+  human" to "acts on its own" removes a safety net each step, so the plan must say what evidence unlocks
+  each step and per which action.
+- **Where it shows up in your stack.** Shadow-mode logging of proposed tool calls, approval gates on write
+  tools, feature flags per cohort, a weekly sampled audit of agent traces, and rollback triggers wired to
+  pooled audit windows.
+- **What you control.** The autonomy level per tool or action type, the cohort, the success and guardrail
+  metrics (task success, override rate, error escapes, cost per task) and the production-gap list.
+- **What you can skip.** Heavy statistics for tiny internal agents with easy rollback; a short pilot and a
+  checklist will do.
 
 ## Why it exists
 - **A PoC cannot answer the adoption questions.** It shows "can it work?" on a sample, not whether people use
@@ -50,7 +63,7 @@ each stage, because a stage without a question has no natural end.
 | General availability | full adoption |
 
 AI systems need a second axis besides exposure: *autonomy*. Each step up removes a human safety net, so
-each needs its own evidence.
+each needs its own evidence. For agents, set the level per tool or action type, not for the whole agent.
 
 | Autonomy level | What happens | Measures |
 |---|---|---|
@@ -93,10 +106,11 @@ n per group ≈ 16 × σ² / δ²      (σ = per-unit standard deviation, δ = e
 ### 4. Write success, guardrail and exit criteria
 - **Success metrics:** the business outcome the system is meant to move.
 - **Guardrail metrics:** what must not get worse (customer satisfaction, error escapes, compliance
-  incidents, cost per transaction).
+  incidents, cost per transaction). For agents add human override rate and wrong write actions.
 - **Exit criteria:** the go/no-go rule, e.g. "median handle time down ≥ 15% with no guardrail regression
   over four weeks".
-- **Stop triggers:** conditions that halt the pilot early, such as a data leak or a severe error.
+- **Stop triggers:** conditions that halt the pilot early, such as a data leak or a severe error, for
+  example an agent calling a write tool outside its allowed scope.
 - **Why guardrails:** AI systems often improve the headline metric by shifting cost elsewhere, for instance
   faster replies with more escalations.
 
@@ -104,6 +118,8 @@ n per group ≈ 16 × σ² / δ²      (σ = per-unit standard deviation, δ = e
 - **List everything production needs that the pilot skipped:** identity integration, security and privacy
   review, data residency, monitoring and alerting, on-call, runbooks, support process, cost budget and
   quotas, evaluation regression gates, user training.
+- **Agent-specific items:** per-tool credentials and scopes, approval-gate UX, trace retention, step and
+  spend limits per task, and a kill switch per tool.
 - **Each item gets an owner and an estimate.**
 - **Run them in parallel with the pilot,** which is what prevents purgatory, because most are slow
   organizational processes, not code.
@@ -141,7 +157,7 @@ flowchart TD
 ## Examples
 ### Pilot readout calculator
 Computes the difference-in-differences, the false-alarm rate of a rollback trigger, and how clustering
-inflates the sample you need.
+inflates the sample you need. The same rollback math applies to a weekly audit of agent traces.
 
 ```python
 import math
@@ -220,10 +236,24 @@ A ticket drafting assistant for an insurer's customer service team. All figures 
 - **Outcome:** because the gap list ran in parallel, production started two weeks after the decision instead
   of months.
 
+### Worked scenario: an autonomy ladder for a refund agent
+Illustrative numbers. The same insurer later pilots an agent that looks up policies and issues small
+refunds. Autonomy is set per action, and each step needs its own evidence.
+
+| Action | Pilot level | Evidence to step up | Weeks 1-6 result | Decision |
+|---|---|---|---|---|
+| Policy and order lookups | act alone | read-only, low risk | n/a | stays act alone |
+| Reply drafts | assist | edit rate falling, audit ≥ 90% | audit 92% | act with review |
+| Refunds under a small limit | shadow mode | agreement with human decisions ≥ 98% on 500 cases | 96% on 500 | stays shadow, fix top error |
+| Refunds above the limit | not offered | | | human only |
+
+- **Why per action:** one aggregate success rate would let the low-risk lookups carry the high-risk refunds.
+
 ## Production patterns
 - **Shadow mode before assist** — when accuracy on live traffic is the open question. How: run the model on
-  every live input, log and score its output, show nothing to users. Monitor: agreement with what humans
-  actually did, per input category; it cannot tell you adoption.
+  every live input, log and score its output (for agents, the proposed tool calls, not executed), show
+  nothing to users. Monitor: agreement with what humans actually did, per input category; it cannot tell
+  you adoption.
 - **Pre-registered readout doc** — at week 0. How: one page with baseline numbers, comparison group, success,
   guardrail and exit criteria, stop triggers and the go/no-go meeting date, signed off by the decision maker.
   Monitor: whether any criterion changed after results started arriving.
@@ -231,11 +261,14 @@ A ticket drafting assistant for an insurer's customer service team. All figures 
   user id, step 25% then 100%, and wire the rollback trigger to a pooled audit window, not a single week.
   Monitor: guardrail metrics per cohort and the trigger's pooled sample size.
 - **Weekly random audit** — through pilot and hypercare. How: sample a fixed number of AI-assisted items (for
-  example 200) at random each week for human quality review. Monitor: pass rate with its interval, and the
-  weekly trend for novelty decay.
+  example 200) at random each week for human quality review, reading the agent trace, not only the output.
+  Monitor: pass rate with its interval, and the weekly trend for novelty decay.
 - **Production-gap tracker with owners** — from pilot day one. How: each gap item is a ticket with an owner
   outside the pilot team, an estimate and a due date before the go/no-go. Monitor: items still open at the
   decision meeting, the leading indicator of purgatory.
+- **Per-tool autonomy flags** — for agents with write tools. How: a flag per tool or action type selects
+  shadow, approval-required or autonomous, so one tool can step up or roll back without touching the rest.
+  Monitor: override rate and error escapes per tool.
 
 ## Trade-offs
 - **Comparison group vs delayed benefit.** It gives a credible causal estimate, but delays benefits for those
@@ -248,6 +281,8 @@ A ticket drafting assistant for an insurer's customer service team. All figures 
   stakeholder patience; set duration from how long the metric needs to stabilize, not by habit.
 - **Parallel readiness work vs wasted effort.** It shortens time to launch, but spends effort on a system that
   might get a no-go; worth it when the PoC evidence was strong.
+- **Approval gates vs agent value.** Gating every write keeps errors out but can erase the time saved; gate
+  per action by risk and remove gates only with evidence.
 
 ## Pitfalls
 - **No baseline measured before the pilot.** The result is a before/after story nobody can verify; the
@@ -265,12 +300,14 @@ A ticket drafting assistant for an insurer's customer service team. All figures 
 - **Jumping from assist to autonomous action** because pilot accuracy looked good; the symptom is errors
   reaching customers that a reviewer used to catch silently, visible as rising complaints with no change in
   measured model accuracy.
+- **Rubber-stamp approvals.** Reviewers approve agent actions without reading them; the symptom is an
+  approval rate near 100% with very short review times. Fix: audit approved actions and track review time.
 
 ## When to use
 - **Write the plan** when a PoC has passed and before the pilot starts, because baseline measurement and
   criteria must be fixed before anyone sees results.
 - **Use the full staged approach** when the system touches many users, regulated data or customer-facing
-  outcomes.
+  outcomes, or when the agent can take write actions.
 - **Compress it** for small internal tools with easy rollback: a short pilot and a checklist.
 - **Measure:** whether the go/no-go meeting is a short reading of agreed numbers and whether production
   follows within weeks.
@@ -325,6 +362,12 @@ to a few hundred typical developers with agreed exit criteria and rollback, rath
 - **Compress the plan** for small internal tools with easy rollback to a short pilot and a checklist; keep
   the full staged approach for regulated data or customer-facing outcomes.
 
+### Your agent has five tools, two of which write to customer systems. How do you plan its autonomy in the pilot?
+- **Per tool, not per agent:** read-only tools can act alone; write tools start in shadow mode or behind an
+  approval gate, each behind its own flag.
+- **Evidence per step:** agreement with human decisions in shadow, then override rate and error escapes under
+  review, with a rollback trigger per tool, so one risky tool does not hold back or endanger the rest.
+
 ## Quiz
 ### Q: Why must the baseline be measured before the pilot begins?
 - [ ] Because the system cannot log metrics once it is live
@@ -349,3 +392,23 @@ to a few hundred typical developers with agreed exit criteria and rollback, rath
 - [ ] Postponing security review until after the go decision
 > Purgatory happens when success arrives with no path, owner or budget for production. Working the gap list
 > during the pilot means a go decision can be acted on quickly; postponing reviews causes the stall.
+
+## Use cases & projects
+### Use cases
+- **Support and operations agents.** Moving from drafted replies to agent-issued refunds or updates, one
+  action type and one autonomy level at a time.
+- **Internal copilots for engineers or analysts.** A cohort pilot with a comparison group shows whether the
+  agent moves cycle time, not just how users feel.
+- **Agents touching regulated data.** The production-gap list (identity, privacy review, trace retention)
+  runs alongside the pilot so approval does not stall launch.
+- **Vendor or FDE handoffs.** The plan names who owns, funds and triages the agent after launch.
+
+### Mini project
+**Write and simulate an agent pilot plan (2-3 hours).**
+- **Goal:** produce a pre-registered pilot plan for a small agent with one write tool and test its rollback
+  trigger with the calculator.
+- **Steps:** pick an agent (for example a ticket-triage agent that can reassign tickets); write success,
+  guardrail, exit and stop criteria; set autonomy per tool; list ten production-gap items with owners; use
+  `p_below` to pick a weekly audit size and rollback threshold with a false-alarm rate under 5%.
+- **Done when:** a one-page plan exists with the autonomy table, the gap list and a rollback trigger whose
+  false-alarm and detection rates you computed and wrote next to it.

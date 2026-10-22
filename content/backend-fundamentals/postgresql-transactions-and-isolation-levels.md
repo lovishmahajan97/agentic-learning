@@ -5,7 +5,8 @@ name: PostgreSQL transactions & isolation levels
 kind: concept
 difficulty: core
 est_minutes: 18
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - backend-fundamentals/database-design
   - backend-fundamentals/sql
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-A transaction makes statements atomic and durable; the isolation level decides what concurrent
-transactions see. With MVCC, readers and writers do not block each other, but READ COMMITTED permits lost updates
-and write skew; fix them with atomic updates, row locks, or SERIALIZABLE plus retries.
+Concurrent agent runs race on budgets, run limits and step records. Transactions make writes atomic;
+isolation decides what concurrent ones see. READ COMMITTED permits lost updates and write skew; fix them
+with atomic updates, row locks, or SERIALIZABLE plus retries.
+
+## For agent builders
+- **Why it matters for agents.** Many agent runs for the same tenant execute at once, each checking a
+  token budget, a concurrent-run cap or "has this tool call already happened?". Those are read-then-write
+  decisions, and under the default isolation level they silently overspend or duplicate work.
+- **Where it shows up in your stack.** psycopg or SQLAlchemy sessions in your agent service, LangGraph's
+  Postgres checkpointer writing state per step, database-backed job queues using `SKIP LOCKED`, and
+  PgBouncer in front of a fleet of agent workers.
+- **What you control.** Transaction boundaries (commit before every model or tool call), atomic
+  conditional updates for budgets, `FOR UPDATE` or SERIALIZABLE for multi-row rules, a retry wrapper for
+  `40001`, and timeouts that kill leaked transactions.
+- **What you can skip.** SSI internals and the full anomaly literature. Know the four anomalies, which
+  level allows which, and the "reserve, commit, call, settle" pattern.
 
 ## Why it exists
 - **Crashes split related writes.** Without transactions, a crash between "insert the message" and
@@ -142,6 +156,20 @@ read, so re-evaluation changes nothing. The fixes move the read inside the prote
 - **Isolation is per transaction:** `BEGIN ISOLATION LEVEL SERIALIZABLE`, or `SET TRANSACTION` as the
   first statement; `SET default_transaction_isolation` changes the session default.
 
+### Transaction boundaries in an agent step
+An agent step is "decide, call a model or tool, record the result". Only the database parts belong in
+transactions:
+
+1. **Reserve (short transaction).** Atomically reserve budget, claim the step (insert a row with a unique
+   `(run_id, step)` key) and commit.
+2. **Call (no transaction).** Call the model or tool with the step id as the idempotency key.
+3. **Settle (short transaction).** Record the result and actual tokens, release unused budget, commit.
+
+- **Why the unique step row:** a worker that crashes after step 2 and restarts finds the claimed step, so
+  it checks the tool's idempotency key instead of calling a side-effecting tool blindly a second time.
+- **Why commit before the call:** a transaction open across a 10 s model call holds its row locks, pins
+  its snapshot and occupies a pooled connection for all 10 s.
+
 ## Diagram
 A decision path for a concurrent write: pick the cheapest mechanism that moves the read inside the
 protected step, and keep every transaction short.
@@ -251,6 +279,21 @@ Rule: a tenant may have at most one active run. Both transactions run at REPEATA
 Neither updated a row the other touched, so REPEATABLE READ sees no conflict. At SERIALIZABLE, SSI sees
 the read-write dependencies and aborts one with `40001`.
 
+### Agent scenario: a transaction held across the model call
+An agent service has a pool of 20 database connections. Each step's model call takes ~8 s and the
+database work takes ~20 ms. Arithmetic only, not a benchmark.
+
+| Design | Connection held per step | Max steps per second the pool allows |
+|---|---|---|
+| One transaction wraps reserve, model call and settle | ~8 s | 20 ÷ 8 ≈ 2.5 |
+| Reserve and commit, call, settle in a second transaction | ~2 × 20 ms | 20 ÷ 0.04 ≈ 500 |
+
+- **Symptoms of the first design:** pool timeouts once 3 or more steps per second arrive, `idle in
+  transaction` sessions that live as long as provider latency, and row locks on the tenant budget row
+  that serialize every run for that tenant.
+- **The second design** needs the unique step row and an idempotency key, because the call now happens
+  outside any transaction and a crash between call and settle must be recoverable.
+
 ## Production patterns
 - **Timeouts as guard rails.** Set `idle_in_transaction_session_timeout` (for example a minute) so a leaked
   transaction is killed instead of pinning snapshots, `lock_timeout` for migrations and request paths, and
@@ -266,6 +309,10 @@ the read-write dependencies and aborts one with `40001`.
   for recurring lock-wait statements.
 - **Transaction-scoped advisory locks behind a pooler.** Under PgBouncer transaction mode, use
   `pg_advisory_xact_lock` (released at commit), never session-level advisory locks. Monitor lock wait time.
+- **Claim each agent step with a unique row.** Insert `(run_id, step)` under a unique constraint in the
+  reserve transaction, so two workers resuming the same run cannot both execute step 7; the loser gets a
+  unique-violation and moves on. Monitor unique-violation counts on the steps table during deploys and
+  worker restarts.
 
 ## Trade-offs
 - **READ COMMITTED throughput vs races.** High throughput and almost no aborts, but every read-modify-write
@@ -298,10 +345,14 @@ the read-write dependencies and aborts one with `40001`.
   code relying on dirty reads silently gets committed data only.
 - **Forgetting a transaction-mode pooler breaks `SET` and advisory locks across statements.** Symptom:
   settings that seem to apply randomly to other requests.
+- **Calling a side-effecting tool inside a transaction that later rolls back.** Symptom: the email or
+  refund happened but the database has no record of it, so a retry does it again. Fix: record intent and
+  commit first, call with an idempotency key, then record the outcome.
 
 ## When to use
 - **Default:** start at READ COMMITTED and make every write path safe by construction.
-- **Counters and quotas:** atomic single-statement updates.
+- **Counters and quotas:** atomic single-statement updates, such as reserving a tenant's agent token
+  budget before each model call.
 - **Exclusive multi-statement decisions:** `FOR UPDATE`, when the transaction stays short.
 - **Job claiming:** `SKIP LOCKED`.
 - **Multi-row invariants hard to lock explicitly:** SERIALIZABLE with retries.
@@ -343,7 +394,7 @@ statement and avoids retries entirely.
   READ COMMITTED), so a long `SELECT` sees a stable view while `UPDATE`s proceed.
 - **The cost is cleanup:** `VACUUM` must reclaim dead versions, and old open snapshots prevent it.
 
-### Two concurrent requests both pass a budget check and overspend. Walk through your fix.
+### Two concurrent agent runs both pass a token-budget check and overspend. Walk through your fix.
 - **Diagnose:** it is a lost update; both read the same committed value at READ COMMITTED and wrote a
   constant computed from a stale read.
 - **Fix:** one conditional `UPDATE ... SET used = used + cost WHERE used + cost <= budget RETURNING`, which
@@ -367,6 +418,14 @@ statement and avoids retries entirely.
   transactions, because each transaction may get a different server connection.
 - **Prepared statements** worked only from PgBouncer 1.21 with `max_prepared_statements` set.
 - **Fix:** move settings into each transaction (`SET LOCAL`) and use `pg_advisory_xact_lock`.
+
+### Where do you put transaction boundaries in an agent step that calls a side-effecting tool?
+- **Reserve and commit first:** reserve budget and insert the step row with a unique `(run_id, step)`
+  key, so a second worker cannot claim the same step.
+- **Call outside any transaction,** passing the step id as the tool's idempotency key, because a
+  transaction must not stay open across seconds of network latency.
+- **Settle in a second short transaction,** recording the result and actual cost; on crash recovery the
+  claimed-but-unsettled step tells you to check the tool's status before retrying.
 
 ## Quiz
 ### Q: Under PostgreSQL's default READ COMMITTED level, why can two transactions both pass a "balance is sufficient" check and overspend?
@@ -393,3 +452,24 @@ statement and avoids retries entirely.
 > MVCC keeps a row version until no snapshot can see it. An old open snapshot (or an old assigned
 > transaction id) holds back the cleanup horizon for the whole database, so dead versions accumulate in
 > every table, indexes grow and scans read more pages; this is why idle-in-transaction is monitored.
+
+## Use cases & projects
+### Use cases
+- **Per-tenant token budgets.** An atomic conditional `UPDATE` reserves tokens before each model call, so
+  parallel agent runs cannot overspend the tenant's quota.
+- **Concurrent-run caps.** "At most N active agent runs per tenant" is a write-skew-prone rule that needs
+  a locked counter row or SERIALIZABLE.
+- **Exactly-once step claims.** A unique step row committed before a tool call keeps two resuming workers
+  from executing the same step.
+- **Database-backed agent job queues.** Workers claim queued agent runs with `FOR UPDATE SKIP LOCKED`
+  without a separate broker.
+
+### Mini project
+**Break and fix an agent budget under concurrency (1-2 hours).**
+- **Goal:** show that naive budget checks overspend under parallel agent runs, then fix them.
+- **Steps:** create a `tenants` table with a budget near its limit; run 20 concurrent fake agent steps
+  (threads or asyncio) that each select, check and update; record the final usage; switch to the atomic
+  conditional `UPDATE`, then to a SERIALIZABLE version with a retry wrapper; add an 8 s fake model call
+  inside one transaction and watch `pg_stat_activity`.
+- **Done when:** the naive version overspends, both fixed versions end exactly at or under budget, and you
+  can show `idle in transaction` sessions appear only in the "transaction around the model call" variant.

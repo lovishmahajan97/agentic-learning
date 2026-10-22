@@ -5,7 +5,8 @@ name: Demos
 kind: practice
 difficulty: core
 est_minutes: 12
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - scoping/rapid-prototyping-poc
   - scoping/success-metrics-kpis
@@ -16,9 +17,21 @@ related:
 ---
 
 ## TL;DR
-A demo is a decision instrument that helps a specific audience decide something. Cherry-picked LLM inputs
-look magical while typical inputs fail, so a good demo uses real data, pairs the story with eval numbers,
-shows a failure and labels what is built.
+An agent demo is a decision instrument for a specific audience. Cherry-picked tasks look magical while
+typical ones fail, so a good demo replays real tasks, pairs the run with eval numbers, shows a contained
+failure and labels which tools are live.
+
+## For agent builders
+- **Why it matters for agents.** Agents fail in more places than a single prompt: wrong tool, bad
+  arguments, a loop, a slow provider mid-run. Per-step variance compounds over a multi-step run, so a live
+  agent demo is riskier than a chatbot demo and must be designed.
+- **Where it shows up in your stack.** The eval set of replayed tasks you pick demo inputs from, the trace
+  viewer you show the audience, sandboxed or stubbed write tools, and the pinned model, prompt and tool
+  versions in a demo manifest.
+- **What you control.** Which tasks run live, sampling settings, which tools are stubbed and labeled, the
+  approval step before any write action, and the aggregate task-success number you quote.
+- **What you can skip.** Polished UI. Audiences deciding on an agent pilot care more about the trace,
+  the hand-off to a human and the success rate than about styling.
 
 ## Why it exists
 - **Decision-makers judge by what they see.** Most people who fund, approve or adopt an AI system will never
@@ -36,8 +49,9 @@ shows a failure and labels what is built.
   chance.
 - **Both naive alternatives fail.** The polished showcase (curated inputs, rehearsed path, everything green)
   wins the meeting and loses the account. Refusing to demo until "ready" leaves stakeholders nothing to react
-  to, so workflow feedback arrives months late, when changes are expensive. The useful middle: designed
-  around a decision, representative inputs, honest boundaries, backed by numbers.
+  to, so workflow feedback arrives months late, when changes are expensive.
+- **The useful middle:** designed around a decision, representative inputs, honest boundaries, backed by
+  numbers.
 
 ## How it works
 ### 1. Start from the decision and the audience
@@ -48,13 +62,15 @@ all audiences, because each decision needs different evidence.
 |---|---|---|
 | Executive | fund a pilot? | business outcome and risk |
 | Operations lead | will her team use it? | her own workflow, including the awkward cases |
-| Security reviewer | approve it? | the data flow |
+| Security reviewer | approve it? | the data flow, and which tools the agent can call with which permissions |
 
 ### 2. Script around a real workflow with real data
 - **Use the customer's own** documents, tickets or records (with permission and appropriate handling),
   arranged as the task a real user performs from start to finish.
 - **Why real data:** it carries the mess synthetic data lacks (scanned pages, abbreviations, missing fields),
   and recognizable inputs make the audience trust what they see.
+- **For agents, show the trace:** the plan, each tool call with its arguments and each result, so the
+  audience sees why the agent acted, not only the final answer.
 
 ### 3. Choose inputs representatively, and say how
 - **Pick from the evaluation set,** roughly in proportion to its error categories: some typical cases, one
@@ -66,12 +82,13 @@ all audiences, because each decision needs different evidence.
 
 ### 4. Show the boundary on purpose
 - **Demonstrate uncertainty handling:** the system abstains, cites its sources, or hands off to a human.
+  For an agent, show the approval gate pausing before a consequential write.
 - **Why:** a controlled failure builds more trust than a flawless run, because experienced buyers know
   nothing is flawless and want to see that failures are contained.
 
 ### 5. Control the live risks
 Live demos of non-deterministic systems fail in ways rehearsals miss: provider latency spikes, rate limits,
-a different output on the same input. Variance compounds across segments:
+a different output on the same input. Variance compounds across segments, and inside an agent across steps:
 
 ```
 P(at least one live input goes wrong) = 1 − (per-input success)^(number of live inputs)
@@ -89,6 +106,7 @@ P(at least one live input goes wrong) = 1 − (per-input success)^(number of liv
 ### 6. Label what is real
 - **Separate built from mocked:** "The extraction is live; the CRM write-back is a stub."
 - **Why:** any UI, integration or data source that is faked becomes an implied commitment unless labeled.
+  For agents, every stubbed tool is an integration someone will later have to build and secure.
 
 ### 7. Capture the reaction as data
 - **Assign a note-taker** for questions, objections and feature requests. These are discovery inputs.
@@ -117,7 +135,8 @@ flowchart TD
 
 ## Examples
 ### Picking and checking demo inputs from the eval set
-Selects a disclosed, representative mix and computes the odds that a live run goes wrong.
+Selects a disclosed, representative mix and computes the odds that a live run goes wrong. For an agent,
+each row is a replayed task and `correct` is task success from the eval harness.
 
 ```python
 import random
@@ -148,6 +167,23 @@ print(f"5 random inputs all succeed: {0.76 ** 5:.2f}")                   # 0.25
 print(f"4 live inputs, one goes wrong: {1 - p_live_ok([0.9] * 4):.0%}")  # 34%
 ```
 
+### Worked scenario: a live run of a six-step support agent
+Illustrative numbers. The agent looks up the customer, reads the order, checks policy, drafts a reply,
+proposes a refund and waits for approval: six steps. Rehearsal shows each step behaves as intended about
+97% of the time.
+
+| Quantity | Value |
+|---|---|
+| Steps per task | 6 |
+| Per-step stability in rehearsal | 0.97 |
+| One whole task behaves as rehearsed | 0.97⁶ ≈ 0.83 |
+| Three live tasks all behave | 0.83³ ≈ 0.57 |
+| Eval task success to quote | 72% on 150 replayed tickets |
+
+- **Decision:** run one task live, the most stable one; show two more from labeled recordings; open the
+  trace of a failed eval task to show the approval gate catching a wrong refund.
+- **Label:** the refund tool is a sandbox stub; the order lookup is live, read-only.
+
 ### A 25-minute contract-review demo
 For a legal operations team deciding whether to run a six-week pilot of a contract-review assistant.
 
@@ -168,8 +204,9 @@ For a legal operations team deciding whether to run a six-week pilot of a contra
 
 ## Production patterns
 - **Demo manifest in the repo** — for any demo you will repeat. How: a small config file listing the
-  eval-set input ids, model version, prompt version and sampling settings, so every rehearsal runs the same
-  path. Monitor: that the manifest's eval-set accuracy matches the number you quote on the slide.
+  eval-set input ids, model version, prompt version, tool versions and sampling settings, so every rehearsal
+  runs the same path. Monitor: that the manifest's eval-set accuracy matches the number you quote on the
+  slide.
 - **Rehearsal stability run** — the day before. How: run each live input 10-20 times through the same build
   and count intended results; anything below your bar moves to the recorded segment. Monitor: per-input
   stability and p95 latency on the presenting network.
@@ -177,8 +214,8 @@ For a legal operations team deciding whether to run a six-week pilot of a contra
   rehearsal, cued up in a second window and introduced as recorded. Monitor: how often the fallback is used,
   which flags provider or network risk for the pilot.
 - **Visible live-versus-stub labels** — whenever anything is mocked. How: a banner or badge on stubbed
-  screens driven by the same feature flag that switches the stub, plus a slide listing what is stubbed.
-  Monitor: SOW drafts for items that only exist as stubs.
+  screens driven by the same feature flag that switches the stub, plus a slide listing what is stubbed and
+  which agent tools are sandboxed. Monitor: SOW drafts for items that only exist as stubs.
 - **No demo branch** — always. How: the demo runs the same build the pilot will use; code review rejects
   special cases keyed on demo input ids or prompts tuned to those documents. Monitor: demo inputs' results on
   the pilot build match the rehearsal.
@@ -196,6 +233,8 @@ For a legal operations team deciding whether to run a six-week pilot of a contra
   but risk anchoring stakeholders on unfinished UI; label rough parts explicitly to keep feedback focused.
 - **Tailored vs reusable.** A demo tailored to one audience is persuasive for that decision, but reusing it
   for a different audience usually answers the wrong question and should prompt a rebuild.
+- **Showing the trace vs a clean answer.** A visible agent trace builds trust with technical reviewers but
+  can overwhelm executives; show it to those who decide on risk and summarise it for the rest.
 
 ## Pitfalls
 - **Demoing on hand-picked inputs easier than real traffic.** The symptom is a pilot whose users say the
@@ -216,6 +255,8 @@ For a legal operations team deciding whether to run a six-week pilot of a contra
 - **Letting demo screens become the specification.** The symptom is change requests and SOW lines that cite
   "as shown in the demo" for behavior nobody designed or estimated. Fix: review the SOW for such lines and
   estimate or remove them.
+- **Letting a live agent write to real systems.** A demo agent with production write access sends a real
+  email or refund on stage. Fix: sandbox or stub write tools, gate them behind approval, and say so.
 
 ## When to use
 - **Use at decision points:** after discovery to confirm you understood the workflow, at the end of a PoC to
@@ -269,11 +310,17 @@ recorded fallback, and close on the pilot proposal.
 - **Run the pilot build, not a demo branch,** so nothing shown depends on special cases.
 - **Review the SOW** for items that cite "as shown in the demo" and estimate or remove them.
 
-### How would you measure whether a demo worked?
-- **By the decision it produced:** did the audience decide what the demo was built to inform, such as
-  funding a six-week pilot?
-- **By the feedback captured:** objections and requests logged and triaged, especially any that change the
-  success criterion, rather than by applause in the room.
+### How do you demo a multi-step agent that can take write actions without risking a live failure?
+- **Do the compounding math:** six steps at 0.97 each give about 0.83 per task, so run few tasks live and
+  pick the most stable ones.
+- **Contain writes:** stub or sandbox write tools and show the approval gate pausing before them.
+- **Show evidence:** quote task success on replayed tasks and open one failed trace to show how it is caught.
+
+### A security reviewer attends your agent demo. What do you show differently?
+- **The data flow and permissions:** which tools the agent can call, with which credentials, and which are
+  read-only.
+- **The boundaries:** approval gates on consequential actions, what is logged in the trace, and what is
+  stubbed, because a reviewer approves the access model, not the answer quality.
 
 ## Quiz
 ### Q: Why are cherry-picked demos a bigger risk for LLM systems than for conventional software?
@@ -299,3 +346,23 @@ recorded fallback, and close on the pilot proposal.
 - [ ] Re-record it at a higher speed so it fits the time slot
 > Recorded output is a legitimate fallback, but hiding it misrepresents latency and reliability. Stating
 > it and giving measured numbers keeps the demo honest and the expectations accurate.
+
+## Use cases & projects
+### Use cases
+- **End-of-PoC agent demos.** Replaying real tasks from the eval set, with the success rate beside them,
+  decides whether a pilot gets funded.
+- **Security and compliance sign-off.** Showing tool permissions, approval gates and traces is how agent
+  teams get an access review approved.
+- **Pilot progress reviews.** Demoing the same replayed tasks each fortnight shows movement on the metric
+  instead of new anecdotes.
+- **Internal launches of agent features.** A demo manifest makes the same path reproducible for every team
+  that asks to see it.
+
+### Mini project
+**Build a reproducible agent demo kit (2-3 hours).**
+- **Goal:** turn an existing small agent into a demo you can run honestly and repeatably.
+- **Steps:** write a demo manifest (task ids, model, prompt and tool versions, settings); pick five tasks
+  from its eval set with the picker above; run each live task 10 times and record stability; stub any write
+  tool with a visible label; record a fallback for the least stable task.
+- **Done when:** one command runs the demo path, a table shows per-task stability and the compounded odds of
+  a clean live run, and a slide states the aggregate task success and what is stubbed.

@@ -397,3 +397,24 @@ way.
 - [ ] Translation between high-resource European languages
 > Tasks that hinge on a few decisive tokens over long chains, or on recalling a detail far back in a
 > quantized KV cache, amplify small distribution shifts. Fluency and recognition-style tasks are robust.
+
+## Use cases & projects
+### Use cases
+- **Choosing a self-hosted agent build.** Paired evals decide between a bf16, fp8 or 4-bit checkpoint
+  before it drives production tool calls.
+- **Turning on an fp8 KV cache.** Long-transcript agent evals show whether recall of early tool results
+  survives the cheaper cache.
+- **Release gates for model swaps.** A CI gate blocks a quantized artifact whose tool-call validity or run
+  success falls outside the agreed margin.
+- **Auditing a provider change.** Re-running the agent eval suite catches a cheaper variant served behind
+  the same model name.
+
+### Mini project
+**Build a quantization gate for an agent (2-3 hours).**
+- **Goal:** decide with evidence whether a quantized model may replace the full-precision one behind a
+  tool-calling agent.
+- **Steps:** collect 50-100 agent tasks with known correct tool calls; run them on the full-precision and
+  quantized builds with the same prompts and temperature 0; score tool-call validity, argument accuracy
+  and end-to-end success per item; compute paired differences with a bootstrap confidence interval.
+- **Done when:** a script prints the per-metric deltas with intervals and exits non-zero when any interval
+  falls below your margin, and you can name the three items that regressed most.

@@ -474,3 +474,25 @@ from the client without checking the caller is authorized for it.
 > Range predicates need a numeric or datetime field; mixed string formats compare lexically and silently
 > exclude rows. The embedding is irrelevant to a metadata predicate, and HNSW engines support ranges via
 > payload indexes.
+
+## Use cases & projects
+### Use cases
+- **Contract and policy agents.** The model fills `doc_type` and a date range as search-tool arguments,
+  and the filter scopes retrieval to the right document family and period.
+- **Multi-tenant support agents.** A tenant predicate injected from the session keeps one customer's
+  tickets out of another customer's answers, whatever the model asks for.
+- **Multilingual help-desk agents.** A language filter stops the agent quoting a German article to a user
+  who asked in English when both exist.
+- **Self-query retrieval.** A planner step turns "last quarter's incident reports from the EU region" into
+  structured predicates before the vector search runs.
+
+### Mini project
+**Build a filtered search tool and measure filtered recall (2-3 hours).**
+- **Goal:** expose a search tool whose filter arguments the agent fills, and show how recall changes with
+  filter selectivity.
+- **Steps:** load a few thousand chunks with `doc_type`, date and tenant fields into a local vector store;
+  define the tool schema with enums for `doc_type`; validate the model's arguments in code and inject the
+  tenant from the session; run the same queries with filters of high and low selectivity, comparing
+  filtered ANN results against an exact filtered scan.
+- **Done when:** you have a table of recall@10 per selectivity band, an empty-result fallback the agent
+  uses instead of hallucinating, and a test proving a model-supplied tenant value is ignored.

@@ -376,3 +376,24 @@ hours, not days.
 > Names, descriptions and enums are rendered into the prompt for selection and argument filling. Side-
 > effect and concurrency metadata drive gating, approval and scheduling decisions that belong to the
 > harness, not the model.
+
+## Use cases & projects
+### Use cases
+- **Agents with large tool catalogues.** Twenty or more tools stay consistent because schema, handler
+  and result shape come from one definition.
+- **Tools shared across agents and hosts.** The same contract can back an in-process tool, an MCP server
+  and a REST endpoint without three hand-written schemas.
+- **Approval and scheduling decisions.** Side-effect and parallel-safety metadata let the harness decide
+  what needs a human and what may run concurrently.
+- **Safe tool evolution.** Schema snapshot tests catch a breaking change to a tool before it changes what
+  the model is told in production.
+
+### Mini project
+**Build a typed tool registry (2-3 hours).**
+- **Goal:** define five agent tools once each and derive everything else from those definitions.
+- **Steps:** write a contract type holding input and output models, error kinds with a `retryable` flag,
+  and side-effect and parallel-safety metadata; build a registry that emits provider tool definitions
+  from it; write one dispatch function that validates input, runs the handler and serializes a result of
+  a stable shape; add a snapshot test of the emitted schemas.
+- **Done when:** renaming a field fails the snapshot test, every result the model reads has the same
+  envelope, and the harness refuses to run two tools marked not parallel-safe at once.

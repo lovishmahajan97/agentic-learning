@@ -443,3 +443,23 @@ constrain the trainable parameters.
 - [ ] The model cannot overfit because duplicates act as regularisation
 > Memorised rows score well on their near-copies, so the gap that reveals overfitting never appears. A
 > clean test set would show the truth, but only once, at the end, after every decision was already made.
+
+## Use cases & projects
+### Use cases
+- **Fine-tuned agent models.** Held-out slices of paraphrases, new customers and unseen tool combinations
+  reveal a model that replays training traces instead of generalising.
+- **Prompt engineering against an eval set.** Rotating or refreshing the iteration set stops a prompt from
+  being tuned to the quirks of fifty familiar tasks.
+- **Few-shot example pools.** Examples copied too closely from the eval set inflate scores; keeping them
+  disjoint keeps the eval honest.
+- **Checkpoint selection.** Picking the step with the best held-out agent score, not the lowest training
+  loss, is the everyday defence against overfitting.
+
+### Mini project
+**Catch an overfit agent fine-tune (2-3 hours).**
+- **Goal:** show the gap between familiar and novel requests as a fine-tune runs too long.
+- **Steps:** build a training set of tool-calling trajectories and two held-out sets, one of near-copies
+  of training requests and one of paraphrases plus unseen tool combinations; deduplicate training against
+  both; fine-tune a small model past the point of convergence, evaluating each epoch on both sets.
+- **Done when:** you have a chart showing the near-copy score climbing while the novel-set score peaks and
+  falls, the checkpoint you would ship, and one example of a replayed training trace.

@@ -5,7 +5,8 @@ name: Batch size
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - ml-fundamentals/gradient-descent
   - ml-fundamentals/gradient-accumulation
@@ -23,9 +24,23 @@ sources:
 ---
 
 ## TL;DR
-Batch size is how many examples (for LLMs, tokens) feed one gradient estimate. Bigger batches give cleaner
-gradients and busier GPUs, until the *critical batch size* where extra examples just burn data, so batch,
-learning rate and steps are one decision.
+Batch size is how many examples (for LLMs, tokens) feed one gradient estimate. When you fine-tune on a few
+thousand agent traces, it decides how many optimizer steps you get, so batch, learning rate and steps
+are one decision.
+
+## For agent builders
+- **Why it matters for agents.** Agent fine-tunes (tool-call format, routing, trajectory imitation) run on
+  small datasets of a few thousand traces. A vendor-default batch of 128 can leave only a few dozen
+  optimizer steps, and the adapter barely learns your tool schema.
+- **Where it shows up in your stack.** `per_device_train_batch_size` and `gradient_accumulation_steps` in
+  the Hugging Face Trainer and TRL trainers, the world size of your launcher, and the batch-size setting a
+  hosted fine-tuning service exposes (often chosen for you).
+- **What you control.** The effective batch in tokens (agent traces vary a lot in length), the step count
+  that follows from it, and re-tuning the learning rate whenever the effective batch changes.
+- **What you can skip.** Measuring the gradient noise scale and batch ramps for pre-training: recognise the
+  terms, but agent fine-tunes are almost always in the regime where "enough steps" is the binding rule.
+- **Not the serving batch.** Batching concurrent agent requests at inference is a different problem
+  (continuous batching in the serving module), with latency rather than gradient noise as the cost.
 
 ## Why it exists
 - **Full-batch descent is absurd at scale.** One exact step over billions of tokens would take hours, and
@@ -35,17 +50,33 @@ learning rate and steps are one decision.
   proportional to `1/B`: small `B` gives cheap, noisy steps, large `B` expensive, accurate ones.
 - **Hardware pushes bigger.** GPUs are efficient only on large matrices, and batch × sequence length is
   what makes activations large. A few hundred tokens leave most of the chip idle and make the step
-  memory-bandwidth bound, because weights are read once per step regardless of batch. Doubling until
-  compute-bound is close to free in wall-clock per example; data parallelism usually adds each GPU's
-  examples to the batch rather than splitting a fixed batch finer.
+  memory-bandwidth bound, because weights are read once per step regardless of batch.
+- **Bigger is nearly free per example, up to a point.** Doubling until compute-bound costs little
+  wall-clock per example; data parallelism usually adds each GPU's examples to the batch rather than
+  splitting a fixed batch finer.
 - **Optimization pushes back.** Once the gradient is accurate, a batch twice as large gives essentially
   the same update: same steps, twice the tokens. That is wasted compute, and for a fixed dataset fewer
   epochs' worth of unique signal.
 - **So "biggest batch that fits" is wrong both ways.** Too small wastes hardware; too large wastes data.
-  The crossover depends on gradient noise, which changes over training.
+  The crossover depends on gradient noise, which changes over training. For a 3,000-trace agent fine-tune,
+  "too large" mostly means "too few steps".
 
 ## How it works
-### Gradient noise and the critical batch size
+### The agent fine-tune view: batch sets the step count
+For small datasets the first question is not gradient noise but whether the optimizer gets enough steps.
+
+```
+optimizer_steps = num_examples × epochs ÷ effective_batch
+effective_batch = micro_batch × gradient_accumulation_steps × data_parallel_world_size
+```
+
+- **Aim for at least a few hundred optimizer steps.** Below that, warmup and decay barely have room and
+  the adapter sees too few updates to absorb the tool-call format.
+- **Count tokens, not traces.** A batch of 16 short routing traces and a batch of 16 traces with 20k-token
+  tool results are very different gradient estimates and memory loads.
+- **Learning rate, warmup and decay follow.** Change the effective batch and all three move with it.
+
+### Background: gradient noise and the critical batch size
 Write the per-example gradient as the true gradient `G` plus noise with covariance `Σ`. The *gradient
 noise scale* is roughly `B_noise = tr(Σ) / |G|²`: the batch at which noise is comparable to signal.
 
@@ -68,10 +99,11 @@ E = E_min × (1 + B / B_noise)        examples processed  (E = S × B)
   the batch up over the first part of the run.
 - **It tracks how low a loss the run reaches and how hard the task is.** Kaplan et al.'s scaling-law work
   found the critical batch depends mainly on the loss rather than directly on parameter count (later
-  studies dispute the details). Hence LLM pre-training uses batches of millions of tokens while a small
-  classifier saturates at a few hundred examples.
+  studies dispute the details).
+- **Hence the range of batch sizes.** LLM pre-training uses batches of millions of tokens while a small
+  classifier (such as an agent's tool router) saturates at a few hundred examples.
 
-### Measuring the noise scale
+### Background: measuring the noise scale
 You do not have to guess it. The squared norm of a mini-batch gradient is biased upward by the noise,
 `E|G_B|² = |G|² + tr(Σ)/B`, so the gradient norm at two batch sizes gives two equations in two unknowns:
 
@@ -95,7 +127,8 @@ A bigger batch justifies a bigger step, because the step comes from a more trust
   works in the perfect-scaling regime with warmup; this recipe trained ImageNet in an hour at a batch of
   8,192.
 - **Adam-family: less clean.** Square-root scaling is a common start with some theoretical support, but
-  the peak rate is re-tuned when the batch changes by more than a small factor.
+  the peak rate is re-tuned when the batch changes by more than a small factor. AdamW is what agent
+  fine-tunes and LoRA runs typically use, so expect to re-tune.
 - **Either way,** changing the batch without touching the learning rate compares two different
   optimizers, not two batch sizes.
 
@@ -125,16 +158,18 @@ and for LLMs it is usually quoted in tokens: `effective_batch × sequence_length
 | Gradient checkpointing, mixed precision | how large the micro-batch can be | the effective batch by itself |
 
 Conflating them is a common confusion: "I added GPUs so I can raise the learning rate" is right; "I added
-accumulation so training is faster" is wrong.
+accumulation so training is faster" is wrong. Long agent traces usually force a small micro-batch, so
+accumulation is how agent fine-tunes reach their target effective batch.
 
 ### Inference is a different problem
 Serving-time batching shares the name, not the trade-off: it amortizes weight reads across concurrent
-users, with latency rather than gradient noise as the cost. That lives in the serving module under
-continuous batching.
+users (or concurrent agent sessions), with latency rather than gradient noise as the cost. That lives in
+the serving module under continuous batching.
 
 ## Diagram
-Planning goes top-down: the target batch comes from the noise scale, memory fixes the micro-batch,
-accumulation and GPUs fill the gap, and the learning rate follows the effective batch.
+Planning goes top-down: the target batch comes from the noise scale (or, for a small agent fine-tune,
+from the step budget), memory fixes the micro-batch, accumulation and GPUs fill the gap, and the
+learning rate follows the effective batch.
 
 ```mermaid
 flowchart TD
@@ -150,6 +185,20 @@ flowchart TD
 ```
 
 ## Examples
+### Worked scenario: batch size for a tool-calling adapter
+A team LoRA-tunes a model on 3,000 tool-call traces for 3 epochs. Traces average about 2,500 tokens
+(illustrative). Only the effective batch changes between rows.
+
+| Effective batch | Optimizer steps per epoch | Total steps | Tokens per step (approx.) | Outcome |
+|---|---|---|---|---|
+| 128 (vendor default) | 23 | 69 | ~320k | too few steps: warmup and decay barely fit, tool format half-learned |
+| 32 | 93 | 279 | ~80k | a few hundred steps: room for warmup and decay |
+| 16 | 187 | 561 | ~40k | more steps and more gradient noise; re-tune the peak rate down |
+
+- **The fix was not more data or more GPUs.** Dropping the effective batch from 128 to 32 quadrupled the
+  optimizer steps on the same traces.
+- **Re-tune the learning rate after the change,** because the step count and gradient noise both moved.
+
 ### Turning a hardware constraint into config numbers
 A planning function that turns a hardware constraint and a token budget into the three numbers written
 into a config, with the learning-rate adjustment explicit. The numbers are illustrative; the structure is
@@ -216,31 +265,34 @@ Going from 1,000 to 4,000 cuts steps only from 2× to 1.25× the minimum while e
 past the noise scale, hardware buys little time and costs a lot of data.
 
 ## Production patterns
+- **Check the step count before every agent fine-tune.** Compute `num_examples × epochs ÷ effective_batch`
+  before launch and refuse runs with fewer than a few hundred optimizer steps; lower the effective batch
+  rather than adding epochs of the same traces. Monitor the learning-rate trace to confirm warmup and
+  decay both happened.
 - **Plot every run against tokens.** Log tokens per optimizer step (`effective_batch × sequence_length`)
-  and use tokens as the x-axis for loss curves, so runs with different batches are comparable. Flattening
-  loss-per-token after a batch increase is the sign you passed the noise scale.
-- **Measure the noise scale on the live run.** Under data parallelism, log each rank's local gradient norm
-  and the all-reduced norm, keep EMAs of the two estimator terms, and track `B_simple` over training. Use
-  it to decide whether a larger batch or more GPUs would actually shorten the run.
+  and use tokens as the x-axis for loss curves, so runs with different batches (or different trace-length
+  mixes) are comparable. Flattening loss-per-token after a batch increase is the sign you passed the noise
+  scale.
+- **Bucket or pack agent traces by length.** Grouping traces of similar length keeps tokens per step
+  steadier and avoids padding a batch to its one 20k-token trace. Monitor tokens per step and peak memory
+  per step, not just traces per step.
 - **Scale GPUs at fixed effective batch.** When adding data-parallel ranks, divide accumulation by the
   same factor so the effective batch, learning rate and schedule stay put. Verify that loss-vs-tokens
   curves overlay the old run.
 - **Re-tune the learning rate on every batch change.** Start from linear scaling for SGD or square-root
-  for Adam, lengthen warmup, then sweep the peak briefly. Monitor early grad-norm spikes and loss per
-  token against the reference run.
-- **Ramp the batch in long pre-training.** Because the noise scale grows as loss falls, start smaller and
-  ramp the batch up over the early part of the run (GPT-3 did this), with the schedule defined in tokens
-  rather than steps.
-- **Guarantee enough steps when fine-tuning.** Choose the effective batch so the run has at least a few
-  hundred optimizer steps; check `num_examples × epochs ÷ effective_batch` before launch.
+  for Adam, lengthen warmup, then sweep the peak briefly. Monitor early grad-norm spikes, loss per token
+  and the agent eval (tool-call validity, task success) against the reference run.
+- **Measure the noise scale on large runs only.** Under data parallelism, log each rank's local gradient
+  norm and the all-reduced norm, keep EMAs of the two estimator terms, and track `B_simple`. For long
+  pre-training, ramp the batch up early (GPT-3 did this), with the schedule defined in tokens.
 
 ## Trade-offs
 - **Utilization vs data efficiency.** Larger batches raise GPU utilization and cut wall-clock per token,
   but past the noise scale they stop reducing step count, so each extra example costs data and compute
   with no loss benefit.
 - **Small batches: steps and regularizing noise vs idle hardware.** More optimizer steps per token help on
-  small datasets, but small batches under-use accelerators and make the step bandwidth-bound rather than
-  compute-bound.
+  small datasets such as agent traces, but small batches under-use accelerators and make the step
+  bandwidth-bound rather than compute-bound.
 - **LR scaling vs exactness.** Scaling the learning rate with batch keeps the optimizer comparable across
   hardware sizes, but the exact rule (linear, square-root, re-tune) depends on the optimizer and breaks
   down near the noise scale.
@@ -250,27 +302,29 @@ past the noise scale, hardware buys little time and costs a lot of data.
   delivers no speed-up; through more GPUs it costs hardware but actually shortens the run.
 
 ## Pitfalls
+- **Assuming batch is irrelevant for small fine-tunes.** With a few thousand examples, a batch of 128 may
+  give only a few dozen optimizer steps per epoch, too few for the optimizer to do anything. Symptom: the
+  tool-call eval barely moves. Fix: shrink the effective batch until you have a few hundred steps.
 - **Doubling the batch (or GPUs) but not the learning rate.** The run trains noticeably slower per token
   and the team blames the larger batch instead of the untouched learning rate. Fix: rescale the rate, then
   re-tune it.
 - **Quoting batch in sequences across context lengths.** Two runs with "batch 64" at 2k and 8k context see
-  4× different numbers of tokens per gradient.
+  4× different numbers of tokens per gradient. Agent traces make this worse because lengths vary per row.
 - **Sizing the schedule in steps, then changing the batch.** Warmup and decay now cover a different
   fraction of the data than intended. Fix: recompute steps from the token budget after every batch change.
 - **Pushing utilization past the noise scale.** Loss-per-token flattens: more tokens for the same loss,
   visible only when runs are plotted against tokens rather than steps.
-- **Assuming batch is irrelevant for small fine-tunes.** With a few thousand examples, a batch of 128 may
-  give only a few dozen optimizer steps per epoch, too few for the optimizer to do anything.
 
 ## When to use
 - **Fix batch size first** in a training plan, because learning rate, warmup and step count all follow
   from it.
-- **Fine-tuning:** start small enough for at least a few hundred optimizer steps, raise the micro-batch
-  until the GPU is busy, and use accumulation only to reach a target effective batch.
+- **Fine-tuning (including agent traces):** start small enough for at least a few hundred optimizer steps,
+  raise the micro-batch until the GPU is busy, and use accumulation only to reach a target effective batch.
 - **Pre-training or large-scale continued training:** pick the effective batch from the expected noise
   scale (prior runs of similar size are the best guide, and the two-batch estimator measures it on the
   live run), consider ramping it, and scale the learning rate when the batch changes.
-- **Measure:** always compare runs on loss versus tokens, not loss versus steps.
+- **Measure:** always compare runs on loss versus tokens, not loss versus steps, and confirm with the
+  agent eval.
 - **Interviews:** expect the noise-scale argument, the coupling with learning rate, and the distinction
   between micro-batch, effective batch and tokens per step.
 
@@ -306,6 +360,14 @@ data, which is a quality cost, not just a compute one.
   fall and tokens consumed double.
 - **It moves:** it grows as loss falls, so the useful batch is larger late in training.
 
+### Your tool-calling fine-tune on 3,000 traces finished but the agent still emits malformed calls. What do you check about batch size?
+- **Count the optimizer steps:** at an effective batch of 128 for 3 epochs that is about 69 steps, too few
+  for warmup, decay and learning the format.
+- **Then the learning rate and schedule:** after lowering the batch, re-tune the peak rate and recompute
+  warmup and decay in optimizer steps.
+- **Confirm on the agent eval:** score held-out tool calls for valid JSON and correct tool choice, not just
+  training loss.
+
 ### Your team doubled the GPUs and the batch, and loss per token got worse. Debug it.
 - **First suspect the learning rate:** a larger batch with an unchanged rate takes equally cautious but
   half as many steps, so progress per token slows.
@@ -313,11 +375,13 @@ data, which is a quality cost, not just a compute one.
 - **Check the schedule:** if warmup and decay were sized in steps, they now cover different fractions of
   the data. Re-tune and compare on loss versus tokens.
 
-### When would you choose a small batch even though the GPU could fit more?
-- **Small fine-tuning datasets:** a few thousand examples at batch 128 give only a few dozen steps per
-  epoch; a smaller batch gives the optimizer enough steps and some regularizing noise.
-- **Early in pre-training:** the noise scale is small, which is why some recipes ramp the batch up.
-- **Cost:** under-used accelerators, so raise the micro-batch for utilization only up to the target.
+### Agent traces range from 500 to 20,000 tokens. How do you set the batch for a fine-tune on them?
+- **Think in tokens per step:** a fixed number of traces per batch gives wildly varying tokens and memory,
+  so bucket or pack by length.
+- **Micro-batch from the longest traces:** memory is set by the longest batch that can occur, and
+  accumulation brings the effective batch up to target.
+- **Steps from the dataset:** keep at least a few hundred optimizer steps, then monitor tokens per step
+  and peak memory alongside loss.
 
 ### How would you measure the noise scale on a running data-parallel job?
 - **Two batch sizes for free:** each rank's local gradient is the small batch, the all-reduced gradient
@@ -358,3 +422,24 @@ data, which is a quality cost, not just a compute one.
 - [ ] Doubling the sequence length
 > Each data-parallel rank contributes its micro-batch to the effective batch, so more ranks mean a larger
 > batch per step at the same per-GPU footprint. Checkpointing and bf16 change what fits, not the batch itself.
+
+## Use cases & projects
+### Use cases
+- **Tool-call format fine-tunes.** Small trace datasets where the effective batch decides whether the run
+  has enough optimizer steps to learn the schema.
+- **Routers and small classifiers for agents.** Tool or sub-agent routers saturate at batches of a few
+  hundred examples, so bigger batches only burn data.
+- **Scaling a fine-tune onto more GPUs.** Holding the effective batch fixed while adding ranks keeps the
+  learning rate and schedule valid and the run comparable.
+- **Mixed-length trajectory datasets.** Length bucketing or packing keeps tokens per step steady when
+  traces range from short calls to long tool results.
+
+### Mini project
+**Batch-size sweep on a tool-calling adapter (2-3 hours).**
+- **Goal:** show how effective batch changes step count and tool-call quality on a small agent dataset.
+- **Steps:** collect or synthesise about 2,000 tool-call traces; write a small planner that prints
+  optimizer steps and tokens per step for effective batches of 16, 32 and 128; LoRA-tune a small open
+  model at each setting with the learning rate re-tuned briefly; score held-out calls for valid JSON and
+  correct tool choice.
+- **Done when:** you have a table of batch, steps, tokens per step, final loss and tool-call accuracy, and
+  a one-paragraph recommendation for the batch you would ship and why.

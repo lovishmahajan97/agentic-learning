@@ -5,7 +5,8 @@ name: Softmax
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: crisp-verified
+status: agentic
+agent_relevance: background
 related:
   - model-internals/logits
   - model-internals/attention-mechanism
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Softmax turns arbitrary real scores into a probability distribution, with sharpness set by temperature
-*T*. An LLM uses it inside every attention head and at the output; "never exactly zero" and "must sum to
-one" explain sampling tails, attention sinks and numerical bugs.
+Softmax turns scores into probabilities, sharpened or flattened by temperature *T*. For agent builders it
+explains what the temperature setting does, why a router's "confidence" needs calibration, and why
+evicting a long agent session's first tokens breaks it.
+
+## For agent builders
+- **Why it matters for agents.** The `temperature` you set on every agent call is a softmax parameter:
+  low values make tool calls and extractions consistent, high values add variety. Any probability you read
+  (logprobs on a routing step, a classifier score used as a guardrail) is a softmax output, not a
+  calibrated correctness estimate.
+- **Where it shows up in your stack.** The `temperature` request parameter, `logprobs` on hosted APIs,
+  classifier heads in guardrail and routing models, and attention kernels inside the serving engine.
+- **What you control.** Temperature per agent step (planner vs tool-argument filling vs creative
+  drafting), whether probabilities are calibrated before thresholds use them, and softmax versus sigmoids
+  when training a multi-label classifier for the agent.
+- **What you can skip.** Deriving the Jacobian and the online-softmax recurrence; recognise that
+  FlashAttention relies on the latter and that NaNs from softmax are a precision or masking bug.
 
 ## Why it exists
 - **Argmax cannot be learned through.** It is piecewise constant: a tiny change in scores does nothing or
@@ -40,7 +54,19 @@ one" explain sampling tails, attention sinks and numerical bugs.
   entropy, the same form as the Boltzmann distribution in physics, which is where "temperature" comes from.
 
 ## How it works
-### The function and its properties
+### What the agent builder uses
+- **Temperature is the knob you touch.** Dividing logits by `T < 1` widens gaps and sharpens the
+  distribution; `T > 1` flattens it. As `T → 0` softmax becomes argmax (greedy); as `T → ∞` it
+  becomes uniform. That is why tool-calling and extraction steps usually run at low temperature.
+- **Probabilities never reach zero.** Only a `−∞` logit gives an exact zero, so unlikely tokens are always
+  possible at temperature above zero. Over thousands of agent steps, a rare bad token in a tool argument
+  will eventually be sampled unless you truncate (top-k, top-p) or constrain.
+- **Probabilities are not correctness.** A routing step that reports 0.95 may be right far less often than
+  95% of the time. Fit a temperature on labelled agent decisions before you threshold on it.
+- **Sums to one forces attention sinks.** Models park unused attention on the first tokens, so KV eviction
+  schemes for long agent sessions must keep them.
+
+### Background: the function and its properties
 For scores `z` and temperature `T > 0`:
 
 ```
@@ -51,8 +77,6 @@ log p_i = z_i / T − logsumexp(z / T)
 - **Shift invariance.** `softmax(z + c) = softmax(z)` for any constant *c*, because `exp(c)` factors out
   of numerator and denominator. Implementations subtract `max(z)` before exponentiating *because* the
   result is identical and the largest exponent becomes `exp(0) = 1`, so nothing overflows.
-- **Temperature.** Dividing by `T < 1` widens gaps and sharpens the distribution; `T > 1` flattens it. As
-  `T → 0` softmax becomes argmax; as `T → ∞` it becomes uniform.
 - **Strictly positive.** Every output is greater than zero for finite inputs. Only `−∞` produces an exact
   zero, which is how masks and token bans work.
 - **Sums to one.** Mass removed from one entry must go somewhere. This is a constraint, not a feature, and
@@ -62,7 +86,7 @@ log p_i = z_i / T − logsumexp(z / T)
 - **Two classes.** With `K = 2`, softmax reduces to the sigmoid of the score difference; the logistic
   function is the special case.
 
-### At the output layer
+### Background: at the output layer
 - **Next-token distribution.** The vocabulary softmax converts the last position's logits into a
   distribution over tens of thousands of entries.
 - **A long tail.** Every entry stays positive, so there are many individually tiny but collectively
@@ -74,7 +98,7 @@ log p_i = z_i / T − logsumexp(z / T)
   it is why the output layer is not a fully general distribution.
 - **Temperature here is a user-facing knob;** temperature inside attention is not.
 
-### Inside attention
+### Background: inside attention
 1. **Weights over positions.** Each head computes `softmax(q·Kᵀ / √d_k)`, weights that sum to one across
    the positions the query may see.
 2. **`√d_k` is a fixed temperature.** Dot products of *d_k*-dimensional vectors grow in magnitude with
@@ -85,7 +109,7 @@ log p_i = z_i / T − logsumexp(z / T)
    excess attention onto an uninformative position, usually the first token. Streaming methods that evict
    old tokens must keep these **sink tokens** or quality collapses.
 
-### Computing it efficiently
+### Background: computing it efficiently
 A naive softmax over a long row needs the whole row in memory to find the max and the sum. The online
 formulation keeps a running maximum *m* and a running sum *s* and updates both in one pass:
 
@@ -101,11 +125,12 @@ softmax(x_i) = exp(x_i − m) / s
 - **Tile-friendly.** It can be accumulated in tiles that never leave fast on-chip memory, and the same
   rescaling applies to a partial weighted sum of value vectors.
 - **That trick is the heart of FlashAttention:** exact attention without materializing the full `n × n`
-  score matrix.
+  score matrix, which is part of why long agent contexts are feasible at all.
 
 ## Diagram
 Both uses share one recipe (scale, mask with minus infinity, subtract the max, exponentiate, normalize);
-only the scores and what consumes the probabilities differ.
+only the scores and what consumes the probabilities differ. The temperature you set enters on the logits
+path.
 
 ```mermaid
 flowchart TD
@@ -158,6 +183,36 @@ Worked by hand (entropy printed by the script, in nats; the uniform maximum for 
 - **At `T = 2`** the distribution is close to uniform.
 - **Same ranking in all three cases;** only the confidence changed.
 
+### Agent scenario: calibrating a router's confidence before gating on it
+An agent's routing step outputs scores over three tools, and low-confidence decisions escalate to a
+stronger model. Fit one temperature on labelled routing decisions so that "0.9" means roughly 90%.
+
+```python
+import numpy as np
+
+def softmax(z, T):
+    z = z / T
+    z = z - z.max(axis=1, keepdims=True)
+    e = np.exp(z)
+    return e / e.sum(axis=1, keepdims=True)
+
+def nll(z, y, T):
+    p = softmax(z, T)
+    return -np.log(p[np.arange(len(y)), y] + 1e-12).mean()
+
+def fit_temperature(z, y):                       # z: [n, k] router scores, y: true tool index
+    grid = np.linspace(0.25, 5.0, 96)
+    return grid[np.argmin([nll(z, y, T) for T in grid])]
+
+# load router scores and labels from your agent's logged, hand-labelled decisions
+# T = fit_temperature(z_val, y_val)
+# conf = softmax(z_live, T).max(axis=1); escalate = conf < threshold
+```
+
+Temperature scaling never changes which tool wins (ranking is preserved); it only changes how confident
+the score claims to be, which is exactly what an escalation threshold depends on. The grid range is
+illustrative.
+
 ### Online softmax equals the two-pass version
 Pure Python, the one-pass running-max update from above checked against the ordinary max-then-sum
 version on 10,000 random scores.
@@ -186,31 +241,35 @@ print(online([1000.0, 0.0]))                     # [1.0, 0.0]: no overflow eithe
 ```
 
 ## Production patterns
-- **Normalize in fp32.** Cast before normalizing (`torch.softmax(x.float(), dim=-1)`) or compute losses on
-  fp32 logits, even when the model runs in bf16 or fp16. Monitor NaN and inf counters on losses and
-  sampled probabilities.
+- **Set temperature per agent step.** Run tool selection, argument filling and extraction at low
+  temperature for consistency, and reserve higher values for drafting or brainstorming steps. Monitor
+  tool-call validity and run-to-run variance on a fixed eval set when you change it.
+- **Calibrate before exposing or gating on probabilities.** If an agent thresholds softmax confidence
+  (routing, guardrails, "ask the user" decisions), fit a single temperature on a held-out labelled set
+  (temperature scaling) and track expected calibration error over time.
+- **Use sigmoids for multi-label outputs.** When labels are not mutually exclusive (a request can need
+  both search and calendar), train independent sigmoids (for example `torch.nn.BCEWithLogitsLoss`) instead
+  of a softmax. Monitor per-label precision and recall.
+- **Keep sink tokens when evicting KV.** Any streaming or sliding-cache scheme for long agent sessions
+  should pin the first few tokens in the cache along with the recent window. Monitor quality on long
+  sessions against a full-cache baseline.
+- **Normalize in fp32.** When fine-tuning or self-hosting, cast before normalizing
+  (`torch.softmax(x.float(), dim=-1)`) or compute losses on fp32 logits, even when the model runs in bf16
+  or fp16. Monitor NaN and inf counters on losses and sampled probabilities.
 - **Use fused attention kernels.** Call `torch.nn.functional.scaled_dot_product_attention` or a
   FlashAttention build instead of hand-writing `softmax(q @ k.T / sqrt(d))`, so the online softmax, the
   scale and masking are handled for you. Monitor peak memory and step time at long sequence lengths.
 - **Mask before, and guard empty rows.** Add `−∞` (or the dtype's most negative value, `torch.finfo(dtype).min`)
   before the softmax, and zero the output of rows where every key is masked. Monitor NaNs specifically in
   padded batches.
-- **Keep sink tokens when evicting KV.** Any streaming or sliding-cache scheme should pin the first few
-  tokens in the cache along with the recent window. Monitor quality on long sessions against a
-  full-cache baseline.
-- **Calibrate before exposing probabilities.** If a product shows or thresholds softmax confidence, fit a
-  single temperature on a held-out labelled set (temperature scaling) and track expected calibration error
-  over time.
-- **Use sigmoids for multi-label outputs.** When labels are not mutually exclusive, train independent
-  sigmoids (for example `torch.nn.BCEWithLogitsLoss`) instead of a softmax. Monitor per-label precision
-  and recall.
 
 ## Trade-offs
 - **Clean gradients vs no hard zero.** Smooth normalization gives gradients everywhere, but it can never
   express a hard zero, so sampling must be truncated externally and attention must park unused mass
   somewhere.
 - **Low vs high temperature.** Lower temperature raises consistency and accuracy on tasks with one right
-  answer; higher raises diversity. The right value flips with whether the task rewards variety.
+  answer, such as tool arguments; higher raises diversity. The right value flips with whether the task
+  rewards variety.
 - **Exact row vs online tiles.** The plain softmax needs the whole row, which is memory-heavy for long
   attention rows; the online version is exact and tile-friendly at the cost of extra rescaling work per
   tile.
@@ -219,15 +278,15 @@ print(online([1000.0, 0.0]))                     # [1.0, 0.0]: no overflow eithe
   their query and key norms.
 
 ## Pitfalls
+- **Treating "99% probability" as 99% correctness.** Softmax outputs are scores shaped by training;
+  calibration must be measured rather than assumed. Symptom: an agent's confidence gate lets through
+  wrong tool choices. Fix: measure calibration error on labelled data and apply temperature scaling.
 - **Exponentiating in half precision or without subtracting the max.** Symptom: NaN or inf probabilities
   on long or confident rows, often only on some batches. Fix: subtract the row max and normalize in fp32.
 - **Masking after the softmax.** Multiplying probabilities by zero instead of adding `−∞` before leaves rows
   that no longer sum to one. The sibling bug, masking with a large finite negative such as −1e4 that
   underflows to nothing in fp16, shows up as attention leaking to masked positions. Fix: add the mask
   before the softmax, using `−∞` or the dtype's own minimum.
-- **Treating "99% probability" as 99% correctness.** Softmax outputs are scores shaped by training;
-  calibration must be measured rather than assumed. Fix: measure calibration error on labelled data and
-  apply temperature scaling if needed.
 - **A fully masked row.** For example a padding query whose every key is masked: the row is all `−∞`,
   softmax computes `0/0`, and NaNs appear only in batches with padding. Kernels guard this case
   explicitly, and hand-written attention must too.
@@ -238,14 +297,14 @@ print(online([1000.0, 0.0]))                     # [1.0, 0.0]: no overflow eithe
 
 ## When to use
 - **You inherit it, not choose it:** at two places in every transformer and in nearly every classifier.
-- **What you choose:** the temperature at the output, the truncation rules layered on top, the precision
-  the normalization runs in, and multi-class (softmax) versus multi-label (independent sigmoids, because
-  labels are not mutually exclusive).
+- **What you choose:** the temperature at the output for each agent step, the truncation rules layered on
+  top, the precision the normalization runs in, and multi-class (softmax) versus multi-label (independent
+  sigmoids, because labels are not mutually exclusive).
 - **Measure** calibration if you intend to read probabilities as confidence.
 - **Day to day** it shows up when debugging NaNs, tuning sampling, and reasoning about why attention
   behaves as it does.
-- **Interviews:** derive the gradient with cross-entropy, explain the max-subtraction trick, and say why
-  attention scores are scaled by `√d_k`.
+- **Interviews:** derive the gradient with cross-entropy, explain the max-subtraction trick, say why
+  attention scores are scaled by `√d_k`, and explain why agent confidence gates need calibration.
 
 ## Role lens
 - **Engineer:** Sets temperature per endpoint, computes softmax and losses in fp32, and masks with `−∞`
@@ -274,6 +333,18 @@ scale was introduced to prevent.
 - **Why it matters:** the signal is proportional to the error and never saturates when the model is
   confidently wrong, unlike squared error on probabilities. Frameworks fuse the two for numerical stability.
 
+### Your agent escalates to a human when the router's top probability is below 0.8, yet wrong tool calls still slip through. What is going on?
+- **The scores are not calibrated.** Softmax outputs reflect training, not accuracy, so many wrong
+  decisions carry 0.9 or more.
+- **Fix:** log routing decisions with labels, fit a temperature on them, re-pick the threshold from the
+  calibrated scores, and track the gate's precision and recall over time.
+
+### How would you set temperature across the steps of a tool-calling agent?
+- **Low for structure.** Tool selection, argument filling and extraction need consistency, so run them at
+  or near zero, where softmax approaches argmax.
+- **Higher only where variety helps,** such as drafting alternatives; evaluate any change on a fixed task
+  set, since the tail never reaches zero and rare bad tokens accumulate over many steps.
+
 ### Your training run shows NaN losses, but only on batches that contain padding. What do you check?
 - **Fully masked rows.** A padding query whose every key is masked gives an all `−∞` row and `0/0` in the
   softmax.
@@ -286,12 +357,6 @@ scale was introduced to prevent.
   forces the probabilities to compete and sum to one.
 - **Softmax remains right** for exactly one class per input, such as next-token prediction, where the
   sum-to-one constraint is the truth.
-
-### How does FlashAttention compute an exact softmax without the full score matrix?
-- **Online softmax.** It keeps a running max and running sum per row, rescaling the sum and the partial
-  weighted sum of values by `exp(m − m_new)` whenever a larger max arrives.
-- **So it can tile.** Blocks of keys and values are processed in on-chip memory and the result is exact,
-  never materializing the `n × n` matrix.
 
 ### What happens numerically when you lower temperature from 1 to 0.5 on logits [2.0, 1.0, 0.1]?
 - **Gaps double.** The scaled scores become [4, 2, 0.2], so probabilities move from about
@@ -323,3 +388,23 @@ scale was introduced to prevent.
 - [ ] Because of weight decay
 > The normalization constraint forces every query to allocate its full weight somewhere. Early tokens
 > are visible to all later positions, so they become the default place to park attention mass.
+
+## Use cases & projects
+### Use cases
+- **Choosing temperature per agent step.** Teams run planners and tool-argument steps cold and drafting
+  steps warmer, because softmax temperature trades consistency for variety.
+- **Confidence gates and escalation.** Router or guardrail probabilities decide when an agent asks the
+  user or hands off, and only work after calibration.
+- **Multi-label intent detection.** A request needing several tools at once is modelled with sigmoids, not
+  a softmax that forces tools to compete.
+- **Long-session serving.** Attention sinks explain why streaming KV schemes for long agent sessions pin
+  the first tokens.
+
+### Mini project
+**Calibrate an agent's routing confidence (1-2 hours).**
+- **Goal:** make a router's probabilities mean what they say before an escalation gate uses them.
+- **Steps:** collect 100 routing decisions with scores over three or four tools and hand-labelled correct
+  tools; plot a reliability diagram (confidence bins vs accuracy); fit a temperature with the example
+  code on half the data; re-plot on the other half; choose an escalation threshold.
+- **Done when:** you have before and after reliability plots, the calibration error dropped on held-out
+  data, and the chosen threshold comes with its expected escalation rate and accuracy.

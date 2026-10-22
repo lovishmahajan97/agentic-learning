@@ -475,3 +475,25 @@ pipeline's error bar, not noise.
 - [ ] Training for fewer epochs
 > Collapse comes from recursively copying a narrowing distribution with compounding errors. Anchoring on
 > real data, filtering errors and measuring diversity attack each part of that mechanism directly.
+
+## Use cases & projects
+### Use cases
+- **Pre-launch agent eval suites.** With no real traffic yet, teams generate tasks against a seeded
+  sandbox and verify each by the end state it should produce.
+- **Teaching a small model a tool-call format.** Construction-first generation samples valid calls from
+  the tool schemas and asks a model only for the user request that leads to them.
+- **Simulated users for multi-turn agents.** A persona-driven model plays the customer so the agent is
+  tested on clarifications, corrections and off-topic turns.
+- **Covering rare failure cases.** Error analysis on real traces names a gap, and synthetic examples fill
+  it while real data stays the anchor.
+
+### Mini project
+**Generate and verify a synthetic agent eval set (2-3 hours).**
+- **Goal:** build 50 verified tasks for a small tool-using agent and use them to compare two agent
+  versions.
+- **Steps:** write a mock backend with 3 tools and seeded state; have a model propose tasks with the
+  expected end state; run each task once with a reference agent and keep only those whose end state
+  matches; deduplicate and record generator, prompt version and seed per row; replay the set against two
+  prompt versions of your agent.
+- **Done when:** you have the task file with provenance, the share of generated tasks that survived
+  verification, and a per-version pass-rate table.

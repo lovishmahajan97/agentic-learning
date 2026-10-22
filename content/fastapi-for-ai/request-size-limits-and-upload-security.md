@@ -462,3 +462,25 @@ Check magic bytes per entry. Keep the app-level byte counter in case the app is 
 - [ ] FastAPI cannot read files larger than 1 MB in handlers
 > Untrusted documents can trigger parser bugs or pathological runtimes. A sandboxed job confines a
 > crash or timeout to one file, while the API stays responsive and returns a job ID.
+
+## Use cases & projects
+### Use cases
+- **RAG ingestion of user documents.** Byte caps while streaming, a magic-byte allowlist and sandboxed
+  parsing keep one hostile PDF or archive from taking down the ingestion workers.
+- **Agents with a `fetch_url` tool.** The tool caps download bytes, content types and redirects, and
+  truncates what enters the context, so a huge or hostile page cannot flood the run.
+- **Chat attachments.** Archive, page and pixel caps catch zip bombs and oversized images before an
+  agent's vision or parsing step runs.
+- **Prompt-injection defence.** Extracted text is labelled as untrusted data in the prompt, and tools with
+  side effects stay behind checks the document cannot switch off.
+
+### Mini project
+**Harden a document-upload path for a RAG agent (2-3 hours).**
+- **Goal:** an upload route and a fetch tool that reject oversized, mislabelled and bomb-like inputs before
+  they reach a parser or the prompt.
+- **Steps:** add byte-counting ASGI middleware for the upload route; check magic bytes against an
+  allowlist; run the bounded archive check before extraction; write a fetch tool with a download cap and
+  an output cap; build test inputs: a chunked body with no Content-Length, a renamed executable and a
+  small zip that expands enormously.
+- **Done when:** every hostile input is refused with a clear 4xx or tool error, memory stays flat during
+  the tests, and a valid PDF still flows through to chunking.

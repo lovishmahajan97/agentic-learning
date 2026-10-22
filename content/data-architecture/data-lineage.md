@@ -5,7 +5,8 @@ name: Data lineage
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - data-architecture/model-and-dataset-provenance
   - data-architecture/data-contracts
@@ -21,9 +22,23 @@ sources:
 ---
 
 ## TL;DR
-Data lineage is the recorded graph of where every dataset, chunk, feature and model came from: inputs,
-job, code version, run. Production questions like "why did this answer change" are graph traversals, so
-lineage is what makes deletion, debugging and reproducibility possible.
+Data lineage is the recorded graph of where every chunk, memory, dataset and model behind your agent came
+from: inputs, job, code version, run. "Why did the agent say that" and "delete this user everywhere" are
+graph traversals, so lineage makes debugging, deletion and reproducibility possible.
+
+## For agent builders
+- **Why it matters for agents.** An agent answer is built from retrieved chunks, long-term memories,
+  cached results and a model trained on some dataset. When a user disputes an answer or asks for erasure,
+  you need to walk from the trace back to document versions, and from a document forward to every memory
+  and cache entry that quotes it.
+- **Where it shows up in your stack.** Chunk metadata in the vector store, retrieved chunk ids logged on
+  the agent's trace spans, input ids stored on memory writes and semantic-cache rows, and OpenLineage
+  events from the ingestion and fine-tuning jobs.
+- **What you control.** Which ids you stamp on every chunk, which ids the agent's tools log per call, what
+  each request-path write (memory summary, cache entry, feedback row) records about its inputs, and
+  whether deletion drills run.
+- **What you can skip.** Column-level lineage across the warehouse and catalog vendor comparisons. Start
+  with a lineage table, chunk stamps and the trace join.
 
 ## Why it exists
 - **AI systems are long chains of transformations.** Source documents become parsed text, then chunks,
@@ -31,7 +46,8 @@ lineage is what makes deletion, debugging and reproducibility possible.
   training mixes, checkpoints and served models. Each hop is written by a different job, often a different
   team.
 - **Each hop forgets the one before.** A vector in the index does not know which parser version produced
-  its text; a checkpoint does not know which rows were filtered out of its training set.
+  its text; a checkpoint does not know which rows were filtered out of its training set; an agent memory
+  does not know which conversation produced it unless you record it.
 - **The question is always upstream or downstream.** Deletion: which chunks, caches, fine-tuning sets and
   checkpoints contain this customer's data? Regression on Tuesday: did the source, parser, chunker,
   embedding model or index build change? Impossible output: was the offending example in the training data,
@@ -43,7 +59,7 @@ lineage is what makes deletion, debugging and reproducibility possible.
   accurate.
 
 ## How it works
-### The graph
+### Background: the graph
 - **Two node types:** **datasets** (a table, a file prefix, a vector collection, a model artifact, a prompt
   template) and **jobs** (a pipeline step).
 - **A run is one execution of a job** and carries edges: run *reads* datasets A and B, run *writes* dataset
@@ -62,7 +78,7 @@ lineage is what makes deletion, debugging and reproducibility possible.
 - **Record-level is heavier,** but it is the only granularity at which "delete this person's data" and "why
   was this passage retrieved" can be answered.
 - **Practical compromise:** table-level for the warehouse, record-level for anything that feeds retrieval,
-  fine-tuning or a model's outputs.
+  agent memory, fine-tuning or a model's outputs.
 
 ### Capture at run time, not by declaration
 1. **Start event:** job name, run id, inputs with their versions.
@@ -91,10 +107,10 @@ lineage is what makes deletion, debugging and reproducibility possible.
 
 ### Traversals
 - **Impact analysis (forward):** from a dataset version, everything derived from it. Used before changing a
-  source schema and for deletion propagation: a document id walks forward to chunks, vectors, caches, eval
-  sets and fine-tuning examples.
-- **Root cause (backward):** from an artifact, its ancestors. Used when quality regresses: compare the
-  ancestor facets of the good run and the bad run.
+  source schema and for deletion propagation: a document id walks forward to chunks, vectors, caches, agent
+  memories, eval sets and fine-tuning examples.
+- **Root cause (backward):** from an artifact (or an agent answer), its ancestors. Used when quality
+  regresses: compare the ancestor facets of the good run and the bad run.
 - **Reproduction:** the backward closure plus the code versions is the recipe to rebuild an artifact.
 
 ### Lineage versus provenance
@@ -106,10 +122,11 @@ The two words are often used interchangeably; the useful distinction is scope.
 | Typical query | traversal: "what depends on this table" | "this checkpoint was built from these digests by this commit, and here is a signature" |
 | Relationship | the graph lets you walk from one manifest to every artifact sharing an input | manifests are nodes and facets in the lineage graph |
 
-### Runtime-derived artifacts are the usual hole
+### Agent runtime artifacts are the usual hole
 - **Batch jobs are easy** to instrument because an orchestrator wraps them.
 - **Request-path artifacts escape:** an agent's memory summary of a conversation, a semantic-cache entry, a
-  generated answer saved as a draft, a user-feedback row copied into an eval set.
+  generated answer saved as a draft, a tool result persisted to a scratchpad, a user-feedback row copied
+  into an eval set.
 - **Same treatment for each:** record the ids of the inputs it was derived from (conversation, retrieved
   chunk ids, model version) at write time. Otherwise forward traversal from a deleted document stops at the
   batch boundary and misses the copies users actually see.
@@ -118,17 +135,18 @@ The two words are often used interchangeably; the useful distinction is scope.
   models must be retrained or retired. Lineage finds the blast radius; retention and deletion architecture
   decides what to do about it.
 
-### Lineage for RAG specifically
+### Lineage for RAG and agent traces
 - **Stamp every chunk** with `source_id`, `source_version`, `parser_version`, `chunker_version`,
   `embedding_version` and `ingest_run_id`.
-- **Log each retrieved chunk with the request trace,** which connects the serving-time trace to the
-  ingestion-time graph.
+- **Log each retrieved chunk with the request trace,** as attributes on the retrieval tool's span, which
+  connects the serving-time trace to the ingestion-time graph.
 - **That join makes citations trustworthy:** not "a chunk that looks like page 12" but "chunk c, from
   document d at version v, ingested by run r".
 
 ### Lineage for training
 - **Inputs and outputs:** a training run reads dataset versions and a base model version, and writes
-  checkpoints and eval results.
+  checkpoints and eval results. Fine-tuning on agent traces is the same: the trace export is a dataset
+  version.
 - **Keep the exact data snapshot** as an immutable version, retained and addressed by its hash. That lets you
   answer "was example x in the training set" by lookup rather than re-running the filter pipeline. It is
   also what dataset contamination checks need.
@@ -137,7 +155,7 @@ The two words are often used interchangeably; the useful distinction is scope.
 
 ## Diagram
 Runs connect versioned datasets. Forward edges answer deletion and impact; backward edges answer root
-cause; the trace join links a user-visible answer into the graph.
+cause; the trace join links an agent's answer into the graph.
 
 ```mermaid
 flowchart TD
@@ -148,12 +166,46 @@ flowchart TD
     C -->|"read by"| R3["Run: build fine-tune mix"]
     R3 -->|"writes"| S["Training snapshot"]
     S --> M["Checkpoint"]
-    V --> T["Request trace logs chunk ids"]
-    T --> A["Answer and citation"]
+    V --> T["Agent trace logs chunk ids"]
+    T --> A["Answer, memory write, cache entry"]
     A -.->|"backward: root cause"| D
 ```
 
 ## Examples
+### Agent tools that record lineage at write time
+The retrieval tool logs the chunk ids it returned on the trace, and the memory tool stores the ids it was
+derived from, so a forward traversal from a deleted document reaches the memory.
+
+```python
+import uuid
+
+trace_spans = []   # stand-in for your tracing backend
+memories = {}      # memory_id -> row
+
+def search_docs(query: str, trace_id: str, hits: list[dict]) -> list[dict]:
+    trace_spans.append({"trace_id": trace_id, "tool": "search_docs", "query": query,
+                        "chunk_ids": [h["chunk_id"] for h in hits],
+                        "source_versions": [h["source_version"] for h in hits]})
+    return hits
+
+def write_memory(summary: str, trace_id: str, conversation_id: str, model: str) -> str:
+    used = [c for s in trace_spans if s["trace_id"] == trace_id for c in s["chunk_ids"]]
+    mid = str(uuid.uuid4())[:8]
+    memories[mid] = {"text": summary, "conversation_id": conversation_id,
+                     "derived_from_chunks": used, "model": model}
+    return mid
+
+def memories_derived_from(doc_id: str) -> list[str]:
+    """Forward traversal for the request path: which memories quote this document?"""
+    return [m for m, row in memories.items()
+            if any(c.startswith(f"chunk:{doc_id}:") for c in row["derived_from_chunks"])]
+
+hits = [{"chunk_id": "chunk:kb/42:h1:0", "source_version": "h1", "text": "Refunds take 5 days."}]
+search_docs("refund time", "t-1", hits)
+write_memory("User was told refunds take 5 days.", "t-1", "conv-9", "model-2025-01")
+print(memories_derived_from("kb/42"))   # the memory to purge or refresh when kb/42 changes
+```
+
 ### A minimal lineage recorder with forward and backward traversal
 It writes versioned dataset nodes and run edges to an in-memory store, then answers the two traversals
 that matter: forward impact from a document and backward root cause from a chunk.
@@ -203,7 +255,7 @@ print(sorted(forward(doc_node)))      # the chunks to delete if kb/42 must be er
 print(backward("chunk:kb/42:%s:0" % doc_node.split("@")[1]))
 ```
 
-In a real system the same records would be OpenLineage events to a catalog, and the serving trace would
+In a real system the same records would be OpenLineage events to a catalog, and the agent trace would
 log the chunk ids it retrieved so a user-visible answer links back to `backward(...)`.
 
 ### Production snippet: forward traversal over a lineage table in SQL
@@ -224,8 +276,9 @@ SELECT dataset, version FROM downstream;
 ```
 
 ### Worked scenario: the Tuesday regression with no deploy
-Retrieval recall on one product area drops overnight. Backward traversal from a chunk that should have been
-retrieved, comparing the last good run with the bad one (illustrative values):
+The support agent's answers on one product area get worse overnight and retrieval recall drops. Backward
+traversal from a chunk that should have been retrieved, comparing the last good run with the bad one
+(illustrative values):
 
 | Facet | Good run (Monday) | Bad run (Tuesday) | Reading |
 |---|---|---|---|
@@ -239,30 +292,31 @@ retrieved, comparing the last good run with the bad one (illustrative values):
   parser-version facet reveals. Fix: pin the parser, re-ingest the affected sources, add a row-count check.
 
 ## Production patterns
-- **Orchestrator-emitted OpenLineage events.** Use when jobs run under Airflow, Spark or dbt. Enable the tool's
-  OpenLineage integration and point its transport at your backend (Marquez or a catalog that ingests
-  OpenLineage). Monitor event volume per job and jobs with START but no COMPLETE, FAIL or ABORT.
+- **Orchestrator-emitted OpenLineage events.** Use when ingestion and fine-tuning jobs run under Airflow,
+  Spark or dbt. Enable the tool's OpenLineage integration and point its transport at your backend (Marquez
+  or a catalog that ingests OpenLineage). Monitor event volume per job and jobs with START but no COMPLETE,
+  FAIL or ABORT.
 - **Lineage coverage gate in CI.** Use once more than a few pipelines exist. Fail the build if a new job
   definition does not emit run events or omits required facets (commit, container digest, input versions).
   Monitor coverage as fraction of jobs emitting lineage.
-- **Chunk stamping plus trace join.** Use for every RAG index. Write `source_version`, `parser_version`,
-  `chunker_version`, `embedding_version` and `ingest_run_id` on each chunk, and log retrieved chunk ids as
-  attributes on the request's trace span. Monitor the share of served answers whose citations resolve to a
-  document version.
-- **Request-path lineage at write time.** Use for agent memories, semantic caches, saved drafts and
-  feedback-to-eval copies. Store input ids (conversation id, chunk ids, model version) in the same row as the
-  derived artifact. Monitor derived rows with empty input-id fields.
+- **Chunk stamping plus trace join.** Use for every RAG index behind an agent. Write `source_version`,
+  `parser_version`, `chunker_version`, `embedding_version` and `ingest_run_id` on each chunk, and log
+  retrieved chunk ids as attributes on the retrieval tool's trace span. Monitor the share of served answers
+  whose citations resolve to a document version.
+- **Request-path lineage at write time.** Use for agent memories, semantic caches, saved drafts, persisted
+  tool results and feedback-to-eval copies. Store input ids (conversation id, chunk ids, model version) in
+  the same row as the derived artifact. Monitor derived rows with empty input-id fields.
 - **Scheduled deletion drill.** Use where erasure requests are possible. Pick a test document, traverse
-  forward, and assert every derived artifact (chunks, vectors, caches, eval rows, fine-tune rows) is found and
-  purged. Monitor drill pass rate and time to complete.
+  forward, and assert every derived artifact (chunks, vectors, caches, agent memories, eval rows, fine-tune
+  rows) is found and purged. Monitor drill pass rate and time to complete.
 
 ## Trade-offs
 - **Exact deletion and citation vs storage.** Record-level lineage makes deletion and citation exact, but
   adds a handful of metadata fields to every chunk and row; at billions of records the storage is real, and
   table-level may be all the warehouse side needs.
-- **Accuracy vs instrumentation effort.** Run-time capture is accurate but requires every job to be
-  instrumented. One uninstrumented job creates a hole exactly where you later need it, so coverage is worth
-  enforcing in CI.
+- **Accuracy vs instrumentation effort.** Run-time capture is accurate but requires every job and every
+  agent tool that writes state to be instrumented. One uninstrumented writer creates a hole exactly where
+  you later need it, so coverage is worth enforcing in CI.
 - **Cross-team impact analysis vs another system to run.** A full lineage catalog serves many teams, but a
   single lineage table owned by the AI platform is enough until multiple teams need to query it.
 - **Precise reproduction vs pipeline changes.** Versioned dataset nodes need immutable snapshots or content
@@ -276,18 +330,18 @@ retrieved, comparing the last good run with the bad one (illustrative values):
   confidently wrong six weeks later. Fix: run-time events.
 - **Storing chunk metadata without the ingest run id or source version.** Symptom: being unable to explain
   why two retrievals of the "same" page differ after a re-index.
-- **Treating the serving trace and the ingestion lineage as separate systems.** Symptom: a citation that
+- **Treating the agent trace and the ingestion lineage as separate systems.** Symptom: a citation that
   cannot be linked to a specific document version when a user disputes it. Fix: log chunk ids on the trace.
 - **Skipping lineage for manual one-off fixes** ("I just patched that table by hand"). Symptom: an
   unexplained discontinuity nobody can reproduce. Fix: run manual fixes as recorded jobs.
 - **Instrumenting batch pipelines but not request-path writes** such as memories, caches and saved answers.
-  Symptom: a deletion drill that finds every chunk yet misses the summaries that quote the document.
+  Symptom: a deletion drill that finds every chunk yet misses the agent memories that quote the document.
 
 ## When to use
 - **Mandatory when** a system must honour deletion requests, must explain its outputs, or has more than one
-  pipeline feeding retrieval or training, which describes nearly every production AI system.
+  pipeline feeding retrieval, memory or training, which describes nearly every production agent.
 - **Start with the minimum:** a run table with inputs, outputs, versions and code commit, plus source and
-  run identifiers on every chunk.
+  run identifiers on every chunk and input ids on every memory write.
 - **Adopt a catalog** when more than one team needs the graph.
 - **Measure:** coverage (fraction of jobs emitting lineage), and test it with a deletion drill: pick a
   document, traverse forward, and verify every derived artifact is found.
@@ -331,6 +385,14 @@ know that "ingestion ran", which is where the investigation would stall.
 - **Stop at weights honestly:** lineage names the checkpoints trained on a snapshot containing the data;
   deletion policy decides whether to retrain or retire them.
 
+### A user disputes something your agent told them last week. What must you have logged to explain it?
+- **The trace:** the model version, the prompt version, and every tool call with its arguments and result
+  ids, especially the retrieved chunk ids and any memory ids read.
+- **The chunk stamps:** each chunk id resolves to a source document version, parser, chunker and ingest run,
+  so you can show exactly which page version the agent relied on.
+- **Memory inputs:** if a memory shaped the answer, its stored conversation and chunk ids let you walk back
+  to where that belief came from.
+
 ### How do lineage and provenance differ, and when do you need both?
 - **Lineage** is the platform-wide derivation graph, queried by traversal.
 - **Provenance** is a verifiable, often signed, record attached to one artifact.
@@ -343,8 +405,9 @@ know that "ingestion ran", which is where the investigation would stall.
 - **For the warehouse, usually no:** table-level is enough, and the extra metadata fields per row are real
   storage at that scale.
 
-### How would you measure whether your lineage is actually trustworthy?
-- **Coverage:** fraction of jobs emitting run events with required facets, enforced in CI.
+### How would you measure whether your agent platform's lineage is actually trustworthy?
+- **Coverage:** fraction of jobs and state-writing agent tools emitting lineage with required facets,
+  enforced in CI.
 - **Deletion drills:** pick a document, traverse forward, and verify every derived artifact is found;
   a miss means an uninstrumented job or request-path write.
 
@@ -373,3 +436,25 @@ know that "ingestion ran", which is where the investigation would stall.
 - [ ] Regulators require machine-readable formats
 > Declared lineage drifts the moment someone changes a job, and it never knows which input version a given
 > run used. Events emitted as a side effect of doing the work are accurate by construction.
+
+## Use cases & projects
+### Use cases
+- **Explaining a disputed agent answer.** The trace's chunk ids resolve to document versions, so support
+  can show which page version the agent quoted.
+- **Erasure across an agent stack.** Forward traversal from a user's documents reaches chunks, vectors,
+  memories, semantic-cache entries and fine-tuning rows.
+- **Debugging an overnight quality drop.** A facet diff between ingestion runs finds the unpinned parser or
+  embedding change that no deploy explains.
+- **Fine-tuning on agent traces.** The trace export is a versioned dataset, so you can tell which
+  checkpoint learned from which conversations.
+
+### Mini project
+**Lineage for a RAG agent with memory (2-3 hours).**
+- **Goal:** make every agent answer and memory traceable to document versions, and prove a deletion reaches
+  all of them.
+- **Steps:** ingest 20 documents into a lineage table and a vector store with chunk stamps; build an agent
+  with `search_docs` and `write_memory` tools that log chunk ids and input ids; run 15 conversations; write a
+  `explain(trace_id)` function that walks back to documents, and a `forward(doc_id)` that finds chunks,
+  vectors and memories; run a deletion drill on one document.
+- **Done when:** `explain` prints document id and version for every cited chunk, and the drill deletes the
+  document's chunks and every memory derived from it with zero leftovers on re-query.

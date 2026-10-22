@@ -477,3 +477,24 @@ shareable thing was made per request, and a per-request thing was made shared.
 - [ ] Module globals are not visible from dependencies
 > Request-scoped identity stored in application scope is shared by every in-flight request in the
 > process; a dependency or a context variable keeps it isolated per request.
+
+## Use cases & projects
+### Use cases
+- **One compiled agent, many users.** The agent graph and provider client are built once per worker, while
+  each run gets its own messages, budget and principal.
+- **Memory across turns.** Conversation history lives in a checkpointer or memory store keyed by a thread
+  ID, so any worker can continue the conversation.
+- **Short DB transactions around long LLM calls.** Opening a session only for reads and writes, not
+  across a 5-30 s model call, keeps the connection pool from draining.
+- **Auditing for cross-user leaks.** Reviewing which objects hold state on `self` or at module level is
+  how teams find intermittent "saw another user's answer" bugs.
+
+### Mini project
+**Reproduce and fix a cross-user state leak (1-2 hours).**
+- **Goal:** show that per-run state on a shared agent object leaks between concurrent users, then fix it.
+- **Steps:** build an agent class that stores `messages` on `self` and is created once in lifespan; run
+  20 concurrent requests from different fake users with a fake LLM that awaits a short random delay and
+  echoes the history; count responses that contain another user's message; refactor so state is passed in
+  and returned, and keep the client application-scoped.
+- **Done when:** the leak count drops from non-zero to zero, and the client is still created once per
+  worker (checked with a log line or counter).

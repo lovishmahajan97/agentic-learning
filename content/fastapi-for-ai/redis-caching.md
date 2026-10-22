@@ -447,3 +447,24 @@ add a hit metric per namespace to confirm savings survive.
 - [x] The request's arrival timestamp
 > The key must contain everything that changes the output. Model, prompt version and tenant all do;
 > the arrival timestamp does not, and including it would make every key unique and the hit rate zero.
+
+## Use cases & projects
+### Use cases
+- **RAG agents re-embedding the same text.** Caching embeddings keyed on model and text hash means a
+  re-index or a repeated user question skips the embedding API entirely.
+- **Tool lookups inside agent loops.** Pure tools such as product search or an internal docs fetch are
+  called again on retries and replays; a short-TTL cache returns the earlier result in milliseconds.
+- **Deterministic sub-steps.** Temperature-0 routing, classification or extraction prompts over the same
+  input can be cached on model, prompt version and input, cutting cost on the agent's cheapest-to-reuse calls.
+- **Multi-worker agent backends.** One Redis shared by every worker and host keeps the hit rate from being
+  split across per-process caches that a deploy would wipe.
+
+### Mini project
+**Cache an agent's embedding and tool calls (2-3 hours).**
+- **Goal:** cut the cost and latency of a small RAG agent by caching embeddings and one pure tool in Redis.
+- **Steps:** build a FastAPI agent endpoint with a fake or real embedding call and one lookup tool; create
+  a `redis.asyncio` client in the lifespan; add cache-aside with a key built from model, prompt version,
+  tenant and an input hash, a TTL per data class, a `SET NX` lock against stampedes, and a fail-open path
+  when Redis is unreachable; log hits and misses.
+- **Done when:** a replayed run shows cache hits for every repeated call in the logs, stopping Redis
+  leaves the agent working (slower, not failing), and a test proves two tenants never share a key.

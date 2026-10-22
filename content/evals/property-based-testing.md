@@ -446,3 +446,24 @@ and keep any model-calling property out of the PR gate with caching and a low ex
 > Comparing against a copy of the implementation reproduces its bugs on both sides. Coverage, size bound
 > and overlap are independent statements about what a correct chunker must do, so they can fail when the
 > code is wrong.
+
+## Use cases & projects
+### Use cases
+- **Hardening tool-argument parsing.** Generated model-shaped JSON (strings for numbers, missing fields,
+  extra keys) proves the parser either returns valid arguments or raises a typed error, never crashes.
+- **Keeping memory under budget.** A stateful test of the history trimmer checks the context never
+  exceeds its token limit and the system prompt and latest user turn are always kept.
+- **Checking RAG chunkers.** Coverage, size bound and overlap properties catch dropped or duplicated text
+  before it reaches the index.
+- **Escaping prompt templates.** Random user text with backticks, braces and header-like lines must not
+  break the rendered prompt's structure.
+
+### Mini project
+**Property-test an agent's tool-call parser and history trimmer (2-3 hours).**
+- **Goal:** find and pin the smallest inputs that break the deterministic code around the model.
+- **Steps:** write a Hypothesis strategy that produces model-like tool-call JSON, including malformed
+  variants; assert the parser returns a validated arguments object or a typed error; write a
+  `RuleBasedStateMachine` that appends user, assistant and tool messages to a history trimmer and checks
+  the token budget and kept messages after each step; pin every shrunk counterexample as an example test.
+- **Done when:** both properties pass under the CI profile, at least one real bug was found and fixed,
+  and its shrunk counterexample lives in the test file.

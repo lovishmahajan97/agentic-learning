@@ -424,3 +424,23 @@ response round trip plus one write, which is small but not zero.
 > Memoising the first successful output under a stable key is what makes a non-deterministic step
 > idempotent; the replay reads the stored result instead of recomputing. Temperature zero is not guaranteed
 > deterministic across runs, and per-retry keys defeat deduplication entirely.
+
+## Use cases & projects
+### Use cases
+- **Resuming agents from checkpoints.** The in-flight step re-runs after a crash, so its tool calls carry
+  keys derived from `(run_id, step_id)` and repeat safely.
+- **Payment and messaging tools.** Sending an email or charging a card goes through a provider
+  idempotency key, because no broker setting can make an external effect happen once.
+- **Memoising model outputs.** The model's chosen tool arguments are stored before acting, so a retry
+  replays the same arguments instead of sampling new ones.
+- **Counting usage for billing.** Token and tool-call counts are written with a dedupe key per step, so a
+  redelivered event does not bill a tenant twice.
+
+### Mini project
+**Make a crash-prone agent step effectively-once (1-2 hours).**
+- **Goal:** show that a step split into generate, act and mark phases survives crashes without duplicates.
+- **Steps:** write a stub model that returns random tool arguments; write a fake `send_email` tool that
+  records calls and dedupes on an idempotency key; store generated arguments in a `step_results` table
+  before acting; inject a crash after each phase in turn; rerun the step after every crash.
+- **Done when:** across all crash points the fake tool records one email per step with the same
+  arguments, and removing the memoisation visibly produces differing duplicate emails.

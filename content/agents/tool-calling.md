@@ -377,3 +377,24 @@ logging the ratio of calls to answerable queries.
 - [ ] The length of the tool name
 > Selection is driven by the description; the schema shapes the arguments once a tool is chosen. Array
 > position and name length matter far less than a description that states the trigger condition.
+
+## Use cases & projects
+### Use cases
+- **Live-data assistants.** Weather, stock levels, order status and calendars reach the agent only
+  through tool calls, because none of it is in the model's weights.
+- **Action-taking agents.** Refunds, ticket updates and emails go through declared tools so the harness
+  can validate and gate each one before it happens.
+- **Agentic RAG.** Retrieval becomes a search tool the model calls when it needs evidence, rather than a
+  fixed step before every answer.
+- **Structured extraction.** A single forced tool call returns typed fields, a common way to get
+  reliable JSON out of a model.
+
+### Mini project
+**Build a tool dispatcher with gating (1-2 hours).**
+- **Goal:** give an agent four tools and a dispatcher that executes, gates and answers every call.
+- **Steps:** declare `search_orders`, `get_order`, `issue_refund` and `send_email` with clear trigger
+  conditions in each description; write one dispatch function that looks up the handler, catches
+  exceptions into error results and blocks `issue_refund` above a set amount until a human approves;
+  run ten prompts, including two that should use no tool.
+- **Done when:** every tool call in the log has a matching result, the blocked refund produced an
+  approval request instead of a side effect, and the two no-tool prompts were answered directly.

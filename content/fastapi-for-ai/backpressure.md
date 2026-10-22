@@ -434,3 +434,24 @@ depth, and raises real capacity if the overload is normal demand rather than a s
 - [ ] FastAPI raises a `BackpressureError` in the generator
 > Socket and server buffers fill and the awaited `send` stalls the generator, which is real flow
 > control. It does not reach the provider, which may keep generating and billing unless you cancel.
+
+## Use cases & projects
+### Use cases
+- **Launch-day agent traffic.** Admission checks reject new runs early with 429 or 503 plus `Retry-After`,
+  so admitted runs finish instead of everyone timing out.
+- **Document ingestion for RAG.** A bounded `asyncio.Queue` in front of embedding workers keeps a bulk
+  upload from piling up unbounded work in memory.
+- **Long-running agent tasks.** Returning 202 with a run ID and moving work to a durable job queue keeps
+  the request path within its latency budget.
+- **Provider 429s inside the loop.** Backing off and honouring the provider's retry hint stops each agent
+  step from amplifying the overload it hit.
+
+### Mini project
+**Add admission control to an agent endpoint (2-3 hours).**
+- **Goal:** keep latency bounded when agent traffic exceeds the model's capacity.
+- **Steps:** build an agent endpoint over a fake model with a fixed capacity; add an admission check that
+  returns 503 with `Retry-After` when in-flight runs reach a bound set from the latency budget; add a
+  bounded `asyncio.Queue` with fixed workers for an ingestion path; make the fake model return 429s at
+  overload and have the loop back off; load-test at 1.5 times capacity.
+- **Done when:** a table compares p95 latency and completed runs with and without the bounds, the bounded
+  version keeps p95 flat and rejects the excess early, and memory stays stable.

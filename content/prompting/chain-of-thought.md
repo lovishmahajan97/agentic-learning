@@ -5,7 +5,8 @@ name: Chain-of-thought prompting
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - prompting/zero-shot
   - prompting/few-shot
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-Chain-of-thought (CoT) has the model write reasoning before its answer, buying sequential computation one
-fixed-compute token cannot supply. Gains are large on multi-step problems, near zero on lookups, and the
-chain is not guaranteed to be the answer's real cause.
+Chain-of-thought (CoT) has the model reason before it answers or calls a tool, buying sequential compute
+one token cannot supply. Agents need it for planning and multi-step choices, not lookups; the chain is
+not guaranteed to be the decision's real cause.
+
+## For agent builders
+- **Why it matters for agents.** Planning, choosing among tools with constraints, and reading a messy
+  tool result are multi-step problems; reasoning before the call raises accuracy there. But every agent
+  step that reasons pays for it in output tokens and latency, multiplied by the number of steps.
+- **Where it shows up in your stack.** Extended thinking or effort settings on reasoning models (often
+  with thinking between tool calls), a `reasoning` field before the action in structured outputs,
+  "plan first" instructions in the system prompt, and self-consistency votes in evals and judges.
+- **What you control.** Which steps get reasoning or a higher effort, the token budget per step, whether
+  reasoning precedes the action, and whether chains are logged or shown to users.
+- **What you can skip.** The circuit-complexity proofs. Keep the one-line version: one token is a fixed
+  amount of compute, so dependent steps need intermediate tokens.
 
 ## Why it exists
 - **Same weights, different result.** Ask for the final answer to a multi-step word problem and the model
@@ -86,6 +99,21 @@ chain is not guaranteed to be the answer's real cause.
   correct option always "A"), models write chains that never mention the bias while their answers follow
   it.
 - **Treat it as evidence to inspect, never as an audit trail.**
+
+### Reasoning inside an agent loop
+| Agent step | Reasoning? | Why |
+|---|---|---|
+| Initial plan for a multi-part task | Yes | Decomposition and ordering are dependent steps |
+| Choosing a tool under constraints ("cheapest flight under 2 stops") | Yes | Several conditions to check together |
+| Reading a large or contradictory tool result | Often | The next action depends on combining facts |
+| Routing, simple lookups, formatting the final answer | Usually no | Nothing to derive; pay latency for nothing |
+
+- **Reason before the action, not after.** The same ordering rule applies: a `reasoning` field before
+  `action` in the schema, or thinking before the tool call, so the reasoning can change which call is made.
+- **Reasoning cost compounds.** Output tokens for reasoning are paid on every step that reasons, so a
+  12-step run multiplies the per-step chain by 12.
+- **Stated reasons are not an audit trail.** An agent's written justification for a tool call can omit
+  what actually drove it; log the inputs and the call itself.
 
 ### Where it does not help
 - **Lookups:** fact retrieval, short-text classification, sentiment. There are no intermediate steps, so
@@ -195,6 +223,22 @@ print(f"plurality, consistent error: {plurality_sim(consistent):.2f}")
 - **Scattered errors are where voting shines**, because the truth wins with a small plurality.
 - **A systematic misreading is amplified.** Fix the prompt or add a rule; more samples will not help.
 
+### Worked scenario: reasoning on every agent step vs routed effort
+A travel-booking agent averages 12 steps per task. Reasoning on every step averages 800 output tokens
+per step; the team routes reasoning only to the plan step and the 3 constraint-checking steps
+(illustrative numbers from one eval run).
+
+| Setup | Reasoning tokens per task | Task success (200 tasks) | p95 latency per task |
+|---|---|---|---|
+| No reasoning | 0 | 71% | 28 s |
+| Reasoning on all 12 steps | 12 × 800 = 9,600 | 86% | 95 s |
+| Reasoning on plan + 3 constraint steps | 4 × 800 = 3,200 | 85% | 47 s |
+
+- **Most of the gain came from 4 of 12 steps.** The other 8 were lookups and formatting, so their chains
+  added tokens and latency, not accuracy.
+- **A one-point gap is inside the noise** at 200 tasks; keep routed effort unless a larger eval shows a
+  real loss.
+
 ## Production patterns
 - **Route reasoning by request class.** Classify or route requests so only multi-step classes (math,
   date logic, multi-constraint selection) get a chain or a higher effort setting; lookups and
@@ -211,6 +255,12 @@ print(f"plurality, consistent error: {plurality_sim(consistent):.2f}")
 - **Keep chains internal.** Show users the answer, log chains for debugging under the same retention and
   access rules as the context they may quote. Review a sample of failed chains weekly to find recurring
   misreadings.
+- **Per-step effort in agents.** Give the planning and constraint-heavy steps a higher effort or thinking
+  budget, and run routing, lookups and final formatting with little or none. Monitor reasoning tokens per
+  step, task success and p95 task latency per agent version.
+- **Plan, then act.** For long tasks, ask for a short numbered plan first, store it in the agent state,
+  and re-check it after surprising tool results. Monitor how often runs revise the plan and whether
+  revisions precede failures.
 
 ## Trade-offs
 - **Accuracy vs latency and output tokens.** Multi-step accuracy rises, but output tokens cost more than
@@ -236,6 +286,8 @@ print(f"plurality, consistent error: {plurality_sim(consistent):.2f}")
   with no accuracy change.
 - **Few-shot CoT with sloppy rationales.** Symptom: the model copies the same shortcut and fails on exactly
   the cases the shortcut misses.
+- **Maximum reasoning on every agent step.** Symptom: tasks that take minutes and cost several times more
+  with the same success rate. Fix: measure per step type and route effort only where it moves success.
 
 ## When to use
 - **Use when** the task has intermediate steps: arithmetic, unit conversion, date logic, multi-constraint
@@ -294,11 +346,19 @@ instead of adding a trigger. Keeping CoT would require a measured gain, not a hu
 - **Use it as debugging evidence** to find misreadings, and keep auditable decisions in code, logged inputs
   and deterministic rules.
 
-### How do you budget tokens for reasoning in production?
-- **Size for the chain.** `max_tokens` must cover hidden or visible reasoning plus the answer, or responses
-  truncate with no answer.
+### How do you budget tokens for reasoning in an agent in production?
+- **Size for the chain.** `max_tokens` must cover hidden or visible reasoning plus the answer or tool call,
+  or responses truncate with no action.
 - **Price output separately.** Output tokens typically cost several times more than input, and chains can
   multiply output length by an order of magnitude, so route only multi-step classes to reasoning.
+- **Multiply by steps.** Per-step reasoning is paid on every step; a 12-step agent at 800 reasoning tokens
+  per step spends 9,600 per task.
+
+### Your agent's tasks got slower and pricier after enabling thinking, with little accuracy gain. What do you do?
+- **Break it down by step type.** Measure reasoning tokens and success contribution for plan, tool-choice,
+  lookup and formatting steps.
+- **Route effort.** Keep reasoning on the steps where removing it lowers success on the eval, and turn it
+  down elsewhere; compare success, cost and p95 latency per task.
 
 ## Quiz
 ### Q: Why does writing out intermediate steps improve a model's accuracy on multi-step arithmetic?
@@ -325,3 +385,23 @@ instead of adding a trigger. Keeping CoT would require a measured gain, not a hu
 > Correct chains converge on the same answer while wrong chains tend to disagree with each other, so the
 > majority is usually right when single-chain accuracy is reasonable. It fails when the model makes the
 > same mistake consistently, costs k times the tokens and needs a discrete answer to vote on.
+
+## Use cases & projects
+### Use cases
+- **Planning agents.** A short reasoned plan before the first tool call orders multi-part tasks such as
+  "compare three vendors and draft an email".
+- **Constraint-heavy tool choice.** Booking, scheduling and pricing agents reason before calls that must
+  satisfy several conditions at once.
+- **LLM judges with self-consistency.** Several sampled judgments with a vote and a margin give a cheap
+  confidence signal for agent evals.
+- **Cost tuning of reasoning models.** Per-step effort routing keeps an agent's accuracy while cutting
+  reasoning tokens and latency.
+
+### Mini project
+**Per-step reasoning budget for an agent (2-3 hours).**
+- **Goal:** find which steps of an agent actually need reasoning.
+- **Steps:** build an agent with 3 tools for a multi-constraint task (for example, pick a meeting slot that
+  fits several calendars and a room); write 20 tasks; run with no reasoning, reasoning on every step, and
+  reasoning only on the plan and slot-choice steps; log reasoning tokens per step, success and latency.
+- **Done when:** you have a 3-row table like the worked scenario above and a recommendation of which
+  steps get reasoning, backed by the numbers.

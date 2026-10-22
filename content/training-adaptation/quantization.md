@@ -458,3 +458,24 @@ quality drops too far, the honest options are two GPUs with FP8 or a smaller mod
 - [ ] A calibration dataset for post-training quantization
 > GGUF is a file format: it bundles tensors in block-quantized types such as Q4_K_M with everything needed
 > to run them. The quantization recipes are chosen when converting into it, not defined by it.
+
+## Use cases & projects
+### Use cases
+- **Fitting a self-hosted agent model on one GPU.** An INT4 AWQ or GPTQ checkpoint leaves enough memory
+  for long agent transcripts where the bf16 model would not fit at all.
+- **Local and edge agents.** GGUF files run coding or desktop agents on a laptop CPU or Apple silicon
+  with no data leaving the machine.
+- **Throughput serving for many agent sessions.** FP8 weights and KV cache raise concurrent sessions per
+  GPU on hardware that supports it.
+- **Release gating a cheaper model.** Teams compare a quantized build against its bf16 parent on
+  tool-call validity and task success before it replaces the parent behind an agent.
+
+### Mini project
+**Quantization eval gate for a tool-calling agent (2-3 hours).**
+- **Goal:** find the cheapest precision of one open model that keeps your agent's tool calls valid.
+- **Steps:** pick a small open model with a chat template that supports tools; get its bf16 weights
+  plus two quantized variants (for example a `Q4_K_M` GGUF and an 8-bit build); run the same 50 scripted
+  tool-calling tasks against each; record schema-valid calls, correct tool names, task success and
+  tokens per second.
+- **Done when:** a table ranks the three builds, names the one you would ship and states the regression
+  threshold you used to decide.

@@ -401,3 +401,24 @@ known, measuring recall@k before and after rather than eyeballing results.
 > Semantic chunking embeds every sentence and needs a tuned threshold; that is worth it only when
 > formatting gives no usable boundaries, such as transcripts. On structured text recursive splitting is
 > cheaper and about as good, and on short single-topic documents it yields one chunk.
+
+## Use cases & projects
+### Use cases
+- **Support agents over product docs.** Heading-aware recursive chunks let the agent's search tool return
+  a passage that still names the product and section it is about, so the answer cites the right page.
+- **Coding agents over a repository.** Splitting on functions and classes instead of fixed characters keeps
+  a whole definition in one hit, so the agent edits code it has actually read.
+- **Agents over meeting transcripts.** Formatting gives no boundaries, which is the case where semantic
+  chunking earns its extra embedding cost.
+- **Context-budgeted multi-step agents.** Chunk size times top-k is the token bill of every search call, so
+  chunking is where teams cap retrieval cost per agent step.
+
+### Mini project
+**Compare three chunkers behind one agent search tool (2-3 hours).**
+- **Goal:** show how the chunker changes what a tool-calling agent finds and how many tokens each search
+  costs.
+- **Steps:** take 20-50 of your own documents and write 20 questions with the passage that answers each;
+  index them three ways (fixed-size, token-counted recursive with heading paths, semantic); expose each
+  index as a `search_docs` tool to the same small agent; log hit rate at top-5 and tokens returned per call.
+- **Done when:** you have a table of hit rate and tokens per search for each chunker, and a short note on
+  which one you would ship and why.

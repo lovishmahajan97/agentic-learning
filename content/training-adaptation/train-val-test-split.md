@@ -392,3 +392,24 @@ comparison paired on the same customers so the error bar on the difference is as
 > The standard error is sqrt(0.9 × 0.1 / 1000) ≈ 0.0095, so differences smaller than about one point are
 > inside the noise; a tenfold larger set is needed for ±0.3, which is why absolute size matters more than
 > the split ratio.
+
+## Use cases & projects
+### Use cases
+- **Prompt and tool iteration.** A dev set absorbs dozens of prompt tweaks while a locked test set gives
+  the honest number before a release, so the team is not shipping a score fit to its own iterations.
+- **Fine-tuning on agent traces.** Splitting by session or customer keeps near-identical turns of one
+  conversation from sitting on both sides and inflating the held-out score.
+- **CI regression gates.** A fixed regression suite, kept separate from the iteration set, decides
+  whether a model or prompt change may merge.
+- **Comparing two agent configs.** Paired runs on the same held-out tasks show whether a difference is
+  larger than the noise implied by the set size.
+
+### Mini project
+**Build a leak-free eval split for an agent (1-2 hours).**
+- **Goal:** split a trace dataset so held-out scores reflect new users and new tasks, not memorised ones.
+- **Steps:** take 500+ agent tasks or traces with session and customer ids; split once by row and once by
+  customer into dev and test; fine-tune or prompt-tune against dev only; score both test sets; compute the
+  standard error of each test score.
+- **Done when:** you have a table showing the row-split versus customer-split test scores with their error
+  bars, the split script is deterministic (seeded, keyed on the id), and the test set is documented as
+  read once per release.

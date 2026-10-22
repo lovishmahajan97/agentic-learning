@@ -408,3 +408,23 @@ track task evals and safety evals, not perplexity, and verify the KV cache budge
 - [ ] Increase the learning rate and run one more epoch of SFT
 > The pruned model already sits near a good solution, and token-level distillation gives a dense signal, so
 > recovery reportedly needs a small fraction of the tokens a fresh small model would require.
+
+## Use cases & projects
+### Use cases
+- **Choosing a small model for fast agent steps.** Pruned-and-distilled open models are common
+  candidates for routers, classifiers and tool selectors where step latency dominates.
+- **Checking vendor sparsity claims.** Before adopting a "sparse" checkpoint, teams benchmark real tokens
+  per second in their serving engine against the dense model.
+- **Depth pruning for latency-bound agents.** Removing whole layers cuts sequential depth, which helps
+  when an agent makes many short calls in a row.
+- **Safety re-validation of a compressed model.** Any pruned candidate re-runs the refusal suite,
+  including prompts that try to make the agent call tools it should refuse.
+
+### Mini project
+**Evaluate a pruned model as an agent step (1-2 hours).**
+- **Goal:** decide whether a pruned-and-distilled small model can replace its parent for one agent step.
+- **Steps:** pick a pruned model whose model card names its parent; write 40 routing or tool-selection
+  tasks and 15 prompts the agent should refuse; run both models on them; record schema-valid outputs,
+  task accuracy, refusal rate and latency per call.
+- **Done when:** a side-by-side table shows the quality, safety and latency deltas, with a one-paragraph
+  ship or no-ship decision.

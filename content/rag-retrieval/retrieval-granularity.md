@@ -410,3 +410,23 @@ explanatory queries regress, I would add sum-based parent scoring or a reranker 
 > Explanatory questions are answered by sections that discuss the topic at length, which several
 > matching children indicate. Pointed factual questions want the single best sentence, where max-child
 > scoring is the right signal.
+
+## Use cases & projects
+### Use cases
+- **Legal and policy agents.** Matching on sentences but returning the parent clause keeps the exceptions
+  and scope that make a cap or limit meaningful.
+- **Research agents with a token budget.** A search tool that returns short snippets with ids, plus a read
+  tool that fetches the parent section, lets the agent decide when the extra tokens are worth it.
+- **FAQ and help-centre agents.** Pointed factual questions are served well by small units with max-child
+  scoring, so the agent gets one precise answer per call.
+- **Long-document assistants.** Small-to-big with parent dedupe stops five sibling hits from returning the
+  same section five times.
+
+### Mini project
+**Build a two-tool search and read agent (2-3 hours).**
+- **Goal:** compare fixed-granularity retrieval with an agent that expands hits on demand.
+- **Steps:** split documents into sections and sentences with parent ids; build `search(query)` returning
+  sentence snippets with ids and `read_section(id)` returning the parent; run 20 questions through an agent
+  with only search, with auto-parent return, and with both tools; log accuracy, tool calls and tokens.
+- **Done when:** a table shows accuracy, calls per question and tokens for the three set-ups, and you can say
+  which question types needed the read tool.

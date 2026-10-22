@@ -5,7 +5,8 @@ name: PostgreSQL transactions & migrations
 kind: practice
 difficulty: core
 est_minutes: 18
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - backend-fundamentals/postgresql-transactions-and-isolation-levels
   - backend-fundamentals/sql
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-Transactions make grouped writes (agent steps, budgets, outbox rows) atomic; a Node pool hands out a
-connection per query, so a transaction must pin one client. Migrations version the schema as ordered,
-forward-only scripts that never lock a live table for minutes.
+An agent's durable state (steps, tool results, token budgets, outbox rows) must change atomically; a Node
+pool hands out a connection per query, so a transaction must pin one client. Migrations evolve that schema
+as ordered, forward-only scripts that avoid locking live tables.
+
+## For agent builders
+- **Why it matters for agents.** Each agent step is a group of writes: tool result, assistant message,
+  budget charge, next-step job. If they are not one transaction, a crash or a redelivered job leaves a
+  run that double-charged, skipped a step or cannot be resumed.
+- **Where it shows up in your stack.** The run and step tables your agent checkpoints into, the
+  per-tenant budget counter, the outbox that triggers the next step, and pgvector tables whose indexes
+  migrations must build without blocking writes.
+- **What you control.** Keep model and tool calls outside transactions, make every step write idempotent
+  on a step id, charge budgets with an atomic predicate update, and review each migration's lock footprint.
+- **What you can skip.** MVCC internals and every isolation anomaly. Know READ COMMITTED, the predicate
+  update, the `40001` retry and expand/contract; that covers almost all agent bookkeeping.
 
 ## Why it exists
 - **Agent bookkeeping changes in groups.** Finishing one step means: insert the tool result, append the
@@ -226,10 +239,26 @@ Two runs for the same tenant charge 1,000 tokens each, at the same moment, with 
 | `SELECT`, check in JS, `SET remaining = $computed` | writes 200 | writes 200 | 200 | one charge lost |
 | Predicate update `... AND remaining >= $1` | 1 row, leaves 200 | waits, re-checks `200 >= 1000`, 0 rows | 200 | run 2 sees "exhausted" |
 
+### Agent scenario: a worker crashes mid-run and the job is redelivered
+A 6-step research agent checkpoints each step with `recordStep`. The worker dies after step 4's model
+call returned but before its transaction committed; the queue redelivers the job.
+
+| Moment | Without step transactions | With `recordStep` per step |
+|---|---|---|
+| Crash during step 4 writes | tool result saved, budget not charged, next step not enqueued | step 4 transaction rolls back as a whole |
+| Redelivered job starts | replays from step 1, re-runs tools 1-3 | reads the last committed step (3) and resumes at 4 |
+| Steps 1-3 written again | duplicate rows, budget charged twice for them | `ON CONFLICT DO NOTHING` returns "duplicate", no charge |
+| Final state | 9 step rows, budget wrong, run stuck | 6 step rows, budget charged once per step |
+
+- **The cost of resume.** Step 4's model call is paid twice (once before the crash, once after), because
+  the transaction deliberately excludes the model call; that is the price of not holding a connection
+  across it.
+
 ### Production snippet: NOT NULL on a live table, in steps
 Each file is its own migration, so the brief strong lock of `ADD CONSTRAINT ... NOT VALID` is not held
-during the validation scan. The backfill runs as a batched job between the first two files, and code
-that writes `tenant_id` on every insert must be deployed before the backfill, because a `NOT VALID`
+during the validation scan. The backfill runs as a batched job between the first two files.
+
+Code that writes `tenant_id` on every insert must be deployed before the backfill, because a `NOT VALID`
 check is still enforced on new and updated rows and `VALIDATE` fails on any null left behind.
 
 ```sql
@@ -254,6 +283,10 @@ ALTER TABLE messages DROP CONSTRAINT messages_tenant_nn;
 ```
 
 ## Production patterns
+- **Checkpoint every agent step in one transaction.** When agent runs span many steps or workers, write
+  each step's result, budget charge and next-step outbox row together, keyed by a deterministic step id
+  (run id plus step index), so a resumed run skips committed steps. Monitor duplicate-step counts and runs
+  stuck without a new step.
 - **Strict timeouts on the application role.** When any code path might leak a client, set
   `ALTER ROLE app SET idle_in_transaction_session_timeout = '30s'` and a `statement_timeout`, leaving
   the migration role looser (values illustrative). Monitor `pg_stat_activity` for sessions in state
@@ -290,6 +323,9 @@ ALTER TABLE messages DROP CONSTRAINT messages_tenant_nn;
   then deploy out of order, so every migration must be compatible with the previous code version.
 
 ## Pitfalls
+- **Holding a transaction open across a model or tool call.** Symptom: pool waiting count climbs during
+  slow completions and migrations time out on locks. Fix: call the model or tool first, then open a short
+  transaction for the step's writes.
 - **Using `pool.query('BEGIN')`.** Statements land on different connections. Symptom: non-atomic data
   with no error, plus connections stuck `idle in transaction` in `pg_stat_activity`.
 - **Outer `db` instead of `tx` inside a Drizzle or Prisma transaction callback.** Symptom: a write that
@@ -355,6 +391,14 @@ connections.
 - **Safety nets:** `SET lock_timeout` in migrations, and `idle_in_transaction_session_timeout` plus
   `statement_timeout` on the application role.
 
+### How would you make a multi-step agent run resumable after a worker crash?
+- **Checkpoint per step:** each step's writes (result, message, budget charge, outbox row for the next
+  step) commit in one transaction keyed by a deterministic step id.
+- **Resume from the last committed step:** on redelivery, read the run's latest step and continue; earlier
+  writes hit the unique key and become no-ops.
+- **Accept re-paid work:** a model or tool call that finished before the crash runs again, so tools with
+  side effects need their own idempotency keys.
+
 ### When would you choose SERIALIZABLE over `FOR UPDATE` or a predicate update?
 - **SERIALIZABLE** when an invariant spans several rows (write skew) and hand-placing locks is error
   prone; it requires retrying on `40001`.
@@ -395,3 +439,24 @@ connections.
 - [x] When Postgres aborts a transaction under REPEATABLE READ or SERIALIZABLE because a concurrent commit made it unserializable
 - [ ] When a statement exceeds `statement_timeout`
 > `40001` is `serialization_failure`: the database detects that the transaction's reads are inconsistent with a concurrent commit and aborts it, expecting the application to retry; unique violations are `23505` and timeouts are `57014`.
+
+## Use cases & projects
+### Use cases
+- **Resumable agent runs.** Per-step transactions with idempotent step ids let a redelivered job pick up
+  at the last committed step instead of replaying tools.
+- **Per-tenant token budgets.** An atomic predicate update stops parallel agent runs from overspending a
+  shared monthly budget.
+- **Triggering the next agent step.** An outbox row written with the step guarantees the next job is
+  enqueued only if the step committed.
+- **Adding embeddings to a live RAG corpus.** Expand migrations plus `CREATE INDEX CONCURRENTLY` add a
+  vector column and HNSW index without blocking ingestion.
+
+### Mini project
+**Crash-proof agent step recorder (2-3 hours).**
+- **Goal:** prove that an agent run survives a worker crash with no duplicate steps and no budget drift.
+- **Steps:** create `runs`, `run_steps`, `budgets` and `outbox` tables through migrations; implement
+  `withTransaction` and `recordStep`; write a fake 5-step agent that calls `recordStep` after each fake
+  model call; kill the process at a random step, restart it, and resume from the last committed step;
+  run two runs in parallel against one budget.
+- **Done when:** after 20 crash-and-resume trials every run has exactly 5 step rows, the budget equals
+  the sum of charged steps, and parallel runs never drive it negative.

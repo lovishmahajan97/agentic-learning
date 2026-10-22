@@ -489,3 +489,23 @@ is the achievable form of exactly-once.
 - [ ] A view of where each run currently is
 > Orchestrators make progress durable, but a crash between performing a side effect and recording its
 > completion leads to a retry. Idempotent steps remain the application's responsibility.
+
+## Use cases & projects
+### Use cases
+- **Long-running agent tasks.** A research or migration agent that runs for minutes or hours keeps its
+  progress durable, so a deploy or crash resumes it instead of restarting it.
+- **Human-in-the-loop approvals.** A workflow waits days for a manager's approval signal, then lets the
+  agent continue, without holding a process or a connection open.
+- **Batch agent jobs.** Nightly runs over thousands of documents or tickets fan out per item with retries
+  and backoff, and failed items surface for review instead of vanishing.
+- **Side-effecting tool calls.** Payments, emails and record updates run as idempotent steps with keys, so
+  a retry after a crash does not repeat the action.
+
+### Mini project
+**Make an agent run survive a crash (2-3 hours).**
+- **Goal:** run a multi-step agent task as a durable workflow that resumes after the worker is killed.
+- **Steps:** model a four-step task (search, draft, wait for approval, send) as workflow steps with
+  recorded completion; give the send step an idempotency key; add retries with backoff on the model
+  call; kill the worker mid-run, restart it and send the approval signal.
+- **Done when:** the run resumes at the step it reached, the email or message is sent exactly once in
+  your logs, and you can show where the run is from the orchestrator's state.

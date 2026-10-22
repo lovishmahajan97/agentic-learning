@@ -427,3 +427,23 @@ dict's shape, not a single value's vocabulary.
 - [ ] Members can be created at runtime by assignment, such as `Reason.NEW = "new"`
 > Lookup by value is supported and duplicate values create aliases. Equality with the raw string and
 > direct JSON serialization only hold for `StrEnum`, which mixes in `str`.
+
+## Use cases & projects
+### Use cases
+- **Typing graph state.** A `TypedDict` state with an `Annotated` reducer for messages keeps graph state
+  a plain dict while the checker catches misspelled keys in nodes.
+- **Routing functions.** A conditional edge returning a `Literal` of node names documents every branch,
+  and `assert_never` fails CI when a new route is added but not handled.
+- **Finish-reason handling.** A `StrEnum` of finish reasons maps each value to an action such as
+  continue, run tools or stop, with exhaustive `match` checking.
+- **Wire messages for SDKs.** Provider message params are TypedDicts, so building them with typed dicts
+  catches a wrong role or missing field before the API returns a 400.
+
+### Mini project
+**Make an agent router exhaustive (1-2 hours).**
+- **Goal:** a small graph-style agent whose state, routes and finish reasons are all closed types.
+- **Steps:** define the state as a `TypedDict` with `NotRequired` optional keys; type the router's return
+  as a `Literal` of three node names; model finish reasons as a `StrEnum` and handle them in a `match`
+  ending in `assert_never`; then add a fourth route without handling it.
+- **Done when:** the checker fails on the unhandled route and on a misspelled state key, passes after the
+  fix, and the state still serializes to JSON as a plain dict.

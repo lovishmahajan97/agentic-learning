@@ -437,3 +437,24 @@ fine-tuning data; and report the test number alongside the number of times it ha
 > The deployment question is "given the past, predict the future for these stores", so the
 > validation must be the future. A shuffled split lets the model train on months after the ones it is
 > scored on. Holding out whole stores answers a different question: generalizing to new stores.
+
+## Use cases & projects
+### Use cases
+- **Golden-set hygiene for an agent eval harness.** Deduping eval tasks against few-shot examples, the
+  RAG index and memory before every release, so a score jump means the agent improved.
+- **Fine-tuning on production traces.** Splitting traces by conversation or customer, so near-duplicate
+  turns from one session cannot sit on both sides of the split.
+- **Prompt iteration without overfitting the test set.** Tuning prompts on a dev split and touching the
+  locked test split only for release decisions.
+- **Memory-enabled agents.** Checking that long-term memory written during an eval run cannot answer the
+  next eval task, by resetting or isolating memory per run.
+
+### Mini project
+**Build a leakage detector for an agent eval set (1-3 hours).**
+- **Goal:** catch eval tasks whose answers already appear in what the agent reads.
+- **Steps:** take a small golden set of agent tasks with reference answers; collect the artifacts the
+  agent sees (system prompt few-shots, a sample of the vector store, memory entries, fine-tune traces);
+  flag exact and near-duplicate matches using normalized text and embedding similarity; plant three
+  deliberate leaks and confirm they are caught; wire the script as a CI step that fails on any hit.
+- **Done when:** the script reports every planted leak with its source artifact, shows no false alarms on
+  the clean set, and you can show the eval score with and without the leaked items.

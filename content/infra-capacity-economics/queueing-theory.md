@@ -434,3 +434,23 @@ validate with a load test replaying real output-length distributions before laun
 > Reducing service-time spread lowers Cs, so waiting falls even at the same utilization. Bigger
 > batches and faster GPUs act on capacity and mean service time, i.e. on ρ, not on the variability
 > term; immediate retries raise arrival burstiness (Ca) and make waiting worse.
+
+## Use cases & projects
+### Use cases
+- **Sizing a self-hosted model fleet for agents.** Convert tasks per second into model calls per second,
+  then use Little's law and an M/M/c estimate to pick slots that keep p99 queue wait inside the step budget.
+- **Explaining p99 spikes at "only" 85% busy.** Queueing curves show why agent task latency explodes near
+  the knee even though no code changed.
+- **Separating interactive and batch agents.** Long offline agent runs get their own queue or priority
+  class so they cannot add wait to every step of a user-facing agent.
+- **Setting retry and concurrency policy in the agent loop.** Retries raise arrival burstiness, so caps and
+  backoff come straight from the variability term.
+
+### Mini project
+**Simulate queue wait in an agent fleet (1-2 hours).**
+- **Goal:** see how per-call queue wait compounds over an 8-step agent as utilization rises.
+- **Steps:** write a small discrete-event simulation of c model slots with Poisson task arrivals, where each
+  task makes 8 sequential calls with variable service times; sweep utilization from 50% to 95%; then cap
+  output length (lower service-time spread) and rerun.
+- **Done when:** you have a table of p50 and p99 task latency per utilization level, before and after the
+  cap, and can point to the knee and explain it with ρ/(1−ρ) and Kingman's variability term.

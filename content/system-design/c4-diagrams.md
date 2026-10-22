@@ -428,3 +428,23 @@ three levels, which is exactly what makes reviewers unsure what each box is and 
 > Only the deployment view maps containers onto environments, so it is the one where "inside your VPC"
 > versus "in our cloud" and the flows between them become visible. Component and code views are below
 > that level of concern.
+
+## Use cases & projects
+### Use cases
+- **Security review of an agent pilot.** A Context view showing the model provider, every tool's external
+  system and the customer's data answers "what can it reach, and where does our data go?" in one meeting.
+- **Procurement and deployment questions.** A Deployment view makes "inside your VPC" versus "in our
+  cloud" explicit for the agent API, vector store, model server and sandbox.
+- **Explaining one agent run.** A Dynamic view numbers the steps of one run (retrieve, call model, call
+  tool, write memory), so reviewers see which arrows carry prompts or customer documents.
+- **Onboarding to an agent codebase.** A Container view next to the code shows new engineers the loop,
+  tool layer, retriever, worker and stores before they open a file.
+
+### Mini project
+**Diagram your agent as code (1-2 hours).**
+- **Goal:** produce the views a reviewer needs for a small tool-calling agent, kept next to its code.
+- **Steps:** pick an agent you have built or a sample with at least two tools and a retriever; write a
+  Context, Container and Deployment view in Structurizr DSL or C4-PlantUML in an `architecture/` folder;
+  add a Dynamic view of one run; label every arrow with what it carries and mark the trust boundary.
+- **Done when:** someone unfamiliar with the agent can say from the diagrams alone which external systems
+  receive customer data, and adding a new tool requires updating the diagram in the same pull request.

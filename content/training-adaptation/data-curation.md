@@ -492,3 +492,22 @@ model, which decides whether the data is ready.
 - [ ] That pretraining data should be deduplicated before fine-tuning
 > LIMA's claim is that alignment mostly teaches format and style, so a small set with diverse prompts and
 > excellent responses suffices; large noisy sets teach the average of their noise.
+
+## Use cases & projects
+### Use cases
+- **Fine-tuning data from agent logs.** Teams filter production traces by outcome and hygiene to build an
+  SFT set of successful trajectories instead of training on raw logs.
+- **Building a clean agent eval set.** Real tasks are deduplicated, scrubbed of PII and decontaminated
+  against training data before they become the regression suite.
+- **RAG index hygiene.** Near-duplicate chunks are removed so retrieval slots go to distinct evidence.
+- **Customer deletion requests.** A provenance manifest turns "remove this customer's data" into a
+  filter and a rebuild of both the training set and the eval set.
+
+### Mini project
+**Curate agent traces into a training set (2-3 hours).**
+- **Goal:** turn a raw export of agent runs into a versioned, deduplicated, PII-scrubbed JSONL set.
+- **Steps:** generate or export a few hundred agent traces with outcome labels; drop failed, looping and
+  unrecovered-error runs into a reject store with reasons; scrub emails and phone numbers from tool
+  results; deduplicate with MinHash; split by conversation group; record stage counts and a content hash.
+- **Done when:** you have train and eval JSONL files, a per-stage drop table, a sample of rejects with
+  reasons, and a check showing no near-duplicate crosses the split.

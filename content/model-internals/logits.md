@@ -5,7 +5,8 @@ name: Logits
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - model-internals/softmax
   - model-internals/sampling-strategies
@@ -20,9 +21,22 @@ sources:
 ---
 
 ## TL;DR
-Logits are the raw, unnormalized scores a model emits for every vocabulary entry before softmax. Every
-no-retraining control (temperature, logit bias, bans, constrained decoding) edits this vector, and every
-confidence measure (logprobs, perplexity) is read from it.
+Logits are the raw per-token scores a model emits before softmax. Agents depend on them: valid tool-call
+JSON, forced label choices and banned tokens are logit edits, and confidence signals for routing (logprobs)
+are read from them.
+
+## For agent builders
+- **Why it matters for agents.** An agent breaks when a tool call does not parse or names a tool that does
+  not exist. Constrained decoding fixes that by masking illegal tokens in the logits each step, which is
+  why structured output and strict tool calling can be guaranteed rather than merely requested.
+- **Where it shows up in your stack.** Structured-output and JSON-schema options on hosted APIs, guided or
+  structured decoding in vLLM, the `logit_bias` and `logprobs` request parameters, and a `LogitsProcessor`
+  in Hugging Face Transformers when self-hosting.
+- **What you control.** Whether tool calls are schema-enforced or validated after the fact, whether
+  routing and classification steps are restricted to a fixed label set, and whether you read logprobs
+  to gate low-confidence steps.
+- **What you can skip.** The logit lens and training-time memory tricks, unless you fine-tune; know shift
+  invariance, the odds rule for bias, and that logprobs need calibration.
 
 ## Why it exists
 - **A language model is a classifier over the vocabulary.** At every position it needs a score per class.
@@ -62,7 +76,7 @@ confidence measure (logprobs, perplexity) is read from it.
   logprobs gives the sequence log-likelihood; exponentiating the negative average gives perplexity.
 
 ### Editing logits
-The sampler sees logits, not text, so steering is arithmetic:
+The sampler sees logits, not text, so steering an agent's output is arithmetic:
 
 | Edit | Operation | Effect |
 |---|---|---|
@@ -78,11 +92,11 @@ The sampler sees logits, not text, so steering is arithmetic:
 - **API range.** OpenAI's API accepts values from −100 to 100; at −100 the factor `e^−100` effectively
   bans a token, and a large positive value effectively forces it.
 - **Constrained decoding** builds the mask each step from a grammar or JSON schema, which is why structured
-  output can be guaranteed rather than merely requested.
+  output, and therefore a parseable tool call, can be guaranteed rather than merely requested.
 - **Order matters.** The edits are not commutative; engines apply them in a fixed pipeline, and the
   `sampling-strategies` topic covers the consequences.
 
-### Numerical care and interpretability
+### Background: numerical care and interpretability
 - **Softmax and cross-entropy in fp32.** Logits come out in the model's compute dtype, but `exp` of a
   half-precision score overflows easily and small probability differences vanish in 16-bit.
 - **Some architectures bound the logits.** Gemma 2 applies a `tanh` soft cap to its final logits to keep
@@ -93,8 +107,9 @@ The sampler sees logits, not text, so steering is arithmetic:
   residual-stream vector and each token's output embedding.
 
 ## Diagram
-Every control knob sits between the unembedding and the sampler; logprobs are read off the same vector.
-The order shown (penalties and bias, then masks, then temperature) is a common one; engines differ.
+Every control knob sits between the unembedding and the sampler; a tool schema becomes a per-step mask,
+and logprobs are read off the same vector. The order shown (penalties and bias, then masks, then
+temperature) is a common one; engines differ.
 
 ```mermaid
 flowchart TD
@@ -106,7 +121,7 @@ flowchart TD
     T --> S["Softmax in fp32"]
     S --> SM["Sampler picks token"]
     Z -.->|"log_softmax"| L["Logprobs, perplexity"]
-    G["Grammar or JSON schema"] -->|"mask per step"| M
+    G["Tool schema or JSON grammar"] -->|"mask per step"| M
 ```
 
 ## Examples
@@ -141,6 +156,37 @@ z2[tok.encode(" Berlin")[0]] += 10.0         # logit bias: push an alternative u
 print("after edits:", repr(tok.decode(torch.softmax(z2, -1).argmax())))
 ```
 
+### Agent scenario: a confidence-gated tool router
+A routing step must pick one of three tools. Masking the logits to the label tokens guarantees a valid
+choice; the renormalized probabilities give a score, and low-confidence steps escalate to a stronger model.
+
+```python
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+tok = AutoTokenizer.from_pretrained("gpt2")              # stand-in for your router model
+m = AutoModelForCausalLM.from_pretrained("gpt2").eval()
+TOOLS = [" search", " calculator", " calendar"]          # leading space: GPT-2 word tokens
+label_ids = [tok.encode(t)[0] for t in TOOLS]            # derive ids from the deployed tokenizer
+
+def route(user_msg, threshold=0.6):
+    prompt = f"User: {user_msg}\nBest tool:"
+    ids = tok(prompt, return_tensors="pt").input_ids
+    with torch.no_grad():
+        z = m(ids).logits[0, -1].float()
+    mask = torch.full_like(z, float("-inf"))
+    mask[label_ids] = 0.0
+    p = torch.softmax(z + mask, -1)[label_ids]           # only the three tools can win
+    best = int(p.argmax())
+    return TOOLS[best].strip(), round(p[best].item(), 2), p[best].item() < threshold
+
+print(route("What is 17% of 2,340?"))   # (tool, confidence, escalate?)
+```
+
+The threshold of 0.6 is illustrative: pick it from a labelled set of real routing decisions, because raw
+probabilities from an untuned model are not calibrated. Each label here is one token; multi-token labels
+need their full sequence scored.
+
 ### What a logit bias does, in numbers
 Pure Python, no model: apply biases to the third of three logits and watch the odds move by `e^b`.
 
@@ -163,7 +209,7 @@ for b in (1.0, 5.0, -100.0):
 # bias -100.0   [0.731, 0.269, 0.0]     effectively banned
 ```
 
-| Bias on token 3 | p(token 3) | Use it for |
+| Bias on token 3 | p(token 3) | Use it for in an agent |
 |---|---|---|
 | 0 | 0.099 | baseline |
 | +1 | 0.229 | a gentle nudge toward a preferred word |
@@ -171,21 +217,22 @@ for b in (1.0, 5.0, -100.0):
 | −100 | ~0 | banning a token (still finite, unlike a −∞ mask) |
 
 ## Production patterns
-- **Enforce structure with constrained decoding.** When output must parse, use the provider's or engine's
-  structured-output feature with a JSON schema (for example `response_format` with a JSON schema on
-  OpenAI's API, or the guided or structured decoding option in vLLM). Monitor parse failures, which should
-  be zero, and task accuracy, which can drop.
-- **Classify over a fixed label set by masking.** Restrict sampling to the label tokens with a logits
-  processor (a `LogitsProcessor` in Hugging Face Transformers), then read the label logprobs as a score.
-  Monitor accuracy and calibration on a labelled set, not just format compliance.
-- **Route on logprob confidence, after calibration.** Request `logprobs`, compute the minimum or mean token
-  logprob over the answer span, and send low-confidence answers to review or retrieval. Pick the threshold
-  on labelled data and monitor the filter's precision and recall.
+- **Enforce tool-call structure with constrained decoding.** When output must parse, use the provider's or
+  engine's structured-output feature with a JSON schema (for example `response_format` with a JSON schema
+  on OpenAI's API, or the guided or structured decoding option in vLLM). Monitor parse failures, which
+  should be zero, and task accuracy, which can drop.
+- **Classify and route over a fixed label set by masking.** Restrict sampling to the label tokens with a
+  logits processor (a `LogitsProcessor` in Hugging Face Transformers), then read the label logprobs as a
+  score. Monitor accuracy and calibration on a labelled set, not just format compliance.
+- **Gate agent steps on logprob confidence, after calibration.** Request `logprobs`, compute the minimum
+  or mean token logprob over the answer span or tool arguments, and send low-confidence steps to review,
+  retrieval or a stronger model. Pick the threshold on labelled data and monitor the filter's precision
+  and recall.
 - **Ban a word by banning all its token ids.** Tokenize every variant (leading space, capitalized, plural)
   with the deployed tokenizer and set each id's `logit_bias` to −100, or mask it. Monitor leakage with an
   output scan for the word.
-- **Keep the loss math in fp32 and off the full tensor.** Cast with `logits.float()` before
-  `log_softmax`, and in training compute cross-entropy in chunks of positions so the full
+- **Keep the loss math in fp32 and off the full tensor.** When fine-tuning on agent traces, cast with
+  `logits.float()` before `log_softmax`, and compute cross-entropy in chunks of positions so the full
   `[seq_len, vocab]` tensor is never materialized. Monitor NaN losses and peak memory.
 
 ## Trade-offs
@@ -197,7 +244,7 @@ for b in (1.0, 5.0, -100.0):
   lexical.
 - **Hard masking vs content quality.** Masking guarantees format compliance with zero probability leakage,
   but a mask that excludes the token the model wanted can push it into low-probability continuations and
-  hurt content.
+  hurt content, for example valid JSON with a wrong argument value.
 - **Bigger vocabulary vs logits tensor size.** Finer-grained tokens, larger tensor: one 8,192-token
   training sequence with a 128,256-entry vocabulary produces about 1.05 billion logits, ~4.2 GB in fp32.
   So chunked or fused cross-entropy kernels that never materialize the full tensor matter as vocabularies
@@ -216,17 +263,17 @@ for b in (1.0, 5.0, -100.0):
   labelled data and pair them with grounding checks.
 - **Copying token ids across tokenizers.** The token you bias must exist in the vocabulary of *this*
   tokenizer; an id copied from another model points at an unrelated token. Fix: derive ids at runtime
-  from the deployed tokenizer.
+  from the deployed tokenizer, which matters when an agent swaps router models.
 
 ## When to use
-- **Use when** you need control or measurement prompting cannot give: forcing a classification into a fixed
-  label set, guaranteeing JSON, banning a competitor's name, computing perplexity on an evaluation set, or
-  scoring candidate answers by likelihood.
+- **Use when** you need control or measurement prompting cannot give: forcing a routing step into a fixed
+  label set, guaranteeing tool-call JSON, banning a competitor's name, computing perplexity on an
+  evaluation set, or scoring candidate answers by likelihood.
 - **Avoid** logit edits to fix what is really a prompt or data problem, and do not over-read logprobs as
   truth signals without a calibration study.
 - **Measure** the effect of any edit on task accuracy, not just on format compliance.
 - **Interviews:** explain the path from hidden state to logits to softmax to sampler, why shift invariance
-  makes masking with −∞ clean, and how constrained decoding plugs in.
+  makes masking with −∞ clean, and how constrained decoding plugs in to make tool calls reliable.
 
 ## Role lens
 - **Engineer:** Uses `logit_bias`, `logprobs` and logits processors in generation code, and knows to
@@ -255,11 +302,17 @@ Any of the three should be evaluated on labelled data rather than trusted on for
 - **Why:** a linear layer cannot produce a simplex, and computing cross-entropy from scores gives the
   clean gradient `softmax(z) − onehot(y)`, which never saturates even when the model is badly wrong.
 
-### How does constrained decoding guarantee valid JSON when prompting cannot?
+### How does constrained decoding guarantee a parseable tool call when prompting cannot?
 - **It edits logits each step.** A grammar or schema state machine computes which tokens are legal next and
   sets every other logit to −∞, so invalid tokens have exactly zero probability.
 - **The cost:** if the model wanted an illegal token, it is pushed into a lower-probability continuation,
-  so measure content accuracy, not just parse rate.
+  so measure argument accuracy and task success, not just parse rate.
+
+### Your agent's router sometimes picks the wrong tool. How would you use logprobs to reduce the damage?
+- **Score the choice.** Restrict the routing step to the tool labels and read their logprobs, or request
+  `logprobs` from the API on the tool-name tokens.
+- **Gate on it.** Below a threshold chosen on labelled routing data, escalate to a stronger model or ask a
+  clarifying question. Track precision and recall of the gate, since raw logprobs are not calibrated.
 
 ### You set a logit bias of −100 on a competitor's name and it still appears in outputs. Why?
 - **Tokenization.** The name probably splits into several tokens, or appears with a leading space or
@@ -303,3 +356,23 @@ Any of the three should be evaluated on labelled data rather than trusted on for
 - [ ] About 99%
 > Probability is exp(logprob); exp(−0.69) ≈ 0.50. Logprobs are natural logs of probabilities, not
 > percentages, and −0.69 is ln(0.5).
+
+## Use cases & projects
+### Use cases
+- **Reliable tool calling.** Schema-constrained decoding guarantees the agent's tool calls parse, so the
+  loop never stalls on malformed JSON.
+- **Routers and classifiers inside an agent.** Intent detection, tool selection and "is this safe to
+  execute" checks restrict output to a label set and read a score from the logprobs.
+- **Confidence-based escalation.** Low-logprob steps are sent to a stronger model, a retrieval step or a
+  human reviewer instead of being executed.
+- **Output guardrails.** Banned terms, competitor names or unsafe commands are blocked by biasing or
+  masking every token variant.
+
+### Mini project
+**Build a logprob-gated tool router (1-2 hours).**
+- **Goal:** route user requests to one of three tools and escalate when the router is unsure.
+- **Steps:** write 40 labelled requests across three tools; implement the masked router from the example
+  (or request `logprobs` from a hosted model on a constrained label); log the chosen tool and its
+  probability; sweep the escalation threshold from 0.4 to 0.9.
+- **Done when:** you have a table of accuracy on non-escalated requests and escalation rate per threshold,
+  and you can justify one threshold for production.

@@ -5,7 +5,8 @@ name: Prompt caching
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - prompting/system-prompt
   - prompting/prompt-templates
@@ -22,9 +23,20 @@ sources:
 ---
 
 ## TL;DR
-Prompt caching reuses the model's stored state for a repeated prompt prefix when a later request starts
-with the same bytes, cutting input cost and time-to-first-token. Only exact prefixes match, so prompt
-layout decides the discount.
+Every agent step re-sends tools, system prompt and a growing transcript. Prompt caching reuses stored
+state for that exact repeated prefix, cutting input cost and time-to-first-token, so request layout
+decides what a long agent loop costs.
+
+## For agent builders
+- **Why it matters for agents.** An agent loop is the best case for caching: step *t* repeats everything
+  from step *t* - 1 and appends a tool call and result. Append-only transcripts get most input tokens at
+  the read rate; one volatile byte at the top makes every step pay full price or more.
+- **Where it shows up in your stack.** `cache_control` breakpoints and the `usage` fields on Anthropic's
+  API, automatic prefix caching on other providers, and prefix caching in vLLM or SGLang when self-hosting.
+- **What you control.** Render order (tools, system, history, new turn), deterministic tool serialization,
+  where breakpoints sit, when you compact, and how you launch parallel sub-agents.
+- **What you can skip.** The attention math. Know that state at position *i* depends on all earlier
+  tokens, so only exact prefixes match.
 
 ## Why it exists
 - **Most of every prompt repeats.** System instructions, tool definitions, few-shot examples and long
@@ -128,12 +140,12 @@ something volatile sits before the breakpoint.
 - The serving module covers the memory side.
 
 ## Diagram
-The prefix up to the breakpoint is hashed and looked up; a hit skips its prefill and bills it at the read
-rate, a miss prefills everything and writes the entry.
+Each agent step's prefix up to the breakpoint is hashed and looked up; a hit skips its prefill and bills
+it at the read rate, a miss prefills everything and writes the entry.
 
 ```mermaid
 flowchart TD
-    R["Request: tools, system, messages"] --> H["Hash prefix up to breakpoint"]
+    R["Agent step: tools, system, history"] --> H["Hash prefix up to breakpoint"]
     H --> L{"Longest prefix in cache?"}
     L -->|"hit"| RD["Reuse K, V at about 0.1x"]
     L -->|"miss"| W["Prefill prefix, write at 1.25x"]
@@ -214,7 +226,28 @@ i = first_divergence(a, b)
 print(i, repr(a[max(0, i - 20):i + 10]))   # the timestamp: everything after it is a cache miss
 ```
 
+### Worked scenario: a 10-step tool-calling agent
+Tools plus system prompt are 8k tokens; each step appends ~1.5k tokens (tool call plus result). Units are
+full-price-equivalent input tokens, using the 1.25× write and 0.1× read rates. Illustrative.
+
+| Layout | What happens each step | Input over 10 steps |
+|---|---|---|
+| Uncached | prefill 8k + 1.5k·*t* | 162.5k |
+| Append-only, breakpoint on system plus automatic tail | step 1 writes 9.5k; later steps read history, write 1.5k | ~42.7k (about 74% less) |
+| "Current step: N" reminder at the top of the system prompt | every step writes the whole prompt at 1.25× | ~203k (25% more than uncached) |
+
+- **The fix for the third row** is to put the reminder in the newest user turn, after the cached prefix.
+- **Read the `usage` fields per step.** In the good layout `cache_read_input_tokens` climbs by ~1.5k each
+  step while writes stay near 1.5k.
+
 ## Production patterns
+- **Append-only agent transcripts, volatile data last.** Never edit or delete earlier tool results
+  mid-run. Put per-step reminders, current date, user name, plan and retrieved snippets in the newest turn
+  or after the shared breakpoint, never at the top of the system prompt. Monitor cached share of input per
+  step, and diff two rendered prompts (as above) whenever reads stay at zero.
+- **Compact at a boundary, not every step.** When the transcript nears the window, summarize old steps
+  once into a new stable block and accept one write, instead of trimming a little each step and missing
+  the cache every time.
 - **Layered request builder.** Build every request as stable (tools, policies), session and turn layers,
   serialized deterministically (`json.dumps(..., sort_keys=True)`, tools sorted by name), with breakpoints
   at the layer boundaries. Monitor hit ratio per route.
@@ -226,9 +259,6 @@ print(i, repr(a[max(0, i - 20):i + 10]))   # the timestamp: everything after it 
   flat traffic points to a volatile byte in the prefix.
 - **Warm before fan-out.** For N parallel calls on one prefix, stream the first request, wait for its
   first token, then release the other N - 1. Monitor writes per batch; it should be one.
-- **Volatile data after the breakpoint.** Put current date, user name, plan and retrieved snippets in the
-  user turn or after the shared breakpoint, never at the top of the system prompt. Diff two rendered
-  prompts (as above) whenever reads stay at zero.
 - **Prefix caching when self-hosting.** Keep automatic prefix caching enabled in vLLM or SGLang and route
   requests sharing a system prompt to the same replica, so the shared blocks stay resident. Monitor the
   engine's prefix-cache hit rate and time to first token.
@@ -334,6 +364,13 @@ deterministic, and the model and thinking settings do not change mid-task.
 - **Keep history append-only** and pin model and thinking settings, or each turn rewrites the whole
   conversation.
 
+### Your agent's cost per task doubled after you added dynamic tool loading. Why, and what do you change?
+- **Tools render first.** Adding or removing tools per step changes the earliest tier, so every step
+  invalidates tools, system and history and pays the write premium on the whole transcript.
+- **Fix:** keep a fixed, sorted tool list for the whole run and gate availability in the tool handler or
+  instructions, or change the tool set only at a compaction boundary.
+- **Verify** with per-step writes and reads from the usage fields.
+
 ## Quiz
 ### Q: Why must a cached prefix match the new request byte for byte?
 - [ ] The hash function cannot tolerate partial matches
@@ -359,3 +396,23 @@ deterministic, and the model and thinking settings do not change mid-task.
 - [ ] When the prefix is below the minimum cacheable size
 > Under continuous traffic every read refreshes the five-minute entry, so the doubled write price of the
 > one-hour TTL buys nothing. It pays only across idle gaps longer than five minutes and shorter than an hour.
+
+## Use cases & projects
+### Use cases
+- **Long-running coding and research agents.** Append-only transcripts keep step 30 close to step 1 in
+  input cost and time to first token.
+- **Agents with large tool sets.** Dozens of tool schemas form a stable prefix that every step reads at the
+  read rate instead of re-paying.
+- **Document-grounded agents.** A contract or codebase summary loaded once is questioned across many steps
+  and sessions within the TTL.
+- **Parallel sub-agents.** Warming one request before fan-out turns N cache writes into one.
+
+### Mini project
+**Measure caching in a tool-calling loop (1-2 hours).**
+- **Goal:** show the cost difference between an append-only agent transcript and one with a volatile
+  value at the top.
+- **Steps:** build a 10-step agent with two fake tools and a ~5k-token system prompt; run it with a
+  breakpoint on the system block and automatic tail caching; run again with a timestamp at the top of the
+  system prompt; log the three `usage` counts per step.
+- **Done when:** you have a per-step table for both runs, a computed cost per task for each, and the
+  `first_divergence` output pointing at the timestamp.

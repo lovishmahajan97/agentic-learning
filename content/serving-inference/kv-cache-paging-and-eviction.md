@@ -273,8 +273,6 @@ print("host tier:", round(swap_ms(KV, ctx) / 2), "ms in +", round(recompute_ms(8
 - **Keep agent transcripts resident across tool waits.** Route every step of a run to the same replica,
   leave headroom in the pool so idle prefixes survive, and add a host-memory tier when tool waits are
   long. Monitor prefix hit rate on the step after each tool call, split by tool latency.
-
-## Production patterns
 - **Alert on preemptions, not memory percent.** Page on the engine's preemption counter (in vLLM,
   `vllm:num_preemptions_total` on `/metrics`) and on free blocks, and tune `max_num_seqs`, the
   per-iteration token budget and `max_model_len` until preemptions are near zero at target peak.
@@ -415,3 +413,23 @@ there is slack. Measure preemptions per minute after each change and stop when i
 > Unreferenced prefix blocks are pure optimization state; losing them costs a recompute on the next
 > matching request but changes no output. Token-dropping methods alter what the model attends to and are
 > approximations that must be evaluated.
+
+## Use cases & projects
+### Use cases
+- **Agents with slow tools.** While a tool runs, the transcript's blocks are evictable; headroom, a
+  host-memory tier and same-replica routing decide whether the next step re-prefills.
+- **Long-context agents on a shared replica.** Admission limits and preemption counters explain mid-answer
+  pauses that show no errors.
+- **Many runs sharing one system prompt and toolset.** Shared blocks with reference counts hold one copy of
+  the common prefix for every run.
+- **Evaluating KV compression for agents.** Token-dropping eviction changes what the model attends to, so
+  it ships only after an agent eval approves it.
+
+### Mini project
+**Watch a transcript get evicted during a tool wait (2-3 hours).**
+- **Goal:** reproduce the slow-tool eviction effect and show one fix.
+- **Steps:** serve a small model with vLLM and prefix caching on; run one agent whose tool sleeps 30 s while
+  a load generator fills the cache pool with unrelated long prompts; record cached tokens and TTFT on the
+  step after the tool; repeat with lower background load or more pool headroom.
+- **Done when:** you have both runs' post-tool TTFT and cached-token counts, plus the preemption and
+  prefix-hit metrics from `/metrics` that explain the difference.

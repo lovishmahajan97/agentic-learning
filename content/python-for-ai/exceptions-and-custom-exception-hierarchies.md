@@ -464,3 +464,23 @@ propagate to a single top-level handler that logs once with the full chain and m
 > Handlers catch by class, so the tree should let a retry loop say `except Transient` and a request
 > handler say `except Permanent`. Mirroring vendor codes or modules forces every caller to know
 > details that belong in the adapter.
+
+## Use cases & projects
+### Use cases
+- **Provider adapters.** Vendor SDK errors are translated once into `Transient` or `Permanent`, so the
+  agent core never imports a provider's exception classes.
+- **Model-visible tool errors.** A `ToolError` such as "order not found" goes back as an error tool
+  result so the model can fix its call or re-plan.
+- **Context-length recovery.** A context-length error triggers history compaction or a smaller request
+  instead of a plain retry.
+- **Parallel tool fan-out.** A `TaskGroup` running several tools raises an `ExceptionGroup`, and
+  `except*` splits model-visible errors from bugs.
+
+### Mini project
+**Give an agent loop an error policy (1-2 hours).**
+- **Goal:** a tool-calling loop where every failure is routed by class to retry, repair, recover or stop.
+- **Steps:** define `AgentError` with `Transient`, `Permanent`, `Recoverable` and `ToolError` branches;
+  write an adapter that maps fake provider errors onto them; retry only `Transient` with a capped
+  budget; return `ToolError` to the model; let a planted `KeyError` propagate; log each decision.
+- **Done when:** a scripted run shows a rate limit retried, a bad tool argument repaired by the model, an
+  auth error stopping the run, and the planted bug failing loudly with no retry.

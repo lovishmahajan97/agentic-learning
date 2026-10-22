@@ -5,7 +5,8 @@ name: Confusion matrix
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - ml-fundamentals/classification
   - ml-fundamentals/precision-recall-f1
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-A confusion matrix counts predictions against truth, one cell per (actual, predicted) pair. Every
-classification metric is a ratio of its cells, so read the table first, then pick the metric from which
-errors are expensive, a product decision.
+A confusion matrix counts predictions against truth, one cell per (actual, predicted) pair. For agents
+it shows which tool was called when another was needed, and which failures a judge passed. Read the table
+first; which cell is expensive is a product decision.
+
+## For agent builders
+- **Why it matters for agents.** Tool selection, intent routing, guardrails and LLM judges are all
+  classifiers. "80% correct tool calls" hides whether the misses are harmless (an extra search) or costly
+  (a refund issued instead of a ticket); only the off-diagonal cells show which.
+- **Where it shows up in your stack.** The eval harness for tool-use and routing, judge-versus-human
+  agreement reports, guardrail block logs, and `confusion_matrix` or a plain `Counter` over
+  (expected, actual) pairs from traces.
+- **What you control.** The label set (including a "no tool" class), the cost of each cell, which
+  confused pair you fix first (tool descriptions, few-shots, a disambiguation rule), and the axis convention.
+- **What you can skip.** Type I and Type II terminology debates and exotic summary metrics. Know rows
+  versus columns, the row and column rates, MCC, and how to price cells.
 
 ## Why it exists
 - **Four outcomes, one label each.** In the binary case the model says yes and is right (true positive), yes
@@ -97,6 +110,8 @@ lower precision when positives are rarer, because the FP column fills from a lar
   (`normalize="pred"`) for per-class precision.
 - **Off-diagonal *mass* is the diagnostic.** One dense cell means two classes are not separable with the
   current features or prompt, and the fix is local to that pair.
+- **In agents,** the tool-selection matrix has rows for the tool the step needed and columns for the tool
+  the agent called, with an explicit "none" class so needless calls and missed calls are both visible.
 - **In LLM systems** this is the matrix of an intent router, a guardrail classifier, or an LLM judge scored
   against human labels. With "pass" as the positive class, a too-lenient judge shows a heavy FP cell (failures
   passed); a too-strict one, a heavy FN cell (good outputs failed).
@@ -120,11 +135,12 @@ lower precision when positives are rarer, because the FP column fills from a lar
    label (scikit-learn's `multilabel_confusion_matrix`) and aggregate as with per-class metrics.
 
 ## Diagram
-From predictions to a decision: the table comes first, the cost of each cell decides.
+From predictions (a classifier's labels or an agent's tool calls) to a decision: the table comes first,
+the cost of each cell decides.
 
 ```mermaid
 flowchart TD
-    S["Scores on validation split"] --> T["Pick threshold"]
+    S["Scores or traces on validation split"] --> T["Pick threshold"]
     T --> CM["Confusion matrix with labels"]
     CM --> R["Row-normalised: recall, FPR"]
     CM --> C["Column-normalised: precision, NPV"]
@@ -226,6 +242,42 @@ for n, a, p in sorted(off, reverse=True)[:3]:        # the pairs worth reading f
 - **Legal has support 10,** so its 0.70 recall is noisy, yet a k × k cost matrix may still make legal → cancel
   the most expensive cell.
 
+### Agent scenario: a tool-selection matrix for a support agent
+120 labelled agent steps from golden tasks: which tool the step needed versus which the agent called.
+
+```python
+from collections import Counter
+
+gold = ["search_docs"] * 60 + ["create_ticket"] * 25 + ["refund"] * 10 + ["none"] * 25
+called = (["search_docs"] * 55 + ["none"] * 5 +
+          ["create_ticket"] * 17 + ["refund"] * 6 + ["search_docs"] * 2 +
+          ["refund"] * 9 + ["create_ticket"] * 1 +
+          ["none"] * 15 + ["search_docs"] * 10)
+
+cells = Counter(zip(gold, called))                   # (needed, called) -> count
+tools = sorted(set(gold) | set(called))
+for t in tools:
+    row = sum(cells[(t, c)] for c in tools)          # steps that needed t
+    col = sum(cells[(g, t)] for g in tools)          # steps where the agent called t
+    print(f"{t:14} recall={cells[(t, t)] / row:.2f} precision={cells[(t, t)] / col:.2f} support={row}")
+off = sorted(((n, g, c) for (g, c), n in cells.items() if g != c), reverse=True)
+for n, g, c in off[:3]:
+    print(f"needed {g} -> called {c}: {n}")
+# create_ticket recall 0.68 precision 0.94 | none 0.60 / 0.75 | refund 0.90 / 0.60 | search_docs 0.92 / 0.82
+# needed none -> called search_docs: 10 / create_ticket -> refund: 6 / search_docs -> none: 5
+```
+
+| Cell | Count | Cost to the business | Fix |
+|---|---|---|---|
+| needed none, called search_docs | 10 | a few seconds and tokens | accept, or tighten the tool description |
+| needed create_ticket, called refund | 6 | money paid out wrongly | top priority: rewrite both descriptions, add a confirmation step |
+| needed search_docs, called none | 5 | answer from memory, risk of hallucination | add few-shots showing when to search |
+
+- **Accuracy is 0.80 (96/120),** but the heaviest off-diagonal cell is the cheapest one, while the
+  second-heaviest (ticket → refund) is the one that costs money. Refund precision of 0.60 is the number
+  to fix.
+- **Price the cells before choosing what to fix,** exactly as with the fraud screen.
+
 ## Production patterns
 - **Labelled axes in every eval report.** Always call `confusion_matrix(y_true, y_pred, labels=[...])` with an
   explicit label list and store it with axis names (rows actual, columns predicted) next to prevalence. Monitor
@@ -238,6 +290,9 @@ for n, a, p in sorted(off, reverse=True)[:3]:        # the pairs worth reading f
   uncertain. Monitor realised cost per day in production.
 - **Judges and guardrails scored by cell.** Score an LLM judge against human labels as a confusion matrix and
   track the FP cell (too lenient) and FN cell (too strict) per release, not just agreement rate.
+- **Tool-selection matrix per agent release.** Label the expected tool (or "none") for each step of the
+  golden tasks, build the (expected, called) matrix on every prompt, tool-description or model change, and
+  gate on the cells that move money or data. Monitor per-tool call counts in production traces.
 - **Per-label matrices for multi-label.** Use `multilabel_confusion_matrix` and alert on per-label FN counts,
   because a rare label's misses vanish in pooled averages.
 
@@ -271,6 +326,9 @@ for n, a, p in sorted(off, reverse=True)[:3]:        # the pairs worth reading f
 - **Collapsing a multi-class matrix into macro-F1 before looking at confused pairs.** Symptom: weeks spent
   adding data to a class whose errors come from label ambiguity with its neighbour. Fix: read the top
   off-diagonal cells first.
+- **Leaving "no tool" out of the agent's label set.** Symptom: a tool-selection matrix that looks clean
+  while the agent makes needless calls or skips needed ones, because those steps were never counted. Fix:
+  add an explicit "none" row and column.
 - **Scoring an LLM judge only by agreement rate.** Symptom: a judge that "agrees 96%" because it passes nearly
   everything, and the 4% it misses are exactly the failures you built it to catch. Fix: recall on the failure
   class.
@@ -279,8 +337,8 @@ for n, a, p in sorted(off, reverse=True)[:3]:        # the pairs worth reading f
 - **Always first:** every time you evaluate a classifier, before any single-number metric, and every time
   someone quotes one, ask for the table and the prevalence.
 - **Matters most** where error costs are asymmetric (fraud, safety, medical triage), where classes are
-  imbalanced, and where the "classifier" is an LLM: an intent router, a guardrail, a feedback classifier or a
-  judge scored against human labels.
+  imbalanced, and where the "classifier" is an LLM: an intent router, a guardrail, a feedback classifier, a
+  judge scored against human labels, or an agent choosing which tool to call.
 - **Day to day:** it is the first artefact of error analysis and what you put in front of a stakeholder to turn
   "the model is wrong" into "it confuses A with B".
 - **Interviews:** derive precision, recall, specificity and FPR from a table, explain why accuracy misleads on
@@ -342,6 +400,13 @@ validation), and compare candidate models with MCC or the precision–recall cur
   judge exists for.
 - **Re-check per release,** because a prompt or model change can move errors between the FP and FN cells.
 
+### Your agent picks the right tool 80% of the time. What do you report to decide if it can ship?
+- **The tool-selection matrix,** rows needed tool (with "none"), columns called tool, with support per row.
+- **Priced cells:** a needless search costs seconds, a refund issued instead of a ticket costs money; rank
+  the off-diagonal cells by count × cost, not by count.
+- **A gate per expensive cell,** for example zero wrong refunds on the golden set, plus a confirmation step
+  for irreversible tools until that holds.
+
 ## Quiz
 ### Q: In scikit-learn's `confusion_matrix(y_true, y_pred)` with labels [0, 1], which cell holds the false negatives?
 - [ ] C[0, 1]
@@ -369,3 +434,24 @@ validation), and compare candidate models with MCC or the precision–recall cur
 > A single dense off-diagonal cell is a separability problem between two specific classes, usually
 > overlapping definitions or inconsistent labelling, so the fix is local to that pair. Spreading data
 > across all classes or changing the aggregate metric does not touch the cause.
+
+## Use cases & projects
+### Use cases
+- **Tool-use evals.** A (needed, called) matrix with a "none" class shows needless calls, missed calls and
+  the confused tool pairs whose descriptions need rewriting.
+- **Intent routers in front of agents.** Off-diagonal cells point to the two intents that overlap, so the
+  fix is a merge or a disambiguation rule rather than more data everywhere.
+- **LLM-judge validation.** The FP cell (failures passed) and FN cell (good runs failed) against human
+  labels say whether the judge is too lenient or too strict for a release gate.
+- **Guardrail reviews.** Counting missed attacks against wrongly blocked legitimate requests, priced per
+  cell, decides where the block threshold should sit.
+
+### Mini project
+**Build a priced tool-selection report for an agent (1-3 hours).**
+- **Goal:** find the single most expensive tool-choice error in a small agent.
+- **Steps:** give an agent three tools plus the option of none; write 50 golden tasks labelled with the
+  expected tool per step; run the agent and log calls from traces; build the (expected, called) matrix
+  with row normalisation; assign a cost to each off-diagonal cell; change one tool description to fix the
+  costliest cell and re-run.
+- **Done when:** you have the matrix and priced cell table before and after the change, and the expected
+  cost per 100 steps fell without a new expensive cell appearing.

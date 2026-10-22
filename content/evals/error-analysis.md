@@ -438,3 +438,26 @@ and slices, not the aggregate, to the product owner.
 > The counts decide priority, and promoting each stable category into golden items and a grader is what
 > keeps the eval suite representative of real failures. A single overall score or a longer prompt would
 > throw away the attribution the round produced.
+
+## Use cases & projects
+### Use cases
+- **Triaging a new agent before launch.** Reading the first batch of staging traces tells the team
+  whether failures sit in planning, tool choice, tool arguments or retrieval, before anyone rewrites the
+  system prompt.
+- **Explaining a score drop after a change.** The flip-diff between two harness runs, read trace by
+  trace, shows which tasks regressed and at which step, so the fix targets the real cause.
+- **Prioritising the agent roadmap.** Failure counts per category turn "the agent feels flaky" into a
+  ranked list of fixes with the share of failures each one addresses.
+- **Growing the golden set from production.** Stable categories found in sampled production traces become
+  new golden items and graders, keeping the eval suite close to real traffic.
+
+### Mini project
+**Run one error-analysis round on a small tool-calling agent (2-3 hours).**
+- **Goal:** produce a failure taxonomy with counts for an agent you can run locally, and turn the top
+  category into an automated check.
+- **Steps:** build or reuse a small agent with two or three tools; run it on about 30-50 varied tasks and
+  save full traces; read each trace and note the first wrong step in a sheet; group notes into
+  stage-prefixed codes (for example plan, tool-choice, tool-args, retrieval, answer); count them; write a
+  golden item and a simple grader for the most frequent category.
+- **Done when:** you have a sheet with one note per failing trace, a taxonomy table with counts and
+  percentages, and a grader that flags the top category on the saved traces and passes on the good ones.

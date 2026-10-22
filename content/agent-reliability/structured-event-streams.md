@@ -5,7 +5,8 @@ name: Structured event streams
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/state-persistence-and-conversation-recovery
@@ -25,6 +26,18 @@ sources:
 An agent run is a sequence of happenings, not a returned string. Emit them as one ordered, typed,
 versioned event stream and derive the UI, persisted state, trace and eval trajectory from it: one
 replayable source of truth instead of four drifting formats.
+
+## For agent builders
+- **Why it matters for agents.** A run is a loop of model calls, tool calls, approvals and pauses. If
+  each consumer logs its own way, the UI, the resume logic, the trace and the eval disagree about what
+  happened; one typed stream makes them agree by construction.
+- **Where it shows up in your stack.** The provider's streaming responses and your framework's stream
+  modes on the way in; your event table, Redis stream or Kafka topic in the middle; SSE or WebSocket to
+  the browser, tracing backends and eval harnesses on the way out.
+- **What you control.** The envelope (`run_id`, `seq`, `type`, `version`), the event vocabulary, which
+  events are durable before the agent acts, payloads by reference, and upcasters for schema changes.
+- **What you can skip.** Full event-sourcing and CQRS frameworks. A single writer per run, an
+  append-only table with a unique `(run_id, seq)` and a pure fold cover most agents.
 
 ## Why it exists
 - **Every new consumer invents a format.** The first agent returns a final answer. The second needs a
@@ -392,3 +405,25 @@ that even a retry after a crash cannot repeat the effect.
 - [ ] Because references are required for SSE transport
 > Events are the permanent history; payloads carry the bulk and the sensitive content. Separating them
 > keeps transport cheap and retention policies independent.
+
+## Use cases & projects
+### Use cases
+- **Live agent UIs.** Token deltas and tool status rows stream to the browser, and a reconnect resumes
+  from the last `seq` instead of losing the run.
+- **Crash recovery for long runs.** Folding persisted events rebuilds state, and a pending
+  `tool.call.requested` is resolved with its idempotency key rather than guessed.
+- **One source for traces, audit and evals.** Each is a projection, so an eval trajectory and an
+  incident trace never disagree about a run.
+- **Human-in-the-loop pauses.** `input.requested` and `input.received` let a run wait hours for an
+  approval and continue on another worker.
+
+### Mini project
+**Event-sourced agent loop with a resumable UI (2-3 hours).**
+- **Goal:** make one small tool-calling agent emit every happening as a typed event and rebuild its
+  state from them.
+- **Steps:** define the envelope and five event types; write events to a SQLite or Postgres table with a
+  unique `(run_id, seq)`; derive state with a pure `apply` fold; serve the stream over SSE with
+  `id: <seq>`; kill the process mid-run and resume from the log.
+- **Done when:** a browser that reconnects mid-run shows no gaps or duplicates, the resumed run finishes
+  with state identical to a clean rebuild from events, and a crash between request and result shows up
+  as a pending call.

@@ -389,3 +389,25 @@ and periodic re-labelling, because the input distribution will move.
 > Softmax forces the tag probabilities to sum to one, so two correct tags compete for the same mass.
 > Independent sigmoids treat each tag as its own binary decision and allow per-tag thresholds that
 > reflect each tag's cost and prevalence.
+
+## Use cases & projects
+### Use cases
+- **Intent and sub-agent routing.** A router decides which specialist agent or workflow handles a
+  request; per-class recall and an abstain path keep misroutes from turning into wrong answers.
+- **Guardrails before and after the model.** Prompt-injection, PII and policy filters are binary or
+  multi-label classifiers whose thresholds encode the cost of a missed block versus a false refusal.
+- **LLM-as-judge pass/fail.** Judges that emit a label are classifiers too, so they get a confusion
+  matrix against human labels before anyone trusts their pass rate.
+- **Escalate or answer.** Support agents classify whether to hand off to a human, with the threshold
+  set from the cost of a wrong autonomous action.
+
+### Mini project
+**Thresholded tool router with an abstain path (2-3 hours).**
+- **Goal:** route requests to one of four tools, or to "ask a human", using probabilities and a
+  cost-based threshold instead of a bare argmax.
+- **Steps:** write 200 labelled requests across four tools plus some out-of-scope ones; get class
+  scores from an LLM (token log-probabilities if your provider returns them) or a small classifier on
+  embeddings; build the confusion matrix; pick the abstain threshold from assumed costs of a misroute
+  versus a handoff.
+- **Done when:** you report per-tool precision and recall, the chosen threshold with its expected cost,
+  and the share of traffic sent to a human at that threshold.

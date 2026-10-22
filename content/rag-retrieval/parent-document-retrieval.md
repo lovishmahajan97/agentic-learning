@@ -416,3 +416,24 @@ single-size baseline.
 - [ ] Faster retrieval, because parent lookups replace vector search
 > The parent must fit the context budget alongside other parents; a whole long manual per hit defeats the
 > purpose, which is sharp matching with just enough surrounding context.
+
+## Use cases & projects
+### Use cases
+- **Agents over pricing tables and specs.** A matched row is useless without its table header and plan
+  name, which the parent section supplies.
+- **Contract and policy agents.** Caveats and exceptions often sit a paragraph away from the matching
+  sentence, so returning the parent keeps them in view.
+- **Token-budgeted agent loops.** Teams return short snippets plus a `read_section` tool so the agent pulls
+  a full parent only when it needs one.
+- **Manuals and runbooks.** Small children for sharp matching plus a heading path keep step-by-step
+  procedures intact when retrieved.
+
+### Mini project
+**Snippets plus `read_section` versus direct parents (2-3 hours).**
+- **Goal:** compare two ways of giving an agent surrounding context and their token cost.
+- **Steps:** chunk a small document set into small children linked to parent sections; build mode A, where
+  `search` returns deduplicated parents, and mode B, where `search` returns child snippets with parent IDs
+  and the agent can call `read_section`; run about 20 questions whose answers need nearby details; log
+  correctness, tool calls and transcript tokens.
+- **Done when:** you have a table of accuracy, tool calls and tokens for both modes, and a short note on
+  which questions each mode got wrong.

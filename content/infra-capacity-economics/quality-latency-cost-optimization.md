@@ -490,3 +490,27 @@ successful task so a regression is caught in days rather than at the next invoic
 - [ ] It always beats it, at any escalation rate
 > Cascade cost is 0.001 + e × 0.010, which is below 0.010 only while e < 0.9. Above that, nearly every
 > request pays for both models and the cascade is strictly worse on cost and on tail latency.
+
+## Use cases & projects
+### Use cases
+- **Choosing a model per agent step.** Teams run the cheap model on routing, tool selection and
+  extraction steps and reserve the large model for planning or the final answer, picking each from the
+  step's own frontier.
+- **Fixing a slow agent.** When users abandon runs, the per-step latency breakdown in traces shows whether
+  steps, output tokens or prefill dominate, so the team pulls the lever that actually moves wall-clock time.
+- **Cutting an agent's bill without losing success rate.** Prompt caching, output caps and step budgets
+  are evaluated on cost per successful run, not cost per call, before they ship.
+- **Re-evaluating after a model or price change.** A new model release or price cut triggers a re-run of
+  the frontier, because yesterday's dominated configuration may now be the best one.
+
+### Mini project
+**Build the frontier for a small tool-calling agent (2-3 hours).**
+- **Goal:** pick a shippable configuration for a 3-tool agent from measured quality, latency and cost per
+  run, not from intuition.
+- **Steps:** write 30-50 eval tasks with a pass/fail check; run the agent under 4-6 configurations (two
+  model tiers, with and without an output cap, with and without a small-first cascade); log success, wall
+  time, steps and tokens per run from the usage fields; compute cost per successful task; plot quality
+  against cost and mark dominated points.
+- **Done when:** you have a table and a scatter plot with the Pareto frontier marked, a chosen
+  configuration that meets a stated latency limit, and two sentences on what you would re-check after the
+  next price change.

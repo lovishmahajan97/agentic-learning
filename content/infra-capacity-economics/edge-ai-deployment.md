@@ -5,7 +5,8 @@ name: Edge AI deployment
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - infra-capacity-economics/hybrid-on-prem
   - infra-capacity-economics/gpu-utilization-and-memory-bandwidth
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-Edge AI runs the model on the device that has the data: phone, laptop, browser, vehicle, controller. It
-buys latency, offline use, privacy and zero cloud cost, at the price of hard memory, bandwidth and power
-budgets: small compressed models, device runtimes, cloud fallback.
+An edge agent runs a small model on the device that holds the data and tools: phone, laptop, vehicle,
+controller. It gains latency, offline use and privacy, but every loop step pays device prefill and
+decode, so keep tools few and escalate hard tasks.
+
+## For agent builders
+- **Why it matters for agents.** On-device assistants that call app or OS actions, field agents that work
+  offline and site agents next to machines all run a loop on hardware with a few GB and tens of GB/s. A
+  five-step loop that feels instant in the cloud can take tens of seconds there.
+- **Where it shows up in your stack.** llama.cpp (GGUF), ONNX Runtime, Core ML, LiteRT, ExecuTorch or
+  WebGPU runtimes hosting a small tool-calling model, plus a cloud escalation path through your normal
+  gateway.
+- **What you control.** How many tools and how much schema text go into the prompt, whether the prefix is
+  reused across steps, the step budget, the escalation rule, and which tools may run without the server.
+- **What you can skip.** Kernel-level accelerator tuning. Know the memory, bandwidth and prefill budgets,
+  the quantization eval gate and why on-device policy is never trusted.
 
 ## Why it exists
 - **A cloud call has four costs.** A network round trip, a need for connectivity, uploading the user's
@@ -73,6 +86,20 @@ Three numbers bound the design:
 - **Hence the habits:** keep prompts short, reuse a cached system-prompt prefix across turns, and use the
   NPU or GPU for prefill where the runtime supports it.
 - **Plan both numbers:** TTFT from prompt length, streaming speed from bandwidth.
+
+### What a loop costs on a device
+- **Every step pays prefill for what is new.** Tool schemas and the system prompt are prefilled once if
+  the runtime reuses the prefix; otherwise each step re-prefills the whole transcript at a few hundred
+  tokens a second.
+- **Tool schemas are prompt tokens.** Ten verbose JSON schemas can cost more prefill than the user's
+  request, so edge agents expose a handful of tools with terse descriptions.
+- **Every step pays decode for the tool call.** A short JSON call at tens of tokens per second is about a
+  second per step before the tool even runs.
+- **Small models drift on long loops.** Tool-call validity and plan-following fall off faster than in a
+  frontier model, so edge agents use short step budgets, constrained output where the runtime offers it,
+  and escalation when parsing fails.
+- **Local tools are the point.** Reading the device's files, sensors or app state without upload is the
+  reason to run on the edge; tools that need the network gain little from a local model.
 
 ### Make the model fit
 - **Choose a small model first.** Down to about 4 bits per weight, a larger quantized model often beats a
@@ -131,8 +158,9 @@ unified-memory GPU and Neural Engine, NVIDIA Jetson-class embedded GPUs. Runtime
   server side when the request escalates.
 
 ## Diagram
-The common consumer shape: decide at install whether a device gets a local model, answer locally when
-confident, and treat every escalation as an upload that policy must allow.
+The common consumer shape, applied to each agent task: decide at install whether a device gets a local
+model, run the loop locally when it is confident and in scope (a valid tool call, inside the step
+budget), and treat every escalation as an upload that policy must allow.
 
 ```mermaid
 flowchart TD
@@ -140,7 +168,7 @@ flowchart TD
     V -->|"no"| CO["Cloud-only mode"]
     V -->|"yes"| L["Small quantized model on device"]
     L --> C{"Confident and in scope?"}
-    C -->|"yes"| A["Answer locally"]
+    C -->|"yes"| A["Run agent loop locally"]
     C -->|"no"| P{"User setting allows upload?"}
     P -->|"no"| D["Degraded local answer"]
     P -->|"yes, offline"| Q["Queue until connectivity returns"]
@@ -218,7 +246,64 @@ print(edge_budget(3, 4, 2048, kv, bandwidth_gb_s=50, prefill_tok_s=300, prompt_t
 | Same model at 8-bit instead of 4-bit | weights double to 3 GB, decode ceiling halves to about 17 tok/s |
 | 8B model at 4-bit | about 4 GB of weights: over a 3 GB app budget before the cache |
 
+### Worked scenario: a five-step agent on the same device
+Same illustrative device (300 tokens per second prefill, ~33 tokens per second decode). The prompt starts
+with 1,200 tokens of system prompt and tool schemas; each step adds ~200 tokens of tool result and emits
+a ~40-token tool call.
+
+| Plan | Prefill over 5 steps | Prefill time | Decode time | Total model time |
+|---|---|---|---|---|
+| Re-prefill the transcript every step | 1,200 + 1,400 + 1,600 + 1,800 + 2,000 = 8,000 tokens | ~26.7 s | ~6 s | ~33 s |
+| Reuse the prefix, prefill only new tokens | 1,200 + 4 × 200 = 2,000 tokens | ~6.7 s | ~6 s | ~13 s |
+| Plus terse schemas (400 tokens instead of 1,200) | 400 + 4 × 200 = 1,200 tokens | ~4 s | ~6 s | ~10 s |
+
+- **Prefix reuse is the biggest lever,** then schema size; decode time is fixed by bandwidth and the
+  length of each tool call.
+- **Still ~10 s:** design the UX to show each step, and escalate tasks that need many steps.
+
+### A local tool-calling step with cloud escalation
+Uses the `llm` object from the llama.cpp example. The small model must return one JSON tool call; an
+invalid or unknown call escalates instead of looping. `escalate` stands for your gateway call, which
+applies its own server-side checks.
+
+```python
+import json
+
+LOCAL_TOOLS = {
+    "read_scan_log": lambda n=5: f"last {n} scans: ok, ok, damaged, ok, ok",   # on-device data only
+    "open_ticket": lambda summary: f"ticket queued offline: {summary}",
+}
+SYSTEM = ('Reply with JSON only: {"tool": name, "args": {...}} or {"answer": text}. '
+          "Tools: read_scan_log(n), open_ticket(summary).")
+
+def edge_agent(task: str, escalate, max_steps: int = 4) -> str:
+    messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": task}]
+    for _ in range(max_steps):            # short budget: small models drift on long loops
+        out = llm.create_chat_completion(messages=messages, max_tokens=80)
+        text = out["choices"][0]["message"]["content"]
+        try:
+            step = json.loads(text)
+        except json.JSONDecodeError:
+            return escalate(task, messages, reason="invalid tool call")
+        if "answer" in step:
+            return step["answer"]
+        if step.get("tool") not in LOCAL_TOOLS:
+            return escalate(task, messages, reason="unknown tool")
+        result = LOCAL_TOOLS[step["tool"]](**step.get("args", {}))
+        messages += [{"role": "assistant", "content": text}, {"role": "user", "content": f"Result: {result}"}]
+    return escalate(task, messages, reason="step budget")   # escalation uploads the transcript
+```
+
+- **Escalation sends the transcript,** including local tool results, so the privacy rule applies to tool
+  data as well as to the user's words.
+
 ## Production patterns
+- **Small tool surface for edge agents.** Expose a handful of local tools with terse schemas and a short
+  step budget, and keep the schema block byte-stable so the runtime reuses its prefix. Monitor TTFT per
+  step and tool-call parse failures per model variant.
+- **Escalate on invalid calls, not just low confidence.** Treat a parse failure, an unknown tool or an
+  exhausted step budget as an escalation trigger rather than retrying locally. Monitor escalation rate by
+  reason; a rising parse-failure share after an update means the new quantization broke tool calling.
 - **Capability detection at install.** Read available RAM and accelerator at install or first launch and
   pick a model variant, or cloud-only mode for low-end devices. Monitor the share of devices per variant
   and out-of-memory crash rate by device class.
@@ -226,7 +311,7 @@ print(edge_budget(3, 4, 2048, kv, bandwidth_gb_s=50, prefill_tok_s=300, prompt_t
   stage rollouts by device class. Monitor the distribution of model versions in the fleet and crash rate per
   version.
 - **Quantization eval gate.** Evaluate each candidate quantization (for example GGUF `Q8_0` and `Q4_K_M`)
-  on the task set against the cloud model, and ship the smallest one that passes. Monitor field quality
+  on the task set, including tool-call validity on agent tasks, against the cloud model, and ship the smallest one that passes. Monitor field quality
   reports and escalation rate per variant.
 - **Thermal soak tests on real devices.** Run a fixed workload for several minutes on the target device
   matrix and record sustained tokens per second, peak memory and battery drain. Monitor the same figures
@@ -237,6 +322,9 @@ print(edge_budget(3, 4, 2048, kv, bandwidth_gb_s=50, prefill_tok_s=300, prompt_t
   cloud request, whatever the device claims. Monitor server-side rejections of escalated requests.
 
 ## Trade-offs
+- **Local loop vs step count.** Running the agent loop on device keeps tool data local and works offline,
+  but each step costs seconds of prefill and decode; past a few steps a single escalation to the cloud
+  can be faster and better, if policy allows the upload.
 - **No network vs capped quality.** On-device inference removes network latency, cloud cost and data
   upload, but caps model quality at what fits the device's memory and bandwidth; the trade flips when the
   task needs frontier capability or broad knowledge.
@@ -252,6 +340,11 @@ print(edge_budget(3, 4, 2048, kv, bandwidth_gb_s=50, prefill_tok_s=300, prompt_t
   control; for a small or internal user base the cloud bill it saves may not repay that engineering.
 
 ## Pitfalls
+- **Porting a cloud agent's tool list to the device unchanged.** Symptom: seconds of blank screen before
+  the first step, because twenty verbose schemas are prefilled on a weak chip. Fix: a few terse local
+  tools, prefix reuse, and the rest behind escalation.
+- **Letting a small model retry invalid tool calls in a loop.** Symptom: battery drain and runs that end
+  at the step budget with nothing done. Fix: escalate on the first invalid call.
 - **Measuring only tokens per second and ignoring prompt length.** Symptom: a feature that streams quickly
   once started but sits blank for seconds whenever a long document is in context.
 - **Benchmarking on a developer laptop.** Symptom: a model that is fast in the demo and crawls or crashes on
@@ -271,6 +364,8 @@ print(edge_budget(3, 4, 2048, kv, bandwidth_gb_s=50, prefill_tok_s=300, prompt_t
 - **Use when** latency must be below a network round trip, the device is often offline, the data must not
   leave it, or per-interaction cloud cost at your install base is untenable, *and* a small or distilled
   model can meet the quality bar on the task.
+- **Use for agents when** the tools are local (device files, sensors, app state), loops are short, and
+  offline or privacy matters more than the last few points of task success.
 - **Avoid when** the task needs frontier reasoning or large context, or the device matrix is too fragmented
   to test.
 - **Measure** sustained tokens per second on target devices, memory high-water marks with the KV cache,
@@ -332,9 +427,16 @@ class, carry the model version in telemetry, and keep any policy enforcement on 
 - **Carry the model version** in telemetry and requests, and keep the server fallback compatible with old
   clients.
 
-### When would you keep a feature in the cloud instead of moving it on device?
-- **Quality:** the task needs frontier reasoning, broad knowledge or large context that no small model can
-  match.
+### Your on-device agent takes 30 seconds for a five-step task. Where does the time go and what do you change?
+- **Prefill dominates:** without prefix reuse each step re-prefills the transcript; at 300 tokens per
+  second, 8,000 prefilled tokens over five steps is ~26.7 s.
+- **Fix the prompt first:** reuse the cached prefix so only new tokens are prefilled, and shrink tool
+  schemas; the same task drops to ~10-13 s.
+- **Then fix the plan:** fewer steps, and escalate long tasks to the cloud where policy allows.
+
+### When would you keep an agent or feature in the cloud instead of moving it on device?
+- **Quality:** the task needs frontier reasoning, broad knowledge, large context or long multi-step tool
+  use that no small model can match.
 - **Operations:** the device matrix is too fragmented to test, or the user base is small enough that the
   saved cloud bill does not repay the engineering.
 - **Security:** the logic or weights are proprietary, since anything on the device is extractable.
@@ -366,3 +468,23 @@ class, carry the model version in telemetry, and keep any policy enforcement on 
 > Everything on the device is under the user's control and can be extracted or altered. Guardrails
 > that protect the business or other users must be re-checked server-side when requests escalate
 > or produce consequential actions.
+
+## Use cases & projects
+### Use cases
+- **On-device assistants that act in apps.** A small model turns a request into one or two local actions
+  (search notes, set a reminder) without uploading the user's data.
+- **Offline field agents.** A warehouse or technician agent reads local logs and queues tickets with no
+  signal, escalating hard cases when connectivity returns.
+- **Site agents next to machines.** An on-site edge box runs an agent over sensor data where streaming
+  every reading to the cloud is impractical.
+- **Cost control at a large install base.** Simple, frequent agent tasks run on the user's hardware, so
+  only escalated tasks cost cloud tokens.
+
+### Mini project
+**Run and time a local tool-calling agent (2-3 hours).**
+- **Goal:** measure what each step of a small on-device agent costs and when escalation beats local work.
+- **Steps:** load a 1-3B GGUF model with llama.cpp on a laptop; build the two-tool edge agent above; run
+  ten tasks with a verbose tool list and again with terse schemas; log prompt tokens, time to first
+  token, decode time, tool-call validity and escalations per step.
+- **Done when:** you have a per-step timing table for both variants, a tool-call validity rate, and a
+  written escalation rule (step count or failure type) backed by those numbers.

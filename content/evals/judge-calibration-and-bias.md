@@ -469,3 +469,24 @@ controls, ship behind an online A/B to confirm.
 > Self-preference is a judge favouring outputs that resemble its own; changing the judge family removes
 > that resemblance. Order swapping fixes position bias, references fix knowledge gaps, and temperature
 > only affects variance.
+
+## Use cases & projects
+### Use cases
+- **Release gates for agent prompts and models.** Before a judge's pass rate can block a deploy, the team
+  checks its TPR and TNR against human labels on agent traces and corrects the aggregate.
+- **Online scoring of production traces.** Sampled traces are judged nightly; a calibration slice re-run
+  on every judge version bump catches drift before trend lines move.
+- **Critic and reflection steps inside the agent.** A self-check that approves drafts is a judge too;
+  measuring its leniency shows whether it blocks bad replies or rubber-stamps them.
+- **Comparing two agent versions side by side.** Both-order judging and a different judge family keep
+  position and self-preference bias from deciding the winner.
+
+### Mini project
+**Calibrate a "ticket resolved" judge for a support agent (2-3 hours).**
+- **Goal:** find out how far an LLM judge's pass rate on agent traces is from the human rate, and fix it.
+- **Steps:** collect 60-100 traces from a small tool-calling support agent; label each pass or fail
+  yourself; run a judge on the final reply only, then on the reply plus tool calls and results; compute
+  TPR, TNR and the corrected pass rate for both; probe position and length bias with swapped and padded
+  variants.
+- **Done when:** you have a table of TPR, TNR, raw and corrected pass rate per judge setup, a note on
+  which biases showed up, and a stated bar the judge must clear before it may gate a release.

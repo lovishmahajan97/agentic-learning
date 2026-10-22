@@ -424,3 +424,25 @@ product also needs voice or continuous client input.
 - [ ] A ping/pong mechanism for detecting dead peers
 > `EventSource` reconnects by itself and sends `Last-Event-ID`; with WebSockets you design session ids,
 > sequence numbers and the reconnect loop. Ping/pong and binary frames are WebSocket features, not SSE.
+
+## Use cases & projects
+### Use cases
+- **Interruptible agents.** A stop message lands in the same process as the agent loop, so the handler
+  cancels the agent task and the model call at once.
+- **Human-in-the-loop tool approval.** The agent pauses before a risky tool call, sends an approval
+  request and waits for the user's yes or no on the same socket.
+- **Voice agents.** Audio flows both ways continuously, and many realtime speech model APIs are
+  WebSocket-based themselves, so the server bridges two sockets.
+- **Collaborative agent sessions.** Several viewers watch one agent run, with Redis pub/sub delivering
+  events to whichever process holds each socket.
+
+### Mini project
+**Interruptible agent socket with tool approval (2-3 hours).**
+- **Goal:** serve an agent over `@app.websocket` that streams tokens, asks before a risky tool and stops
+  on demand.
+- **Steps:** authenticate on the handshake (a short-lived token in the query string or first message);
+  run a reader loop and a separate agent task; define prompt, stop, approve, token, tool_call and done
+  messages; make one fake tool require approval; cancel the agent task on stop or disconnect.
+- **Done when:** a test client can start a run, approve or reject the tool call and see the result
+  change, press stop mid-answer and receive no further tokens, and an unauthenticated client is
+  rejected before any agent work starts.

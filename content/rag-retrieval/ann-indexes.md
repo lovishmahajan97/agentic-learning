@@ -427,3 +427,25 @@ configuration, not on a full-precision prototype.
 > ones, and a fixed-size candidate list runs dry. Engines address this with filtered traversal,
 > pre-filtering to an id set with a brute-force fallback, or partitioned indexes; k-means is an IVF
 > concept, not HNSW.
+
+## Use cases & projects
+### Use cases
+- **Multi-step research agents.** An agent that makes several retrieval calls per task needs each one
+  fast, so the ANN search knobs set a large share of end-to-end latency.
+- **Per-user and per-tenant memory.** Agent memory stores filter by user, tenant or conversation, which is
+  where filtered HNSW searches can silently return fewer than k results.
+- **Memory churn.** Agents that write and delete memories constantly leave stale graph links behind, so
+  rebuild or compaction schedules become an operations task.
+- **Latency-recall tuning.** Teams raise or lower the query-time search width per tool to trade a few
+  milliseconds for recall on high-stakes lookups.
+
+### Mini project
+**Measure ANN recall and filtered starvation for an agent memory store (2-3 hours).**
+- **Goal:** quantify how the query-time search width and a restrictive user filter affect what an agent's
+  memory tool returns.
+- **Steps:** load 50k-100k embeddings with a `user_id` field into pgvector or Qdrant with HNSW; compute
+  brute-force top-10 as ground truth for 100 queries; sweep `ef_search` (or the engine's equivalent) and
+  record recall@10 and p95 latency; repeat with a filter that keeps about 1% of rows and count queries
+  that return fewer than 10 results.
+- **Done when:** you have a recall-versus-latency table for both the unfiltered and filtered runs, and a
+  chosen setting for the memory tool with a one-paragraph justification.

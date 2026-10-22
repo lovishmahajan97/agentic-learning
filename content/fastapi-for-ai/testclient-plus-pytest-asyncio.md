@@ -442,3 +442,24 @@ synchronous and let the app create its own engine in the lifespan.
 - [ ] Mark all LLM tests as expected failures
 > The dependency is the seam the app already uses, so overriding it swaps the real client for a
 > controllable fake. An empty key just makes calls fail, and patching another library misses httpx.
+
+## Use cases & projects
+### Use cases
+- **Regression tests for the tool loop.** A scripted fake LLM returns a tool call, then a final answer,
+  proving the loop executes the tool, appends its result and stops.
+- **Provider error mapping.** Scripting a timeout or 429 from the fake proves the endpoint returns the
+  status code and error body you promised, not a 500.
+- **Streaming contract tests.** `TestClient` reads the event stream and asserts the final event is
+  well formed, so the frontend never hangs waiting for it.
+- **Fast CI for agent services.** In-process tests run in milliseconds with no model spend, so every pull
+  request can run the full suite.
+
+### Mini project
+**Test an agent endpoint with a scripted fake LLM (1-2 hours).**
+- **Goal:** cover an agent endpoint's loop, error path and stream without calling a real model.
+- **Steps:** inject the LLM client and tool registry through `Depends`; write a fake that returns a
+  scripted list of responses; override it with `app.dependency_overrides` in a fixture that clears
+  overrides afterwards; write sync tests with `TestClient` (inside `with` so lifespan runs) and one
+  `async def` test using `httpx.AsyncClient` with `ASGITransport` that inspects an async fake memory store.
+- **Done when:** tests cover tool-call-then-answer, a max-steps stop, a provider error mapped to the right
+  status, and the final stream event, and the suite passes repeatedly with no event-loop errors.

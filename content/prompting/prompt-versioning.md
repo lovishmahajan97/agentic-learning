@@ -5,7 +5,8 @@ name: Prompt versioning
 kind: practice
 difficulty: core
 est_minutes: 12
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - prompting/prompt-templates
   - prompting/prompt-caching
@@ -22,9 +23,20 @@ sources:
 ---
 
 ## TL;DR
-A prompt is behaviour-defining code written as prose, so it needs immutable versions, an id on every
-call, review, an eval before promotion and one-step rollback. Without that, regressions cannot be dated
-and complaints cannot be reproduced.
+An agent's behaviour is a bundle of prompts, tool descriptions, schemas and a pinned model. Version it
+immutably, log the version on every step, eval before promotion and roll back with one pointer move, or
+agent regressions cannot be dated or replayed.
+
+## For agent builders
+- **Why it matters for agents.** An agent has many prompts (system, planner, sub-agents, tool
+  descriptions, summarizer), and rewording any one shifts tool choice and stopping behaviour. Without a
+  version on each step's trace, "the agent got worse on Tuesday" cannot be tied to a change.
+- **Where it shows up in your stack.** Prompt files in the repo, a registry such as Langfuse or LangSmith,
+  span attributes in your tracing, and the CI job that runs your agent eval suite.
+- **What you control.** The versioned unit (include tool schemas and the model snapshot), aliases for
+  canary and production, and the promotion gate on per-category agent eval scores.
+- **What you can skip.** Building a registry product. Files plus an alias file and a hash on every trace
+  cover most agent teams until non-engineers edit prompts weekly.
 
 ## Why it exists
 - **The prompt changes most and is guarded least.** Behaviour is model × prompt × parameters × tools ×
@@ -53,6 +65,15 @@ Version all of it, *because* a change to any part changes behaviour:
 - the rendering code that fills variables.
 
 A bundle that records only the template reports "no change" after someone edits a tool description.
+
+### Agents multiply the bundle
+- **One agent, many prompts.** A planner prompt, an executor prompt, sub-agent prompts, a compaction
+  summarizer and every tool description all shape a run. Version them as one agent bundle with one hash,
+  because they are tuned together and a run uses all of them.
+- **Log per step, not per run.** Each LLM step in the loop records the bundle hash, so a trace where a
+  sub-agent ran an older version (mid-rollout) is visible instead of confusing.
+- **Tool code is versioned separately.** The tool's implementation ships with code; its name, description
+  and schema ship with the bundle, because those are what the model reads.
 
 ### Two identities: hash and label
 | Identity | Example | Property | Where it goes |
@@ -102,7 +123,8 @@ canary exists because the golden set never covers the real distribution.
 - **Model upgrades are prompt versions.** Prompts are tuned to a model, so pin it in the bundle and
   re-evaluate when it changes. Pin a dated snapshot id, not a floating alias (many providers offer both),
   *because* a floating alias can move underneath an unchanged bundle hash: exactly the silent change
-  versioning is meant to rule out.
+  versioning is meant to rule out. Store the dated id (such as `gpt-4o-2024-08-06` rather than `gpt-4o`)
+  in the version metadata.
 
 ### Replay reproduces the input, not the output
 - **Sampling is non-deterministic.** Even at temperature 0, providers do not promise bit-identical output
@@ -114,13 +136,13 @@ canary exists because the golden set never covers the real distribution.
   difference between v13 and v14 may be noise.
 
 ## Diagram
-A version moves through gates by pointer moves only; every call logs which version answered, so rollback
-and replay are both cheap.
+An agent bundle moves through gates by pointer moves only; every agent step logs which version answered,
+so rollback and replay are both cheap.
 
 ```mermaid
 flowchart TD
-    E["Edit prompt bundle"] --> V["New immutable version + hash"]
-    V --> G["Golden set + regression suite"]
+    E["Edit agent bundle"] --> V["New immutable version + hash"]
+    V --> G["Agent eval set + regression suite"]
     G -->|"per-case diff vs production"| C["Move canary alias"]
     G -->|"regression"| X["Reject candidate"]
     C -->|"metrics hold"| P["Move production alias"]
@@ -203,7 +225,29 @@ print("promote" if ok else f"blocked: {drops}")       # blocked: {'refunds': (0.
 
 A mean-only gate would have shipped v14; the per-category gate catches the refunds regression.
 
+### Worked scenario: a tool description edit that "changed nothing"
+A support agent has three tools: `lookup_order`, `issue_refund` and `escalate`. An engineer rewords the
+`issue_refund` description to sound friendlier. The template is untouched. Numbers are illustrative.
+
+| Metric on 200 agent eval tasks | v21 (production) | v22 (description reworded) |
+|---|---|---|
+| Correct tool on first call | 91% | 84% |
+| `issue_refund` called without a prior `lookup_order` | 2% | 9% |
+| Median steps per task | 4 | 5 |
+| Bundle hash | changes | changes, because tool schemas are in the bundle |
+
+- **Because the description is in the bundle**, v22 gets a new hash, runs the agent eval and is blocked
+  on the tool-order regression before reaching users.
+- **If only the template were hashed**, the trace would show v21 for both, and the refund incidents
+  would look like model drift.
+
 ## Production patterns
+- **Version the whole agent, log it on every step.** Put the planner, sub-agent and summarizer prompts plus
+  tool schemas in one bundle, and set its hash on every LLM span in the loop. Monitor runs whose steps
+  carry more than one bundle hash; they mean a rollout happened mid-run.
+- **Gate on agent metrics, not only answers.** The promotion eval scores task success, correct tool
+  choice, steps per task and cost per task per category. Block on any category drop, because a prompt
+  change often shows up as extra tool calls before it shows up as wrong answers.
 - **Version and hash as trace attributes.** On every LLM span, set prompt name, version label, content
   hash and model id as attributes (for example in your OpenTelemetry or Langfuse traces). Monitor the
   share of calls carrying a version; it should be 100%.
@@ -216,9 +260,6 @@ A mean-only gate would have shipped v14; the per-category gate catches the refun
 - **Cached alias resolution with fallback.** Resolve the alias through a short-TTL in-process cache and
   keep the last known version if the registry is unreachable, so the registry is not a hard dependency
   of every request. Monitor registry errors and alias staleness.
-- **Pin dated model snapshots in the bundle.** Store a dated model id (such as `gpt-4o-2024-08-06`
-  rather than `gpt-4o`) in the version metadata, so a provider alias moving cannot change behaviour
-  under an unchanged hash.
 - **Read-only production in the console.** Let people edit drafts in the registry UI, but allow only CI
   (or a reviewed action) to move the `production` label. Monitor label moves as audit events.
 
@@ -250,9 +291,12 @@ A mean-only gate would have shipped v14; the per-category gate catches the refun
   fell from 95% to 70%, visible only in per-case diffs.
 - **Releasing to 100% of traffic at once.** Symptom: a regression reaching every user before any metric
   flags it, plus a brief cost and latency spike as all traffic misses the prompt cache together.
+- **Resolving the alias on every agent step.** Symptom: a long run switches prompt versions halfway when
+  the alias moves, producing plans one version wrote and another cannot follow. Fix: resolve once per run
+  and carry the version through the loop.
 
 ## When to use
-- **Start:** from the first prompt that reaches a user.
+- **Start:** from the first prompt that reaches a user, or the first agent run that calls a real tool.
 - **Minimum that pays for itself in a week:** prompt in a file with a metadata header, a content hash
   logged on every call, and the golden set run in CI before merge.
 - **Add later:** aliases when you need rollback without a deploy, a registry when non-engineers edit,
@@ -300,13 +344,6 @@ to the version that caused them, and CI blocks promotion of any version without 
 - **Decide by rate.** If most samples are wrong, fix or revert the version; if roughly one in ten is
   wrong, treat it as variance and tighten the prompt, add a schema or add a check.
 
-### When would you choose a prompt registry over files in the repository?
-- **Registry when non-engineers iterate.** Domain experts editing weekly, or fixes that must ship
-  without a release, favour runtime fetch by alias.
-- **Files when engineers own prompts.** You get pull-request review and atomic code-plus-prompt changes.
-- **Often both.** Files stay the source of truth and CI pushes them to the registry, with a variable
-  contract checked at load time to stop drift.
-
 ### You release a new prompt version and cost and TTFT spike for a few minutes. Why?
 - **Prompt cache misses.** The new version changes bytes near the front of the request, so every request
   misses until the new prefix has been written once.
@@ -320,6 +357,21 @@ to the version that caused them, and CI blocks promotion of any version without 
 - **Treat a model change as a new prompt version.** Run the golden set and regression suite, compare per
   case, and canary it like any other change.
 - **Never combine it with a prompt edit**, or an eval drop cannot be attributed to either.
+
+### Your agent started calling the wrong tool after a deploy where "only code changed". How do you find out why?
+- **Diff the bundle hashes on the traces.** If the hash changed, something rendered into the request
+  changed: often a tool description or schema generated from code, such as a docstring edit.
+- **Compare tool-choice metrics per version.** Correct first tool and steps per task for old versus new
+  hash on the same eval tasks show whether the change is the cause.
+- **Fix the process.** Put generated tool schemas in the bundle so they are hashed, evaluated and
+  canaried like any prompt.
+
+### How do you roll out a new version of a multi-agent system without breaking runs in progress?
+- **Pin the bundle at run start.** Resolve the alias once when an agent run begins and carry that version
+  through every step and sub-agent, so a run never mixes planner v13 with executor v14.
+- **Canary by conversation id.** New runs on the canary slice get the new bundle; existing runs finish on
+  the old one.
+- **Monitor per version.** Task success, cost per task and escalation rate, before moving `production`.
 
 ## Quiz
 ### Q: Which single piece of data makes prompt versioning pay off most once it is in place?
@@ -348,3 +400,24 @@ to the version that caused them, and CI blocks promotion of any version without 
 > The model selects and uses tools by reading their descriptions, so rewording one changes behaviour
 > exactly like rewording the system prompt; the versioned unit must include everything that is
 > rendered into the request.
+
+## Use cases & projects
+### Use cases
+- **Shipping agent prompt changes safely.** Every planner or tool-description edit becomes a candidate
+  version that runs the agent eval suite before any user sees it.
+- **Debugging an agent incident.** The bundle hash on each step's trace tells you which prompts and tool
+  schemas produced the bad run, so you can replay it.
+- **Model upgrades for agents.** Moving to a new model snapshot is a new bundle version, evaluated on tool
+  choice and task success like any prompt edit.
+- **Per-customer agent variants.** Forward-deployed teams keep customer-specific prompts as versions of
+  a shared base, so a base fix can be re-evaluated across all customers.
+
+### Mini project
+**Version and gate a small tool-calling agent (2-3 hours).**
+- **Goal:** make every agent run traceable to a bundle hash, and block a promotion that regresses tool
+  choice.
+- **Steps:** put the system prompt, two tool schemas and the model id in `prompts/agent/v1.md` with an
+  `aliases.yaml`; hash the bundle at load; log the hash on every step; write 20 eval tasks scoring correct
+  first tool; create v2 by rewording one tool description and run the per-category gate.
+- **Done when:** traces show the hash per step, the gate prints a per-category table for v1 versus v2, and
+  rolling back is a one-line edit to `aliases.yaml`.

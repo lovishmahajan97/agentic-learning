@@ -5,7 +5,8 @@ name: Distributed tracing across services
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - observability/tracing
   - observability/spans
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-In-process span context dies at every service boundary, so distributed tracing *propagates* trace id and
-parent span id with each call (the W3C `traceparent` header, or queue message metadata). Without it, one
-LLM turn becomes disconnected fragments with unattributable latency.
+An agent turn crosses a model gateway, tool servers, sub-agents and queues. Distributed tracing
+*propagates* trace and parent span ids across each hop (the W3C `traceparent` header, or message
+metadata), so the turn stays one tree.
+
+## For agent builders
+- **Why it matters for agents.** Agents fan out: tools behind MCP servers, models behind a gateway,
+  sub-agents in other services, long steps run by queue workers. Without propagation, the orchestrator's
+  waterfall shows "tool.call: 6 s" and nothing underneath, exactly where the question is.
+- **Where it shows up in your stack.** OpenTelemetry `inject` and `extract` (usually via HTTP client and
+  server auto-instrumentation), `OTEL_PROPAGATORS`, your AI gateway's span support, and the metadata
+  your tool transport or queue can carry.
+- **What you control.** That every hop you own extracts and injects, that the sampling flag is honoured
+  downstream, that provider request ids land on leaf spans, and that baggage never carries user data to
+  third parties.
+- **What you can skip.** Writing propagators, or collector internals beyond knowing tail sampling needs
+  trace-id routing. Most of the work is verifying each hop, not code.
 
 ## Why it exists
 - **One turn crosses many processes.** An API gateway, an orchestrator, a retrieval service, a model
@@ -94,6 +108,17 @@ traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
 | **Third-party providers** | the provider will not continue your trace, so the client span is the leaf | record the provider's request id from response headers (names such as `request-id` or `x-request-id`), *because* it is the only handle their support team can use |
 | **Thread pools** | not a network hop, same failure: Python does not copy context into executor threads by default | asyncio tasks copy it at creation and `asyncio.to_thread` copies it; `loop.run_in_executor` and bare `ThreadPoolExecutor.submit` do not. Wrap callables with `contextvars.copy_context().run` or use an instrumented executor |
 
+### Agent-specific hops
+- **Sub-agents in other services.** When an orchestrator delegates to a remote agent (over HTTP or an
+  agent-to-agent protocol), propagate context on the delegation call so the sub-agent's whole loop nests
+  under the orchestrator's step. If the remote agent belongs to another team or company, treat it like the
+  edge: link rather than continue.
+- **Human approval waits.** A step paused for approval and resumed hours later is an asynchronous hop:
+  carry the context and the durable execution id in the stored pending action, and expect a new trace on
+  resume with a link back.
+- **Parallel tool calls.** Concurrent calls from one step run in asyncio tasks or threads; each must start
+  with the step's context, or their spans become orphans while the step shows an unexplained gap.
+
 ### The edge is a trust boundary
 - **A `traceparent` from the public internet is untrusted input.** A client can set the sampled flag on
   every request and force you to record (and pay to store) all of them, or reuse a trace id so unrelated
@@ -114,20 +139,20 @@ traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
 - **Keep hosts under NTP or equivalent;** most trace viewers do not correct for it.
 
 ## Diagram
-One turn crossing three services and a queue: every hop injects context and the next extracts it, so all
-spans share one trace id; the provider is the leaf.
+One agent turn crossing a tool server, a model gateway and a queue: every hop injects context and the
+next extracts it, so all spans share one trace id; the provider is the leaf.
 
 ```mermaid
 sequenceDiagram
     participant G as API gateway
-    participant O as Orchestrator
-    participant R as Retrieval service
+    participant O as Agent orchestrator
+    participant R as Tool server
     participant M as Model gateway
     participant P as Provider
     participant Q as Queue worker
     G->>O: traceparent 00-T-g-01
     O->>R: traceparent 00-T-o1-01
-    R-->>O: hits
+    R-->>O: tool result
     O->>M: traceparent 00-T-o2-01
     M->>P: no trace context continues
     P-->>M: completion plus request-id
@@ -198,6 +223,22 @@ print(f"bare submit: {lost}   copied context: {kept}")
 # bare submit: None   copied context: req-42
 ```
 
+### Worked scenario: an agent turn with a broken MCP hop
+An agent's turn takes 8.2 s. Before the fix, the tool server does not extract context (illustrative
+numbers).
+
+| Span | Before: what the orchestrator trace shows | After propagation is fixed |
+|---|---|---|
+| `agent.run` | 8.2 s | 8.2 s |
+| `generation` ×2 | 1.9 s total | 1.9 s total |
+| `tool.search_tickets` (CLIENT) | 6.1 s, no children | 6.1 s |
+| `tool.search_tickets` (SERVER, tool server) | separate one-span trace, 0.2 s | 0.2 s, child of the client span |
+| `db.query` (tool server) | in that separate trace | 0.15 s |
+| Client-to-server gap | invisible | 5.9 s: connection pool wait in the transport |
+
+- **Diagnosis:** the tool was never slow; the orchestrator's connection pool to the tool server was
+  capped and requests queued. Visible only once the server span joined the agent's tree.
+
 ### Worked numbers: independent vs propagated sampling
 Five hops, each keeping 10% of spans.
 
@@ -223,6 +264,10 @@ Five hops, each keeping 10% of spans.
 - **Gateway spans with provider ids.** The model gateway emits a span per upstream attempt with provider,
   model, fallback reason and the provider's request id. Monitor fallback rate and per-provider latency
   from those spans.
+- **Propagation tests for every agent hop.** In integration tests, run one agent task through the real
+  gateway, tool servers and queue, then assert all spans share one trace id and every tool CLIENT span
+  has a SERVER child. Monitor the share of tool and sub-agent client spans with a remote child, per tool
+  server.
 - **Baggage allowlist.** Strip baggage on egress to third parties and allow only named keys internally.
   Monitor outbound headers in a staging egress proxy for unexpected baggage keys.
 
@@ -236,6 +281,9 @@ Five hops, each keeping 10% of spans.
 - **Auto vs manual propagation.** Auto-instrumentation of HTTP clients and servers gives propagation for
   free, but invisibly, so when a hop silently loses context nobody knows where to look. Manual inject and
   extract at boundaries is more work and far easier to audit.
+- **Continuing vs linking a remote sub-agent.** Continuing the trace gives one waterfall for the whole
+  delegation, but lets the remote side's sampling and span volume into your tree. It flips to a link when
+  the sub-agent is owned by another team or vendor.
 - **Baggage vs explicit fields.** Baggage tags every service's spans and logs with tenant and experiment
   without API changes, but leaks to every downstream call by default. It flips to explicit API fields once
   third-party calls are in the path.
@@ -253,6 +301,9 @@ Five hops, each keeping 10% of spans.
   that track one client's behaviour, or unrelated requests in the same tree.
 - **Each service sampling independently.** Symptom: traces complete for short paths and almost never
   complete for deep ones.
+- **Parallel tool calls launched without the step's context.** Symptom: an agent step with a multi-second
+  gap and a cluster of orphan tool traces starting at the same instant. Fix: start each concurrent call
+  from the step's context (asyncio tasks created inside the step span, or copied context for threads).
 - **Treating a child-before-parent waterfall as a bug.** Symptom: minutes lost before someone checks the
   hosts' clocks.
 
@@ -302,6 +353,14 @@ spans that have a server child climb towards 100%.
 - **Check the gateway itself:** it must extract incoming context, emit its own span and inject on the
   outbound call; look for a fresh single-span trace on the gateway with the same timing.
 
+### An orchestrator agent delegates to an internal sub-agent service and a vendor's agent. How do you trace both?
+- **Internal sub-agent: continue the trace.** Inject context on the delegation call so the sub-agent's
+  run, steps and tool calls nest under the orchestrator step that delegated, with one sampling decision.
+- **Vendor agent: treat it as the edge.** Do not expect it to continue your trace, and do not send
+  baggage; record its task or request id on your client span and, if it sends context back, link to it.
+- **Either way,** put a shared execution id on both sides so a long delegation stays findable after trace
+  retention expires.
+
 ### Why not just honour every incoming `traceparent`?
 - **It is untrusted input at the edge:** a client can force-sample every request, raising your storage
   bill, or reuse trace ids so unrelated requests merge.
@@ -344,3 +403,24 @@ spans that have a server child climb towards 100%.
 - [ ] Because providers reject requests that carry a traceparent header
 > You cannot see inside the provider, but their support can if you give them the identifier they
 > returned. Capturing it on the leaf span turns "the API was slow" into something they can investigate.
+
+## Use cases & projects
+### Use cases
+- **Agents with remote tool servers.** Propagation through MCP or HTTP tool servers shows whether a slow
+  tool call is the tool or the transport.
+- **Model gateways in the agent path.** Gateway spans with fallback reasons and provider request ids
+  explain latency spikes and provider incidents per agent step.
+- **Queue-backed long-running agents.** Context carried in messages keeps worker-executed steps in the
+  same tree, with an execution id for steps that run much later.
+- **Multi-agent systems across services.** One trace per delegated task shows where an orchestrator and
+  its sub-agents spent time.
+
+### Mini project
+**Propagate one agent turn across three processes (2-3 hours).**
+- **Goal:** one trace id from the agent loop through a tool server and a queue worker.
+- **Steps:** run an agent process, a small HTTP tool server and a queue worker locally, all with the
+  OpenTelemetry SDK exporting to a local collector or the console; inject on the tool call and into the
+  queue message, extract on the other side; then deliberately break one hop (strip the header) and
+  observe the result.
+- **Done when:** a healthy run shows every span under one trace id, the broken run shows the orphan trace
+  and the gap, and a test asserts every tool client span has a server child.

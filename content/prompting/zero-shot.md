@@ -5,7 +5,8 @@ name: Zero-shot prompting
 kind: pattern
 difficulty: intro
 est_minutes: 10
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - prompting/few-shot
   - prompting/chain-of-thought
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-Zero-shot prompting describes the task in words with no demonstrations. Instruction tuning makes a clearly
-described new task in distribution, so it is the default start: shortest prompt, no example bias. It fails
-where the specification cannot be written down precisely.
+Zero-shot prompting describes a task in words with no demonstrations, and most agent steps run this way:
+tool descriptions, routers, stop decisions. It is the default start (shortest prompt, no example bias)
+and fails only where the spec cannot be written down.
+
+## For agent builders
+- **Why it matters for agents.** A tool description is a zero-shot spec: the model has never seen your
+  `search_orders` tool, only its name, description and schema. Routers, planners and "am I done?" checks
+  are zero-shot too, so their precision decides the loop's.
+- **Where it shows up in your stack.** Tool definitions in provider APIs and agent frameworks, the
+  router step in front of sub-agents, forced tool calls with enum schemas for classification, and LLM
+  judges in your evals.
+- **What you control.** Label and tool names, one-line definitions, enums and an escape label such as
+  `other`, edge rules, and how many samples you take when probing consistency.
+- **What you can skip.** The history of FLAN-style instruction tuning beyond one point: it is why a clear
+  description of a new task works at all.
 
 ## Why it exists
 - **Every task used to need its own model.** Before large language models, each task needed its own
@@ -65,6 +78,18 @@ Each clause narrows the distribution and removes a specific class of error:
    synonyms and boundary cases resolve the same way each time.
 4. **The format**: a schema, tags or a fixed template, so code can parse the response.
 5. **Edge rules**: what to do when the input is empty, off-topic or fits two labels.
+
+### Zero-shot inside an agent
+The same anatomy applies to every agent surface the model reads without examples:
+
+| Agent surface | Task verb | Output space | Escape |
+|---|---|---|---|
+| Tool description | "use this to look up order status" | call or do not call | "if no tool fits, ask the user" |
+| Router | "pick the sub-agent for this request" | enum of sub-agents | `other` goes to a human |
+| Stop check | "decide whether the task is complete" | done or continue | step budget in code |
+
+- **Tool names are labels.** `get_order_status` is read as a word; `tool_7` is not, so the model maps it
+  by surface similarity or ignores it.
 
 ### Labels are interpreted by their names
 - **Names carry meaning.** With no demonstrations the model reads each label as a word: "positive" and
@@ -170,7 +195,7 @@ for ticket, expected in EVAL:
 ```
 
 ### Closing the label set with a forced tool call
-A production variant: instead of a format clause in words, force a tool call whose input schema has an
+A production variant, and the usual shape of an agent's router step: instead of a format clause in words, force a tool call whose input schema has an
 enum, so the label is always one of the set, `other` included as the exit.
 
 ```python
@@ -212,6 +237,21 @@ Five samples each, illustrative counts.
 After the two definition edits, a rerun shows 2 tickets still split. Only those justify few-shot
 examples, chosen from exactly that boundary.
 
+### Worked scenario: a zero-shot router in front of three sub-agents
+A support agent routes each conversation to a billing, technical or account sub-agent, with `other`
+going to a human. Weekly numbers from traces (illustrative).
+
+| Week | Conversations | Routed to `other` | Misroutes found in a 100-trace sample |
+|---|---|---|---|
+| 1 | 5,000 | 4% | 3 |
+| 2 | 5,200 | 4% | 4 |
+| 3 (new "data export" feature ships) | 5,600 | 11% | 9 |
+
+- **The escape label caught the drift.** Most new `other` traffic was export questions the router's
+  definitions never mentioned.
+- **The fix was a definition, not examples.** Adding "data export and CSV issues" to the technical
+  sub-agent's description brought `other` back to 5% the next week.
+
 ## Production patterns
 - **Zero-shot baseline first.** For every new task, ship the precise zero-shot spec to the eval before
   writing any example, and record its score. Every later technique (few-shot, CoT, fine-tuning) must beat
@@ -226,6 +266,9 @@ examples, chosen from exactly that boundary.
   definition version each prediction used.
 - **Re-baseline on model change.** Zero-shot prompts port well, but instruction-following quality differs;
   rerun the baseline before switching models, especially to smaller ones.
+- **Tool descriptions written as specs.** For each agent tool, state what it does, when to use it, when
+  not to, and what each argument means with units and formats. Monitor tool-selection accuracy and
+  argument-validation failures per tool on a routing eval.
 
 ## Trade-offs
 - **Shortest and cheapest vs reliance on the prior.** The lowest cost per call comes with total reliance on
@@ -253,6 +296,9 @@ examples, chosen from exactly that boundary.
   under the nearest real label, inflating that label's counts downstream.
 - **Using a base, non-instruction-tuned model zero-shot.** Symptom: the model continues or paraphrases your
   instruction instead of executing it.
+- **Opaque or overlapping tool names in an agent.** Symptom: the agent calls the wrong one of two similar
+  tools, or never calls a tool named by an internal code. Fix: descriptive names and a "use this when, not
+  when" line in each description.
 
 ## When to use
 - **Start here, always.** Make the description precise before anything else; the zero-shot eval is the
@@ -312,11 +358,17 @@ zero-shot baseline rather than assumed to help.
 - **Periodic consistency samples:** rerun a slice several times and watch the unanimity rate, plus spot
   accuracy against fresh human labels.
 
-### Does "think step by step" still help zero-shot on modern models?
-- **It adds intermediate tokens**, giving multi-step problems more sequential computation without any
-  demonstration.
-- **It is model-dependent.** Models with built-in reasoning already do this, so measure the gain on your
-  eval rather than assuming it, and weigh it against the extra output tokens.
+### Your agent ignores a new tool you added. How do you debug it zero-shot?
+- **Read the description as the model does.** Its name and description are the whole spec; check that
+  they say what it does and when to prefer it over existing tools.
+- **Probe selection directly.** Run tasks that should use it several times and count first-tool choices;
+  split votes point to overlap with another tool's description.
+
+### How do you make an agent's router step reliable without examples?
+- **Enumerate and define the sub-agents** as an enum in a forced tool call, so every route is valid.
+- **Add an escape route** such as `other` to a human, and alarm on its rate as a drift signal.
+- **Probe consistency**, several samples per conversation, and add examples only for routes that still
+  split.
 
 ## Quiz
 ### Q: Why can an instruction-tuned model perform a task it never saw during training, given only a description?
@@ -344,3 +396,23 @@ zero-shot baseline rather than assumed to help.
 > The trigger changes what the model generates, not how it is decoded: intermediate tokens give a
 > multi-step problem more sequential computation. Models with built-in reasoning may already do this, so
 > the gain is model-dependent.
+
+## Use cases & projects
+### Use cases
+- **Agent tool definitions.** Every tool the agent has never seen is learned zero-shot from its name,
+  description and argument schema.
+- **Routers in front of sub-agents.** An enum-constrained forced tool call with an `other` route sends
+  each request to the right specialist or a human.
+- **Completion and stop checks.** A zero-shot "is the task done?" step decides when the loop ends, backed
+  by a step budget in code.
+- **LLM judges in agent evals.** A rubric described in words scores trajectories without labeled
+  demonstrations.
+
+### Mini project
+**Zero-shot router with drift alarm (1-2 hours).**
+- **Goal:** build and probe the router step of a three-sub-agent support agent.
+- **Steps:** define 3 sub-agents plus `other` as an enum in a forced tool call; write 30 test messages
+  including 5 off-topic ones; sample each 5 times; fix definitions for split or wrong cases; then add 10
+  messages about a feature the definitions never mention and watch the `other` rate.
+- **Done when:** you report unanimity rate and accuracy before and after definition fixes, and show the
+  `other` rate rising on the new-feature messages.

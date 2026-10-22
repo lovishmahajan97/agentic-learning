@@ -388,3 +388,23 @@ transfer time first, then predict the gain of each option before they buy anythi
 > Page-locked memory cannot be swapped out, so the DMA engine can read it directly. Pageable memory
 > forces the driver to copy into a pinned staging buffer first, roughly halving effective transfer
 > bandwidth.
+
+## Use cases & projects
+### Use cases
+- **Local agent development.** Partial GPU offload with llama.cpp lets you prototype an agent against a
+  model larger than your laptop GPU, as long as you accept slow steps.
+- **Paused and waiting agents.** Moving the idle KV of agents blocked on tools or humans to host RAM frees
+  GPU blocks for agents that are actively decoding.
+- **Offline agent evals and batch runs.** Large batches amortise each PCIe transfer, so offloading can make
+  an overnight eval sweep possible on hardware that cannot serve the model interactively.
+- **Load-time guards.** Detecting a silent `device_map="auto"` spill to CPU explains an agent that suddenly
+  takes minutes per step.
+
+### Mini project
+**Measure what offloading does to an agent step (1-2 hours).**
+- **Goal:** quantify the per-token and per-run cost of offloading part of a model behind a small agent.
+- **Steps:** run a quantized GGUF model in llama.cpp with `-ngl` set to all layers, then to about 90% and
+  50% of layers; drive a 5-step scripted tool-calling loop against each; record tokens per second and
+  total run time; add a startup check that fails if any layer lands on the CPU when you expect full GPU.
+- **Done when:** you have a table of layers on GPU versus tokens per second and run time, and the guard
+  fails loudly on the 50% setup.

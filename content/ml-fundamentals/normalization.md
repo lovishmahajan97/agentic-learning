@@ -5,7 +5,8 @@ name: Normalization (LayerNorm, RMSNorm)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: background
 related:
   - ml-fundamentals/residual-connections
   - ml-fundamentals/warmup
@@ -23,8 +24,21 @@ sources:
 
 ## TL;DR
 Normalization rescales each token's activation vector before a sublayer, so attention and the MLP see a
-stable scale. LayerNorm centers and scales; RMSNorm only scales, cheaper and as good. Pre-LN versus Post-LN
-placement decides training stability.
+stable scale. For agent builders it is a checkpoint detail: self-host or fine-tune with the exact norm
+type, `ε` and precision, or outputs drift.
+
+## For agent builders
+- **Why it matters for agents.** You will not design a norm, but you will self-host, port and fine-tune
+  open models that run your agents. A norm mismatch (`ε`, gain convention, 16-bit statistics) gives
+  logits that match to two digits and tool calls that drift after a few hundred tokens.
+- **Where it shows up in your stack.** `rms_norm_eps` in Llama-style Hugging Face configs, `layer_norm_eps`
+  in BERT-style ones (embedding and reranker models in RAG), fused RMSNorm kernels in serving engines, and
+  norm parameters left trainable in PEFT fine-tunes.
+- **What you control.** Loading the checkpoint with its own norm settings, keeping norm statistics in fp32
+  in any custom code, excluding norm gains from weight decay, and parity-testing a port before it serves
+  agent traffic.
+- **What you can skip.** The scale-invariance and Post-LN gradient derivations: know that modern decoders
+  are Pre-LN with RMSNorm, which is why agent fine-tunes need only a short warmup.
 
 ## Why it exists
 - **Each layer assumes a fixed input scale.** Without normalization a small change in layer 3 shifts the
@@ -41,13 +55,23 @@ placement decides training stability.
   per-layer synchronization.
 - **LayerNorm (2016) normalizes per token, across features.** Each token uses only its own `d_model`
   numbers, so the result is identical at batch size 1 and 1,024, in training and inference, and
-  independent of padding.
+  independent of padding. That is why one agent request's output does not depend on who else is batched
+  with it on the server.
 - **The function is not optional, even if the layer is.** Careful init plus a low learning rate trains
-  shallow transformers but does not scale; norm-free attempts use substitutes (zero-initialized scalar gates per branch, bounded
-  element-wise functions) to recover the same stability.
+  shallow transformers but does not scale; norm-free attempts use substitutes (zero-initialized scalar
+  gates per branch, bounded element-wise functions) to recover the same stability.
 
 ## How it works
-### LayerNorm
+### What the agent builder does with it
+1. **Read the norm settings from the checkpoint config,** never from memory: type, `ε`, gain convention
+   and cast order are part of the model.
+2. **Keep statistics in fp32** in any custom kernel or port, because the variance is a long sum.
+3. **Exclude norm gains and biases from weight decay** when fine-tuning an agent model; PEFT recipes often
+   leave them trainable since they are tiny.
+4. **Parity-test before serving:** compare logits and long greedy generations (including tool-call JSON)
+   against the reference implementation.
+
+### Background: LayerNorm
 For one token's activation vector `x ∈ R^d`:
 
 ```
@@ -71,7 +95,7 @@ Two properties do the optimization work:
 2. **Orthogonal gradient.** The gradient through the norm is projected orthogonal to the input direction,
    removing the part of an update that would only have rescaled the activation.
 
-### RMSNorm
+### Background: RMSNorm
 ```
 rms = sqrt( (1/d) Σ_i x_i² + ε )
 y_i = γ_i × x_i / rms
@@ -86,7 +110,7 @@ y_i = γ_i × x_i / rms
   compute it in fp32 and cast back; some (Gemma, for example) parameterize the gain as `1 + γ`, so a
   zero-initialized `γ` means identity scaling.
 
-### Where the norm sits: Post-LN versus Pre-LN
+### Background: Post-LN versus Pre-LN
 The original transformer normalized *after* the residual addition (Post-LN):
 
 ```
@@ -129,7 +153,8 @@ squares.
 ### Training details
 - **No weight decay on `γ` and `β`** (nor on biases), conventionally: decaying the gain toward zero fights
   the normalization's purpose.
-- **Often left trainable in PEFT:** norm parameters are a tiny fraction of the model.
+- **Often left trainable in PEFT:** norm parameters are a tiny fraction of the model, so agent LoRA
+  recipes sometimes train them alongside the adapter.
 
 ## Diagram
 A Pre-LN decoder layer: the norms sit on the branch inputs, the residual stream (the straight path) is
@@ -150,6 +175,24 @@ flowchart TD
 ```
 
 ## Examples
+### Worked scenario: a self-hosted agent model that drifts on long trajectories
+A team ports an open RMSNorm model into a custom inference path for its coding agent. Short prompts look
+fine; long multi-step runs produce more malformed tool calls than the hosted reference. Rates below are
+illustrative.
+
+| Check | Reference | Port | What it revealed |
+|---|---|---|---|
+| Logits on 20 fixed prompts | baseline | match to two digits | not enough: the gap is small per token |
+| Valid tool-call JSON over 200 long trajectories | ~99% | ~93% | errors compound over hundreds of tokens |
+| `ε` in the port | `rms_norm_eps` from config | hard-coded default | first mismatch |
+| Where `γ` is applied | before casting back to bf16 | after the cast | second mismatch |
+| After fixing both, plus fp32 statistics | ~99% | ~99% | per-layer hidden states now match |
+
+- **The lesson:** a port is not done when short logits match; test long greedy generations with the agent's
+  real tool schemas.
+- **The fastest localization** is comparing per-layer hidden states against the reference to find the
+  first layer that diverges.
+
 ### LayerNorm and RMSNorm from scratch, plus the Pre-LN block
 A from-scratch LayerNorm and RMSNorm checked against the built-in, with one token's numbers in the
 comments, then the Pre-LN block every modern decoder layer reduces to. The offset test is the point:
@@ -189,7 +232,7 @@ class PreLNBlock(torch.nn.Module):     # norm on the sublayer INPUT; the residua
 ### Production snippet: keep norm gains out of weight decay
 Handing `model.parameters()` to AdamW as one group decays every norm gain toward zero. The common fix
 splits parameters by dimensionality: matrices are decayed, while 1-D tensors (norm gains, norm biases,
-linear biases) are not.
+linear biases) are not. It applies equally when an agent fine-tune leaves norms trainable.
 
 ```python
 import torch
@@ -221,17 +264,20 @@ def adamw_with_no_decay_norms(model, lr=3e-4, weight_decay=0.1):
   Hugging Face configs, `layer_norm_eps` in BERT-style ones), gain convention (`w` or `1 + w`) and cast
   order from the reference implementation. Verify a port by comparing logits on fixed prompts, then long
   greedy generations, against the reference.
+- **Gate agent model ports on long-trajectory parity.** Before a self-hosted or converted model serves an
+  agent, replay a fixed set of multi-step traces with greedy decoding and require tool-call validity and
+  task success to match the reference. Monitor per-layer hidden-state differences when they do not.
 - **fp32 statistics in every custom kernel.** Upcast before squaring, cast back at the end, as the
   reference RMSNorm does. Add a unit test that compares the kernel's bf16 output with an fp32 reference on
   activations containing values above 256.
 - **No-decay group for norms and biases.** Split parameters by `p.ndim < 2` (or by name) into a
   zero-weight-decay group. Print group sizes at startup and alert if the no-decay group is empty.
-- **Track residual and logit growth.** Log the residual-stream norm per layer and the maximum attention
-  logit during training; both growing without bound predicts a loss spike. Add QK-norm when training at
-  large scale or with aggressive learning rates.
 - **Fused norm kernels for serving.** Because the norm is bandwidth-bound at inference, use the engine's
   fused RMSNorm (often fused with the residual add) rather than a chain of element-wise ops, and benchmark
   per-token latency before and after.
+- **Track residual and logit growth when training from scratch.** Log the residual-stream norm per layer
+  and the maximum attention logit; both growing without bound predicts a loss spike. Add QK-norm when
+  training at large scale or with aggressive learning rates.
 
 ## Trade-offs
 - **RMSNorm vs LayerNorm.** RMSNorm saves one reduction and the bias parameters per layer and matches
@@ -250,17 +296,17 @@ def adamw_with_no_decay_norms(model, lr=3e-4, weight_decay=0.1):
   layout pretrained weights and fused kernels assume.
 
 ## Pitfalls
-- **Normalizing over the wrong axis.** `LayerNorm(normalized_shape)` normalizes the trailing dimensions, so
-  a `[B, d, T]` tensor is normalized across time instead of features. The model trains but worse; the first
-  clue is a norm whose parameter count equals the sequence length.
+- **Porting weights across implementations that differ in detail:** gain `1 + w` versus `w`, multiplying
+  by `γ` before or after casting back to bf16, and `ε`. Symptom: logits that match to two digits and
+  generations (and agent tool calls) that diverge after a few hundred tokens.
 - **Statistics in bf16 or fp16 in a custom implementation.** Symptom: a slow quality gap against the
   reference (bf16) or NaNs after a few hundred steps (fp16 overflow in the sum of squares). Upcast to fp32
   inside the op.
 - **Weight decay on norm gains and biases,** because the optimizer got `model.parameters()` as one group.
   The gains drift toward zero and per-layer effective learning rates wander. Use a no-decay group.
-- **Porting weights across implementations that differ in detail:** gain `1 + w` versus `w`, multiplying
-  by `γ` before or after casting back to bf16, and `ε`. Symptom: logits that match to two digits and
-  generations that diverge after a few hundred tokens.
+- **Normalizing over the wrong axis.** `LayerNorm(normalized_shape)` normalizes the trailing dimensions, so
+  a `[B, d, T]` tensor is normalized across time instead of features. The model trains but worse; the first
+  clue is a norm whose parameter count equals the sequence length.
 - **Forgetting the final norm in a Pre-LN model.** The raw residual stream's norm grows with depth, so
   logits are huge, the softmax saturates, and the loss sits high from step one.
 - **Copying warmup across layouts.** Post-LN settings on Pre-LN waste thousands of steps at a needlessly
@@ -268,15 +314,15 @@ def adamw_with_no_decay_norms(model, lr=3e-4, weight_decay=0.1):
 
 ## When to use
 You do not choose whether a transformer has normalization; you choose which, where, and how it is
-computed.
+computed. Agent builders mostly meet it when self-hosting or fine-tuning.
+- **Fine-tuning or serving existing models for agents:** match the checkpoint exactly; norm type, `ε`, gain
+  parameterization and cast order are part of the model.
 - **New decoder models:** Pre-LN with RMSNorm, fp32 statistics, a final norm before the head and no weight
   decay on norm parameters, the default the open-weight ecosystem has converged on.
 - **Add QK-norm** when training at large scale or with aggressive learning rates and attention logits are
   seen growing.
-- **Fine-tuning or serving existing models:** match the checkpoint exactly; norm type, `ε`, gain
-  parameterization and cast order are part of the model.
 - **Measure:** the residual-stream norm per layer and attention-logit magnitudes during training; both
-  growing without bound predicts a loss spike.
+  growing without bound predicts a loss spike. For a port, measure long-trajectory parity.
 - **Interviews:** write both formulas, explain why per-token statistics beat per-batch ones for sequences,
   and derive why Pre-LN needs less warmup from the gradient path through the skip connection.
 
@@ -310,19 +356,22 @@ better final loss when it can be trained, but at 48 layers trainability dominate
 - **LayerNorm:** `γ × (x − μ) / sqrt(σ² + ε) + β`, with mean and variance over the token's own features.
 - **RMSNorm:** `γ × x / sqrt(mean(x²) + ε)`: no mean subtraction and no bias.
 - **What is lost:** re-centering, which matters only if an input develops a large common offset; the
-  stabilizing scale invariance is kept, at one reduction instead of two.
+  stabilizing scale invariance is kept, at one reduction instead of two. Scale invariance helps because
+  `LN(a·x) = LN(x)` while the gradient shrinks like `1/a`, self-stabilizing training.
 
-### Why does the scale invariance of a norm help optimization?
-- **Forward unchanged:** `LN(a·x) = LN(x)`, so growing weights before the norm do not change the output.
-- **Gradient shrinks like `1/a`:** large weights automatically get a smaller effective learning rate, which
-  self-stabilizes training.
-- **Plus an orthogonal gradient** that discards updates which would only rescale the activation.
-
-### A port of an open model matches logits to two digits but generations drift after a few hundred tokens. What do you check?
+### Your self-hosted port of an open model matches logits to two digits but the agent's tool calls drift after a few hundred tokens. What do you check?
 - **The norm details first:** `ε`, gain convention (`w` versus `1 + w`), and whether `γ` is applied before
   or after casting back to bf16.
 - **Then precision:** statistics must be computed in fp32, as the reference does.
-- **Verify** by comparing per-layer hidden states against the reference to find the first divergence.
+- **Verify** by comparing per-layer hidden states against the reference to find the first divergence, and
+  gate the port on long-trajectory tool-call parity, not short logits.
+
+### You batch many agent sessions on one GPU. Can one session's output depend on what else is in the batch?
+- **Not through normalization:** LayerNorm and RMSNorm use only each token's own features, so results are
+  the same at batch size 1 and 1,024 and independent of padding.
+- **BatchNorm would leak** batch composition into every token, one reason transformers do not use it.
+- **Remaining differences** come from numerics (kernel choice and reduction order under batching), not the
+  norm's definition, so evaluate with run-to-run variance.
 
 ### When would you add QK-norm to a model?
 - **When attention logits grow** during training at large scale or with aggressive learning rates, which
@@ -365,3 +414,24 @@ better final loss when it can be trained, but at 48 layers trainability dominate
 > Post-LN puts a norm on the residual stream at every layer, which at initialization leaves gradients near
 > the output large and those near the input small; warmup compensates for that. Pre-LN leaves the skip path untouched, so the
 > imbalance never arises. RMSNorm versus LayerNorm is independent of placement.
+
+## Use cases & projects
+### Use cases
+- **Self-hosting open models for agents.** Loading or converting a checkpoint with the wrong `ε` or gain
+  convention is a classic cause of long-generation drift in tool calls.
+- **Embedding and reranker models in RAG.** BERT-style encoders carry `layer_norm_eps`; ports and ONNX
+  exports must match it to keep retrieval scores identical.
+- **Agent fine-tunes with PEFT.** Norm parameters are sometimes trained alongside the adapter and must sit
+  in the no-decay optimizer group.
+- **Custom inference kernels.** Fused RMSNorm with fp32 statistics keeps serving fast without changing
+  outputs.
+
+### Mini project
+**Norm-mismatch drill for an agent model (1-2 hours).**
+- **Goal:** see how small norm mismatches change an agent model's long outputs, and build the parity check
+  that catches them.
+- **Steps:** load a small open RMSNorm model; patch its norm layers three ways (wrong `ε`, statistics in
+  bf16, `γ` applied after the cast); for each, run 20 fixed tool-calling prompts with greedy decoding for a
+  few hundred tokens; record first-token logit difference, the first diverging token and JSON validity.
+- **Done when:** you have a table showing that short logits barely move while long generations diverge,
+  and a reusable parity script that compares per-layer hidden states against the unpatched model.

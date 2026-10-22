@@ -396,3 +396,23 @@ plain retrieval for lookups. Validate with an eval split by question type before
 - [ ] A question answered by a keyword match on a product code
 > Local search starts at matched entities and follows relationships to neighbours and their source chunks,
 > joining facts that never co-occur. Single-chunk and keyword lookups are served as well by hybrid search.
+
+## Use cases & projects
+### Use cases
+- **Incident and postmortem analysis agents.** Global search answers "what keeps going wrong across all
+  incidents?" from community summaries in one tool call.
+- **Due-diligence and research agents.** Local search links people, companies and events mentioned in
+  different documents that no single chunk connects.
+- **Customer-feedback mining.** Themes across thousands of tickets or reviews come from pre-written
+  community summaries instead of dozens of vector searches.
+- **Tool routing.** An agent that holds global, local and plain search as separate tools picks the cheap
+  one for lookups and the graph one for corpus-wide questions.
+
+### Mini project
+**Pilot GraphRAG against hybrid search on a slice (2-3 hours).**
+- **Goal:** decide with numbers whether GraphRAG earns its indexing cost for your agent's questions.
+- **Steps:** pick a few hundred documents; index them with Microsoft's `graphrag` package and record
+  tokens and cost; write 10 global and 10 lookup questions; answer each with global or local search and
+  with hybrid search plus reranking; expose both as agent tools and log which one the agent chooses.
+- **Done when:** you have a table of indexing cost, per-query cost, latency and graded answer quality per
+  question type, plus a go or no-go note on scaling to the full corpus.

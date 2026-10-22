@@ -455,3 +455,25 @@ long, loosely relevant document.
 > The classic form ln((N − n + 0.5)/(n + 0.5)) goes negative when n exceeds about half of N, meaning a
 > document could be penalized for containing a query term. Adding 1 inside the log bounds IDF below by
 > zero while leaving rare-term weights nearly unchanged.
+
+## Use cases & projects
+### Use cases
+- **Identifier lookups for agents.** Agents pass ticket ids, error codes and function names between tools,
+  and BM25 with a well-chosen analyzer is what finds them reliably.
+- **Keyword arm of hybrid search.** BM25 is the sparse half that fusion combines with dense retrieval in
+  most agent RAG stacks.
+- **Score handling in search tools.** Because BM25 scores are query-relative and grow with query length,
+  teams turn them into ranks or calibrated signals before an agent or threshold uses them.
+- **Field-boosted enterprise search.** Boosting titles or headings over body text helps an agent land on
+  the right policy or runbook section.
+
+### Mini project
+**Tune BM25 for agent-written queries (1-2 hours).**
+- **Goal:** see how analyzer choices and k1/b change results for the long, fragment-heavy queries agents
+  write.
+- **Steps:** index 1k-5k docs with `rank_bm25` or a local search engine; collect 20 agent-style queries
+  with labeled answers, including ids with hyphens or dots; compare a default analyzer with one that keeps
+  identifiers whole; sweep k1 and b over a small grid; log top-1 scores per query to see how they scale
+  with query length.
+- **Done when:** you have recall@5 per analyzer and parameter setting, a plot of top score versus query
+  length, and a written rule for how your search tool will expose scores to the agent.

@@ -5,7 +5,8 @@ name: Mixed precision
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - ml-fundamentals/gradient-clipping
   - ml-fundamentals/gradient-accumulation
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-Mixed precision runs matmuls in a 16-bit float for tensor-core speed and half the activation memory, while
-an fp32 weight copy keeps tiny updates from rounding away. fp16 needs loss scaling; bf16 has fp32's range,
-so it is the default where supported.
+Mixed precision runs matmuls in a 16-bit float for speed and half the activation memory, while fp32
+copies keep tiny updates alive. For agent builders it is the `bf16=True` that makes long-trace fine-tunes
+fit, and why serving differs from fp32.
+
+## For agent builders
+- **Why it matters for agents.** Agent traces are long, so activation memory decides how many fit per
+  GPU; bf16 halves it. The same 16-bit weights then serve your agent, so precision also explains small
+  output differences between a reference run and production.
+- **Where it shows up in your stack.** `bf16=True` or `fp16=True` in the Hugging Face Trainer and TRL
+  trainers, `torch.autocast` in a custom loop, `torch.amp.GradScaler` for fp16, and the model dtype you
+  load for serving (bf16 or fp16 weights are the baseline in vLLM and similar engines).
+- **What you control.** bf16 versus fp16 for your GPU generation, keeping trainable weights (including
+  LoRA adapters) in fp32, the unscale-clip-step order on fp16, and pinning precision in your agent eval
+  harness so regressions are comparable.
+- **What you can skip.** fp8 training recipes and the bit layouts beyond "bf16 has fp32's range, fp16 does
+  not": agent fine-tunes use bf16 autocast, or fp16 with a scaler on older cards.
 
 ## Why it exists
 - **The number format sets the speed.** Training time is dominated by matmuls. On an A100 the datasheet
@@ -34,7 +48,7 @@ so it is the default where supported.
 - **Half the bytes, half the traffic.** A 16-bit activation is half the bytes to store and move; for
   bandwidth-bound parts of a step (normalization, softmax, element-wise ops) that halving is the whole
   speed-up. Activation memory, scaling with batch × sequence length, also halves: a larger micro-batch or
-  longer context on the same card.
+  longer context (longer agent traces) on the same card.
 - **"Cast everything to fp16" fails three ways** (documented by the 2018 mixed-precision paper):
   1. **Overflow:** fp16's largest value is 65,504; attention logits, loss sums and variance terms exceed
      it, becoming `inf` and then `NaN`.
@@ -47,7 +61,16 @@ so it is the default where supported.
   fast.
 
 ## How it works
-### The formats
+### What the agent builder needs to know
+- **Trainable weights need fp32 masters; frozen ones do not.** Swamped updates only hurt parameters that
+  get updated. In a LoRA fine-tune the frozen base can sit in bf16 (2 bytes per parameter, about 14 GB for
+  7B) while the small adapter keeps fp32 weights and Adam state.
+- **bf16 on Ampere or newer, fp16 plus a scaler on older cards.** That one choice covers most agent
+  fine-tunes and serving deployments.
+- **Serving uses the training dtype.** bf16 or fp16 weights are the baseline, so expect last-digit logit
+  differences from fp32 and occasional flips on near ties.
+
+### Background: the formats
 ```
            sign  exponent  mantissa   max value   smallest normal   spacing at 1.0
 fp32         1       8        23       3.4e38       1.2e-38          2^-23 ≈ 1.2e-7
@@ -93,7 +116,7 @@ master-copy style (Megatron,    bf16 params 2 + bf16 grads 2 + fp32 master 4 + m
   communication) and hold the fp32 master inside the optimizer.
 - **Model state is not reduced.** Under Adam a 7B model carries about 112 GB of model state regardless.
   Mixed precision shrinks activation memory and buys compute speed; cutting model state is the job of
-  sharding, 8-bit optimizers and quantization.
+  sharding, 8-bit optimizers, quantization and parameter-efficient methods such as LoRA.
 
 ### Loss scaling (fp16 only)
 By linearity the gradient of `S × loss` is `S` times the gradient of `loss` everywhere.
@@ -126,7 +149,7 @@ By linearity the gradient of `S × loss` is `S` times the gradient of `loss` eve
 
 ### Inference
 - **bf16 or fp16 weights are the serving baseline, not quantization:** the weights are stored in the type
-  they trained in.
+  they trained in, and that is what your agent runs on.
 - **Quantization** to int8, fp8 or int4 is a further step with its own calibration and quality
   evaluation, covered in the training-adaptation and serving modules.
 
@@ -150,6 +173,31 @@ flowchart TD
 ```
 
 ## Examples
+### Worked scenario: fitting a tool-calling fine-tune of a 7B model
+Model-state arithmetic for adapting a 7B model to an agent's tool-call format. The adapter size is
+illustrative (tens of millions of parameters is typical for LoRA).
+
+| Setup | Model state | Fits on one 80 GB card? |
+|---|---|---|
+| Full fine-tune, Adam, mixed precision | 7B × 16 bytes ≈ 112 GB | no: mixed precision does not shrink this |
+| LoRA: frozen base in bf16, 20M-parameter adapter in fp32 with Adam | 14 GB + 20M × 16 bytes ≈ 14.3 GB | yes, leaving room for activations |
+| Same LoRA run, activations for long traces | halved by bf16 autocast versus fp32 | more traces per micro-batch or longer context |
+
+- **Why it works:** only the adapter is updated, so only it needs fp32 masters; the base stays 2 bytes per
+  parameter.
+- **What still matters:** keep the adapter fp32, use autocast (not `model.half()` on trainable weights), and
+  check the loss against a short reference run.
+
+### Worked scenario: an agent eval that flips after a precision change
+A team runs a 200-task tool-calling eval with greedy decoding. The reference ran in fp32; production serves
+bf16 weights. A handful of tasks pick a different tool on the first step.
+
+| Check | Finding |
+|---|---|
+| Logit gap between top two tools on flipped tasks | tiny: near ties, where bf16 differs from fp32 in the third digit |
+| Tasks with a clear logit margin | identical choices |
+| Fix | run the eval in the serving dtype, report pass rate with run-to-run variance, and treat near-tie flips as noise, not regressions |
+
 ### The failure modes and a correct training step
 The first block shows the three failure modes on a CPU; the second is the training step. Note what is
 absent: no `model.half()`, no casting of the optimizer, no change to the learning rate. The model stays
@@ -223,9 +271,13 @@ except OverflowError as e:
 | fp32 master, fp16 cast for forward | 0.9000 master, 0.8999 cast | the full update is applied |
 
 ## Production patterns
-- **bf16 autocast by default.** On Ampere-class or newer GPUs and TPUs set `bf16=True` in the Hugging
-  Face Trainer (or wrap the forward in `torch.autocast(..., dtype=torch.bfloat16)`) and keep parameters
-  fp32. Measure step time and peak memory before and after: activations should roughly halve.
+- **bf16 autocast by default for agent fine-tunes.** On Ampere-class or newer GPUs and TPUs set
+  `bf16=True` in the Hugging Face Trainer (or wrap the forward in `torch.autocast(..., dtype=torch.bfloat16)`)
+  and keep trainable parameters fp32. Measure step time and peak memory before and after: activations
+  should roughly halve.
+- **Run agent evals in the serving dtype.** Evaluate the checkpoint in the precision production uses, keep
+  greedy decoding and a fixed seed, and report run-to-run variance so near-tie tool-choice flips are not
+  mistaken for regressions.
 - **Watch the loss scale on fp16.** Where fp16 is forced (T4, V100), log `scaler.get_scale()` and the
   count of skipped steps. A scale that keeps halving means the forward overflows; fix softmax, norm and
   loss precision rather than tuning the scaler.
@@ -233,13 +285,11 @@ except OverflowError as e:
   so any fp32 matmuls use tensor cores. Note it in run metadata, because results will differ slightly from
   true fp32.
 - **Checkpoint masters, export 16-bit.** Resumable checkpoints hold fp32 masters plus optimizer state;
-  inference exports can be bf16-only. Test resume by checking the loss continues without a bump.
+  inference exports (merged adapters for your agent server) can be bf16-only. Test resume by checking the
+  loss continues without a bump.
 - **Parity test against fp32.** Before adopting a new precision recipe, run a few hundred steps of a small
   model in both and require the loss curves to overlap within noise. Repeat whenever custom kernels or
-  norms change.
-- **fp8 only with a library and a validation budget.** At pre-training scale on Hopper, use Transformer
-  Engine's fp8 autocast with its per-tensor scaling, and compare loss against a bf16 baseline over a long
-  window before committing.
+  norms change. Leave fp8 to large pre-training runs with Transformer Engine and a long bf16 comparison.
 
 ## Trade-offs
 - **bf16 vs fp16.** bf16 removes loss scaling and overflow from the failure list but keeps only about
@@ -250,7 +300,7 @@ except OverflowError as e:
   activation traffic.
 - **Activation savings vs model state.** Halved activation memory raises the feasible micro-batch, but the
   16 bytes-per-parameter model state is untouched; if weights plus optimizer state do not fit, it is the
-  wrong tool.
+  wrong tool (reach for LoRA or sharding).
 - **fp32 masters vs pure bf16.** Masters cost 4 extra bytes per parameter and a cast per step; pure bf16
   with stochastic rounding saves that memory but makes convergence depend on the rounding scheme and on
   the learning rate staying above the rounding floor.
@@ -262,8 +312,8 @@ except OverflowError as e:
 
 ## Pitfalls
 - **`model.half()` or `.to(torch.bfloat16)` for training.** No master weights, so updates below the
-  rounding unit vanish and the loss plateaus early (bf16) or NaNs appear (fp16). Keep parameters fp32 and
-  use autocast.
+  rounding unit vanish and the loss plateaus early (bf16) or NaNs appear (fp16). Keep trainable parameters
+  fp32 and use autocast; only frozen base weights may live in 16 bits.
 - **Clipping before `scaler.unscale_()`.** Every step is clipped to near zero, the loss barely moves, and
   nothing raises an error.
 - **A `GradScaler` on a bf16 run.** Harmless but pointless, and a sign an fp16 recipe was copied without
@@ -278,20 +328,20 @@ except OverflowError as e:
   different trajectory, often with a loss bump. Save fp32 masters plus optimizer state; bf16-only exports
   are for inference.
 - **Blaming the model for precision gaps.** bf16 logits legitimately differ from fp32 in the third digit,
-  and a greedy-decoded answer can flip on a near tie.
+  and a greedy-decoded answer (or an agent's first tool choice) can flip on a near tie.
 - **Porting recipes across hardware blindly.** Moving fp16 to a GPU without bf16 (T4, V100), or the
   reverse, without re-checking the scaler, softmax precision and loss computation. Symptom: stable on A100,
   NaNs on T4.
 
 ## When to use
-- **Use bf16 autocast** for any training on Ampere-class or newer GPUs and on TPUs; **use fp16 with
-  dynamic loss scaling** only when hardware forces it.
-- **Always** keep fp32 master weights and fp32 reductions; frameworks default to this, and the main job is
-  not to undo it. Enable TF32 for whatever remains in fp32.
+- **Use bf16 autocast** for any training on Ampere-class or newer GPUs and on TPUs, including agent-trace
+  fine-tunes; **use fp16 with dynamic loss scaling** only when hardware forces it.
+- **Always** keep fp32 master weights for trainable parameters and fp32 reductions; frameworks default to
+  this, and the main job is not to undo it. Enable TF32 for whatever remains in fp32.
 - **Consider fp8** only for large pre-training runs with the budget to validate it.
 - **Measure:** step time (large gain if the step was matmul-bound), peak memory (activations should
   roughly halve), and a few hundred steps of loss against an fp32 run on a small model, overlapping within
-  noise.
+  noise. For agents, also the eval pass rate in the serving dtype.
 - **Interviews:** why fp16 needs loss scaling and bf16 does not, why master weights stay fp32, and which
   memory mixed precision does not reduce. Answers: exponent bits, the rounding of small updates, and
   optimizer state.
@@ -327,12 +377,20 @@ answer is that this recipe wants bf16 hardware, and the saving on T4s is not rea
 - **fp32 where it matters:** master weights, the optimizer update and long reductions (softmax, norms,
   loss) stay fp32, because small updates and long sums round away in 16 bits.
 
-### A fine-tune after model.to(torch.bfloat16) plateaus early but never NaNs. What is wrong?
-- **No master weights:** with bf16 weights, updates below about 2^-8 of a weight's magnitude round to no
-  change, so many parameters stop moving. (`model.half()` gives fp16, where the floor is about 2^-11 and
-  overflow NaNs are the more common symptom.)
-- **Confirm:** compare against an autocast run with fp32 parameters; the loss curves separate early.
-- **Fix:** keep parameters fp32 and use `torch.autocast`; do not cast the model or optimizer.
+### A LoRA fine-tune of your agent's model after model.to(torch.bfloat16) plateaus early but never NaNs. What is wrong?
+- **No master weights for the trainable part:** with bf16 adapter weights, updates below about 2^-8 of a
+  weight's magnitude round to no change, so many parameters stop moving. (`model.half()` gives fp16, where
+  the floor is about 2^-11 and overflow NaNs are the more common symptom.)
+- **Confirm:** compare against an autocast run with fp32 trainable parameters; the loss curves separate
+  early.
+- **Fix:** keep trainable parameters fp32 and use `torch.autocast`; the frozen base may stay bf16.
+
+### After switching agent serving from fp32 to bf16, a few eval tasks pick a different tool. Regression or noise?
+- **Check the margins:** if the flipped tasks had near-tied top logits, bf16's third-digit differences
+  explain them; tasks with clear margins should not change.
+- **Measure variance:** rerun the eval several times and in both dtypes, and compare the pass-rate change
+  with run-to-run noise.
+- **Fix the process:** evaluate in the serving dtype from now on, so the baseline matches production.
 
 ### Your GradScaler's scale keeps halving and steps keep being skipped. What do you do?
 - **Recognize it:** occasional skips early are normal; a collapsing scale means the *forward* overflows
@@ -345,13 +403,13 @@ answer is that this recipe wants bf16 hardware, and the saving on T4s is not rea
 - **Model state stays about 16 bytes per parameter** under Adam in either layout, roughly 112 GB for 7B.
 - **Mixed precision cuts activations and time,** not weights plus optimizer state.
 - **Use other tools for model state:** sharding (ZeRO, FSDP), 8-bit optimizers, or parameter-efficient
-  methods.
+  methods such as LoRA on a frozen 16-bit base.
 
 ### When would you choose fp8 training, and when not?
 - **Choose it** for large pre-training on Hopper-class GPUs, where roughly doubling tensor-core throughput
   over bf16 pays for the engineering; DeepSeek-V3 reported fp8 training with fine-grained scaling.
-- **Avoid it** for most fine-tuning: three mantissa bits need per-tensor scaling, library support and long
-  validation against a bf16 baseline.
+- **Avoid it** for most fine-tuning, agent fine-tunes included: three mantissa bits need per-tensor
+  scaling, library support and long validation against a bf16 baseline.
 
 ## Quiz
 ### Q: Why does fp16 training need loss scaling while bf16 training normally does not?
@@ -379,3 +437,24 @@ answer is that this recipe wants bf16 hardware, and the saving on T4s is not rea
 > The master weights and both Adam moments stay fp32, so model state is still about 16 bytes per
 > parameter. Sharding, 8-bit optimizers or parameter-efficient methods reduce that; mixed precision targets
 > activations and compute.
+
+## Use cases & projects
+### Use cases
+- **Long-trace agent fine-tunes on one GPU.** bf16 autocast halves activation memory, so more or longer
+  tool-calling traces fit per micro-batch.
+- **LoRA on a frozen 16-bit base.** Only the adapter needs fp32 masters and Adam state, which is why a 7B
+  agent model adapts on a single card.
+- **Cheap fine-tuning on older GPUs.** T4 or V100 runs use fp16 with a dynamic loss scaler, with its scale
+  and skipped steps monitored.
+- **Agent eval and serving parity.** Running evals in the serving dtype keeps tool-choice comparisons
+  honest when production uses bf16 weights.
+
+### Mini project
+**Precision audit for an agent fine-tune and eval (2-3 hours).**
+- **Goal:** measure what precision changes in memory, speed and agent behaviour.
+- **Steps:** LoRA-tune a small open model on a few hundred tool-call traces three ways (fp32, bf16 autocast
+  with fp32 adapters, and bf16 with the adapter cast to bf16); log step time, peak memory and loss; then
+  run a 50-task tool-choice eval with greedy decoding in fp32 and bf16 and record which tasks flip and
+  their top-two logit gap.
+- **Done when:** you have a table of memory, step time and final loss per setup, a list of flipped eval
+  tasks with their logit margins, and a short note on which setup you would ship.

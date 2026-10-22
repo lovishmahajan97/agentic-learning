@@ -5,7 +5,8 @@ name: Prompt injection
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - prompting/jailbreaks
   - prompting/system-prompt
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-Prompt injection is text from someone other than the operator that the model treats as instructions. A
-transformer has no privileged channel, so no prompt wording fixes it; containment means limiting what the
-model can do and see.
+Prompt injection is text from someone other than the operator, usually arriving in an agent's tool
+results, that the model treats as instructions. No prompt wording fixes it; containment means limiting
+what the agent can do, see and send.
+
+## For agent builders
+- **Why it matters for agents.** Every tool that reads the outside world (web, email, tickets, files,
+  retrieval) is an entry point, and every tool that acts or sends is a payoff. An agent with both holds
+  your user's authority while reading an attacker's text.
+- **Where it shows up in your stack.** Tool-result handling in the loop, tool allowlists per route,
+  approval gates, memory writes, the chat UI's rendering of images and links, and the injection suite in
+  CI.
+- **What you control.** Which legs of the lethal trifecta a feature has, policy checks in the tool
+  executor, literal-action approvals, egress control, and how untrusted content is labelled.
+- **What you can skip.** Hoping for a perfect classifier or prompt. Treat both as tripwires and design so
+  a successful injection produces a refused call, not a leak.
 
 ## Why it exists
 - **Untrusted input plus privilege makes a confused deputy.** Once a model reads untrusted input (user
@@ -348,3 +361,23 @@ will not be zero, so monitoring and logging matter as much as prevention.
 - [ ] Jailbreaks require tool access; injection does not
 > Both exploit the absence of a boundary, but the attacker and target differ: a third party's text
 > versus the application in injection, the user versus the model's trained refusals in a jailbreak.
+
+## Use cases & projects
+### Use cases
+- **Email and calendar agents.** Recipient allowlists and literal-action approval close the exfiltration
+  leg while the agent still reads untrusted mail.
+- **Browsing and research agents.** Read-only tools, no outbound channel, and stripped images keep a
+  planted instruction on a web page from leaking anything.
+- **Support agents over tickets and internal docs.** Tenant-scoped retrieval and human-approved replies
+  bound what a malicious ticket can make the agent disclose.
+- **Agents with long-term memory.** Gated memory writes stop an attacker's "remember that..." from
+  persisting across sessions.
+
+### Mini project
+**Red-team and contain a two-tool email agent (2-3 hours).**
+- **Goal:** measure attack success and task success before and after code-level controls.
+- **Steps:** build an agent with fake `read_inbox` and `send_email`; write 10 benign tasks and 10
+  injected emails (direct, hidden-text, paraphrased, another language); run once with only a system-prompt
+  warning, then with `wrap_untrusted`, the recipient check, approval and `neutralise_images`.
+- **Done when:** a table shows attack success rate and task success for both runs, every stopped attempt
+  is logged as a refused call, and benign tasks still succeed.

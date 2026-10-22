@@ -396,3 +396,23 @@ prompt, invented details get cited. Keep it as a search key only.
 - [ ] When no labelled relevance data exists
 > Such models already map questions near their answers, which is the gap HyDE was designed to close;
 > the remaining benefit is small or negative while the generation cost stays.
+
+## Use cases & projects
+### Use cases
+- **Agents over terse or technical corpora.** When short user questions sit far from long passages in a
+  generic embedder, a hypothetical answer can land closer to the right chunks.
+- **Cold-start knowledge agents.** With no labelled relevance data to fine-tune an embedder, HyDE is a
+  label-free way to try lifting recall.
+- **Fallback on weak first-pass results.** Teams run HyDE only when the plain search scores low, so the
+  extra generation is paid on a minority of calls.
+- **Agents that already draft answers.** The agent can pass its own draft as a search argument, reusing a
+  generation it has already paid for.
+
+### Mini project
+**HyDE as a fallback inside an agent's search tool (1-2 hours).**
+- **Goal:** measure whether HyDE helps your embedder, and what it costs per agent search.
+- **Steps:** take about 30 questions with labelled relevant chunks; measure recall@k with the plain query,
+  with HyDE always on, and with HyDE only when the top first-pass score is below a threshold you pick;
+  keep the hypothetical out of the evidence returned to the agent; log extra tokens and latency per call.
+- **Done when:** you have a table of recall, added latency and added tokens for the three modes, and a
+  clear keep-or-drop decision for HyDE on this corpus.

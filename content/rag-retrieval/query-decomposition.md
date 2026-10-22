@@ -424,3 +424,25 @@ measurement would catch. A third is cost: without a gate, every simple question 
 - [ ] The embedding model was trained on one plan's documents
 > An empty retrieval for a facet is invisible to the synthesis step unless the sub-answer prompt must
 > state "insufficient evidence"; without that rule the model fills the gap with a confident guess.
+
+## Use cases & projects
+### Use cases
+- **Comparison questions in sales or support agents.** "Compare plan A and plan B" becomes one search per
+  plan, emitted as parallel tool calls in a single step.
+- **Policy and compliance assistants.** Questions spanning several regulations or regions need one
+  retrieval per facet so none is crowded out by the others.
+- **Analyst agents building reports.** A report outline is decomposed into sections, each with its own
+  retrieval and evidence, before synthesis.
+- **Guarding atomic questions.** Teams add a gate so simple lookups skip decomposition and avoid extra
+  calls and latency.
+
+### Mini project
+**Parallel facet search for comparison questions (2-3 hours).**
+- **Goal:** show that splitting comparison questions into facets raises recall without adding sequential
+  steps.
+- **Steps:** write about 15 comparison questions over a small corpus with labelled evidence per facet;
+  run them once as a single search and once with the agent instructed to emit one `search` call per facet
+  in the same response; require each sub-answer to state "insufficient evidence" when its facet returns
+  nothing; log calls per step, facet coverage and answer correctness.
+- **Done when:** you have a table comparing facet coverage, total tool calls, latency and accuracy for both
+  modes, plus one trace where a missing facet was correctly reported instead of guessed.

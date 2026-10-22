@@ -5,7 +5,8 @@ name: Attention mechanism
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: crisp-verified
+status: agentic
+agent_relevance: background
 related:
   - model-internals/self-attention
   - model-internals/multi-head-attention
@@ -20,9 +21,22 @@ sources:
 ---
 
 ## TL;DR
-Attention is a differentiable lookup: a query is scored against keys, a softmax turns scores into weights
-summing to one, and the output is the weighted sum of values. It replaces one fixed-size summary with
-learned, on-demand reads of the input.
+Attention is a soft lookup: a query scores keys, softmax makes weights, the output blends values. Your
+agent's model attends over its whole transcript this way, and your retriever is the hard top-k version of
+the same lookup.
+
+## For agent builders
+- **Why it matters for agents.** Everything in the context window, from system prompt and tool schemas to
+  every tool result, is read by soft attention. That read is a blend, not a citation, and its cost grows
+  with transcript length, which is why long agent loops get slower and dearer.
+- **Where it shows up in your stack.** The model you call, the retriever in your RAG step (top-k dot
+  product over embeddings), and tool selection by embedding similarity when you have too many tools to
+  list in the prompt.
+- **What you control.** What enters the window (retrieve a slice versus paste everything), how many
+  tools and results you append, and whether provenance comes from retrieval ids rather than the model's
+  say-so.
+- **What you can skip.** Additive-attention details and the history of translation models. Keep the
+  query/key/value picture, why softmax blends, and the n² cost.
 
 ## Why it exists
 - **The fixed-vector bottleneck.** The 2014 sequence-to-sequence translators read the source sentence
@@ -40,15 +54,15 @@ learned, on-demand reads of the input.
 - **Soft so gradients flow.** The general move replaces "summarize once, then read the summary" with
   "look up what you need, when you need it", made soft so it trains end to end.
 - **A long lineage.** That single move is the ancestor of self-attention, cross-attention and, in hard
-  top-k form, of vector retrieval.
+  top-k form, of vector retrieval, which is what your agent's RAG step does.
 
 ## How it works
 ### Three roles
-| Role | Question it answers | Analogy |
-|---|---|---|
-| **Query** | what am I looking for | the search term |
-| **Key** | what each item advertises about itself | the database index entry |
-| **Value** | what each item hands over if selected | the row the index points to |
+| Role | Question it answers | Analogy | In an agent |
+|---|---|---|---|
+| **Query** | what am I looking for | the search term | the user question or the agent's current step |
+| **Key** | what each item advertises about itself | the database index entry | a chunk or tool-description embedding |
+| **Value** | what each item hands over if selected | the row the index points to | the chunk text or tool schema |
 
 - **Keys and values are separate** because the thing you match on need not be the thing you retrieve.
 - **All three are learned.** In neural attention they are usually linear projections `W_Q`, `W_K`, `W_V`
@@ -106,17 +120,18 @@ The choice of *f* is the main design decision:
 - **Attention** looks up every key a little and returns a blend, which is what makes it differentiable.
 - **A vector database** doing top-k dot-product search over stored embeddings is the hard, external,
   disk-backed version of the same operation.
-- **Retrieval-augmented generation** is attention over documents the model's weights never saw.
+- **Retrieval-augmented generation** is attention over documents the model's weights never saw: the
+  retriever picks a few keys hard, then the model attends softly over that slice.
 
 ### Cost
 - **One query against *n* keys:** O(n·d) for scores plus O(n·d) for the weighted sum.
 - **With *n* queries** (self-attention): O(n²·d).
 - **The n×n score matrix** is the quantity that drives every later discussion of context length, memory
-  and kernels.
+  and kernels, and therefore of how long your agent transcripts can grow.
 
 ## Diagram
 Read it top to bottom: the query is scored against every key, softmax turns scores into weights, and the
-output is a blend of all values, never a single pick.
+output is a blend of all values, never a single pick. A retriever replaces the softmax with a hard top-k.
 
 ```mermaid
 flowchart TD
@@ -166,9 +181,33 @@ for s in (False, True):
 # Exact values depend on the draw; the gap in entropy is the point.
 ```
 
+### Agent scenario: soft blend versus hard top-k for tool selection
+An agent with many tools cannot list every schema in the prompt. A common move is to embed tool
+descriptions and pick the top-k by dot product, which is attention with the softmax replaced by a hard
+selection. The toy vectors below stand in for real embeddings.
+
+```python
+import numpy as np
+
+tools = ["search_orders", "refund_order", "get_weather", "create_ticket"]
+K = np.array([[0.9, 0.1, 0.0], [0.8, 0.5, 0.0], [0.0, 0.0, 1.0], [0.3, 0.9, 0.1]])  # tool-description embeddings
+q = np.array([0.85, 0.45, 0.0])                     # embedding of "refund my last order"
+K = K / np.linalg.norm(K, axis=1, keepdims=True); q = q / np.linalg.norm(q)
+
+scores = K @ q
+soft = np.exp(scores / 0.1); soft /= soft.sum()     # soft attention: every tool gets some weight
+top_k = np.argsort(-scores)[:2]                     # hard top-k: only these schemas enter the prompt
+
+for t, s, w in zip(tools, scores, soft):
+    print(f"{t:14s} score {s:.2f}  soft weight {w:.2f}")
+print("schemas sent to the model:", [tools[i] for i in top_k])
+# The soft weights blend two close tools; the hard top-k gives an auditable list you can log and eval.
+```
+
 ### Padding masks: the same input must give the same output
 A batched implementation normalizes across keys and masks padded keys to `-inf`. Without the mask, the
-output depends on how much padding the batch needed.
+output depends on how much padding the batch needed, which shows up when you self-host a model serving
+many agent sessions at once.
 
 ```python
 import numpy as np
@@ -192,32 +231,36 @@ print(np.allclose(out_alone, masked_attention(Q, Kp, Vp, mask)))              # 
 print(np.allclose(out_alone, masked_attention(Q, Kp, Vp, np.ones(5, bool))))  # False: padding leaked in
 ```
 
-### Worked scenario: the n² cost of reading everything
+### Worked scenario: the n² cost of an agent transcript
 Self-attention score count per head per layer grows with the square of input length (illustrative
-arithmetic, one head, one layer):
+arithmetic, one head, one layer). An agent that appends tool results crosses these rows as it runs:
 
-| Input length *n* | Scores (n × n) | Growth vs 1k |
-|---|---|---|
-| 1,024 | about 1.05 million | 1× |
-| 8,192 | about 67 million | 64× |
-| 65,536 | about 4.3 billion | 4,096× |
+| Input length *n* | Agent state (illustrative) | Scores (n × n) | Growth vs 1k |
+|---|---|---|---|
+| 1,024 | system prompt plus a few tool schemas | about 1.05 million | 1× |
+| 8,192 | after several steps of search results | about 67 million | 64× |
+| 65,536 | after pasting whole documents into the loop | about 4.3 billion | 4,096× |
 
 This is the budget question behind "attend over the whole input or retrieve a short slice": at long
 lengths a retriever that selects a few thousand tokens is the hard top-k version of the same lookup.
 
 ## Production patterns
-- **Mask padding and causality explicitly.** Pass a boolean `attn_mask` (or `is_causal=True`) to
-  `torch.nn.functional.scaled_dot_product_attention` and an `attention_mask` to Hugging Face models.
-  Test that one input gives identical outputs alone and inside a padded batch; monitor for output drift
-  across batch sizes.
 - **Retrieve before you attend over huge inputs.** When documents exceed what you can afford to put in
-  context, use top-k vector search to select passages, then let the model attend over those. Monitor
-  retrieval recall on a labelled set and the context length per request.
-- **Use fused attention kernels, not hand-rolled softmax.** Library kernels apply the √d_k scale,
-  numerically stable softmax and masking for you. Monitor peak memory and step time as context grows.
+  the agent's context, use top-k vector search to select passages, then let the model attend over those.
+  Monitor retrieval recall on a labelled set and the context length per request.
+- **Select tools by similarity when the tool list is large.** Embed tool descriptions, retrieve the top
+  few per step and send only those schemas. Monitor tool-selection accuracy on an eval set and the rate
+  of "no suitable tool" failures.
 - **Ground citations with hard retrieval.** When users need provenance, return the retrieved passages and
   their ids alongside the answer instead of reading attention weights. Monitor citation accuracy in
   evals.
+- **Summarise or drop stale tool results.** Long raw outputs dilute attention and grow cost with every
+  step; replace them with short summaries once used. Monitor context length per step and task success.
+- **Mask padding and causality explicitly when self-hosting.** Pass a boolean `attn_mask` (or
+  `is_causal=True`) to `torch.nn.functional.scaled_dot_product_attention` and an `attention_mask` to
+  Hugging Face models. Test that one input gives identical outputs alone and inside a padded batch.
+- **Use fused attention kernels, not hand-rolled softmax.** Library kernels apply the √d_k scale,
+  numerically stable softmax and masking for you. Monitor peak memory and step time as context grows.
 
 ## Trade-offs
 - **Content-based lookup vs cost.** Lookup over the entire input costs time linear in the number of keys
@@ -226,6 +269,9 @@ lengths a retriever that selects a few thousand tokens is the hard top-k version
 - **Differentiable vs blurred.** Soft weights train end to end, but the output is always a blend. When
   several keys match, the result is blurred, so tasks that need exact provenance (citations) use hard
   top-k retrieval in front of the model.
+- **Paste everything vs retrieve a slice.** Pasting avoids retrieval misses but pays n² cost and dilutes
+  focus; retrieval is cheap and auditable but caps quality at retrieval recall. Paste when the input is
+  small and fixed; retrieve when it is large or changing.
 - **Learned similarity vs interpretability.** Learned projections let the model decide what "similar"
   means, at the price of parameters and of attention maps that look like alignments but are not reliable
   explanations.
@@ -236,6 +282,9 @@ lengths a retriever that selects a few thousand tokens is the hard top-k version
 - **Reading attention weights as feature importance.** Symptom: explanations that change with the random
   seed or disagree with gradient-based attribution for the same prediction. Fix: use attribution or
   ablation for explanations, and retrieval ids for provenance.
+- **Treating "it is in the context" as "the agent used it".** Symptom: the agent ignores a fact buried in
+  a long tool result. Fix: put critical facts in short, structured fields, and eval whether answers cite
+  the right source.
 - **Omitting the √d_k scaling** in a from-scratch implementation. Symptom: attention maps nearly one-hot
   from the first steps and a training loss that plateaus early. Fix: divide scores by √d_k, or call a
   library kernel that does it.
@@ -250,8 +299,8 @@ lengths a retriever that selects a few thousand tokens is the hard top-k version
 You rarely instantiate attention as a standalone primitive, but you meet the pattern constantly.
 - **Where you meet it:** every transformer layer, cross-attention adapters that fuse modalities, and the
   retrieval layer of a RAG system, which is attention done externally with hard top-k.
-- **Decide:** how to mask padding and future positions, and whether a task needs the model to attend over
-  a long input or a retriever to select a short one.
+- **Decide:** whether an agent step needs the model to attend over a long input or a retriever to select
+  a short one, and how to mask padding and future positions when self-hosting.
 - **Measure:** budget the n² cost for your context lengths before committing to "just put it all in the
   prompt".
 - **Interviews:** explain query, key and value with an example, say why softmax and why √d_k, and
@@ -284,17 +333,23 @@ plateaus, and performance that gets worse, not better, as you increase the head 
 - **Separate because** what you match on need not be what you retrieve, like a database index versus the
   row it points to; separate projections let the model learn each.
 
-### Your batched inference returns different answers for the same prompt depending on batch size. What do you check?
-- **Padding mask first.** If padded keys are not masked to negative infinity before softmax, the weights
-  leak onto padding and the output depends on batch-mates' lengths.
-- **Then the softmax axis.** Weights must sum to one across keys, not queries; a wrong axis makes
-  magnitudes shift with sequence length.
+### Your agent has 200 tools. How do you decide which ones the model sees each step?
+- **Retrieve, do not list.** Embed tool descriptions and select the top few by similarity to the current
+  step, which is hard top-k attention outside the model.
+- **Because** listing every schema costs tokens on every step and spreads the model's attention thin.
+- **Measure** tool-selection accuracy on a labelled eval set and log which tools were offered per step.
 
-### When would you use retrieval instead of putting the whole document in the context window?
+### When would you use retrieval instead of putting the whole document in the agent's context window?
 - **When the input is far larger than you can afford.** Self-attention costs O(n²·d), so very long inputs
   get expensive; a retriever is the hard top-k version of the same lookup.
 - **When you need provenance.** Soft attention blends matching keys and does not give reliable citations,
   so returning retrieved passages gives auditable grounding.
+
+### Your self-hosted batched inference returns different answers for the same prompt depending on batch size. What do you check?
+- **Padding mask first.** If padded keys are not masked to negative infinity before softmax, the weights
+  leak onto padding and the output depends on batch-mates' lengths.
+- **Then the softmax axis.** Weights must sum to one across keys, not queries; a wrong axis makes
+  magnitudes shift with sequence length.
 
 ### Why did dot-product attention win over additive attention?
 - **Hardware fit.** All scores for all queries come from one matrix–matrix product, which runs on tensor
@@ -336,3 +391,24 @@ plateaus, and performance that gets worse, not better, as you increase the head 
 > Bahdanau et al. let the decoder look back at all encoder states instead of one summary vector, which
 > fixed the collapse in quality on long sentences. Quadratic cost is a property attention introduced,
 > not one it solved.
+
+## Use cases & projects
+### Use cases
+- **RAG over a knowledge base.** The retriever does hard top-k attention over chunk embeddings, and the
+  model attends softly over the few chunks that enter the window.
+- **Tool selection for large toolsets.** Embedding similarity picks which tool schemas an agent sees per
+  step, keeping prompts short and choices auditable.
+- **Deciding paste versus retrieve.** The n² cost table tells you when pasting a whole document into an
+  agent step stops being affordable.
+- **Explaining grounding to stakeholders.** "The model read your document" is a blend; citations come
+  from retrieval ids, which is the argument for a retrieval step.
+
+### Mini project
+**Build a tool router with hard top-k attention (1-2 hours).**
+- **Goal:** route each user request to the right 2 of 20 tools using embedding similarity, and measure
+  how often the right tool is offered.
+- **Steps:** write 20 short tool descriptions and 40 labelled requests; embed both with any embedding
+  model; score requests against tools by dot product and keep the top 2; compare with a softmax-weighted
+  view to see where two tools blur together.
+- **Done when:** you report top-2 recall on the 40 requests, list the misses, and rewrite at least two
+  tool descriptions to fix a miss.

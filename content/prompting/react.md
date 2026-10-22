@@ -5,7 +5,8 @@ name: ReAct (reason + act)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - prompting/chain-of-thought
   - prompting/function-tool-calling
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-ReAct interleaves reasoning and acting in one loop: thought, tool call, observation, repeat, so each step
-reasons over fresh evidence. Native tool calling is ReAct with the parsing moved into the API; the loop,
-budget and safety checks remain yours.
+ReAct is the agent loop: thought, tool call, observation, repeat, so each step reasons over fresh
+evidence. Native tool calling is ReAct with the parsing moved into the API; the loop, budgets, error
+handling and safety checks remain your harness's job.
+
+## For agent builders
+- **Why it matters for agents.** Almost every tool-calling agent you build or read, from a 50-line script
+  to a framework graph, is a ReAct loop with extra structure. Knowing what the harness owns is knowing
+  where agents break.
+- **Where it shows up in your stack.** The `while` loop around a tool-use API call, the "agent node" of
+  graph frameworks such as LangGraph, provider agent SDKs, and the `stop_reason` check that decides
+  whether to run tools or return.
+- **What you control.** Step and cost budgets, stop conditions, loop detection, how errors and large
+  results come back as observations, the trust boundary on tool output, approval gates, and trajectory
+  logs.
+- **What you can skip.** Reproducing the paper's benchmark numbers and the regex text protocol unless you
+  must support a model without tool calling.
 
 ## Why it exists
 - **Chain-of-thought adds computation, not information.** Every fact in the chain comes from the weights,
@@ -251,6 +265,9 @@ about 150 tokens of thought and call plus one observation. Call *n* re-sends eve
 - **Approval gates for consequential tools.** Read-only tools run freely; tools that send, pay, delete or
   write require an allowlist check and, where needed, human approval in code, regardless of what the model
   says. Log every gated call.
+- **Trajectory evals before shipping loop changes.** Run a fixed task set through the harness on every
+  change to tools, prompts or budgets, and score completion, steps per task, cost per completed task and
+  termination reason. A change that raises completion but doubles steps is a cost regression to discuss.
 - **Trajectory logging and replay.** Store every message, tool call, result and stop reason with a run id
   and prompt version, so failures can be replayed. Review failed trajectories to rewrite tool descriptions
   and stopping rules.
@@ -368,3 +385,24 @@ updating for the queries real users actually ask.
 - [ ] Remove the tool from the tool list for the rest of the run
 > In ReAct an error is just another observation. Feeding it back lets the model reason about it and
 > recover; hiding it leads to invented results or identical retries.
+
+## Use cases & projects
+### Use cases
+- **Support agents over policies and order systems.** Search the policy, look up the order, compute the
+  refund: each step depends on the last observation.
+- **Troubleshooting and on-call agents.** Read logs, query metrics, form a hypothesis and check it, with
+  approval gates on any remediation action.
+- **Research agents.** Multi-hop questions where the second search depends on the first answer, with
+  truncated observations to keep context manageable.
+- **Data-gathering agents across APIs.** Paginated or dependent API calls where errors come back as
+  observations and the loop recovers.
+
+### Mini project
+**Hardened ReAct harness (2-3 hours).**
+- **Goal:** turn the minimal harness above into one you could put behind a real tool.
+- **Steps:** add a third tool that sometimes raises an error and one that returns 20,000 characters; add a
+  per-run token budget alongside `max_steps`; log every message, call, result and termination reason as
+  JSON lines; write 15 tasks including 3 impossible ones.
+- **Done when:** impossible tasks end by budget with a graceful exit, errors are recovered on at least
+  some runs, observations never exceed the cap, and a table shows steps, tokens and termination reason per
+  task.

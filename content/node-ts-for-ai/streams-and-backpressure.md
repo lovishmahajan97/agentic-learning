@@ -5,7 +5,8 @@ name: Streams & backpressure
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - node-ts-for-ai/abortcontroller-and-cancellation
   - node-ts-for-ai/event-loop-and-microtask-queue
@@ -20,9 +21,21 @@ sources:
 ---
 
 ## TL;DR
-Streams process data in chunks as it arrives, so model tokens reach a browser with sub-second first-token
-latency. Backpressure pauses a fast producer when the consumer lags, keeping memory bounded; `pipeline` and
-`pipeTo` wire Node and Web streams with errors and backpressure intact.
+Agents stream: model tokens, tool-progress events and voice reach the user chunk by chunk, with
+sub-second first-token latency. Backpressure pauses a fast producer when the consumer lags, keeping memory
+bounded; `pipeline` and `pipeTo` keep errors and aborts wired.
+
+## For agent builders
+- **Why it matters for agents.** A multi-step agent run can take a minute; streaming tokens and step events
+  ("calling search", "reading 3 docs") is what makes it feel alive. Every open run is a stream, so a
+  backpressure bug multiplies by the number of concurrent sessions.
+- **Where it shows up in your stack.** Provider SDK streams (Web `ReadableStream` from `fetch`), your SSE or
+  NDJSON endpoint to the UI, voice and TTS pipelines, and bulk ingestion for RAG (chunking and embedding
+  large files).
+- **What you control.** `pipeline` versus manual wiring, `highWaterMark` per stage, aborting upstream on
+  client close, and turning off proxy buffering for streamed routes.
+- **What you can skip.** Writing custom `Duplex` streams and the internals of `_read`. Know the
+  `write()`/`'drain'` contract, `for await`, and `Readable.fromWeb`.
 
 ## Why it exists
 - **Users should not wait for the whole answer.** An 800-token answer takes on the order of ten seconds at
@@ -88,6 +101,9 @@ latency. Backpressure pauses a fast producer when the consumer lags, keeping mem
 - **The other direction:** `Readable.from(asyncGenerator)`.
 - **Often clearest for tokens:** an async generator yielding parsed events, consumed by a loop that writes to
   the response and awaits `drain` when needed.
+- **The agent shape.** An agent run is naturally an async generator: it yields token deltas while the model
+  speaks, a step event when a tool starts, and the tool result when it lands, so one loop can stream the
+  whole run.
 
 ### Web Streams
 - **What `fetch` returns.** In Node, `response.body` is a WHATWG `ReadableStream`, the same API as browsers and
@@ -188,6 +204,46 @@ export async function proxy(req: IncomingMessage, res: ServerResponse) {
 }
 ```
 
+### Agent scenario: streaming a multi-step run to the UI
+The run is an async generator of events; the HTTP loop writes NDJSON and honours `'drain'`, and a client
+disconnect aborts the run (and its model and tool calls) through one signal.
+
+```ts
+import { once } from "node:events";
+import type { ServerResponse } from "node:http";
+
+type AgentEvent =
+  | { type: "token"; text: string }
+  | { type: "tool_start"; name: string }
+  | { type: "tool_result"; name: string; ok: boolean }
+  | { type: "done" };
+
+export async function streamRun(
+  run: (signal: AbortSignal) => AsyncGenerator<AgentEvent>,
+  res: ServerResponse,
+) {
+  const ac = new AbortController();
+  res.on("close", () => ac.abort());            // user left: stop the model and tools
+  res.writeHead(200, { "content-type": "application/x-ndjson", "x-accel-buffering": "no" });
+  try {
+    for await (const ev of run(ac.signal)) {
+      if (!res.write(JSON.stringify(ev) + "\n")) {
+        await once(res, "drain", { signal: ac.signal });   // backpressure; rejects if the client leaves
+      }
+    }
+  } catch (e) {
+    if (!ac.signal.aborted) console.error("agent run failed", e);
+  } finally {
+    res.end();
+  }
+}
+```
+
+- **Tool calls are not streamed raw.** The generator assembles a tool call's argument fragments and parses
+  them whole before running the tool; only the human-facing events are streamed.
+- **Why the signal on `once`:** a client that disconnects mid-wait never emits `'drain'`, so without it the
+  loop would hang holding the generator and its open model call.
+
 ### Seeing `write()` return `false`
 Save as `bp.mjs` and run `node bp.mjs`. A slow sink takes 5 ms per 4 KiB frame. Honouring `'drain'` keeps the
 buffer at the 16 KiB threshold; delete the `await` line and the same loop buffers all 200 frames.
@@ -221,6 +277,9 @@ Raw 24 kHz 16-bit mono PCM is 48,000 bytes per second, streamed to mobile client
 | Same, plus abort upstream on client `'close'` | Freed when the client leaves | Abandoned streams stop costing memory and tokens |
 
 ## Production patterns
+- **Stream typed run events, not just tokens.** Agent teams stream a small union of events (token, tool
+  start, tool result, done) as NDJSON or SSE, so the UI can show progress during slow tool steps. Monitor
+  time-to-first-event per run and the longest gap between events.
 - **`pipeline` everywhere, with the request's signal.** Use `pipeline(src, ...transforms, res, { signal })`
   from `node:stream/promises` for every proxied stream, and treat errors after an abort as normal. Monitor
   open file descriptors and upstream sockets after client disconnects.
@@ -253,6 +312,9 @@ Raw 24 kHz 16-bit mono PCM is 48,000 bytes per second, streamed to mobile client
   of more memory per stream, which multiplies by concurrency.
 
 ## Pitfalls
+- **Streaming nothing during tool steps.** Symptom: users abandon runs that are actually working, because
+  the UI is silent for 20 seconds while tools execute. Fix: emit a step event when each tool starts and
+  finishes.
 - **Ignoring the `false` return of `write()`** in a manual `'data'` handler. Symptom: heap growth proportional
   to the number of slow clients and eventual out-of-memory under load. Fix: `pipeline`, or `await
   once(res, "drain")` when `write()` returns `false`.
@@ -329,6 +391,12 @@ sampled across open responses) so a regression is visible.
   KB, so drain upstream into a bounded buffer and disconnect clients that exceed it.
 - **Keep it strict for audio, files and exports,** where per-client buffers reach megabytes.
 
+### How would you stream a multi-step agent run to a web UI?
+- **Model the run as an async generator** of typed events (tokens, tool start, tool result, done) and write
+  them as NDJSON or SSE, awaiting `'drain'` when `write()` returns `false`.
+- **Parse tool calls whole** inside the run; stream only user-facing events.
+- **Tie one `AbortController` to client close** so a closed tab stops the model and every pending tool call.
+
 ### How do you estimate worst-case stream memory for a service?
 - **Per stream:** the sum of `highWaterMark`s along the chain plus one chunk per stage.
 - **Per process:** that figure times maximum concurrent streams; for example 3 stages × 64 KiB × 1,000 streams
@@ -368,3 +436,24 @@ sampled across open responses) so a regression is visible.
 > `Readable.fromWeb` adapts the Web stream to a Node `Readable` while keeping backpressure and
 > cancellation semantics, so `pipeline` can manage the chain. Buffering with `text()` destroys the
 > streaming benefit, and the other options do not produce a stream at all.
+
+## Use cases & projects
+### Use cases
+- **Chat and coding agents in a web UI.** Tokens and step events stream as NDJSON or SSE so a long run shows
+  progress instead of a spinner.
+- **Voice agents.** TTS audio is bulk data (48,000 bytes per second raw), so strict backpressure keeps slow
+  mobile clients from exhausting memory.
+- **RAG ingestion.** Large files are read, chunked and embedded as a stream, so memory stays flat however big
+  the corpus.
+- **Gateways in front of providers.** A proxy re-frames provider SSE for clients and aborts upstream when a
+  user leaves, so abandoned runs stop costing tokens.
+
+### Mini project
+**Stream an agent run with progress events (1-2 hours).**
+- **Goal:** a Node endpoint that streams a fake two-tool agent run to the browser with correct backpressure
+  and cancellation.
+- **Steps:** write an async generator that yields token events, then `tool_start` and `tool_result` around two
+  slow fake tools; serve it with `streamRun`; consume it with `fetch` and a reader in a small page; test a
+  throttled client and a closed tab.
+- **Done when:** the page shows step events during tool calls, `res.writableLength` stays bounded with a
+  throttled client, and closing the tab logs that the generator and fake tools were aborted.

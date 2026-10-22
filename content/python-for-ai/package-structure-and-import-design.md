@@ -425,3 +425,24 @@ the network or environment at import time.
 - [ ] Catch the ImportError and set the name to None
 > TYPE_CHECKING is False at runtime, so the import exists only for type checkers and the runtime cycle
 > disappears. Merging modules or dynamic imports work but are heavier changes than the cause needs.
+
+## Use cases & projects
+### Use cases
+- **Agent services that grow tools fast.** A clear `services/`, `adapters/`, `entrypoints/` direction keeps
+  new tools from importing the agent loop and creating cycles.
+- **Cold-start-sensitive tool workers.** Lazy imports of heavy libraries keep a serverless tool or an
+  autoscaled agent worker from loading model libraries just to list its tools.
+- **Shipping prompts and tool schemas as package data.** Prompt templates and JSON schemas inside the
+  package, tested from the built wheel, stop "works locally, missing in the image" failures.
+- **Shared agent components across teams.** A stable public import surface lets several agents reuse the
+  same tool library without depending on its internals.
+
+### Mini project
+**Restructure a flat agent script into a layered package (1-3 hours).**
+- **Goal:** turn a single-file agent with two tools into a package with a one-way import direction.
+- **Steps:** move the loop into `services/`, the model client and tools into `adapters/`, and a CLI or
+  FastAPI app into `entrypoints/`; put prompt templates in package data; make any heavy import lazy; add
+  an import-direction check (a linter rule or a small test that inspects imports); build the wheel and run
+  one test against the installed wheel, not the source tree.
+- **Done when:** there are no import cycles, importing the tool registry does not load the heavy library,
+  and the wheel test finds the prompt files.

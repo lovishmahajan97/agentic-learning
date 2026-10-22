@@ -416,3 +416,25 @@ brute-force recall check on a labeled sample before and after.
 > Cosine is bounded by one regardless of dimension or normalization, so neither mechanical explanation
 > holds. Each model places query–document pairs in its own band of scores; a threshold calibrated on one
 > model is an arbitrary line for another and must be re-estimated on labeled pairs.
+
+## Use cases & projects
+### Use cases
+- **Knowledge-base search tools.** A support or internal-docs agent calls a semantic search tool whose
+  ranking is exactly the similarity score; the metric and normalization decide which chunks it reasons
+  from.
+- **Long-term agent memory.** Recalling past conversations, user preferences or saved notes is a
+  nearest-neighbor lookup over memory embeddings, scored the same way.
+- **"Nothing relevant" gating.** A calibrated score threshold lets the tool tell the agent to re-query,
+  widen the search or answer "I don't know" instead of passing weak chunks on.
+- **Embedding-model migrations.** Swapping models means re-embedding, re-checking the metric the new
+  model was trained with and re-calibrating every threshold the agent relies on.
+
+### Mini project
+**Metric sanity check for an agent's search tool (1-2 hours).**
+- **Goal:** show how metric choice and normalization change what an agent's retrieval tool returns.
+- **Steps:** embed 200-500 short docs and 20 hand-written agent-style queries with one labeled relevant
+  doc each; rank with cosine, raw dot product and Euclidean distance, with and without normalizing the
+  vectors; wrap the best setup as a `search_docs` tool with a score threshold and run 5 queries through
+  a small tool-calling loop.
+- **Done when:** you have a table of recall@5 per metric and normalization setting, a note on which
+  settings tie and why, and a logged threshold value with examples of queries it correctly rejects.

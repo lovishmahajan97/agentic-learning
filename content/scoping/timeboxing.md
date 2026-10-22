@@ -5,7 +5,8 @@ name: Timeboxing
 kind: practice
 difficulty: core
 est_minutes: 11
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - scoping/rapid-prototyping-poc
   - scoping/problem-decomposition
@@ -16,17 +17,29 @@ related:
 ---
 
 ## TL;DR
-Timeboxing fixes the time and lets scope flex: you commit to answer one question within a set budget,
-then decide (ship, continue, pivot, stop) when the box closes. AI quality improves asymptotically, so
-without a box teams tune prompts forever.
+Agent quality climbs fast and then plateaus, so agent PoCs drift for months. A timebox fixes the time,
+lets scope flex, and commits you to one question answered by an eval: ship, continue, pivot or stop when
+the box closes.
+
+## For agent builders
+- **Why it matters for agents.** Agents have more knobs than any single prompt: system prompt, tool
+  descriptions, tool set, planner, model, retrieval, memory. There is always one more thing to try, so
+  without a box an agent prototype stays "almost there" indefinitely.
+- **Where it shows up in your stack.** The frozen eval set of replayed tasks, the eval harness you run
+  daily, the trace store you mine for error categories, and the decision record that closes the box.
+- **What you control.** The question (for example task success rate on 200 real tickets), the exit rule
+  written on day 0, the order of work (riskiest tool or integration first) and the midpoint arithmetic.
+- **What you can skip.** Formal estimation of agent "features". Estimate the plumbing; box the unknowns,
+  such as whether the model picks the right tool reliably.
 
 ## Why it exists
 - **AI work breaks classic estimation.** Estimation assumes known work: list the features, sum the effort.
-  Whether an LLM can extract fields from this customer's scanned invoices at 95% accuracy is an empirical
-  question nobody can answer by thinking; you find out by trying.
+  Whether an LLM can extract fields from this customer's scanned invoices at 95% accuracy, or whether an
+  agent resolves their tickets end to end, is an empirical question nobody can answer by thinking; you find
+  out by trying.
 - **The trying has no natural end.** Accuracy climbs fast, then flattens: day one of prompt work might move
   a metric from 60% to 80%, the next week from 80% to 85%, the following month from 85% to 87%. There is
-  always one more prompt variant, retrieval tweak or model to try.
+  always one more prompt variant, tool description, retrieval tweak or model to try.
 - **Estimating the work fails.** "The extraction feature will take three weeks" is a guess about an unknown.
   When it is wrong the team keeps going, because stopping feels like admitting failure and the next tweak
   always looks promising. Result: a proof of concept that is "almost there" for three months.
@@ -38,9 +51,11 @@ without a box teams tune prompts forever.
 ## How it works
 ### 1. Name the question, not the task
 - **Good:** one question with a yes/no or a number: "Can we reach 90% field-level accuracy on their real
-  invoice sample with an off-the-shelf model?"
-- **Bad:** an activity: "Work on extraction."
-- **Why the question form matters:** it tells you when you are done and what evidence counts.
+  invoice sample with an off-the-shelf model?" or "Can the agent complete 70% of replayed refund tickets
+  with correct tool calls?"
+- **Bad:** an activity: "Work on extraction" or "build the support agent".
+- **Why the question form matters:** it tells you when you are done and what evidence counts, which for an
+  agent means a scored eval run, not a good-looking transcript.
 
 ### 2. Set the budget from the value of the answer
 Match the box length to what the answer is worth and how much uncertainty it removes, not to how long the
@@ -51,19 +66,19 @@ worth boxing if   cost of box  <  P(answer changes the decision) × cost of deci
 ```
 
 - **Large stakes justify longer boxes.** A question that gates a large contract justifies two weeks; which
-  of two chunking strategies to use justifies a day.
+  of two chunking strategies a RAG tool should use justifies a day.
 - **Worked check:** three engineers for two weeks is about 30 person-days. If the answer has a
   one-in-three chance of flipping a decision that would otherwise sink six months of a larger team into the
   wrong design, the box is cheap.
 - **No decision change, no box.** If the team would make the same choice whatever the result, the box buys
   nothing; skip or shrink it.
 
-| Box type | Typical length |
-|---|---|
-| Spike | hours |
-| Feasibility check | days |
-| PoC | a few weeks |
-| Open-ended | almost never |
+| Box type | Typical length | Agent example |
+|---|---|---|
+| Spike | hours | does the model call this API tool with valid arguments? |
+| Feasibility check | days | can one agent loop finish the core task on 20 real cases? |
+| PoC | a few weeks | task success on a frozen set of real tasks, with cost per task |
+| Open-ended | almost never | "keep improving the agent" |
 
 - **Scrum sprints are timeboxes too, but for delivery cadence.** The discovery-style box here differs in that
   "stop" is an expected, legitimate outcome.
@@ -79,11 +94,13 @@ Write the decision rule before any work: what result means go, stop or pivot. Fo
 
 - **Why pre-commit:** after a week of effort everyone is anchored on their sunk cost, and criteria written
   afterwards drift toward whatever was achieved.
+- **For agents, add guardrail criteria:** a success rate alone can hide unsafe tool calls, so the rule also
+  caps wrong write actions, cost per task and p95 latency.
 
 ### 4. Order the work by risk, with a scope ladder
-1. **Split scope** into must, should and could.
+1. **Split scope** into must, should and could. For an agent, a review UI or memory is usually "could".
 2. **Do the riskiest must-have first,** because if it fails nothing else matters and you want to learn that
-   on day two, not day nine.
+   on day two, not day nine. Often that is access to the one system the agent must write to.
 3. **Build the evaluation set before tuning,** so every hour of tuning moves a number you trust.
 
 ### 5. Checkpoint at fixed points
@@ -100,7 +117,7 @@ observed rate = gain over the last few working days / those days
 - **Caution 1, curves bend down:** the observed rate overstates the future one.
 - **Caution 2, noise:** a gain only counts if it exceeds the eval set's noise. On 100 documents a one-point
   move can come from a handful of borderline cases flipping, so "we went from 86% to 87%" may be no
-  movement at all.
+  movement at all. Agent runs add sampling noise too, so run each task more than once.
 
 ### 6. Close the box with a decision record
 - **Record** the question, the evidence, the decision and what was learned, including dead ends.
@@ -130,7 +147,8 @@ flowchart TD
 ## Examples
 ### Midpoint checkpoint calculator
 Turns the checkpoint into arithmetic, with a rough noise floor (one standard error of a proportion over
-the number of documents, because fields within a document fail together).
+the number of documents, because fields within a document fail together). For an agent, pass the number
+of tasks in the eval set as `n_docs`.
 
 ```python
 import math
@@ -161,7 +179,7 @@ evidence of progress.
 
 ### Worked scenario: a two-week extraction box
 A forward-deployed team gets two weeks (10 working days) to test whether an LLM can extract 12 fields from
-a logistics customer's bills of lading.
+a logistics customer's bills of lading, the core tool step of a planned document-processing agent.
 
 - **Question:** can we reach ≥ 90% field-level accuracy on the customer's real documents?
 - **Exit rule (written day 0):** ≥ 90% → pilot; 80–90% → one focused extra week; < 80% → recommend a
@@ -179,22 +197,46 @@ a logistics customer's bills of lading.
 The numbers are illustrative, but the shape is typical: rapid early gains, then a plateau that only a
 pre-written rule stops the team from chasing indefinitely.
 
+### Worked scenario: boxing a support-agent PoC
+Illustrative numbers. Question: can a tool-calling agent resolve refund tickets end to end? Eval set: 200
+replayed tickets, each run 3 times, scored on task success and on wrong write actions (refunds issued
+when they should not be).
+
+| Exit rule (day 0) | Decision |
+|---|---|
+| ≥ 70% success and 0 wrong refunds | pilot with approval gate on refunds |
+| 50–70% success, 0 wrong refunds | one more week on the top error category |
+| < 50% success, or any wrong refund that guardrails cannot catch | stop; recommend agent drafts, human sends |
+
+| Day | Work | Task success |
+|---|---|---|
+| 1–3 | Read-only sandbox access to the order API (the riskiest must-have), replay harness, labels | eval set |
+| 4 | Baseline agent, 4 tools | 41% |
+| 5 (midpoint) | Traces show 60% of failures are wrong tool choice between two lookup tools; merge them | 58% |
+| 10 | Clearer tool descriptions, argument validation | 64%, 0 wrong refunds |
+
+At 64% the pre-written rule says one more box, scoped to the largest remaining failure category, not
+"keep improving the agent".
+
 ## Production patterns
 - **Decision record per box** — when every box closes. How: a one-page file in the repo or project wiki
   with question, exit rule, evidence table, decision and dead ends, committed on day 0 with the rule filled
   in. Monitor: share of boxes that end with a written decision, and how many end in "stop".
-- **Frozen, versioned eval set** — before any tuning. How: label the set, store it read-only with a content
-  hash in the file name, and have the eval script refuse to run if the hash changes. Monitor: score on the
-  frozen set plus a small held-out sample nobody tunes against.
-- **Daily metric plot** — throughout the box. How: run the eval script once a day (a scheduled CI job or a
-  notebook) and append date, commit and score to a shared sheet. Monitor: slope over the last few days
-  versus the required rate.
+- **Frozen, versioned eval set** — before any tuning of prompts, tools or the planner. How: label the set,
+  store it read-only with a content hash in the file name, and have the eval script refuse to run if the
+  hash changes. Monitor: score on the frozen set plus a small held-out sample nobody tunes against.
+- **Daily metric plot** — throughout the box. How: run the agent eval harness once a day (a scheduled CI
+  job or a notebook) and append date, commit and score to a shared sheet. Monitor: slope over the last few
+  days versus the required rate.
 - **Calendar-fixed midpoint review** — for any box of a week or more. How: book the midpoint and closing
   meetings with the decision-maker on day 0, and present the required-versus-observed arithmetic. Monitor:
   whether scope was cut at the midpoint when the curve was flat.
 - **Scope ladder in the tracker** — when a box has more than a few tasks. How: label each ticket must,
-  should or could, and work riskiest-must first. Monitor: how often a must-have gets cut, since repeated
-  cuts mean the question was too large.
+  should or could, and work riskiest-must first (usually tool access and the eval harness). Monitor: how
+  often a must-have gets cut, since repeated cuts mean the question was too large.
+- **Trace-driven error buckets** — at each checkpoint. How: tag failed agent traces by category (wrong
+  tool, bad arguments, retrieval miss, loop or timeout) and spend the next days only on the largest bucket.
+  Monitor: share of failures in the top bucket.
 
 ## Trade-offs
 - **Fixed time vs a working solution.** It gives predictable schedules and forces decisions, but you may
@@ -207,6 +249,8 @@ pre-written rule stops the team from chasing indefinitely.
   reason recorded.
 - **Cutting scope vs answering the question.** It keeps the date, but repeatedly cutting the same must-have
   item means the question was too large and should have been decomposed into smaller boxes.
+- **One agent question vs many.** Boxing "can the agent do the whole workflow" gives a dramatic answer but
+  diffuse errors; boxing one tool step gives a clean answer that may not compose.
 
 ## Pitfalls
 - **Silently extending the box.** "Just two more days" until the PoC has run for months; the symptom is a
@@ -214,22 +258,24 @@ pre-written rule stops the team from chasing indefinitely.
 - **Timeboxing an activity instead of a question.** The box ends with work done but no decision; the
   symptom is a closing meeting where nobody can say whether to proceed. Fix: rewrite the box as one
   question with a yes/no or numeric answer before day 1.
-- **Tuning prompts before building the evaluation set.** Progress is judged by eyeballing outputs; the
-  symptom is accuracy claims that collapse when someone runs a held-out sample. Fix: label the eval set
-  first and make it the must-have of days 1-2.
+- **Tuning prompts before building the evaluation set.** Progress is judged by eyeballing outputs or agent
+  transcripts; the symptom is accuracy claims that collapse when someone runs a held-out sample. Fix: label
+  the eval set first and make it the must-have of days 1-2.
 - **Sizing the box by feel.** Setting length by how long the work feels like it should take rather than by
   the value of the answer shows up as two-week investigations into decisions worth a day. Fix: run the
   value-of-information test and shrink or skip boxes whose answer would not change the decision.
 - **Treating "stop" as a team failure.** Nobody ever recommends stopping; the symptom is an organisation
   whose boxes all end in "promising, continue" and never in a stop. Fix: name "stop" as a legitimate
   outcome in the exit rule and credit the team for a well-evidenced stop.
+- **Leaving tool access to the last day.** The agent works against mocks until day 9, then the real API
+  behaves differently. Fix: make real (sandboxed) tool access the first must-have.
 
 ## When to use
 - **Use when:** the outcome is uncertain and the work could expand without limit: feasibility checks, PoCs,
-  model or vendor bake-offs, debugging an unexplained quality drop, and any research spike inside a
+  agent and model or vendor bake-offs, debugging an unexplained quality drop, and any research spike inside a
   delivery project.
 - **Avoid when:** the engineering work is well understood; ordinary estimation is fine and the scope is
-  fixed by requirements.
+  fixed by requirements, such as wiring an agent to a documented API.
 - **Measure:** progress by the metric the question names, plotted over the box, not by hours spent.
 - **Interviews and customer conversations:** a timebox is how you say "we will know by Friday" credibly:
   name the question, the evidence and the decision rule up front.
@@ -276,11 +322,18 @@ narrower scope) instead. Enthusiasm is not evidence; the trajectory and error di
 - **Revise the rule once,** at the first checkpoint, if it was written before you understood the data, and
   record why. Revising it at the end to match what was achieved is the failure the rule exists to prevent.
 
-### A stakeholder asks for "a few more days" at the end of a box. How do you respond?
-- **Open a new box, do not slide.** Name a narrower question (for example only handwritten documents), its
-  own pass/fail threshold and a fixed length.
-- **Ground it in error analysis:** extend only if remaining errors cluster in a category with a concrete
-  fix; diffuse errors on a flat curve argue for a design that tolerates the current accuracy.
+### How would you write the exit rule for a two-week agent PoC that can take write actions?
+- **Primary metric:** task success on a frozen set of replayed real tasks, each run several times because
+  agent runs vary.
+- **Guardrail metrics:** zero uncaught wrong write actions, plus caps on cost per task and p95 latency, so a
+  higher success rate cannot hide an unsafe agent.
+- **Bands:** pilot, one scoped extra box, or stop with a human-in-the-loop design.
+
+### Your agent PoC is flat at day 6 of 10. How do you use traces to decide what happens next?
+- **Bucket the failures:** wrong tool, bad arguments, retrieval miss, loops or timeouts, using the trace store.
+- **Concentrated:** if one bucket holds most failures and has a concrete fix (merge tools, rewrite a
+  description, validate arguments), spend the remaining days only there.
+- **Diffuse:** prepare a stop or a narrower-scope recommendation rather than trying more prompts.
 
 ## Quiz
 ### Q: What is the defining feature of a timebox compared with an ordinary estimate?
@@ -306,3 +359,23 @@ narrower scope) instead. Enthusiasm is not evidence; the trajectory and error di
 - [ ] Switch to measuring hours spent so the effort is visible to stakeholders
 > Checkpoints exist to detect a flat trajectory early. Continuing unchanged spends the second week hoping;
 > extending without a new question is a silent slide, and hours spent measure effort, not learning.
+
+## Use cases & projects
+### Use cases
+- **Agent feasibility spikes.** A one-day box answers "does the model call our order API tool with valid
+  arguments?" before anyone designs the full agent.
+- **Agent PoCs for customers.** A two-week box with a written exit rule turns "build us an agent" into a
+  dated go, pivot or stop decision.
+- **Model or framework bake-offs.** Boxing the comparison on a frozen task set stops endless "let us also
+  try this one" rounds.
+- **Quality regressions in production agents.** A short box to find why task success dropped, ending in a
+  fix or a rollback decision.
+
+### Mini project
+**Run a timeboxed agent spike (2-3 hours).**
+- **Goal:** answer one agent question inside a fixed box and close it with a decision record.
+- **Steps:** pick a question such as "can a two-tool agent answer 20 FAQ-plus-lookup tasks correctly?";
+  write the exit rule first; build the 20-task eval set; run a baseline, then two timed improvement rounds,
+  logging the score after each; run the checkpoint calculator at the midpoint.
+- **Done when:** you have the exit rule, a score per round, the checkpoint output and a one-page decision
+  record that names go, pivot or stop and the largest failure bucket.

@@ -410,3 +410,24 @@ cases. Correctness still needs a golden set; this measures stability, which the 
 > The relation only states that the two outputs must agree. Assuming the paraphrase kept the meaning,
 > disagreement proves inconsistency, not which side is correct; assuming either direction is a common mistake that can enshrine the wrong
 > answer as the expectation.
+
+## Use cases & projects
+### Use cases
+- **Checking tool-choice stability.** Paraphrased requests must route to the same tool with the same
+  arguments, which catches brittle tool descriptions before users do.
+- **Testing robustness to distractors.** Adding an irrelevant tool to the list or an off-topic chunk to
+  the context should not change the agent's action.
+- **Reusing unlabelled production logs.** Sampled real requests, transformed and compared, become
+  stability tests with no labelling cost.
+- **Validating a pairwise judge.** Swapping the order of the two candidates must not flip the verdict,
+  or the judge's agent rankings are partly position bias.
+
+### Mini project
+**Build a metamorphic suite for an agent's tool router (1-2 hours).**
+- **Goal:** measure how often the agent's first tool call changes under transforms that should not
+  change it.
+- **Steps:** take 40 requests for an agent with 4-5 tools; write three INV transforms (paraphrase,
+  add a distractor tool, shuffle the tool list); run each original and transformed request; compare tool
+  name and arguments exactly; run an identity transform (the same input twice) to measure the noise floor.
+- **Done when:** a table shows the violation rate per transform next to the identity floor, and each
+  violation above the floor is listed with both outputs for review.

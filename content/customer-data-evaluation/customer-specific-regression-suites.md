@@ -5,7 +5,8 @@ name: Customer-specific regression suites
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - evals/regression-tests
   - evals/golden-dataset
@@ -18,9 +19,21 @@ related:
 ---
 
 ## TL;DR
-A frozen set of one customer's own cases, run under that customer's configuration whenever a shared
-prompt, model or pipeline changes, and gated case by case against production. Averages hide one
-customer's breakage; this suite does not.
+A frozen set of one customer's own agent tasks, replayed under that customer's configuration and tool
+stubs whenever a shared prompt, model, tool or pipeline changes, and gated case by case against
+production. Averages hide one tenant's broken agent; this does not.
+
+## For agent builders
+- **Why it matters for agents.** One edit to a shared system prompt, tool schema or model version changes
+  every tenant's agent at once. Agents fail in tenant-specific ways (a different tool chosen, a missed
+  escalation, a wrong field format), and those failures vanish inside a global pass rate.
+- **Where it shows up in your stack.** Your eval harness and CI: a runner parameterised by tenant id that
+  loads tenant config, prompt version, a frozen retrieval snapshot and recorded tool responses, then
+  scores the final answer and the tool-call trajectory.
+- **What you control.** Which cases are blocking, how tool calls are stubbed, whether you assert on the
+  trajectory or only the outcome, and the gate: paired flips plus a correction across tenants.
+- **What you can skip.** Deriving McNemar or Holm by hand. Know that you compare paired flips, that small
+  suites have little power, and that many tenants inflate false blocks.
 
 ## Why it exists
 - **Every shared change hits every customer at once.** Base prompt, model version, retriever and parser
@@ -57,6 +70,22 @@ Four sources, each for a different reason:
   invisible if you test with defaults.
 - **Why retrieval is frozen** (a snapshot or the captured context): otherwise a failure could be caused
   by new documents rather than by your change, and you could not tell which.
+
+### Agent cases: assert on the trajectory, not only the answer
+An agent case is a task plus the environment it runs in. Three additions make it reproducible:
+- **Recorded tool responses.** Stub each tool with the responses captured when the case was created, so
+  a flip means your change altered the agent's behaviour, not that a live API returned something new.
+- **Trajectory assertions.** Check which tools were called, with which arguments, in what order where it
+  matters ("must call `lookup_policy` before quoting a refund", "must never call the payments tool").
+- **Budget assertions.** Record step count and tokens per case; a candidate that reaches the same answer
+  in twice the steps is a regression for a customer billed per run.
+
+| Assertion | Example for one tenant | Usually |
+|---|---|---|
+| Outcome | Extracted invoice total matches, two decimals | Deterministic check |
+| Trajectory | Escalation tool called when amount exceeds tenant limit | Deterministic check on the call log |
+| Forbidden action | No write tool called in a read-only tenant | Blocking |
+| Budget | Steps within the tenant's usual range | Tracked |
 
 ### How it is run and judged
 1. **On every change to a shared component**, run each customer's suite under that customer's config.
@@ -176,6 +205,23 @@ print(holm_flagged(p))   # ['D']  -> A and B go to "inspect", not "block"
 - **Note on A:** Holm does not hard-block A here, but A still fails because a blocking case broke. That
   is exactly why the blocking tier exists alongside the statistics.
 
+### Agent scenario: a tool-schema rename breaks one tenant's escalations
+A team renames a shared tool argument and rewrites its description to cut tokens. The global agent eval
+is flat. One insurance tenant's 60-case suite, replayed with recorded tool responses (illustrative
+numbers):
+
+| Measure on tenant B's suite | Production | Candidate |
+|---|---|---|
+| Final-answer pass | 54 / 60 | 53 / 60 |
+| Escalation trajectory cases (blocking) | 12 / 12 | 9 / 12 |
+| Median steps per case | 4 | 6 |
+| Paired flips (pass-to-fail, fail-to-pass) | | 5, 1 |
+
+- **Outcome-only scoring would ship it.** The answers barely moved; three escalations were skipped
+  because the new description no longer mentioned the tenant's approval limit.
+- **The trajectory tier blocks it.** Three blocking escalation cases failed, so B is pinned to the old
+  tool definition while the others roll forward and the description is fixed.
+
 ## Production patterns
 - **Tenant-parameterised test harness** — when two or more customers share components. Load each tenant's
   config (flags, prompt version, context snapshot, tool stubs) per case and parameterise the runner by
@@ -193,6 +239,13 @@ print(holm_flagged(p))   # ['D']  -> A and B go to "inspect", not "block"
 - **Per-tenant version pinning** — when one customer fails. Route that tenant to the old prompt or model
   version through tenant configuration while others roll forward. Monitor how many tenants are pinned and
   for how long, because each pin is another live version to maintain.
+- **Record-and-replay tool stubs** — for every agent case that calls tools. Capture tool requests and
+  responses when the case is created and replay them in the suite; an unexpected call with no recording
+  fails the case loudly. Monitor how many cases hit unrecorded calls, since that means the agent's
+  behaviour drifted.
+- **Trajectory tier for consequential actions** — when an agent can escalate, refund, write or send. Make
+  "called the right approval or escalation tool" and "never called a forbidden tool" blocking assertions
+  per tenant. Monitor blocking trajectory failures separately from answer accuracy.
 
 ## Trade-offs
 - **Per-customer gating vs cost.** It catches regressions averages hide, but cost and run time grow with
@@ -205,6 +258,9 @@ print(holm_flagged(p))   # ['D']  -> A and B go to "inspect", not "block"
   most customers move forward, at the price of maintaining several live versions for a while.
 - **LLM judges vs determinism.** Judge assertions cover open-ended outputs that exact checks cannot, but
   add their own noise; prefer deterministic checks whenever the requirement can be stated as a rule.
+- **Recorded tools vs realism.** Replayed tool responses make agent cases deterministic and cheap, but
+  cannot show how the agent copes with a tool that now returns new fields or errors; keep a small live
+  sandbox suite for tool and API changes.
 
 ## Pitfalls
 - **Running every customer's cases with default configuration.** Symptom: a green suite followed by a
@@ -220,10 +276,16 @@ print(holm_flagged(p))   # ['D']  -> A and B go to "inspect", not "block"
   trusting the gate.
 - **Treating customer suites as shared fixtures.** Symptom: one customer's documents appear in another
   customer's test logs or in a training set, which is a data-handling breach.
+- **Scoring only the agent's final answer.** Symptom: a release passes the suite, then a tenant reports
+  the agent stopped escalating or called a tool it should not. Fix: add trajectory and forbidden-action
+  assertions for every consequential tool.
+- **Letting suite runs call live tenant tools.** Symptom: flaky results and, worse, real side effects such
+  as emails or tickets created by a test run. Fix: replay recorded responses and run write tools against
+  stubs only.
 
 ## When to use
-- **Use when** a second customer runs on shared components. Start on day one with the acceptance cases
-  and grow the suite with every fixed incident.
+- **Use when** a second customer runs on your shared agent (same prompt, tools or model). Start on day
+  one with the acceptance cases and grow the suite with every fixed incident.
 - **Matters most when** customers differ in document formats, terminology or contract rules, and shared
   prompts or models change often.
 - **Skip when** there is one customer: your global regression set already is the customer suite.
@@ -271,18 +333,27 @@ they share a cause, fix or add a customer-scoped override, and re-run before pro
   significant-but-small flip counts to "inspect" and keep hard blocks for blocking cases.
 - **Also check flake rate**, since flaky cases inflate discordant pairs.
 
-### When would you not freeze the retrieval context in a customer suite?
-- **When the change under test is the index or ingestion itself.** Frozen context hides exactly those
-  regressions.
-- **So run two suites:** a frozen-context suite that attributes failures to prompt and model changes, and
-  a separate live-index suite for retrieval and ingestion changes.
-
 ### How do you keep the cost of per-customer suites under control as the fleet grows?
 - **Cost scales as customers × cases × repetitions**, so tier it: a small smoke subset per customer on
   every pull request, the full suite nightly and before release.
 - **Prefer deterministic assertions** over LLM judges where the rule allows, because they are cheaper and
   need fewer repetitions.
 - **Prune and re-review cases** so stale expectations do not consume budget or trust.
+
+### How do you make a tool-calling agent case reproducible enough to gate on?
+- **Freeze the environment.** Pin the tenant config, prompt and tool-schema versions, a retrieval
+  snapshot, and replay recorded tool responses so the only moving part is your change.
+- **Assert on the trajectory** as well as the answer: required tools, forbidden tools and argument
+  checks, plus step and token budgets.
+- **Measure residual noise** with production-versus-production runs, because sampling still varies the
+  path an agent takes.
+
+### A shared tool-description change leaves the global agent eval flat, but one tenant complains. How should your suite have caught it?
+- **Per-tenant trajectory cases.** The tenant's rule (escalate above its limit) lives in tool use, not in
+  the final text, so it needs a blocking assertion on the call log.
+- **Paired, per-tenant gating** would show the flips for that tenant even when the global score is flat.
+- **Then** pin the tenant to the old tool definition, fix the description, and add the complaint as a
+  new blocking case.
 
 ## Quiz
 ### Q: Why are customer regression suites compared case by case against production rather than against a pass-rate threshold?
@@ -308,3 +379,29 @@ they share a cause, fix or add a customer-scoped override, and re-run before pro
 - [x] So failures reproduce under that tenant's real setup and are attributable to the change being tested
 > Bugs often appear only under one tenant's flags or prompt overrides, and live retrieval adds changes
 > unrelated to the release. Pinning both makes a flip mean that your change caused it.
+
+## Use cases & projects
+### Use cases
+- **Multi-tenant support agents.** One shared agent serves many companies; each tenant's suite guards
+  its escalation rules, tone and refusal behaviour on every shared prompt change.
+- **Document-extraction agents for enterprise clients.** Per-customer layouts and field formats are
+  where shared prompt or parser changes break first.
+- **Model or provider migrations.** Before moving every tenant's agent to a new model, each tenant's
+  suite shows exactly which customers flip and which can move today.
+- **Post-incident hardening.** Every fixed tenant incident becomes a blocking case, so that customer
+  never sees the same agent bug twice.
+
+### Mini project
+**Build a per-tenant agent regression gate (2-3 hours).**
+- **Goal:** catch a shared change that keeps the global score flat but breaks one tenant's agent.
+- **Steps:** write a tiny tool-calling agent with two tools and two tenant configs (one with an
+  escalation limit); create 20 cases per tenant with recorded tool responses and outcome plus trajectory
+  assertions; run production and a candidate prompt that drops the escalation hint; compute paired flips
+  and the exact McNemar p per tenant with the code above, and mark escalation cases blocking.
+- **Done when:** the gate prints a per-tenant report, passes the unaffected tenant, blocks the tenant
+  whose escalation cases flipped, and lists the flipped case ids.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): the per-customer regression suite and
+harness that gates the utility's email agent case by case, and must catch a planted change that lifts
+the global score while breaking a utility-specific rule.

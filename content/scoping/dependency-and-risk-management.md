@@ -5,7 +5,8 @@ name: Dependency & risk management
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - scoping/statement-of-work
   - scoping/data-access-and-permissions-discovery
@@ -20,9 +21,22 @@ sources:
 ---
 
 ## TL;DR
-AI projects slip on things the team does not control: data, access, security reviews, SME time, quotas.
-Map dependencies with owners and need-by dates, size risks in days, and retire the biggest with cheap
-spikes, so surprises arrive in week one.
+Agent projects slip on things the team does not control: data, tool API access, security reviews, SME
+time, quotas. Map dependencies with owners and need-by dates, size risks in days, and retire the biggest
+with cheap spikes, so surprises arrive in week one.
+
+## For agent builders
+- **Why it matters for agents.** An agent is only as available as its tools. Every tool means a customer
+  API, credentials, a sandbox, rate limits and often a security approval for write access, each owned by
+  someone else and each able to stall the build.
+- **Where it shows up in your stack.** Tool credentials and sandbox environments, provider quotas and
+  regional availability, the adapter layer around model calls, and the eval set that needs real data
+  before anything can be accepted.
+- **What you control.** Spiking each tool integration against the real API in week one, putting model
+  calls behind an adapter, recording each dependency with a named owner and date, and wiring triggers to
+  pre-agreed contingencies.
+- **What you can skip.** Formal risk-management frameworks in depth. The NIST AI RMF has its own lesson; a
+  living RAID log with numbers is what scoping needs.
 
 ## Why it exists
 - **The plan says "weeks 1–2: data ingestion"; reality differs.** Week 1 is spent learning the document
@@ -34,7 +48,8 @@ spikes, so surprises arrive in week one.
 - **A kickoff-deck risk list gives no protection.** Written once and never reopened, it records risks and
   drives no action. Rating everything "medium" makes it impossible to prioritise.
 - **Watching risks instead of retiring them** leaves the biggest unknowns (data quality, security approval,
-  feasibility on real inputs) unresolved until late, when there is no slack left to absorb them.
+  feasibility on real inputs, whether the agent's tools actually behave as documented) unresolved until
+  late, when there is no slack left to absorb them.
 - **AI adds its own risks:** the data may not support the task, the eval set may not represent production,
   model behaviour can change when a provider updates or retires a version, and quotas or regional
   availability can block a deployment design that worked in a demo.
@@ -52,23 +67,26 @@ One living log, because each category triggers a different action:
 
 ### Map dependencies
 1. **Record each one:** what is needed (in a specific format), who owns it (a named person, not "IT"), the
-   realistic lead time, the need-by date derived from the plan, and the status.
+   realistic lead time, the need-by date derived from the plan, and the status. For agents, list each
+   tool's API access, credentials and sandbox as separate rows.
 2. **Find the critical path:** the chain of dependent tasks with zero slack, such as data export → eval set
    → PoC → pilot sign-off. Anything on that chain slips the end date day for day; anything off it has slack
    you can spend.
-3. **Start the longest-lead items first.** Security reviews, legal agreements and procurement often take
-   longer than the engineering, so they should start in week zero, before anything is built.
+3. **Start the longest-lead items first.** Security reviews, legal agreements, procurement and approvals
+   for write-capable tools often take longer than the engineering, so they should start in week zero,
+   before anything is built.
 
 ### Identify risks by category
 Walk a checklist so you do not rely on memory:
 - **Data:** availability, quality, volume, representativeness, rights to use.
-- **Access and security:** credentials, network paths, approval of external model APIs, data residency.
+- **Access and security:** credentials, network paths, approval of external model APIs, data residency,
+  approval for the agent to write to customer systems.
 - **Technical and model:** feasibility on real inputs, latency or cost at volume, provider quotas,
-  deprecation of a model version.
+  deprecation of a model version, customer API rate limits and undocumented tool behaviour.
 - **People and adoption:** SME availability, sponsor turnover, user resistance.
 - **Commercial and vendor:** pricing changes, contract terms, lock-in.
-- **Regulatory and harm:** whether outputs could harm users or breach rules. This overlaps with AI-system
-  risk management (frameworks such as the NIST AI RMF), which is covered in its own lesson.
+- **Regulatory and harm:** whether outputs or agent actions could harm users or breach rules. This overlaps
+  with AI-system risk management (frameworks such as the NIST AI RMF), which is covered in its own lesson.
 
 ### Assess in units people can act on
 - **Score likelihood and impact,** with impact in schedule days or money where possible, not "high".
@@ -88,7 +106,7 @@ Walk a checklist so you do not rely on memory:
 ### Choose a response and a trigger
 | Response | How |
 |---|---|
-| **Avoid** | change the plan |
+| **Avoid** | change the plan, for example drop a write tool from the pilot |
 | **Reduce** | a spike, a fallback or an earlier start |
 | **Transfer** | to the party best placed to own it, for example a data date as a customer obligation in the SOW |
 | **Accept** | with a contingency plan |
@@ -99,6 +117,8 @@ Walk a checklist so you do not rely on memory:
 ### Retire the biggest unknowns first
 - **Order early work by the uncertainty it removes,** not by the order the architecture suggests. A two-day
   spike on 50 real documents removes more risk than two weeks of polished pipeline code over synthetic ones.
+- **For agents, spike each tool against the real API:** call it with real credentials in a sandbox, check
+  the response shape and rate limits, and see whether the model picks it correctly from its description.
 - **Review the log weekly** at the steering meeting, with escalation thresholds agreed in the SOW.
 
 ## Diagram
@@ -144,9 +164,25 @@ kickoff the RAID log holds these top items:
 - **Outcome:** in week 4 the security review asked for an in-region deployment. Because R1 had a
   contingency, the switch took 4 days instead of the 20 it would have cost unplanned.
 
+### Worked scenario: tool dependencies for a service-desk agent (illustrative)
+An agent that triages IT tickets needs four tools. Each is a separate dependency with its own owner and
+lead time.
+
+| Tool | Needs | Owner | Lead time | Need-by | Risk and response |
+|---|---|---|---|---|---|
+| `search_kb` (read) | API key, sandbox | KB admin | 3 days | week 1 | low; accept |
+| `get_user_devices` (read) | service account, network path | Endpoint team | 10 days | week 2 | on critical path; request day 0 |
+| `reset_mfa` (write) | security approval for agent writes | CISO | 25 days | week 6 | 40% chance of refusal; avoid by shipping it as "draft for human" first |
+| `create_ticket` (write) | sandbox with rate limit of the real system | ITSM owner | 5 days | week 3 | spike in week 1 to read the real limit |
+
+- **The write tool drives the schedule,** not the model. Shipping `reset_mfa` as a human-approved draft
+  turns a fatal-impact risk into a later scope addition.
+- **The week-1 spike on `create_ticket`** finds a much lower rate limit than the docs claimed, so the agent
+  gets a queue and retry budget before the pilot instead of failing under load.
+
 ### Exposure calculator for the weekly review
 Ranks risks by expected days, flags fatal-impact ones, and compares critical-path exposure with slack.
-Re-run it after each spike; the numbers reproduce the scenario above.
+Re-run it after each spike; the numbers reproduce the contract-review scenario above.
 
 ```python
 RISKS = [  # id, probability, impact in schedule days, on critical path?
@@ -180,16 +216,20 @@ report(with_impact(after_spike, "R1", 4))        # adapter contingency: R1 20 ->
 
 ## Production patterns
 - **RAID log as a shared, owned document.** Keep it where both delivery team and customer edit it, with a
-  named person per row and a need-by date per dependency. Monitor the count of dependencies past their
-  need-by date at every weekly steering meeting.
-- **Week-zero approvals.** Submit the security questionnaire, data processing agreement and procurement
-  requests on day 0, in parallel with building. Track each approval's age against its expected lead time.
+  named person per row and a need-by date per dependency, including one row per agent tool. Monitor the
+  count of dependencies past their need-by date at every weekly steering meeting.
+- **Week-zero approvals.** Submit the security questionnaire, data processing agreement, write-access
+  approvals for agent tools and procurement requests on day 0, in parallel with building. Track each
+  approval's age against its expected lead time.
 - **Provider seam for contingencies.** Put model calls behind an adapter interface so a switch to an
   in-region or alternative hosted model is a configuration change. Monitor provider quota usage, regional
   availability and announced model deprecation dates.
-- **Spike-first backlog.** Schedule one- to two-day spikes on real data for every risk on the critical path
-  before building pipeline code. Track total critical-path exposure week by week; a flat or rising curve
-  means the work is not attacking the risks.
+- **Spike-first backlog.** Schedule one- to two-day spikes on real data and real tool APIs for every risk
+  on the critical path before building pipeline code. Track total critical-path exposure week by week; a
+  flat or rising curve means the work is not attacking the risks.
+- **Read-only first, writes behind approval.** Launch tools that write to customer systems as drafts a
+  human approves, and promote them once approval and evals allow. Monitor approval rate and reverted
+  actions per write tool.
 - **Triggers wired to the calendar.** Turn each trigger (for example "export not received by day 10") into
   a dated check owned by a person, with the contingency pre-agreed in steering notes. Monitor fired
   triggers and time from trigger to switch.
@@ -199,7 +239,8 @@ report(with_impact(after_spike, "R1", 4))        # adapter contingency: R1 20 ->
   week. Keep the top ten items active and archive the rest, unless the engagement is regulated or
   multi-vendor.
 - **Early certainty vs visible progress.** Front-loading spikes removes uncertainty early but delays visible
-  demo progress. That trade is worth making whenever a feasibility or data risk sits on the critical path.
+  demo progress. That trade is worth making whenever a feasibility, data or tool-access risk sits on the
+  critical path.
 - **Schedule protection vs relationship.** Transferring risk to the customer through dated obligations
   protects the schedule but can strain the relationship. Frame it as shared planning, and only for items
   they genuinely control.
@@ -215,8 +256,10 @@ report(with_impact(after_spike, "R1", 4))        # adapter contingency: R1 20 ->
   in week 8, after it has already caused a slip.
 - **Naming teams instead of people as owners.** Symptom: a dependency marked "with IT" for three weeks with
   nobody able to say who is working on it.
-- **Starting security and legal reviews only when the system is ready.** Symptom: a finished pilot that
-  waits a month for approval to touch production data.
+- **Starting security and legal reviews only when the system is ready.** Symptom: a finished agent pilot
+  that waits a month for approval to touch production data or write to a customer system.
+- **Building tools against API docs instead of the real API.** Symptom: in pilot week the agent hits rate
+  limits, auth scopes or response fields the docs never mentioned. Fix: a week-one spike per tool.
 - **Accepting risks without triggers or contingencies.** Symptom: a crisis meeting debating options that
   could have been decided calmly in week one.
 - **Ignoring model and provider risks.** Symptom: a deployment design that fails on quota, regional
@@ -225,8 +268,8 @@ report(with_impact(after_spike, "R1", 4))        # adapter contingency: R1 20 ->
 ## When to use
 - **Use when:** scoping, before the SOW is signed, because dated customer dependencies and known risks
   belong in the SOW itself. Then review the log weekly for the life of the engagement.
-- **Lighter version:** even a two-week internal PoC benefits from a ten-line version naming the data, access
-  and people it depends on.
+- **Lighter version:** even a two-week internal agent PoC benefits from a ten-line version naming the data,
+  tool access and people it depends on.
 - **Measure:** count dependencies past their need-by date, compare expected delay with slack on the critical
   path, and track total exposure (the sum of expected days on the critical path) week by week. Exposure
   should fall as spikes retire unknowns; a flat or rising curve means the work is not attacking the risks.
@@ -258,12 +301,20 @@ against remaining slack and tell the sponsor now whether the end date still hold
 - **Why four:** each category triggers a different action. Assumptions get verified, risks get a response
   and trigger, issues get resolved now, and dependencies get chased by their owner.
 
-### What are the biggest risks specific to an AI pilot that an ordinary software plan misses?
-- **Data:** the data may not support the task, and scans or poor OCR can surface weeks in.
-- **Evaluation:** the eval set may not represent production inputs.
+### What are the biggest risks specific to an agent pilot that an ordinary software plan misses?
+- **Data and evaluation:** the data may not support the task, scans or poor OCR can surface weeks in, and
+  the eval set may not represent production inputs.
+- **Tools:** each tool is a customer API with credentials, rate limits and undocumented behaviour, and
+  write access needs its own security approval.
 - **Provider:** behaviour changes when a model version is updated or retired, and quotas or regional
   availability can block a design that worked in a demo.
-- **Approval:** security review of external model APIs and data residency, often the longest lead time.
+
+### Your agent needs a write tool whose security approval may take 25 days and might be refused. How do you plan around it?
+- **Treat it as fatal-impact if the agent is useless without it,** and start the approval on day 0.
+- **Avoid the risk in the pilot:** ship the tool as a draft a human approves, so the pilot runs on read
+  tools and approved drafts while the review proceeds.
+- **Keep a trigger:** if approval is not granted by an agreed date, the write path stays human-approved
+  for launch and becomes a later change request.
 
 ### When would you plan by impact rather than by expected delay?
 - **When the impact would be fatal,** such as the pilot being unable to run at all or a budget window
@@ -309,3 +360,25 @@ against remaining slack and tell the sponsor now whether the end date still hold
 > Each RAID category has a different action. Assumptions get verified, because a false one usually
 > becomes a risk or issue. Risks get a response and a trigger, issues get resolved now, and dependencies
 > get chased with their owner.
+
+## Use cases & projects
+### Use cases
+- **Agents that integrate with customer systems.** One RAID row per tool (credentials, sandbox, rate limit,
+  write approval) shows which integration will gate the pilot.
+- **Regulated or data-residency customers.** An adapter seam plus a day-0 security review turns "no external
+  API in this region" into a 4-day switch instead of a 20-day slip.
+- **Model deprecations and quota limits.** Tracking provider deprecation dates and quota headroom as risks
+  avoids a final-week surprise in a batch backfill or launch.
+- **Weekly steering with a sponsor.** The exposure trend gives an honest, numeric answer to "will we hit
+  the date?"
+
+### Mini project
+**RAID log and tool spikes for a planned agent (2-3 hours).**
+- **Goal:** find the dependency that will gate a planned agent before writing its loop.
+- **Steps:** pick an agent with three or four tools against real or public APIs; write one RAID row per
+  tool plus data, model provider and approval rows, each with owner, lead time and need-by date; run a
+  short spike per tool (authenticate, call it, record response shape and rate limit); size each risk in
+  days and run the exposure calculator before and after the spikes.
+- **Done when:** you have a RAID log with named owners, a spike note per tool listing at least one
+  surprise against its docs, and an exposure number that fell after the spikes, with the remaining top risk
+  and its trigger written down.

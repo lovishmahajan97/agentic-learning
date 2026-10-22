@@ -396,3 +396,30 @@ batch. Better still, "matched" should be a deterministic check on stored records
 - [ ] Every ten steps regardless of progress
 > Replanning is for when the plan's premises are wrong. Single transient errors deserve a retry, and
 > periodic replanning without a signal burns planner calls while shuffling work that was fine.
+
+## Use cases & projects
+### Use cases
+- **Coding agents with todo lists.** The agent writes a plan of steps, marks each as done or blocked and
+  re-reads it every turn, which stops it forgetting the goal halfway through a refactor.
+- **Approval before side effects.** An operations agent shows its plan to a human before running any
+  write tool, so a wrong approach is caught before anything changes.
+- **Research agents.** A plan-then-execute graph lists the sub-questions up front, runs them, and
+  replans only when a finding contradicts an assumption.
+- **Cost control on long tasks.** Step and replan budgets turn a runaway loop into a clean stop with a
+  partial result and a reason.
+
+### Mini project
+**Add an explicit plan to a greedy tool-calling loop (2-3 hours).**
+- **Goal:** compare a plain ReAct-style loop with a plan-then-execute version on the same 10 multi-step
+  tasks.
+- **Steps:** give both versions the same three or four mock tools; have the planner emit a plan with a
+  `done_when` check per step; re-inject the plan with step statuses each turn; replan only when a step
+  fails twice or an observation breaks an assumption; cap steps and replans; log tokens, steps and
+  success per task.
+- **Done when:** you have a table of success, steps and tokens for both versions, and at least one trace
+  where a replan trigger fired for a stated reason.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): the billing-dispute agent's investigation
+island runs under a step and token budget, and its proposal state is effectively a plan a support lead
+approves before execution.

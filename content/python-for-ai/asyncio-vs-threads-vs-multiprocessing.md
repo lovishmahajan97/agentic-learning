@@ -405,3 +405,25 @@ empirical. If the hot loop can be expressed as vectorised Polars string operatio
 - [x] Each task's arguments and results are pickled and copied, which can cost more than tiny tasks
 > Processes have separate memory, so data crosses a pipe as pickled bytes. When per-task compute is
 > small or the payload is large, serialisation and startup overhead outweigh the parallel speed-up.
+
+## Use cases & projects
+### Use cases
+- **Async agent core with sync tools.** Model and MCP calls stay on the loop, while a vendor SDK with no
+  async client runs through `asyncio.to_thread`.
+- **CPU-heavy tools in a chat agent.** PDF parsing or code linting moves to a process pool so one upload
+  does not stall every other session.
+- **RAG ingestion pipelines.** Downloads and embedding calls run async; chunking and parsing fan out over
+  processes, sized to the cores you have.
+- **Sizing an agent service.** Choosing server worker count and pool sizes against a memory budget,
+  because each process carries its own clients and model copies.
+
+### Mini project
+**Route three tools to the right executor (1-2 hours).**
+- **Goal:** measure what each concurrency model does for an I/O tool, a blocking SDK tool and a CPU
+  tool inside one async agent.
+- **Steps:** write an async HTTP-style tool (`asyncio.sleep`), a blocking tool (`time.sleep`) and a
+  pure-Python CPU tool (a tight loop over a few million items); run 8 concurrent sessions calling each
+  tool directly on the loop, via `asyncio.to_thread`, and via a `ProcessPoolExecutor`; record wall time
+  and event-loop lag.
+- **Done when:** a table shows the best executor per tool, with numbers, and you can explain why threads
+  did not help the CPU tool on standard CPython.

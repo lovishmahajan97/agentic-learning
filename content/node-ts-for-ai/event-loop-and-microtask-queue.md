@@ -5,7 +5,8 @@ name: Event loop & microtask queue
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - node-ts-for-ai/promises-and-async-error-propagation
   - node-ts-for-ai/worker-threads-for-cpu-bound-tasks
@@ -19,9 +20,21 @@ sources:
 ---
 
 ## TL;DR
-Node runs JavaScript on one thread, multiplexing I/O through a phased event loop and draining microtask
-queues after every callback. That lets an AI gateway hold 5,000 open model streams cheaply, and lets one
-200 ms synchronous computation stall every one of them.
+A Node agent server runs all sessions' JavaScript on one thread, with a phased event loop that drains
+microtask queues after each callback. It holds 5,000 open model streams cheaply, and one 200 ms
+synchronous step stalls them all.
+
+## For agent builders
+- **Why it matters for agents.** An agent run is mostly waiting (model calls, tool HTTP calls), which the
+  loop makes cheap, plus occasional CPU bursts (parsing a big tool result, local reranking, tokenizing for
+  context packing) that freeze every other session's stream on that process.
+- **Where it shows up in your stack.** Your agent server or gateway (Express, Fastify, Next.js route
+  handlers), parallel tool calls via `Promise.all`, SSE token streaming to the UI, and the timeouts you set
+  on tools.
+- **What you control.** Which agent steps run inline versus in a worker thread, how big a tool result you
+  accept, chunking with `setImmediate`, and a loop-lag gauge with load shedding.
+- **What you can skip.** libuv internals and the pending/close phases in depth. Know the ordering rule
+  (sync, `nextTick`, promises, macrotasks) and how to measure lag.
 
 ## Why it exists
 - **LLM services mostly wait.** A model request might take 2–30 seconds, during which the CPU does nothing
@@ -96,7 +109,7 @@ are empty, *then* moves on. Microtasks queued while draining run in the same dra
   depends on whether 1 ms has elapsed when the timers phase is checked). Inside an I/O callback,
   `setImmediate` always runs first, because check comes before the next timers phase.
 
-### What "blocking the loop" looks like in an AI service
+### What "blocking the loop" looks like in an agent service
 - **Anything not awaiting I/O runs to completion on the loop thread:** `JSON.parse` of a multi-megabyte
   response, a regex over a long transcript, cosine similarity across 100k embeddings in plain JS, synchronous
   `zlib`/`crypto` calls, or a tight loop building a prompt from a large document.
@@ -210,6 +223,19 @@ setTimeout(() => {
 setTimeout(() => clearInterval(ticker), 1000);
 ```
 
+### Agent scenario: parallel tool calls on one thread
+A research agent fires three tool calls with `Promise.all`. The waits overlap; the CPU steps do not.
+
+| Step | Time | Runs on the loop thread? |
+|---|---|---|
+| 3 HTTP tool calls (search, docs, CRM), awaited together | ~1.2 s wall, overlapping | No: only short callbacks as bytes arrive |
+| Parse the 3 results (small JSON) | ~2 ms | Yes, sequentially |
+| Rerank 100k cached embeddings in plain JS, unchunked | ~300 ms | Yes: every other session's stream pauses ~300 ms |
+| Same rerank chunked every 500 vectors | ~300 ms total spread over 200 slices | Yes, but other sessions wait at most one slice |
+
+Illustrative timings. The lesson: `Promise.all` gives concurrency for waiting, never parallelism for
+compute, so the rerank step belongs in a worker thread once it runs on every turn.
+
 ### Worked scenario: one handler, every stream paused
 A gateway holds 2,000 SSE streams. One route parses tool results of up to 20 MB inline.
 
@@ -222,6 +248,9 @@ A gateway holds 2,000 SSE streams. One route parses tool results of up to 20 MB 
 | Fix: parse in a worker thread, cap tool-result size | p99 lag back under 10 ms (illustrative) |
 
 ## Production patterns
+- **Keep the agent loop thin; offload heavy steps.** Agent teams keep orchestration (model calls, tool
+  dispatch, streaming) on the loop and push tokenizing, reranking and large-result parsing to a worker pool.
+  Cap tool-result size before parsing. Monitor loop lag per agent step type in traces.
 - **Ship a loop-lag gauge with every service.** Enable `monitorEventLoopDelay({ resolution: 10 })` at
   startup, export p50/p99 every few seconds to your metrics system, and reset the histogram after each read.
   Alert on p99 lag next to the latency SLO.
@@ -250,6 +279,9 @@ A gateway holds 2,000 SSE streams. One route parses tool results of up to 20 MB 
   contention bite.
 
 ## Pitfalls
+- **Assuming `Promise.all` parallelizes an agent's CPU steps.** Symptom: running three local scorers "in
+  parallel" takes the sum of their times and stalls other sessions. Fix: parallel waits are fine; parallel
+  compute needs worker threads.
 - **CPU-heavy work inline in a handler** (tokenizing, big `JSON.parse`, similarity search). Symptom: every
   concurrent stream stalls at once and p99 spikes while one core sits at 100%. Fix: offload to a worker
   thread, or chunk with `setImmediate` if the job is occasional.
@@ -320,6 +352,12 @@ yields if it is occasional, and keep a loop-lag alert so regressions are caught 
 - **Pair it with utilization:** high lag at moderate utilization means long callbacks to offload; high lag
   at utilization near 1 means saturation and a scale-out.
 
+### Your agent server hosts 200 sessions and users say tokens stutter whenever one agent reranks results. What do you do?
+- **Confirm it is the loop:** stutters synchronized across sessions plus a p99 `monitorEventLoopDelay` spike
+  that matches the rerank duration point to one long callback, not the provider.
+- **Fix by step type:** move the rerank to a worker pool (it runs every turn), cap tool-result size, and add
+  load shedding on lag so in-flight agent streams are protected.
+
 ### Does raising `UV_THREADPOOL_SIZE` help a handler that blocks on a large `JSON.parse`?
 - **No:** the pool runs native operations such as filesystem calls and `getaddrinfo`, never your JavaScript.
 - **`JSON.parse` runs on the loop thread,** so the fix is a worker thread, a size cap, or a streaming parser.
@@ -352,3 +390,23 @@ yields if it is occasional, and keep a loop-lag alert so regressions are caught 
 > Marking a function `async` does not move its synchronous body off the loop, and the libuv pool only
 > serves native operations, not your JavaScript. Only a worker thread gives true parallelism, and chunked
 > yielding at least lets other callbacks run between slices.
+
+## Use cases & projects
+### Use cases
+- **Agent gateways streaming to many users.** One Node process holds thousands of SSE streams because each
+  waiting model call costs heap, not a thread.
+- **Parallel tool calls.** `Promise.all` over independent tool calls overlaps their network waits, cutting
+  a step's latency to the slowest call.
+- **Diagnosing "everyone freezes at once".** Loop lag explains synchronized stalls across agent sessions
+  that provider dashboards cannot.
+- **Placing local compute.** Deciding whether reranking, tokenizing or result parsing stays inline, gets
+  chunked, or moves to a worker.
+
+### Mini project
+**Make one agent's CPU step visible to every other session (1-2 hours).**
+- **Goal:** show and then remove the cross-session stall caused by inline compute in an agent server.
+- **Steps:** build a small Node server that streams fake tokens over SSE for 50 concurrent sessions; add an
+  agent step that scores 100k random vectors inline; export `monitorEventLoopDelay` p99; then chunk the
+  scoring with `setImmediate` and finally move it to a worker thread.
+- **Done when:** you have a table of p99 loop lag and the longest token gap per session for inline,
+  chunked and worker versions, with a short note on which you would ship and why.

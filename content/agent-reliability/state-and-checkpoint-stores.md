@@ -5,7 +5,8 @@ name: State & checkpoint stores
 kind: decision
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/state-persistence-and-conversation-recovery
@@ -23,6 +24,19 @@ sources:
 The agent state store sets per-step latency, crash survival, tenant isolation and deletion. A sound
 default: Postgres for run records, events and small snapshots, object storage for large tool outputs,
 Redis only for leases and stream buffers, and a tenant id on every row.
+
+## For agent builders
+- **Why it matters for agents.** Every agent step pays at least one durable write before tools run, so the
+  store adds latency to each step of a streaming run. It also decides whether a resume finds the last step
+  and whether you can delete a tenant's data on request.
+- **Where it shows up in your stack.** The checkpointer you pass to your framework (LangGraph's
+  `InMemorySaver` for tests, its Postgres or SQLite checkpointers for real runs), the `runs`, `events` and
+  `checkpoints` tables, an object-store bucket for large tool outputs, and Redis for leases.
+- **What you control.** One transaction per step, which durability level a commit acknowledges
+  (`synchronous_commit`, `appendfsync`), leases with fencing epochs, blob offload thresholds, `tenant_id`
+  on every row and key, and retention per data class.
+- **What you can skip.** A distributed database on day one. A single Postgres holds about 200 MB a day for a
+  thousand runs (illustrative); move only when one primary becomes the bottleneck.
 
 ## Why it exists
 - **Every step pays a durable write.** Checkpointing puts one on the critical path of each step. A store
@@ -364,3 +378,25 @@ audit policy, and tenant-scoped deletion covers the blobs too.
 - [ ] It allows TTLs to be set per tenant only
 > Deletion requests and isolation rules apply per tenant across events, snapshots and archives;
 > inferring tenancy through joins is slow and error-prone, and object stores cannot join at all.
+
+## Use cases & projects
+### Use cases
+- **Moving an agent prototype to production.** Swap the in-memory checkpointer for a Postgres one so
+  deploys and restarts no longer wipe runs.
+- **Browsing and scraping agents.** Multi-megabyte page outputs go to object storage under
+  `tenant/run_id/seq`, keeping events small and the hot store fast.
+- **Horizontally scaled agent workers.** Leases with fencing epochs stop a paused worker from overwriting
+  its successor's checkpoint or repeating a side effect.
+- **Enterprise agent platforms.** Tenant-scoped rows and blob prefixes make "prove our data is deleted at
+  contract end" a scheduled job instead of a forensic project.
+
+### Mini project
+**Build a Postgres checkpoint store for an agent loop (2-3 hours).**
+- **Goal:** persist each agent step in one transaction with a lease check, and offload large tool outputs
+  to a blob directory.
+- **Steps:** create `runs`, `events` and `checkpoints` tables with `tenant_id` columns in a local Postgres;
+  write a `save_step()` that inserts events, upserts the checkpoint and updates the run only if the caller
+  still holds the lease; store payloads over a size threshold as files keyed `tenant/run_id/seq`; time 100
+  steps.
+- **Done when:** a second worker cannot write after taking over an expired lease from the first, a crash
+  mid-transaction leaves no half-written step, and you report p50 and p95 write latency per step.

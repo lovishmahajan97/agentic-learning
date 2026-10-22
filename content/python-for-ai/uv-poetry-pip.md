@@ -395,3 +395,24 @@ platform mismatches stop.
 - [ ] Installs packages without metadata
 > uv still resolves, but caches packages globally and materializes them into each environment cheaply,
 > alongside parallel downloads. Building from source would be slower, not faster.
+
+## Use cases & projects
+### Use cases
+- **Reproducible agent images.** `uv sync --locked` in the Dockerfile builds the agent service with exactly
+  the versions that passed evals.
+- **Eval runners that match production.** A dependency group for eval tooling, synced from the same lock,
+  keeps the eval harness on the service's exact framework and SDK versions.
+- **Throwaway environments for code-executing agents.** `uvx` and PEP 723 scripts give each generated
+  script its own isolated environment instead of polluting the agent's.
+- **Gated framework upgrades.** A `langgraph` or provider SDK bump lands in its own pull request and merges
+  only when the eval suite passes.
+
+### Mini project
+**Set up a locked agent project end to end (1-2 hours).**
+- **Goal:** create an agent project whose local, CI and container environments are identical.
+- **Steps:** `uv init` a project, `uv add` an agent framework and a provider SDK, and add a dev group with
+  pytest and an eval group; commit `pyproject.toml` and `uv.lock`; write a Dockerfile that runs
+  `uv sync --locked` and a CI job that does the same and runs a tiny offline agent test; then upgrade one
+  package in a separate branch and compare the lock diff.
+- **Done when:** CI and the image fail if the lock is stale, the agent test passes in both, and the upgrade
+  branch shows exactly which direct and transitive versions moved.

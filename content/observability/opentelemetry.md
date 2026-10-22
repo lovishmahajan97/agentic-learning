@@ -5,7 +5,8 @@ name: OpenTelemetry
 kind: tool
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - observability/tracing
   - observability/spans
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-OpenTelemetry (OTel) is the CNCF vendor-neutral standard for producing traces, metrics and logs: one API
-and SDK per language, one wire protocol (OTLP), W3C Trace Context and shared attribute names. Instrument
-once; the backend becomes configuration.
+OpenTelemetry (OTel) is the CNCF vendor-neutral standard for traces, metrics and logs. Instrument your
+agent once, every run, model call and tool call becomes a span in one trace, and Langfuse, Phoenix or
+your APM is just an OTLP endpoint.
+
+## For agent builders
+- **Why it matters for agents.** An agent run is a tree: a root task, model calls that decide, tool calls
+  that act, retrievals and sub-agents. OTel gives that tree one `trace_id`, parent links and timings, so
+  "which of the fourteen calls was slow or wrong" has an answer.
+- **Where it shows up in your stack.** Framework and provider instrumentors (OpenLLMetry, OpenInference,
+  `opentelemetry-instrumentation-*`), the OTLP endpoint of Langfuse, Phoenix or LangSmith, and the
+  `traceparent` header on calls to MCP or tool servers.
+- **What you control.** Span names and boundaries for agent steps, `gen_ai.*` attributes, whether prompt
+  and completion content is captured, sampling, and context propagation across async tool tasks.
+- **What you can skip.** OTLP protobuf details and Collector internals beyond receivers, processors and
+  exporters. Know the API/SDK split, propagation and head versus tail sampling.
 
 ## Why it exists
 - **Every vendor had its own agent.** A library author who wanted to emit spans had to pick a vendor or
@@ -195,6 +208,52 @@ What crosses the wire is small:
   appear without the manual span; keep the GenAI attributes on a wrapping span or let an LLM instrumentation
   library set them.
 
+### Tracing an agent loop: one root, a span per model call and tool call
+The agent run is the root; each turn's model call and each tool call is a child, and tool calls run as
+asyncio tasks. `call_model` and `TOOLS` stand for your own client and tool registry.
+
+```python
+import asyncio, json
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind, Status, StatusCode
+
+tracer = trace.get_tracer("research-agent")   # provider set up as in the previous example
+
+async def run_tool(call):
+    # asyncio tasks copy the current context, so this span parents to the turn span
+    with tracer.start_as_current_span(f"tool {call.name}", kind=SpanKind.INTERNAL) as s:
+        s.set_attributes({"app.tool.name": call.name, "app.tool.args_chars": len(call.arguments)})
+        try:
+            return await TOOLS[call.name](**json.loads(call.arguments))
+        except Exception as e:
+            s.record_exception(e); s.set_status(Status(StatusCode.ERROR)); return {"error": str(e)}
+
+async def run_agent(task: str, max_steps: int = 8):
+    with tracer.start_as_current_span("agent.run") as root:
+        root.set_attribute("app.agent.max_steps", max_steps)
+        messages = [{"role": "user", "content": task}]
+        for step in range(max_steps):
+            with tracer.start_as_current_span(f"agent.turn {step}"):
+                with tracer.start_as_current_span("chat gpt-4o-mini", kind=SpanKind.CLIENT) as s:
+                    s.set_attributes({"gen_ai.operation.name": "chat", "gen_ai.request.model": "gpt-4o-mini"})
+                    msg, usage = await call_model(messages)
+                    s.set_attributes({"gen_ai.usage.input_tokens": usage.input,
+                                      "gen_ai.usage.output_tokens": usage.output})
+                if not msg.tool_calls:
+                    root.set_attribute("app.agent.steps", step + 1); return msg.content
+                results = await asyncio.gather(*(run_tool(c) for c in msg.tool_calls))
+                messages += [msg.to_dict()] + [{"role": "tool", "tool_call_id": c.id,
+                             "content": json.dumps(r)} for c, r in zip(msg.tool_calls, results)]
+        root.set_status(Status(StatusCode.ERROR, "max_steps reached"))
+```
+
+- **Parallel tool calls appear as siblings** under the turn span, so the trace view shows them overlapping.
+- **The `app.*` attributes are your own namespace.** Recent GenAI conventions also describe agent and tool
+  spans (for example an `execute_tool` operation and tool-name attributes); they are experimental, so check
+  the version you pin before relying on exact names.
+- **A failed tool is an ERROR span but not a crash,** because the error goes back to the model as a tool
+  result; the root is marked ERROR only when the step budget runs out.
+
 ### Collector gateway: keep every error, 10% of the rest
 A production gateway config using the contrib `tail_sampling` processor. A trace is kept if any policy
 matches, so errors and slow traces are always retained.
@@ -268,6 +327,10 @@ memory to hold `decision_wait` seconds of full traffic (here 40,000 spans for 10
   sampled audit.
 - **Pin GenAI instrumentation versions.** Treat the experimental `gen_ai.*` names as a schema: pin package
   versions and test dashboards on upgrade. Monitor token panels for sudden gaps.
+- **One span per agent step, named for the step type.** Agent teams name spans `agent.run`, `agent.turn`,
+  `tool <name>` and `chat <model>`, and put step index, tool name and outcome in attributes, so a query like
+  "p95 duration of tool spans by name" or "runs that hit the step budget" works. Monitor spans per trace,
+  because a runaway loop shows up as a trace with hundreds of turn spans.
 - **Opt in to content per environment.** Enable prompt and completion capture in staging and for sampled
   production traffic only, using the instrumentation library's content-capture setting. Monitor span size and
   storage growth.
@@ -367,6 +430,13 @@ confirm each service sets a distinct `service.name` so the merged trace is reada
 - **Fix:** end the span when the stream is exhausted, set `gen_ai.usage.*` from the final chunk's usage, and
   record first-token time as an event or attribute so TTFT is visible.
 
+### How would you structure the spans for a tool-calling agent so failures are easy to find?
+- **One root per agent run,** a child per turn, and under each turn one model-call span plus one span per
+  tool call, with the step index, tool name and outcome as attributes.
+- **Mark tool failures as ERROR spans** even when the agent recovers, and mark the root ERROR when the step
+  budget or a guardrail ends the run, so tail sampling keeps both kinds.
+- **Propagate `traceparent` to tool and MCP servers,** so their internal spans join the same trace.
+
 ### Should prompt and completion text go on spans in production?
 - **Default no.** The GenAI conventions make content opt-in because it is large and sensitive, creating PII
   and retention obligations.
@@ -397,3 +467,24 @@ confirm each service sets a distinct `service.name` so the merged trace is reada
 - [ ] The sampling ratio as a floating-point value
 > `traceparent` is deliberately tiny: `00-<trace id>-<parent span id>-<flags>`. Attributes and resources
 > stay on the spans themselves; the sampled flag, not a ratio, tells downstream services whether to record.
+
+## Use cases & projects
+### Use cases
+- **Debugging a wrong agent answer.** The trace shows which tool returned bad data, which turn misread it
+  and how many steps were spent, instead of a flat log of model calls.
+- **One trace across agent, tools and MCP servers.** Propagated `traceparent` joins the agent service, a
+  remote tool server and its database calls, so tool latency is attributed correctly.
+- **Switching LLM observability vendors.** Instrumenting with OTel lets a team move from one OTLP backend
+  to another, or send to two at once through a Collector, without touching agent code.
+- **Keeping every failed agent run.** Tail sampling on ERROR status retains every run that hit the step
+  budget or a tool error, with a small baseline of successful runs.
+
+### Mini project
+**Trace a two-tool agent end to end (2-3 hours).**
+- **Goal:** see an agent run as one trace with turns, model calls and parallel tool calls.
+- **Steps:** run Jaeger or Phoenix locally as an OTLP backend; build a small agent with two tools (one that
+  sometimes raises); instrument it with a root `agent.run` span, turn spans, model spans with `gen_ai.*`
+  attributes and tool spans; run the tools as asyncio tasks; then add a Collector with an error tail
+  sampling policy.
+- **Done when:** one run shows a single trace with sibling tool spans, a failing tool appears as an ERROR
+  span under its turn, and only error runs plus a baseline survive the Collector.

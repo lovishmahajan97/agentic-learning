@@ -5,7 +5,8 @@ name: Backpropagation
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: background
 related:
   - ml-fundamentals/gradient-descent
   - ml-fundamentals/loss-functions
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-Backpropagation gets the loss gradient for every parameter in one backward sweep of the chain rule, at a
-small multiple of the forward cost regardless of parameter count. The price is memory: saved activations
-scale with batch × sequence length × depth.
+Backpropagation computes every parameter's gradient in one backward chain-rule sweep. For agent builders
+it explains two things: why fine-tuning on long trajectories runs out of memory, and why you cannot
+backpropagate through a tool call or a task-success score.
+
+## For agent builders
+- **Why it matters for agents.** Most agent work never touches it, but two decisions do. Fine-tuning on
+  long agent trajectories is memory-bound by saved activations, and the graph stops at sampling and tool
+  calls, so "train on task success" needs RL or preference methods, not plain backprop.
+- **Where it shows up in your stack.** Gradient checkpointing and LoRA settings in fine-tuning libraries,
+  out-of-memory errors at long sequence lengths, `detach()` and `.item()` in training code, and the reason
+  RLHF, DPO and rejection-sampling fine-tunes exist.
+- **What you control.** Sequence length and micro-batch size, gradient checkpointing, which weights are
+  frozen (LoRA), and whether the training signal is differentiable (token loss) or not (run outcome).
+- **What you can skip.** Writing backward passes, autograd internals and Jacobian algebra. Know the cost
+  rule (a step is about three forward passes), the memory rule (activations scale with B × T × depth) and
+  where the graph stops.
 
 ## Why it exists
 - **Gradient descent needs ∇L,** one partial derivative per parameter.
@@ -45,7 +59,7 @@ scale with batch × sequence length × depth.
   do with them.
 
 ## How it works
-### The computation graph and adjoints
+### Background: the chain rule run backwards
 1. **Record.** A forward pass is a sequence of primitive operations, each recording its inputs, its output
    and which operation it was. The loss L sits at the end.
 2. **Define adjoints.** For every intermediate value v, v̄ = ∂L/∂v, with L̄ = 1.
@@ -67,16 +81,8 @@ scale with batch × sequence length × depth.
 
 Forgetting the "+=" and keeping only the last contribution would give 2 or 6, a silently wrong gradient.
 
-### What the framework actually does
-- **Graph recorded during the forward pass.** In PyTorch every tensor produced by a differentiable op
-  carries a `grad_fn` pointing at the op and the values it saved.
-- **`loss.backward()`** walks those pointers in reverse, writes each parameter's adjoint into `.grad`, and
-  then frees the graph and its saved tensors (unless `retain_graph=True`).
-- **`.grad` is *added to*, not overwritten,** the same += rule applied across calls. That is why
-  `zero_grad()` is needed between steps, and why gradient accumulation over several micro-batches works by
-  calling `backward()` several times before `step()`.
+**Why reverse rather than forward.**
 
-### Why reverse rather than forward
 | Mode | Cost | Training (1 output, P inputs) |
 |---|---|---|
 | Forward | one pass per input direction | P passes |
@@ -86,11 +92,10 @@ Forgetting the "+=" and keeping only the last contribution would give 2 or 6, a 
   constant multiple of the forward cost.
 - **About 2× forward FLOPs** for matrix-multiply-dominated networks, because each linear layer needs two
   matmuls in the backward pass against one in the forward pass. Hence the rule of thumb that a training
-  step costs about three forward passes.
+  step costs about three forward passes, the basis of fine-tuning compute estimates.
 
-### A linear layer, worked out
-For y = xW with x of shape [B, d_in] and W of shape [d_in, d_out], given the upstream adjoint ȳ of shape
-[B, d_out]:
+**A linear layer, worked out.** For y = xW with x of shape [B, d_in] and W of shape [d_in, d_out], given
+the upstream adjoint ȳ of shape [B, d_out]:
 
 ```
 W̄ = xᵀȳ      shape [d_in, d_out]   -> needs x, the layer's saved input activation
@@ -102,10 +107,19 @@ softmax + cross-entropy (fused):  z̄ = q − onehot(y)
 Attention and normalisation layers are more involved but follow the same recipe: a local derivative
 applied to the upstream adjoint, using saved forward values.
 
-### Where training memory goes
+### What the framework actually does
+- **Graph recorded during the forward pass.** In PyTorch every tensor produced by a differentiable op
+  carries a `grad_fn` pointing at the op and the values it saved.
+- **`loss.backward()`** walks those pointers in reverse, writes each parameter's adjoint into `.grad`, and
+  then frees the graph and its saved tensors (unless `retain_graph=True`).
+- **`.grad` is *added to*, not overwritten,** the same += rule applied across calls. That is why
+  `zero_grad()` is needed between steps, and why gradient accumulation over several micro-batches works by
+  calling `backward()` several times before `step()`.
+
+### Where training memory goes (long agent trajectories)
 - **Saved forward values are held until their backward step.** Per layer that is several tensors of shape
   [batch, sequence, hidden], so activation memory scales with B × T × d × depth and for long sequences
-  dwarfs the parameters.
+  dwarfs the parameters. Agent trajectories with tool results routinely run to many thousands of tokens.
 - **Gradient checkpointing** stores only each block's input and recomputes the interior during the
   backward pass, trading roughly a third more compute for a large memory reduction.
 - **Fused attention kernels** recompute attention probabilities in the backward pass rather than storing
@@ -116,31 +130,34 @@ applied to the upstream adjoint, using saved forward values.
 - **Compute falls less than you think.** What is skipped is the weight-gradient matmul for each frozen
   layer, roughly half the backward FLOPs, so compute per step falls by at most about a third, nowhere near
   in proportion to the parameter count.
+- **Masking the loss does not save memory.** Tool-result tokens masked out of the loss still pass through
+  the forward and backward sweep, so they still cost activations.
 
 ### Vanishing and exploding gradients
 - **Products of Jacobians.** The adjoint at the first layer is the upstream adjoint multiplied by the
   Jacobian of every layer above it; a product of many matrices shrinks or grows exponentially.
 - **Sigmoid arithmetic.** A sigmoid's derivative is at most 0.25, so twenty sigmoid layers scale the
   gradient by at most 0.25²⁰ ≈ 10⁻¹²; early layers simply stop learning.
+- **Every standard remedy answers this arithmetic:** ReLU and GELU have derivative near 1 on their active
+  side; residual connections make each block's Jacobian I plus something small, so gradients have a
+  highway to early layers; normalisation keeps activation scales from drifting; variance-preserving
+  initialisation starts the product near 1; clipping bounds the explosions that remain.
 
-Every standard remedy is a response to this arithmetic:
-- **ReLU and GELU** have derivative near 1 on their active side.
-- **Residual connections** make each block's Jacobian I plus something small, so the product stays near
-  the identity and gradients have a highway to early layers.
-- **Normalisation** keeps activation scales from drifting.
-- **Variance-preserving initialisation** starts the product near 1.
-- **Clipping** bounds the explosions that remain.
-
-### Where the graph stops
+### Where the graph stops: tool calls and task success
 - **No useful derivative:** argmax, sampling, string operations and external tool calls. You cannot
-  backpropagate through "generate a response and score it".
+  backpropagate through "generate a response and score it", or through "call the search tool and check
+  whether the agent finished the task".
 - **That gap is why** policy-gradient methods exist for RLHF, and why straight-through estimators and
   Gumbel-softmax are used when a discrete step must sit inside a differentiable model.
+- **What agent teams do instead:** filter successful runs and fine-tune on them with token cross-entropy
+  (rejection sampling), train on preference pairs (reward models, DPO), or use RL that weights each run's
+  log-probability by its outcome.
 - **`detach()` cuts the graph deliberately,** for example to stop gradients flowing into a target network
   or a teacher.
 
 ## Diagram
 The forward pass saves activations; the backward pass consumes them in reverse to produce every gradient.
+The graph ends at the loss, so anything outside it, such as a tool's result, sends no gradient back.
 
 ```mermaid
 flowchart TD
@@ -157,6 +174,40 @@ flowchart TD
 ```
 
 ## Examples
+### No gradient through a tool call, and the REINFORCE workaround
+A toy router samples one of four tools; the tool runs and the outcome is scored outside the graph. The
+reward has no gradient, so the update weights the log-probability of the chosen tool by the reward.
+
+```python
+import torch
+
+logits = torch.randn(4, requires_grad=True)     # router scores for 4 tools
+probs = logits.softmax(-1)
+tool = torch.multinomial(probs, 1).item()       # sampling: no gradient flows through this
+reward = 1.0 if tool == 2 else 0.0              # tool ran, task scored outside the graph
+# reward is a plain float: there is nothing to call .backward() on
+
+surrogate = -torch.log(probs[tool]) * reward    # REINFORCE: log-prob weighted by the outcome
+surrogate.backward()
+print(tool, reward, logits.grad)                # gradient is zero when the run earned no reward
+```
+
+### Worked scenario: fine-tuning on longer agent trajectories
+A team fine-tunes with LoRA on agent traces and raises the maximum sequence length to keep whole runs.
+Activation memory is shown relative to the 4k setting; it is a scaling sketch, not a measurement.
+
+| Max sequence length | Activations (relative) | With gradient checkpointing | Compute per step |
+|---|---|---|---|
+| 4k | 1× | much lower | baseline |
+| 8k | about 2× | much lower | about a third more with checkpointing |
+| 16k | about 4× | much lower | about a third more with checkpointing |
+
+- **Weights and LoRA state do not change** with sequence length; activations do, which is why the job ran
+  at 4k and failed at 16k.
+- **Order of levers:** checkpointing, a fused attention kernel, micro-batch 1 with gradient accumulation,
+  then truncating or summarising long tool results in the training data.
+- **Measure** peak memory at two lengths before buying hardware, to confirm the linear scaling.
+
 ### A two-layer network by hand, checked numerically
 A two-layer network with ReLU and softmax cross-entropy, differentiated by hand and checked against a
 finite difference. Each backward line is one local derivative multiplied by the upstream adjoint; the
@@ -243,23 +294,26 @@ for name, n in grad_norms(model).items():
 ```
 
 ## Production patterns
-- **Log per-layer gradient norms.** Compute norms from `named_parameters()` after `backward()` every N
-  steps and send them to your experiment tracker. Monitor the ratio of first-layer to last-layer norms; a
-  collapse of several orders of magnitude means vanishing gradients.
-- **Gradient checkpointing to fit longer sequences.** In Hugging Face Transformers call
+- **Gradient checkpointing to fit long trajectories.** In Hugging Face Transformers call
   `model.gradient_checkpointing_enable()`, or wrap blocks with `torch.utils.checkpoint.checkpoint`. Expect
   roughly a third more compute per step; monitor peak memory and step time.
+- **Turn run outcomes into differentiable data.** Because task success has no gradient, filter successful
+  agent runs for SFT or pair good and bad runs for preference tuning, instead of trying to backpropagate a
+  success flag. Monitor task success on a held-out eval after each round.
 - **Gradient accumulation for large effective batches.** Call `backward()` on several micro-batches
   (scale each loss by 1/k) before one `step()` and one `zero_grad()`. Monitor that the effective batch and
   learning rate match the intended recipe.
+- **Log per-layer gradient norms.** Compute norms from `named_parameters()` after `backward()` every N
+  steps and send them to your experiment tracker. Monitor the ratio of first-layer to last-layer norms; a
+  collapse of several orders of magnitude means vanishing gradients.
 - **Log scalars, not tensors.** Use `loss.item()` or `loss.detach()` for metrics so the graph is freed
   each step. Monitor allocated memory per step; steady growth means a graph is being retained.
-- **Gradient-check custom ops in float64.** For a custom `torch.autograd.Function`, run
-  `torch.autograd.gradcheck` on small double-precision inputs before training. Monitor nothing in
-  production; this is a pre-merge test.
 - **Profile activation memory before buying hardware.** Use `torch.cuda.max_memory_allocated()` across a
   few sequence lengths and batch sizes to see how memory scales, then choose checkpointing, length and
   batch. Monitor peak memory against the GPU limit.
+- **Gradient-check custom ops in float64.** For a custom `torch.autograd.Function`, run
+  `torch.autograd.gradcheck` on small double-precision inputs before training. Monitor nothing in
+  production; this is a pre-merge test.
 
 ## Trade-offs
 - **Reverse mode: cheap gradients vs stored activations.** Every gradient for about twice the forward
@@ -275,6 +329,8 @@ for name, n in grad_norms(model).items():
 - **Recompute in fused kernels: FLOPs vs memory.** Kernels that recompute intermediate results in the
   backward pass trade FLOPs for memory bandwidth and capacity; they win when saved tensors would dominate
   memory, as attention does at long sequence lengths.
+- **Token loss vs outcome signal.** Token cross-entropy is differentiable and stable but only imitates
+  runs; outcome-based RL optimises what you care about but has high-variance gradients and needs many runs.
 
 ## Pitfalls
 - **Forgetting `optimizer.zero_grad()`.** Gradients accumulate across steps; the gradient norm grows step
@@ -289,11 +345,15 @@ for name, n in grad_norms(model).items():
   graph alive. Symptom: memory growing every step until an out-of-memory error.
 - **Gradient-checking in fp16 or bf16.** Symptom: "mismatches" that are nothing but rounding noise. Do the
   check in float64.
+- **Expecting a reward to train the model directly.** Symptom: a "reward loss" built from a judge score or
+  success flag that never changes the weights, because it was computed outside the graph.
 
 ## When to use
 You do not choose backpropagation; the framework performs it. What you choose follows from its arithmetic.
 - **Decide:** which parameters to freeze, where to checkpoint, what sequence length and batch fit in
   memory, and when a custom autograd function is needed for a non-differentiable step.
+- **Decide the signal:** token loss on curated trajectories when you can, outcome-based methods only when
+  imitation is not enough.
 - **Debug** a model that is not learning by following gradients layer by layer.
 - **Measure** per-layer gradient norms with hooks and peak activation memory with the framework's memory
   profiler.
@@ -330,11 +390,18 @@ diagnosis before and after by logging per-layer gradient norms.
 - **Result:** parameter adjoints are added into `.grad`, then the graph and saved tensors are freed unless
   `retain_graph=True`.
 
-### Your fine-tune runs out of memory at sequence length 8k but not 4k. Where is the memory going and what do you do?
+### You want to fine-tune your agent directly on "did the task succeed". Why can't you just backpropagate that?
+- **The graph stops:** sampling tokens, executing tools and scoring the outcome happen outside the
+  differentiable graph, so the success flag has no gradient with respect to the weights.
+- **Workarounds:** fine-tune with token cross-entropy on successful runs only, train on preference pairs
+  (reward model or DPO), or use policy-gradient RL that weights each run's log-probability by its reward.
+- **Trade-off:** imitation is stable and cheap; outcome RL needs many runs and careful variance control.
+
+### Your fine-tune on agent trajectories runs out of memory at sequence length 8k but not 4k. Where is the memory going and what do you do?
 - **Activations, not weights:** saved tensors scale with B × T × d × depth, so doubling T roughly doubles
-  them, and naive attention stores T × T matrices.
+  them, and naive attention stores T × T matrices. Masked tool-result tokens still count.
 - **Levers:** enable gradient checkpointing (about a third more compute), use a fused attention kernel,
-  lower the micro-batch and use gradient accumulation.
+  lower the micro-batch and use gradient accumulation, or shorten tool results in the data.
 - **Measure** peak memory at a few lengths to confirm the scaling before changing hardware.
 
 ### Why does a training step cost about three forward passes?
@@ -383,3 +450,25 @@ diagnosis before and after by logging per-layer gradient norms.
 > Adapters in early layers need the adjoint of the loss with respect to their outputs, which can only be
 > obtained by backpropagating through every frozen layer above them. What is skipped is the weight-gradient
 > matmul (about half the backward FLOPs) and the optimizer state for frozen parameters.
+
+## Use cases & projects
+### Use cases
+- **Sizing a fine-tune on long trajectories.** The activation-memory rule tells you whether a 16k-token
+  agent trace fits, and whether checkpointing or shorter tool results is the cheaper fix.
+- **Choosing a training signal.** Knowing the graph stops at tool calls explains why teams use rejection
+  sampling, preference pairs or RL rather than a "success loss".
+- **Estimating training cost.** About three forward passes per training token turns a dataset size into
+  a compute budget for a fine-tuning quote.
+- **Debugging a fine-tune that does nothing.** Per-layer gradient norms and graph-break checks find frozen
+  or detached parameters quickly.
+
+### Mini project
+**Router trained from tool outcomes (1-2 hours).**
+- **Goal:** show that a reward computed outside the graph gives no gradient, then train a tiny tool router
+  from outcomes with REINFORCE.
+- **Steps:** define four fake tools where one solves each task type; build a linear softmax router over a
+  one-hot task feature; first try to backpropagate a success flag and observe no update; then train with
+  the log-probability-times-reward surrogate for a few hundred sampled runs; compare with supervised
+  cross-entropy on the correct tool labels.
+- **Done when:** you have a plot of success rate over training for both methods and a short note on why
+  the supervised version converges faster and when the outcome version is the only option.

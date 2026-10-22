@@ -5,7 +5,8 @@ name: Precision / recall / F1
 kind: metric
 difficulty: intro
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - ml-fundamentals/confusion-matrix
   - ml-fundamentals/roc-auc
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-Precision: of what I flagged, how much was right. Recall: of what was there, how much I found. The
-threshold trades them, so a scorer is a curve; F1 picks one point and assumes both errors cost the same,
-which production rarely grants.
+Precision and recall are how you score an agent's retriever, guardrails, judges and tool-call decisions:
+of what it flagged, how much was right; of what was there, how much it found. F1 assumes both errors cost
+the same, which agents rarely grant.
+
+## For agent builders
+- **Why it matters for agents.** Most agent components are detectors: did retrieval find the right chunk,
+  did the guardrail catch the injection, did the agent call the tool when it should have, did the judge
+  flag the failed run. Each has a miss and a false alarm with different costs.
+- **Where it shows up in your stack.** recall@k and precision@k in RAG evals, per-tool call precision and
+  recall in the eval harness, guardrail block rates, judge agreement with human labels, and
+  `precision_recall_curve` when picking a threshold.
+- **What you control.** The threshold (or k), which error you put a floor on, β when you need one number,
+  and the prevalence of positives in your eval set.
+- **What you can skip.** Information-retrieval history and interpolated-AP variants. Know the two
+  formulas, why prevalence moves precision, and how to pick an operating point from a product constraint.
 
 ## Why it exists
 - **Accuracy is dominated by the common class.** On 2%-positive data a model that finds nothing scores 98%.
@@ -113,7 +126,10 @@ Each class gets one-vs-rest P, R and F1, then you aggregate:
 - **Recall with zero actual positives is likewise undefined,** one reason to stratify small evaluation sets.
 - **Per-class metrics with a support of three are noise;** always print the support column.
 
-### Where it shows up in LLM systems
+### Where it shows up in agents and LLM systems
+- **Tool-call decisions:** treat "should this step call tool X" as a binary label per step. Precision is
+  how many of the agent's calls were needed; recall is how many needed calls it made. Score each tool
+  separately, because a rarely needed tool hides inside a pooled number.
 - **Retrieval:** with R relevant chunks and the top k retrieved, precision@k = (relevant in top k) / k and
   recall@k = (relevant in top k) / R. Recall@k decides whether the generator can possibly answer;
   precision@k decides how much noise it must ignore. k plays the threshold: raising k trades precision for
@@ -127,7 +143,8 @@ Each class gets one-vs-rest P, R and F1, then you aggregate:
   set before trusting its pass rate.
 
 ## Diagram
-One scorer, many products: the threshold choice comes from the product constraint, not from F1.
+One scorer (a guardrail, judge, retriever or tool-call policy), many products: the threshold choice
+comes from the product constraint, not from F1.
 
 ```mermaid
 flowchart TD
@@ -214,6 +231,22 @@ for k in (1, 3, 5, 8):
 - **Recall@k never falls as k grows;** precision@k wanders. If recall@5 is 0.67, one relevant chunk never reaches a
   top-5 generator, whatever the prompt says.
 
+### Agent scenario: scoring when a research agent calls its search tool
+An eval set of 200 tasks, 80 of which need a web search. Two system-prompt versions are compared on the
+per-step label "called search when needed".
+
+| Version | Search calls | TP | FP | FN | Precision | Recall | F1 | F2 |
+|---|---|---|---|---|---|---|---|---|
+| v1, "search when unsure" | 100 | 70 | 30 | 10 | 0.70 | 0.875 | 0.778 | 0.833 |
+| v2, "search only if needed" | 60 | 58 | 2 | 22 | 0.967 | 0.725 | 0.829 | 0.763 |
+
+- **F1 prefers v2,** but its 22 misses are tasks answered from memory, the main source of hallucinated
+  facts in a research agent.
+- **The 30 extra calls in v1 cost latency and API spend,** which is usually cheaper than a wrong answer.
+  If a miss is the expensive error, F2 (or "recall ≥ 0.85, then fewest calls") picks v1.
+- **Score per tool.** The same table for a rarely needed `refund` tool would use a precision floor
+  instead, because an unneeded refund call is the expensive error.
+
 ## Production patterns
 - **Recall floor as the release gate.** Encode the product constraint ("recall ≥ 0.9 at best precision") in
   the eval harness, pick τ with `precision_recall_curve` on validation, and store τ with the model version.
@@ -228,6 +261,9 @@ for k in (1, 3, 5, 8):
   query set on every index or chunking change, before touching prompts. Monitor recall@k per query segment.
 - **Judges validated as classifiers.** Before trusting an LLM judge's pass rate, compute its precision and
   recall on the failure class against a human-labelled set, and re-run it when the judge model or prompt changes.
+- **Per-tool call precision and recall in the agent eval.** Label which steps of each golden task should
+  call which tool, compute P and R per tool on every prompt or model change, and gate releases on the
+  expensive error for each tool. Monitor tool-call volume per task in production as the precision proxy.
 
 ## Trade-offs
 - **One comparable number vs hidden costs.** F1 bakes in "a false alarm costs the same as a miss"; it flips
@@ -259,7 +295,8 @@ for k in (1, 3, 5, 8):
 
 ## When to use
 - **Use when** the positive class is what matters and negatives are plentiful or uninteresting: detection,
-  extraction, retrieval, moderation, routing to a rare action.
+  extraction, retrieval, moderation, routing to a rare action, and deciding whether an agent step should
+  call a tool.
 - **Report** them as a pair at a threshold chosen on validation, with prevalence and support; add the PR curve
   or AP when comparing scorers.
 - **Choose the summary by cost knowledge:** F1 as a tie-breaker for dashboards and leaderboards, Fβ when costs
@@ -323,6 +360,13 @@ set.
 - **Fix the reporting:** print support per class, add more examples for rare classes, and track micro or
   weighted alongside macro.
 
+### Your agent now calls its search tool on almost every step. How do you evaluate whether that is a problem?
+- **Label the steps:** on golden tasks, mark which steps actually need a search, then compute the agent's
+  search-call precision and recall.
+- **Read the pair against costs:** high recall with low precision means wasted latency and spend but few
+  missed facts; decide from per-call cost versus the cost of a hallucinated answer.
+- **Fix with a constraint,** for example "recall ≥ 0.85 at the fewest calls", and re-check per prompt version.
+
 ## Quiz
 ### Q: A classifier has precision 1.0 and recall 0.1. What is its F1, and why does it differ from the arithmetic mean of 0.55?
 - [ ] 0.55, because F1 is the average of precision and recall
@@ -351,3 +395,24 @@ set.
 > Pooling counts makes total FP equal total FN, because each misclassified item is a false positive for
 > the predicted class and a false negative for the true class; micro-precision, micro-recall and
 > micro-F1 therefore all equal correct/total. Macro-F1 differs whenever classes perform unequally.
+
+## Use cases & projects
+### Use cases
+- **RAG retrieval evals.** recall@k tells you whether the right chunk ever reaches the generator;
+  precision@k tells you how much noise it must ignore, before anyone tunes prompts.
+- **Prompt-injection and moderation guardrails.** A recall floor on attacks with a false-block budget on
+  legitimate traffic, read as volumes per 100,000 messages.
+- **Tool-use evals.** Per-tool call precision and recall show whether an agent over-calls cheap tools or
+  under-calls the one that grounds its answers.
+- **Validating LLM judges.** The judge's precision and recall on the failure class against human labels
+  decide whether its pass rate can gate a release.
+
+### Mini project
+**Tool-call precision and recall for a small agent (1-3 hours).**
+- **Goal:** measure, per tool, whether an agent calls its tools when it should.
+- **Steps:** build an agent with two tools (search and calculator); write 40 golden tasks and label which
+  tools each needs; run two system-prompt versions; log every tool call; compute precision, recall, F1
+  and F2 per tool and version; pick a version with a stated constraint (for example "search recall ≥
+  0.85, fewest calls").
+- **Done when:** you have a per-tool table for both versions, the chosen version, and one paragraph
+  explaining why F1 alone would or would not have picked it.

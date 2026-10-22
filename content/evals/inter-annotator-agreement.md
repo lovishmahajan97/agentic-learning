@@ -431,3 +431,23 @@ measured at all.
 > Human–human agreement is the reference level for comparisons against human labels, so a judge near it
 > has reached annotator quality. Calling it better or worse than humans overreads a three-point difference,
 > and with no ground truth beyond the labels, agreement is the accuracy figure you have.
+
+## Use cases & projects
+### Use cases
+- **Deciding which criteria may gate a release.** Criteria whose human κ clears the agreed bar can block
+  a deploy; low-agreement ones stay informational until the guidelines are fixed.
+- **Validating an LLM judge.** Judge–human κ is read next to human–human κ, so the team knows whether the
+  judge has reached annotator quality.
+- **Running a trace-labeling program.** A fixed overlap share of double-labeled traces tracks reviewer
+  drift as the agent and the reviewer pool change.
+- **Building a golden set for a customer agent.** Agreement on a pilot batch shows whether the labeling
+  guide is ready before thousands of traces are labeled.
+
+### Mini project
+**Measure agreement on agent trace criteria (1-2 hours).**
+- **Goal:** find which of four or five trace criteria are reliable enough to gate an agent release.
+- **Steps:** export 40-60 traces from a small agent; have two people (or you, a week apart, blind to your
+  first labels) label each criterion; compute raw agreement and Cohen's κ per criterion; rewrite the
+  guideline for the weakest criterion with examples and relabel a fresh batch.
+- **Done when:** a table shows raw agreement and κ per criterion before and after the rewrite, with each
+  criterion marked gate or informational.

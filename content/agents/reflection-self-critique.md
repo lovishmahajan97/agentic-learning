@@ -356,3 +356,28 @@ support rate before and after rather than trusting that more iterations means be
 - [ ] A vote among several parallel generations
 > Reflexion keeps reflections as text in episodic memory and feeds them into the next attempt, so the
 > agent improves across trials without any weight update; the feedback came from outcomes such as tests.
+
+## Use cases & projects
+### Use cases
+- **Coding agents.** Generate a patch, run the tests, feed failures back as the critique, and stop when
+  tests pass or the iteration cap is hit.
+- **Structured extraction.** A schema validator rejects malformed output with a specific error, and the
+  agent revises against that error instead of re-reading its own answer.
+- **Customer-facing drafts.** A rubric critic in a fresh context checks a reply for policy and tone
+  before it is sent, with keep-best so a revision never ships worse than the first draft.
+- **Learning across attempts.** Reflexion-style lessons from failed runs are stored and prepended to the
+  next attempt on similar tasks.
+
+### Mini project
+**Measure when reflection helps a small coding agent (2-3 hours).**
+- **Goal:** compare no reflection, plain "look again" reconsideration and test-grounded critique on 15
+  small Python functions with unit tests.
+- **Steps:** generate a first solution; in one arm ask the model to review itself with no new evidence;
+  in another feed the failing test output back; cap at three revisions and keep the best-scoring
+  version; log pass rate, tokens and how often a correct answer became wrong after revision.
+- **Done when:** you have a table of pass rate and cost per arm, and a count of right-to-wrong flips that
+  shows whether ungrounded critique hurt.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): the billing-dispute agent critiques its
+invoice reconciliation against totals computed in a sandboxed code tool before it proposes any refund.

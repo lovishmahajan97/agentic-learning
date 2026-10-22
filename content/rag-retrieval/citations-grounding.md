@@ -383,3 +383,24 @@ rather than presence. Also check retrieval recall, since missing evidence produc
 - [ ] When the product has no UI for showing sources
 > Post-hoc attribution searches the sources for support for every sentence after generation, so it can
 > flag uncited or unsupported claims regardless of the generator, at the cost of extra latency.
+
+## Use cases & projects
+### Use cases
+- **Customer-support agents.** Each answer links to the help article or policy span it came from, so
+  agents and users can check it in one click.
+- **Research and analyst agents.** A report built from many searches cites every claim to a tool result,
+  making it auditable after the run.
+- **Agents that take actions.** A refund or account change records the policy passage that justified it,
+  giving reviewers an audit trail.
+- **Regulated domains.** Legal, medical and financial assistants abstain when no source supports a claim
+  rather than answering from model memory.
+
+### Mini project
+**Add verified citations to a RAG agent (2-3 hours).**
+- **Goal:** make an agent cite a stable source ID and quote for every claim, and reject answers that fail
+  verification.
+- **Steps:** give each search result a run-level ID in a source registry; define a structured output with
+  claims, source IDs and quoted spans; check in code that every ID exists and every quote appears in its
+  source; on failure, ask the model to repair once, then drop the claim or abstain.
+- **Done when:** on 20 test questions, every returned claim passes the quote check, out-of-scope questions
+  get an abstention, and your logs show how many answers needed repair.

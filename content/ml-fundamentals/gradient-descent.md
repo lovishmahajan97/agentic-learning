@@ -5,7 +5,8 @@ name: Gradient descent
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - ml-fundamentals/loss-functions
   - ml-fundamentals/backpropagation
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-Gradient descent minimises a loss by stepping against the gradient, θ ← θ − η∇L(θ). It scales to
-billions of parameters because a gradient costs a constant multiple of a forward pass. Mini-batch
-noise trades precision per step for many more steps, and helps.
+Every fine-tune of an agent model, LoRA on tool-call traces included, is gradient descent:
+θ ← θ − η∇L(θ). You need it to pick a learning rate, read the loss curve, and tell a diverged run from
+a stalled one.
+
+## For agent builders
+- **Why it matters for agents.** When prompting is not enough and you fine-tune a model on agent
+  trajectories, a router or a retriever, the run succeeds or fails on the learning rate, the batch size and
+  the schedule. Most "the fine-tune did nothing" or "it went to NaN" reports are gradient-descent settings.
+- **Where it shows up in your stack.** The `learning_rate`, batch size, gradient accumulation, warmup and
+  clipping settings of your fine-tuning library or a hosted fine-tuning API, and the loss and gradient-norm
+  curves it logs.
+- **What you control.** Peak learning rate (found with a short sweep), effective batch size, warmup and
+  decay, gradient-norm clipping, and when to stop.
+- **What you can skip.** Convergence proofs and Hessian algebra. Know the η < 2/λ ceiling as intuition,
+  why mini-batches work, what momentum does, and the loss-curve symptom table.
 
 ## Why it exists
 - **Training is minimising L(θ),** the average loss over the data. Closed-form solutions exist only for a
@@ -43,8 +56,10 @@ noise trades precision per step for many more steps, and helps.
   adaptive optimizers do with a per-parameter diagonal.
 - **Two problems remain.** The approximation is local, so the step must be small enough (the learning
   rate, the most common training failure). And exact gradients over billions of examples are too
-  expensive; Robbins and Monro showed in 1951 that noisy, unbiased estimates suffice if steps are chosen
-  sensibly, which licenses mini-batches: stochastic gradient descent, underneath every modern optimizer.
+  expensive.
+- **Noisy gradients are enough.** Robbins and Monro showed in 1951 that noisy, unbiased estimates suffice
+  if steps are chosen sensibly, which licenses mini-batches: stochastic gradient descent, underneath every
+  modern optimizer.
 
 ## How it works
 ### The update and why the learning rate has a ceiling
@@ -69,9 +84,12 @@ converges only if |1 − ηλ| < 1, i.e. η < 2/λ;   one step at η = 1/λ
 - **Critical batch size.** For a fixed compute budget, smaller batches mean more updates. Beyond a
   problem-dependent critical batch size, extra examples reduce noise that was no longer limiting, and the
   compute is wasted.
-- **Shuffle each epoch** so consecutive batches are not correlated.
+- **Shuffle each epoch** so consecutive batches are not correlated, for example all trajectories from one
+  customer or one tool in a row.
 - **Scale η with B, up to a point.** When you raise the batch size the learning rate usually needs to rise
   with it to keep progress per epoch; the heuristic holds up to a point and then breaks.
+- **Gradient accumulation** sums gradients over several micro-batches before one update, so long agent
+  trajectories that fit only one or two per GPU still give a usable effective batch size.
 - **Noise may help.** The widely held, still-debated view: noise helps escape saddle points and biases
   training toward flatter minima that generalise better. The batch-size lesson goes deeper.
 
@@ -101,15 +119,16 @@ converges only if |1 − ηλ| < 1, i.e. η < 2/λ;   one step at η = 1/λ
 | Loss flat from the start | η far too small, dead units, or a bug stopping gradient flow |
 | Loss oscillating with period two | η near 2/λ_max in some direction |
 | Long plateau, then a sudden drop | a saddle |
+| Training loss falls, held-out agent eval drops | overfitting the trajectories, or forgetting general skills |
 
 Watching the gradient norm alongside the loss separates these cases quickly.
 
 ## Diagram
-One training step, and the checks that decide whether the learning rate is right.
+One training step of an agent fine-tune, and the checks that decide whether the learning rate is right.
 
 ```mermaid
 flowchart TD
-    B["Sample a shuffled mini-batch"] --> F["Forward pass: loss"]
+    B["Sample a shuffled batch of trajectories"] --> F["Forward pass: loss"]
     F --> BW["Backward pass: gradient"]
     BW --> GN["Log gradient norm, clip"]
     GN --> M["Momentum: v = mu v + g"]
@@ -123,6 +142,23 @@ flowchart TD
 ```
 
 ## Examples
+### Worked scenario: learning-rate sweep for a LoRA fine-tune on agent traces
+A team fine-tunes a small open model with LoRA on 3,000 successful tool-calling trajectories, effective
+batch 16 (about 188 steps per epoch), and runs 300 steps at each of four peak learning rates spaced by
+about 3×. All figures are illustrative.
+
+| Peak η | Loss at step 300 | Gradient norm | Tool-call accuracy on held-out tasks | Verdict |
+|---|---|---|---|---|
+| 3e-5 | barely moved, near linear | small, steady | unchanged from base | too low |
+| 1e-4 | falling smoothly | steady | improved | candidate |
+| 3e-4 | falling fastest | occasional spikes, clipped | improved most | pick, with clipping |
+| 1e-3 | spike, then NaN | exploding before NaN | not evaluated | above the stability limit |
+
+- **Pick the largest η that does not spike,** then confirm on the agent eval, not on loss alone.
+- **Watch for forgetting:** if general-instruction evals drop while tool-call accuracy rises, lower η or
+  train fewer steps.
+- **Retune if you change the batch:** doubling gradient accumulation halves the updates per epoch.
+
 ### Ill-conditioned bowl: plain GD vs momentum
 A two-dimensional quadratic whose curvature is 50× larger along w2 than along w1 (condition number 50).
 The stability limit is 2/50 = 0.04. Plain gradient descent must crawl along w1 to stay stable along w2;
@@ -165,7 +201,8 @@ The error along each axis is multiplied by (1 − ηλ) every step. Same bowl, �
 No single η is fast on both axes, which is the condition-number problem in four rows.
 
 ### A production training step with the safety rails
-The loop most fine-tunes run: zero gradients, backward, clip and log the norm, step, schedule.
+The loop most fine-tunes run, including ones on agent trajectories: zero gradients, backward, clip and log
+the norm, step, schedule.
 
 ```python
 import torch
@@ -189,7 +226,10 @@ def train_epoch(model, loader, optimizer, scheduler, max_norm=1.0, log=print):
 ## Production patterns
 - **Short learning-rate sweep before every new fine-tune.** Run a few hundred steps at several peak
   learning rates spaced by factors of about 3, keep the largest that does not spike. Monitor loss and
-  gradient norm per run side by side.
+  gradient norm per run side by side, then score the survivors on the agent eval suite.
+- **Gate checkpoints on agent evals, not loss.** Save checkpoints periodically and promote the one with
+  the best task success or tool-call accuracy on held-out tasks; the lowest training loss is often an
+  overfit one. Monitor a general-skills eval too, to catch forgetting.
 - **Gradient-norm clipping as a default.** Call `torch.nn.utils.clip_grad_norm_` (max norm around 1.0 is
   a common starting value) before `optimizer.step()`. Monitor the returned pre-clip norm; frequent
   clipping means the learning rate is too high.
@@ -202,9 +242,9 @@ def train_epoch(model, loader, optimizer, scheduler, max_norm=1.0, log=print):
 - **Retune η when the batch size changes.** When moving to more GPUs or gradient accumulation, re-sweep
   the learning rate instead of reusing the old one. Monitor progress per token or per example, not per
   step, when comparing runs.
-- **Standardise inputs and targets.** For classical models fit a scaler on the training split only (for
-  example scikit-learn `StandardScaler`) before gradient-based training. Monitor the number of steps to a
-  target loss.
+- **Standardise inputs and targets.** For classical models such as a cost predictor, fit a scaler on the
+  training split only (for example scikit-learn `StandardScaler`) before gradient-based training. Monitor
+  the number of steps to a target loss.
 
 ## Trade-offs
 - **Large η: fast progress vs divergence.** It crosses flat regions quickly but diverges once it exceeds
@@ -217,6 +257,8 @@ def train_epoch(model, loader, optimizer, scheduler, max_norm=1.0, log=print):
   the velocity.
 - **Full-batch: exact vs one update per pass.** Exact and deterministic, pleasant for small convex
   problems, but one update per pass over the data is hopeless at dataset scale.
+- **More steps: better tool use vs forgetting.** Longer fine-tunes fit your trajectories more closely but
+  can erode general instruction following; the held-out agent eval decides where to stop.
 
 ## Pitfalls
 - **Unscaled inputs or targets.** They inflate the condition number; the loss plateaus unless the learning
@@ -224,13 +266,13 @@ def train_epoch(model, loader, optimizer, scheduler, max_norm=1.0, log=print):
 - **Learning rate too high or too low.** Too high: loss rising after a few steps or NaN. Too low: loss
   decreasing slowly and almost linearly for the whole run.
 - **Not shuffling between epochs.** Symptom: a loss curve with a periodic pattern once per epoch and a
-  model biased by data order.
+  model biased by data order, for example by whichever tool's traces came last.
 - **Forgetting to zero gradients between steps in PyTorch.** They accumulate, giving an effective learning
   rate that grows every step and a run that diverges for no visible reason.
 - **Comparing batch sizes at the same learning rate.** The larger-batch run "learns slower" because it
   makes fewer updates per epoch, not because the optimizer is worse.
 - **Judging convergence from training loss alone.** Training loss still falling while validation loss
-  rises is overfitting, not an optimisation problem.
+  rises is overfitting, not an optimisation problem; for agents, check the eval suite too.
 
 ## When to use
 Gradient descent is the default for every differentiable model; the decisions are about its variant and
@@ -241,6 +283,8 @@ its hyperparameters.
   pick the batch size from hardware and the critical-batch-size curve.
 - **Avoid when** a tiny convex problem has a closed form, or the objective is non-differentiable, such as
   "did the agent complete the task", which is why reinforcement learning and surrogate losses exist.
+- **Before fine-tuning at all,** check that better prompts, tool descriptions or retrieval do not already
+  fix the agent; gradient descent is the expensive lever.
 - **Measure** loss and gradient norm over steps.
 - **Interviews:** why not a closed form, why the learning rate has an upper bound, why mini-batches, and
   what momentum does.
@@ -279,6 +323,13 @@ the per-step dynamics that caused the blow-up.
   iterations scale with κ.
 - **In practice** the landscape sharpens during training, which is why warmup, decay and clipping are
   used.
+
+### Your LoRA fine-tune on agent trajectories lowers the loss but tool-call accuracy gets worse. What do you check?
+- **Overfitting or forgetting:** compare held-out loss and a general-skills eval; a falling training loss
+  with a falling eval means too many steps or too high a learning rate.
+- **What the loss covers:** if tool results and prompts are not masked, the loss improves on text the
+  agent never writes.
+- **Fix:** pick the checkpoint by agent eval, lower η or the number of epochs, and re-sweep.
 
 ### Loss is flat for the first 1,000 steps of a fine-tune. How do you debug it?
 - **Check gradient flow:** log the gradient norm; zero or tiny means frozen parameters, dead units, or a
@@ -325,3 +376,23 @@ the per-step dynamics that caused the blow-up.
 > The gradient estimate stays unbiased but there are half as many steps per pass over the data. Lower
 > variance lets you use a larger learning rate, which is why batch size and learning rate are tuned
 > together rather than independently.
+
+## Use cases & projects
+### Use cases
+- **Fine-tuning a tool-calling model.** A learning-rate sweep and clipping decide whether a LoRA run on
+  agent trajectories improves tool use or diverges.
+- **Debugging a failed hosted fine-tune.** Reading the returned loss curve against the symptom table tells
+  you whether to change the learning rate, the epochs or the data.
+- **Training small agent components.** Routers, guardrail classifiers and cost predictors are trained by
+  the same loop, often on a laptop.
+- **Scaling a training job.** Moving to more GPUs or gradient accumulation for long trajectories requires
+  retuning the learning rate for the new effective batch.
+
+### Mini project
+**Learning-rate sweep for a tiny tool router (1-2 hours).**
+- **Goal:** see divergence, stagnation and a good run side by side on a model that picks one of four tools.
+- **Steps:** embed 400 labelled requests with any sentence encoder; train a linear softmax router with
+  SGD plus momentum at four learning rates spaced by about 3×; log loss and gradient norm every step; add
+  clipping to the fastest run and repeat.
+- **Done when:** you have one chart with four loss curves, each labelled with its symptom from the table,
+  and held-out routing accuracy for the run you would ship.

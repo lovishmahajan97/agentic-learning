@@ -377,3 +377,24 @@ results feed analytics, convert the finished JSONL to Parquet.
 - [x] Each record spans several lines, so line-by-line readers fail to parse
 > Indentation inserts newlines between keys. JSON parsers tolerate whitespace inside one document, but
 > JSONL readers split on newlines first, so each fragment is an incomplete value and parsing fails.
+
+## Use cases & projects
+### Use cases
+- **Tool-call round trips.** Parsing the model's argument string, validating it and serializing the tool
+  result back is JSON on every step of every agent run.
+- **Agent trace logs.** One JSONL record per step (run ID, tool, arguments, status, tokens) is easy to
+  append, tail and load into pandas or Polars later.
+- **Eval datasets.** Each test case is one JSONL line with a stable ID, so a crashed eval run resumes by
+  skipping IDs already present in the results file.
+- **Fine-tuning and batch jobs.** Training files built from good agent transcripts and batch inputs and
+  outputs are JSONL, one request or example per line.
+
+### Mini project
+**A resumable JSONL trace logger for an agent (1-2 hours).**
+- **Goal:** log every step of a small tool-calling agent to JSONL safely enough that bad values fail at
+  write time, not at analysis time.
+- **Steps:** write a logger that serializes with `allow_nan=False` and a `default=` hook for datetimes
+  and numpy scalars; write one record per step with a run ID and step number; write a reader that
+  reports the line number of any bad record; feed it a tool result containing NaN and a `datetime`.
+- **Done when:** the NaN case raises at the writer, the datetime is stored as a string, the reader loads
+  a 100-step log and names the exact line of a hand-corrupted record.

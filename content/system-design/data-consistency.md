@@ -446,3 +446,24 @@ revocation-to-enforcement time and report it.
 > The index is a derived copy, so its ACL metadata lags the source by the sync interval. Checking current
 > permissions against the authoritative store at query time closes that window; the metadata filter stays
 > useful as a pre-filter for efficiency, not as the enforcement point.
+
+## Use cases & projects
+### Use cases
+- **Agent memory that reads its own writes.** Reads within a run go to the primary after a memory write,
+  so the agent does not repeat a tool call it just recorded.
+- **Permission-safe RAG.** Index metadata pre-filters chunks, then a query-time check against the source
+  of truth removes anything the user lost access to since the last sync.
+- **Freshly uploaded documents.** The UI shows "indexing" until the index catches up, instead of the
+  agent confidently saying the document does not exist.
+- **Per-tenant token budgets.** Concurrent runs debit an atomic counter, so two runs cannot both spend
+  the last of a tenant's budget.
+
+### Mini project
+**Find and fix stale reads in a RAG agent (2-3 hours).**
+- **Goal:** demonstrate three staleness bugs and close each with the matching consistency fix.
+- **Steps:** build a toy primary store and a replica that applies writes after a delay; put documents
+  and their ACLs in a toy index synced on an interval; have a stub agent write memory then read it back,
+  answer about a just-uploaded document, and answer for a user whose access was revoked; then add
+  primary reads after writes, an "indexing" status and a query-time ACL check.
+- **Done when:** before the fixes a test shows all three bugs, and after them the same test passes with
+  the replica delay and sync interval unchanged.

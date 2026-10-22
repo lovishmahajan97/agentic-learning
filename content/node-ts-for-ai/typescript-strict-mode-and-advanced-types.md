@@ -5,7 +5,8 @@ name: TypeScript strict mode & advanced types
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - node-ts-for-ai/runtime-schema-validation
   - node-ts-for-ai/promises-and-async-error-propagation
@@ -18,12 +19,24 @@ sources:
 ---
 
 ## TL;DR
-TypeScript types are erased before code runs, so they protect you only under `strict`. Strict mode plus
-discriminated unions, generics, `satisfies` and `unknown` encode stream events, tool contracts and
-provider responses, so mismatches fail at compile time, not as mid-stream `undefined` crashes.
+An agent loop is glue between shapeless data: model output, invented tool arguments, stream events.
+TypeScript types are erased at runtime, so under `strict` with discriminated unions, generics, `satisfies`
+and `unknown` they make contract mismatches fail at compile time, not mid-run.
+
+## For agent builders
+- **Why it matters for agents.** Every agent step crosses a boundary: the model emits tool-call arguments
+  it made up, your tool returns a result, the provider streams several event variants. Strict types plus
+  an `unknown`-first boundary are what keep a 20-step run from dying on step 14 with `undefined`.
+- **Where it shows up in your stack.** The tool registry (each tool's parser tied to its handler), the
+  stream-event handler for provider SDKs, the model/config table, and the shared types package that the
+  agent server, workers and evals all import.
+- **What you control.** The `tsconfig.json` baseline (`strict`, `noUncheckedIndexedAccess`), lint bans on
+  `any` and `as`, and the rule that tool arguments are `unknown` until parsed.
+- **What you can skip.** Writing deep conditional or template-literal types from memory. Know they exist
+  for SDK wrappers and tool registries; spend your effort on unions, narrowing and the parse boundary.
 
 ## Why it exists
-- **AI services are glue between shapeless data.** JSON from a model, tool-call arguments the model
+- **Agent services are glue between shapeless data.** JSON from a model, tool-call arguments the model
   invented, server-sent events in four or five variants, SDK objects with deeply optional fields. In
   OpenAI's Chat Completions shape, `choices[0]?.message?.content` is legitimately `null` when the model
   returned a tool call instead of text.
@@ -88,6 +101,9 @@ variable can be. After `if (x === null) return;` the type of `x` below is `T`, n
   inside the boundary can then be trusted *because* nothing crosses it unvalidated.
 
 ### Discriminated unions and exhaustiveness
+An agent loop is a switch over what the model just did (text, tool call, done), so this is the pattern
+you use most.
+
 1. **Model the stream as a union** of object types sharing a literal `type` field:
    `{ type: "text_delta"; text: string } | { type: "tool_call"; name: string; args: unknown } |
    { type: "done"; usage: Usage }`.
@@ -137,8 +153,8 @@ variable can be. After `if (x === null) return;` the type of `x` below is `T`, n
 - **Pair with runtime validation** at the edges, the subject of the schema-validation lesson.
 
 ## Diagram
-Untrusted data enters as `unknown`, is parsed once at the boundary, and from then on strict checking and
-exhaustive switches guard every use.
+Model output and tool arguments enter as `unknown`, are parsed once at the boundary, and from then on
+strict checking and exhaustive switches guard every step of the agent loop.
 
 ```mermaid
 flowchart TD
@@ -204,9 +220,10 @@ try { parseJson("{"); } catch (e) {                        // e: unknown
 }
 ```
 
-### A typed tool registry with a constrained generic
-`defineTool` ties each tool's parser to its handler, so the registry cannot hold a mismatched pair. The
-type guard here is deliberately tiny, as the narrowing section advises.
+### Agent scenario: a typed tool registry with a constrained generic
+This is the core of a tool-calling agent: the model names a tool and sends arguments, and `dispatch`
+runs it. `defineTool` ties each tool's parser to its handler, so the registry cannot hold a mismatched
+pair. The type guard here is deliberately tiny, as the narrowing section advises.
 
 ```ts
 type Tool<A, R> = { name: string; parse: (x: unknown) => A; run: (args: A) => Promise<R> };
@@ -232,6 +249,17 @@ async function dispatch<A, R>(tool: Tool<A, R>, rawArgs: unknown): Promise<R> {
 // dispatch(getWeather, JSON.parse('{"city":"Oslo"}')) resolves to "Sunny in Oslo"
 ```
 
+- **In the loop,** catch the parse error and send its message back to the model as the tool result, so the
+  model can retry with corrected arguments instead of the run crashing.
+
+### Worked scenario: a support agent's tool-argument failures
+An illustrative 1,000-run eval of a support agent with 6 tools, before and after typing the registry.
+
+| Setting | Bad arguments reaching a handler | Runs that crashed |
+|---|---|---|
+| Args cast with `as ToolArgs` | every malformed call (for example a missing `orderId`) | each one threw `TypeError` inside the tool |
+| Args `unknown`, parsed per tool | none: parse fails first | 0; the parse message went back to the model, which retried |
+
 ### Worked scenario: an SDK upgrade that made a field nullable
 A team upgraded a provider SDK; the response field holding text became `string | null` because tool calls
 now return no text.
@@ -243,6 +271,10 @@ now return no text.
 | `strict` plus `never` default in the event switch | The new `tool_call` variant also failed to compile in the handler until a case was added |
 
 ## Production patterns
+- **Tool arguments are `unknown` until parsed.** Agent teams type the registry as
+  `Tool<A, R>` with a `parse: (x: unknown) => A` per tool, and return parse errors to the model as the tool
+  result. Monitor parse-failure rate per tool; a spike after a prompt change means the model's arguments
+  drifted.
 - **Strict baseline in a shared tsconfig.** Every service extends one base config with `"strict": true`,
   `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes`, and CI runs `tsc --noEmit` on every PR.
   Monitor the error count when bumping the TypeScript version, since new releases can add strict flags.
@@ -279,6 +311,9 @@ now return no text.
   shippable but leaves types that lie; set a deadline or the migration never finishes.
 
 ## Pitfalls
+- **Typing tool arguments as the shape you asked for.** Symptom: a handler crashes on a field the model
+  omitted, killing the whole agent run. Fix: the model's arguments are `unknown`; parse per tool and feed
+  failures back as a tool result.
 - **Casting with `as` to silence an error** (`JSON.parse(x) as Response`). Symptom: a runtime `TypeError` on
   a field the type said was present, usually after an upstream API change. Fix: return `unknown` and parse.
 - **Leaving `strict: false` and trusting the red squiggles.** Symptom: implicit `any` everywhere, so renaming
@@ -296,7 +331,7 @@ now return no text.
   every field the predicate claims, or derive the guard from a schema.
 
 ## When to use
-- **Day one:** turn on `strict` in any Node AI service and add `noUncheckedIndexedAccess`; the cost of
+- **Day one:** turn on `strict` in any Node agent service and add `noUncheckedIndexedAccess`; the cost of
   retrofitting grows with every file.
 - **Use discriminated unions** whenever data has variants (stream events, tool results, provider error
   shapes), and **constrained generics** when a registry or SDK wrapper must tie an input type to a handler.
@@ -339,6 +374,12 @@ boundary, never mid-request.
   dropped silently; log unknown `type` values at the boundary to confirm.
 - **Prevent:** model events as a discriminated union and add a `default` that assigns `ev` to `never`, so
   the next variant breaks the build on the upgrade PR instead of in production.
+
+### How would you type an agent's tool registry so model-invented arguments never reach a handler unchecked?
+- **Generic per tool:** `Tool<A, R>` pairs `parse: (x: unknown) => A` with `run: (args: A) => Promise<R>`, and
+  `defineTool` infers `A`, so a handler cannot be registered with the wrong parser.
+- **Boundary:** arguments arrive as `unknown`; `dispatch` always calls `parse` first.
+- **Loop behaviour:** a parse failure becomes a tool-result message the model can correct, not a crash.
 
 ### When would you not reach for conditional and mapped types?
 - **In application code with one or two users of a type,** where a plain type is clearer and the compile-time
@@ -387,3 +428,25 @@ boundary, never mid-request.
 > An annotation widens the value to the declared type, turning literal keys into `string`. `satisfies`
 > only verifies compatibility, so the inferred type keeps `"fast" | "smart"` as keys and the compiler
 > can reject typos in model names. Immutability comes from `as const`, not `satisfies`.
+
+## Use cases & projects
+### Use cases
+- **Tool registries for tool-calling agents.** A generic `Tool<A, R>` ties each tool's parser to its handler,
+  so adding a tool cannot ship a mismatched pair.
+- **Provider stream handlers.** A discriminated union with a `never` default makes an SDK upgrade that adds
+  an event variant break the build instead of silently ending agent turns early.
+- **Shared contracts across agent services.** One types package imported by the agent server, background
+  workers and eval harness keeps tool results and trace records in sync.
+- **Model routing tables.** `as const satisfies` keeps model keys literal, so a typo in a routing rule is a
+  compile error.
+
+### Mini project
+**Type a three-tool agent loop end to end (1-2 hours).**
+- **Goal:** a tool-calling loop where no model-produced value is used before it is parsed.
+- **Steps:** enable `strict`, `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes`; model the
+  provider's events as a `StreamEvent` union with a `never` default; register three tools with `defineTool`;
+  run the loop against a mocked model that sometimes sends malformed arguments; return parse errors to the
+  model as tool results.
+- **Done when:** `tsc --noEmit` passes with zero `any` or `as` outside the brand factory, adding a fourth
+  event variant fails to compile, and malformed arguments produce a retry rather than a crash in your test
+  run.

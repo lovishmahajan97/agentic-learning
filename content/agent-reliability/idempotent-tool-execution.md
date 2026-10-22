@@ -5,7 +5,8 @@ name: Idempotent tool execution
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/conversation-execution-identifiers
@@ -24,6 +25,20 @@ sources:
 Agents retry at three layers, and exactly-once execution across a network is impossible. Target
 at-least-once execution with idempotent effects: classify tools, derive a deterministic key per call,
 dedupe downstream or locally, and gate unkeyable effects behind approvals or an outbox.
+
+## For agent builders
+- **Why it matters for agents.** The tools that make agents useful create, send, charge and deploy, and
+  the model, the harness and the durable runtime all retry them. Without idempotent effects, one ambiguous
+  timeout becomes three invoices or three customer emails.
+- **Where it shows up in your stack.** Your tool adapters and their schemas, MCP tool annotations
+  (`readOnlyHint`, `idempotentHint`, `destructiveHint`), downstream headers such as Stripe's
+  `Idempotency-Key`, a `tool_executions` dedup table beside the checkpoint, and an outbox for effects with
+  no key.
+- **What you control.** The class of each tool, the key derivation from run id, step and call index, the
+  argument fingerprint, the dedup window versus the longest parked run, what a replay returns to the
+  model, and which tools sit behind an approval gate.
+- **What you can skip.** Chasing exactly-once delivery. Accept at-least-once execution and make the effect
+  idempotent instead.
 
 ## Why it exists
 - **A timeout is ambiguous.** `send_invoice(customer, amount)` times out after thirty seconds. Did the
@@ -399,3 +414,24 @@ approval or an outbox worker rather than guessing.
 - [ ] Tools that charge payments
 > Reads are naturally idempotent and the agent needs current data, so replaying a cached result risks
 > acting on stale state. Writes are where replaying the first result prevents duplicates.
+
+## Use cases & projects
+### Use cases
+- **Billing and payments agents.** Every charge or invoice call carries a key derived from run id, step and
+  call index, passed downstream as the provider's idempotency header.
+- **Ticketing and CRM agents.** A conditional create on an `external_ref` field turns a resumed
+  `create_ticket` into a no-op that returns the existing ticket id.
+- **Messaging agents.** SMS and email with no downstream key go through an outbox or an approval gate,
+  because a delivered message cannot be undone.
+- **Approval-gated agents that wait for days.** The dedup window is set longer than the longest parked run,
+  so a resumed call after approval does not duplicate.
+
+### Mini project
+**Wrap a non-idempotent tool for an agent (1-2 hours).**
+- **Goal:** make a fake `create_ticket` tool safe under model, harness and runtime retries.
+- **Steps:** implement a dedup table `tool_executions(key, args_hash, status, result)` in SQLite; derive keys
+  from run id, step and call index; insert `in_flight` before executing and `done` after; return
+  `{"replayed": true, ...}` on a repeat; raise on a same-key, different-arguments call; inject a lost
+  response and a crash between effect and record.
+- **Done when:** 100 randomized retry trials create exactly one ticket per logical call, the
+  different-arguments case raises, and the crash case is flagged "possibly executed" rather than repeated.

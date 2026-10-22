@@ -5,7 +5,8 @@ name: Few-shot prompting
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - prompting/zero-shot
   - prompting/prompt-engineering
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-Few-shot prompting puts input → output demonstrations in the prompt; in-context learning shifts output
-toward their format, labels and style with no weight update. It shows what is hard to say, at a per-call
-token cost plus order, frequency and copying biases.
+Few-shot prompting puts input → output demonstrations in the prompt; in agents, these are example tool
+calls and short trajectories. The model copies their format and boundaries with no weight update, at a
+per-call token cost plus order, frequency and copying biases.
+
+## For agent builders
+- **Why it matters for agents.** When an agent keeps formatting an argument wrong, picks the wrong tool
+  at a fuzzy boundary, or skips a step, one or two demonstrated calls usually fix it faster than more
+  rules. The same copying makes it paste an example's order ID into a real call.
+- **Where it shows up in your stack.** `<example>` blocks in the system prompt, example user/assistant
+  (and tool-call) pairs before the real turn, retrieved past trajectories in memory-backed agents, and the
+  labeled examples inside LLM-judge prompts.
+- **What you control.** Which cases you show (boundaries, not easy ones), label and tool balance, order,
+  placeholder values, and whether examples are static and cached or retrieved per request.
+- **What you can skip.** The interpretability detail of induction heads; remember only that the model
+  copies what it sees, especially the nearest example.
 
 ## Why it exists
 - **Instructions are poor at conveying shape.** Try writing rules for the exact layout of a changelog
@@ -105,6 +118,19 @@ Mitigations:
 | Alternating user/assistant pairs before the real turn | Matches the fine-tuning structure, anchors format most strongly | Model may treat them as real conversation history |
 
 Either way, label them as examples and keep the instructions distinct from them.
+
+### Demonstrations in an agent
+| What you show | What it fixes |
+|---|---|
+| One example call per tricky tool | Argument formats (dates, IDs, units) the schema description did not pin down |
+| A short trajectory (call, result, next call) | Step order, such as "look up the customer before issuing a refund" |
+| A boundary pair (same-looking requests, different tools) | Confusion between two overlapping tools |
+| A "do not call a tool" example | Answering directly when no tool is needed |
+
+- **Use obvious placeholders.** Values like `ORDER-EXAMPLE-1` are easy to detect if they leak into real
+  calls; realistic IDs are not.
+- **Keep trajectories short.** A full 15-step example costs tokens on every step of every run and pulls
+  the agent toward that exact plan.
 
 ### Examples usually beat instructions when they conflict
 - **The pattern wins.** If an instruction says "respond in one sentence" and the examples show three, the
@@ -216,6 +242,43 @@ print({k: round(v, 2) for k, v in cal.items()})
   that is the bias of the example set, not evidence about any ticket.
 - **Better still, fix the source.** Calibration corrects a skew; balancing the examples removes it.
 
+### Example tool calls in an agent prompt, with a leak check
+A refund agent kept sending dates as "March 3" and refunding before checking the order. Two short
+demonstrated trajectories go in the cached system prompt; a check on every real tool call catches
+example values leaking into arguments.
+
+```python
+import json
+
+EXAMPLES = [  # placeholders are deliberately fake so leaks are detectable
+    {"user": "Refund order ORDER-EXAMPLE-1, it arrived broken",
+     "calls": [("get_order", {"order_id": "ORDER-EXAMPLE-1"}),
+               ("issue_refund", {"order_id": "ORDER-EXAMPLE-1", "reason": "damaged"})]},
+    {"user": "What did I order on 2000-01-15?",
+     "calls": [("search_orders", {"date": "2000-01-15"})]},
+]
+EXAMPLE_VALUES = {v for ex in EXAMPLES for _, args in ex["calls"] for v in args.values()}
+
+def render_examples():
+    blocks = []
+    for ex in EXAMPLES:
+        steps = "\n".join(f"call {name} {json.dumps(args)}" for name, args in ex["calls"])
+        blocks.append(f"<example>\nuser: {ex['user']}\n{steps}\n</example>")
+    return "Examples of correct tool use (values are placeholders):\n" + "\n".join(blocks)
+
+def leaked(tool_args: dict) -> bool:
+    """True if a real call reuses a value that only exists in the examples."""
+    return any(v in EXAMPLE_VALUES for v in tool_args.values())
+
+SYSTEM = "You are a refund agent. Always call get_order before issue_refund. Dates are YYYY-MM-DD.\n"
+SYSTEM += render_examples()          # static: stays inside the cached prefix
+print(leaked({"order_id": "ORDER-EXAMPLE-1"}), leaked({"order_id": "A-88231"}))   # True False
+```
+
+- **Two examples, not twenty.** They fix the date format and the get-before-refund order; the rule is
+  also stated in words, and every example obeys it.
+- **Block on a leak.** A real call carrying `ORDER-EXAMPLE-1` is rejected before it reaches the refund API.
+
 ### Worked scenario: many-shot or fine-tune?
 300 examples of 60 tokens each, 100,000 requests a day. Cache reads at an illustrative 0.1× of the base
 input price; check your provider.
@@ -244,6 +307,12 @@ stable and volume stays high.
   compare every change against the zero-shot baseline, so gains are real and not memorised.
 - **Harvest failures into the pool.** Route production cases the model got wrong (or split on) to expert
   labelling, then add balanced boundary cases to the pool. Track pool label balance as it grows.
+- **Demonstrate only the tools that fail.** Add an example call for a tool only when traces show
+  repeated argument or ordering errors on it, using obvious placeholder values. Monitor argument
+  validation failures per tool and leaked placeholder values in real calls.
+- **Retrieve past successful trajectories.** Memory-backed agents can store solved tasks and insert the
+  most similar one or two as examples after the cached block. Monitor whether retrieved trajectories
+  raise task success against a no-example baseline, and prune ones that lead to failures.
 
 ## Trade-offs
 - **Specification by demonstration vs per-call tokens.** The balance flips toward fine-tuning once volume
@@ -270,6 +339,9 @@ stable and volume stays high.
 - **Evaluating on the demonstrations.** Symptom: an eval score that collapses on production traffic.
 - **Rotating or re-ordering examples per request without need.** Symptom: a cache hit rate near zero and
   bills that do not drop after caching is enabled.
+- **Realistic values in agent examples.** Symptom: a real tool call carries the example's order ID or
+  email address. Fix: obvious placeholders and a code check that rejects arguments matching example
+  values.
 
 ## When to use
 - **Use when** a precise zero-shot prompt is still inconsistent on cases humans label consistently, the
@@ -311,11 +383,12 @@ stable prefix so caching still works.
 - **Mostly shape.** Random-label experiments kept much of the gain, so examples mainly convey input
   distribution, label space and format, and they cannot add missing facts.
 
-### Outputs start containing names from your demonstrations. What is going on and how do you fix it?
+### Your agent's outputs and tool calls start containing names from your demonstrations. What is going on and how do you fix it?
 - **Surface copying.** Induction-style copying leaks entities and numbers from examples, especially the one
-  nearest the query.
+  nearest the query; in an agent the leak lands in tool arguments, where it causes real actions.
 - **Fix:** use varied, neutral placeholder content in examples, add more diverse examples so no single one
-  dominates, and check outputs for example-specific strings in the eval.
+  dominates, check outputs for example-specific strings in the eval, and reject tool calls whose arguments
+  match example values.
 
 ### Static or dynamic example selection: how do you choose?
 - **Static** when inputs are homogeneous: a fixed set caches as a stable prefix and costs nothing extra.
@@ -335,6 +408,13 @@ stable prefix so caching still works.
 - **Content-free probe.** Send "N/A" with the same examples; a skewed label distribution reveals the prior
   the examples impose.
 - **Confusion matrix per label** on a held-out set, compared against the zero-shot baseline.
+
+### Your agent keeps formatting a tool argument wrong despite a schema description. What do you try?
+- **One demonstrated call.** Add a short example showing the exact format with a placeholder value, after
+  checking the description states the format plainly.
+- **Then guard in code.** Validate the argument against the schema and return a clear error the agent can
+  fix on its next step; measure validation failures per tool before and after.
+- **Watch for leaks** of the example value into real calls.
 
 ## Quiz
 ### Q: What do few-shot demonstrations mainly teach the model?
@@ -362,3 +442,23 @@ stable prefix so caching still works.
 > Pattern continuation is what the model does natively, so a demonstrated format usually dominates a
 > described one; there is no fixed rule that instructions outrank examples. Every example must comply with
 > every rule, or the rule is effectively overwritten.
+
+## Use cases & projects
+### Use cases
+- **Fixing tool-argument formats.** One demonstrated call settles dates, IDs and units that a schema
+  description left ambiguous.
+- **Enforcing step order.** A short example trajectory teaches "look up before you act" for refund,
+  booking or deployment agents.
+- **Disambiguating overlapping tools.** A boundary pair of similar requests mapped to different tools
+  fixes recurring misroutes.
+- **Calibrating LLM judges.** Labeled pass and fail trajectories inside the judge prompt align its scores
+  with human reviewers.
+
+### Mini project
+**Few-shot fix for a misbehaving agent tool (1-2 hours).**
+- **Goal:** cut argument errors on one agent tool with the fewest examples possible.
+- **Steps:** build an agent with a `search_orders(date)` tool that requires YYYY-MM-DD; write 20 tasks
+  using natural-language dates; run zero-shot and log validation failures; add one, then two placeholder
+  examples; add the leak check from this lesson.
+- **Done when:** you have a table of validation-failure rate and task success for 0, 1 and 2 examples, and
+  the leak check reports zero placeholder values in real calls.

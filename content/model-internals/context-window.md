@@ -5,7 +5,8 @@ name: Context window
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - model-internals/kv-cache
   - model-internals/positional-encoding
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-The context window is the maximum tokens a model attends over in one request, shared by system prompt,
-history, documents, tool results and the answer. It is finite because of attention cost, KV-cache memory
-and trained positions, so budgeting it is core engineering work.
+The context window is your agent's entire working memory for one step: system prompt, tool schemas,
+history, tool results, retrieved chunks and the answer share it. It is finite, so budgeting and compacting
+it is core agent engineering.
+
+## For agent builders
+- **Why it matters for agents.** An agent loop appends a tool call and a tool result every step, so its
+  context only grows. Without a budget and a compaction policy, latency and cost climb each step and the
+  run eventually dies with a "context length exceeded" error, often mid-task.
+- **Where it shows up in your stack.** The model's advertised window, the output cap (`max_tokens`),
+  `max_model_len` in vLLM when self-hosting, provider prompt caching, and the token usage fields every API
+  returns per call.
+- **What you control.** What goes into each step's prompt (instructions, tool definitions, retrieved
+  material, history, tool outputs), in what order, how large tool outputs are truncated or summarized,
+  and when old turns are compacted.
+- **What you can skip.** The details of RoPE scaling methods such as YaRN; remember that positions beyond
+  the trained length degrade quality and that the effective window is shorter than the nominal one.
 
 ## Why it exists
 - **Attention compute grows with length.** Every token is compared with every earlier token, so prefill
@@ -36,17 +50,18 @@ and trained positions, so budgeting it is core engineering work.
   vendors publish a hard limit and engines enforce one (`max_model_len` in vLLM), because worst-case memory
   must be reserved in advance.
 - **The model is stateless between calls.** "The chatbot remembers our conversation" is wrong in a way
-  that matters: the client re-sends the entire transcript each turn and the model re-reads it. Memory is an
-  illusion the application maintains, paid in tokens on every request.
+  that matters: the client re-sends the entire transcript each turn and the model re-reads it. Agent
+  memory is an illusion the application maintains, paid in tokens on every step.
 - **And it ends abruptly.** At the window boundary the request is rejected or something is dropped.
-  Deciding what to drop, summarize or retrieve is the problem the context window forces on you.
+  Deciding what to drop, summarize or retrieve is the problem the context window forces on every agent.
 
 ## How it works
-### Accounting
+### Accounting for one agent step
 Every request must satisfy `input_tokens + max_output_tokens ≤ window`.
 
 - **Input is everything after chat templating:** system prompt, each prior user and assistant turn, tool
-  definitions, tool outputs, retrieved chunks, and the template's own role markers.
+  definitions, tool outputs, retrieved chunks, and the template's own role markers. In agents, tool
+  schemas and tool outputs are often the largest items.
 - **Output is often capped separately.** Many APIs cap output at a figure well below the window, so the
   practical limit on a long answer is the output cap, not the window.
 - **Count with the model's own tokenizer.** The same text can differ in token count by tens of percent
@@ -71,6 +86,7 @@ KV per token = 2 × 32 × 8 × 128 × 2 bytes = 128 KiB
 - **The crossover.** The attention term overtakes the rest once *n* exceeds roughly 6·d, around 25k tokens
   at d = 4,096 (a rule of thumb for orders of magnitude, not a measurement).
 - **So** below that, long prompts cost roughly linearly; above it, every doubling costs more than double.
+  A long-running agent crosses this line without anyone deciding it should.
 
 ### Why the limit sits where it does
 | Constraint | What sets it |
@@ -90,26 +106,29 @@ KV per token = 2 × 32 × 8 × 128 × 2 bytes = 128 KiB
 - **The effective window** is the length over which the model reliably uses information. It is
   task-dependent, usually shorter than the nominal one, and must be measured for your task rather than
   read off a spec sheet.
+- **For agents** this means an instruction from step 1 or a tool result from step 5 can be technically
+  present at step 30 and still be ignored, because it now sits in the middle of a long transcript.
 
 ### Living within it
 - **Sliding window:** drop the oldest turns. Simple, loses early instructions and facts.
 - **Summarization / compaction:** replace old turns with a model-written summary. Keeps the gist, loses
-  detail and costs a call.
+  detail and costs a call. The usual choice for long agent runs.
 - **Retrieval:** keep history or documents outside the prompt and pull in only what the current turn
-  needs. The default for large corpora; the `long-context-vs-rag` topic covers the trade.
+  needs. The default for large corpora and for agent long-term memory; the `long-context-vs-rag` topic
+  covers the trade.
 - **Prompt caching:** does not enlarge the window, but makes a long shared prefix cheap to re-send by
-  reusing its KV cache across requests, which changes the economics of a big system prompt.
+  reusing its KV cache across requests, which changes the economics of a big system prompt and tool list.
 - **Sliding-window attention** in the model itself (Mistral 7B v0.1 attends over a 4,096-token window per
   layer) bounds per-layer cost while deeper layers still propagate information further back. It is an
   architectural choice, not something you configure per request.
 
 ## Diagram
-Each turn the application rebuilds the whole prompt; fixed parts and the output reservation are paid
-first, and history gets whatever is left.
+Each agent step rebuilds the whole prompt; fixed parts and the output reservation are paid first, and
+history and tool results get whatever is left.
 
 ```mermaid
 flowchart TD
-    A["New user turn"] --> B["Count fixed parts with model tokenizer"]
+    A["New agent step"] --> B["Count fixed parts with model tokenizer"]
     B --> C["Reserve max output tokens"]
     C --> D{"Budget left for history?"}
     D -->|"no"| E["Trim chunks or reject"]
@@ -158,6 +177,49 @@ print(f"kept {len(kept)} of {len(history)} turns, {left} tokens spare")
 # usual upgrade, and it is what you would do before ever cutting the system prompt or chunks.
 ```
 
+### Compacting an agent loop's tool outputs
+A tool-calling loop that clips large tool results and compacts old turns once the transcript passes a
+threshold. `summarize` is whatever cheap model call you use; token counts come from your tokenizer.
+
+```python
+MAX_TOOL_TOKENS = 1_500      # clip any single tool result to this (illustrative)
+COMPACT_AT = 0.7             # compact when the transcript uses 70% of the input budget
+KEEP_RECENT = 6              # messages kept verbatim after compaction
+
+def add_tool_result(messages, call_id, text, count, store):
+    if count(text) > MAX_TOOL_TOKENS:
+        ref = store.put(text)                          # raw output kept outside the prompt
+        text = text[: MAX_TOOL_TOKENS * 3] + f"\n[truncated, full result: {ref}]"
+    messages.append({"role": "tool", "tool_call_id": call_id, "content": text})
+
+def maybe_compact(system, messages, count, budget, summarize):
+    used = count(system) + sum(count(m["content"]) for m in messages)
+    if used < COMPACT_AT * budget:
+        return messages
+    old, recent = messages[:-KEEP_RECENT], messages[-KEEP_RECENT:]
+    summary = summarize(old)                           # one call, one cache miss, at a boundary
+    return [{"role": "user", "content": f"Summary of earlier steps:\n{summary}"}] + recent
+```
+
+The characters-per-token factor of 3 in the clip is a rough heuristic; clip by tokens if your tokenizer
+is cheap to call. Keep the system prompt and tool definitions out of the compacted region.
+
+### Worked scenario: a 30-step research agent on a 128k window
+The agent starts with a 7k-token prefix (system prompt plus 15 tool schemas) and each step appends about
+4k tokens (tool call plus a raw web-page result).
+
+| Step | Input tokens, raw results | Input tokens, results clipped to 1.5k |
+|---|---|---|
+| 1 | 7k | 7k |
+| 10 | 43k | 20.5k |
+| 20 | 83k | 35.5k |
+| 30 | 123k: the next step, plus output room, no longer fits | 50.5k |
+
+- **Raw results** kill the run near step 30, and early findings sit mid-context where they are used least
+  reliably by then.
+- **Clipping alone** cuts growth to about a third; compaction at 70% of the budget then caps input per
+  step for runs of any length (illustrative figures from the stated per-step sizes).
+
 ### What filling the window costs on Llama-3-8B
 Pure Python using the two formulas above: KV memory per request, and the share of per-layer FLOPs spent
 on attention for the last token (rule of thumb, d = 4,096).
@@ -183,12 +245,17 @@ for n in (8_192, 32_768, 131_072):
 | 128k | ~16 GiB | ~84% | one request holds as much memory as the weights |
 
 ## Production patterns
-- **Budget before you call.** Count every request with the deployed model's tokenizer, including template
-  and tool-definition overhead, and trim or reject before the API call. Monitor "context length exceeded"
-  errors and truncation events per route as first-class metrics.
+- **Budget every agent step before you call.** Count each request with the deployed model's tokenizer,
+  including template and tool-definition overhead, and trim or reject before the API call. Monitor
+  "context length exceeded" errors and truncation events per route as first-class metrics.
 - **Compact long agent runs.** Keep the last few turns verbatim, summarize older turns and large tool
   outputs, and store raw outputs outside the prompt for retrieval. Monitor input tokens per turn; it
   should plateau, not grow linearly.
+- **Clip tool outputs at the tool boundary.** Each tool returns a bounded, structured result (top rows,
+  key fields, a pointer to the full payload) rather than raw HTML or full logs. Monitor tool-result token
+  size per tool; one noisy tool usually dominates.
+- **Load only the tools a step needs.** With dozens of tools, schemas alone can cost thousands of tokens
+  every step; shortlist tools per task and keep the shortlist stable within a run so the prefix still caches.
 - **Size the engine window per deployment.** Set `max_model_len` in vLLM to the length the traffic
   actually uses and route long-document work to a separate deployment, so a few long requests cannot
   starve short chats. Monitor KV utilization and preemptions.
@@ -207,6 +274,8 @@ for n in (8_192, 32_768, 131_072):
   no longer fits, changes too often to keep cached, or costs more to re-read than a retrieval miss costs.
 - **Full history vs summary.** Keeping full history maximizes fidelity; summarizing cuts tokens and latency
   at the price of lost detail. The flip happens when old turns stop being referenced.
+- **Compaction timing vs cache hits.** Compacting rewrites history, which invalidates the cached prefix
+  from that point. Compact rarely and at a boundary rather than trimming a little every step.
 - **Output reservation vs input room.** A large output budget protects long answers but shrinks the space
   for input; size it to the real distribution of answer lengths rather than the maximum.
 - **Window vs concurrency.** Operators can shrink the engine's window to fit more concurrent users in GPU
@@ -232,8 +301,8 @@ for n in (8_192, 32_768, 131_072):
 
 ## When to use
 - **There is no opting out;** every request has a window. The decisions are how much of it to spend on
-  instructions, on examples, on retrieved material, on history, and on the answer.
-- **Measure** the token distribution of real requests, the rate of truncation events, and task accuracy
+  instructions, tool definitions, examples, retrieved material, history, and on the answer.
+- **Measure** the token distribution of real agent steps, the rate of truncation events, and task accuracy
   as a function of where key information sits in the prompt.
 - **Watch for the RoPE-scaling trap.** Some model cards note that statically enabling a context-extension
   method for all requests can slightly degrade quality on short inputs, so enable it only on deployments
@@ -241,8 +310,8 @@ for n in (8_192, 32_768, 131_072):
 - **Prefer retrieval** when the corpus is large or changes, long context when a single document must be
   reasoned over as a whole, and compaction for long agent runs.
 - **Day to day** the window appears as a budgeting function, a truncation policy and a cost line.
-- **Interviews:** expect why windows are finite, what the KV cache has to do with it, and whether a bigger
-  window makes RAG unnecessary.
+- **Interviews:** expect why windows are finite, what the KV cache has to do with it, whether a bigger
+  window makes RAG unnecessary, and how you keep a long agent run inside it.
 
 ## Role lens
 - **Engineer:** Writes the budgeting and truncation logic, counts tokens with the right tokenizer, and
@@ -277,6 +346,12 @@ pasted versus retrieved, measured before the pipeline is deleted.
   appends raw tool results forever.
 - **Fix the loop.** Summarize or truncate large tool outputs, keep only the last few turns verbatim, and
   store raw results outside the prompt for retrieval. Input tokens per turn should then plateau.
+
+### Your agent follows an instruction early in a run but ignores it by step 25. Why, and what do you change?
+- **Likely cause:** the instruction is still in the prompt but now sits in the middle of a long
+  transcript, where models use information least reliably; or compaction dropped it.
+- **Fix:** keep durable instructions in the pinned system prompt, restate the current goal near the end
+  of each step's prompt, and check the compaction summary preserves constraints. Test by position.
 
 ### How much KV memory does a 128k-token request need on Llama-3-8B, and what does that imply?
 - **Per token:** 2 × 32 layers × 8 KV heads × 128 × 2 bytes = 128 KiB.
@@ -319,3 +394,23 @@ pasted versus retrieved, measured before the pipeline is deleted.
 - [ ] It compresses the prompt into fewer tokens
 > Caching stores the computed keys and values for a byte-identical prefix so later requests skip that
 > prefill work. The window and the model's use of the content are unchanged.
+
+## Use cases & projects
+### Use cases
+- **Long-running coding and research agents.** Tool outputs accumulate fastest here, so clipping and
+  compaction decide whether a 50-step run finishes at all.
+- **Support agents with RAG and history.** A per-step budget splits the window between policy chunks,
+  conversation history and the answer, so neither crowds out the other.
+- **Agents with large tool catalogs.** Tool schemas are paid on every step, so shortlisting tools frees
+  room for the actual task.
+- **Choosing long context vs retrieval.** Teams test whether pasting a whole document beats retrieving
+  from it on accuracy, latency and cost before committing to either design.
+
+### Mini project
+**Add a context budget and compaction to a tool-calling agent (2-3 hours).**
+- **Goal:** keep a 30-step agent run inside a fixed input budget without losing the task.
+- **Steps:** build a loop with a search tool that returns long raw text; log input tokens per step; run 30
+  steps and plot the growth; then add tool-result clipping and compaction at 70% of the budget with the
+  last few messages kept verbatim; rerun the same task.
+- **Done when:** you have two per-step token curves (linear vs plateau), the compacted run completes the
+  task, and a short note lists what the summary had to preserve for the agent to finish.

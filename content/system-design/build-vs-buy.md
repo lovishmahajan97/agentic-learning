@@ -433,3 +433,24 @@ vector store, and revisit at renewal.
 - [ ] To hide the component's cost from the finance team
 > A seam you own turns a vendor swap into a known amount of work rather than a rewrite. Its value is
 > proportional to how likely and how expensive a switch would otherwise be.
+
+## Use cases & projects
+### Use cases
+- **Choosing an agent framework.** Deciding between a hand-written loop, an open-source framework and a
+  managed agent service, layer by layer, with a seam you own.
+- **Picking a tracing and eval platform.** Buying the platform while keeping the golden task set and
+  span format portable, so renewal is not a hostage negotiation.
+- **Evaluating an end-to-end agent vendor.** The four questions per layer show where their workflow
+  replaces your domain logic and where your sensitive data would flow.
+- **Planning a migration off a platform.** Time-to-swap through each seam turns "can we leave?" into an
+  estimate in days.
+
+### Mini project
+**Measure time-to-swap behind a seam (2-3 hours).**
+- **Goal:** show that an owned seam makes a build-versus-buy choice reversible.
+- **Steps:** define a small agent runner interface and a tool interface; implement the agent once as a
+  hand-written loop and once on an open-source framework behind the same interface; run the same 10
+  golden tasks through both; time how long the second implementation took.
+- **Done when:** both implementations pass the same task suite with comparable success rates, a layer
+  map records build, buy or adopt per layer with one line of reasoning each, and you have a measured
+  time-to-swap figure.

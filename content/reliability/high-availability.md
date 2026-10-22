@@ -5,7 +5,8 @@ name: High availability
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - reliability/fault-tolerance
   - reliability/multi-region-architecture
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-High availability (HA) keeps a system answering through the failure of any single component, using
-redundancy, fast health checks and automatic failover. It costs money and complexity, and an AI
-product is capped by its least available dependency, usually the model provider.
+High availability (HA) keeps your agent answering when any one replica, zone or provider fails, using
+redundancy, fast health checks and failover. An agent run multiplies every dependency per step, so the
+model provider usually caps you.
+
+## For agent builders
+- **Why it matters for agents.** One agent run makes many model and tool calls in series, so per-call
+  availability compounds: 15 model calls at 99.9% each finish cleanly only ~98.5% of the time. HA for
+  agents is about surviving a failed step, not only a dead server.
+- **Where it shows up in your stack.** Readiness probes on self-hosted model servers, a load balancer in
+  front of stateless agent workers, circuit breakers and fallbacks around each model provider, and a
+  replicated store for conversation state and run checkpoints.
+- **What you control.** Keep agent workers stateless (history and checkpoints in a replicated store),
+  retry a failed step instead of the whole run, add a fallback model with portable prompts, and drain
+  long runs before deploys.
+- **What you can skip.** Building your own consensus or database failover; buy managed multi-zone
+  databases and queues. Know the series, parallel and MTTR formulas, which cover most design reviews.
 
 ## Why it exists
 - **A single server is a single point of failure.** One disk, one kernel panic, one bad deploy, one
@@ -121,16 +135,23 @@ Because changes cause most outages, HA includes the deployment process:
 - **Rollbacks** that take seconds.
 - **A system redundant at runtime but deploying to all replicas at once is not HA.**
 
-### Where AI systems differ
+### Where AI systems and agents differ
 - **Model providers are a shared dependency.** Multi-provider fallback raises availability only if your
   prompts and evals are portable and you accept that the fallback model gives different answers.
   "Available but different" is a product decision, not just an infrastructure one.
 - **GPU capacity is expensive,** so N+1 redundancy may be replaced by graceful degradation to a smaller model.
 - **For self-hosted serving,** the readiness probe should include a real tiny inference.
+- **An agent run is a long series chain.** Each step (model call, tool call, retrieval) must succeed, so
+  run success is roughly the product of per-step availabilities. Step-level retries turn each step into a
+  small parallel system and claw most of it back.
+- **Tool availability counts too.** A run that calls a flaky internal API ten times inherits that API's
+  availability ten times over; tool calls need the same timeouts, retries and fallbacks as model calls.
+- **Runs outlive instances.** A 10-minute agent run will meet deploys and node restarts, so the run's
+  state belongs in a store, not in worker memory, and a new worker must be able to resume it.
 
 ## Diagram
-A request survives a dead replica because the load balancer only routes to instances whose readiness
-passes; the shared provider is guarded by a fallback, not by the probe.
+An agent request survives a dead worker because the load balancer only routes to instances whose
+readiness passes; the shared model provider is guarded by a breaker and fallback, not by the probe.
 
 ```mermaid
 flowchart TD
@@ -193,6 +214,39 @@ Using `A = MTBF / (MTBF + MTTR)` for a component that fails about once a month (
 The failure rate never changed; only detection and failover did. That is why the first HA investment
 is usually automation of recovery, not a sturdier box.
 
+### Worked scenario: why one agent run fails far more often than one call
+A support agent makes 15 model calls (provider at 99.9%) and 10 tool calls (an internal API at 99.5%)
+per run. Failures are treated as independent, which is optimistic.
+
+| Design | Per model call | Per tool call | Run completes cleanly |
+|---|---|---|---|
+| No retries | 99.9% | 99.5% | 0.999^15 × 0.995^10 ≈ 93.7% |
+| One retry per step | ≈ 99.9999% | ≈ 99.9975% | ≈ 99.97% |
+
+- **Without retries about 1 run in 16 fails,** although every component looks healthy on its own
+  dashboard. Users experience the run, not the call.
+- **One step-level retry recovers almost all of it,** but only if retrying is safe: the tool must be
+  idempotent (or carry an idempotency key) and the run's progress must be checkpointed.
+- **Correlated failures break the retry math.** If the provider is down for 20 minutes, an immediate
+  retry fails too; that is what the fallback provider and the circuit breaker are for.
+
+```python
+import random, time
+
+class StepFailed(Exception): ...
+
+def run_step(call, *, retries=1, backoff_s=0.5, fallback=None):
+    """Run one agent step (model or tool call) with a bounded retry, then a fallback."""
+    for attempt in range(retries + 1):
+        try:
+            return call()
+        except TimeoutError:
+            time.sleep(backoff_s * (2 ** attempt) * (0.5 + random.random()))  # jittered backoff
+    if fallback is not None:
+        return fallback()            # e.g. second provider or smaller model with a portable prompt
+    raise StepFailed("step exhausted retries")  # caller resumes the run from its last checkpoint
+```
+
 ## Production patterns
 - **Readiness that runs a tiny inference.** For self-hosted model servers, have the readiness endpoint
   generate a few tokens against the loaded model, and keep liveness cheap (process alive). In Kubernetes,
@@ -210,6 +264,12 @@ is usually automation of recovery, not a sturdier box.
 - **Managed failover for stateful tiers.** Use a managed database with multi-zone standby and fencing
   rather than a heartbeat script. Monitor replication lag, because that is the data an async promotion
   would lose.
+- **Stateless agent workers with external run state.** Store the transcript, plan and completed steps
+  in a replicated database or a durable workflow engine after each step, so any worker can resume a run
+  after a crash or deploy. Monitor resumed-run count and the share of runs that restart from step 1.
+- **Measure run success, not call success.** Define the SLO as agent runs that finish without an
+  infrastructure error, alongside per-call error rates. Monitor run completion rate per agent type,
+  because a 99.9% call rate can hide a 94% run rate.
 
 ## Trade-offs
 - **Extra nines vs cost.** Every extra nine roughly multiplies cost and complexity, so a 99.9% target
@@ -223,6 +283,9 @@ is usually automation of recovery, not a sturdier box.
   a transparent one.
 - **Aggressive health checks vs misdiagnosis.** They fail over faster but mark slow nodes as dead under
   load, turning a latency problem into a capacity problem as traffic piles onto fewer survivors.
+- **Step retries vs side effects.** Retrying a failed agent step recovers most run failures, but a retry
+  of a non-idempotent tool (send email, create ticket) can act twice; it flips to "do not retry" unless
+  the tool takes an idempotency key.
 
 ## Pitfalls
 - **Counting redundancy that shares a failure mode.** Two replicas in one zone, two providers behind one
@@ -238,6 +301,9 @@ is usually automation of recovery, not a sturdier box.
   error-budget deficit nobody can engineer away.
 - **Forgetting that deploys are downtime.** Rolling restarts that kill in-flight generations show up as
   a spike of client errors at every release, not as an "outage".
+- **Keeping agent run state in worker memory.** Every deploy or node loss kills the runs on it, and they
+  restart from scratch, repeating tool calls. Fix: checkpoint after each step to a replicated store and
+  resume on any worker.
 
 ## When to use
 - **Decide the target before the design.** Ask what one hour of downtime costs, convert that into a
@@ -245,7 +311,10 @@ is usually automation of recovery, not a sturdier box.
 - **Match the design to the surface.** An internal retrieval tool may be fine at 99.5% with a 15-minute
   rollback; a customer-facing assistant inside a checkout flow needs multi-zone active-active and
   multi-provider fallback.
-- **Measure the way users experience it:** successful requests, by endpoint, by tenant, not host uptime.
+- **Measure the way users experience it:** successful requests and completed agent runs, by endpoint,
+  by tenant, not host uptime.
+- **For agents, start at the step:** step-level retries, a fallback model and checkpointed run state
+  usually buy more run success than another replica.
 - **Day to day:** readiness probes, drain timeouts, N+1 capacity reviews, and the design-review question
   "what happens if this box disappears right now?".
 - **Interviews:** compose availabilities, explain why the provider caps yours, and distinguish HA
@@ -288,12 +357,6 @@ the target should be renegotiated unless both changes are funded.
   does not complete.
 - **Keep liveness cheap,** so warm-up or slow inference does not trigger restart loops.
 
-### Should readiness probes check the model provider? Why or why not?
-- **No for shared dependencies.** Every replica would fail together on a provider blip, emptying the load
-  balancer pool and turning degradation into a full outage.
-- **Probe only what removing this instance fixes,** such as its own loaded model or local resources.
-- **Handle the provider with circuit breakers and fallbacks** in the request path instead.
-
 ### When would you choose active-passive over active-active?
 - **Active-passive fits** when state sharing between nodes is hard, such as a single-writer database, and
   a failover gap of detection plus warm-up is acceptable.
@@ -306,6 +369,20 @@ the target should be renegotiated unless both changes are funded.
 - **Cut MTTR to about 4.5 minutes** through automatic detection and failover, which gives about 99.99%
   with no change in failure rate.
 - **Budget detection inside that:** a 10 s probe needing 3 failures already spends ~30 s.
+
+### Every component of your agent is at 99.9%, yet 6% of runs fail. What is going on and what do you do?
+- **Runs are series chains.** Fifteen model calls and ten tool calls multiply, so per-call health of
+  99.9% and 99.5% gives only about 93.7% clean runs.
+- **Add step-level retries with backoff,** which lifts each step close to 99.999% when failures are
+  independent, and make tools idempotent so a retry cannot act twice.
+- **Track run completion as the SLO,** not per-call success, so the gap is visible on a dashboard.
+
+### How do you keep long agent runs alive through deploys and node failures?
+- **Externalise run state:** checkpoint transcript, plan and completed tool calls after each step to a
+  replicated store or durable workflow engine.
+- **Drain, then resume:** fail readiness, let short runs finish within the grace period, and let any
+  worker pick up longer runs from their last checkpoint.
+- **Verify** by killing a worker mid-run in staging and checking that no tool call repeats.
 
 ## Quiz
 ### Q: Two API replicas each at 99.9% sit behind a load balancer. Why is the combined availability usually worse than the 99.9999% the parallel formula predicts?
@@ -331,3 +408,24 @@ the target should be renegotiated unless both changes are funded.
 - [ ] They are the same practice measured over different time windows
 > HA keeps the system up through routine faults using redundancy and failover. DR plans for the
 > cases redundancy cannot cover, such as a region loss or corrupted data, and is measured by RPO and RTO.
+
+## Use cases & projects
+### Use cases
+- **Customer-facing assistants with an SLO.** Availability math per run decides whether you need a
+  second model provider or only step retries to meet the target.
+- **Self-hosted model serving for agents.** Readiness probes that run a tiny inference keep wedged GPU
+  replicas out of rotation while weights load or after a fault.
+- **Long-running coding or research agents.** Stateless workers with checkpointed runs survive deploys
+  and node loss without repeating tool calls.
+- **Agent platforms shared by many teams.** N+1 capacity per zone and graceful degradation to a smaller
+  model keep one zone failure from becoming an outage for every tenant.
+
+### Mini project
+**Measure and raise agent run availability (2-3 hours).**
+- **Goal:** show how per-step failures compound across an agent run and how step retries plus a fallback
+  model recover run success.
+- **Steps:** build a 15-step fake agent loop whose model and tool calls fail at configurable rates (for
+  example 0.1% and 0.5%); run 10,000 simulated runs without retries, then with one jittered retry per
+  step, then with a fallback that is down at the same time as the primary 20% of the time.
+- **Done when:** you have a table of run completion rate for the three designs that matches the series
+  and parallel formulas within a fraction of a percent, plus a note on how correlated outages change it.

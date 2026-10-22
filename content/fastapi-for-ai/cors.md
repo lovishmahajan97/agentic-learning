@@ -426,3 +426,24 @@ response.
 - [ ] max_age was set too high
 > If middleware that returns early sits outside CORS, its responses lack Access-Control-Allow-Origin,
 > and the browser hides them. Making CORS outermost lets the front end see the real 429 and its Retry-After.
+
+## Use cases & projects
+### Use cases
+- **Browser chat UIs on their own origin.** A web app on one origin streams agent runs from a FastAPI API
+  on another, with bearer tokens and an explicit origin allowlist.
+- **Embeddable agent widgets.** A support agent embedded on customer sites checks each tenant's allowed
+  origins instead of using a wildcard.
+- **Surfacing limits and errors to the UI.** CORS outermost plus exposed headers let the front end read a
+  run id, a 401 or a 429 with `Retry-After` instead of showing "the agent is stuck".
+- **Separating browser hops from server hops.** Teams confirm that provider, tool and MCP calls from
+  Python need no CORS, and focus the policy on the one browser-facing API.
+
+### Mini project
+**Wire a cross-origin chat UI to a streaming agent API (1-2 hours).**
+- **Goal:** a static page on one local port streams an agent run from FastAPI on another, with errors
+  visible in the UI.
+- **Steps:** add `CORSMiddleware` with an explicit origin and bearer-token auth to a FastAPI endpoint
+  that streams fake agent steps; read the stream with a `fetch` reader; add a rate limiter and make sure
+  CORS sits outermost; expose a run id header.
+- **Done when:** the UI shows streamed steps and the run id, a 429 appears as a readable error with its
+  retry hint, and a request from an unlisted origin is blocked in the browser.

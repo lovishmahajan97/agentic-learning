@@ -5,7 +5,8 @@ name: Idempotency
 kind: concept
 difficulty: core
 est_minutes: 13
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - serving-inference/retry-strategies
   - serving-inference/timeouts
@@ -20,9 +21,22 @@ sources:
 ---
 
 ## TL;DR
-An operation is idempotent when doing it twice equals doing it once. Retries, timeouts, queues and agents
-all create duplicates that cost money or act twice, so a client-chosen key stored with the outcome lets
-repeats replay the saved result.
+An operation is idempotent when doing it twice equals doing it once. Agents retry, regenerate and resume,
+so every side-effecting tool needs a key derived from run and step, stored with the outcome, so a repeat
+replays the result instead of acting again.
+
+## For agent builders
+- **Why it matters for agents.** A model call that times out after the tool already ran, a regenerated
+  turn, a resumed checkpoint: each replays a step. Without keys, `send_email`, `create_ticket` or a refund
+  happens twice, and that is a customer-visible incident, not a log line.
+- **Where it shows up in your stack.** Your tool functions (the only place the effect actually happens),
+  the `Idempotency-Key` header on your agent API, external APIs that accept keys (Stripe does), durable
+  execution and checkpointing in agent frameworks, and the queues that deliver agent jobs.
+- **What you control.** How the key is derived (run id plus a stable step identifier, never only the
+  model's tool-call id), the atomic claim, the lease length versus your slowest tool, and which tools are
+  idempotent by design.
+- **What you can skip.** Formal exactly-once theory. Know that it is impossible across a network and that
+  at-least-once plus idempotent handlers is the substitute.
 
 ## Why it exists
 - **A timeout is ambiguous.** The request may never have arrived, may still be running, or may have
@@ -92,6 +106,18 @@ Often you can skip the key store by making the operation naturally idempotent:
 
 - **Agent caveat:** a regenerated model turn produces new tool-call ids, so the derivation must include
   something stable about the step, not only the model's id.
+
+### Deriving a stable key inside an agent loop
+| Candidate key | Survives a transport retry | Survives a regenerated turn | Survives resume from checkpoint |
+|---|---|---|---|
+| Model's tool-call id | yes | no: new id each generation | only if the checkpoint stored it |
+| Random UUID made in the tool | no: new id every attempt | no | no |
+| `run_id` + step index + tool name + hash of key arguments | yes | yes, if the step index is the same | yes |
+
+- **Include the arguments that define the effect** (recipient, amount, ticket subject), so a corrected
+  call with different arguments is a new operation, not a replay.
+- **Record the tool result in the transcript or checkpoint** under the same key, so a resumed run feeds
+  the model the stored result instead of calling the tool again.
 
 ### Streaming
 - **Partial output complicates replay.** Persist the final text under the key when the stream completes.
@@ -209,7 +235,61 @@ A tool call that takes 150 s against a 120 s lease, without a heartbeat (illustr
 
 With a heartbeat every 30 s, B keeps getting 409 until A completes, then gets the replay.
 
+### Agent tool wrapper keyed on run and step
+A decorator for side-effecting tools: the key comes from the run, the step and the effect-defining
+arguments, so a retried, regenerated or resumed step returns the stored result. `store` is the
+`IdempotencyStore` above; `billing.create_invoice` stands in for your external API.
+
+```python
+import hashlib, json, functools
+
+def idempotent_tool(effect_args):
+    def wrap(fn):
+        @functools.wraps(fn)
+        def tool(ctx, **kwargs):
+            effect = {k: kwargs[k] for k in effect_args}
+            digest = hashlib.sha256(json.dumps(effect, sort_keys=True).encode()).hexdigest()[:16]
+            key = f"{ctx.tenant}:{ctx.run_id}:{ctx.step}:{fn.__name__}:{digest}"
+            status, saved = store.claim(key, digest)
+            if status == "done":
+                return saved                                   # replay: no second invoice
+            if status == "in_progress":
+                return {"error": "already running, check back"}   # observation for the model
+            try:
+                result = fn(ctx, idem_key=key, **kwargs)
+            except TransientError:
+                store.release(key)
+                raise
+            store.complete(key, result)
+            return result
+        return tool
+    return wrap
+
+@idempotent_tool(effect_args=["customer_id", "amount_cents"])
+def create_invoice(ctx, idem_key, customer_id, amount_cents, memo=""):
+    return billing.create_invoice(customer_id, amount_cents, memo, idempotency_key=idem_key)
+```
+
+### Worked scenario: one timeout, three layers of duplicates
+A support agent's step calls `create_invoice`, then the model call that reads the result times out.
+
+| Event | Without keys | With run-and-step keys |
+|---|---|---|
+| SDK retries the model call | model re-emits the tool call | tool claim finds `completed`, replays invoice id |
+| User clicks "regenerate" | new turn, new tool-call id, second invoice | same run and step, same arguments: replay |
+| Worker crashes, run resumes from checkpoint | step re-executes, third invoice | stored result fed back to the model |
+| Invoices created | 3 | 1 |
+
+- **Regenerate the text, not the effect.** "Regenerate" gets a new key for the model's reply (the user
+  wants a different answer), while tool effects inside the step keep their run-and-step keys.
+
 ## Production patterns
+- **Key every side-effecting tool by default.** Wrap tools that email, charge, create or delete with an
+  idempotency decorator in the tool registry, so a new tool cannot ship without one. Monitor tools in the
+  registry without a key as a release check.
+- **Persist tool results with the checkpoint.** When an agent framework resumes a run, it should replay
+  recorded tool results to the model rather than re-executing tools. Monitor tool executions per resumed
+  run; it should be zero for already-completed steps.
 - **Client-generated message ids for chat.** The UI creates the id when the user presses send and sends
   it as an `Idempotency-Key` header (the IETF draft's name) on every retry. Monitor replay rate per
   client version; a jump points at an over-eager retry loop.
@@ -234,6 +314,9 @@ With a heartbeat every 30 s, B keeps getting 409 until A completes, then gets th
 - **Replay cache vs retention duty.** Stored responses double as a cache, but they are retained user
   content with privacy and retention obligations, so the TTL is a policy decision as well as a technical
   one.
+- **Coarse vs fine step keys.** Keying on run and step only blocks a legitimate second call in the same
+  step (two different emails); adding effect arguments allows it, but a model that rewords a memo
+  slightly then looks like a new operation. Pick the effect-defining arguments per tool.
 
 ## Pitfalls
 - **Generating the key inside the retry loop,** so each attempt gets a fresh one. Symptom: duplicates
@@ -250,6 +333,8 @@ With a heartbeat every 30 s, B keeps getting 409 until A completes, then gets th
   requests, with two attempts for the same key overlapping in the trace.
 - **Assuming temperature zero makes generation idempotent.** Symptom: subtly different replayed outputs,
   since determinism is not guaranteed across hardware and batch composition.
+- **Resuming a checkpointed run by re-executing its last step.** Symptom: duplicate effects only after
+  worker restarts or deploys. Fix: record each tool result under its key before advancing the checkpoint.
 
 ## When to use
 - **Require a key** on every endpoint that creates something, costs money or triggers a side effect: in
@@ -304,11 +389,19 @@ catch the rare window where the effect happened but the record did not.
 - **For pure reads,** which have no effect to duplicate.
 - **When set semantics fit,** because setting a value twice leaves one state.
 
-### How long should the lease be, and what happens if you get it wrong?
+### Your agent's slowest tool takes up to 150 s. How long should the idempotency lease be, and what happens if you get it wrong?
 - **It must outlast the slowest legitimate execution,** or a retry takes over a running attempt and
   duplicates its effect.
 - **But a long lease delays recovery** after a crash, so long operations heartbeat and the completing
   write checks the attempt id before recording.
+
+### How do you derive idempotency keys for an agent's tool calls?
+- **Not from the model's tool-call id alone,** because a regenerated turn gets a new id and repeats the
+  effect.
+- **Use run id, a stable step identifier, the tool name and a hash of the effect-defining arguments,**
+  scoped per tenant, and forward the key to external APIs that accept one.
+- **Store the result under that key** and feed it back on resume, so a restarted run never re-executes a
+  finished step.
 
 ### Why does temperature zero not make generation idempotent?
 - **Determinism is not guaranteed** across hardware and batch composition, so replayed outputs can differ
@@ -341,3 +434,24 @@ catch the rare window where the effect happened but the record did not.
 - [ ] To make the key unique across tenants
 > Keys are generated by clients, and clients have bugs. Without the fingerprint a reused key silently
 > replays a response to an unrelated request; with it the server can reject the mismatch explicitly.
+
+## Use cases & projects
+### Use cases
+- **Agents that move money or create records.** Refund, invoice and order tools keyed on run and step
+  make retries and regenerations safe.
+- **Email and notification agents.** A stored outcome per key means a timed-out step never sends the same
+  message twice.
+- **Durable, resumable agent runs.** Checkpointed runs replay recorded tool results after a crash instead
+  of re-executing them.
+- **Chat front ends for agents.** Client-generated message ids stop a double click from starting two
+  agent runs and billing two generations.
+
+### Mini project
+**Make a side-effecting agent tool safe under chaos (2-3 hours).**
+- **Goal:** prove that a tool-calling agent creates exactly one record per intended action, despite
+  timeouts, regenerations and crashes.
+- **Steps:** build a small agent with a `create_ticket` tool writing to SQLite; wrap it with a run-and-step
+  key and an atomic claim; inject a timeout after the tool runs, a "regenerate" of the turn, and a worker
+  kill mid-run; resume from a checkpoint each time.
+- **Done when:** across 50 chaos runs the ticket table holds exactly one row per intended ticket, and a log
+  shows which events were replays.

@@ -5,7 +5,8 @@ name: Customer VPC / on-prem / air-gapped deployment
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - deployment/private-endpoints
   - deployment/vpn
@@ -22,18 +23,33 @@ sources:
 ---
 
 ## TL;DR
-Customer VPC, on-prem and air-gapped are deployments where the customer owns the perimeter, because
-their data may not leave their custody. Each step inward trades your operability for their control,
-so the job becomes shipping software that installs, verifies and upgrades offline.
+Customer VPC, on-prem and air-gapped mean your agent runs inside a perimeter the customer owns, because
+their data may not leave. Model, tools, retrieval and traces must all work offline, so shipping the
+agent becomes a signed, self-contained bundle.
+
+## For agent builders
+- **Why it matters for agents.** An agent is a web of outbound calls: the model API, tool endpoints, an
+  embedding model, a vector store, a tracing backend. Inside a customer perimeter every one of those must
+  resolve to something the customer hosts, or the loop fails on its first step.
+- **Where it shows up in your stack.** The model client's base URL, the tool registry's endpoint hosts,
+  framework telemetry and tracing exporters, `HF_HUB_OFFLINE=1` for local weights, and the Helm values
+  file that wires all of them to the customer's services.
+- **What you control.** Which open-weight model the agent is evaluated on, which tools may exist inside,
+  where traces go, and an offline preflight that fails install if any tool or model host is outside the
+  allowed set.
+- **What you can skip.** Data-diode hardware and cross-domain solution internals. Know that artifacts
+  cross on media or one-way links and that the customer's site sets the speed.
 
 ## Why it exists
 - **SaaS assumes the customer sends you data.** For a bank's transaction records, a hospital's clinical
   notes, a defence contractor's documents or a government's citizen data, the contract, regulator or
-  classification policy says the data stays inside a perimeter they control.
+  classification policy says the data stays inside a perimeter they control. An agent that reads those
+  records through tools is processing them, wherever its model sits.
 - **Encryption promises do not answer the rule.** "We encrypt it and promise not to train on it" does
   not satisfy a rule about *where processing happens* and *who can be compelled to hand it over*.
 - **Copying your SaaS stack fails three ways.** It quietly depends on the open internet; you no longer
-  own the platform; and you lose your eyes (no dashboards, no logs, no hot-fix at 2 a.m.).
+  own the platform; and you lose your eyes (no dashboards, no logs, no hot-fix at 2 a.m.). For an agent,
+  losing traces means losing the only record of why it chose a tool.
 - **So it is a different product shape.** A signed, self-contained bundle, a configuration surface that
   captures every environment decision, and an operating model where the customer's platform team holds
   the keys. The further inward, the more of your product is packaging rather than infrastructure you run.
@@ -46,6 +62,8 @@ so the job becomes shipping software that installs, verifies and upgrades offlin
 | Python packages installed at build time inside their network | no package index reachable |
 | Licence checks and feature flags served from your SaaS | call-home traffic |
 | Traces shipped to an observability vendor | data leaving the perimeter |
+| Hosted LLM API behind the agent loop | every step is an outbound call carrying customer data |
+| Tools that call public SaaS APIs (search, web fetch) | no route out, and a data leak if there were |
 
 Platform you no longer own: their Kubernetes version, storage classes, certificate authority, egress
 proxy and identity provider.
@@ -59,17 +77,18 @@ proxy and identity provider.
 | Models | managed service over private endpoint, or open-weight on GPUs in the VPC | open-weight on their GPUs | open-weight, shipped in |
 | Updates | registry replication | mirror they populate | physical media or diode |
 | Your access | optional cross-account role | usually none | none |
+| Agent tools | their internal APIs plus managed services | their internal APIs only | their internal APIs only, no web tools |
 
 **Customer VPC (often sold as "bring your own cloud").**
 - **Their identity and data stores.** Containers run in a VPC/VNet they own; identity is their IAM;
-  storage, databases and KMS keys are theirs.
+  storage, databases and KMS keys are theirs. The agent's tool credentials come from their IAM roles.
 - **Model calls stay private.** Calls go to the cloud's managed model service (Bedrock, Azure OpenAI,
   Vertex AI) over a private endpoint, or to open-weight models on GPU instances in the same VPC.
 - **Vendor access is narrow.** If any, a cross-account role with a time-bound, logged session and an
   `ExternalId` condition to prevent the confused-deputy problem.
 - **Control plane / data plane split.** Many vendors host a **control plane** (licensing, version
   catalogue, configuration, upgrade orchestration) while the customer hosts the **data plane** (every
-  component that touches customer data).
+  component that touches customer data: the agent loop, tools, retrieval, memory, traces).
 - **Why the split works.** The customer's requirement is about data custody, not metadata, so you keep
   operability for everything that is not data. It must be optional *because* some customers reject any
   outbound connection on principle.
@@ -88,13 +107,15 @@ proxy and identity provider.
 - **Everything on-prem implies, plus no network path.** Artifacts cross on physical media or through a
   one-way transfer device (a data diode or a cross-domain solution).
 - **Inside:** a mirrored container registry, a package mirror, their own time source and their own CA.
-- **Nothing can call home.** No licence server, no telemetry, no automatic update, no hosted model.
+- **Nothing can call home.** No licence server, no telemetry, no automatic update, no hosted model, no
+  web-search tool.
 - **Updates and support.** Updates are a new bundle carried in; support is a log bundle carried out.
 
 ### The delivery pipeline
 1. **Build deterministically.** Pin every dependency, build images from a locked manifest, and ensure
    nothing at container start needs the network.
-   - Model weights are baked into an image or seeded into a persistent volume from the bundle.
+   - Model weights (LLM, embedding model, reranker) are baked into an image or seeded into a persistent
+     volume from the bundle.
    - `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` turn Hugging Face libraries into pure local loaders.
    - Tokenizer files are shipped, not fetched.
 2. **Sign and attest.** Sign images and the bundle manifest (cosign is the common choice), ship an SBOM
@@ -103,22 +124,23 @@ proxy and identity provider.
    unmodified.
 3. **Package.** Images exported with `docker save` or `skopeo copy` into a tarball or OCI layout, the
    chart, the weights, a wheelhouse built with `pip download` for anything installed on-site, the docs,
-   and a verify script.
+   the agent's eval set, and a verify script.
 4. **Transfer.** Registry-to-registry replication for VPC and connected on-prem; media or diode for the
    air gap. A 70B-parameter model in 16-bit precision is roughly 140 GB of weights (2 bytes per
    parameter), so the transfer is a planned activity, not a download.
 5. **Install.** `helm install` with a values file holding every environment decision: registry host,
-   storage class, ingress class, CA bundle, proxy, model endpoint, identity provider, resource limits.
-   Hard-coded assumptions are the single biggest source of failed installs.
+   storage class, ingress class, CA bundle, proxy, model endpoint, tool endpoints, identity provider,
+   resource limits. Hard-coded assumptions are the single biggest source of failed installs.
 6. **Verify.** Smoke tests that exercise the real path inside their network: a model call, a retrieval,
-   an authenticated request, a write to their database.
+   an authenticated request, a write to their database, and one end-to-end agent task that calls a tool.
 7. **Operate.**
-   - Logs and metrics stay inside and flow to *their* backends (ship Prometheus and OpenTelemetry
-     collector configs that point at them).
-   - A `support-bundle` command gathers redacted logs, config and version info into a tarball they can
-     send you.
+   - Logs, metrics and agent traces stay inside and flow to *their* backends (ship Prometheus and
+     OpenTelemetry collector configs that point at them).
+   - A `support-bundle` command gathers redacted logs, config, version info and failed agent traces into
+     a tarball they can send you.
    - Upgrade is a new bundle plus `helm upgrade`; rollback is the previous chart version, which only
-     works if your schema migrations are backward compatible.
+     works if your schema migrations (including agent memory and checkpoint tables) are backward
+     compatible.
 
 ### Signing for an air gap: key pair vs keyless
 - **Key pair (simplest).** A long-lived key pair whose public key ships out of band; verification needs
@@ -129,21 +151,23 @@ proxy and identity provider.
   bundle with its log inclusion proof and the Sigstore trusted root, and keep that root current: extra
   machinery many air-gapped sites decline.
 
-### What changes about the software itself
+### What changes about the agent itself
 - **Licensing.** A signed offline licence file with an expiry and a grace period, checked locally.
-- **Feature flags.** Move from a remote service into the values file.
-- **Trust the customer's CA.** Every HTTP client reads their CA bundle (`SSL_CERT_FILE`,
-  `REQUESTS_CA_BUNDLE`) *because* their proxy re-signs traffic.
-- **Secrets.** Come from their secret store, not yours.
+- **Feature flags.** Move from a remote service into the values file, including which tools are enabled.
+- **Trust the customer's CA.** Every HTTP client, the model client and each tool adapter, reads their CA
+  bundle (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`) *because* their proxy re-signs traffic.
+- **Secrets.** Tool credentials come from their secret store, not yours.
 - **Time bombs fail loudly.** Certificate expiry, licence expiry and token lifetimes must fail loudly and
   early *because* nobody will be watching a dashboard when they fail silently.
 - **The model is whatever you shipped.** On-prem and air-gapped customers run open-weight models on vLLM
   or similar, so your evaluation suite must have run on that exact model and prompt set before the
-  bundle was cut.
+  bundle was cut. Tool-calling accuracy is often what drops first when you leave a frontier model.
+- **Tool set shrinks to what is inside.** Web search and public SaaS tools are removed or pointed at
+  internal equivalents, and the system prompt and tool descriptions are re-evaluated for the new set.
 
 ## Diagram
-Follow the bundle from your connected build side across the boundary; nothing on the right may reach
-back out.
+Follow the agent bundle from your connected build side across the boundary; nothing on the right may
+reach back out.
 
 ```mermaid
 flowchart TD
@@ -157,11 +181,51 @@ flowchart TD
     V -->|"reject"| P
     V -->|"ok"| MR[("Customer mirror registry")]
     MR --> I["helm install with values file"]
-    I --> ST["Smoke tests inside network"]
+    I --> ST["Agent smoke task inside network"]
     ST --> O["Operate: their logs, support bundle"]
 ```
 
 ## Examples
+### Offline preflight for an agent's model and tool hosts
+Run at agent start-up inside the customer's network. It refuses to start if the model or any tool
+endpoint resolves to a host outside the allowlist from the values file, so a leftover public tool fails
+at install, not mid-task with customer data in the request.
+
+```python
+"""Preflight: every model and tool endpoint must be an approved internal host."""
+import os, sys
+from urllib.parse import urlparse
+
+ALLOWED = set(os.environ["AGENT_ALLOWED_HOSTS"].split(","))  # from the Helm values file
+
+AGENT_CONFIG = {
+    "model": {"base_url": os.environ["MODEL_BASE_URL"]},          # e.g. in-cluster vLLM service
+    "tools": {
+        "search_tickets": "https://tickets.internal.example/api",
+        "lookup_customer": "https://crm.internal.example/v2",
+        "web_search": os.environ.get("WEB_SEARCH_URL", ""),       # must be empty inside an air gap
+    },
+}
+
+def check():
+    problems = []
+    host = urlparse(AGENT_CONFIG["model"]["base_url"]).hostname
+    if host not in ALLOWED:
+        problems.append(f"model host {host!r} not allowed")
+    for name, url in AGENT_CONFIG["tools"].items():
+        if not url:
+            continue                                             # tool disabled for this site
+        h = urlparse(url).hostname
+        if h not in ALLOWED:
+            problems.append(f"tool {name}: host {h!r} not allowed")
+    for p in problems:
+        print("PREFLIGHT FAIL", p)
+    return not problems
+
+if __name__ == "__main__":
+    sys.exit(0 if check() else 1)    # run as an init container; the agent never starts on failure
+```
+
 ### Bundle manifest tool: build and verify
 - **Where it runs.** `build` runs on your connected side after packaging; `verify` runs on the
   customer's side, before anything is loaded into their mirror registry.
@@ -218,7 +282,7 @@ if __name__ == "__main__":
 # Typical layout: images/app-1.8.3.tar, charts/assistant-1.8.3.tgz, models/<name>/, wheels/, docs/
 ```
 
-### Worked scenario: sizing the weights in an air-gap delivery
+### Worked scenario: sizing the weights in an air-gap agent delivery
 Weights are parameters × bytes per parameter, so precision choice decides the media and transfer plan.
 Link speeds are illustrative; a diode or cross-domain solution is often slower and is set by the site.
 
@@ -232,12 +296,15 @@ Link speeds are illustrative; a diode or cross-domain solution is often slower a
 - **Read it as:** 140 GB × 8 = 1,120 Gb, and 1,120 Gb ÷ 1 Gbps ≈ 1,120 s ≈ 19 min, before hashing,
   media handling and the customer's inbound scanning.
 - **Each extra precision ships as another full copy**, so bundling both 16-bit and 8-bit doubles the
-  media without doubling usefulness; ship the one your eval suite approved.
+  media without doubling usefulness; ship the one your agent eval suite approved, including its
+  tool-calling cases.
+- **An agent ships more than one model.** Add the embedding model and any reranker the RAG step uses;
+  they are small next to the LLM but missing either one breaks retrieval at start-up.
 
 ### Offline-first CI gate: deny egress during the install test
-Run the install test in a namespace whose pods may only reach each other and cluster DNS. Any hidden
-download now fails in your CI instead of the customer's cluster. NetworkPolicy is enforced only if the
-cluster's CNI plugin supports it.
+Run the install test, including one end-to-end agent task, in a namespace whose pods may only reach each
+other and cluster DNS. Any hidden download or public tool call now fails in your CI instead of the
+customer's cluster. NetworkPolicy is enforced only if the cluster's CNI plugin supports it.
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -260,37 +327,43 @@ spec:
 ```
 
 ## Production patterns
-- **Offline-first CI gate.** On every release candidate, install the bundle into a namespace with the
-  deny-egress NetworkPolicy above and run the smoke tests. Monitor DNS and connection-timeout errors in
-  pod logs; any public hostname in them is a release blocker.
+- **Offline-first CI gate with a real agent task.** On every release candidate, install the bundle into a
+  namespace with the deny-egress NetworkPolicy above and run the smoke tests plus a scripted agent task
+  that calls each enabled tool. Monitor DNS and connection-timeout errors in pod logs; any public
+  hostname in them is a release blocker.
 - **One values file for every environment decision.** Expose registry host, storage class, ingress class,
-  CA bundle, proxy and model endpoint as chart values (Bitnami-style charts use `global.imageRegistry`
-  for the registry). Lint with `helm template` against each customer's values file before shipping.
+  CA bundle, proxy, model endpoint and tool endpoints as chart values (Bitnami-style charts use
+  `global.imageRegistry` for the registry). Lint with `helm template` against each customer's values
+  file before shipping.
+- **Per-model agent evals in the bundle.** Ship the eval set and a runner with the bundle so the customer
+  (or your FDE) can re-run task-completion and tool-call accuracy on their GPUs after install. Track the
+  scores per site and per bundle version.
 - **Mirror relocation with skopeo.** Use `skopeo copy` to move images into an OCI layout for the media,
   then into the customer's mirror, keeping digests unchanged so signatures still verify. Monitor
   signature-verification failures at admission.
 - **Expiry warnings well ahead of the date.** Have the licence and certificate checks log and surface a
   warning weeks before expiry and again during the grace period. Monitor days-to-expiry per site from
   support bundles.
-- **Bounded version support.** Publish how many bundle versions you support at once and require sites
-  to upgrade into that window, so back-ports stay finite. Track the version each site runs.
-- **Expand-then-contract migrations.** Add columns and tables first, remove old ones a release later, so
-  `helm rollback` to the previous chart still finds a schema it understands. Test rollback in CI.
+- **Bounded version support and expand-then-contract migrations.** Publish how many bundle versions you
+  support at once and require sites to upgrade into that window, so back-ports stay finite. Add columns
+  and tables first, remove old ones a release later, so `helm rollback` to the previous chart still
+  finds a schema it understands. Test rollback in CI.
 
 ## Trade-offs
 - **Data custody vs observability.** The customer keeps custody of data and uses their own cloud
-  discounts and controls, but you lose direct observability and fast iteration. Flips toward hosted
-  SaaS plus a strong DPA when the customer has no platform team to operate what you ship.
+  discounts and controls, but you lose direct observability and fast iteration on prompts and tools.
+  Flips toward hosted SaaS plus a strong DPA when the customer has no platform team to operate what you
+  ship.
 - **Control-plane split vs zero egress.** The split keeps upgrades and configuration manageable across
   many customers, but any outbound connection is a review item. Flips to fully self-contained the moment
   the customer's policy forbids egress.
 - **On-prem vs elastic capacity.** On-prem removes cloud dependency and per-token fees, but GPU capacity
-  is fixed on a procurement cycle measured in months. Flips when the workload is bursty or needs
-  frontier-model quality.
+  is fixed on a procurement cycle measured in months, and multi-step agents consume many model calls per
+  task. Flips when the workload is bursty or needs frontier-model quality.
 - **Air-gap isolation vs support speed.** The strongest isolation possible, but every bug fix is a
   physical delivery and bugs surface weeks later through log bundles. Accept it only where mandated,
   and budget support time accordingly.
-- **Open-weight portability vs quality.** Shipping open-weight models makes the product deployable
+- **Open-weight portability vs quality.** Shipping open-weight models makes the agent deployable
   anywhere, but your quality bar must be re-established per shipped model, since the hosted model your
   SaaS uses is not an option inside.
 
@@ -298,6 +371,9 @@ spec:
 - **Runtime downloads.** Model weights from a hub, tokenizer files, `pip install` on start, NLTK or
   tiktoken data. Works in CI, then the pod crash-loops in the customer's cluster with DNS resolution or
   connection-timeout errors for a public hostname. Fix: bundle them and set the offline flags.
+- **A tool that still points outside.** A web-search or SaaS tool left in the registry fails mid-task, and
+  the agent retries or improvises. Symptom: timeouts on one tool and odd answers. Fix: the start-up
+  preflight above, plus removing the tool from the prompt.
 - **Hard-coded registry host, DNS domain or storage class in the chart.** Symptom: `ImagePullBackOff`
   or persistent volume claims stuck in `Pending` on an otherwise healthy cluster. Fix: make them values.
 - **Not trusting the customer's CA.** Every outbound call from your containers fails with a certificate
@@ -305,7 +381,7 @@ spec:
 - **Licence or certificate expiry inside an air gap.** The system stops on a date, nobody can renew
   online, and the customer discovers it during business hours.
 - **Assuming you will have the logs.** Incidents are debugged from screenshots in email until a support
-  bundle command exists and the customer knows how to run it.
+  bundle command exists and the customer knows how to run it. For agents, include redacted traces.
 - **Version sprawl across customers.** Each site is on a different bundle, so a fix must be back-ported
   to several versions; the symptom is a support matrix nobody can keep in their head.
 - **Schema migrations that cannot roll back.** A failed upgrade on-site leaves the customer unable to
@@ -313,12 +389,12 @@ spec:
 
 ## When to use
 - **Customer VPC when** the blocker is data custody within a cloud the customer already runs; it keeps
-  managed model services and most of your operability.
+  managed model services (and a strong tool-calling model) and most of your operability.
 - **On-prem when** the customer has no cloud footprint, needs GPU proximity to their systems or has a
   contractual prohibition on public cloud.
 - **Air-gapped only when** a regulator or classification policy mandates it, and price the support model in.
 - **Measure before committing:** install time per customer, bundle size, number of supported versions,
-  and mean time to deliver a fix.
+  mean time to deliver a fix, and agent eval scores on the shipped model.
 - **Day to day** this shows up as the values file, the bundle pipeline and the support-bundle tool.
 - **Interviews:** list what breaks when the network goes away and how the delivery pipeline changes as a
   result; that is the expected depth.
@@ -354,6 +430,14 @@ observability; fixes arrive as bundles on a schedule, and they must operate the 
 - **Air-gapped:** no network path at all; chosen only when a regulator or classification policy demands
   it, because every update and support exchange becomes physical.
 
+### You are moving a tool-calling agent from your SaaS into a customer's air-gapped site. What changes in the agent itself?
+- **The model:** a hosted frontier model becomes an open-weight model on their GPUs, so re-run the agent
+  eval suite, especially tool-selection and argument accuracy, on exactly that model and precision.
+- **The tools:** public tools (web search, SaaS APIs) are removed or re-pointed at internal services, and
+  the prompt and tool descriptions are re-evaluated for the smaller set.
+- **The operations:** traces go to their collector, a preflight rejects non-internal hosts, and failed
+  runs leave the site only through a redacted support bundle.
+
 ### Your chart installs cleanly in your lab but pods sit in ImagePullBackOff at the customer. How do you debug it?
 - **Read the event first:** `kubectl describe pod` shows which image reference failed and why
   (unreachable host, auth, unknown manifest).
@@ -378,12 +462,13 @@ observability; fixes arrive as bundles on a schedule, and they must operate the 
 - **Quality and hardware:** confirm their GPUs fit the chosen precision and that your eval suite passed
   on exactly that model and precision.
 
-### How can an air-gapped customer verify your artifacts, and why might keyless signing be awkward there?
-- **Hash manifest plus signature:** SHA-256 per file proves integrity; a signature over the manifest
-  proves origin; both check offline with a public key shipped out of band.
-- **Keyless needs more shipped state:** cosign keyless relies on Fulcio certificates and the Rekor log, so
-  offline verification needs the inclusion proof and a current Sigstore trusted root carried in too.
-- **So most sites choose key pairs**, accepting key-rotation work in exchange for simpler verification.
+### An on-prem agent works in your smoke test but fails intermittently on real tasks at the customer. How do you investigate without access?
+- **Get the evidence out:** ask the customer to run the support-bundle command, which carries redacted
+  agent traces, tool error counts and versions, since you cannot log in.
+- **Look for the boundary:** a tool timing out through their proxy, a certificate error from a tool
+  adapter that skipped their CA bundle, or the open-weight model producing malformed tool arguments.
+- **Close the gap:** add the failing case to the bundled eval set and the offline CI gate, then ship a fix
+  bundle.
 
 ## Quiz
 ### Q: Why do many vendors split a customer-VPC deployment into a vendor-hosted control plane and a customer-hosted data plane?
@@ -412,3 +497,26 @@ observability; fixes arrive as bundles on a schedule, and they must operate the 
 > Hashes prove integrity and a signature over the manifest proves origin, and both can be checked
 > offline. A README is unverifiable, a licence file proves entitlement rather than integrity, and a
 > telemetry ping is impossible without a network path.
+
+## Use cases & projects
+### Use cases
+- **Agents for regulated enterprises.** A bank's support agent runs in the bank's VPC, calling Bedrock or
+  Azure OpenAI over a private endpoint and tools on internal APIs, so no record leaves their account.
+- **On-prem document agents.** A hospital's RAG assistant runs open-weight models on the hospital's GPUs,
+  with retrieval over notes that may never reach a public cloud.
+- **Air-gapped analyst agents.** A defence or government site receives the agent, its models and its eval
+  set on media, and sends back only redacted support bundles.
+- **Bring-your-own-cloud agent platforms.** A vendor keeps a control plane for licensing and upgrades
+  while each customer hosts the data plane that runs agent loops and tools.
+
+### Mini project
+**Make a tool-calling agent pass an offline install gate (2-3 hours).**
+- **Goal:** prove a small agent (one model endpoint, two tools, one retrieval step) runs with zero
+  internet access.
+- **Steps:** containerise the agent with weights baked in and `HF_HUB_OFFLINE=1` set; add the host
+  preflight as an init container; deploy it to a local kind or k3s cluster in a namespace with the
+  deny-egress NetworkPolicy; run a scripted task that calls both tools; then add a public web-search tool
+  and watch the preflight fail.
+- **Done when:** the clean install completes the task with no DNS errors for public hosts, the polluted
+  install is refused before the agent starts, and you have a one-page list of every outbound dependency
+  you removed.

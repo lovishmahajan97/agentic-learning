@@ -5,7 +5,8 @@ name: Deterministic replay & reproducibility
 kind: concept
 difficulty: advanced
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/structured-event-streams
@@ -25,6 +26,19 @@ Rerunning an agent does not reproduce it: models sample, providers change, tools
 Reproducibility has three grades: exact replay from recorded effects, best-effort re-execution with pinned
 settings, and statistical reproduction. Deterministic orchestration plus recorded effects keeps exact
 replay always available.
+
+## For agent builders
+- **Why it matters for agents.** A bug report says "step 7 picked the wrong tool", and rerunning gives a
+  different trajectory. Without recorded effects you cannot see what the model saw, and without repeated
+  runs you cannot tell whether a fix helped.
+- **Where it shows up in your stack.** Checkpointing and time-travel features in agent frameworks,
+  workflow-engine replay (Temporal), your event stream as the recording, and eval harnesses that run
+  each task many times.
+- **What you control.** Which calls go through the effect interface (LLM, tools, clock, random), what
+  the recording stores, keys for parallel calls, the code version stamped on each run, sandboxed forks
+  and the N you budget for statistical checks.
+- **What you can skip.** Chasing bit-exact model outputs across providers. Exact replay from recordings
+  plus statistical reproduction answers the questions that matter.
 
 ## Why it exists
 - **The failure you cannot see.** A run fails at 03:00: the agent called the wrong tool at step 7 and
@@ -385,3 +399,24 @@ this recording warn that it predates the change.
 - [ ] Any single successful rerun after the fix
 > Replay reproduces the past and a single rerun is one sample from a stochastic process; only repeated
 > runs measure a change in rate.
+
+## Use cases & projects
+### Use cases
+- **Debugging a production incident.** Replay the recorded run step by step and inspect the exact
+  prompt and tool results behind the bad decision, with no model or tool called.
+- **Testing a fix on the failing tail.** Fork the recording at the step before the mistake, go live
+  with sandboxed tools, and pay only for the divergent steps.
+- **Safe orchestration refactors.** Replaying recorded runs in CI catches code changes that alter the
+  trajectory before they break resumption of in-flight runs.
+- **Release decisions.** Statistical reproduction with an interval shows whether a prompt or model
+  change actually cut the failure rate.
+
+### Mini project
+**Record, replay and fork an agent run (2-3 hours).**
+- **Goal:** make one tool-calling agent fully replayable and use a fork to test a fix.
+- **Steps:** route LLM calls, tool calls, `time.now()` and `uuid4()` through one effect interface keyed
+  by `(step, call_id)`; record a run that makes a mistake; replay it offline; change one line of
+  orchestration and confirm replay refuses; fork at the step before the mistake with a fixed prompt and
+  fake side-effecting tools.
+- **Done when:** replay reproduces the run with zero live calls, the code change raises a
+  non-determinism error, and the fork shows whether the fix changes the decision, run at least 20 times.

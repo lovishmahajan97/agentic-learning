@@ -418,3 +418,24 @@ pre-deploy job with a lock timeout, and each step is compatible with the code st
 > Concurrent builds avoid blocking writes but cannot run in a transaction, while Alembic runs
 > migrations inside one by default on PostgreSQL. The autocommit block commits what came before and
 > runs that statement outside a transaction; it does not change logging or speed.
+
+## Use cases & projects
+### Use cases
+- **New tool, new column.** Adding a JSONB column for a tool's payload ships as a reviewed revision while
+  agent workers keep running.
+- **Embedding-model switches.** Expand-contract adds a second vector column, backfills by re-embedding,
+  then moves reads and drops the old column over three releases.
+- **Vector and lookup indexes on big tables.** `CREATE INDEX CONCURRENTLY` inside an autocommit block
+  builds them without blocking agent writes.
+- **Customer VPC installs.** A linear revision chain lets every customer database upgrade from whatever
+  version it runs today.
+
+### Mini project
+**Expand step for an embedding switch (1-2 hours).**
+- **Goal:** ship the first release of an embedding-model switch on an agent's RAG chunks table.
+- **Steps:** start from a chunks table with one vector column; autogenerate a revision adding a nullable
+  second vector column and review the draft; add a concurrent index build in an autocommit block with a
+  lock timeout; write `downgrade()`; run upgrade, downgrade and upgrade again in CI against a throwaway
+  Postgres with the vector extension.
+- **Done when:** the round trip passes, the old column and existing agent reads still work during the
+  migration, and you have written the plan for the backfill and contract releases.

@@ -424,3 +424,24 @@ on a properly sized volume.
 - [ ] Send the PDF in a header and the options in the body
 > A request body has one encoding. Files require multipart, so metadata must travel as form fields, and
 > a JSON-string field validated with model_validate_json keeps it structured and typed.
+
+## Use cases & projects
+### Use cases
+- **Chat agents with attachments.** A `POST /chat` route takes a message plus files, copies them to object
+  storage in chunks and starts the run with storage keys.
+- **Document Q&A and RAG ingestion.** `POST /documents` persists the file, returns a job id, and a
+  background job parses, chunks and embeds it.
+- **Voice and meeting agents.** Large audio recordings spool to disk, not memory, and a transcription job
+  loads them by key after the request ends.
+- **Vision steps over screenshots.** A tool like `read_document(key)` or a vision call loads image bytes by
+  key, so the agent can revisit them at any step.
+
+### Mini project
+**Attachments that outlive the request (1-2 hours).**
+- **Goal:** a chat endpoint where the agent can read an uploaded PDF several steps after the upload
+  request has returned.
+- **Steps:** accept a message and files as multipart with `UploadFile` and a JSON-string form field;
+  copy each file in chunks to local or object storage while hashing it; start a background agent run with
+  the keys; give the agent a `read_document(key)` tool.
+- **Done when:** the agent quotes the PDF in a later step, a duplicate upload is recognised by its hash,
+  and passing the `UploadFile` object instead of a key reproduces the closed-file error in a test.

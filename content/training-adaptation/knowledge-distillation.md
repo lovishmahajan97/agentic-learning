@@ -444,3 +444,25 @@ least rejection sampling with the teacher as judge.
 - [ ] The teacher must be re-run every epoch
 > Training on teacher trajectories creates exposure bias: at inference the student conditions on its own
 > imperfect prefixes. Sampling from the student and scoring with the teacher trains on exactly that situation.
+
+## Use cases & projects
+### Use cases
+- **Distilling the agent's router.** A frontier model labels real requests with the right sub-agent or
+  tool, and a small student takes over routing at a fraction of the cost per step.
+- **Cheap tool-output summarisers.** Long tool results (search pages, logs, API payloads) are
+  summarised by a distilled student before re-entering the agent's context.
+- **Moving a prototype agent onto self-hosted models.** Teacher trajectories from the frontier
+  prototype, filtered by a verifier, become SFT data for an open model that meets latency or data
+  residency limits.
+- **Student with teacher fallback.** The student handles the common cases and the teacher catches
+  outputs that fail schema or confidence checks, so cost falls without a quality cliff.
+
+### Mini project
+**Distil an agent router with a teacher fallback (2-3 hours).**
+- **Goal:** replace a frontier-model routing step with a small student and measure cost, accuracy and
+  fallback rate.
+- **Steps:** define 4-6 routes; have a teacher model label a few hundred realistic requests and keep
+  only labels that pass a schema check; fine-tune a small model (or train a small classifier) on them;
+  in the agent, call the student first and fall back to the teacher when its output is invalid.
+- **Done when:** a table compares teacher-only and student-plus-fallback on held-out accuracy, fallback
+  rate and estimated cost per 1,000 requests.
