@@ -5,7 +5,8 @@ name: PEFT (LoRA, QLoRA)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - training-adaptation/supervised-fine-tuning
   - training-adaptation/quantization
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-PEFT freezes the base model and trains a few extra parameters. LoRA learns each weight update as two
-thin matrices; QLoRA also stores the base in 4-bit, so one consumer GPU suffices, quality stays close to
-full fine-tuning, and adapters are swappable.
+When prompting cannot make an open model call your tools reliably, PEFT fine-tunes it cheaply: LoRA
+trains two thin matrices per layer, QLoRA keeps the base in 4-bit, so one GPU suffices and each agent or
+tenant gets a swappable adapter.
+
+## For agent builders
+- **Why it matters for agents.** Hosted frontier models usually need no fine-tune. You reach for LoRA
+  when a small self-hosted model must emit your tool-call format, follow your agent's policy or match a
+  customer's tone at a fraction of the frontier price per step.
+- **Where it shows up in your stack.** A `LoraConfig` in PEFT or TRL, an adapter directory in object
+  storage, and multi-adapter serving in vLLM (`--enable-lora`) or SGLang, where one base model serves a
+  different adapter per agent, task or tenant.
+- **What you control.** Which traces you train on (successful trajectories, assistant turns only), the
+  chat template and tool schemas used in training, rank and target modules, the learning rate, and
+  whether the adapter ships merged or unmerged.
+- **What you can skip.** The intrinsic-dimension theory and the NF4 quantile math. Know the
+  16-bytes-per-parameter figure, why B starts at zero, and that adapters are deltas pinned to one base.
 
 ## Why it exists
 - **Full fine-tuning does not fit.** Updating every weight of a 7B model needs on the order of 100 GB of

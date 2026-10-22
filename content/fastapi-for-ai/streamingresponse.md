@@ -5,7 +5,8 @@ name: StreamingResponse
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - fastapi-for-ai/server-sent-events
   - fastapi-for-ai/websockets
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-`StreamingResponse` sends bytes from an iterator as each chunk exists, so users wait for time to first
-token, not the whole generation. Status and headers freeze at the first byte, so mid-stream errors go
-in-band and nothing on the path may buffer.
+An agent run takes many seconds of model calls and tool calls; `StreamingResponse` sends each token or
+step event as it exists, so users see progress at once. Status and headers freeze at the first byte, so
+mid-run errors go in-band and nothing may buffer.
+
+## For agent builders
+- **Why it matters for agents.** A tool-calling loop can take tens of seconds end to end. Without
+  streaming the user stares at a spinner and the load balancer's idle timeout may kill the run; with it
+  they see "searching...", tool results and answer tokens as they happen.
+- **Where it shows up in your stack.** Every agent HTTP endpoint you write in FastAPI: your own loop over
+  a vendor SDK's async stream, or a framework's streaming iterator (LangGraph, the OpenAI Agents SDK and
+  similar expose one) re-emitted as NDJSON or SSE through `StreamingResponse`.
+- **What you control.** The event protocol (typed step, tool, delta, done and error records), validation
+  before the first byte, cancelling the upstream model and tools on disconnect, and buffering on every hop.
+- **What you can skip.** HTTP/2 framing details and chunked-encoding byte formats. Know the ASGI message
+  order, the frozen-headers rule and the proxy buffering trap; that is enough to ship and debug agent streams.
 
 ## Why it exists
 - **The default path buffers.** The handler returns a value, FastAPI serialises it, Starlette sets
@@ -126,21 +139,40 @@ Any component that waits for the whole body destroys the benefit.
 - **Compression middleware** can delay small chunks while it fills a compression window.
 - **Test with `curl -N` against the real ingress**, not just uvicorn on localhost.
 
+### Streaming an agent loop
+An agent response is not one token stream but several phases: model thinks, model asks for a tool, tool
+runs (often silently), model reads the result, model answers. Stream all of them as typed records:
+
+| Record | When it is emitted | What the UI does |
+|---|---|---|
+| `{"type": "step", ...}` | a new loop iteration starts | shows "step 2 of at most 8" |
+| `{"type": "tool_call", ...}` | the model requested a tool | shows "searching orders..." |
+| `{"type": "tool_result", ...}` | the tool returned (summary only) | collapses the spinner |
+| `{"type": "delta", ...}` | answer tokens arrive | appends text |
+| `{"type": "done"}` / `{"type": "error"}` | the run ends | final state, retry button |
+
+- **Tool phases are the silent ones.** A slow search or SQL tool emits nothing, so this is where idle
+  timeouts fire and where heartbeats matter most.
+- **Do not stream raw tool output.** It may hold data the user should not see; send a summary record and
+  keep the full result in the agent's state.
+- **Streamed text cannot be retracted.** If an output guardrail runs after generation, either buffer the
+  final answer behind it or stream it and send a typed retraction the UI honours.
+
 ## Diagram
-Validation happens before the start message; after it, status is frozen and every failure must travel
-in-band as a body chunk.
+Validation happens before the start message; after it, status is frozen and every failure, including a
+failed tool call mid-run, must travel in-band as a body chunk.
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant P as Proxy
     participant A as App
-    participant M as Model SDK
-    C->>P: POST /answer
+    participant M as Model and tools
+    C->>P: POST /agent/run
     P->>A: forward request
     Note over A: auth, quota, validation (can still return 4xx)
     A->>P: http.response.start, status 200 frozen
-    M-->>A: token chunk
+    M-->>A: tool call, then token chunk
     A->>P: http.response.body, more_body True
     P->>C: chunk (only if proxy buffering is off)
     C--xP: client disconnects

@@ -5,7 +5,8 @@ name: Timeouts
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - fastapi-for-ai/shared-httpx-asyncclient
   - fastapi-for-ai/cancellation-on-client-disconnect
