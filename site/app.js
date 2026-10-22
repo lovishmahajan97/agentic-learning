@@ -89,9 +89,10 @@
 
   /* ---------------- state ---------------- */
   const KEY = 'ai-roles-academy.v1';
-  const defaults = () => ({ path: 'all', learned: {}, review: {}, quiz: {}, modquiz: {}, notes: {}, capstone: {}, visits: {}, last: null, days: [], theme: 'light', open: {} });
+  const defaults = () => ({ path: 'all', mastery: {}, mistakes: [], learned: {}, review: {}, quiz: {}, modquiz: {}, notes: {}, capstone: {}, visits: {}, last: null, days: [], theme: 'light', open: {} });
   let S = defaults();
   try { Object.assign(S, JSON.parse(localStorage.getItem(KEY) || '{}')); } catch (e) { }
+  S.mastery = S.mastery || {}; S.mistakes = S.mistakes || [];
   if (!S.themeV2) { S.theme = 'light'; S.themeV2 = true; }   // light is the default look; dark stays one click away
   let saveT; function save() { clearTimeout(saveT); saveT = setTimeout(() => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { } }, 150); }
 
@@ -162,7 +163,29 @@
     else { delete S.learned[t.key]; delete S.review[t.key]; }
     save(); refreshChrome();
   }
-  function topicDot(t) { if (!inPath(t)) return ''; if (isDue(t) && isLearned(t)) return 'due'; if (isLearned(t)) return 'learned'; if (S.visits[t.key]) return 'started'; return ''; }
+  /* ---------------- mastery (evidence, not reading) ---------------- */
+  const LV = ['Not started', 'Understand', 'Implement', 'Evaluate'];
+  const mrec = t => S.mastery[t.key] || {};
+  const mlevel = t => mrec(t).level || 0;
+  function setMastery(t, patch) {
+    const m = Object.assign({}, S.mastery[t.key], patch, { at: now() });
+    let lvl = m.explained ? 1 : 0;
+    if (lvl >= 1 && m.exercise) lvl = 2;
+    if (lvl >= 2 && m.failure && m.testPassed) lvl = 3;
+    m.level = lvl; S.mastery[t.key] = m;
+    if (lvl >= 1) { if (!S.learned[t.key]) S.learned[t.key] = now(); if (!S.review[t.key]) S.review[t.key] = { step: 0, reps: 0, lapses: 0, due: now() + DAY, last: now() }; }
+    save(); refreshChrome(); return lvl;
+  }
+  const openMistakes = () => S.mistakes.filter(x => !x.resolved);
+  function addMistake(t, text, source) {
+    text = String(text || '').trim(); if (!text) return;
+    S.mistakes.unshift({ id: now() + '-' + S.mistakes.length, key: t.key, text, source: source || 'note', at: now(), resolved: false });
+    const r = S.review[t.key] || { step: 0, reps: 0, lapses: 0 }; r.due = Math.min(r.due || Infinity, now() + DAY); r.step = 0; S.review[t.key] = r;
+    save(); refreshChrome();
+  }
+  function masteryCounts(ts) { const c = [0, 0, 0, 0]; ts.forEach(t => c[mlevel(t)]++); return c; }
+
+  function topicDot(t) { if (!inPath(t)) return ''; if (isDue(t) && isLearned(t)) return 'due'; const lv = mlevel(t); if (lv) return 'm' + lv; if (isLearned(t)) return 'learned'; if (S.visits[t.key]) return 'started'; return ''; }
   function modProgress(m) { const ts = m.topics.filter(inPath); const done = ts.filter(isLearned).length; return { done, total: ts.length, pct: ts.length ? Math.round(100 * done / ts.length) : 0 }; }
   function touchDay() { const d = new Date().toISOString().slice(0, 10); if (!S.days.includes(d)) { S.days.push(d); S.days = S.days.slice(-400); save(); } }
   function streak() { const set = new Set(S.days); let n = 0; const d = new Date(); for (; ;) { const k = d.toISOString().slice(0, 10); if (set.has(k)) { n++; d.setDate(d.getDate() - 1); } else break; } return n; }
@@ -205,6 +228,7 @@
   }
   function refreshChrome() {
     const n = dueTopics().length; const c = $('#dueCount'); c.textContent = n; c.classList.toggle('zero', n === 0);
+    const mcnt = $('#mistakeCount'); if (mcnt) { const k = openMistakes().length; mcnt.textContent = k; mcnt.classList.toggle('zero', k === 0); }
     tree.querySelectorAll('a[data-key]').forEach(a => { const t = topics.get(a.dataset.key); const d = a.querySelector('.dot'); if (t && d) d.className = 'dot ' + topicDot(t); });
     tree.querySelectorAll('.mod').forEach(el => { const m = modById.get(el.dataset.mod); if (!m) return; const p = modProgress(m); el.querySelector('.mod-count').textContent = `${p.done}/${p.total}`; el.querySelector('.mod-bar i').style.width = p.pct + '%'; });
   }
@@ -244,6 +268,8 @@
     const ts = flat.filter(inPath); const learned = ts.filter(isLearned).length; const due = dueTopics().length;
     const last = S.last && topics.get(S.last);
     const nextUp = ts.filter(t => !isLearned(t) && topicStatus(t) === 'core' && t.status === 'ok').slice(0, 6);
+    const mc = masteryCounts(ts);
+    const weak = modules.map(m => ({ m, n: S.mistakes.filter(x => !x.resolved && x.key.startsWith(m.id + '/')).length })).filter(x => x.n).sort((a, b) => b.n - a.n).slice(0, 4);
     const quizzes = Object.values(S.quiz); const quizAvg = quizzes.length ? Math.round(100 * quizzes.reduce((a, q) => a + q.best / q.of, 0) / quizzes.length) : null;
     const okCount = D.meta.ok_count != null ? D.meta.ok_count : flat.filter(t => t.status === 'ok').length;
     let html = `<div class="page">
@@ -254,9 +280,11 @@
         <ol class="stage-strip">${STAGES.map(s => `<li style="--st: var(--s${s.n}); --st2: var(--s${s.n}b)"><a href="#stage-${s.id}"><span class="stage-n">${s.n}</span>${esc(s.title)}</a></li>`).join('')}</ol>
       </div>
       <div class="stats">
-        <div class="stat"><div class="label">Learned</div><div class="value">${learned}<span class="muted" style="font-size:16px;font-weight:400"> / ${ts.length}</span></div><div class="sub">${fmtMin(minutesLeft(ts))} of reading left · at <select id="pace" class="pace">${[1, 2, 3, 5, 8].map(n => `<option value="${n}" ${(S.pace || 3) == n ? 'selected' : ''}>${n}</option>`).join('')}</select>/day, done by <b>${paceDate(ts.length - learned)}</b></div><div class="bar"><i style="width:${ts.length ? 100 * learned / ts.length : 0}%"></i></div></div>
+        <div class="stat"><div class="label">Mastery</div><div class="value">${mc[1] + mc[2] + mc[3]}<span class="muted" style="font-size:16px;font-weight:400"> / ${ts.length}</span></div><div class="sub mastery-split"><span class="lv1">${mc[1]} understand</span> · <span class="lv2">${mc[2]} implement</span> · <span class="lv3">${mc[3]} evaluate</span></div><div class="bar"><i style="width:${ts.length ? 100 * (mc[1] + mc[2] + mc[3]) / ts.length : 0}%"></i></div></div>
+        <div class="stat"><div class="label">Read</div><div class="value">${learned}<span class="muted" style="font-size:16px;font-weight:400"> / ${ts.length}</span></div><div class="sub">${fmtMin(minutesLeft(ts))} of reading left · at <select id="pace" class="pace">${[1, 2, 3, 5, 8].map(n => `<option value="${n}" ${(S.pace || 3) == n ? 'selected' : ''}>${n}</option>`).join('')}</select>/day, done by <b>${paceDate(ts.length - learned)}</b></div><div class="bar"><i style="width:${ts.length ? 100 * learned / ts.length : 0}%"></i></div></div>
         <div class="stat"><div class="label">Due for review</div><div class="value">${due}</div><div class="sub">${due ? '<a href="#review">Start a review session</a>' : 'Nothing due right now'}</div></div>
         <div class="stat"><div class="label">Streak</div><div class="value">${streak()}<span class="muted" style="font-size:16px;font-weight:400"> days</span></div><div class="sub">${S.days.length} study days total</div></div>
+        <div class="stat"><div class="label">Open mistakes</div><div class="value">${openMistakes().length}</div><div class="sub">${openMistakes().length ? '<a href="#mistakes">Work through them</a>' : 'Log what you get wrong'}</div></div>
         <div class="stat"><div class="label">Quiz accuracy</div><div class="value">${quizAvg == null ? '–' : quizAvg + '%'}</div><div class="sub">${quizzes.length} topic quizzes taken</div></div>
       </div>`;
     if (okCount < TOTAL) html += `<div class="banner">Lessons are still being generated: ${okCount} of ${TOTAL} are ready. Topics without a lesson appear greyed out in the curriculum.</div>`;
@@ -266,11 +294,20 @@
           <div style="margin-top:10px;display:flex;justify-content:space-between;align-items:center"><span class="eyebrow">Next up in the track</span><button class="btn sm" id="randomBtn">Random lesson</button></div>
           <ul class="next-list" style="margin-top:6px">${nextUp.map(t => `<li><a href="#t.${t.module}.${t.id}"><span>${esc(t.name)}<div class="sub">${esc(t.moduleTitle)}</div></span><span class="muted mono" style="font-size:12px">${t.est_minutes || 12} min</span></a></li>`).join('') || '<li class="muted">Everything in the track is learned.</li>'}</ul>
         </div>
-        <div class="card"><h3>How this works</h3>
-          <div class="prose" style="font-size:15px">
-            <p><strong>Read</strong> a lesson top to bottom: the forcing problem, the mechanism, a concrete example, trade-offs and pitfalls. <strong>Check yourself</strong> with the interview question before revealing the answer, then <strong>take the quiz</strong>. Three correct answers marks the lesson learned and schedules it for review.</p>
+        <div class="card"><h3>A study session</h3>
+          <ol class="session-steps">
+            <li><b>Learn one concept</b> or a small group of closely related ones.</li>
+            <li><b>Close the lesson and explain it</b> from memory in Prove it, then compare.</li>
+            <li><b>Do the exercise</b> without following a solution line by line.</li>
+            <li><b>Break it on purpose:</b> investigate one failure or edge case.</li>
+            <li><b>Log what you got wrong</b> and what is still unclear.</li>
+            <li><b>Come back later</b> through the review queue and new questions.</li>
+          </ol>
+          ${weak.length ? `<div class="eyebrow" style="margin-top:12px">Weak areas</div><ul class="next-list" style="margin-top:6px">${weak.map(w => `<li><a href="#m.${w.m.id}"><span>${esc(w.m.title)}</span><span class="pill warn">${w.n} open</span></a></li>`).join('')}</ul>` : ''}
+          <div class="prose" style="font-size:15px;margin-top:12px">
+            <p>Progress here is <strong>mastery</strong>, not lessons read: <b>Understand</b> (explain it), <b>Implement</b> (build it), <b>Evaluate</b> (diagnose failures, solve a new problem). The quiz is only a knowledge check.</p>
             <p><strong>Interview drill</strong> shuffles the check questions of a module or the whole track so you can rehearse reasoning out loud. The <strong>review queue</strong> uses expanding intervals (1, 3, 7, 14, 30, 60, 120 days). Grade yourself honestly; a miss resets the interval. Each module ends with a <strong>capstone</strong> you can build and a <strong>module quiz</strong> drawn from all its lessons.</p>
-            <p>Keys: <span class="kbd">/</span> search · <span class="kbd">n</span> / <span class="kbd">p</span> next / previous lesson · <span class="kbd">l</span> mark learned.</p>
+            <p>Keys: <span class="kbd">/</span> search · <span class="kbd">n</span> / <span class="kbd">p</span> next / previous lesson · <span class="kbd">l</span> mark read.</p>
           </div>
         </div>
       </div>`;
@@ -313,7 +350,7 @@
         <div class="topic-meta">${pillTier(m.tier)}<span class="pill">${ROLE_FOR_TIER[m.tier]}</span><span class="pill">${m.topics.length} lessons</span><span class="pill">${fmtMin(m.topics.reduce((a, t) => a + (t.est_minutes || 12), 0))} total</span></div>
         <h1>${esc(m.title)}</h1>
         <div class="bar tier-${m.tier}"><i style="width:${p.pct}%"></i></div>
-        <div class="muted">${p.done} of ${p.total} learned${S.modquiz[mid] ? ` · best module quiz ${S.modquiz[mid].best}/${S.modquiz[mid].of}` : ''}</div>
+        <div class="muted">${(() => { const c = masteryCounts(m.topics); return `Mastery: ${c[1]} understand · ${c[2]} implement · ${c[3]} evaluate`; })()} · ${p.done} of ${p.total} read${S.modquiz[mid] ? ` · best module quiz ${S.modquiz[mid].best}/${S.modquiz[mid].of}` : ''}</div>
         <div class="btn-row"><a class="btn primary" href="#t.${m.id}.${first.id}">${p.done ? 'Continue module' : 'Start module'}</a><a class="btn" href="#q.${m.id}">Module quiz</a><a class="btn" href="#drill.${m.id}">Interview drill</a></div>
       </div>`;
     if (intro) {
@@ -329,6 +366,8 @@
         <span class="meta">${t.kind ? `<span class="pill">${esc(t.kind)}</span>` : ''}<span>${t.est_minutes || 12} min</span></span>${intro && intro.order_reasons && intro.order_reasons[t.id] ? `<span class="reason">${mdi(intro.order_reasons[t.id])}</span>` : ''}</a></li>`; }).join('')}</ol></section>`;
     if (intro && intro.capstone) {
       const cs = S.capstone[mid] || {};
+      const cps = flat.filter(x => x.mastery && x.mastery.milestones && x.mastery.milestones.some(ms => ms.after === m.id));
+      if (cps.length) html += `<section class="section" id="checkpoints"><h2>Project checkpoints unlocked here</h2><ul class="checkpoint-list">${cps.flatMap(x => x.mastery.milestones.filter(ms => ms.after === m.id).map(ms => `<li><a href="#t.${x.module}.${x.id}"><span class="cp-proj">${esc(x.name)}</span><span>${esc(ms.title)}</span></a></li>`)).join('')}</ul></section>`;
       html += `<section class="section" id="major"><h2>Major project</h2><div class="prose">${md(intro.capstone.brief)}</div>
         <h3 style="margin:18px 0 8px">Deliverables</h3><ul class="checklist">${intro.capstone.deliverables.map((d, i) => `<li><label class="${cs[i] ? 'done' : ''}"><input type="checkbox" data-cap="${i}" ${cs[i] ? 'checked' : ''}><span>${mdi(d)}</span></label></li>`).join('')}</ul>
         <h3 style="margin:18px 0 8px">Rubric</h3><ul class="list-cards">${intro.capstone.rubric.map((r, i) => `<li><span class="mark">${i + 1}</span><span>${mdi(r)}</span></li>`).join('')}</ul></section>`;
@@ -352,7 +391,9 @@
         <div class="topic-meta">${pillRel(t.agent_relevance)}${pillTier(m.tier)}${t.kind ? `<span class="pill">${esc(t.kind)}</span>` : ''}${t.difficulty ? `<span class="pill">${esc(t.difficulty)}</span>` : ''}<span class="pill">${t.est_minutes || 12} min</span>${t.caveat ? `<span class="pill caveat" title="${esc(t.caveat)}">caveated</span>` : ''}${pillStatus(st)}${st === 'skip' ? '<span class="pill">not on your path</span>' : ''}</div>
         <h1>${esc(t.name)}</h1>
         <div class="topic-actions">
-          <button class="btn ${learned ? 'good' : 'primary'}" id="learnBtn">${learned ? '✓ Learned' : 'Mark as learned'}</button>
+          <button class="btn ${learned ? 'good' : 'primary'}" id="learnBtn">${learned ? '✓ Read' : 'Mark as read'}</button>
+          <a class="mastery-chip lv${mlevel(t)}" href="#s-prove" id="mchip">Mastery: <b>${LV[mlevel(t)]}</b>${t.mastery && t.mastery.level ? ` · target ${t.mastery.level}` : ''}</a>
+          ${t.mastery && t.mastery.code_tested ? `<span class="pill" title="Whether this lesson's code examples were executed">code tested: ${esc(t.mastery.code_tested)}</span>` : ''}
           ${rec ? `<span class="muted" style="font-size:13px">${rec.due <= now() ? 'Due for review now' : 'Next review ' + new Date(rec.due).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</span>` : ''}
         </div>
       </div>`;
@@ -367,8 +408,9 @@
       ['example', t.format === 'crisp' ? 'Examples' : 'Example', md(t.example)],
       ...((t.patterns && t.patterns.length) ? [['patterns', 'Production patterns', `<ul class="list-cards patterns">${t.patterns.map(b => `<li><span class="mark">▸</span><span>${mdi(b)}</span></li>`).join('')}</ul>`]] : []),
       ['tradeoffs', 'Trade-offs', `<ul class="list-cards tradeoffs">${(t.tradeoffs || []).map(b => `<li><span class="mark">⇄</span><span>${mdi(b)}</span></li>`).join('')}</ul>`],
-      ['pitfalls', 'Pitfalls', `<ul class="list-cards pitfalls">${(t.pitfalls || []).map(b => `<li><span class="mark">!</span><span>${mdi(b)}</span></li>`).join('')}</ul>`],
+      ['pitfalls', t.exercise ? 'Failure modes' : 'Pitfalls', `<ul class="list-cards pitfalls">${(t.pitfalls || []).map(b => `<li><span class="mark">!</span><span>${mdi(b)}</span></li>`).join('')}</ul>`],
       ['when', 'When to use', md(t.when)],
+      ...(t.exercise ? [['exercise', 'Exercise', `<div class="exercise-box"><div class="proj-head">Do it yourself <span class="pill">no solution given</span></div><div class="prose">${md(t.exercise)}</div></div>`]] : []),
       ['lens', 'Role lens', `<div class="lens">${['engineer', 'architect', 'fde'].map(r => `<div><b>${ROLE[r]}</b>${mdi((t.role_lens || {})[r] || '')}</div>`).join('')}</div>`],
     ];
     const related = (t.related || []).map(k => topics.get(k)).filter(Boolean);
@@ -377,6 +419,7 @@
       ${t.status === 'invalid' ? `<div class="banner">This lesson failed validation and may be incomplete.<pre style="font-size:12px;white-space:pre-wrap">${esc((t.errors || []).join('\n'))}</pre></div>` : ''}
       ${t.caveat ? `<div class="banner">Caveat: ${esc(t.caveat)}.</div>` : ''}
       <div class="tldr"><div class="eyebrow">In one breath</div><div class="prose">${md(t.tldr)}</div></div>
+      ${t.mastery && t.mastery.prerequisites && t.mastery.prerequisites.length ? `<div class="prereq"><span class="prereq-head">Know these first</span>${t.mastery.prerequisites.map(k => topics.get(k)).filter(Boolean).map(r => `<a class="chip" href="#t.${r.module}.${r.id}"><span class="dot ${topicDot(r)}"></span>${esc(r.name)}<span class="sub">${LV[mlevel(r)]}</span></a>`).join('')}</div>` : ''}
       ${t.agent ? `<div class="agent-box"><div class="agent-box-head"><span class="agent-glyph" aria-hidden="true"></span><span>For agent builders</span>${pillRel(t.agent_relevance)}</div><div class="prose">${md(t.agent)}</div></div>` : ''}
       ${secs.map(([id, title, body], i) => `<section class="section" id="s-${id}"><h2><span class="num">${String(i + 1).padStart(2, '0')}</span>${title}</h2>${body.startsWith('<ul') || body.startsWith('<div') ? body : `<div class="prose">${body}</div>`}</section>`).join('')}
       ${related.length ? `<section class="section" id="s-related"><h2><span class="num">${pad2(secs.length + 1)}</span>Related lessons</h2><div class="chips">${related.map(r => `<a class="chip" href="#t.${r.module}.${r.id}"><span class="dot ${topicDot(r)}"></span>${esc(r.name)}<span class="sub">${esc(r.moduleTitle)}</span></a>`).join('')}</div></section>` : ''}
@@ -386,6 +429,7 @@
         <div class="ivq-list">${ivq.map((x, xi) => `<details class="ivq"><summary><span class="ivq-n">Q${xi + 1}</span><span>${mdi(x.q)}</span></summary><div class="prose">${md(x.a)}</div></details>`).join('')}</div>
         <div class="btn-row" style="margin-top:12px"><button class="btn sm" id="ivqAll">Expand all answers</button></div></section>` : ''}
       <section class="section" id="s-quiz"><h2><span class="num">${pad2(secs.length + (ivq.length ? 4 : 3))}</span>Quiz</h2><div class="quiz" id="quiz">${(t.quiz || []).map((q, qi) => `<div class="qcard" data-q="${qi}"><div class="q"><span class="n">Q${qi + 1}</span>${mdi(q.q)}</div><div class="opts">${q.options.map((o, oi) => `<button class="opt" data-o="${oi}"><span class="k">${'ABCD'[oi]}</span><span>${mdi(o)}</span></button>`).join('')}</div><div class="expl" hidden></div></div>`).join('')}<div id="quizResult"></div></div></section>
+      ${proveIt(t, secs.length + (ivq.length ? 5 : 4))}
       ${t.projects && (t.projects.use_cases || t.projects.mini_project) ? `<section class="section" id="s-projects"><h2><span class="num">${pad2(secs.length + (ivq.length ? 5 : 4))}</span>Use cases &amp; projects</h2>
         <div class="proj-grid"><div class="proj-card proj-uses"><div class="proj-head">Use cases</div><div class="prose">${md(t.projects.use_cases)}</div></div>
         <div class="proj-card proj-mini"><div class="proj-head">Mini project <span class="pill">1-3 hours</span></div><div class="prose">${md(t.projects.mini_project)}</div></div></div>
@@ -396,7 +440,7 @@
     </article>
     <aside class="toc"><div class="toc-title">On this page</div>
       ${secs.map(([id, title]) => `<a href="#s-${id}" data-toc="s-${id}">${title}</a>`).join('')}
-      <a href="#s-check" data-toc="s-check">Check yourself</a>${ivq.length ? '<a href="#s-interview" data-toc="s-interview">Interview questions</a>' : ''}<a href="#s-quiz" data-toc="s-quiz">Quiz</a>${t.projects ? '<a href="#s-projects" data-toc="s-projects">Use cases &amp; projects</a>' : ''}
+      <a href="#s-check" data-toc="s-check">Check yourself</a>${ivq.length ? '<a href="#s-interview" data-toc="s-interview">Interview questions</a>' : ''}<a href="#s-quiz" data-toc="s-quiz">Quiz</a><a href="#s-prove" data-toc="s-prove">Prove it</a>${t.projects ? '<a href="#s-projects" data-toc="s-projects">Use cases &amp; projects</a>' : ''}
       <div class="toc-side"><div class="toc-title">Module</div><a href="#m.${m.id}" style="border:0;padding-left:0">${esc(m.title)} →</a><div class="bar tier-${m.tier}"><i style="width:${modProgress(m).pct}%"></i></div><div class="muted" style="font-size:12px">${modProgress(m).done}/${modProgress(m).total} learned</div></div>
     </aside></div>`;
     main.innerHTML = html;
@@ -407,6 +451,54 @@
     main.querySelectorAll('.toc a[data-toc]').forEach(a => a.onclick = e => { e.preventDefault(); const el = document.getElementById(a.dataset.toc); if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' }); });
     const notes = $('#notes'); let nt; notes.oninput = () => { clearTimeout(nt); nt = setTimeout(() => { if (notes.value.trim()) S.notes[key] = notes.value; else delete S.notes[key]; save(); }, 300); };
     bindQuiz(t);
+    bindProve(t);
+  }
+  function splitTest(md_) {
+    const s = String(md_ || ''); const i = s.search(/\*\*A strong answer/i);
+    return i < 0 ? { problem: s, rubric: '' } : { problem: s.slice(0, i).trim(), rubric: s.slice(i).trim() };
+  }
+  function proveIt(t, n) {
+    const m = mrec(t), tst = splitTest(t.mastery_test);
+    const step = (k, lv, title, body) => `<div class="prove-step ${mlevel(t) >= lv ? 'done' : ''}" data-step="${k}"><div class="prove-head"><span class="prove-n">${lv}</span><span>${title}</span><span class="prove-state">${mlevel(t) >= lv ? '✓ ' + LV[lv] : ''}</span></div>${body}</div>`;
+    return `<section class="section" id="s-prove"><h2><span class="num">${pad2(n)}</span>Prove it</h2>
+      <p class="muted prove-lede">Reading and the quiz are not mastery. Each level needs evidence: explain it from memory, implement it without copying, then diagnose a failure and solve a new problem.</p>
+      <div class="prove">
+      ${step('understand', 1, 'Understand: explain it from memory', `<textarea id="pvExplain" placeholder="Without scrolling up: what problem does this solve, how does it work, and when would you not use it?">${esc(m.explain || '')}</textarea>
+        <div class="btn-row"><button class="btn sm" id="pvCompare">Compare with the lesson</button></div>
+        <div id="pvKey" class="prove-key" hidden><div class="prose">${md(t.tldr)}</div>${t.check ? `<div class="prose" style="margin-top:10px">${md(t.check.a)}</div>` : ''}
+          <div class="btn-row"><button class="btn good sm" id="pvGot">I explained it correctly</button><button class="btn sm" id="pvMissed">I missed something</button></div></div>`)}
+      ${step('implement', 2, 'Implement: build it without copying', `<label class="prove-check"><input type="checkbox" id="pvEx" ${m.exercise ? 'checked' : ''}> I completed ${t.exercise ? 'the Exercise' : 'the mini project'} myself, without following a solution line by line</label>
+        <input id="pvLink" class="prove-input" placeholder="Link to your code or notes (optional)" value="${esc(m.link || '')}">`)}
+      ${step('evaluate', 3, 'Evaluate: diagnose and transfer', `<textarea id="pvFail" placeholder="A failure you reproduced or diagnosed: what broke, how you found it, how you fixed it.">${esc(m.failure || '')}</textarea>
+        ${tst.problem ? `<div class="prove-test"><div class="proj-head">Mastery test</div><div class="prose">${md(tst.problem)}</div>
+          <textarea id="pvAnswer" placeholder="Your answer, before looking at the rubric">${esc(m.answer || '')}</textarea>
+          <div class="btn-row"><button class="btn sm" id="pvRubric">Reveal the strong answer</button></div>
+          <div id="pvRub" class="prove-key" hidden><div class="prose">${md(tst.rubric)}</div><div class="btn-row"><button class="btn good sm" id="pvPass">My answer covered it</button><button class="btn sm" id="pvFailTest">It did not</button></div></div></div>`
+          : `<label class="prove-check"><input type="checkbox" id="pvPassBox" ${m.testPassed ? 'checked' : ''}> I applied this to a new problem and could justify my choices</label>`}`)}
+      <div class="prove-step mistakes-step"><div class="prove-head"><span class="prove-n">!</span><span>Mistake log</span><span class="prove-state">${S.mistakes.filter(x => x.key === t.key && !x.resolved).length} open</span></div>
+        <div class="btn-row" style="flex-wrap:nowrap"><input id="pvMistake" class="prove-input" placeholder="What I got wrong or what is still unclear"><button class="btn sm" id="pvAddMistake">Log it</button></div>
+        <ul class="mlist">${S.mistakes.filter(x => x.key === t.key).slice(0, 6).map(x => `<li class="${x.resolved ? 'resolved' : ''}">${esc(x.text)} <span class="sub">${new Date(x.at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} · ${esc(x.source)}</span></li>`).join('')}</ul>
+        <a href="#mistakes" class="muted" style="font-size:13px">All mistakes →</a></div>
+      </div></section>`;
+  }
+  function bindProve(t) {
+    const sec = $('#s-prove'); if (!sec) return;
+    const refresh = () => { const lv = mlevel(t); const c = $('#mchip'); if (c) { c.className = 'mastery-chip lv' + lv; c.querySelector('b').textContent = LV[lv]; }
+      sec.querySelectorAll('.prove-step[data-step]').forEach((el, i) => { const done = lv >= i + 1; el.classList.toggle('done', done); el.querySelector('.prove-state').textContent = done ? '✓ ' + LV[i + 1] : ''; }); };
+    const deb = (el, fn) => { let h; el.oninput = () => { clearTimeout(h); h = setTimeout(fn, 300); }; };
+    deb($('#pvExplain'), () => setMastery(t, { explain: $('#pvExplain').value }));
+    $('#pvCompare').onclick = () => { if (!$('#pvExplain').value.trim()) { toast('Write your explanation first'); $('#pvExplain').focus(); return; } $('#pvKey').hidden = false; };
+    $('#pvGot').onclick = () => { setMastery(t, { explained: true }); refresh(); toast('Understand: recorded'); };
+    $('#pvMissed').onclick = () => { $('#pvMistake').value = 'Explain-back: '; $('#pvMistake').focus(); };
+    $('#pvEx').onchange = () => { if ($('#pvEx').checked && !mrec(t).explained) { toast('First explain it from memory (step 1)'); } setMastery(t, { exercise: $('#pvEx').checked }); refresh(); };
+    deb($('#pvLink'), () => setMastery(t, { link: $('#pvLink').value }));
+    deb($('#pvFail'), () => { setMastery(t, { failure: $('#pvFail').value.trim() }); refresh(); });
+    const ans = $('#pvAnswer'); if (ans) deb(ans, () => setMastery(t, { answer: ans.value }));
+    const rb = $('#pvRubric'); if (rb) rb.onclick = () => { if (!ans.value.trim()) { toast('Answer first, then compare'); ans.focus(); return; } $('#pvRub').hidden = false; };
+    const ps = $('#pvPass'); if (ps) ps.onclick = () => { setMastery(t, { testPassed: true }); refresh(); toast(mlevel(t) >= 3 ? 'Evaluate: recorded' : 'Test passed; log a diagnosed failure to reach Evaluate'); };
+    const pf = $('#pvFailTest'); if (pf) pf.onclick = () => { setMastery(t, { testPassed: false }); addMistake(t, 'Mastery test: answer missed parts of the strong answer', 'mastery test'); refresh(); toast('Logged; it will come back in review'); };
+    const pb = $('#pvPassBox'); if (pb) pb.onchange = () => { setMastery(t, { testPassed: pb.checked }); refresh(); };
+    $('#pvAddMistake').onclick = () => { const v = $('#pvMistake').value; if (!v.trim()) return; addMistake(t, v, 'note'); $('#pvMistake').value = ''; renderTopic(t.key); location.hash = '#t.' + t.module + '.' + t.id; setTimeout(() => { const s = $('#s-prove'); if (s) s.scrollIntoView(); }, 50); toast('Logged · review tomorrow'); };
   }
   function pager(prev, next, m, nextMod) {
     return `<nav class="pager">${prev ? `<a class="prev" href="#t.${m.id}.${prev.id}"><span class="eyebrow">← Previous</span><span>${esc(prev.name)}</span></a>` : '<span></span>'}
@@ -414,7 +506,7 @@
   }
   function bindLearn(t) {
     const b = $('#learnBtn'); if (!b) return;
-    b.onclick = () => { const on = !isLearned(t); setLearned(t, on); b.className = 'btn ' + (on ? 'good' : 'primary'); b.textContent = on ? '✓ Learned' : 'Mark as learned'; toast(on ? 'Marked learned · review tomorrow' : 'Unmarked'); };
+    b.onclick = () => { const on = !isLearned(t); setLearned(t, on); b.className = 'btn ' + (on ? 'good' : 'primary'); b.textContent = on ? '✓ Read' : 'Mark as read'; toast(on ? 'Marked read · prove it below to build mastery' : 'Unmarked'); };
   }
   function bindQuiz(t) {
     const box = $('#quiz'); if (!box) return;
@@ -434,10 +526,10 @@
     const prev = S.quiz[t.key] || { best: 0, attempts: 0, of };
     S.quiz[t.key] = { best: Math.max(prev.best, score), last: score, attempts: prev.attempts + 1, of, at: now() };
     const perfect = score === of;
-    if (perfect) { if (!isLearned(t)) { S.learned[t.key] = now(); } schedule(t.key, 1); } else if (isLearned(t)) { schedule(t.key, 0); }
+    if (!perfect) { (t.quiz || []).forEach((q, qi) => { const card = document.querySelector(`#quiz .qcard[data-q="${qi}"]`); if (card && card.querySelector('.opt.wrong')) addMistake(t, 'Quiz: ' + q.q.replace(/[*`]/g, ''), 'quiz'); }); }
+    else if (S.review[t.key]) schedule(t.key, 1);
     save(); refreshChrome();
-    const r = $('#quizResult'); r.innerHTML = `<div class="quiz-result ${perfect ? 'good' : 'warn'}">${score}/${of} correct. ${perfect ? 'Marked learned; next review ' + new Date(S.review[t.key].due).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + '.' : 'Re-read the sections behind the misses, then try again later.'}</div>`;
-    const b = $('#learnBtn'); if (b && isLearned(t)) { b.className = 'btn good'; b.textContent = '✓ Learned'; }
+    const r = $('#quizResult'); r.innerHTML = `<div class="quiz-result ${perfect ? 'good' : 'warn'}">${score}/${of} correct. This is a knowledge check, not mastery. ${perfect ? 'Now prove it: explain it from memory and do the exercise below.' : 'The misses are in your mistake log and will come back in review.'}</div>`;
   }
 
   function renderModuleQuiz(mid) {
@@ -548,6 +640,17 @@
       <div class="results">${scored.map(({ t }) => `<a class="result" href="#t.${t.module}.${t.id}"><div class="where">${esc(t.moduleTitle)} · Tier ${t.tier}${inPath(t) ? '' : ' · not on your path'}${t.status !== 'ok' ? ' · not generated yet' : ''}</div><div><span class="dot ${topicDot(t)}" style="display:inline-block;margin-right:8px"></span><strong>${hi(t.name)}</strong></div>${t.tldr ? `<div class="snip">${hi(snip(t))}</div>` : ''}</a>`).join('') || '<div class="empty">No matches. Try a shorter or different term.</div>'}</div></div>`;
   }
 
+  function renderMistakes() {
+    touchDay();
+    const all = S.mistakes; const open = all.filter(x => !x.resolved);
+    main.innerHTML = `<div class="page-narrow"><div class="crumbs"><a href="#dashboard">Home</a><i>›</i><span>Mistake log</span></div>
+      <h1>Mistake log</h1><p class="lede">What you got wrong and what is still unclear. Each entry pulls its lesson back into review. Resolve an entry only when you can now explain or do it correctly.</p>
+      ${all.length ? `<ul class="mistake-page">${all.map(x => { const t = topics.get(x.key); return `<li class="${x.resolved ? 'resolved' : ''}"><label><input type="checkbox" data-mid="${esc(x.id)}" ${x.resolved ? 'checked' : ''}> <span>${esc(x.text)}</span></label><span class="sub">${t ? `<a href="#t.${t.module}.${t.id}">${esc(t.name)}</a> · ${esc(t.moduleTitle)}` : esc(x.key)} · ${esc(x.source)} · ${new Date(x.at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</span></li>`; }).join('')}</ul>`
+        : '<div class="empty">No mistakes logged yet. Wrong quiz answers, missed mastery tests and anything you add in a lesson\'s Prove it section land here.</div>'}
+      <p class="muted" style="margin-top:14px">${open.length} open · ${all.length - open.length} resolved</p></div>`;
+    main.querySelectorAll('[data-mid]').forEach(cb => cb.onchange = () => { const x = S.mistakes.find(y => y.id === cb.dataset.mid); if (x) { x.resolved = cb.checked; x.resolvedAt = now(); save(); refreshChrome(); cb.closest('li').classList.toggle('resolved', cb.checked); } });
+  }
+
   function renderSettings() {
     const json = JSON.stringify(S);
     main.innerHTML = `<div class="page-narrow settings"><div class="crumbs"><a href="#dashboard">Home</a><i>›</i><span>Settings</span></div><h1>Settings</h1>
@@ -561,7 +664,7 @@
       <section class="section"><h2>About</h2><div class="prose" style="font-size:15px"><p>Built from the AI Roles Skills Taxonomy (Nugen IT Services, Oct 20 2026). ${TOTAL} lessons across 30 modules; data built ${esc(D.meta.built_at || '')}.</p></div></section></div>`;
     main.querySelectorAll('[data-theme]').forEach(b => b.onclick = () => { S.theme = b.dataset.theme; save(); applyTheme(); renderSettings(); });
     $('#copyBtn').onclick = async () => { const box = $('#exportBox'); try { await navigator.clipboard.writeText(box.value); toast('Copied'); } catch (e) { box.select(); toast('Select and copy manually'); } };
-    $('#importBtn').onclick = () => { try { const inc = JSON.parse($('#importBox').value); ['learned', 'review', 'quiz', 'modquiz', 'notes', 'capstone', 'visits', 'open'].forEach(k => { if (inc[k]) S[k] = Object.assign({}, S[k], inc[k]); }); if (inc.days) S.days = [...new Set([...(S.days || []), ...inc.days])].sort(); if (inc.path) S.path = inc.path; save(); renderTree(); refreshChrome(); toast('Imported'); renderSettings(); } catch (e) { toast('That is not valid progress JSON'); } };
+    $('#importBtn').onclick = () => { try { const inc = JSON.parse($('#importBox').value); ['learned', 'review', 'quiz', 'modquiz', 'notes', 'capstone', 'visits', 'open', 'mastery'].forEach(k => { if (inc[k]) S[k] = Object.assign({}, S[k], inc[k]); }); if (Array.isArray(inc.mistakes)) { const ids = new Set(S.mistakes.map(x => x.id)); inc.mistakes.forEach(x => { if (!ids.has(x.id)) S.mistakes.push(x); }); } if (inc.days) S.days = [...new Set([...(S.days || []), ...inc.days])].sort(); if (inc.path) S.path = inc.path; save(); renderTree(); refreshChrome(); toast('Imported'); renderSettings(); } catch (e) { toast('That is not valid progress JSON'); } };
     $('#resetBtn').onclick = () => { $('#resetConfirm').hidden = false; };
     $('#resetNo').onclick = () => { $('#resetConfirm').hidden = true; };
     $('#resetYes').onclick = () => { S = defaults(); save(); applyTheme(); buildPathSelect(); renderTree(); refreshChrome(); toast('Progress erased'); location.hash = '#dashboard'; };
@@ -578,6 +681,7 @@
     else if (parts[0] === 'm' && parts[1]) renderModule(parts[1]);
     else if (parts[0] === 'q' && parts[1]) renderModuleQuiz(parts[1]);
     else if (h === 'review') renderReview();
+    else if (h === 'mistakes') renderMistakes();
     else if (parts[0] === 'drill') renderDrill(parts[1]);
     else if (h === 'settings') renderSettings();
     else if (h === 'search') { if (search.value.trim()) renderSearch(search.value.trim()); else renderDashboard(); }
