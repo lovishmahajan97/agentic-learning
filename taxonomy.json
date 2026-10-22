@@ -3374,6 +3374,73 @@
      "note": "a reference stack and how the pieces connect"
     }
    ]
+  },
+  {
+   "id": "mcp",
+   "tier": 1,
+   "order": 31,
+   "title": "Model Context Protocol (MCP) in depth",
+   "topics": [
+    {
+     "id": "mcp-architecture",
+     "key": "mcp/mcp-architecture",
+     "name": "MCP architecture (hosts, clients, servers, JSON-RPC lifecycle, capability negotiation)"
+    },
+    {
+     "id": "mcp-server-primitives",
+     "key": "mcp/mcp-server-primitives",
+     "name": "MCP server primitives (tools, resources, prompts)"
+    },
+    {
+     "id": "mcp-client-primitives",
+     "key": "mcp/mcp-client-primitives",
+     "name": "MCP client primitives (sampling, roots, elicitation)"
+    },
+    {
+     "id": "mcp-transports",
+     "key": "mcp/mcp-transports",
+     "name": "MCP transports (stdio, Streamable HTTP, legacy SSE)"
+    },
+    {
+     "id": "building-an-mcp-server-end-to-end",
+     "key": "mcp/building-an-mcp-server-end-to-end",
+     "name": "building an MCP server end to end (FastMCP in Python, TypeScript SDK)",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "designing-mcp-tools-for-agents",
+     "key": "mcp/designing-mcp-tools-for-agents",
+     "name": "designing MCP tools for agents (naming, schemas, errors, pagination, token-efficient results)"
+    },
+    {
+     "id": "using-mcp-servers-inside-agents",
+     "key": "mcp/using-mcp-servers-inside-agents",
+     "name": "using MCP servers inside agents (Claude, OpenAI Agents SDK, LangGraph adapters)",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "testing-and-debugging-mcp-servers",
+     "key": "mcp/testing-and-debugging-mcp-servers",
+     "name": "testing and debugging MCP servers (MCP Inspector, contract tests)",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "deploying-remote-mcp-servers",
+     "key": "mcp/deploying-remote-mcp-servers",
+     "name": "deploying remote MCP servers (OAuth, sessions, hosting, scaling)"
+    },
+    {
+     "id": "mcp-security-in-practice",
+     "key": "mcp/mcp-security-in-practice",
+     "name": "MCP security in practice (tool poisoning, injection through tool results, consent, least privilege)"
+    },
+    {
+     "id": "mcp-ecosystem",
+     "key": "mcp/mcp-ecosystem",
+     "name": "MCP ecosystem (registries, popular servers, when not to use MCP)",
+     "note": "when MCP beats direct tool calling and when it does not"
+    }
+   ]
   }
  ]
 }

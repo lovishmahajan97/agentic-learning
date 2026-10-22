@@ -234,6 +234,19 @@ TAXONOMY = [
   ("code-execution sandboxes for agents (E2B, Modal, Docker)", "tool"),
   ("end-to-end agent stack (framework, LLM gateway, vector store, tracing, evals, deployment)", "decision: a reference stack and how the pieces connect"),
  ]),
+ ("mcp", 1, "Model Context Protocol (MCP) in depth", [
+  ("MCP architecture (hosts, clients, servers, JSON-RPC lifecycle, capability negotiation)", ""),
+  ("MCP server primitives (tools, resources, prompts)", ""),
+  ("MCP client primitives (sampling, roots, elicitation)", ""),
+  ("MCP transports (stdio, Streamable HTTP, legacy SSE)", ""),
+  ("building an MCP server end to end (FastMCP in Python, TypeScript SDK)", "tool"),
+  ("designing MCP tools for agents (naming, schemas, errors, pagination, token-efficient results)", ""),
+  ("using MCP servers inside agents (Claude, OpenAI Agents SDK, LangGraph adapters)", "tool"),
+  ("testing and debugging MCP servers (MCP Inspector, contract tests)", "tool"),
+  ("deploying remote MCP servers (OAuth, sessions, hosting, scaling)", ""),
+  ("MCP security in practice (tool poisoning, injection through tool results, consent, least privilege)", ""),
+  ("MCP ecosystem (registries, popular servers, when not to use MCP)", "decision: when MCP beats direct tool calling and when it does not"),
+ ]),
 ]
 
 TIER_INFO = {

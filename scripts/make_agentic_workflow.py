@@ -136,10 +136,11 @@ FIRST read, in full:
 YOUR FILES (module "${m.title}", id ${m.id}, chunk ${c.index}). Rewrite exactly these, in place; other agents own other files:
 ${filesOf(c).map(f => '  ' + f).join('\n')}
 Skip a file only if it already has "status: agentic" or "status: agentic-verified" AND both checks below pass.
+If a file is already agentic and the v3 check fails only because "## Use cases & projects" is missing, ADD that closing section (after the Quiz) without reworking the rest.
 
 For each file:
 1. Read the whole lesson. Decide agent_relevance: core (used directly when building agents), useful (met when fine-tuning, serving, evaluating or operating agents), or background (context to recognise).
-2. Rewrite it per SPEC v3 with the Write tool: add "agent_relevance: ..." to front matter and set "status: agentic"; agent-framed TL;DR (10-45 words); "## For agent builders" right after the TL;DR (3-5 bold-led bullets, 50+ words); How it works, Diagram, Examples, Production patterns, Trade-offs, Pitfalls, When to use and Interview questions all reframed around building and running agents. At least one example must be an agent scenario (code or a worked numeric table); at least 2 interview questions must be about building or operating agents. For background topics, compress general theory into a short "### Background" subsection of How it works and spend the space on what the agent builder does with it.
+2. Rewrite it per SPEC v3 with the Write tool: add "agent_relevance: ..." to front matter and set "status: agentic"; agent-framed TL;DR (10-45 words); "## For agent builders" right after the TL;DR (3-5 bold-led bullets, 50+ words); How it works, Diagram, Examples, Production patterns, Trade-offs, Pitfalls, When to use and Interview questions all reframed around building and running agents; and a closing "## Use cases & projects" section AFTER the Quiz with "### Use cases" (3-5 bold-led bullets) and "### Mini project" (1-3 hours, agent-focused: **Goal**, **Steps**, **Done when**). At least one example must be an agent scenario (code or a worked numeric table); at least 2 interview questions must be about building or operating agents. For background topics, compress general theory into a short "### Background" subsection of How it works and spend the space on what the agent builder does with it.
 3. Keep every number and inline code span somewhere in the lesson, and keep caveats. Generic code may be replaced by agent-focused code. Copy "## Role lens", "## Check yourself" and "## Quiz" exactly. Keep all crisp-format rules (no paragraph over 60 words, bullet over 80, bold lead-ins, tables) and the mermaid rules.
 4. No invented APIs, flags, numbers or citations; when unsure a setting exists, describe it in words.
 5. Run both checks and fix until both print ✓:
@@ -153,7 +154,7 @@ function writeNewPrompt(c, m) {
 
 FIRST read, in full: content/SPEC.md (v3 at the top, then the v2 base format, readability and mermaid rules) and the exemplar content/model-internals/kv-cache.md. Then print your assignment with exact names and hints:
    python3 -c "import json;print(json.dumps(json.load(open('chunks.json'))[${c.i}],indent=1))"
-For 'related' keys, grep taxonomy.json (any module; never print it whole). Related lessons that already cover parts of these tools include agents/frameworks, observability/langsmith, observability/langfuse, evals/tooling, agents/model-context-protocol, python-for-ai/litellm, python-for-ai/instructor, node-ts-for-ai/vercel-ai-sdk, system-design/workflow-orchestration, agents/agent-memory, agents/sandboxing; link them and do not repeat their content at length.
+For 'related' keys, grep taxonomy.json (any module; never print it whole). Related lessons that already cover parts of these tools include agents/frameworks, observability/langsmith, observability/langfuse, evals/tooling, agents/model-context-protocol, python-for-ai/litellm, python-for-ai/instructor, node-ts-for-ai/vercel-ai-sdk, system-design/workflow-orchestration, agents/agent-memory, agents/sandboxing, and for MCP: agents/model-context-protocol, agents/mcp-authentication-authorization-transport-security, python-for-ai/mcp-python-sdk, node-ts-for-ai/mcp-typescript-sdk; link them and do not repeat their content at length. For MCP lessons, follow the current MCP specification's concepts (hosts, clients, servers, tools, resources, prompts, sampling, roots, elicitation, stdio and Streamable HTTP transports, OAuth-based authorization for remote servers) and say which spec version a detail comes from when unsure.
 
 Write exactly these files (create them; other agents own other files):
 ${filesOf(c).map(f => '  ' + f).join('\n')}
@@ -164,6 +165,7 @@ Each file follows SPEC v3 fully, with front matter: id, module, name, kind (tool
 - Production patterns (deployment, persistence, tracing, evals, cost, failure handling) that teams actually use with this tool.
 - 4-6 interview questions a hiring team building agents would ask about it.
 - A "## Quiz" with exactly 3 questions in the SPEC format, a "## Check yourself" Q/A, and a "## Role lens" with Engineer, Architect and FDE bullets.
+- A closing "## Use cases & projects" section after the Quiz: "### Use cases" (3-5 bold-led bullets) and "### Mini project" (1-3 hours: **Goal**, **Steps**, **Done when**).
 These libraries change quickly. Use only APIs you are confident exist in their stable releases; prefer the core, long-lived abstractions; say "check the current docs" for anything version-sensitive; never invent class names, parameters or flags.
 
 Validate each file and fix until both print ✓:
@@ -185,6 +187,7 @@ For each file compare the current version with "git show pre-agentic:<path>" and
 - Accuracy of everything new: trace code, recompute numbers, confirm named settings and APIs exist. Fix or remove anything wrong or unverifiable.
 - Readability and spacing: scannable, bold lead-ins, short bullets, tables for numbers; the diagram follows the SPEC mermaid rules exactly.
 - Interview questions: realistic, correct, at least 2 about building or operating agents, not repeating Check yourself.
+- Use cases & projects: real use cases; the mini project is doable in 1-3 hours, agent-focused, with a clear "Done when".
 When a file is right, set its front matter to "status: agentic-verified". Both checks must pass:
   python3 scripts/build.py --check --v3 <file>
   python3 scripts/compare_lesson.py <file>
@@ -198,7 +201,7 @@ Read the "Module file" section and the v3 section of content/SPEC.md, and skim t
 - Why it matters: Engineer / Architect / FDE bullets, each framed around building or running agents.
 - Mental model: bullets or a small table plus ONE mermaid flowchart (in a fenced mermaid code block, following the SPEC "Mermaid rules": quoted labels, no semicolons, no classDef or style, prefer flowchart TD) showing where this module's ideas sit in an agent system.
 - Suggested order: every slug exactly once with its reason; put agent-core lessons first where prerequisites allow.
-- Capstone: an agent-building project (brief of at least 120 words in short paragraphs and bullets, 3+ deliverables, 3+ rubric items).
+- Capstone: this is the module's MAJOR PROJECT (multi-day): a working agent or agent component that combines most of the module's lessons. Brief of at least 120 words in short paragraphs and bullets that starts with the use case it serves, 3+ concrete deliverables, 3+ observable rubric items.
 - Keep every fact; restructure rather than delete. Set front matter "status: agentic" (add the line after id/title).
 Validate with python3 scripts/build.py --check --v2 content/${m.id}/_module.md until ✓. Return the file path and notes.`
 }

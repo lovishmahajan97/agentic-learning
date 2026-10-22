@@ -43,6 +43,7 @@ def norm_heading(h):
                "trade-offs": "Trade-offs", "tradeoffs": "Trade-offs", "trade offs": "Trade-offs",
                "pitfalls": "Pitfalls", "common pitfalls": "Pitfalls",
                "production patterns": "Production patterns", "in production": "Production patterns",
+               "use cases & projects": "Use cases & projects", "use cases and projects": "Use cases & projects",
                "for agent builders": "For agent builders", "agent builder's take": "For agent builders",
                "diagram": "Diagram", "flowchart": "Diagram", "flow": "Diagram",
                "interview questions": "Interview questions", "interview prep": "Interview questions",
@@ -173,6 +174,19 @@ def diagram(md, errs):
     if words(caption) < 8: errs.append("'Diagram' needs a one or two sentence caption saying what to look at")
     return {"code": code, "caption": caption}
 
+def projects(md, errs):
+    secs, order, _ = split_sections(md, level=3)
+    by = {re.sub(r"\s+", " ", h.strip().lower()): secs[h] for h in order}
+    uc = next((v for k, v in by.items() if k.startswith("use case")), None)
+    mp = next((v for k, v in by.items() if k.startswith("mini project")), None)
+    if uc is None or len(bullets(uc)) < 3:
+        errs.append("'Use cases & projects' needs '### Use cases' with 3-5 bold-led bullets")
+    if mp is None or words(mp) < 60:
+        errs.append("'Use cases & projects' needs '### Mini project' (60+ words: goal, steps, done when)")
+    for kind_, w, head in long_blocks(md):
+        errs.append(f"'Use cases & projects': {kind_} of {w} words; split it: {head!r}")
+    return {"use_cases": uc or "", "mini_project": mp or ""}
+
 def interview(md, errs):
     secs, order, _ = split_sections(md, level=3)
     qs = []
@@ -283,13 +297,13 @@ def parse_topic(path: Path):
     st_ = str(fm.get("status", "")).lower()
     v3 = V3_FORCE or st_.startswith("agentic")
     v2 = v3 or V2_FORCE or st_.startswith("crisp") or "Production patterns" in got
-    need = (["For agent builders"] + TOPIC_SECTIONS_V2) if v3 else (TOPIC_SECTIONS_V2 if v2 else TOPIC_SECTIONS)
+    need = (["For agent builders"] + TOPIC_SECTIONS_V2 + ["Use cases & projects"]) if v3 else (TOPIC_SECTIONS_V2 if v2 else TOPIC_SECTIONS)
     for s in need:
         if s not in got: errs.append(f"missing section '## {s}'")
     if any(s not in got for s in need):
         return None, errs, warns
     is_tool = kind == "tool"
-    patterns, dia, ivq = [], None, []
+    patterns, dia, ivq, proj = [], None, [], None
     if not v2:
         mins = {"TL;DR": 15, "Why it exists": 120, "How it works": 150 if is_tool else 250,
                 "When to use": 60}
@@ -323,6 +337,7 @@ def parse_topic(path: Path):
         if v3:
             rel = str(fm.get("agent_relevance", "")).lower()
             if rel not in RELEVANCE: errs.append(f"front matter agent_relevance must be one of {sorted(RELEVANCE)}")
+            proj = projects(got["Use cases & projects"], errs)
             fb = bullets(got["For agent builders"])
             if len(fb) < 3: errs.append("'For agent builders' needs 3-5 bold-led bullets (why it matters for agents, where it shows up in an agent stack, what you can skip)")
             if words(got["For agent builders"]) < 50: errs.append("'For agent builders' too thin (min 50 words)")
@@ -346,7 +361,7 @@ def parse_topic(path: Path):
          "related": [r for r in related if r in ALL_KEYS], "sources": sources,
          "tldr": got["TL;DR"], "why": got["Why it exists"], "how": got["How it works"],
          "example": got["Example"], "patterns": patterns, "agent": got.get("For agent builders") if v3 else None,
-         "agent_relevance": str(fm.get("agent_relevance", "")).lower() or None, "diagram": dia, "interview": ivq, "format": "crisp" if v2 else "long", "tradeoffs": tr, "pitfalls": pf, "when": got["When to use"],
+         "agent_relevance": str(fm.get("agent_relevance", "")).lower() or None, "projects": proj, "diagram": dia, "interview": ivq, "format": "crisp" if v2 else "long", "tradeoffs": tr, "pitfalls": pf, "when": got["When to use"],
          "role_lens": role_lens(got["Role lens"], errs, "Role lens"),
          "check": check_yourself(got["Check yourself"], errs), "quiz": quiz(got["Quiz"], errs)}
     if "caveat" in tax_t: t["caveat"] = tax_t["caveat"]
@@ -460,7 +475,7 @@ def build(report_only=False):
         for k, v in list(report["invalid"].items())[:40]:
             print(f"  ✗ {k}: {v[0]}")
         return
-    HEAVY = ("agent", "why", "how", "example", "patterns", "diagram", "interview", "tradeoffs", "pitfalls", "when", "role_lens", "check", "quiz", "sources")
+    HEAVY = ("agent", "projects", "why", "how", "example", "patterns", "diagram", "interview", "tradeoffs", "pitfalls", "when", "role_lens", "check", "quiz", "sources")
     built = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     (ROOT / "site" / "data").mkdir(exist_ok=True)
     light_modules, total_bytes = [], 0

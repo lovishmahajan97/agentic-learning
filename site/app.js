@@ -281,7 +281,7 @@
         <span class="meta">${t.kind ? `<span class="pill">${esc(t.kind)}</span>` : ''}<span>${t.est_minutes || 12} min</span></span>${intro && intro.order_reasons && intro.order_reasons[t.id] ? `<span class="reason">${mdi(intro.order_reasons[t.id])}</span>` : ''}</a></li>`; }).join('')}</ol></section>`;
     if (intro && intro.capstone) {
       const cs = S.capstone[mid] || {};
-      html += `<section class="section"><h2>Capstone</h2><div class="prose">${md(intro.capstone.brief)}</div>
+      html += `<section class="section" id="major"><h2>Major project</h2><div class="prose">${md(intro.capstone.brief)}</div>
         <h3 style="margin:18px 0 8px">Deliverables</h3><ul class="checklist">${intro.capstone.deliverables.map((d, i) => `<li><label class="${cs[i] ? 'done' : ''}"><input type="checkbox" data-cap="${i}" ${cs[i] ? 'checked' : ''}><span>${mdi(d)}</span></label></li>`).join('')}</ul>
         <h3 style="margin:18px 0 8px">Rubric</h3><ul class="list-cards">${intro.capstone.rubric.map((r, i) => `<li><span class="mark">${i + 1}</span><span>${mdi(r)}</span></li>`).join('')}</ul></section>`;
     }
@@ -338,13 +338,17 @@
         <div class="ivq-list">${ivq.map((x, xi) => `<details class="ivq"><summary><span class="ivq-n">Q${xi + 1}</span><span>${mdi(x.q)}</span></summary><div class="prose">${md(x.a)}</div></details>`).join('')}</div>
         <div class="btn-row" style="margin-top:12px"><button class="btn sm" id="ivqAll">Expand all answers</button></div></section>` : ''}
       <section class="section" id="s-quiz"><h2><span class="num">${pad2(secs.length + (ivq.length ? 4 : 3))}</span>Quiz</h2><div class="quiz" id="quiz">${(t.quiz || []).map((q, qi) => `<div class="qcard" data-q="${qi}"><div class="q"><span class="n">Q${qi + 1}</span>${mdi(q.q)}</div><div class="opts">${q.options.map((o, oi) => `<button class="opt" data-o="${oi}"><span class="k">${'ABCD'[oi]}</span><span>${mdi(o)}</span></button>`).join('')}</div><div class="expl" hidden></div></div>`).join('')}<div id="quizResult"></div></div></section>
+      ${t.projects && (t.projects.use_cases || t.projects.mini_project) ? `<section class="section" id="s-projects"><h2><span class="num">${pad2(secs.length + (ivq.length ? 5 : 4))}</span>Use cases &amp; projects</h2>
+        <div class="proj-grid"><div class="proj-card proj-uses"><div class="proj-head">Use cases</div><div class="prose">${md(t.projects.use_cases)}</div></div>
+        <div class="proj-card proj-mini"><div class="proj-head">Mini project <span class="pill">1-3 hours</span></div><div class="prose">${md(t.projects.mini_project)}</div></div></div>
+        <a class="proj-major" href="#m.${m.id}"><span class="proj-head">Major project</span><span>The ${esc(m.title)} capstone combines this lesson with the rest of the module →</span></a></section>` : ''}
       <section class="section notes" id="s-notes"><h2><span class="num">${pad2(secs.length + (ivq.length ? 5 : 4))}</span>Your notes</h2><textarea id="notes" placeholder="What clicked, what is still fuzzy, how this connects to your own work…">${esc(S.notes[key] || '')}</textarea></section>
       ${t.sources && t.sources.length ? `<section class="section"><h2>Sources</h2><ul class="sources">${t.sources.map(s => `<li>${esc(s)}</li>`).join('')}</ul></section>` : ''}
       ${pager(prev, next, m, nextMod)}
     </article>
     <aside class="toc"><div class="toc-title">On this page</div>
       ${secs.map(([id, title]) => `<a href="#s-${id}" data-toc="s-${id}">${title}</a>`).join('')}
-      <a href="#s-check" data-toc="s-check">Check yourself</a>${ivq.length ? '<a href="#s-interview" data-toc="s-interview">Interview questions</a>' : ''}<a href="#s-quiz" data-toc="s-quiz">Quiz</a>
+      <a href="#s-check" data-toc="s-check">Check yourself</a>${ivq.length ? '<a href="#s-interview" data-toc="s-interview">Interview questions</a>' : ''}<a href="#s-quiz" data-toc="s-quiz">Quiz</a>${t.projects ? '<a href="#s-projects" data-toc="s-projects">Use cases &amp; projects</a>' : ''}
       <div class="toc-side"><div class="toc-title">Module</div><a href="#m.${m.id}" style="border:0;padding-left:0">${esc(m.title)} →</a><div class="bar tier-${m.tier}"><i style="width:${modProgress(m).pct}%"></i></div><div class="muted" style="font-size:12px">${modProgress(m).done}/${modProgress(m).total} learned</div></div>
     </aside></div>`;
     main.innerHTML = html;

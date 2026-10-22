@@ -589,3 +589,14 @@ body { background:
 .pill.rel-background { background: var(--surface-2); color: var(--ink-3); }
 
 @media (prefers-reduced-motion: reduce) { .mod-card:hover { transform: none; } }
+
+/* use cases & projects */
+.proj-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; max-width: 72ch; }
+.proj-card { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px; min-width: 0; }
+.proj-uses { border-top: 4px solid var(--s1); }
+.proj-mini { border-top: 4px solid var(--s3); background: linear-gradient(180deg, color-mix(in srgb, var(--s3) 7%, var(--surface)), var(--surface) 45%); }
+.proj-head { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-2); margin-bottom: 10px; }
+.proj-card .prose { font-size: 15.5px; }
+.proj-major { display: grid; gap: 4px; margin-top: 14px; max-width: 72ch; padding: 16px 20px; border-radius: 14px; color: #fff; background: var(--grad); box-shadow: var(--glow); }
+.proj-major .proj-head { color: rgba(255,255,255,.85); margin: 0; }
+.proj-major:hover { text-decoration: none; filter: brightness(1.06); }
