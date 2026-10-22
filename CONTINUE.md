@@ -1,5 +1,26 @@
 # Continuing the lesson build (handoff)
 
+## Status 2026-10-22: agent-builder edition complete
+
+- 613 lessons in 32 modules, 6 stages (`curriculum.json`); new modules: Agent frameworks & tooling (18)
+  and Model Context Protocol in depth (11).
+- Every lesson is in SPEC v3 (agent-builder framing on the crisp format): For agent builders box,
+  agent_relevance tag ({'useful': 276, 'core': 316, 'background': 21}), diagram, 2+ examples, production patterns, interview questions,
+  use cases and a mini project. Every lesson is `agentic-verified` by an independent reviewer.
+- 32/32 module guides rewritten for agent builders; each Capstone is the module's major project.
+- Checks: `python3 scripts/build.py` ok=613/613; `python3 scripts/compare_lesson.py --all` 0 lost data
+  vs tag `pre-agentic`; 645/645 mermaid diagrams parse (613 lessons + 32 guides).
+- Design: vibrant light theme (stage hues, signature gradient), dark mode on the toggle.
+- Baselines: tag `pre-crisp` (long-form originals) and tag `pre-agentic` (crisp edition) keep every
+  earlier version recoverable.
+
+To add or change lessons later: edit the Markdown, run `python3 scripts/build.py --check --v3 <file>` and
+`python3 scripts/compare_lesson.py <file>`, then `python3 scripts/build.py`. For bulk work, regenerate with
+`python3 scripts/make_agentic_workflow.py --groups 3` (it schedules only unfinished work).
+
+---
+
+
 ## Snapshot 2026-10-21: crisp rewrite stopped on request
 
 **What this phase does.** Every lesson is rewritten from long prose into a scannable format (SPEC v2 in

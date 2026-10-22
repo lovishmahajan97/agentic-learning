@@ -5,7 +5,7 @@ name: MCP ecosystem (registries, popular servers, when not to use MCP)
 kind: decision
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - agents/model-context-protocol
@@ -109,7 +109,8 @@ import json, sys, urllib.parse, urllib.request
 REGISTRY = "https://registry.modelcontextprotocol.io/v0.1/servers"   # check the docs for the current API version
 
 def search(term: str, limit: int = 10) -> list[dict]:
-    url = f"{REGISTRY}?{urllib.parse.urlencode({'search': term, 'limit': limit})}"
+    query = {"search": term, "limit": limit, "version": "latest"}     # one row per server, not per release
+    url = f"{REGISTRY}?{urllib.parse.urlencode(query)}"
     with urllib.request.urlopen(url, timeout=60) as r:
         return [entry["server"] for entry in json.load(r)["servers"]]
 
@@ -122,7 +123,10 @@ for s in search(sys.argv[1] if len(sys.argv) > 1 else "github"):
 ```
 
 - **What to notice.** A search for a popular tool name returns many look-alike servers from unrelated
-  publishers. Read the namespace and repository before trusting one.
+  publishers. Read the namespace and repository before trusting one: GitHub's own server is
+  `io.github.github/github-mcp-server`, and other `io.github.*` names belong to whoever owns that account.
+- **Before an agent uses it.** Turn the chosen entry into a pinned launch command or remote URL in your
+  agent config, then allowlist only the tools the agent needs.
 
 ### Worked numbers: when MCP is overhead
 An internal support agent needs 4 tools: look up an order, issue a refund, read a policy, escalate.

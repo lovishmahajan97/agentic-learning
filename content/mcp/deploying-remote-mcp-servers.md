@@ -5,7 +5,7 @@ name: deploying remote MCP servers (OAuth, sessions, hosting, scaling)
 kind: practice
 difficulty: advanced
 est_minutes: 22
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/mcp-authentication-authorization-transport-security
@@ -110,15 +110,17 @@ sequenceDiagram
 
 ## Examples
 ### A token-protected, stateless server with the Python SDK
-Python `mcp` SDK 2.x; on 1.x import `FastMCP` from `mcp.server.fastmcp` and pass `stateless_http` and
-`json_response` to the constructor instead. Swap the toy verifier for JWT validation against your
-identity provider.
+Python `mcp` SDK 2.x; on 1.x import `FastMCP` from `mcp.server.fastmcp` and pass `stateless_http`,
+`json_response` and `transport_security` to the constructor instead. Swap the toy verifier for JWT
+validation against your identity provider.
 
 ```python
 import os
+from urllib.parse import urlsplit
 from mcp.server.mcpserver import MCPServer                 # mcp SDK 2.x
 from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings
+from mcp.server.transport_security import TransportSecuritySettings
 
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "http://localhost:8000/mcp")
 ISSUER = os.environ.get("ISSUER_URL", "https://auth.example.com")
@@ -143,7 +145,11 @@ def get_ticket(ticket_id: str) -> dict:
     """Fetch one support ticket by id, for example 'T-1'."""
     return {"id": ticket_id, "status": "open"}
 
-app = mcp.streamable_http_app(stateless_http=True, json_response=True)   # any replica can serve any request
+app = mcp.streamable_http_app(
+    stateless_http=True, json_response=True,                 # any replica can serve any request
+    # by default only localhost Host headers pass (DNS rebinding guard); allow your public host
+    transport_security=TransportSecuritySettings(allowed_hosts=[urlsplit(PUBLIC_URL).netloc]),
+)
 # run: uvicorn remote_server:app --host 0.0.0.0 --port 8000 --workers 4
 ```
 
@@ -151,15 +157,19 @@ app = mcp.streamable_http_app(stateless_http=True, json_response=True)   # any r
 Probing the server above with `curl` shows the discovery chain the spec requires.
 
 ```bash
-curl -si -X POST http://127.0.0.1:8000/mcp -H 'content-type: application/json' \
+curl -si -X POST http://localhost:8000/mcp -H 'content-type: application/json' \
   -H 'accept: application/json, text/event-stream' -d '{}'
 # HTTP/1.1 401 Unauthorized
 # www-authenticate: Bearer error="invalid_token", error_description="Authentication required",
 #   resource_metadata="http://localhost:8000/.well-known/oauth-protected-resource/mcp"
 
-curl -s http://127.0.0.1:8000/.well-known/oauth-protected-resource/mcp
+curl -s http://localhost:8000/.well-known/oauth-protected-resource/mcp
 # {"resource":"http://localhost:8000/mcp","authorization_servers":["https://auth.example.com"],
 #  "scopes_supported":["tickets:read"],"bearer_methods_supported":["header"]}
+
+curl -si -X POST http://localhost:8000/mcp -H 'Host: evil.example' -H 'authorization: Bearer dev-token' \
+  -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d '{}'
+# HTTP/1.1 421 Misdirected Request      (Host not in allowed_hosts)
 ```
 
 ### Worked scenario: sticky sessions during a rolling deploy
@@ -176,16 +186,18 @@ A team ran a stateful server on 4 replicas with sticky routing and deployed duri
 - **Validate tokens for your audience.** Check issuer, signature, expiry, scopes and audience (the server's
   canonical URL), and reject anything else; in the Python SDK set `validate_token_resource=True`. Monitor
   `401` and `403` rates by client.
-- **Default to stateless.** Use stateless mode unless tools need sampling, elicitation or progress
-  mid-call; it removes sticky routing and lets autoscaling work. Monitor replica count against request rate.
+- **Default to stateless.** Use stateless mode unless tools need sampling or elicitation mid-call; it
+  removes sticky routing and lets autoscaling work. Progress notifications still stream on the POST's SSE
+  response if you leave `json_response` off. Monitor replica count against request rate.
 - **Make streaming survive the proxy.** Disable response buffering for the MCP path, raise idle timeouts
   above your longest tool call, and send keep-alives on SSE. Monitor dropped streams and tool-call duration.
 - **Rate limit and isolate per client.** Key limits on token subject or client id, scope data by tenant
   claims in the token, and cap concurrent calls per user. Monitor `429`s and the noisiest clients.
 - **Log one structured line per tool call.** Include tool name, client id, subject, latency, `isError` and
   protocol version, with no token values. Alert on error rate per tool and on unknown protocol versions.
-- **Protect the endpoint itself.** Serve only HTTPS, validate `Origin` on browser-reachable endpoints,
-  restrict CORS to known origins, and never treat `Mcp-Session-Id` as authentication. Monitor rejected origins.
+- **Protect the endpoint itself.** Serve only HTTPS, validate `Host` and `Origin` (the Python SDK's
+  `TransportSecuritySettings(allowed_hosts=..., allowed_origins=...)`), restrict CORS to known origins, and
+  never treat `Mcp-Session-Id` as authentication. Monitor `421` responses and rejected origins.
 
 ## Trade-offs
 - **Stateless vs stateful.** Stateless scales trivially and survives deploys but cannot ask the client
@@ -208,6 +220,9 @@ A team ran a stateful server on 4 replicas with sticky routing and deployed duri
   request. Fix: stateless mode, sticky routing or a shared session store.
 - **Wrong public URL in metadata.** Behind a proxy the server advertises an internal host, so clients fail
   discovery. Fix: set the resource URL from configuration, not from the incoming request.
+- **Shipping the localhost-only Host check.** The Python SDK turns on DNS rebinding protection for
+  localhost by default. Symptom: every request through the public hostname gets `421 Invalid Host header`.
+  Fix: list the public host in `allowed_hosts`.
 
 ## When to use
 - **Deploy remotely when:** many users or agents share the server, users authenticate with their own
@@ -260,7 +275,7 @@ replicas; switch to stateless mode, add sticky routing on `Mcp-Session-Id`, or s
 - **Instead:** keep separate downstream credentials, or exchange the user's token for a downstream token
   scoped to that API, and log both identities.
 
-### What would you log and alert on for a multi-tenant remote MCP server?
+### What would you log and alert on for a multi-tenant remote MCP server that many agents call?
 - **Per call:** tenant, client id, subject, tool, latency, `isError` and protocol version, never token values.
 - **Alerts:** error rate and p95 per tool, auth failures per client, `429` spikes and unknown protocol versions
   after a client update.
@@ -305,7 +320,7 @@ replicas; switch to stateless mode, add sticky routing on `Mcp-Session-Id`, or s
 - **Goal:** run the token-protected server above in a container behind HTTPS and connect an agent to it.
 - **Steps:** replace the toy verifier with JWT validation against a free IdP tenant or a local Keycloak;
   containerise with uvicorn and two replicas behind a proxy; confirm the `401` and metadata responses with
-  curl; connect with the Inspector and with an OpenAI Agents SDK agent using `MCPServerStreamableHttp`;
-  then kill one replica mid-run.
+  curl; connect with the Inspector and with an OpenAI Agents SDK agent using `MCPServerStreamableHttp`
+  (set `max_retry_attempts` above its default of 0); then kill one replica mid-run.
 - **Done when:** a token for another audience is rejected, the agent's run survives losing a replica, and
   logs show one structured line per tool call with no token values.

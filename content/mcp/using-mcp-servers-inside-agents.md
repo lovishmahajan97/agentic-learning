@@ -5,7 +5,7 @@ name: using MCP servers inside agents (Claude, OpenAI Agents SDK, LangGraph adap
 kind: tool
 difficulty: core
 est_minutes: 20
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/model-context-protocol
@@ -65,7 +65,7 @@ and controlling which calls need approval.
 |---|---|---|---|
 | Client object | `MCPServerStdio`, `MCPServerStreamableHttp` | `mcp_servers` dict in `ClaudeAgentOptions` | `MultiServerMCPClient` |
 | How tools reach the agent | `Agent(mcp_servers=[server])` | Named `mcp__<server>__<tool>` | `await client.get_tools()` returns LangChain tools |
-| Filtering | `tool_filter=create_static_tool_filter(...)` | `allowed_tools` / `disallowed_tools` | Select from the returned list |
+| Filtering | `tool_filter=create_static_tool_filter(...)` | `allowed_tools` (auto-approved) / `disallowed_tools` (removed) | Select from the returned list |
 | Approval | `require_approval` on the server object | `permission_mode`, `can_use_tool`, hooks | Interrupts or middleware in the graph |
 | In-process tools | Plain function tools | `create_sdk_mcp_server` with `@tool` | Plain LangChain tools |
 
@@ -79,8 +79,9 @@ and controlling which calls need approval.
 ### Knobs that matter in production
 - **Tool list caching.** `cache_tools_list=True` (OpenAI Agents SDK) avoids a `tools/list` round-trip on
   every run; invalidate it when the server version changes.
-- **Timeouts and retries.** `client_session_timeout_seconds` and `max_retry_attempts` on OpenAI's MCP
-  server classes; the LangChain connection dicts take `timeout`.
+- **Timeouts and retries.** `client_session_timeout_seconds` (default 5 seconds) and `max_retry_attempts`
+  (default 0) on OpenAI's MCP server classes; the LangChain HTTP connection dicts take `timeout` and
+  `sse_read_timeout`. Raise the defaults for slow tools, or calls fail before the server answers.
 - **Name collisions.** Two servers can both expose `search`; LangChain's `tool_name_prefix=True` and
   Claude's `mcp__server__tool` naming keep them apart.
 
@@ -109,14 +110,17 @@ sequenceDiagram
 ## Examples
 ### An OpenAI Agents SDK agent over a local stdio server
 `tickets_server.py` is a tiny server; the agent launches it, filters its tools and answers a question.
+An unknown id raises `ToolError`, which the client receives as an `isError` result the model can read.
 Needs `pip install openai-agents` and `OPENAI_API_KEY`.
 
 ```python
 # tickets_server.py
 try:
-    from mcp.server.mcpserver import MCPServer           # mcp SDK 2.x
+    from mcp.server.mcpserver import MCPServer                     # mcp SDK 2.x
+    from mcp.server.mcpserver.exceptions import ToolError
 except ImportError:
-    from mcp.server.fastmcp import FastMCP as MCPServer  # mcp SDK 1.x
+    from mcp.server.fastmcp import FastMCP as MCPServer            # mcp SDK 1.x
+    from mcp.server.fastmcp.exceptions import ToolError
 
 mcp = MCPServer("tickets")
 TICKETS = {"T-1": {"id": "T-1", "status": "open", "title": "Refund not received"}}
@@ -124,7 +128,9 @@ TICKETS = {"T-1": {"id": "T-1", "status": "open", "title": "Refund not received"
 @mcp.tool()
 def get_ticket(ticket_id: str) -> dict:
     """Fetch one support ticket by id, for example 'T-1'."""
-    return TICKETS.get(ticket_id, {"error": f"no ticket {ticket_id}"})
+    if ticket_id not in TICKETS:
+        raise ToolError(f"no ticket {ticket_id}; ticket ids look like T-1")   # isError result
+    return TICKETS[ticket_id]
 
 if __name__ == "__main__":
     mcp.run()        # stdio by default
@@ -251,8 +257,9 @@ Accuracy usually improves too, because the model chooses among 8 relevant tools 
   names with the server name.
 - **Treating `isError` results as crashes.** A tool error is information for the model to recover from;
   surfacing it as an exception ends the run. Fix: pass it back as a tool message and cap retries.
-- **Mixing SDK generations.** The Python `mcp` package 2.x renamed FastMCP to `MCPServer` and changed result
-  field names, while some adapters still pin 1.x. Fix: check which `mcp` version each dependency pins.
+- **Mixing SDK generations.** The Python `mcp` package 2.x renamed FastMCP to `MCPServer` and moved result
+  fields to snake_case (`is_error`), while some adapters still pin 1.x (`langchain-mcp-adapters` 0.3 requires
+  `mcp<2`). Fix: check which `mcp` version each dependency pins, and keep servers in their own environment.
 
 ## When to use
 - **Use when:** a maintained MCP server already exists for the system you need (GitHub, a browser, your

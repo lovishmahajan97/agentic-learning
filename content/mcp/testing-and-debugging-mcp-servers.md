@@ -5,7 +5,7 @@ name: testing and debugging MCP servers (MCP Inspector, contract tests)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - mcp/building-an-mcp-server-end-to-end
@@ -157,13 +157,15 @@ async def test_known_ticket_returns_status():
 @pytest.mark.anyio
 async def test_unknown_ticket_is_a_readable_error_not_a_crash():
     result = await call("get_ticket", {"ticket_id": "nope"})
+    assert result["isError"] is True                           # a tool result, not a protocol error
     assert "no ticket nope" in result["content"][0]["text"]
 ```
 
 - **Faster unit level.** SDK 2.x also accepts a server object directly, `async with Client(server) as c:`
   (`from mcp import Client`), for an in-memory session without a subprocess.
-- **Errors on SDK 2.x.** Raise `ToolError` (from `mcp.server.mcpserver.exceptions`) for expected failures;
-  other exceptions reach the model only as "Error executing tool <name>".
+- **Errors on SDK 2.x.** Raise `ToolError` (from `mcp.server.mcpserver.exceptions`) for expected failures,
+  as `tickets_server.py` does; other exceptions reach the model only as "Error executing tool <name>",
+  with your message hidden. On 1.x the exception text is passed through, so do not put secrets in it.
 
 ### Worked scenario: a rename that passed unit tests
 A team renamed `query` to `q` in a search tool's schema and shortened its description.
@@ -187,13 +189,15 @@ A team renamed `query` to `q` in a search tool's schema and shortened its descri
   tool-selection and task-success evals against the new server build before release. Track correct-tool
   rate and calls per task.
 - **Trace every tool call.** Emit one span per `tools/call` with tool name, latency, `isError` and payload
-  size (the Python SDK 2.x ships OpenTelemetry hooks; check the docs). Alert on error rate and p95 latency per tool.
+  size (the Python SDK 2.x emits an OpenTelemetry span per request by default; configure an exporter to
+  collect them). Alert on error rate and p95 latency per tool.
 - **Record and replay sessions.** Capture JSON-RPC traffic from real agent runs (with secrets redacted) and
   replay it against new builds to catch behaviour changes. Monitor replay mismatches.
 
 ## Trade-offs
 - **Subprocess contract tests vs in-memory tests.** Subprocess tests cover the real launch path and stdout
-  hygiene but take about a second each; in-memory sessions are fast but skip transport bugs.
+  hygiene but cost a process start per test (about half a second each for the suite above); in-memory
+  sessions are fast but skip transport bugs.
 - **Strict snapshots vs agility.** Freezing descriptions catches accidental prompt changes but makes every
   wording tweak a review; that cost is the point while agents depend on the wording.
 - **Evals with a real model vs cost.** They are the only check on tool choice, but cost tokens and are
@@ -253,7 +257,7 @@ that starts the server through the SDK client and fails if initialisation or `to
   another server, or a description the model does not connect to the task. Fix and rerun tool-selection evals.
 
 ### What should a tool return when the user asks for something that does not exist?
-- **A tool result with `isError: true`** and a message such as "no ticket nope; ticket ids look like T-123",
+- **A tool result with `isError: true`** and a message such as "no ticket nope; ticket ids look like T-1",
   so the model can recover or ask the user.
 - **Not a protocol error or crash,** which most clients surface as a generic failure and which gives the
   model nothing to act on.
