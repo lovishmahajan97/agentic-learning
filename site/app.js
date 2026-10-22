@@ -41,9 +41,10 @@
 
   /* ---------------- state ---------------- */
   const KEY = 'ai-roles-academy.v1';
-  const defaults = () => ({ path: 'all', learned: {}, review: {}, quiz: {}, modquiz: {}, notes: {}, capstone: {}, visits: {}, last: null, days: [], theme: 'system', open: {} });
+  const defaults = () => ({ path: 'all', learned: {}, review: {}, quiz: {}, modquiz: {}, notes: {}, capstone: {}, visits: {}, last: null, days: [], theme: 'light', open: {} });
   let S = defaults();
   try { Object.assign(S, JSON.parse(localStorage.getItem(KEY) || '{}')); } catch (e) { }
+  if (!S.themeV2) { S.theme = 'light'; S.themeV2 = true; }   // light is the default look; dark stays one click away
   let saveT; function save() { clearTimeout(saveT); saveT = setTimeout(() => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { } }, 150); }
 
   /* ---------------- index ---------------- */
@@ -163,7 +164,7 @@
     const root = document.documentElement; if (S.theme === 'system') root.removeAttribute('data-theme'); else root.setAttribute('data-theme', S.theme);
     $('#themeToggle').title = 'Theme: ' + S.theme;
   }
-  $('#themeToggle').onclick = () => { S.theme = { system: 'light', light: 'dark', dark: 'system' }[S.theme] || 'system'; save(); applyTheme(); toast('Theme: ' + S.theme); if (document.querySelector('.diagram')) route(); };
+  $('#themeToggle').onclick = () => { S.theme = { light: 'dark', dark: 'system', system: 'light' }[S.theme] || 'light'; save(); applyTheme(); toast('Theme: ' + S.theme); if (document.querySelector('.diagram')) route(); };
   const navToggle = $('#navToggle'), scrim = $('#scrim');
   function setNav(open) { app.classList.toggle('nav-open', open); scrim.hidden = !open; navToggle.setAttribute('aria-expanded', open); }
   navToggle.onclick = () => setNav(!app.classList.contains('nav-open'));

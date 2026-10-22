@@ -466,7 +466,8 @@ mark { background: var(--warn-soft); color: inherit; padding: 0 2px; border-radi
    indigo -> fuchsia -> orange gradient for brand moments, tinted surfaces.
    ===================================================================== */
 :root {
-  --bg: #f5f4fb; --surface: #ffffff; --surface-2: #efedf8; --surface-3: #e3e0f2;
+  --bg: #fcfbff; --surface: #ffffff; --surface-2: #f3f1fa;
+  --glow-a: rgba(99,102,241,.06); --glow-b: rgba(217,70,239,.04); --surface-3: #e3e0f2;
   --ink: #17132b; --ink-2: #4a4566; --ink-3: #7d7899; --line: #e2def0; --line-strong: #c9c3e0;
   --accent: #6d28d9; --accent-ink: #ffffff; --accent-soft: #efe7ff; --accent-soft-ink: #4c1d95;
   --g1: #4f46e5; --g2: #c026d3; --g3: #f97316;
@@ -482,6 +483,7 @@ mark { background: var(--warn-soft); color: inherit; padding: 0 2px; border-radi
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
+    --glow-a: rgba(99,102,241,.14); --glow-b: rgba(217,70,239,.10);
     --bg: #0c0a18; --surface: #15122a; --surface-2: #1d1938; --surface-3: #2a2550;
     --ink: #f1eeff; --ink-2: #bdb7dc; --ink-3: #8b85ad; --line: #2b2650; --line-strong: #40396f;
     --accent: #a78bfa; --accent-ink: #12082e; --accent-soft: #2a1f57; --accent-soft-ink: #ddd3ff;
@@ -493,6 +495,7 @@ mark { background: var(--warn-soft); color: inherit; padding: 0 2px; border-radi
   }
 }
 :root[data-theme="dark"] {
+  --glow-a: rgba(99,102,241,.14); --glow-b: rgba(217,70,239,.10);
   --bg: #0c0a18; --surface: #15122a; --surface-2: #1d1938; --surface-3: #2a2550;
   --ink: #f1eeff; --ink-2: #bdb7dc; --ink-3: #8b85ad; --line: #2b2650; --line-strong: #40396f;
   --accent: #a78bfa; --accent-ink: #12082e; --accent-soft: #2a1f57; --accent-soft-ink: #ddd3ff;
@@ -505,8 +508,8 @@ mark { background: var(--warn-soft); color: inherit; padding: 0 2px; border-radi
 
 /* atmosphere */
 body { background:
-  radial-gradient(1100px 520px at 12% -8%, rgba(99,102,241,.14), transparent 60%),
-  radial-gradient(900px 480px at 100% 0%, rgba(217,70,239,.10), transparent 60%),
+  radial-gradient(1100px 520px at 12% -8%, var(--glow-a), transparent 60%),
+  radial-gradient(900px 480px at 100% 0%, var(--glow-b), transparent 60%),
   var(--bg); background-attachment: fixed; }
 .topbar { background: color-mix(in srgb, var(--surface) 82%, transparent); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border-bottom: 0; }
 .topbar::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: var(--grad); opacity: .9; }
