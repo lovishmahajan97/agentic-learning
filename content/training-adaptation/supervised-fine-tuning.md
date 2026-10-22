@@ -5,7 +5,7 @@ name: Supervised fine-tuning (SFT)
 kind: concept
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - training-adaptation/instruction-tuning

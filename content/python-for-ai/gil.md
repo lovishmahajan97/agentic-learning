@@ -5,7 +5,7 @@ name: GIL (Global Interpreter Lock)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - python-for-ai/asyncio-vs-threads-vs-multiprocessing
@@ -22,8 +22,8 @@ sources:
 ---
 
 ## TL;DR
-The GIL lets one thread run Python bytecode at a time in standard CPython. It is why threads help agent
-model and tool I/O but not pure-Python parsing, which also makes token streams jitter. It does not make
+The GIL is CPython's mutex letting one thread run bytecode at a time. Threads help agent I/O and
+GIL-releasing native code, not pure-Python parsing, which also jitters token streams. It does not make
 code thread-safe.
 
 ## For agent builders

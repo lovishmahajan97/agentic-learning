@@ -5,7 +5,7 @@ name: Pre-training
 kind: concept
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: background
 related:
   - training-adaptation/post-training
@@ -216,8 +216,9 @@ Back-of-envelope for a 7B base, as an illustrative order of magnitude:
 | Wall clock on 1,024 GPUs | a little over a day, after months of data engineering |
 | Tokens per parameter | 1e12 / 7e9 ≈ 143, well past the compute-optimal ~20 |
 
-Pre-training is the one stage where the arithmetic is in GPU-years, not GPU-hours. An agent fine-tune on
-50k traces is a few GPU-hours on the same model, which is where agent teams spend their training budget.
+Pre-training is the one stage where the arithmetic is in GPU-years, not GPU-hours. By the same 6·N·D sum,
+an agent fine-tune on 50k traces of about 4k tokens (2e8 tokens) is about 6 GPU-hours on the same model,
+which is where agent teams spend their training budget.
 
 ```python
 import math
@@ -246,8 +247,8 @@ Illustrative numbers for a support agent with a 6k-token prefix and ~1.5k tokens
 |---|---|---|
 | Prefix | 6k tokens | ~7.8k tokens |
 | Tokens added per step | ~1.5k | ~1.95k |
-| Context at step 20 | ~34.5k | ~44.9k |
-| Fits a 32k window? | no, needs compaction once | no, needs compaction earlier |
+| Context after 20 steps | ~36k | ~46.8k |
+| Fits a 32k window? | no: crosses it after step 18 | no: crosses it after step 13 |
 
 Same task, same quality: the tokenizer alone moves context pressure, prefill cost and when compaction
 kicks in.
@@ -430,7 +431,8 @@ failure cases, and only then decide whether adaptation of the weights is justifi
 **Score two base checkpoints on your agent traffic (1-2 hours).**
 - **Goal:** pick the better base for an agent from data, not from leaderboards.
 - **Steps:** collect 50 agent transcripts (system prompt, tool definitions, tool calls and results); load
-  two small open-weight base models; measure tokens per word and average loss on the transcripts for each;
-  then give each a 3-shot prompt asking for one JSON tool call and check how many outputs parse.
-- **Done when:** you have a table with tokens per word, loss and JSON parse rate per model, and a short
-  recommendation of which base to fine-tune for the agent and why.
+  two small open-weight base models; measure tokens per word and bits per byte on the transcripts for each
+  (raw loss is per token, so it is not comparable across tokenizers); then give each a 3-shot prompt
+  asking for one JSON tool call and check how many outputs parse.
+- **Done when:** you have a table with tokens per word, bits per byte and JSON parse rate per model, and
+  a short recommendation of which base to fine-tune for the agent and why.

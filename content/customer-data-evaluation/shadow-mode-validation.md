@@ -5,7 +5,8 @@ name: Shadow-mode validation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - llmops-platform/canary-shadow-deployments
   - evals/offline-vs-online-evaluation
@@ -18,9 +19,21 @@ related:
 ---
 
 ## TL;DR
-Shadow mode runs a candidate model, prompt or pipeline on a copy of real traffic while only production's
-answer reaches users. It measures agreement and judged quality on real inputs, not user outcomes, and
-is safe only if the candidate cannot cause side effects.
+Shadow mode runs a candidate agent (new model, prompt or tools) on a copy of real traffic while only
+production's answer reaches users. It measures agreement and judged quality, not user outcomes, and is
+safe only if every write tool is stubbed.
+
+## For agent builders
+- **Why it matters for agents.** It is the safest way to see a new model or prompt drive your real tools
+  on real customer inputs before anyone acts on its output. The cost of getting it wrong is concrete: an
+  unstubbed write tool means duplicate refunds or emails.
+- **Where it shows up in your stack.** A queue after the production response, a shadow worker that runs
+  the candidate agent loop, a tool layer that knows which tools write, and a comparison store keyed by
+  request id.
+- **What you control.** Which tools run live, replay or dry-run; what you compare (routing fields, tool
+  calls, intended writes, steps, cost); the self-agreement baseline; and the exit criteria.
+- **What you can skip.** Mesh-level mirroring details unless your candidate is a separate HTTP service;
+  most agent shadows are queue-based workers.
 
 ## Why it exists
 - **Curated sets miss the long tail.** Golden sets and regression suites are chosen by people, so they
@@ -69,6 +82,16 @@ This step makes shadow mode safe or dangerous.
 - **Operational metrics:** p50/p95 latency, error and timeout rate, cost per request.
 - **Review disagreements, because that is where the information is.** Where both agree, both are usually
   right, or both wrong in ways the regression suite should cover.
+
+### Comparing agent runs, not just answers
+For a tool-calling agent, the comparison record is a pair of trajectories:
+
+| Compare | Why |
+|---|---|
+| **Tool sequence and arguments** | Same answer via a different tool path can still break a customer rule (no approval lookup before a refund) |
+| **Intended writes vs production's writes** | The most consequential disagreement: what the candidate would have changed in the world |
+| **Steps and tokens per run** | A cheaper model that takes twice the steps may not be cheaper per task |
+| **Stop reason** | Finished, hit the step budget, or errored; budget hits are hidden failures |
 
 ### Calibrate with a self-agreement baseline
 - **Shadow production against itself** (same model, prompt and inputs, a second call) on a slice of
@@ -212,6 +235,9 @@ print(shadow_readout(18_000, 0.94, 140, 90, 70))
 - **Self-agreement slice** — on every shadow run. Route a small fraction of traffic to a second production
   call and report candidate agreement next to production self-agreement. Monitor the gap, not the raw
   agreement rate.
+- **Step budget and cost cap on the shadow loop** — for every agent shadow. Give the candidate the same
+  maximum step count as production and a per-run token cap, and record the stop reason. Monitor budget-hit
+  rate and cost per task next to production's, since a looping candidate burns money silently.
 
 ## Trade-offs
 - **Zero user exposure vs no outcome signal.** When task completion is the KPI, shadow must be followed by
@@ -237,6 +263,9 @@ print(shadow_readout(18_000, 0.94, 140, 90, 70))
   "6% disagreement" when a second production run would have disagreed nearly as often.
 - **Sharing the production rate-limit quota.** Symptom: production 429 errors that begin exactly when
   shadow mode is switched on.
+- **Comparing only final answers for an agent.** Symptom: shadow looks clean, then the canary shows the
+  candidate skipping a required lookup or approval tool. Fix: store both tool-call sequences and diff
+  them, with intended writes as their own report.
 
 ## When to use
 - **Use before** replacing the model, prompt or pipeline under a live customer, and before go-live when
@@ -299,6 +328,13 @@ escalations and complaints, rather than a full switch.
   adjudicated disagreements, broken down by severity.
 - **Operations:** no unexplained dry-run writes, latency and error budgets.
 
+### A cheaper candidate agent agrees on 95% of answers in shadow, but cost per task went up. What happened?
+- **Look at steps per run and stop reasons.** The candidate may reach the same answer with more tool
+  calls, retries or re-plans, so per-token savings vanish per task.
+- **Check budget hits.** Runs that stopped at the step limit are failures hidden behind "agreement" if
+  the comparison only reads the last message.
+- **Decide per task,** not per token: report cost and latency per completed task for both systems.
+
 ## Quiz
 ### Q: What is the most important safety requirement when shadowing an agent that can call tools?
 - [ ] The shadow must use the same random seed as production
@@ -323,3 +359,29 @@ escalations and complaints, rather than a full switch.
 - [ ] Only the first turn, since later turns cannot be mirrored
 > Each shadow turn is conditioned on production's previous replies, so it is a one-step counterfactual.
 > After the first divergence, the candidate's own trajectory is never actually played out.
+
+## Use cases & projects
+### Use cases
+- **Model swaps for a live support agent.** Shadow a cheaper or customer-hosted model on real tickets,
+  comparing routing, tool calls and cost per task before a canary.
+- **Agents that act on systems of record.** Claims, refunds or CRM-updating agents prove their intended
+  writes match production's without touching real records.
+- **Replacing a human process with an agent.** The customer's human team acts as "production" and the
+  agent's decisions are compared against theirs before go-live.
+- **Prompt or tool-schema rewrites.** Large prompt changes are shadowed on live inputs that the
+  regression suite never anticipated.
+
+### Mini project
+**Shadow a candidate agent with dry-run writes (2-3 hours).**
+- **Goal:** compare a candidate agent against production on replayed requests without any real writes.
+- **Steps:** build a small agent with one read tool and one write tool; record 50 production runs
+  (inputs, tool calls, outputs); adapt the `DryRunTools` worker above to run a candidate prompt or model;
+  store both trajectories; compute answer agreement, tool-sequence agreement, intended-write diffs and
+  steps per run; add a production self-agreement slice; feed the adjudicated counts to `shadow_readout`.
+- **Done when:** the write tool's real implementation is never called by the candidate (assert it), and
+  you have a readout with win rate, interval, worse-share and a list of intended-write differences.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): shadowing the utility's mandated
+self-hosted model against the current system on replayed traffic, with a go, hold or no-go report that
+confirms the shadow path made no writes.

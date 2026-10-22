@@ -5,7 +5,7 @@ name: Stopping conditions / termination
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agent-reliability/max-step-budgets
@@ -174,6 +174,9 @@ nudges exactly once when the model ends its turn without submitting.
 - **Counterfactual:** had step 9 been the twelfth and last allowed step with tests still red, the outcome
   would be `partial/budget_exhausted` carrying the model's summary, and the dashboard would count it as
   not done.
+- **Wire in the fail-closed map.** As written, `decide()` checks raw Claude values only, so a `refusal`
+  with no tool calls falls through to `None` and the run idles until the budget fires. In real code, pass
+  the stop reason through `normalise()` (next example) and return `failed` on `refused` or `unknown`.
 
 ```python
 from dataclasses import dataclass

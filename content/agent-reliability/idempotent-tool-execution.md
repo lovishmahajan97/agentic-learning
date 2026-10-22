@@ -5,7 +5,7 @@ name: Idempotent tool execution
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agent-reliability/durable-execution-and-checkpointing

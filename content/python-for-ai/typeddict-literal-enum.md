@@ -5,7 +5,7 @@ name: TypedDict, Literal and Enum
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/type-hints
@@ -444,6 +444,7 @@ dict's shape, not a single value's vocabulary.
 - **Goal:** a small graph-style agent whose state, routes and finish reasons are all closed types.
 - **Steps:** define the state as a `TypedDict` with `NotRequired` optional keys; type the router's return
   as a `Literal` of three node names; model finish reasons as a `StrEnum` and handle them in a `match`
-  ending in `assert_never`; then add a fourth route without handling it.
+  ending in `assert_never`; dispatch on the router's result with a second `match` that also ends in
+  `assert_never`; then add a fourth node name to the `Literal` without a dispatch case.
 - **Done when:** the checker fails on the unhandled route and on a misspelled state key, passes after the
   fix, and the state still serializes to JSON as a plain dict.

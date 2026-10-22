@@ -5,7 +5,8 @@ name: Representative test-case sampling
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - evals/golden-dataset
   - evals/error-analysis
@@ -16,9 +17,21 @@ related:
 ---
 
 ## TL;DR
-Choosing which real customer inputs enter the eval set so its score predicts production. Sample recent
-traffic by stratum with a floor per important stratum, then re-weight to the real mix: a trustworthy
-overall number plus enough cases per segment to act on.
+Choosing which real customer tasks enter an agent's eval set so its score predicts production. Sample
+recent sessions by stratum with a floor per important stratum, then re-weight to the real mix: a
+trustworthy headline plus enough cases per segment to act on.
+
+## For agent builders
+- **Why it matters for agents.** Agent traffic is lopsided: most sessions are short lookups, while the rare
+  long, multi-tool or write-action sessions are where agents loop, call the wrong tool or do damage. A
+  random sample barely tests them.
+- **Where it shows up in your stack.** The script that draws eval tasks from production traces, the strata
+  config (intent, tools touched, step count band, write vs read-only), and the per-stratum report your
+  eval harness prints.
+- **What you control.** The sampling unit (a whole session or task, not one step), the strata and floors,
+  dedup of templated requests, re-weighting for the headline, and the leak check against prompt examples.
+- **What you can skip.** Survey-sampling theory beyond the formulas here; stratify, floor, re-weight and
+  report intervals, and you have what an agent eval needs.
 
 ## Why it exists
 - **An eval score is an estimate of future traffic,** and an estimate is only as good as the sample behind
@@ -28,25 +41,27 @@ overall number plus enough cases per segment to act on.
   under-represent the boring bulk, so the score is pessimistic on volume and says nothing reliable about
   the mix. They are also biased toward problems the team has already seen and discussed.
 - **Simple random samples starve rare strata.** If legal-threat tickets are 2% of traffic, a 300-item
-  random sample holds about six, too few to tell 60% accuracy from 90%, though a wrong answer there is the
-  most expensive kind.
-- **Old samples go stale.** Last year's traffic misses new products, policy changes and seasonal patterns.
+  random sample holds about six, too few to tell 60% accuracy from 90%, though a wrong answer or a wrong
+  agent action there is the most expensive kind.
+- **Old samples go stale.** Last year's traffic misses new products, policy changes, new tools and seasonal patterns.
 - **What this buys:** a set faithful to production in aggregate and dense enough in the strata where
   decisions are made.
 
 ## How it works
 ### 1. Define the population and the sampling unit
-- **State exactly which traffic the system will see:** channels, products, languages, date range.
+- **State exactly which traffic the agent will see:** channels, products, languages, date range.
 - **Pull from the most recent representative window,** ideally the same period of the business cycle the
   launch will face, because traffic composition drifts and old samples encode old policies.
-- **Pick the unit deliberately:** sample conversations or documents, not turns or pages, when the system is
-  judged on the whole; cap items per account so one heavy customer cannot dominate.
+- **Pick the unit deliberately:** sample conversations, sessions or documents, not turns, steps or pages,
+  when the agent is judged on the whole task; cap items per account so one heavy customer cannot dominate.
 - **Check what the logs cannot contain.** If today's process routes legal threats straight to a phone
   team, they never reach the ticket log and no sampling scheme recovers them; fill that gap from another source.
 
 ### 2. Choose strata from the decision, not the data
 - **Strata are segments needing a separate answer:** intent or document type, customer tier, language,
   risk class, input length band, source system.
+- **Agent-specific strata:** which tools the task needs, read-only vs write action, and expected step count
+  band, because failure modes (loops, wrong tool, unsafe write) concentrate in long and write-heavy tasks.
 - **Test each one:** "if quality differed here, would we act differently?" Each stratum costs sample
   budget, so keep only those with a consequence.
 - **When nobody knows the segments yet,** cluster a large unlabelled slice by embedding, have SMEs name the
@@ -73,7 +88,8 @@ rule of three: zero failures in n items      one-sided 95% upper bound ≈ 3/n
 | Floor plus proportional | floor per important stratum first, rest by traffic | both a headline and per-stratum answers | slightly wider headline interval |
 
 ### 4. Deduplicate before sampling
-- **Logs are full of near-duplicates:** templated emails, retries, the same invoice resubmitted.
+- **Logs are full of near-duplicates:** templated emails, retries, the same invoice resubmitted, and
+  agent sessions that a client retried after a timeout.
 - **Cluster by normalised text or embedding similarity and sample clusters, not rows,** because fifty
   copies of one template make the set look large while testing one case.
 
@@ -86,14 +102,15 @@ rule of three: zero failures in n items      one-sided 95% upper bound ≈ 3/n
 - **Report per-stratum numbers with their own intervals** alongside the weighted one.
 
 ### 6. Add targeted cases as a labelled minority
-- **Known failure modes, adversarial inputs and SME-nominated edge cases belong in the suite,** tagged as a
-  separate "targeted" stratum excluded from the weighted population metric.
+- **Known failure modes, adversarial inputs (prompt injection in tool results, for agents) and
+  SME-nominated edge cases belong in the suite,** tagged as a separate "targeted" stratum excluded from
+  the weighted population metric.
 - **Mixing them in silently** makes the headline number unrepresentative.
 
 ### 7. Keep it fresh and leak-free
-- **Resample a slice each cycle** from new traffic.
+- **Resample a slice each cycle** from new traffic, especially after a new tool ships.
 - **Keep a holdout** nobody tunes against.
-- **No sampled case** may also appear as a prompt example or in a fine-tuning set.
+- **No sampled case** may also appear as a prompt example, in retrieval content or in a fine-tuning set.
 
 ## Diagram
 Floors make rare strata measurable; re-weighting by traffic share turns the oversampled set back into a
@@ -101,7 +118,7 @@ production estimate. Targeted cases stay out of the headline.
 
 ```mermaid
 flowchart TD
-    A["Recent production window"] --> B["Deduplicate into clusters"]
+    A["Recent agent sessions"] --> B["Deduplicate into clusters"]
     B --> C["Assign strata from the decision"]
     C --> D["Floor per important stratum"]
     D --> E["Rest of budget by traffic share"]
@@ -114,9 +131,9 @@ flowchart TD
 
 ## Examples
 ### Stratified sample with floors, then re-weighting
-Ticket triage for a telecom customer. Of 10,000 recent tickets, 9,000 are billing, 800 cancellation and
-200 legal threats (illustrative mix). The budget is 300 SME-labelled items, with a floor of 60 per
-stratum so the rare one is measurable.
+Ticket triage agent for a telecom customer. Of 10,000 recent tickets, 9,000 are billing, 800
+cancellation and 200 legal threats (illustrative mix). The budget is 300 SME-labelled items, with a
+floor of 60 per stratum so the rare one is measurable.
 
 ```python
 import random, math
@@ -171,6 +188,28 @@ Reading the result:
 | legal: 62 items near 60% | roughly ±12 points: enough to know it is far below billing and must be fixed before launch |
 | proportional 300-item sample | would have held about six legal tickets |
 
+### Agent strata from traces: tools touched and write actions
+The same `stratified_sample` works on agent sessions when the key reads the trace. Here the stratum is
+whether the agent needed a write tool and how many steps the session took (illustrative counts).
+
+```python
+def agent_stratum(session):
+    writes = any(c in {"issue_refund", "cancel_plan"} for c in session["tool_calls"])
+    band = "long" if len(session["tool_calls"]) > 6 else "short"
+    return f"{'write' if writes else 'read'}-{band}"
+
+sessions = ([{"tool_calls": ["get_account"]}] * 8500
+            + [{"tool_calls": ["get_account"] * 8}] * 900
+            + [{"tool_calls": ["get_account", "issue_refund"]}] * 500
+            + [{"tool_calls": ["get_account"] * 7 + ["cancel_plan"]}] * 100)
+sample, w = stratified_sample(sessions, key=agent_stratum, budget=300, floor=50)
+print({s: sum(t == s for t, _ in sample) for s in w})
+# {'read-short': 135, 'read-long': 59, 'write-short': 55, 'write-long': 51}
+```
+
+- **Why it matters:** write-long sessions are 1% of traffic but hold most of the costly failures; a
+  proportional 300-item sample would contain about three.
+
 ### Deduplicate by cluster before drawing
 A crude but runnable version: normalise digits and whitespace, keep one representative per cluster and
 its size, so the size can weight the population metric later. Production versions use embedding similarity.
@@ -203,12 +242,12 @@ for row, size in sample_clusters(rows, k=3):
 - **Versioned sampling frame.** Write the population filter (channels, products, languages, date window),
   strata, floors and random seed into a config file checked in beside the eval set, so any customer's set
   can be redrawn and audited. Monitor that each refresh reproduces the documented counts per stratum.
-- **Per-stratum report as the default view.** Every eval run prints count, pass rate and 95% interval
-  per stratum, then the weighted headline with its own interval. Alert when a stratum's interval is wider
-  than the threshold gap the decision needs.
-- **Rolling refresh from new traffic.** Each cycle, draw a fresh slice with the same frame and replace the
-  oldest items, keeping the holdout fixed. Monitor the strata mix of production against the set and
-  investigate when a stratum's traffic share shifts.
+- **Per-stratum report as the default view.** Every agent eval run prints count, pass rate and 95%
+  interval per stratum, then the weighted headline with its own interval. Alert when a stratum's interval
+  is wider than the threshold gap the decision needs.
+- **Rolling refresh from new traffic.** Each cycle, draw a fresh slice of sessions with the same frame and
+  replace the oldest items, keeping the holdout fixed. Monitor the strata mix of production against the
+  set and investigate when a stratum's traffic share shifts, for example after a new tool launches.
 - **Leak check before every run.** Hash normalised inputs and compare against prompt examples, retrieval
   content and fine-tuning data; fail the run on any overlap. Monitor the overlap count, which should be zero.
 - **Coverage gap audit.** Ask operations which case types bypass the log (phone, email to a named team,
@@ -239,10 +278,12 @@ for row, size in sample_clusters(rows, k=3):
   complaints about a case type that never appeared in the eval set.
 - **Sampling from a period before a policy or product change.** Symptom: SMEs relabel many items as "no
   longer how we do it".
+- **Sampling agent steps instead of sessions.** Symptom: the eval passes on individual tool calls while
+  whole tasks fail, because errors that compound across steps are never scored.
 
 ## When to use
-- **Use stratified, re-weighted sampling** whenever an eval set will inform a ship decision or be quoted
-  to a customer, and whenever traffic has rare segments with a high cost of error.
+- **Use stratified, re-weighted sampling** whenever an agent eval set will inform a ship decision or be
+  quoted to a customer, and whenever traffic has rare segments with a high cost of error.
 - **Simple random sampling is fine** for a quick health check on homogeneous traffic.
 - **Decide strata with the business owner** at the same time as acceptance criteria, because they define
   where thresholds apply.
@@ -276,6 +317,12 @@ sampling; if not, I would look at grading differences between eval and productio
 - **Rare strata are often the expensive ones,** so the sample is weakest exactly where errors cost most.
 - **Fix:** floors on important strata, then re-weight by traffic share for the headline.
 
+### How would you stratify an eval set for a support agent that can issue refunds?
+- **Stratify on behaviour, not only intent:** read-only vs write-action sessions and a step-count band,
+  because unsafe writes and loops concentrate in rare long, write-heavy sessions.
+- **Floor the write strata** so they are measurable, and use the rule of three if the bar is "no wrong refunds".
+- **Sample whole sessions** from traces and re-weight to the traffic mix for the headline task success rate.
+
 ### Your eval is oversampled on rare intents. How do you report one production accuracy number?
 - **Weight each stratum by its traffic share:** p̂ = Σ W_h·p_h, not the plain average over sampled items.
 - **Give its uncertainty:** standard error √(Σ W_h²·p_h(1−p_h)/n_h), which is dominated by the bulk stratum.
@@ -286,10 +333,10 @@ sampling; if not, I would look at grading differences between eval and productio
 - **So you need roughly 300 clean items in that stratum;** 50 clean items only bound it at about 6%.
 - **Budget it explicitly,** because 300 SME-labelled items in one stratum is a real cost to agree with the sponsor.
 
-### The eval said 94% but production QA measures 86% a month after launch. How do you debug it?
+### The agent eval said 94% but production QA measures 86% a month after launch. How do you debug it?
 - **Compare the strata mix** of the eval set against the launch-period traffic, and check for new intents,
-  products or policy changes since the sampling window.
-- **Look for traffic the log never held:** case types routed elsewhere before launch now reach the system.
+  products, tools or policy changes since the sampling window.
+- **Look for traffic the log never held:** case types routed elsewhere before launch now reach the agent.
 - **Check grading:** confirm eval graders and production QA apply the same rubric before blaming sampling.
 
 ### When would you choose Neyman allocation over floors plus proportional?
@@ -322,3 +369,22 @@ sampling; if not, I would look at grading differences between eval and productio
 - [ ] Deduplication guarantees the set matches production traffic
 > Fifty copies of a templated email are one test case wearing fifty labels. Sampling clusters gives more
 > distinct behaviours per expert label; re-weighting by cluster size restores the population view.
+
+## Use cases & projects
+### Use cases
+- **Pre-launch eval for a support agent.** Floors on refund and cancellation sessions make the risky,
+  write-action strata measurable before go-live.
+- **Tracking agent quality after a new tool ships.** A fresh stratified slice catches the new task types
+  the old eval set never contained.
+- **Quoting one number to a customer.** A re-weighted task success rate with an interval, backed by
+  per-stratum results the team acts on.
+- **Sizing SME labelling budgets.** Floors and the rule of three turn "how many cases?" into expert-hours.
+
+### Mini project
+**Stratify an agent eval set from traces (1-2 hours).**
+- **Goal:** draw a representative eval set from synthetic agent sessions and show why re-weighting matters.
+- **Steps:** generate 10,000 fake sessions with tool-call lists; define `agent_stratum`; dedupe templated
+  requests; draw 300 with a floor of 50; assign made-up pass rates per stratum; compute the unweighted
+  average, the weighted estimate and per-stratum intervals.
+- **Done when:** a table shows per-stratum counts and intervals, the gap between unweighted and weighted
+  numbers, and how many write-long sessions a proportional sample would have held.

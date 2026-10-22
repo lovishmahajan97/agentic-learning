@@ -5,7 +5,7 @@ name: NFRs (non-functional requirements)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - system-design/trade-off-analysis
@@ -450,6 +450,6 @@ only hard cases to the expensive model, and to attach a cost to any tightening o
 - **Steps:** pick a small tool-calling agent; write NFRs for task success, run time p95, cost per
   successful task, step cap and injection resistance, each with metric, target, method, condition and
   enforcement point; build a 30-case golden set; script a run that reports task success with its
-  interval, run-time p95, cost per successful task and runs hitting the cap.
+  interval (expect it to be wide, about ±11 points at p = 0.90, which is the lesson), run-time p95, cost per successful task and runs hitting the cap.
 - **Done when:** the script exits non-zero when any NFR fails, you can show one prompt change that the
   gate catches, and the register says which NFR drove each design choice.

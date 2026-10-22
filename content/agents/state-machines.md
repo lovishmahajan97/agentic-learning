@@ -5,7 +5,7 @@ name: State machines
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/agent-loop
@@ -424,7 +424,9 @@ NEEDS_HUMAN state for approvals.
 - **Goal:** build a small agent whose phases, tools and guards live in a table, and prove it resumes
   safely.
 - **Steps:** implement the six-state machine from the example with fake `edit_file` and `run_tests`
-  tools; store checkpoints in SQLite; add the reachability and guard-coverage tests; kill the process
-  mid-APPLY and restart it with the same `run_id`.
-- **Done when:** the CI-style tests pass, a scripted "test, pass, edit, finish" attempt is rejected, and
-  the resumed run reaches DONE with the fake edit applied exactly once.
+  tools; store checkpoints in SQLite, including the pending call before it executes (the production fix
+  the example notes); add the reachability and guard-coverage tests; kill the process mid-APPLY and
+  restart it with the same `run_id`.
+- **Done when:** the CI-style tests pass; a scripted run where `run_tests` fails and the model calls
+  `finish` is rejected by the guard; an `edit_file` call in VERIFY is rejected before it executes; and
+  the resumed run replays the checkpointed call and reaches DONE with the fake edit applied exactly once.

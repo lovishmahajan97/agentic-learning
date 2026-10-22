@@ -5,7 +5,7 @@ name: TPOT (time per output token)
 kind: metric
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - serving-inference/ttft
@@ -142,7 +142,8 @@ step_time ≥ (weight_bytes + Σ kv_bytes_per_sequence) / memory_bandwidth
 - **Hidden reasoning counts.** Reasoning tokens are decoded at the same TPOT even when the user never
   sees them, which is why an agent step with a large thinking budget can be slow with a tiny visible output.
 - **The cheapest lever is fewer tokens.** Terse tool-call formats, capped intermediate outputs and
-  routing simple steps to a smaller, faster model beat any serving tweak.
+  routing simple steps to a smaller, faster model usually save more than serving tweaks, and need no
+  hardware change.
 
 ## Diagram
 One decode step, which every output token of every agent call passes through: the weight read is

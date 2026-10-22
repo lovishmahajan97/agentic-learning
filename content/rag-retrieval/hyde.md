@@ -5,7 +5,7 @@ name: HyDE (Hypothetical Document Embeddings)
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - rag-retrieval/query-rewriting
@@ -405,8 +405,8 @@ prompt, invented details get cited. Keep it as a search key only.
   label-free way to try lifting recall.
 - **Fallback on weak first-pass results.** Teams run HyDE only when the plain search scores low, so the
   extra generation is paid on a minority of calls.
-- **Agents that already draft answers.** The agent can pass its own draft as a search argument, reusing a
-  generation it has already paid for.
+- **Agents that already draft answers.** The agent can pass its own draft as a search argument, so the
+  hypothetical costs a few output tokens in the same call instead of a separate generation round trip.
 
 ### Mini project
 **HyDE as a fallback inside an agent's search tool (1-2 hours).**

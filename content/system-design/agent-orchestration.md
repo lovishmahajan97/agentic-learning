@@ -5,7 +5,7 @@ name: Agent orchestration
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/workflows-vs-agents
@@ -129,8 +129,8 @@ reimplements them differently.
 | State | a typed state (TypedDict or Pydantic) | the conversation plus context object | workflow variables |
 | Node | a function added with `add_node` | the model loop, a tool, or a hand-off target | an activity |
 | Router | `add_conditional_edges` | the model's tool or hand-off choice | ordinary workflow code |
-| Persistence | a checkpointer keyed by `thread_id` | usually yours to add | event history, replayed |
-| Human wait | `interrupt()` then `Command(resume=...)` | usually yours to add | a signal the workflow awaits |
+| Persistence | a checkpointer keyed by `thread_id` | session or conversation history at most; durable run checkpoints usually yours to add | event history, replayed |
+| Human wait | `interrupt()` then `Command(resume=...)` | tool-approval hooks in some SDKs; waits of hours usually yours to add | a signal the workflow awaits |
 
 - **LangChain is not the orchestrator.** It supplies model, retriever and tool integrations that nodes
   call; LangGraph (or your own loop) owns the control flow, and LangSmith traces it.
@@ -294,15 +294,15 @@ print(len(asyncio.run(fan_out(append_reducer))["findings"]))    # 3
   stable `thread_id` per run in the config. Monitor run counts by status and runs with no checkpoint
   write for longer than their expected duration.
 - **Approval as an interrupt, resumed by event.** Pause in the approval node (LangGraph offers an
-  `interrupt()` call, resumed later by invoking the graph with `Command(resume=...)` on the same thread), return immediately, and resume from the
-  approval service's event. Monitor time spent waiting, approval and rejection rates, and expired
-  approvals.
+  `interrupt()` call, resumed later by invoking the graph with `Command(resume=...)` on the same
+  thread), return immediately, and resume from the approval service's event. Monitor time spent
+  waiting, approval and rejection rates, and expired approvals.
 - **Declared reducers for every fan-out field.** Any state key written by parallel branches gets an
   explicit merge rule, for example `Annotated[list, operator.add]` in a LangGraph state type. Monitor in
   tests: assert the joined result contains one entry per branch.
 - **Idempotency keys on every side-effecting node.** Derive the key from run id and node (for
-  example `f"{run_id}:send"`) and pass it to the downstream API, because node execution is at-least-once. Monitor
-  duplicate side effects detected by the downstream system.
+  example `f"{run_id}:send"`) and pass it to the downstream API, because node execution is
+  at-least-once. Monitor duplicate side effects detected by the downstream system.
 - **Per-run event stream to clients and traces.** Stream node started, tool result, waiting and done
   events to the UI (for example over server-sent events) and to tracing under the run id. Alert on
   running runs whose last event is older than a threshold you set: they are stuck.

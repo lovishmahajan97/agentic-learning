@@ -104,7 +104,8 @@ RFC 8259 defines six types: object, array, string, number, `true`/`false`, `null
 5. **Compress** with `gzip.open(path, "wt")` for `.jsonl.gz`; line semantics are unchanged.
 
 ### Three details that decide crash isolation
-- **What counts as a line.** Iterating a text file splits only on `\n` (and `\r\n`), which is what JSONL
+- **What counts as a line.** Iterating a text file splits only on real line endings (`\n`, `\r\n`, and a
+  lone `\r` in default text mode), all of which encoders escape inside strings, so that is what JSONL
   means. `str.splitlines()` also splits on U+2028 and U+0085, which `json.dumps(..., ensure_ascii=False)`
   leaves unescaped inside strings, so `text.splitlines()` can cut a valid record in half. Iterate the
   file, or split on `"\n"` explicitly.
@@ -221,8 +222,38 @@ for case in read_jsonl(p):                             # one record in memory at
 
 ### Worked scenario: a resumable agent eval run that survives a torn last line
 A worker runs the agent on each case, appends one result per `custom_id`, and can be killed at any time.
-On restart, a `resume` step reads the file in binary, stops at a line with no trailing `\n`, truncates
-the file to the last complete line, and returns the finished IDs; the run then skips those and appends.
+On restart it drops a torn tail, skips finished IDs and appends the rest.
+
+```python
+import json
+from pathlib import Path
+
+def resume(path: Path) -> set[str]:
+    done, good_bytes = set(), 0
+    if not path.exists():
+        return done
+    with path.open("rb") as f:
+        for raw in f:                          # binary iteration splits on b"\n" only
+            if not raw.endswith(b"\n"):        # torn last line: writer died mid-record
+                break
+            if raw.strip():                    # a bad *complete* line is real corruption: let it raise
+                done.add(json.loads(raw)["custom_id"])
+            good_bytes += len(raw)
+    with path.open("r+b") as f:
+        f.truncate(good_bytes)                 # cut the torn tail before appending again
+    return done
+
+def run_eval(cases, out: Path, run_agent):
+    done = resume(out)
+    with out.open("a", encoding="utf-8") as f:
+        for case in cases:
+            if case["custom_id"] in done:
+                continue                       # finished: do not pay for it twice
+            result = run_agent(case)           # several model and tool calls
+            f.write(json.dumps({"custom_id": case["custom_id"], **result},
+                               ensure_ascii=False, allow_nan=False) + "\n")
+            f.flush()                          # durability matches progress
+```
 
 | Event | Effect on `results.jsonl` |
 |---|---|
@@ -390,7 +421,7 @@ results feed analytics, convert the finished JSONL to Parquet.
   outputs are JSONL, one request or example per line.
 
 ### Mini project
-**A resumable JSONL trace logger for an agent (1-2 hours).**
+**A strict JSONL trace logger for an agent (1-2 hours).**
 - **Goal:** log every step of a small tool-calling agent to JSONL safely enough that bad values fail at
   write time, not at analysis time.
 - **Steps:** write a logger that serializes with `allow_nan=False` and a `default=` hook for datetimes

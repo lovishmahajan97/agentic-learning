@@ -5,7 +5,7 @@ name: Agentic architecture
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/agent-loop
@@ -234,6 +234,9 @@ What the sketch leaves out, so you do not copy it as-is:
   catch the error and return it like the unknown-tool case, so the model can fix its arguments.
 - **One status covers two caps.** Hitting `max_steps` and hitting `budget_usd` both record
   `budget_exhausted`; record them separately if you alert on them separately.
+- **Resume leaves a stale status.** The loaded state still says `awaiting_approval` while the resumed run
+  executes; set it back to running when you pop `pending`, and add a rejection path that records the
+  denial as an observation instead of leaving the run paused forever.
 
 ### Walking one run through the runtime
 | Step | What happens | Status after |

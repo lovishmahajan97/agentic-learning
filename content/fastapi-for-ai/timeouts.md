@@ -5,7 +5,7 @@ name: Timeouts
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - fastapi-for-ai/shared-httpx-asyncclient
@@ -128,16 +128,15 @@ known errors: phase timeouts per call, one run deadline, innermost first.
 
 ### The timeouts people forget
 - **Postgres:** a `statement_timeout` (or the driver's command timeout), so a bad query plan can't hold
-  a pool connection for minutes.
+  a pool connection for minutes. Set it per connection (asyncpg accepts it through `server_settings`, and
+  `command_timeout` bounds the client side), so a SQL tool an agent calls cannot outlive the run. Monitor
+  pool wait time and statements cancelled by timeout.
 - **Redis:** a socket timeout on the client.
 - **Pools and semaphores:** a timeout on acquiring a pool connection or a semaphore slot.
 - **Queues:** a deadline on queue `get` calls.
 - **Service-to-service:** pass the remaining budget along so the downstream service doesn't start work
   its caller has already abandoned. gRPC does this natively with deadlines; over HTTP a header carrying
   the remaining milliseconds works, relative so that clock skew between hosts doesn't matter.
-- **Database at the pool:** set Postgres `statement_timeout` per connection (asyncpg accepts it through
-  `server_settings`, and `command_timeout` bounds the client side), so a SQL tool an agent calls cannot
-  hold a pool connection past the run. Monitor pool wait time and statements cancelled by timeout.
 
 ### Budgets for an agent loop
 An agent request is a loop, so it needs limits a single call does not:
@@ -293,11 +292,12 @@ async def run_agent(llm, tools: dict, messages: list) -> str:
                 if left() < FINAL_TURN_RESERVE:            # keep time for the answer
                     result = {"error": "budget exhausted, answer with what you have"}
                 else:
+                    limit = min(TOOL_TIMEOUT, left() - FINAL_TURN_RESERVE)
                     try:
-                        async with asyncio.timeout(min(TOOL_TIMEOUT, left() - FINAL_TURN_RESERVE)):
+                        async with asyncio.timeout(limit):
                             result = await tools[call["name"]](**call["args"])
                     except TimeoutError:                   # tool timeout becomes data for the model
-                        result = {"error": f"{call['name']} timed out after {TOOL_TIMEOUT}s"}
+                        result = {"error": f"{call['name']} timed out after {limit:.1f}s"}
                 messages.append({"role": "tool", "tool_call_id": call["id"],
                                  "content": json.dumps(result)})
     return "stopped: step limit reached"

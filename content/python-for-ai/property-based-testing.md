@@ -5,7 +5,7 @@ name: Property-based testing (Hypothesis)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - python-for-ai/pytest
@@ -126,7 +126,7 @@ failing input remains.
 ```mermaid
 flowchart TD
     S["@given test starts"] --> DB[(".hypothesis/ example database")]
-    DB -->|"replay saved failures first"| G["Generate input from strategies, edge cases over-sampled"]
+    DB -->|"replay saved failures first"| G["Generate edge-biased input"]
     G --> R["Run the property"]
     R -->|"passes"| N{"Reached max_examples?"}
     N -->|"no"| G
@@ -135,7 +135,7 @@ flowchart TD
     SH -->|"still fails, keep it"| SH
     SH -->|"no simpler failure found"| M["Report minimal counterexample"]
     M -->|"save for next run"| DB
-    M --> E["Pin it with @example or a named regression test"]
+    M --> E["Pin it with @example"]
 ```
 
 ## Examples

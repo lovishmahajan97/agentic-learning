@@ -5,7 +5,7 @@ name: Chunking strategies (fixed, recursive, semantic)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - rag-retrieval/chunk-overlap
@@ -106,8 +106,10 @@ Every splitter answers three questions:
 
 - **Illustrative run, six transcript sentences:** consecutive similarities 0.81, 0.78, 0.34, 0.80, 0.76.
   The drop to 0.34 between sentences 3 and 4 stands out, so a percentile rule (break on the largest few
-  percent of distances, distance = 1 − similarity) yields two chunks of three sentences. In code, the
-  `sims` list comes from sentence embeddings and the cut is a percentile of `1 - s` over it.
+  percent of distances, distance = 1 − similarity) yields two chunks of three sentences.
+- **The arithmetic:** in code, the `sims` list comes from sentence embeddings and each distance is
+  `1 - s`: 0.19, 0.22, 0.66, 0.20, 0.24. A 95th-percentile cut over those five lands on 0.66, so the
+  only boundary falls before sentence 4.
 - **The rule is relative on purpose.** Absolute cosine levels differ by embedding model, so a fixed
   threshold such as 0.5 that works under one model splits everywhere or nowhere under another. A
   percentile of the document's own distances still cuts at the largest drop after a model swap, as long
@@ -208,8 +210,8 @@ def search_docs(query: str, k: int = 5, budget_tokens: int = 2000) -> str:
         m = h.metadata
         block = f"[{m['doc_id']}#{m['position']}] {m['heading_path']}\n{h.text}"
         cost = count_tokens(block)             # same tokenizer family as the agent model
-        if used + cost > budget_tokens:
-            break                              # keep later agent steps room to think
+        if out and used + cost > budget_tokens:
+            break                              # always return the top hit, then stop at the budget
         out.append(block); used += cost
     if not out:
         return "No matching passages. Try a more specific query or another tool."

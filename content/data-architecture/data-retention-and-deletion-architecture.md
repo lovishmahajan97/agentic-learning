@@ -5,7 +5,8 @@ name: Data retention & deletion architecture
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - data-architecture/data-lineage
   - rag-retrieval/freshness-document-deletion-index-consistency
@@ -21,9 +22,23 @@ sources:
 ---
 
 ## TL;DR
-LLM apps copy user data into logs, traces, indexes, caches, eval and training sets, vendor logs and
-weights. This architecture inventories every copy, gives each a retention class and TTL, and executes
-deletion across all of them with proof, designed in from the start.
+Agents copy user data into traces, memories, checkpoints, indexes, caches, eval and training sets, vendor
+logs and weights. This architecture inventories every copy, gives each a retention class and TTL, and
+executes deletion across all of them with proof, designed in from the start.
+
+## For agent builders
+- **Why it matters for agents.** An agent persists far more than a chat app: long-term memories,
+  durable-execution checkpoints of in-flight runs, tool results written to scratchpads, full traces of
+  every tool call. Each is a copy of user data that an erasure request must reach, and several never
+  expire on their own.
+- **Where it shows up in your stack.** The memory store your agent framework writes to, the checkpoint or
+  state store behind long-running runs, the tracing backend, the semantic cache, the vector index, eval and
+  fine-tuning sets built from traces, and the model provider's request logs.
+- **What you control.** The `subject_id` and `tenant_id` on every memory, checkpoint, vector and trace;
+  redaction before traces are written; the TTL per store; the deletion job with receipts; and whether
+  personal data ever enters fine-tuning.
+- **What you can skip.** Machine unlearning research and the fine print of every privacy regime. Know the
+  one-month GDPR deadline, legal holds, and that weights cannot be edited; design around those.
 
 ## Why it exists
 - **Law and contracts bound retention.** GDPR's right to erasure, similar rights under CCPA and other
@@ -31,42 +46,44 @@ deletion across all of them with proof, designed in from the start.
   and deleted on request within a bounded time. Under GDPR a response is due without undue delay and within
   one month, extendable by two further months for complex requests.
 - **The classic model does not fit.** For a web app, data lives in a database with backups, and deletion is
-  a `DELETE` plus a backup expiry policy. An AI application breaks that model.
+  a `DELETE` plus a backup expiry policy. An AI application, and an agent most of all, breaks that model.
 - **One conversation, eight persisted copies.** The message (name, order number) goes to the application
   database; into a prompt; to a vendor whose API logs it; into a trace with full prompt and completion; into
   a memory vector; into a semantic-cache entry; into a weekly eval set; into a fine-tuning dataset; and
-  partially into model weights.
+  partially into model weights. Agents add checkpoints and tool scratchpads on top.
 - **Spread across owners and companies.** Setting aside the transient prompt, that is eight persisted
   copies in eight systems, owned by several teams, with at least one (vendor logs) outside the company, two
   if observability is hosted.
 - **"Delete the primary and let the rest expire" fails,** because several copies have no expiry (vector
-  index, fine-tuning dataset, weights), and those that do often expire too late for the request deadline.
-- **"Never store anything" fails,** because observability, evaluation and improvement all depend on
-  retaining interactions. Retention must be a per-copy decision, and deletion a traversal that reaches every
-  copy.
+  index, agent memory, fine-tuning dataset, weights), and those that do often expire too late for the
+  request deadline.
+- **"Never store anything" fails,** because observability, evaluation, agent memory and improvement all
+  depend on retaining interactions. Retention must be a per-copy decision, and deletion a traversal that
+  reaches every copy.
 
 ## How it works
 ### Inventory and classify every copy
 - **Map where data lands.** For each store record the data classes it holds (user content, derived content
-  such as embeddings and summaries, operational metadata, aggregate metrics), whether it is keyed by a
-  subject identifier, and who owns it.
+  such as embeddings, summaries and memories, operational metadata, aggregate metrics), whether it is keyed
+  by a subject identifier, and who owns it.
 - **Sources of the map:** the lineage system supplies most of it for derived data; the rest (vendor logs,
-  caches, backups) is documented by hand.
+  caches, backups, agent checkpoints) is documented by hand.
 - **Why classify:** retention is set per class. An aggregate latency metric can live for years; a raw prompt
   with a customer's address should not.
 
 ### Retention classes and TTLs
 - **Each store gets a policy:** a time-to-live after which data is deleted automatically, or "retain while
   the relationship exists".
-- **Derived data inherits the shortest TTL of its inputs,** *because* an embedding of a deleted message is
-  still a representation of it.
+- **Derived data inherits the shortest TTL of its inputs,** *because* an embedding or memory summary of a
+  deleted message is still a representation of it.
 - **Enforce TTLs mechanically:** database partitions dropped by date, object storage lifecycle rules, vector
-  collections partitioned by ingestion month, trace stores with built-in retention. Policy that depends on
-  someone remembering to run a cleanup is not a policy.
+  collections partitioned by ingestion month, trace stores with built-in retention, checkpoint stores that
+  purge completed runs. Policy that depends on someone remembering to run a cleanup is not a policy.
 
 ### Retention minimums and legal holds
 - **Retention has a floor as well as a ceiling.** Some data must be kept for a minimum period (financial
-  records, security audit logs, records a regulator requires).
+  records, security audit logs, records a regulator requires). An audit log of the consequential actions an
+  agent took can fall here.
 - **Legal holds** from litigation can freeze data that would otherwise expire or be erased.
 - **Erasure has exceptions.** GDPR's erasure right excludes, among others, data needed to comply with a legal
   obligation or to establish or defend legal claims.
@@ -81,8 +98,8 @@ deletion across all of them with proof, designed in from the start.
 ### Deletion as a propagated job
 A deletion request (one subject, one tenant, or one document) becomes a job that:
 1. Resolves the subject to identifiers in every store, using lineage to find derived artifacts: the
-   document's chunks, their vectors, cache entries that embedded them, eval examples sampled from them,
-   fine-tuning rows that include them.
+   document's chunks, their vectors, cache entries that embedded them, agent memories that quote them, eval
+   examples sampled from them, fine-tuning rows that include them.
 2. Issues deletes to each store, idempotently, with retries, and records a per-store receipt.
 3. Verifies by re-querying each store for the identifiers.
 4. Writes a tombstone so re-ingestion from a still-live source does not resurrect the data, and so a
@@ -99,6 +116,7 @@ A deletion request (one subject, one tenant, or one document) becomes a job that
 | Traces and logs | redact PII before the trace is written, or key by subject with a short retention | redaction at write time is the more robust choice |
 | Backups, immutable stores | short rotation plus a deletion log, or crypto-shredding | you cannot delete one row from a backup |
 | Summaries and memories | record source conversations and subjects; delete or regenerate on erasure | one summary can blend several people's data |
+| Agent checkpoints and scratchpads | key by run and subject; purge on run completion plus a short TTL | paused or failed runs can sit in the store indefinitely |
 | Training datasets | rows carry subject or tenant identifiers | the snapshot digest changes, which flows into provenance |
 | Model weights | keep deletable data out, time-box models, or retrain | cannot delete from weights |
 
@@ -112,6 +130,7 @@ A deletion request (one subject, one tenant, or one document) becomes a job that
   confirm the approach with your privacy counsel.
 - **Summaries and memories:** an LLM-written summary or agent memory is a new document that cannot be
   filtered row by row, so erasing one subject means deleting it or regenerating it from the remaining inputs.
+  Shared memories (a team's agent remembering a meeting) need every participant recorded.
 - **Model weights:** machine unlearning techniques exist but are not reliable enough to certify. The
   architectural answers: keep deletable data out of training (redact, or train only on data with consent
   terms that survive deletion requests); time-box models so a retrain on the cleaned dataset happens within
@@ -129,16 +148,16 @@ A deletion request (one subject, one tenant, or one document) becomes a job that
   can produce it accurately.
 
 ## Diagram
-An erasure request fans out to every store found by inventory and lineage; holds are checked first, and only
-verified deletes count toward a complete receipt.
+An erasure request fans out to every store found by inventory and lineage, agent memory and checkpoints
+included; holds are checked first, and only verified deletes count toward a complete receipt.
 
 ```mermaid
 flowchart TD
     R["Erasure request for subject"] --> H{"On legal hold?"}
     H -->|"yes"| HR["Skip, report as held"]
     H -->|"no"| L["Resolve ids via inventory and lineage"]
-    L --> S1[("App DB and traces")]
-    L --> S2[("Vectors and caches")]
+    L --> S1[("App DB, traces, checkpoints")]
+    L --> S2[("Memories, vectors, caches")]
     L --> S3[("Eval and training sets")]
     L --> S4["Backup keys: crypto-shred"]
     S1 --> V{"Re-query: all gone?"}
@@ -150,6 +169,42 @@ flowchart TD
 ```
 
 ## Examples
+### Agent memory that can be forgotten
+Every memory records its subjects and source conversations. Erasing a subject deletes memories only about
+them and regenerates shared ones from what remains; the `summarize` call is a stand-in for an LLM.
+
+```python
+memories = {
+    "m1": {"subjects": {"u42"}, "sources": ["conv-1"], "text": "u42 prefers email, order 991."},
+    "m2": {"subjects": {"u42", "u7"}, "sources": ["conv-2", "conv-3"],
+           "text": "Team call: u42 and u7 agreed the launch slips a week."},
+    "m3": {"subjects": {"u7"}, "sources": ["conv-4"], "text": "u7 works in Berlin."},
+}
+conversations = {"conv-2": {"subject": "u42"}, "conv-3": {"subject": "u7"}}
+
+def summarize(conv_ids: list[str]) -> str:          # stand-in for an LLM regeneration call
+    return f"regenerated from {conv_ids}"
+
+def forget(subject: str) -> dict:
+    report = {"deleted": [], "regenerated": []}
+    for mid, m in list(memories.items()):
+        if subject not in m["subjects"]:
+            continue
+        remaining = [c for c in m["sources"] if conversations.get(c, {}).get("subject") != subject]
+        if m["subjects"] == {subject} or not remaining:
+            del memories[mid]; report["deleted"].append(mid)
+        else:                                       # shared memory: rebuild without the subject
+            m.update(text=summarize(remaining), sources=remaining, subjects=m["subjects"] - {subject})
+            report["regenerated"].append(mid)
+    report["verified"] = not any(subject in m["subjects"] for m in memories.values())
+    return report
+
+print(forget("u42"))   # {'deleted': ['m1'], 'regenerated': ['m2'], 'verified': True}
+```
+
+The same pattern applies to checkpoints of in-flight agent runs: key them by subject, and either finish and
+purge the run or delete its state as part of the erasure job.
+
 ### A deletion orchestrator with retries, verification and receipts
 It fans out over registered stores, retries, verifies, and produces a receipt. Stores are small stand-ins;
 the shape of the job is what matters.
@@ -206,7 +261,7 @@ quietly closed. In production the store list comes from the inventory, and the d
 from a forward lineage traversal rather than a per-store scan.
 
 ### Worked scenario: does expiry alone meet a one-month deadline?
-An inventory for the support assistant above, with illustrative TTLs. The deadline is the GDPR one month.
+An inventory for a support agent with memory, with illustrative TTLs. The deadline is the GDPR one month.
 
 | Store | TTL | Expiry meets deadline? | Action on erasure |
 |---|---|---|---|
@@ -222,6 +277,8 @@ An inventory for the support assistant above, with illustrative TTLs. The deadli
 
 - **Reading it:** five stores need explicit action and one needs a retrain. Shortening the backup rotation
   well under one month, or crypto-shredding, removes one more row of manual work.
+- **Agent-specific rows to add:** durable-execution checkpoints for paused runs (purge on completion plus a
+  short TTL) and tool scratchpad files (key by run and subject).
 
 ### Production snippet: TTL by lifecycle rule
 Object storage enforces the trace-export TTL mechanically, so nobody has to remember a cleanup job.
@@ -240,27 +297,29 @@ Object storage enforces the trace-export TTL mechanically, so nobody has to reme
 ```
 
 ## Production patterns
-- **Redact before the trace is written.** Use whenever full prompts reach observability. Run a PII detector
-  (Microsoft Presidio is a common open-source choice) in the app or in an OpenTelemetry Collector processor
-  that deletes or hashes span attributes, so the trace store holds nothing deletable. Monitor the detector's
-  hit rate and sample traces for missed PII.
+- **Redact before the trace is written.** Use whenever full prompts and tool results reach observability.
+  Run a PII detector (Microsoft Presidio is a common open-source choice) in the app or in an OpenTelemetry
+  Collector processor that deletes or hashes span attributes, so the trace store holds nothing deletable.
+  Monitor the detector's hit rate and sample traces for missed PII.
 - **Mechanical TTLs per store.** Use for every store with a retention class. S3-style lifecycle expiration
   rules for exports, time-partitioned Postgres tables dropped by date (`DROP TABLE` on the old partition),
   and the trace backend's own retention setting. Monitor the number of stores with no automated TTL; the
   target is zero outside "retain while relationship exists".
+- **Subject-keyed agent memory and checkpoints.** Use for any agent with long-term memory or durable runs.
+  Store `subject_id`, `tenant_id` and source conversation ids on every memory and checkpoint, expose a
+  `forget(subject)` path the erasure job calls, and purge checkpoints of completed runs. Monitor memories
+  and checkpoints with no subject id, and the age of the oldest paused run.
 - **Metadata-keyed vector deletes plus scheduled rebuilds.** Use for every RAG or memory index. Store
   `subject_id`, `tenant_id` and `document_id` on each point and delete by filter (Qdrant deletes points by
   payload filter; in pgvector it is a plain `DELETE ... WHERE subject_id = ...` followed by vacuum). Rebuild
   or compact on a schedule so soft-deleted vectors leave disk. Monitor deleted-but-not-compacted counts.
-- **Per-tenant envelope encryption.** Use for multi-tenant enterprise products. Each tenant's data key is
-  wrapped by a KMS key; offboarding deletes the tenant's key, shredding backups and logs. Monitor key-to-tenant
-  coverage and key deletion events.
-- **Tombstone check at ingestion.** Use wherever a crawl or sync can re-read deleted data. Ingestion computes
-  the keyed hash of each record's subject and skips matches. Monitor tombstone hits per sync; hits mean the
-  source still holds the data and the owner should be told.
+- **Per-tenant envelope encryption and tombstones.** Each tenant's data key is wrapped by a KMS key;
+  offboarding deletes the tenant's key, shredding backups and logs. Ingestion computes the keyed hash of
+  each record's subject and skips tombstoned matches. Monitor key-to-tenant coverage and tombstone hits per
+  sync; hits mean the source still holds the data and the owner should be told.
 - **Quarterly deletion drill.** Use for every regulated deployment. Erase a synthetic test subject seeded into
-  every store, and require a `complete: True` receipt within the target time. Monitor request-to-verified
-  completion time.
+  every store, including agent memory and checkpoints, and require a `complete: True` receipt within the
+  target time. Monitor request-to-verified completion time.
 
 ## Trade-offs
 - **Easy deadlines vs debugging window.** Short TTLs on traces and caches make deletion deadlines trivial but
@@ -273,6 +332,9 @@ Object storage enforces the trace-export TTL mechanically, so nobody has to reme
 - **No unlearning problem vs useful training data.** Keeping personal data out of fine-tuning avoids the
   unlearning problem entirely, but some use cases need it; then retraining on a schedule is the cost of being
   able to honour deletions.
+- **Personalised memory vs erasure cost.** Rich long-term memory makes the agent more useful, but every
+  memory is a derived copy to track; shared memories that blend several people cost a regeneration call on
+  each erasure.
 - **Partition drops vs collection sprawl.** Partitioning every store by tenant makes offboarding a partition
   drop, but multiplies collections and indexes. For thousands of small tenants, logical partitioning with
   tenant keys plus filtered deletes is more practical.
@@ -282,6 +344,8 @@ Object storage enforces the trace-export TTL mechanically, so nobody has to reme
 ## Pitfalls
 - **Vectors stored without subject or document identifiers.** Symptom: a deletion request that requires a
   full index rebuild because nothing can be targeted.
+- **Agent memories written without subject or source ids.** Symptom: the agent still "remembers" an erased
+  user's preferences in a later conversation. Fix: subject and source ids on every memory write.
 - **Treating "the source document was deleted" as "the chunks are gone".** Symptom: retrieval still citing a
   page that no longer exists. Fix: propagate via lineage.
 - **Relying on ANN soft deletes.** Symptom: an audit finding the bytes still on disk months after a confirmed
@@ -300,10 +364,10 @@ Object storage enforces the trace-export TTL mechanically, so nobody has to reme
   surfaces in litigation, which is the worst place to discover it.
 
 ## When to use
-- **Required wherever** personal, customer-confidential or regulated data enters prompts, indexes or
-  training sets: most enterprise deployments and any consumer product.
-- **Design it before the first index exists,** because adding subject identifiers to vectors and tenant
-  partitioning to collections after the fact is a full rebuild.
+- **Required wherever** personal, customer-confidential or regulated data enters prompts, agent memory,
+  indexes or training sets: most enterprise deployments and any consumer product.
+- **Design it before the first index or memory store exists,** because adding subject identifiers to vectors
+  and tenant partitioning to collections after the fact is a full rebuild.
 - **Measure:** time from deletion request to verified completion across all stores, number of stores with no
   automated TTL, and percentage of derived artifacts reachable through lineage.
 - **Drill:** run deletion drills quarterly.
@@ -338,8 +402,16 @@ the job's receipt plus the provenance manifest of the replacement model showing 
 ### Why do AI applications need a dedicated deletion architecture when web apps get by with DELETE and backup expiry?
 - **Copies multiply:** one conversation lands in roughly eight persisted stores, several owned by other teams
   and one outside the company.
-- **Several never expire:** vector indexes, training datasets and weights persist until something deletes
-  them, so deletion has to be a propagated, verified job.
+- **Several never expire:** vector indexes, agent memories, training datasets and weights persist until
+  something deletes them, so deletion has to be a propagated, verified job.
+
+### Your agent has long-term memory. How do you design it so a user can be forgotten?
+- **Key every memory:** subject ids, tenant id and source conversation ids on each write, so memories about a
+  person can be found without a scan.
+- **Handle shared memories:** a memory that blends several people is regenerated from the remaining sources,
+  not left intact or deleted for everyone.
+- **Cover the rest of the agent's state:** checkpoints of paused runs, tool scratchpads and the semantic
+  cache join the same erasure job, verified by re-query.
 
 ### A user deleted last month reappears in search results. What went wrong and how do you fix it?
 - **Likely cause:** the source system still holds the record and the next crawl re-ingested it, because
@@ -391,3 +463,25 @@ the job's receipt plus the provenance manifest of the replacement model showing 
 - [ ] To signal the model vendor to purge their logs
 > Source systems or crawls may still contain the data; the tombstone tells ingestion to skip it and gives
 > auditors a record of what was deleted and when. It is a deny-list, not a holding area.
+
+## Use cases & projects
+### Use cases
+- **Consumer assistants with long-term memory.** A "forget me" request must reach memories, vectors,
+  caches and traces, and regenerate memories shared with other users.
+- **Enterprise agent offboarding.** Tenant partitions and per-tenant keys turn a customer's exit into a
+  partition drop and a key deletion with a receipt.
+- **Agents that fine-tune on their own traces.** Redaction before sampling and subject ids on training rows
+  keep erasure possible without certifying unlearning.
+- **Long-running agents with durable state.** Checkpoints of paused runs and tool scratchpads get keys and
+  TTLs so they do not become forgotten PII stores.
+
+### Mini project
+**Erasure drill for an agent with memory (2-3 hours).**
+- **Goal:** prove that one user can be fully forgotten by a small agent, with a verifiable receipt.
+- **Steps:** build an agent with a vector memory, a semantic cache, a trace log and a checkpoint table, all
+  keyed by `subject_id`; seed three synthetic users across 20 conversations, including one shared memory;
+  redact emails before traces are written; implement the deletion job with retries, re-query verification,
+  shared-memory regeneration and a keyed tombstone; re-ingest the source conversations afterwards.
+- **Done when:** the receipt shows `complete: True` across every store, the agent cannot recall anything
+  about the erased user when asked, the other user's half of the shared memory survives, and re-ingestion
+  skips the tombstoned records.

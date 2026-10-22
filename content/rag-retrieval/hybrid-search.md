@@ -5,7 +5,7 @@ name: Hybrid search (BM25 + dense)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - rag-retrieval/dense-vs-sparse-retrieval
@@ -22,7 +22,7 @@ sources:
 ---
 
 ## TL;DR
-Hybrid search is the default retrieval tool for production agents: run BM25 and a dense retriever on the
+Hybrid search is a common default for production agents: run BM25 and a dense retriever on the
 same query and merge, because they fail on different queries. Fuse by rank (RRF), apply one filter to
 both arms, and prove the gain with recall@k.
 

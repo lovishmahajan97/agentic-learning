@@ -5,7 +5,7 @@ name: Benchmarking (MMLU, HumanEval, SWE-bench, GPQA)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - evals/model-evaluation
@@ -440,8 +440,9 @@ nothing more.
 ### Mini project
 **Re-run a small benchmark slice through your own agent scaffold (2-3 hours).**
 - **Goal:** see how much the scaffold and protocol move a benchmark-style score for two candidate models.
-- **Steps:** pick 30-50 public tool-calling or coding tasks with automatic scoring; run each candidate
-  model once with a plain prompt and once inside your own tool-calling loop; keep sampling settings fixed;
-  log pass/fail, steps and cost per task; compute pass rates with a rough interval.
+- **Steps:** pick 30-50 auto-scored public tasks (for example HumanEval problems, graded by their unit
+  tests); run each candidate model once single-shot with a plain prompt and once inside a small agent
+  loop with a `run_python` tool and up to 3 attempts; keep sampling settings fixed; log pass/fail, steps
+  and cost per task; compute pass rates with a rough interval.
 - **Done when:** you have a table of score and cost per model and setup, and a short note on whether the
   ranking changed between the plain prompt and your scaffold.

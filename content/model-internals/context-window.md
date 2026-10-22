@@ -193,16 +193,23 @@ def add_tool_result(messages, call_id, text, count, store):
     messages.append({"role": "tool", "tool_call_id": call_id, "content": text})
 
 def maybe_compact(system, messages, count, budget, summarize):
-    used = count(system) + sum(count(m["content"]) for m in messages)
+    used = count(system) + sum(count(m.get("content") or "") for m in messages)
     if used < COMPACT_AT * budget:
         return messages
-    old, recent = messages[:-KEEP_RECENT], messages[-KEEP_RECENT:]
+    cut = len(messages) - KEEP_RECENT
+    while cut > 0 and messages[cut]["role"] == "tool":   # never orphan a tool result from its call
+        cut -= 1
+    if cut <= 0:
+        return messages
+    old, recent = messages[:cut], messages[cut:]
     summary = summarize(old)                           # one call, one cache miss, at a boundary
     return [{"role": "user", "content": f"Summary of earlier steps:\n{summary}"}] + recent
 ```
 
 The characters-per-token factor of 3 in the clip is a rough heuristic; clip by tokens if your tokenizer
-is cheap to call. Keep the system prompt and tool definitions out of the compacted region.
+is cheap to call. Keep the system prompt and tool definitions out of the compacted region, and never
+split an assistant tool call from its tool result: most chat APIs reject a `tool` message whose call is
+missing, which is why the cut point moves back past any tool messages.
 
 ### Worked scenario: a 30-step research agent on a 128k window
 The agent starts with a 7k-token prefix (system prompt plus 15 tool schemas) and each step appends about
@@ -256,6 +263,7 @@ for n in (8_192, 32_768, 131_072):
   size per tool; one noisy tool usually dominates.
 - **Load only the tools a step needs.** With dozens of tools, schemas alone can cost thousands of tokens
   every step; shortlist tools per task and keep the shortlist stable within a run so the prefix still caches.
+  Monitor tool-schema tokens per step and how often the needed tool was missing from the shortlist.
 - **Size the engine window per deployment.** Set `max_model_len` in vLLM to the length the traffic
   actually uses and route long-document work to a separate deployment, so a few long requests cannot
   starve short chats. Monitor KV utilization and preemptions.

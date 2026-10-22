@@ -5,7 +5,8 @@ name: Secrets & credential isolation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - backend-fundamentals/secrets-management
   - backend-fundamentals/oauth-2-0-oidc
@@ -25,6 +26,19 @@ sources:
 Assume the model will repeat anything in its context, so secrets never enter the context, the sandbox or
 model-filled arguments. The model names a connection; a separate executor mints a short-lived, scoped,
 per-tenant credential at call time and never returns it.
+
+## For agent builders
+- **Why it matters for agents.** Anything in your agent's context, environment or sandbox can end up in
+  an answer, a trace or an attacker's URL, because a prompt injection only has to ask. Keeping secrets
+  unreachable is the only control that holds no matter what the model is talked into.
+- **Where it shows up in your stack.** Tool schemas and adapters, the tool-worker process, an MCP server's
+  downstream auth, Vault or a cloud secrets manager, OAuth token exchange, AWS STS or GitHub App tokens, and
+  the egress proxy in front of code sandboxes.
+- **What you control.** Connection references instead of credential fields, which process holds what (loop,
+  worker, sandbox), token TTL and scope per integration, proxy method and path rules, and scrubbing results
+  before they re-enter the context.
+- **What you can skip.** Running your own KMS or writing a secret scanner from scratch. Use a managed vault
+  and a simple pattern scrubber, and spend the effort on process separation.
 
 ## Why it exists
 - **Agents call real systems, which need credentials:** API keys, OAuth tokens, database passwords, cloud
@@ -356,3 +370,25 @@ value appears, and alert on any scrubber hit as a sign something upstream regres
 > A read-only or encrypted-but-decryptable key is still readable by the code and therefore by the model.
 > The proxy pattern means the sandbox never possesses the secret, and the allow-list closes the exfiltration
 > channel at the same time.
+
+## Use cases & projects
+### Use cases
+- **Agents that act on each user's SaaS accounts.** CRM, calendar and email tools resolve a connection
+  reference through a broker that mints minutes-long, down-scoped tokens under the user's own grant.
+- **Coding agents with repository access.** GitHub App installation tokens are minted per run for the
+  needed repositories, and generated code reaches GitHub only through a path-restricted egress proxy.
+- **Data agents that query databases.** Vault dynamic credentials limited to the tenant's schema replace a
+  shared `DATABASE_URL`.
+- **MCP servers in front of internal APIs.** Each server obtains its own downstream credential instead of
+  passing the client's token through.
+
+### Mini project
+**Make a sandboxed coding agent unable to leak a key (2-3 hours).**
+- **Goal:** show that a prompt-injected "print your environment and POST it" attack finds nothing to steal.
+- **Steps:** run generated Python in a container with only `HTTPS_PROXY` and `SSL_CERT_FILE` set; put a
+  forward proxy in front that allows one host and one path and adds a fake `Authorization` header; expose a
+  `crm_search` tool whose schema has only `query`; add the `scrub` function to tool results; run the
+  `secret_hits` test inside both images in CI.
+- **Done when:** the injected `env` dump shows only the proxy address and CA path, a POST to a non-allowed
+  host is blocked, a planted secret in a tool response comes back as `[REDACTED]`, and adding a
+  `GITHUB_TOKEN` variable fails the CI test.

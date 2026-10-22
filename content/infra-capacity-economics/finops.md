@@ -5,8 +5,8 @@ name: FinOps
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
-agent_relevance: core
+status: agentic-verified
+agent_relevance: useful
 related:
   - observability/token-cost-tracking
   - infra-capacity-economics/cost-allocation-by-tenant-and-feature
@@ -79,6 +79,10 @@ traffic mix moves. A snapshot goes stale in a month.
    and a cost history that silently re-prices itself is useless for trend analysis.
 4. **Take token counts from the provider's response usage fields,** not your own tokenizer estimate,
    *because* tokenizers differ between models and estimates drift.
+   - **Read each provider's fields carefully:** OpenAI's `prompt_tokens` already includes the cached
+     tokens reported in `prompt_tokens_details.cached_tokens`, while Anthropic reports
+     `cache_read_input_tokens` and `cache_creation_input_tokens` separately from `input_tokens`.
+     Map both into the same uncached, cached and cache-write columns, or cached tokens get billed twice.
 5. **Send events to the warehouse** where every other business metric lives.
 6. **Reconcile monthly against the invoice.** The gap is a data-quality KPI; a growing one means a call
    path is bypassing the gateway or a price in the table is stale.
@@ -266,13 +270,14 @@ except BudgetExceeded as e:
 
 | Stuck run | Steps | Cost per run | 1,000 such runs a day |
 |---|---|---|---|
-| No limits (loop until a 100-step framework default) | 100 | ≈ $23.36 | ≈ $23,355 |
+| No limits (stops only at an illustrative 100-step ceiling) | 100 | ≈ $23.36 | ≈ $23,355 |
 | `max_usd=0.50` in the meter | 14 | ≈ $0.56 | ≈ $560 |
 
 - **The spend limit fired before the step limit,** because context growth makes later steps expensive:
   step 1 costs about $0.011, step 14 about $0.069.
-- **The 100-step ceiling is illustrative;** check what your framework actually defaults to, and set your
-  own limit explicitly.
+- **The 100-step ceiling is illustrative;** framework defaults differ (LangGraph's `recursion_limit`
+  counts graph super-steps, the OpenAI Agents SDK's `max_turns` counts model turns), and none of them
+  caps spend, so set your own step and spend limits explicitly.
 - **Log the stop as an event,** so "runs stopped by budget" becomes a daily metric, not a silent failure.
 
 ### Worked scenario: month-to-date vs trailing-days forecast

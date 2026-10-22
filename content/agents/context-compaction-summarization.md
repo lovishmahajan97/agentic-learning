@@ -5,7 +5,7 @@ name: Context compaction / summarization
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/agent-loop

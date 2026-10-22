@@ -5,7 +5,8 @@ name: Approval & authorization boundaries
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - agents/human-in-the-loop
   - agents/approval-gates-for-consequential-actions
@@ -25,6 +26,18 @@ sources:
 Authorization asks "may this principal do this at all"; approval asks "must a human confirm this instance".
 The runtime decides both at tool dispatch, outside the model's influence, using user-and-agent intersected
 authority and approvals bound to exact arguments.
+
+## For agent builders
+- **Why it matters for agents.** Any text your agent reads (a ticket, a web page, a retrieved document) can
+  steer its tool calls. The gate at dispatch is what stops an injected or hallucinated call from refunding
+  money or emailing the wrong person, because the system prompt cannot.
+- **Where it shows up in your stack.** The dispatcher in your agent runtime, LangGraph `interrupt()` before
+  consequential tools, OAuth token exchange or on-behalf-of flows in tool adapters, and an approvals inbox
+  or Slack/Teams card in the product.
+- **What you control.** The tier table (auto, log, approve, deny), argument thresholds, the fingerprint and
+  TTL on each approval, single-use consumption, and re-authorization when a parked run resumes.
+- **What you can skip.** Designing a full policy language on day one. A reviewed tier table, delegated
+  tokens and fingerprint-bound approvals cover most agents; generalise later.
 
 ## Why it exists
 - **Whoever influences the model influences the actions.** The user, a web page the agent read or a document
@@ -371,3 +384,24 @@ exceed it. Finally, I would monitor approval and reject rates to keep the thresh
 - [ ] Downgrade the action to the `log` tier because a human already saw it
 > Approvals carry a TTL because the human's context goes stale, and permissions can be revoked while a run
 > is parked. Re-checking both keeps a long-parked run from executing an action nobody would authorise today.
+
+## Use cases & projects
+### Use cases
+- **Support agents with refund tools.** Small refunds run as `log`, large ones park for an
+  argument-bound approval, and the payments service still enforces per-user limits.
+- **Email and outreach agents.** Every external send is `approve`-tier, the card shows the real recipient
+  and body, and a changed recipient forces a fresh approval.
+- **Internal data assistants.** Delegated, intersected tokens stop users from reading records through the
+  agent that they cannot open directly.
+- **DevOps and coding agents.** Merges and deploys need approval while destructive admin actions (drop
+  tables, change IAM, disable logging) are `deny` regardless of the user.
+
+### Mini project
+**Gate a refund agent against prompt injection (2-3 hours).**
+- **Goal:** show that an injected ticket cannot trigger a large refund while small refunds stay automatic.
+- **Steps:** build a tool-calling agent with `search_docs`, `create_ticket` and `refund_payment`; put the
+  gate and approvals table from the examples in the dispatcher; plant a ticket telling the agent to
+  refund 4000; add a command-line approvals inbox that renders stored arguments; test a revoked user
+  resuming a parked run.
+- **Done when:** the injected refund parks and is rejected, a refund of 30 executes as `log`, an approved
+  refund executes once and an identical repeat parks again, and the revoked user's run is denied on resume.

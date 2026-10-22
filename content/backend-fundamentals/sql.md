@@ -5,7 +5,7 @@ name: SQL
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - backend-fundamentals/database-design
@@ -334,7 +334,8 @@ In PostgreSQL the same guards are a role with only `SELECT` grants on a few view
   algorithm; when it guesses wrong you fix statistics or indexes, not the query's "steps".
 - **One big query vs several.** One joined query minimizes round trips but can produce a huge intermediate
   result; when a join multiplies rows (one conversation × many messages × many tool calls), two targeted
-  queries are cheaper.
+  queries (conversations with messages, then tool calls for those message ids) move less data. Keep the
+  query count constant, not proportional to rows, so the split does not become N+1.
 - **Index speed vs write cost.** Indexes make predicates cheap but each slows writes and uses memory; an
   hourly reporting query rarely justifies an index every insert pays for.
 - **ORM convenience vs visibility.** ORMs speed CRUD and keep types in sync but hide the SQL; once a query

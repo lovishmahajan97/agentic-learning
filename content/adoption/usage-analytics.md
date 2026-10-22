@@ -5,7 +5,8 @@ name: Usage analytics
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - adoption/adoption-and-value-realization-measurement
   - observability/tracing
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-Usage analytics instruments an AI feature to show who uses it, how often, how deeply, and what they do
-with its output: accept, edit, regenerate or abandon. Traces show what the system did; analytics shows
-what people did with it.
+Usage analytics instruments an agent to show who delegates work to it, how often, how deeply, and what
+they do with its output: approve, edit, retry, take over or abandon. Traces show what the agent did;
+analytics shows what people did with it.
+
+## For agent builders
+- **Why it matters for agents.** An agent can finish every run cleanly in its traces while users quietly
+  take over a quarter of the tasks or reject its proposed actions. Disposition events are the cheapest
+  large-scale signal of whether people trust the agent's work.
+- **Where it shows up in your stack.** The agent UI and approval gate emit events, an event collector and
+  warehouse store them, and the tracing store keeps prompts, tool calls and results. A `request_id` or run
+  ID is the only bridge between the two.
+- **What you control.** A task-level event vocabulary (runs, proposed actions, approvals, takeovers), the
+  eligible population and unit of work, client-side edit size, noise bands, segment slicing, and which
+  content never leaves the tracing store.
+- **What you can skip.** Heavy experimentation theory. The two standard-error formulas below are enough to
+  tell a real agent regression from noise in a pilot.
 
 ## Why it exists
 - **A healthy system can still go unused.** A deployed assistant can be technically fine while nobody
@@ -64,6 +78,21 @@ A small, stable vocabulary beats hundreds of ad-hoc events.
 - **`request_id` is the design choice that matters most.** It lets you go from "acceptance dropped on
   Tuesday" to the exact traces, prompt version and retrieved documents behind the dropped requests,
   *without* storing content in the analytics store.
+
+### Agent runs add task-level events
+For an agent that plans and calls tools, one model response is not the unit of work; the run is.
+
+| Event | Meaning |
+|---|---|
+| **run_started / run_finished** | One delegated task, with a run ID that joins to the trace, plus steps and tool calls used |
+| **action_proposed** | The agent asks to take a consequential action (send, refund, write a record) |
+| **action_decision** | Approved as proposed, edited before approval, or rejected at the approval gate |
+| **human_takeover** | The user stopped the run and did the task by hand |
+
+- **Run outcome is the agent's disposition.** Completed unaided, completed after edits, or taken over are
+  the agent equivalents of sent-as-is, edited and discarded.
+- **Normalise by completed tasks, not calls.** Tool calls and steps per completed task expose cost and
+  flailing that raw request counts hide, because a looping agent inflates usage.
 
 ### Edit size, defined precisely
 - **Why define it:** "edited" alone lumps a fixed typo together with a full rewrite.
@@ -118,13 +147,13 @@ A small, stable vocabulary beats hundreds of ad-hoc events.
   tracking is a legal and political issue.
 
 ## Diagram
-Behavioural events and content take separate paths; the `request_id` is the only bridge, and labelled
-samples keep the proxies honest.
+Agent behaviour events and agent content take separate paths; the `request_id` (run ID) is the only
+bridge, and labelled samples of runs keep the proxies honest.
 
 ```mermaid
 flowchart TD
-    UI["Customer UI"] -->|"exposure, invocation, disposition"| EV["Event collector"]
-    UI -->|"prompt and response text"| TR[("Tracing store, access-controlled")]
+    UI["Agent UI and approval gate"] -->|"run outcome, action decision, takeover"| EV["Event collector"]
+    UI -->|"prompts, tool calls, results"| TR[("Tracing store, access-controlled")]
     EV -->|"drop internal, hash user IDs"| WH[("Analytics warehouse")]
     WH --> V["Funnel, cohorts, breadth, quality proxies"]
     V --> N{"Move over 2 standard errors?"}
@@ -137,6 +166,43 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: did agent v4 make users take over more often?
+A support agent drafts replies, looks up orders and proposes refunds behind an approval gate. Weekly
+aggregates come from `run_finished` events only, so no prompt or tool content is involved. Numbers are
+illustrative.
+
+```python
+from math import sqrt
+
+# Weekly aggregates per agent version from run_finished events (no prompt or tool content).
+weeks = {
+    "v3": {"runs": 600, "completed": 390, "edited": 120, "taken_over": 90, "tool_calls": 4_200},
+    "v4": {"runs": 600, "completed": 330, "edited": 132, "taken_over": 138, "tool_calls": 5_700},
+}
+
+def diff_se(p1, n1, p2, n2):
+    return sqrt(p1 * (1 - p1) / n1 + p2 * (1 - p2) / n2)
+
+for v, w in weeks.items():
+    done = w["completed"] + w["edited"]
+    print(v, f"takeover={w['taken_over'] / w['runs']:.2f}",
+          f"tool_calls_per_completed_task={w['tool_calls'] / done:.1f}")
+
+p3 = weeks["v3"]["taken_over"] / weeks["v3"]["runs"]
+p4 = weeks["v4"]["taken_over"] / weeks["v4"]["runs"]
+se = diff_se(p3, 600, p4, 600)
+print(f"diff={p4 - p3:.2f} se={se:.3f} z={(p4 - p3) / se:.1f}")
+# v3 takeover=0.15 tool_calls_per_completed_task=8.2
+# v4 takeover=0.23 tool_calls_per_completed_task=12.3
+# diff=0.08 se=0.023 z=3.6
+```
+
+| Reading | Conclusion |
+|---|---|
+| Takeover 0.15 → 0.23 on 600 runs each | about 3.6 standard errors: not noise |
+| Tool calls per completed task 8.2 → 12.3 | the agent is looping or retrying tools before users give up |
+| Next step | slice by team to rule out mix, then pull taken-over runs by run ID and read their trajectories |
+
 ### Cohort retention and draft disposition in SQL
 Two Postgres queries over an `ai_events` table for a support-reply drafting assistant. The first computes
 weekly cohort retention on a deliberate action (`draft_requested`), excluding internal users; the second
@@ -226,9 +292,14 @@ for n in (500, 50):                       # drafts per prompt version
 ```
 
 ## Production patterns
-- **Versioned event contract** — when several features or teams emit events, keep the vocabulary in one
-  schema file (for example JSON Schema) validated in the collector; quarantine unknown event types instead
-  of silently accepting them. Monitor the rejected-event rate after every client release.
+- **Versioned agent event contract** — when several agents, features or teams emit events, keep the run,
+  action-decision, takeover and disposition vocabulary in one schema file (for example JSON Schema)
+  validated in the collector; quarantine unknown event types instead of silently accepting them. Monitor
+  the rejected-event rate after every client release.
+- **Approval-gate analytics** — for agents that propose consequential actions, emit a decision event for
+  every proposal (approved, edited, rejected) tagged with the tool name and agent version. Monitor the
+  rejection rate per tool; one tool with a rising rejection rate points to a bad argument or a bad plan,
+  not a bad model.
 - **Join key, not content** — whenever prompts may hold customer data, put `request_id` and
   `prompt_version` on every analytics event and keep text only in the tracing store. Monitor the share of
   response events whose `request_id` has a matching trace; a falling join rate means broken instrumentation.
@@ -237,11 +308,13 @@ for n in (500, 50):                       # drafts per prompt version
   share of events from flagged accounts, so vendor testing never reaches the sponsor dashboard.
 - **Noise band on every rate** — on any dashboard leadership reads, show the event count and a two-standard-
   error band next to each rate, and grey out slices below a minimum *n*. Monitor *n* per slice per week.
-- **Staged prompt rollout with a comparison** — ship a new prompt version to a fraction of users or teams
-  first and compare acceptance, edit-size buckets and regeneration against the old version by segment
-  (see A/B testing). Monitor the per-segment difference, not just the total.
+- **Staged prompt or agent-version rollout with a comparison** — ship a new prompt, tool set or agent
+  version to a fraction of users or teams first and compare acceptance, edit-size buckets, regeneration
+  and takeover rates against the old version by segment (see A/B testing). Monitor the per-segment
+  difference, not just the total.
 - **Proxy calibration sampling** — on a fixed cadence, have reviewers label a random sample of responses
-  per disposition bucket. Monitor agreement between "accepted unchanged" and "labelled good" over time.
+  or agent runs per disposition bucket, reading the trajectory, not just the final answer. Monitor
+  agreement between "accepted unchanged" and "labelled good" over time.
 
 ## Trade-offs
 - **Rich disposition events vs UI work.** They give unbiased coverage of every response, but need front-end
@@ -253,6 +326,9 @@ for n in (500, 50):                       # drafts per prompt version
   missing feature-specific nuance; add events only when a decision depends on them.
 - **Content alongside events vs data spread.** It makes ad-hoc analysis easy but copies sensitive data
   widely; keep content in the tracing store and join by `request_id` unless the data is non-sensitive.
+- **Run-level vs step-level events.** Run outcomes keep dashboards small and readable, but hide which step
+  or tool failed; emit step detail to traces and only summary counts (steps, tool calls) to analytics,
+  unless a decision needs per-tool rates.
 
 ## Pitfalls
 - **Counting requests instead of users and work items.** Symptom: a rising usage chart while most eligible
@@ -269,6 +345,9 @@ for n in (500, 50):                       # drafts per prompt version
   downstream outcomes such as reopen rate or customer satisfaction slip.
 - **Logging raw prompts into the product analytics tool.** Discovered at a security review, after customer
   data has spread to a system with broad access.
+- **Counting agent tool calls as adoption.** Usage "doubles" after a release because the agent now loops
+  through retries, while completed tasks are flat. Fix: report tool calls per completed task and takeover
+  rate next to any volume number.
 
 ## When to use
 - **Instrument before the pilot starts,** not after someone asks for numbers. You cannot reconstruct
@@ -276,7 +355,8 @@ for n in (500, 50):                       # drafts per prompt version
 - **Use it to separate three diagnoses:** "the system is wrong", "people are not using it" and "people use
   it but it doesn't help". They lead to engineering, training and scoping work respectively.
 - **Minimal dashboard:** weekly active ÷ eligible, AI-assisted share of work items, week-4 cohort retention,
-  and accepted-unchanged, edit-size and regeneration rates sliced by prompt version and team.
+  and accepted-unchanged, edit-size and regeneration rates sliced by prompt version and team. For an
+  agent, add takeover rate, approval-gate rejection rate and tool calls per completed task.
 - **Avoid when** it is standing in for outcome measurement: high usage proves engagement, not value (see
   adoption and value-realization measurement).
 - **Interviews:** expect to design the event schema for an AI feature and say which implicit signals you
@@ -310,13 +390,6 @@ the claim. Even then it shows engagement, and value still needs an outcome compa
   document caused a bad draft.
 - **Join them by `request_id`** so content stays in the access-controlled tracing store.
 
-### Design the event schema for an AI email-drafting feature.
-- **Five event types:** exposure, invocation, response (with `request_id`), disposition (sent unchanged,
-  sent edited with an edit-size bucket, regenerated, discarded, escalated) and explicit feedback.
-- **Common fields:** pseudonymous user ID, tenant, feature name, prompt and model version, timestamp.
-- **Deliberately excluded:** the email text itself, because it belongs in the tracing store, and per-person
-  productivity views unless the customer has agreed to them.
-
 ### Acceptance fell eight points the week a new prompt shipped. How do you work out whether the prompt is to blame?
 - **Check noise first:** compute the standard error of the difference from the event counts; under about
   two standard errors, the move is unproven.
@@ -340,6 +413,22 @@ the claim. Even then it shows engagement, and value still needs an outcome compa
   version.
 - **At 50 drafts a week,** that is months of data, so in small pilots report direction and wait, or use
   human-labelled samples instead.
+
+### Your agent's traces look healthy, but users take over about a quarter of runs. What analytics do you add?
+- **Run-level dispositions:** a `run_finished` event with outcome (completed, completed after edits, taken
+  over), steps and tool calls, carrying the run ID so each takeover joins to its trajectory.
+- **Approval-gate decisions per tool,** to see whether takeovers follow rejected actions on one tool.
+- **Then slice and read:** check noise and mix by team, and read a sample of taken-over trajectories to
+  name the failure modes before changing prompts.
+
+### Design usage analytics for an agent that issues refunds behind an approval gate.
+- **Events:** exposure, invocation, run started and finished, action proposed, action decision (approved,
+  edited with an edit-size bucket, rejected), human takeover and explicit feedback, each with pseudonymous
+  user ID, tenant, agent and prompt version, and timestamp.
+- **Rates with denominators:** approvals ÷ proposals, takeovers ÷ runs, refunds completed ÷ eligible
+  tickets, each with a two-standard-error band and *n*.
+- **Privacy:** the refund reason text and customer data stay in traces; analytics holds IDs, versions,
+  tool names and outcomes only.
 
 ## Quiz
 ### Q: Why are disposition events (accepted, edited, regenerated, discarded) usually preferred over thumbs ratings as the main quality signal?
@@ -366,3 +455,24 @@ the claim. Even then it shows engagement, and value still needs an outcome compa
 - [ ] That the eligible population was defined too broadly
 > Retention that decays toward zero instead of flattening is the classic novelty curve. New cohorts
 > arriving can hide it in a total-users chart, which is exactly why cohort views exist.
+
+## Use cases & projects
+### Use cases
+- **Agent pilots with a sponsor review.** Takeover rate, breadth by team and week-4 retention show whether
+  the agent is trusted, not just whether it ran.
+- **Releasing a new agent version.** Per-segment takeover and approval rates with noise bands decide
+  whether v4 is a regression or a mix shift.
+- **Approval-gated actions.** Rejection rate per tool shows which tool's arguments or plans users do not
+  trust, so the fix lands on that tool.
+- **Cost control.** Tool calls and steps per completed task catch looping agents that look like rising
+  adoption on a volume chart.
+
+### Mini project
+**Instrument a toy agent with run-level analytics (2-3 hours).**
+- **Goal:** turn agent runs into disposition rates you can compare across two agent versions honestly.
+- **Steps:** build a small tool-calling agent with two tools and an approval step; emit `run_finished`,
+  action-decision and takeover events (IDs, versions, counts only) to a local SQLite table; simulate or
+  label 100+ runs for two prompt versions; compute takeover rate, approval rate and tool calls per
+  completed task, each with a standard error.
+- **Done when:** you have a per-version table with two-standard-error bands, a verdict of "real" or
+  "unproven" for the takeover difference, and no prompt or tool content stored in the events table.

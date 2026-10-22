@@ -5,7 +5,7 @@ name: Overfitting
 kind: concept
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - training-adaptation/train-val-test-split
@@ -280,8 +280,9 @@ for g in flagged:
 
 ## Production patterns
 - **Generalisation slices in the agent eval.** Keep held-out slices of paraphrased requests, new
-  customers and unseen tool combinations next to the familiar-phrasing set. Monitor the gap between the
-  familiar slice and the others per model version; a widening gap is memorisation.
+  customers and unseen tool combinations next to the familiar-phrasing set, plus a small general-skills
+  set. Monitor the gap between the familiar slice and the others per model version; a widening gap is
+  memorisation of surface form.
 - **Best-checkpoint selection on the shipped metric.** Evaluate at a fixed cadence, save at each
   evaluation and reload the best (in Hugging Face, `load_best_model_at_end=True` with
   `metric_for_best_model` set to your task metric). Monitor the epoch or step of the best checkpoint;
@@ -458,8 +459,10 @@ constrain the trainable parameters.
 ### Mini project
 **Catch an overfit agent fine-tune (2-3 hours).**
 - **Goal:** show the gap between familiar and novel requests as a fine-tune runs too long.
-- **Steps:** build a training set of tool-calling trajectories and two held-out sets, one of near-copies
-  of training requests and one of paraphrases plus unseen tool combinations; deduplicate training against
-  both; fine-tune a small model past the point of convergence, evaluating each epoch on both sets.
-- **Done when:** you have a chart showing the near-copy score climbing while the novel-set score peaks and
-  falls, the checkpoint you would ship, and one example of a replayed training trace.
+- **Steps:** build a training set of a few hundred tool-calling trajectories and two held-out sets: new
+  requests in the training phrasing, and paraphrases plus unseen tool combinations; check that no
+  held-out item is an exact or near copy of a training row; LoRA fine-tune a small model for several
+  more epochs than needed, evaluating each epoch on both sets; run the copied-argument check.
+- **Done when:** you have a chart showing the familiar-phrasing score climbing while the novel-set score
+  peaks and falls, the checkpoint you would ship, and one example of a replayed training trace or copied
+  argument.

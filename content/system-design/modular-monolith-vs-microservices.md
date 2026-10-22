@@ -5,7 +5,7 @@ name: Modular monolith vs microservices
 kind: decision
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - system-design/domain-driven-design-and-bounded-contexts
@@ -199,6 +199,7 @@ def run_agent(tenant_id: str, run_id: str, task: str, tools: dict[str, Tool], ll
     messages = [{"role": "user", "content": task}]
     for step in range(max_steps):
         reply = llm(messages, tools=list(tools))            # model call elided
+        messages.append(reply.message)                      # assistant turn incl. its tool calls
         if not reply.tool_calls:
             publish("run.finished", {"tenant_id": tenant_id, "steps": step + 1})
             return reply.text
@@ -209,7 +210,7 @@ def run_agent(tenant_id: str, run_id: str, task: str, tools: dict[str, Tool], ll
 
 # .importlinter — the build fails if the agent loop imports internals
 # [importlinter:contract:retrieval-is-private]
-# name = agent may only use retrieval.api and tools.api
+# name = agent must not import retrieval internals
 # type = forbidden
 # source_modules = app.agent
 # forbidden_modules = app.retrieval.service
@@ -391,7 +392,7 @@ retrieval needing a different data store, and keep module facades so extraction 
 
 ### How would you extract the retrieval module into its own service safely?
 - **Same interface, new transport:** write an HTTP client implementing the existing `Retriever` contract,
-  so `ChatService` and the agent loop do not change.
+  so the agent loop and any `ChatService`-style handler do not change.
 - **Strangler routing:** send a small, rising percentage of calls to the new service behind a flag and
   compare error rate and p99 with the in-process path.
 - **Then move data:** migrate the tables, delete the in-process implementation, and keep the contract tests

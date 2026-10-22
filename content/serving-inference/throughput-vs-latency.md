@@ -5,7 +5,7 @@ name: Throughput vs latency
 kind: decision
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - serving-inference/continuous-batching
@@ -130,7 +130,10 @@ latency.
 - **Agents generate their own load.** Parallel tool calls, sub-agents and retries put several requests
   in flight per user, so concurrency rises faster than user count; cap in-flight calls per run.
 - **Two traffic classes, two points.** Interactive agents sit at the knee; background agents, evals and
-  trace backfills belong at the plateau or on a provider batch tier.
+  trace backfills belong at the plateau.
+- **Batch tiers fit single calls, not loops.** A provider batch API returns results within hours, so it
+  suits one-shot work (LLM-judge grading of finished trajectories, re-scoring traces); a multi-step run
+  would wait a batch window per step, so run whole agent loops on a high-concurrency pool instead.
 
 ## Diagram
 How an operating point is chosen and enforced: the SLO picks the concurrency, and everything above that
@@ -197,8 +200,7 @@ queue or tool time).
 
 - **An interactive agent** where a user waits wants the second row: less than half the decode time per
   run, at about a third fewer runs per hour.
-- **A nightly research or eval agent** wants the first row, or a batch tier, because only runs per
-  dollar matter.
+- **A nightly research or eval agent** wants the first row, because only runs per dollar matter.
 
 ### Why the tail explodes near saturation
 Runnable: a single-server FIFO queue with random arrivals and service times (Lindley's recursion),
@@ -224,8 +226,9 @@ for rho in (0.5, 0.7, 0.9, 0.95):
 
 ## Production patterns
 - **Split agent traffic by who is waiting.** Route user-facing agent runs to the latency pool or
-  interactive tier, and eval sweeps, background agents and trace re-scoring to a batch pool or provider
-  batch API. Monitor interactive per-step TTFT while background jobs run.
+  interactive tier, multi-step eval sweeps and background agents to a high-concurrency pool, and
+  single-call work such as trace re-scoring to a provider batch API. Monitor interactive per-step TTFT
+  while background jobs run.
 - **Cap in-flight calls per agent run.** Limit parallel tool calls and sub-agents per run with a
   semaphore or the framework's concurrency setting, so one run cannot fill a replica. Monitor in-flight
   requests per run and per tenant.
@@ -320,8 +323,9 @@ finance with cost per token at the required latency, which is the real request.
   depth, and move background agents off the interactive pool.
 
 ### How do you run a nightly eval of 10,000 agent trajectories without hurting live users?
-- **Separate the traffic:** a provider batch tier or a separate pool run at the plateau, not the
-  interactive replicas.
+- **Separate the traffic:** run the agent loops on a separate pool at the plateau, not the interactive
+  replicas; a batch API suits only the single-call parts, such as LLM-judge grading of finished runs,
+  because each agent step would otherwise wait a batch window.
 - **Throughput is the goal:** high concurrency per replica, because nobody waits on a single run.
 - **Watch the live pool's** TTFT p95 during the run as the guardrail.
 
@@ -372,8 +376,8 @@ finance with cost per token at the required latency, which is the real request.
 
 ## Use cases & projects
 ### Use cases
-- **Interactive versus background agents.** Teams route user-facing runs to a low-latency path and send
-  nightly or bulk agent jobs to a batch tier or a high-concurrency replica.
+- **Interactive versus background agents.** Teams route user-facing runs to a low-latency path, nightly
+  or bulk agent loops to a high-concurrency replica, and one-shot grading calls to a batch tier.
 - **Eval and data-generation runs.** Thousands of agent runs where nobody waits are run at the throughput
   end to cut cost and finish overnight.
 - **Parallel tools and sub-agents.** Fan-out width per run is a throughput choice that raises queue wait
@@ -384,8 +388,8 @@ finance with cost per token at the required latency, which is the real request.
 ### Mini project
 **Find the knee for an agent workload (2-3 hours).**
 - **Goal:** chart run latency against throughput for one agent and pick an operating point.
-- **Steps:** replay the same 10-step agent task at increasing concurrency against a self-hosted model (or
-  a hosted API within your rate limits); record run latency p50 and p99 and completed runs per minute at
+- **Steps:** replay the same 10-step agent task at increasing concurrency against a self-hosted model (a
+  hosted API usually shows rate-limit errors before it shows the knee); record run latency p50 and p99 and completed runs per minute at
   each level; mark the point where p99 starts to climb steeply.
 - **Done when:** you have a latency-versus-throughput chart with the knee marked, and a one-paragraph
   recommendation for the interactive cap and the background setting.

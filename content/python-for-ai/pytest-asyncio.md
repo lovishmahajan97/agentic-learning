@@ -5,7 +5,7 @@ name: pytest-asyncio
 kind: tool
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/pytest
@@ -340,9 +340,12 @@ pytestmark = pytest.mark.asyncio(loop_scope="session")   # every test in this mo
 - **Orphaned tasks.** `asyncio.create_task` without awaiting or cancelling, common in agents that start
   background tool calls or memory writes. Symptom: "Task was destroyed
   but it is pending" warnings and assertions failing in a later, unrelated test.
-- **Stale `event_loop` override.** Copied from an old blog post into a pinned recent version: on 0.2x
+- **Stale `event_loop` override.** Copied from an old blog post into a pinned recent version: on later 0.2x
   releases it gives a deprecation warning; on 1.x the plugin no longer consults that fixture at all, so
   your custom loop or policy silently stops applying.
+- **Fake-clock assumptions in retry tests.** The plugin has no fake clock, so a retry test with
+  production backoff really waits `asyncio.sleep(10)`. Fix: inject a `sleep` callable or the delays and
+  pass 0.01 s, and use `asyncio.timeout(0.05)` for timeout paths.
 
 ## When to use
 - **Use when:** the unit under test is a coroutine and the property depends on scheduling: parallel tool
@@ -423,8 +426,8 @@ the loop they were made on, so fixture lifetime and loop lifetime must match.
 - **Test it:** start the consumer with `asyncio.create_task`, cancel it after a few tokens, expect
   `CancelledError`, and assert the stream's `finally` closed the response.
 - **Also cover early stop** with `aclosing`, since a `break` alone leaves the generator suspended.
-- **Retry tests stay fast** the same way timeouts do: there is no fake clock, so `asyncio.sleep(10)`
-  really waits; inject a `sleep` callable and pass 0.01 s.
+- **Check retries do not undo it:** a retry wrapper that catches `CancelledError` (or a bare `except`)
+  restarts the stream; one test cancels mid-retry and asserts no new model call was made.
 
 ## Quiz
 ### Q: In pytest-asyncio's strict mode, what happens to an unmarked `async def` test?

@@ -5,7 +5,7 @@ name: Tool selection accuracy
 kind: metric
 difficulty: core
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/tool-calling
@@ -60,7 +60,7 @@ At each step the model makes three choices, each with its own metric:
 | 1. Call or not | *Should-call recall* | Of cases needing a tool, fraction where one was called | Hallucinated facts |
 | 1. Call or not | *Should-call precision* | Of cases where it called, fraction that needed a call | Cost and latency on questions a sentence would answer |
 | 2. Which tool | *Name accuracy* | Exact match against the expected tool, given a needed call was made | Wrong tool of a similar pair |
-| 3. Which arguments | *Schema-valid rate* | Automatic and cheap | Shape errors |
+| 3. Which arguments | *Schema-valid rate* | Fraction of calls whose arguments pass schema validation (automatic, cheap) | Shape errors |
 | 3. Which arguments | *Argument accuracy* | Key fields compared with the expectation | Right tool, wrong record |
 
 - **Use a confusion matrix for names,** over (expected, chosen) pairs, because it points at the specific pair

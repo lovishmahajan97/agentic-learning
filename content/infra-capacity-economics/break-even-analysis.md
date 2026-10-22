@@ -5,7 +5,7 @@ name: Break-even analysis (hosted API vs self-hosting)
 kind: decision
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - system-design/self-host-vs-api
@@ -34,7 +34,7 @@ cost more than GPU list price.
   model, and which workloads are interactive versus flat (evals, batch backfills, offline agents). Each one
   moves `V`, `p` or `u` in the formulas below.
 - **What you can skip.** Building the GPU cluster yourself to "find out". Run the sign test on a
-  spreadsheet first; most agent teams stay on an API or a managed open-weight endpoint.
+  spreadsheet first; it often points to an API or a managed open-weight endpoint.
 
 ## Why it exists
 - **The question arrives with the first five-figure API invoice:** "would it not be cheaper to run this
@@ -257,6 +257,9 @@ steps per run, ~12,000 input and ~300 output tokens per step (the transcript is 
   halves the API bill and leaves self-hosting even further behind.
 - **Caching moves `p`.** If prompt caching on the stable prefix brought the effective blended price to $1,
   the interactive `c_self` of $1.74 fails the sign test outright.
+- **Caching helps the self-hosted side too.** Serving engines reuse a shared prefix's KV cache (vLLM's
+  automatic prefix caching), which raises `T_slo` on this input-heavy shape; compare cached API pricing
+  against a load test with prefix caching on, or the comparison is unfair to self-hosting.
 - **Measure `T_slo` on this shape.** The mix is ~98% input tokens, so the 2,000 tokens per second
   assumption may be far off in either direction; replay the traces before trusting it.
 

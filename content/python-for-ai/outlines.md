@@ -5,7 +5,7 @@ name: Outlines
 kind: tool
 difficulty: advanced
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - python-for-ai/instructor

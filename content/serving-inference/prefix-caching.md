@@ -5,7 +5,7 @@ name: Prefix caching
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - prompting/prompt-caching
@@ -23,9 +23,9 @@ sources:
 ---
 
 ## TL;DR
-An agent re-sends its system prompt, tool schemas and whole trajectory on every step. Prefix caching keeps
-that prefix's KV cache alive so each step prefills only the newest tokens. It is exact, but only for
-byte-identical beginnings.
+An agent re-sends its system prompt, tool schemas and trajectory every step. Prefix caching keeps that
+prefix's KV cache alive, so each step prefills only the newest tokens, cutting TTFT and compute. Exact
+under causal attention, but only for byte-identical beginnings.
 
 ## For agent builders
 - **Why it matters for agents.** Step *n* of an agent loop begins with steps 1 to *n−1*. With a stable,
@@ -121,8 +121,8 @@ byte-identical beginnings.
 ### Managed APIs
 - **Same mechanism, different controls.** Some providers cache automatically above a minimum prompt
   length; others need explicit cache breakpoints in the request.
-- **Pricing shape:** most price cached input tokens at a fraction of normal input and charge a premium to
-  write an entry. Lifetime is short (minutes) unless refreshed, so a slow tool call can outlive it.
+- **Pricing shape:** most price cached input tokens at a fraction of normal input, and some (Anthropic's
+  explicit breakpoints, for example) also charge a premium to write an entry. Lifetime is short (minutes) unless refreshed, so a slow tool call can outlive it.
 - **Look the numbers up, do not memorize them,** because rules differ per provider and change over time.
   The discipline is identical: stable prefix first, measure hit rate, keep volatile content out of the top.
 
@@ -307,8 +307,8 @@ A 4k-token system prompt plus a growing trajectory, 10 tool steps per task, illu
   grow; compaction saves tokens and memory at the cost of one full re-prefill per compaction.
 - **Cache-aware routing vs load balance.** It raises fleet-wide hit rate but concentrates a tenant's or a
   run's traffic on one replica. Worth it when prefixes are long and tenants are many.
-- **Managed-API write premium vs read discount.** Cache writes cost more than plain input and reads cost
-  less. It pays once a prefix is reused a few times within the cache lifetime, as in any multi-step agent
+- **Managed-API write premium vs read discount.** Where the provider charges for writes, they cost more
+  than plain input and reads cost less. It pays once a prefix is reused a few times within the cache lifetime, as in any multi-step agent
   run, and loses money on one-off prompts.
 
 ## Pitfalls

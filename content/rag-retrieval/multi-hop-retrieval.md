@@ -5,7 +5,7 @@ name: Multi-hop retrieval
 kind: pattern
 difficulty: advanced
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - rag-retrieval/query-decomposition
@@ -29,7 +29,7 @@ an agent loop with a search tool: retrieve, read the bridging fact, write the ne
 hop limit, then answer with citations.
 
 ## For agent builders
-- **Why it matters for agents.** This is the core reason agents beat fixed RAG pipelines: the next query
+- **Why it matters for agents.** This is a core reason agents beat fixed RAG pipelines: the next query
   comes from what the last tool call returned. It is also where agents burn cost, loop on the same query
   and invent the second fact.
 - **Where it shows up in your stack.** A ReAct-style loop over a `search` tool in any provider SDK, a
@@ -254,11 +254,12 @@ def run_agent(question, max_steps=4, k=5):
         if not reply.tool_calls:
             return reply.text, step                         # the model's "done" signal
         for call in reply.tool_calls:
-            q = call["input"]["query"].strip().lower()
-            if q in tried:                                  # no progress: same query again
+            q = call["input"]["query"].strip()
+            key = " ".join(q.lower().split())               # normalised only for the repeat check
+            if key in tried:                                # no progress: same query again
                 content = {"status": "repeated_query", "hint": "name the entity you still need"}
             else:
-                tried.add(q)
+                tried.add(key)
                 new = [(i, t) for i, t in retrieve(q, k) if i not in seen]
                 seen.update(i for i, _ in new)
                 content = ({"status": "ok", "passages": [{"id": i, "text": t} for i, t in new]}
@@ -266,7 +267,9 @@ def run_agent(question, max_steps=4, k=5):
             messages.append(tool_result(call["id"], content))
     messages.append({"role": "user", "content": "Search budget reached. Answer only from the passages "
                      "above, cite their ids for every fact, and say which fact is still missing."})
-    return call_model(messages, tools=[]).text, max_steps   # partial answer, never a silent timeout
+    # keep the tool defined (the transcript holds tool calls) but forbid calling it
+    final = call_model(messages, tools=[SEARCH_TOOL], tool_choice="none")
+    return final.text, max_steps                            # partial answer, never a silent timeout
 ```
 
 Illustrative token flow for the INC-4812 question, with a 2,000-token system prompt and tool schemas and
@@ -280,7 +283,7 @@ Illustrative token flow for the INC-4812 question, with a 2,000-token system pro
 | Total input across 3 calls | | ~10,500 | |
 
 - **Each extra hop re-reads everything before it,** so input grows faster than hop count; prefix caching
-  on an append-only transcript recovers most of that cost.
+  on an append-only transcript recovers much of that cost.
 - **Returning short notes plus ids** instead of five full passages shrinks the per-hop append, at the cost
   of fetching full passages again for the cited answer.
 

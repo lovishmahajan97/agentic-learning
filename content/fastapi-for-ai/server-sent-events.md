@@ -5,7 +5,7 @@ name: Server-Sent Events
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - fastapi-for-ai/streamingresponse
@@ -280,7 +280,7 @@ one tool call.
 | Setup | What happens at t = 60 s | Outcome |
 |---|---|---|
 | No keepalive | proxy sees no bytes, closes the stream | client reconnects; without a buffer, a second billed run |
-| `: ping` every 15 s | idle timer last reset at t = 45 s, so it never reaches 60 s | stream survives the tool call |
+| `: ping` every 15 s | pings land at t = 45 s and t = 60 s, so the idle timer is never more than 15 s old | stream survives the tool call |
 | Ping + per-run buffer | drop on mobile instead, reconnect with `Last-Event-ID: 42` | events 43+ replayed, no second run |
 
 ## Production patterns

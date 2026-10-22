@@ -5,7 +5,7 @@ name: OAuth 2.0 / OIDC
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - backend-fundamentals/authentication-vs-authorization
@@ -304,8 +304,11 @@ def run_tool(call, session, vault, refresh):
         return {"error": "needs_authorization", "provider": str(e)}   # model sees this, not a token
     r = requests.request(call.method, call.url, json=call.args, timeout=20,
                          headers={"Authorization": f"Bearer {token}"})
-    if r.status_code == 403:
-        return {"error": "insufficient_scope", "detail": "ask the user to grant more access"}
+    if r.status_code == 401:                          # consent revoked or token invalidated upstream
+        vault.delete(session.user_key, call.provider)
+        return {"error": "needs_authorization", "provider": call.provider}
+    if r.status_code == 403:                          # scope too narrow, or the user lacks the permission
+        return {"error": "forbidden", "detail": "missing scope or user permission"}
     return {"status": r.status_code, "body": r.json()}       # the token never enters the transcript
 ```
 
@@ -519,7 +522,10 @@ rotation enabled.
 - **Steps:** register an OAuth app with GitHub (or any provider with a sandbox); implement `/login` and
   `/callback` with `state` and PKCE; store the refresh or access token in a local encrypted table keyed on
   the user; write a `list_issues` tool whose runtime attaches the token; return `needs_authorization` when
-  no token exists; redact `Authorization` from logged tool calls.
+  no token exists or the API answers 401 (delete the stored token then); redact `Authorization` from
+  logged tool calls.
+- **Provider note:** GitHub OAuth-app tokens do not expire by default, so use a GitHub App with expiring
+  user tokens if you want to exercise refresh.
 - **Done when:** the agent answers "what issues are assigned to me?" for two different test users with
   different results, revoking consent in the provider makes the next call return `needs_authorization`,
   and grepping your traces finds no token.

@@ -35,8 +35,9 @@ inference dropout must be off, or your agent turns non-deterministic.
   serving or eval path.
 - **What you control.** Epoch count, a held-out split of whole tasks (not turns), adapter dropout and
   decay, and which checkpoint you ship, chosen on agent task success rather than training loss.
-- **What you can skip.** Hosted APIs never expose dropout, and pretraining recipes are fixed. If you only
-  prompt hosted models, you need the diagnosis (train/val gap) and the eval-mode rule, not the math.
+- **What you can skip.** Hosted APIs do not expose dropout, and pretraining recipes are fixed. On a hosted
+  fine-tuning API your levers are mostly the epoch count and learning rate, read off the train/val curves
+  it reports. If you only prompt, you need the diagnosis and the eval-mode rule, not the math.
 
 ## Why it exists
 - **Big networks memorize.** With more parameters than training examples a network can reach zero training

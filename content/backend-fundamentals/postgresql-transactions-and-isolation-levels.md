@@ -5,7 +5,7 @@ name: PostgreSQL transactions & isolation levels
 kind: concept
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - backend-fundamentals/database-design

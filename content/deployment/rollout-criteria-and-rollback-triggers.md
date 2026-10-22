@@ -5,7 +5,8 @@ name: Rollout criteria & rollback triggers
 kind: practice
 difficulty: core
 est_minutes: 18
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - llmops-platform/canary-shadow-deployments
   - llmops-platform/rollback
@@ -18,9 +19,22 @@ related:
 ---
 
 ## TL;DR
-Rollout criteria say what evidence moves a release to the next exposure stage; rollback triggers say
-what signal sends it back. Both are written beforehand as thresholds with minimum samples, because
-people rationalise bad numbers mid-incident, and AI quality signals are noisy and slow.
+Rollout criteria say what evidence moves a new agent version to the next exposure stage; rollback
+triggers say what sends it back. Write both beforehand as thresholds with minimum samples, because agent
+quality signals are noisy and slow.
+
+## For agent builders
+- **Why it matters for agents.** Most agent releases are not code: a new prompt, model version, tool
+  description or retrieval setting. They can make the agent take worse paths, loop longer or cost more
+  per task with no rise in HTTP errors, and some of its actions (emails, record updates) cannot be undone.
+- **Where it shows up in your stack.** A feature flag or config service holding prompt version and pinned
+  model ID, a canary controller or gate script evaluated on a timer, an LLM judge on sampled traffic, and
+  per-task metrics from your agent traces.
+- **What you control.** Which agent signals are hard triggers (error rate, cost per task, step-budget
+  exhaustion, guardrail blocks), which are soft (judge score, task completion), minimum samples, and
+  whether write tools are fenced in early stages.
+- **What you can skip.** Building your own traffic-shifting controller; use the flag service or an
+  existing canary tool and spend your effort on the agent-specific metrics.
 
 ## Why it exists
 - **A staged rollout only reduces risk if someone decides at each stage.** Without written criteria, that
@@ -43,8 +57,8 @@ people rationalise bad numbers mid-incident, and AI quality signals are noisy an
   fraction (a quarter), then everyone.
 - **Minimum duration per stage**, because traffic varies by hour and weekday; a stage that only saw
   Sunday-night traffic proved little about Monday morning.
-- **Minimum sample per stage** (requests, sessions or completed tasks), because rare failures cannot be
-  observed in small samples.
+- **Minimum sample per stage** (requests, sessions or completed agent tasks), because rare failures
+  cannot be observed in small samples.
 
 Error counts are roughly Poisson: with *n* requests at baseline rate *p* you expect *np* errors with a
 standard deviation of about √(np).
@@ -70,6 +84,8 @@ n per arm ≈ (z_α/2 + z_β)² · (p₁q₁ + p₂q₂) / (p₁ − p₂)²
   before a 3-point quality drop is reliably visible.
 - **So quality criteria force longer bake times than error criteria**, and a stage with "enough requests"
   may still have too few judgements to decide anything about quality.
+- **For agents, count tasks, not model calls.** One task may make ten LLM calls; the unit that succeeds or
+  fails, and that the judge scores, is the task.
 
 ### 2. Compare against a baseline, not an absolute
 - **Run old and new side by side** on comparable traffic, so seasonal or upstream effects hit both.
@@ -79,9 +95,12 @@ n per arm ≈ (z_α/2 + z_β)² · (p₁q₁ + p₂q₂) / (p₁ − p₂)²
 ### 3. Split triggers into hard and soft
 | | Hard triggers | Soft triggers |
 |---|---|---|
-| **Signals** | Error rate, timeouts, p95 or p99 latency, guardrail block rate, cost per request, provider 429s, crash loops | Online LLM-judge score on sampled traffic, user feedback rate, escalation-to-human rate, task completion rate |
+| **Signals** | Error rate, timeouts, p95 or p99 latency, guardrail block rate, cost per request or task, step-budget exhaustion rate, tool-call error rate, provider 429s, crash loops | Online LLM-judge score on sampled traffic, user feedback rate, escalation-to-human rate, task completion rate |
 | **Nature** | Fast to measure, unambiguous | Slower, noisier |
 | **Action** | Automated, immediate rollback | Set a *hold*; a named person decides within a set time |
+
+- **Agent cost is a hard signal.** A model that takes 50% more steps per task shows up immediately in
+  cost per task and tokens per task, long before any judge score moves.
 
 ### 4. Make the outcome one of three states
 - **Promote:** all criteria met, duration and sample reached.
@@ -91,7 +110,7 @@ n per arm ≈ (z_α/2 + z_β)² · (p₁q₁ + p₂q₂) / (p₁ − p₂)²
 
 ### 5. Make rollback cheap and rehearsed
 - **Version every behaviour-changing artefact:** prompt, model identifier (pinned, never a floating
-  alias), retrieval config, index.
+  alias), tool definitions, retrieval config, index.
 - **Ship behind a flag** so rollback is a config change, not a redeploy.
 - **Keep the old index serving** until the new one has baked, because re-embedding a corpus can take hours
   and is not a rollback you can do mid-incident.
@@ -106,11 +125,11 @@ n per arm ≈ (z_α/2 + z_β)² · (p₁q₁ + p₂q₂) / (p₁ − p₂)²
 
 ## Diagram
 Every evaluation tick runs hard triggers first, then the evidence floors, then the soft quality check;
-only a clean pass promotes.
+only a clean pass promotes the new agent version.
 
 ```mermaid
 flowchart TD
-    T["Evaluation tick, every 15 min"] --> S{"Minimum requests reached?"}
+    T["Evaluation tick, every 15 min"] --> S{"Minimum tasks reached?"}
     S -->|"yes"| H{"Any hard trigger tripped?"}
     H -->|"yes"| RB["Roll back via flag"]
     H -->|"no"| E{"Duration and judged sample met?"}
@@ -168,6 +187,38 @@ print(evaluate(canary, control, minutes_in_stage=240))
 - **The judged-sample floor matters.** Had the same drop appeared after only 200 judgements, the gate
   would have returned "collecting evidence".
 
+### Agent-specific hard triggers from task traces
+For a tool-calling agent, add task-level signals computed from traces. The numbers are illustrative.
+
+```python
+def agent_triggers(canary, control):
+    if canary["tasks"] < 1000:                                   # task-level minimum sample
+        return "HOLD", "collecting tasks"
+    if canary["cost_per_task"] > 1.3 * control["cost_per_task"]:
+        return "ROLLBACK", "cost per task"
+    if canary["step_budget_hit_rate"] > max(2 * control["step_budget_hit_rate"], 0.01):
+        return "ROLLBACK", "agent hitting max steps (looping)"
+    if canary["tool_error_rate"] > max(2 * control["tool_error_rate"], 0.01):
+        return "ROLLBACK", "tool-call errors (bad arguments or schema drift)"
+    return "OK", "no agent hard trigger"
+
+control = {"tasks": 9000, "cost_per_task": 0.062, "steps_per_task": 6.1,
+           "step_budget_hit_rate": 0.004, "tool_error_rate": 0.008}
+canary  = {"tasks": 1400, "cost_per_task": 0.094, "steps_per_task": 9.3,
+           "step_budget_hit_rate": 0.021, "tool_error_rate": 0.009}
+print(agent_triggers(canary, control))   # ('ROLLBACK', 'cost per task')
+```
+
+| Signal | Control | Canary | Limit | Result |
+|---|---|---|---|---|
+| Steps per task | 6.1 | 9.3 | (watched, not a trigger) | about 52% more steps |
+| Cost per task | $0.062 | $0.094 | 1.3 × 0.062 ≈ $0.081 | Trips: roll back |
+| Step-budget hit rate | 0.4% | 2.1% | max(0.8%, 1%) = 1% | Would also trip |
+| Tool error rate | 0.8% | 0.9% | max(1.6%, 1%) = 1.6% | Within limit |
+
+- **No HTTP error moved**, yet the new model loops more and costs about 52% more per task. Request-level
+  gates would have promoted it.
+
 ### Deriving the minimum request count
 Require the expected gap between baseline and regressed error counts to exceed *k* standard deviations
 of the baseline count: n·p·(r − 1) ≥ k·√(n·p), so n ≥ k² / (p·(r − 1)²).
@@ -191,6 +242,9 @@ print(min_requests(0.01, 1.5))   # 10000 -> smaller regressions cost quadratical
 - **Flag-based percentage rollout for prompts and models.** Keep prompt version and pinned model ID in a
   feature-flag or config service, roll out by percentage or tenant, and roll back by flipping the flag.
   Monitor flag change events alongside the quality dashboard so every shift is attributable.
+- **Task-level agent metrics on canary and control.** Tag every trace with the release version and compute
+  cost per task, steps per task, step-budget hits and tool-call error rate per arm. Monitor these next to
+  request metrics; they catch looping and path regressions that HTTP metrics miss.
 - **Judged-sample floor on quality gates.** Route a fixed fraction of canary and control traffic to an
   LLM judge and refuse to promote until the judged count reaches the computed floor (about 1,600 per arm
   for a 3-point drop near 90%). Monitor judged count per stage, not just request count.
@@ -203,12 +257,12 @@ print(min_requests(0.01, 1.5))   # 10000 -> smaller regressions cost quadratical
 ## Trade-offs
 - **Trustworthy decisions vs release speed.** Long bake times and large minimum samples make decisions
   trustworthy but slow every release; the balance flips toward speed for low-risk changes behind flags
-  and toward caution for model swaps.
+  and toward caution for model swaps under an agent with tools.
 - **Reaction time vs thrash.** Automated rollback reacts in minutes but can thrash on noisy metrics;
   reserve automation for hard, low-noise signals and route noisy quality signals to a human hold.
 - **Robust comparison vs cost.** Relative thresholds against a live control absorb traffic shifts, but
   require running two versions at once, which doubles some costs and is awkward for stateful or
-  per-tenant releases.
+  per-tenant releases, such as agents with long-lived memory.
 - **Blast radius vs signal.** Rolling out by tenant gives clean blast-radius control and clearer
   attribution, but small tenants produce too little traffic to judge, so per-tenant stages need longer
   durations.
@@ -219,19 +273,20 @@ print(min_requests(0.01, 1.5))   # 10000 -> smaller regressions cost quadratical
 - **Judging a stage before its minimum sample.** Symptom: releases promoted on a quiet hour and incidents
   that start when peak traffic arrives. Fix: enforce duration and sample floors in the gate.
 - **Monitoring only errors and latency for a prompt or model change.** Symptom: a green rollout followed by
-  a week of user complaints about worse answers. Fix: add sampled quality as a soft trigger.
+  a week of user complaints about worse answers, or a cost bill up by half. Fix: add sampled quality as a
+  soft trigger and cost and steps per task as hard ones.
 - **Pointing at a floating model alias.** The provider changes the model underneath you; symptom: a
   quality shift no release on your side explains and rollback does not fix. Fix: pin model versions.
 - **Assuming rollback undoes everything.** Symptom: a clean revert while records written or messages sent
   by the bad version remain in customer systems. Fix: fence write actions early.
 
 ## When to use
-- **Use for any behaviour-changing release:** code, prompt, model, retrieval configuration, index,
-  guardrail policy, tool set.
+- **Use for any behaviour-changing release:** code, prompt, model, tool definitions, retrieval
+  configuration, index, guardrail policy, tool set.
 - **Scale the ladder to risk:** a copy change behind a flag may need only a short internal stage; a model
   swap for an agent with write tools needs staged tenants, a long bake and human-reviewed quality gates.
 - **Measure** what the customer feels (errors, latency, cost, task success) and what predicts it (judge
-  score on sampled traffic, escalations).
+  score on sampled traffic, escalations, steps per task).
 - **Interviews:** strong answers name the three-state decision, minimum samples, relative-plus-absolute
   thresholds, hard versus soft triggers, and the irreversibility of agent side effects.
 
@@ -272,6 +327,12 @@ roll back; if they are spread and the gap closes with more data, continue.
 - **Fix the gate:** add sampled LLM-judge scoring on canary and control as a soft trigger, with a judged
   sample floor (about 1,600 per arm to see 91% falling to 88%).
 
+### A new model makes your agent take 50% more steps per task. Which trigger should catch it?
+- **A hard cost or step trigger, not the judge:** cost per task and step-budget exhaustion are fast and
+  unambiguous, so compare them per arm and roll back automatically past a relative limit.
+- **Instrument at task level:** tag traces with the release version, because request-level metrics hide
+  that one task now makes nine model calls instead of six.
+
 ### When would you roll forward instead of rolling back?
 - **When rollback is impossible:** a schema migration already applied, or an external contract already
   changed.
@@ -308,3 +369,24 @@ roll back; if they are spread and the gap closes with more data, continue.
 - [x] Keeping the old index serving in parallel until the new one has passed its bake period
 > Re-embedding takes hours, so it is not a mid-incident rollback. Keeping the old index live lets
 > rollback be a configuration switch, while code-only rollback would query vectors from an incompatible model.
+
+## Use cases & projects
+### Use cases
+- **Swapping the model under a production agent.** Staged rollout with cost-per-task and step triggers
+  catches a model that loops or over-calls tools before it reaches every tenant.
+- **Shipping a prompt or tool-description change.** A judged-sample floor decides whether a few points of
+  quality loss are real before promotion.
+- **Enabling a new write tool.** Early stages run it in dry-run, counting would-be writes to size the blast
+  radius before turning it on.
+- **Re-embedding the knowledge base behind a RAG agent.** The old index stays warm so rollback is a config
+  switch, not hours of re-embedding.
+
+### Mini project
+**Canary gate for an agent release (2-3 hours).**
+- **Goal:** a gate script that returns promote, hold or roll back for a new agent version from simulated
+  task traces.
+- **Steps:** generate synthetic traces for control and canary (steps, cost, tool errors, a judge verdict
+  per task); implement hard triggers for cost per task and step-budget hits, a task minimum, and a soft
+  judge trigger with a judged-sample floor; run it every simulated 15 minutes as traffic accumulates.
+- **Done when:** a looping canary rolls back on cost, a canary with a five-point judge drop holds and
+  "pages", a clean canary promotes only after its floors are met, and each decision prints its reason.

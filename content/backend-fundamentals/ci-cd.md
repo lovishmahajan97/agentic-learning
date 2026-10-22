@@ -5,7 +5,7 @@ name: CI/CD
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - backend-fundamentals/docker
@@ -490,8 +490,9 @@ artifact so a rollback reverts both.
 - **Goal:** a GitHub Actions workflow that blocks a pull request when an agent change lowers task success
   or raises cost per run.
 - **Steps:** write 15 eval cases for a small tool-calling agent with fake tools and a `check` per case;
-  record a baseline JSON from main; add the trajectory gate script; wire a workflow that runs unit tests
-  with the model mocked on every PR and the gate when `prompts/**` or `tools/**` change, using a CI-only
-  key with a spend cap; open a PR that deliberately breaks a tool description.
+  record a baseline JSON from main; add the trajectory gate script; wire one workflow that runs unit tests
+  with the model mocked on every PR and a second, `on: pull_request: paths:`-filtered workflow that runs
+  the gate when `prompts/**` or `tools/**` change, using a CI-only key with a spend cap; open a PR that
+  deliberately breaks a tool description.
 - **Done when:** the breaking PR fails the gate with a readable reason, a harmless PR passes, and the
   workflow run shows the eval cost stayed under your cap.

@@ -5,7 +5,8 @@ name: Legacy system integration
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - enterprise-integration/enterprise-connectors
   - enterprise-integration/incremental-synchronization-and-cdc
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-Legacy systems hold the data AI features need but offer no modern API and cannot be changed or
-overloaded. Wrap them in an anti-corruption layer that uses the least invasive access path and
-translates their model into yours, so quirks stop at one boundary.
+Enterprise agents often need a mainframe or old ERP with no modern API that cannot be changed
+or overloaded. Back agent tools with an anti-corruption layer that uses the least invasive access
+path and translates legacy codes, so quirks stop at one boundary.
+
+## For agent builders
+- **Why it matters for agents.** "What is the status of claim 4471?" and "raise a return for this order"
+  are tool calls that end in a legacy system. Agents call faster, retry more eagerly and loop more than
+  humans at terminals, so an unprotected legacy tool turns one confused agent into an outage.
+- **Where it shows up in your stack.** Behind your function tools or MCP server: a domain operation such as
+  `get_claim(id)`, a concurrency limiter, a read cache, a write queue with client references, and a batch
+  calendar the tool checks before calling.
+- **What you control.** Which access path each tool uses, what the tool returns to the model (named states,
+  never raw codes like `07`), how timeouts are reported (in-doubt, not failed), and the agent-visible
+  message during maintenance windows.
+- **What you can skip.** Writing COBOL or CICS programs. You need to read a copybook, decode `COMP-3`, apply
+  Little's law and make writes idempotent; the legacy owners run the rest.
 
 ## Why it exists
 - **The system of record is old and staying.** In most large enterprises policies, accounts, claims or
@@ -43,7 +57,8 @@ translates their model into yours, so quirks stop at one boundary.
 
 ## How it works
 ### 1. Choose the access path, least invasive first
-Ordered roughly from safest to riskiest, *because* each step down couples you more tightly to internals:
+Ordered roughly from safest to riskiest, *because* each step down couples you (and every agent tool) more
+tightly to internals:
 
 | Path | What it is | Why choose or avoid |
 |---|---|---|
@@ -56,10 +71,11 @@ Ordered roughly from safest to riskiest, *because* each step down couples you mo
 ### 2. Build an anti-corruption layer
 A translation service owned by your side converts legacy records into your canonical model and back:
 - **Decodes encodings:** EBCDIC, COBOL `COMP-3` packed decimal, implied decimal points.
-- **Maps codes to named states**, and normalizes dates and time zones.
+- **Maps codes to named states**, and normalizes dates and time zones, so the model reads "pending
+  assessor review" instead of guessing what `07` means.
 - **Exposes domain operations** such as `get_claim(id)`, hiding access-path details.
 - **Is the only interface consumers see, including LLM tools**, *because* when the legacy system is
-  eventually replaced, only this layer changes.
+  eventually replaced, only this layer changes and the agent's tool schemas stay put.
 
 Two encoding traps cause most "the numbers are wrong" incidents:
 1. **Zoned signs.** Signed numeric fields stored as display digits (`PIC S9(5)V99` without `COMP-3`) carry
@@ -69,13 +85,15 @@ Two encoding traps cause most "the numbers are wrong" incidents:
    binary and decoded field by field from the copybook, *because* a transfer step that converts the whole
    file from EBCDIC to ASCII rewrites the packed bytes as characters and destroys them without any error.
 
-### 3. Protect the legacy system
+### 3. Protect the legacy system from the agent
 - **Cache or replica in front of reads, a queue in front of writes**, and explicit concurrency limits
   everywhere.
 - **Size the limit with Little's law:** concurrent calls = arrival rate × call latency.
 - **Worked number:** an illustrative 20 lookups per second at 1.5 seconds per legacy transaction means
   about 30 calls in flight. If operations allows 10 concurrent sessions, you must cache, batch, or shed load,
   *because* the gateway will otherwise queue requests until user-facing timeouts fire and retries make it worse.
+- **Agents amplify load.** One user question can fan out into several tool calls, and a model that sees an
+  error often retries the same call, so budget legacy calls per agent session as well as per second.
 - **Respect batch windows.** Schedule bulk extracts when the system says, and make agent tools return
   "system unavailable, try after 06:00" rather than hammering it.
 
@@ -95,13 +113,16 @@ So:
 3. **After a timeout, look the reference up before retrying**; if it exists, the write happened.
 4. **No queryable field?** Route writes through a single queue consumer and confirm them against the next
    extract, *because* only reconciliation can then tell you which in-doubt writes landed.
+5. **Tell the model the truth.** The tool result says "applied", "scheduled" or "in doubt, reference X", so
+   the agent never tells a customer a change is done when it is only queued.
 
 ### 5. Migrate incrementally if replacing
 - **Strangler fig:** route one capability at a time from the legacy system to the new one behind a facade,
-  *because* big-bang rewrites of systems with decades of undocumented rules routinely fail.
+  *because* big-bang rewrites of systems with decades of undocumented rules routinely fail. The agent's
+  tools sit on the facade, so they survive the migration.
 
 ## Diagram
-Consumers only ever see domain operations; protection and translation sit between them and the legacy system.
+Agent tools only ever see domain operations; protection and translation sit between them and the legacy system.
 
 ```mermaid
 flowchart TD
@@ -123,7 +144,7 @@ flowchart TD
 ### Decoding a fixed-width EBCDIC extract
 A nightly SFTP extract contains fixed-width 30-byte records in EBCDIC: customer id `PIC X(10)`, name
 `PIC X(16)`, balance `PIC S9(5)V99 COMP-3` (seven digits plus a sign nibble = 4 bytes, two implied
-decimals). The anti-corruption layer decodes it into a typed record.
+decimals). The anti-corruption layer decodes it into a typed record the agent's lookup tool can return.
 
 ```python
 from decimal import Decimal
@@ -163,12 +184,13 @@ assert unpack_comp3(bytes.fromhex("0000150D"), 2) == Decimal("-1.50")
 
 - **Wrong decoding fails silently.** Reading the file as UTF-8 raises decode errors or produces garbage
   names. Worse, treating the packed bytes as text (or decoding them with `cp037`, which maps every byte to
-  some character) silently produces plausible-looking wrong balances.
+  some character) silently produces plausible-looking wrong balances that an agent will quote.
 - **So the layout comes first.** The COBOL copybook is the first artifact to request from the customer.
 
-### Idempotent write wrapper for an in-doubt timeout
+### Idempotent write tool for an in-doubt timeout
 The reference is recorded before sending and looked up after a timeout, so a lost reply never becomes a
-second write. The fake gateway applies the write and then loses the reply once.
+second write even if the agent calls the tool again. The fake gateway applies the write and then loses the
+reply once.
 
 ```python
 import uuid
@@ -208,6 +230,11 @@ print(update_contact(pending, gw, "CLM4471", "1 New St"))
 print(len(gw.rows), pending)                       # 1 {}: applied once, nothing in doubt
 ```
 
+- **The string goes back to the model.** "in-doubt" tells the agent to report a pending change and stop,
+  rather than calling the tool a fourth time.
+- **Key the agent's retries too.** If the agent framework retries a whole tool call, pass a stable
+  idempotency key from the agent step so the second call reuses the first reference.
+
 ### Worked capacity check with Little's law
 Agent lookups against a claims mainframe that allows 10 concurrent sessions (illustrative figures).
 
@@ -218,7 +245,8 @@ Agent lookups against a claims mainframe that allows 10 concurrent sessions (ill
 | Cache plus batching 2 lookups per call | 3 calls/s | 1.5 s | 4.5 | Yes, with headroom |
 
 The cache is the lever, because latency is fixed by the legacy system and arrival rate is the only thing
-you control.
+you control. An agent that averages 2.5 claim lookups per conversation turns 8 user questions per second
+into those 20 lookups per second, so per-session caching of the same claim matters as much as the shared cache.
 
 ## Production patterns
 - **Bulkhead the legacy calls.** Wrap every call in a limiter sized to the session count operations agrees
@@ -227,6 +255,9 @@ you control.
 - **Maintenance-aware tools.** Keep the batch and maintenance calendar in config and check it before calling,
   so agent tools answer "system unavailable, try after 06:00" during the window. Monitor calls attempted
   inside windows (should be zero).
+- **Per-session tool budgets.** Cap legacy calls per agent conversation and return a "limit reached"
+  result the model can explain, because a retry loop in one session can consume the shared session pool.
+  Monitor calls per session at p50 and p99.
 - **Binary transfer plus copybook-driven parsing.** Move mixed files without code-page conversion (FTP in
   binary mode, or SFTP, which does not convert), then decode per field from the copybook. Quarantine records
   that fail validation and alert on parse rejects per extract.
@@ -235,38 +266,40 @@ you control.
   writes and how they resolved.
 - **Status-code translation table, owned and versioned.** Keep the mapping from codes like `07` to named
   states in one reviewed table in the anti-corruption layer, and fail on unknown codes rather than passing
-  them through. Monitor unknown-code counts.
+  them through to the model. Monitor unknown-code counts.
 
 ## Trade-offs
 - **Batch files: decoupled vs stale.** Files are decoupled and replayable, but data is as stale as the last
-  extract. It flips to CDC or a queue when users need answers about changes made in the last hour.
+  extract. It flips to CDC or a queue when users need answers about changes made in the last hour, and the
+  agent must say how old its data is.
 - **Replica: protects the primary vs lag.** Replication lag means a just-submitted transaction may be
-  invisible; read-your-writes flows must query the primary or wait.
+  invisible; read-your-writes flows (the agent writes, then reads back to confirm) must query the primary or wait.
 - **Screen automation: reach vs fragility.** It reaches logic no API exposes, but breaks on any UI change and
-  is slow. Acceptable only when volumes are low and a proper interface is on the roadmap.
-- **Anti-corruption layer: a service to run vs leaked semantics.** Without it every consumer learns legacy
-  codes; it stops paying off only for a single throwaway consumer.
+  is slow. Acceptable only when volumes are low and a proper interface is on the roadmap; computer-use agents
+  do not change that trade-off.
+- **Anti-corruption layer: a service to run vs leaked semantics.** Without it every consumer, including
+  every prompt, learns legacy codes; it stops paying off only for a single throwaway consumer.
 
 ## Pitfalls
 - **Querying production during the batch window.** Symptom: the nightly job overruns and operations asks
-  who is running unplanned queries.
+  who is running unplanned queries. Fix: a maintenance-aware tool.
 - **Wrong code page or ignored packed decimals.** Symptom: mojibake in names or balances off by orders of
   magnitude.
 - **Retrying non-idempotent writes on timeout.** Symptom: duplicate orders or payments discovered at
   reconciliation.
 - **Raw legacy codes as tool output.** Symptom: the model guesses what status `07` means and confidently
-  tells a customer the wrong thing.
+  tells a customer the wrong thing. Fix: map to named states in the layer.
 - **Text-mode transfer of mixed text-and-packed files**, or a gateway converting code pages for the whole
   record. Symptom: names look fine while numeric fields are garbage or fail validation.
 - **Assuming 24/7 availability.** Symptom: agent tools fail every night during maintenance with unhelpful
-  error messages.
+  error messages, and the agent retries them.
 
 ## When to use
-- **Use when** an AI feature must read from or write to a system you cannot change.
+- **Use when** an AI feature or agent tool must read from or write to a system you cannot change.
 - **Ask first, code second:** existing interfaces, the batch schedule, the record layouts and the capacity
   constraints.
-- **Release order:** read-only first; add writes only through a path that runs the system's own business
-  rules, with idempotency references.
+- **Release order:** read-only tools first; add write tools only through a path that runs the system's own
+  business rules, with idempotency references and, for consequential writes, human approval.
 - **Measure:** data freshness against the batch schedule, load on the legacy system (calls, concurrency, CPU
   where the owners can report it), in-doubt writes and how they resolved, parse rejects per extract, and
   reconciliation mismatches.
@@ -326,6 +359,14 @@ the change is scheduled, not done.
   still be running.
 - **No queryable field:** single queue consumer plus reconciliation against the next extract.
 
+### Your agent keeps calling a legacy lookup tool after it times out, and operations complain. How do you fix the agent side?
+- **Return a structured result, not an exception string.** "System busy, retry not useful for 10 minutes"
+  or "in maintenance until 06:00" gives the model a reason to stop.
+- **Enforce a per-session budget in the runtime**, so the model cannot exceed N legacy calls whatever it
+  decides.
+- **Cache per conversation** so the same claim is fetched once, and trace tool calls per session to find
+  prompts that trigger loops.
+
 ## Quiz
 ### Q: Why is screen automation usually the last-resort integration path?
 - [ ] It cannot read data, only write it
@@ -350,3 +391,24 @@ the change is scheduled, not done.
 - [ ] The database rejects the record
 > Packed decimal stores two digits per byte plus a sign nibble, so text decoding yields nonsense characters
 > or numbers that look valid; explicit COMP-3 decoding with nibble validation is required.
+
+## Use cases & projects
+### Use cases
+- **Insurance claims agents.** Look up claim status and update contact details through a CICS gateway,
+  with client references on every write.
+- **Order and returns agents on old ERPs.** Read order state from a replica; raise returns through the
+  existing MQ interface so business rules run.
+- **Banking assistants over nightly extracts.** Answer balance and transaction questions from parsed
+  EBCDIC files, stating the as-of time.
+- **Strangler migrations.** Agent tools sit on a facade that routes each capability to the old or new
+  system as it migrates.
+
+### Mini project
+**Protected legacy lookup tool for an agent (2-3 hours).**
+- **Goal:** give a tool-calling agent a `get_customer` tool backed by a fake slow legacy system that allows
+  only 3 concurrent calls.
+- **Steps:** generate a fixed-width EBCDIC fixture with `COMP-3` balances and parse it; wrap a fake gateway
+  with 1.5-second latency in a semaphore, a read cache and a maintenance calendar; map status codes to named
+  states; run 20 concurrent agent conversations against it.
+- **Done when:** in-flight calls never exceed 3, the agent reports maintenance windows instead of retrying,
+  balances match the fixture exactly, and a trace shows each customer fetched once per conversation.

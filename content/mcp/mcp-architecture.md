@@ -1,0 +1,367 @@
+---
+id: mcp-architecture
+module: mcp
+name: MCP architecture (hosts, clients, servers, JSON-RPC lifecycle, capability negotiation)
+kind: concept
+difficulty: core
+est_minutes: 16
+status: agentic
+agent_relevance: core
+related:
+  - agents/model-context-protocol
+  - mcp/mcp-server-primitives
+  - mcp/mcp-client-primitives
+  - mcp/mcp-transports
+  - agents/mcp-authentication-authorization-transport-security
+  - python-for-ai/mcp-python-sdk
+  - agents/tool-calling
+  - agents/a2a-protocol
+sources:
+  - Official docs: Model Context Protocol specification (revisions 2025-11-25 and 2026-07-28)
+  - Official docs: MCP Python SDK
+  - Official docs: JSON-RPC 2.0 specification
+---
+
+## TL;DR
+MCP splits an agent app into a host (your agent), one client per connection, and servers that expose
+capabilities, all speaking JSON-RPC 2.0. Knowing who owns what, and how versions and capabilities are
+agreed, lets you debug and scale MCP-backed agents.
+
+## For agent builders
+- **Why it matters for agents.** Every MCP tool your agent calls crosses this architecture: the host
+  decides what the model sees, the client speaks the protocol, the server runs the code. Most
+  production bugs ("tool missing", "hangs at start", "works locally, fails behind a load balancer") are
+  architecture bugs, not model bugs.
+- **Where it shows up in your stack.** IDE and desktop agents (hosts), the official Python and TypeScript
+  SDKs (clients and servers), agent frameworks with MCP adapters, and gateways that aggregate servers.
+- **What you control.** Which servers a host connects to, which capabilities your client declares, which
+  protocol versions you accept, and how server failures are isolated from the agent loop.
+- **What you can skip.** Hand-writing JSON-RPC framing. The SDKs do it; you need to read a wire trace,
+  not produce one.
+
+## Why it exists
+- **N agents times M systems is a lot of glue.** Before MCP, every agent framework wrapped every API in its
+  own tool format. A shared protocol turns N×M adapters into N clients plus M servers.
+- **Function calling alone is not a protocol.** Provider tool calling defines what the model emits, not
+  how a separate process advertises tools, streams progress, or asks the user a question mid-call.
+- **Capabilities differ per party.** A desktop host can show a form; a headless batch agent cannot.
+  Capability declarations let each side use only what the other supports, instead of failing at runtime.
+- **Versions move fast.** The spec has had five dated revisions (2024-11-05, 2025-03-26, 2025-06-18,
+  2025-11-25, 2026-07-28). Explicit version agreement keeps old and new peers interoperable.
+
+## How it works
+### Three roles
+| Role | Is | Owns | Example |
+|---|---|---|---|
+| **Host** | Your agent application | The model, the user, consent, which servers to load, what reaches the context | An IDE agent, a desktop chat app, your own LangGraph service |
+| **Client** | A connector inside the host | One connection to one server: protocol, capabilities, request ids | `ClientSession` (Python), `Client` (TypeScript) |
+| **Server** | A program exposing capabilities | Tools, resources, prompts and its own credentials to backends | A GitHub, Postgres or ticketing server |
+
+- **One client per server, 1:1.** A host with three servers runs three clients. This isolates servers from
+  each other, because a server never sees another server's traffic or the full conversation.
+- **The host is the trust boundary.** Servers propose; the host decides which tools the model may see,
+  which calls need approval, and what tool output is allowed into context.
+- **Servers can be local or remote.** Local servers run as a subprocess over stdio; remote ones sit behind
+  Streamable HTTP with OAuth (see `mcp/mcp-transports`).
+
+### The message layer: JSON-RPC 2.0
+- **Requests** carry an `id` and a `method` and expect exactly one response with the same `id`; the `id`
+  must not be `null` and must be unique among in-flight requests.
+- **Responses** carry either `result` or `error` (`code`, `message`, optional `data`).
+- **Notifications** have no `id` and get no reply: progress, log messages, list changes, cancellation.
+- **Standard error codes:** `-32700` parse error, `-32600` invalid request, `-32601` method not found,
+  `-32602` invalid params, `-32603` internal error. In 2026-07-28 the range `-32020` to `-32099` is
+  reserved for MCP-defined errors such as `UnsupportedProtocolVersion` (`-32022`).
+- **Correlation by `id`** is what lets several tool calls be in flight on one connection, which is how a
+  host serves parallel tool calls from one model turn.
+
+### Lifecycle in the handshake era (2024-11-05 to 2025-11-25)
+Most deployed servers and SDK 1.x releases still speak this model.
+1. **`initialize`.** The client sends `protocolVersion` (the latest it supports), `capabilities` and
+   `clientInfo`.
+2. **Server reply.** The server answers with the same version if it supports it, otherwise another version
+   it supports, plus its `capabilities`, `serverInfo` and optional `instructions` for the model. If the
+   client cannot speak the returned version it should disconnect.
+3. **`notifications/initialized`.** The client confirms; only then do normal requests flow.
+4. **Operation.** Discovery (`tools/list`, `resources/list`, `prompts/list`) and use (`tools/call`, ...)
+   within the negotiated capabilities. Either side may `ping`.
+5. **Shutdown.** No shutdown message: on stdio the client closes stdin, then escalates to `SIGTERM` and
+   `SIGKILL`; on HTTP the client closes connections or sends HTTP `DELETE` with its session id.
+
+### Lifecycle in the stateless era (2026-07-28, the current revision)
+- **No handshake.** `initialize` and `notifications/initialized` are gone. Every request carries
+  `io.modelcontextprotocol/protocolVersion`, `io.modelcontextprotocol/clientCapabilities` and (should)
+  `io.modelcontextprotocol/clientInfo` in `_meta`, and the server judges each request on its own.
+- **`server/discover`.** Servers must implement it to return `supportedVersions`, `capabilities`,
+  identity and `instructions`; clients may call it first, or just send requests and handle errors.
+- **Version mismatch** returns `UnsupportedProtocolVersionError` with a `supported` list, and the client
+  retries with a common version.
+- **No sessions, no server-initiated requests.** Sampling, elicitation and roots ride inside results as
+  input requests (multi round-trip requests, see `mcp/mcp-client-primitives`), and long-lived change
+  notifications use a `subscriptions/listen` request.
+- **Why the change:** a request that carries everything it needs can hit any replica, so remote servers
+  scale like ordinary stateless HTTP services.
+- **Dual-era peers.** A dual-era client probes (stdio: `server/discover` first; HTTP: inspect a `400`
+  body) and falls back to `initialize` for legacy servers. Check the current spec before relying on
+  details, because this revision is new.
+
+### Capability negotiation
+| Side | Capability | Means |
+|---|---|---|
+| Server | `tools`, `resources`, `prompts` | Offers that primitive; `listChanged` means it will announce changes |
+| Server | `resources.subscribe` | Clients may subscribe to updates of one resource |
+| Server | `logging`, `completions` | Emits log messages; offers argument autocompletion |
+| Client | `roots`, `sampling`, `elicitation` | Can list workspace roots, run an LLM call for the server, ask the user |
+| Both | `experimental`, `extensions` (2026-07-28) | Opt-in features outside the core |
+
+- **Rule:** neither side may use a feature the other did not declare. A server must not send an
+  elicitation to a client without `elicitation`, which is why a headless agent can simply omit it.
+- **Deprecations (2026-07-28):** roots, sampling and logging are marked deprecated with a migration path
+  (tool parameters or config instead of roots, direct provider calls instead of sampling, stderr or
+  OpenTelemetry instead of logging). They still work during the deprecation window of at least twelve
+  months.
+
+## Diagram
+Follow one connection in the handshake era: the host creates a client, the client negotiates once, then
+the agent loop drives discovery and calls through it.
+
+```mermaid
+sequenceDiagram
+    participant H as Host (agent)
+    participant C as MCP client
+    participant S as MCP server
+    H->>C: connect(server config)
+    C->>S: initialize (version, capabilities, clientInfo)
+    S-->>C: result (version, capabilities, serverInfo)
+    C->>S: notifications/initialized
+    H->>C: list tools for the model
+    C->>S: tools/list
+    S-->>C: tools with input schemas
+    H->>C: model chose search_tickets
+    C->>S: tools/call (id 3)
+    S-->>C: result (id 3) or isError
+```
+
+## Examples
+### A host that negotiates and inspects a server
+Run `host.py` next to the server; it does what every agent host does at startup and prints what was
+negotiated. Pin the 1.x SDK (`pip install "mcp>=1.10,<2"`); in the 2.x SDK `FastMCP` became `MCPServer`
+and result fields became snake_case, so check the migration guide.
+
+```python
+# tickets_server.py
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("tickets", instructions="Helpdesk tickets. Search before you create.")
+
+@mcp.tool()
+def search_tickets(query: str) -> list[str]:
+    """Find ticket titles containing `query`."""
+    return [t for t in ["VPN down", "Printer jam"] if query.lower() in t.lower()]
+
+if __name__ == "__main__":
+    mcp.run()                                        # stdio by default
+```
+
+```python
+# host.py
+import asyncio, sys
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+async def main():
+    params = StdioServerParameters(command=sys.executable, args=["tickets_server.py"])
+    async with stdio_client(params) as (read, write):          # host spawns the server
+        async with ClientSession(read, write) as session:      # one client for this server
+            init = await session.initialize()                  # handshake-era negotiation
+            print(init.protocolVersion)                        # e.g. 2025-11-25 on SDK 1.x
+            print(init.serverInfo.name, "|", init.instructions)
+            print(init.capabilities.model_dump(exclude_none=True))  # tools, prompts, resources...
+            tools = (await session.list_tools()).tools         # becomes the model's tool list
+            res = await session.call_tool("search_tickets", {"query": "vpn"})
+            print([t.name for t in tools], res.isError, res.structuredContent)
+
+asyncio.run(main())
+```
+
+### Worked scenario: the same `tools/call` in both eras
+What changes on the wire when a server moves to the current revision (abridged JSON).
+
+| Step | Handshake era (2025-11-25) | Stateless era (2026-07-28) |
+|---|---|---|
+| Before first call | `initialize` plus `notifications/initialized` | Nothing, or an optional `server/discover` |
+| Version and capabilities | Sent once, held in session state | Sent in `_meta` on every request |
+| HTTP routing | `Mcp-Session-Id` header, sticky to one replica | Any replica; `Mcp-Method` and `Mcp-Name` headers |
+| Server needs user input | Server sends `elicitation/create` mid-call | Result with `resultType: "input_required"`, client retries |
+| Version mismatch | Server returns another version in `initialize` | `UnsupportedProtocolVersionError` with `supported` list |
+
+```
+-> {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"search_tickets",
+     "arguments":{"query":"vpn"},
+     "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+              "io.modelcontextprotocol/clientCapabilities":{}}}}
+<- {"jsonrpc":"2.0","id":7,"result":{"resultType":"complete",
+     "content":[{"type":"text","text":"[\"VPN down\"]"}],"isError":false}}
+```
+
+## Production patterns
+- **Isolate each server behind its own client and timeout.** Wrap every connection with a connect timeout,
+  a per-call timeout and a restart policy, so one hung vendor server degrades one tool set instead of
+  stalling the whole agent turn. Monitor per-server connect failures and call latency.
+- **Log negotiated version, capabilities and server identity at connect time.** Put `protocolVersion`,
+  `serverInfo` and declared capabilities in one structured log line per connection. Most "tool is missing"
+  tickets resolve in seconds when you can see what was actually negotiated.
+- **Pin the protocol versions you accept.** Configure clients to support a known set (for example
+  2025-06-18 and later) and alert on fallbacks, because an old peer silently loses features such as
+  structured output and elicitation.
+- **Declare only the client capabilities you really implement.** A headless worker agent omits
+  `elicitation` and `sampling`, so servers degrade gracefully instead of waiting on a UI that does not
+  exist.
+- **Treat the host as the policy layer.** Filter, rename and gate tools in the host (allow-lists, approval
+  for write tools, output size caps) before they reach the model; never rely on server descriptions to
+  enforce policy.
+- **Plan the stateless migration.** For remote servers, move to an SDK that speaks 2026-07-28 or runs
+  dual-era, then drop sticky routing once traffic is on the new revision. Track the share of requests per
+  protocol version.
+
+## Trade-offs
+- **Standard protocol vs direct function calling.** MCP gives reuse across hosts and a process boundary,
+  but adds a hop, a dependency and a second schema layer. For one agent calling three internal functions,
+  plain tool calling is simpler.
+- **1:1 client-server isolation vs connection count.** Isolation stops servers seeing each other's data,
+  but a host with 20 servers manages 20 connections, 20 failure modes and 20 tool lists.
+- **Handshake sessions vs stateless requests.** Sessions let servers push requests and keep context
+  cheaply; stateless requests scale on any replica but repeat metadata on every call and push state into
+  explicit handles.
+- **Rich capabilities vs portability.** Using elicitation or sampling makes a server nicer in hosts that
+  support them, and broken or degraded in hosts that do not.
+
+## Pitfalls
+- **Treating the server as the security boundary.** Symptom: a vendor server's tool description tells the
+  model to read secrets, and it does. Fix: the host filters tools, requires approval for consequential
+  calls and treats tool output as untrusted data.
+- **Writing logs to stdout in a stdio server.** Symptom: the host hangs or fails at `initialize` with parse
+  errors. Fix: log to stderr; stdout carries only JSON-RPC messages.
+- **Assuming capabilities instead of checking them.** Symptom: a server's elicitation works in one IDE and
+  errors in a headless agent. Fix: branch on the peer's declared capabilities and provide a fallback path.
+- **Ignoring the version you negotiated.** Symptom: `structuredContent` is missing or `isError` handling
+  differs between environments. Fix: log the version and test against each version you accept.
+
+## When to use
+- **Use this model when** an agent consumes capabilities owned by other teams or vendors, or one set of
+  tools must serve several hosts (IDE agents, chat apps, your own service).
+- **Avoid MCP when** tools live in the same process as one agent and nobody else needs them; in-process
+  function calling is faster and simpler.
+- **Measure:** connect success rate and time per server, negotiated version mix, per-server call latency
+  and error rate, and tool count per host.
+- **Interviews:** be ready to draw host, client, server and explain the handshake and what 2026-07-28 changed.
+
+## Role lens
+- **Engineer:** Wires `ClientSession` or `Client` into the agent loop with timeouts, logs the negotiated
+  version and capabilities, and reads JSON-RPC traces to debug hangs and missing tools.
+- **Architect:** Decides which systems become MCP servers, where the host enforces policy, how remote
+  servers scale (sessions or stateless), and which protocol versions the platform supports.
+- **FDE:** Connects a customer's existing MCP servers to the agent, explains why a server works in one host
+  and not another (capabilities, versions), and isolates a flaky vendor server from the rest.
+
+## Check yourself
+**Q:** Your agent host connects to four MCP servers. One vendor server hangs at startup, and since then the
+whole agent takes 60 seconds to answer anything. Explain what is happening in architecture terms and how you
+would restructure the host.
+**A:** Each server has its own client and connection, but the host is probably connecting to all four
+serially and waiting for every `initialize` (or first request) to finish before building the tool list, so
+one hung server blocks the turn until a long default timeout fires. Restructure so each client connects
+concurrently with a short connect timeout, a server that fails is marked unavailable and its tools dropped
+from the model's list, and a background task retries it. Log the negotiated version, capabilities and
+server identity per connection so failures are visible. The other three servers keep working because the
+1:1 client-server design already isolates them; the host just has to stop waiting on the slow one.
+
+## Interview questions
+### What are the host, client and server in MCP, and why is the client one-to-one with a server?
+- **Host** is the agent application that owns the model, the user and policy; **client** is a connector
+  that speaks the protocol to exactly one **server**, which exposes tools, resources and prompts.
+- **One-to-one** keeps servers isolated: a server cannot see other servers' traffic or the conversation,
+  and one failing connection can be dropped without affecting the rest.
+
+### Walk me through the handshake-era lifecycle and what can go wrong at each step.
+- **`initialize`:** version and capabilities are proposed; failures are version mismatches, or a stdio
+  server printing logs to stdout so the client cannot parse the reply.
+- **`notifications/initialized` then discovery:** missing tools usually mean a capability was not
+  declared or the list is paginated and the host read one page.
+- **Operation and shutdown:** hung calls need per-call timeouts; zombie stdio processes need the close
+  stdin, `SIGTERM`, `SIGKILL` escalation.
+
+### What changed in the 2026-07-28 revision, and why does it matter for remote servers?
+- **Stateless requests:** no `initialize`, no `Mcp-Session-Id`; version and capabilities ride in each
+  request's `_meta`, and `server/discover` advertises what the server supports.
+- **Server-to-client requests became multi round-trip results,** so any replica can answer any request.
+  Remote servers drop sticky sessions and scale like plain HTTP services, with state moved into explicit
+  handles passed as tool arguments.
+
+### A tool works in one IDE agent but fails in your headless batch agent. How do you debug it?
+- **Compare negotiated capabilities and versions** from both hosts' connect logs. A tool that elicits or
+  samples needs `elicitation` or `sampling`, which a headless client usually does not declare.
+- **Fix on the right side:** the server should check capabilities and fall back (fail with an actionable
+  `isError`, or accept the value as an argument); the batch agent should pass that input explicitly.
+
+### When would you not put MCP between your agent and its tools?
+- **Same process, single consumer:** if the functions live in the agent's codebase and no other host needs
+  them, direct tool calling avoids a process hop, a second schema and a new failure mode.
+- **Latency-critical loops** that call a tool dozens of times per turn may not want the extra hop; measure
+  before choosing. MCP pays off when tools are shared across hosts or owned by other teams.
+
+## Quiz
+### Q: In MCP, which component decides which tools the model is allowed to see?
+- [ ] The MCP server, through its tool descriptions
+- [ ] The MCP client, during capability negotiation
+- [x] The host application that embeds the model and the clients
+- [ ] The JSON-RPC layer, by rejecting unknown methods
+> The host owns the model, the user and policy. Servers only propose tools; the host filters, renames and
+> gates them before they reach the model's tool list.
+
+### Q: In the handshake-era lifecycle (2025-11-25 and earlier), what must happen before a client sends `tools/list`?
+- [ ] The server sends `notifications/tools/list_changed`
+- [x] The client sends `initialize`, receives the result, then sends `notifications/initialized`
+- [ ] The client calls `server/discover`
+- [ ] The client opens a `subscriptions/listen` stream
+> Handshake-era sessions start with `initialize` and its result, then the client's initialized
+> notification. `server/discover` and `subscriptions/listen` belong to the stateless 2026-07-28 revision.
+
+### Q: Why does the 2026-07-28 revision put protocol version and client capabilities in every request's `_meta`?
+- [ ] To make messages smaller than with a handshake
+- [ ] Because JSON-RPC 2.0 requires it
+- [x] So any server replica can handle any request without shared session state
+- [ ] To let servers send requests to clients more easily
+> Removing the handshake and sessions makes each request self-contained, so remote servers can scale on
+> ordinary load balancers. Server-to-client requests were replaced by multi round-trip results for the
+> same reason.
+
+## Use cases & projects
+### Use cases
+- **IDE and desktop agents.** One host loads several local stdio servers (repo, tests, docs), each behind
+  its own client, and gates which tools the model sees.
+- **Internal agent platforms.** A gateway host aggregates team-owned remote servers, logs negotiated
+  versions and capabilities, and enforces approval for write tools.
+- **Customer deployments.** An FDE connects the agent to a customer's existing MCP servers and debugs
+  capability or version mismatches between their hosts and yours.
+- **Protocol migration.** A platform team moves remote servers from session-based Streamable HTTP to the
+  stateless 2026-07-28 revision and removes sticky routing.
+
+### Mini project
+**Build a connection inspector for MCP servers (1-2 hours).**
+- **Goal:** a small host that connects to any list of stdio servers concurrently and reports what each
+  negotiated, so you can debug "tool missing" and "hangs at start" without a model in the loop.
+- **Steps:** read server commands from a JSON config; open one `ClientSession` per server with a 5-second
+  connect timeout; record protocol version, server name, instructions, capabilities and tool names; mark
+  servers that time out; print one table.
+- **Done when:** with one deliberately broken server (it prints to stdout before starting), the inspector
+  reports that server as failed within the timeout while the others are listed with their capabilities.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): an agent host that consumes several MCP
+servers safely.
+- **Scope (multi-day):** concurrent connections with timeouts and restart, a per-server capability and
+  version log, a host-side tool allow-list and approval gate, and support for both a handshake-era server
+  and a 2026-07-28 server.
+- **Done when:** killing any one server mid-run removes only its tools, the agent still finishes tasks
+  that do not need it, and the connect log shows version and capabilities for every server.

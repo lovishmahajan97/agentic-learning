@@ -5,7 +5,7 @@ name: Agent loop
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/tool-calling
@@ -32,9 +32,9 @@ this loop with defaults.
   plug into one of its steps, so if you can write it by hand you can debug any framework that writes it
   for you, and read any trace it produces.
 - **Where it shows up in your stack.** Hand-rolled on the Claude or OpenAI SDK, or prebuilt: LangGraph's
-  `create_react_agent` (a model node and a tool node joined by a conditional edge), the OpenAI Agents SDK
-  `Runner.run`, the Claude Agent SDK and Pydantic AI's `Agent`. LangSmith, Langfuse or OpenTelemetry
-  tracing shows one span per iteration.
+  `create_react_agent` (a model node and a tool node joined by a conditional edge; LangChain 1.0 moves
+  it to `create_agent`), the OpenAI Agents SDK `Runner.run`, the Claude Agent SDK and Pydantic AI's
+  `Agent`. LangSmith, Langfuse or OpenTelemetry tracing shows one span per iteration.
 - **What you control.** Step, token and wall-clock budgets (LangGraph's `recursion_limit`, the Agents
   SDK's `max_turns`), how tool exceptions become results, which tools need approval, when to compact, and
   the status the loop returns when it stops.

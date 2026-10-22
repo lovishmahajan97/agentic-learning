@@ -5,7 +5,7 @@ name: Red teaming
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - evals/adversarial-evaluation
@@ -299,8 +299,7 @@ print(k_needed(0.05), k_needed(0.01))   # 59 299
 - **Canary tokens with live alerting.** Plant a unique random string in the system prompt and in canary
   customer records, then scan every production output and outbound tool argument for it. Alert on any
   hit, because a unique random string has no legitimate reason to appear in output, so false positives
-  are close to zero. Monitor canary hits per day
-  and the route they came from.
+  are close to zero. Monitor canary hits per day and the route they came from.
 - **Adversarial suite as a CI gate.** Store each finding as a case with its deterministic or judge
   grader and run it on every prompt, model, tool or guardrail change (Promptfoo's red-team mode, for
   example, runs from its CLI). Fail the build when a closed attack reopens. Monitor suite size, pass
@@ -486,11 +485,12 @@ change.
 ### Mini project
 **Red-team a small agent for indirect prompt injection (2-3 hours).**
 - **Goal:** measure how often an agent obeys instructions hidden in tool output, and show that a
-  server-side control lowers that rate without breaking benign tasks.
+  server-side control stops the harmful calls from executing without breaking benign tasks.
 - **Steps:** build an agent with a fake `read_document` tool and a fake `send_email` tool that only logs
   calls; plant a canary string in the system prompt; write 10-20 documents carrying hidden instructions
   (send data out, reveal the prompt) plus 10 benign tasks; run each several times and grade the logged
-  tool-call arguments, not the reply text; then add a confirmation gate or recipient allowlist inside the
-  tool handler and re-run.
-- **Done when:** you have a table of attack success rate and benign task success before and after the
-  control, and every successful attack is saved as a regression test.
+  tool-call arguments, not the reply text; then add a recipient allowlist inside the `send_email`
+  handler and re-run.
+- **Done when:** you have a before/after table of attempted versus executed malicious calls and benign
+  task success (expect attempts to stay similar while executions drop, because the model is still
+  fooled but the handler is not), and every successful attack is saved as a regression test.

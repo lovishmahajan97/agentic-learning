@@ -5,7 +5,7 @@ name: asyncio
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/async-await
@@ -196,7 +196,9 @@ print(asyncio.run(agent("Where is my order and can I get a refund?")))
 1. `TaskGroup` wraps the three tool coroutines in tasks.
 2. On the next loop iteration each runs until its first not-ready await and yields, so all three are in
    flight within a few milliseconds; the sync CRM call runs in a worker thread.
-3. The step costs about the slowest tool (1.0 s) instead of the sum (2.3 s).
+3. The loop then blocks once in the selector for all of them, and resumes each task as its socket,
+   timer or thread future becomes ready.
+4. The step costs about the slowest tool (1.0 s) instead of the sum (2.3 s).
 
 ### Fan out twenty chat completions
 Twenty calls share one HTTP connection pool; a blocking tokenizer step moves to a thread so it cannot

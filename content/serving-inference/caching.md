@@ -5,7 +5,7 @@ name: Caching (semantic, prompt)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - serving-inference/prefix-caching

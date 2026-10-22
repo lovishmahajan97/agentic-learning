@@ -5,7 +5,7 @@ name: Multi-agent patterns (orchestrator-worker, handoffs)
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/task-decomposition
@@ -28,9 +28,10 @@ Orchestrator-worker fans out to parallel workers; handoffs pass the conversation
 Both cost tokens and coordination, so one good agent is the default.
 
 ## For agent builders
-- **Why it matters for agents.** Past a dozen tools or a context full of search output, a single loop
-  picks wrong tools and holds credentials it should not. Splitting fixes that structurally, but every
-  boundary loses context and multiplies tokens, so the decision is an engineering trade, not a style.
+- **Why it matters for agents.** As the tool list grows (the example below has fourteen) or the context
+  fills with search output, a single loop picks wrong tools more often and holds credentials it should
+  not. Splitting fixes that structurally, but every boundary loses context and multiplies tokens, so the
+  decision is an engineering trade, not a style.
 - **Where it shows up in your stack.** The OpenAI Agents SDK's handoffs and agents-as-tools, LangGraph
   supervisor and subgraph patterns, sub-agents in coding agents such as Claude Code, CrewAI crews, and
   A2A when the peer agent belongs to another team.

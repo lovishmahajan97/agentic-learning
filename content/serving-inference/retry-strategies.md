@@ -5,7 +5,7 @@ name: Retry strategies
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - serving-inference/timeouts
@@ -252,9 +252,18 @@ import random, time
 
 TRANSIENT = {408, 429, 500, 502, 503, 504}
 
-def call_tool(fn, args, key, attempts=3, base=0.5, cap=4.0):
+class RunBudget:
+    """Caps every call a run makes, retries included."""
+    def __init__(self, max_calls=40): self.left = max_calls
+    def spend(self):
+        self.left -= 1
+        if self.left < 0:
+            raise RuntimeError("run budget exhausted: stop and report")
+
+def call_tool(fn, args, key, budget, attempts=3, base=0.5, cap=4.0):
     """Returns a tool-result dict the agent appends to its transcript."""
     for attempt in range(attempts):
+        budget.spend()                                  # every attempt counts against the run
         try:
             return {"ok": True, "result": fn(**args, idempotency_key=key)}   # same key on every attempt
         except ToolHTTPError as e:
@@ -264,15 +273,9 @@ def call_tool(fn, args, key, attempts=3, base=0.5, cap=4.0):
             # Semantic error, or retries exhausted: let the model decide what to do next.
             return {"ok": False, "error": f"{e.status}: {e.message}", "retryable": e.status in TRANSIENT}
 
-class RunBudget:
-    """Caps every call a run makes, retries included."""
-    def __init__(self, max_calls=40): self.left = max_calls
-    def spend(self):
-        self.left -= 1
-        if self.left < 0:
-            raise RuntimeError("run budget exhausted: stop and report")
-
-result = call_tool(send_email_api, {"to": "a@example.com", "body": "..."}, key=f"{run_id}:step4:email")
+run_budget = RunBudget(max_calls=40)                  # shared by every model and tool call in this run
+result = call_tool(send_email_api, {"to": "a@example.com", "body": "..."},
+                   key=f"{run_id}:step4:email", budget=run_budget)
 ```
 
 ### Worked scenario: layered retries in a 10-step agent during a provider blip
@@ -388,8 +391,8 @@ policy holds.
   created the ticket. Without an idempotency key, surface the timeout instead.
 - **With a key, retry under the same key,** so the email provider deduplicates; never let the model
   regenerate the call with a fresh key.
-- **When tokens have already been streamed,** a retry would duplicate text; restart as a new message
-  instead.
+- **With no key, reconcile before acting:** look the effect up in the target system (sent-mail log, ticket
+  search by run id), then record the result or report the timeout to the model, rather than retrying blind.
 
 ### Design the retry policy for a LangGraph agent whose nodes call a hosted model and three HTTP tools.
 - **One layer for model transport:** keep the SDK's `max_retries` and leave node retry policies off for

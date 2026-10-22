@@ -5,7 +5,7 @@ name: Race conditions & synchronization primitives (asyncio.Lock, Semaphore)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/asyncio

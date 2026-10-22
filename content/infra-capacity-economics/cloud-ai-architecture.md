@@ -189,6 +189,7 @@ flowchart TD
     G -->|"private endpoint"| R["Reserved deployment, approved region"]
     R -->|"200"| R2
     R -->|"429 at peak"| P["Pay-as-you-go deployment, same region"]
+    P -->|"200"| R2
     P -->|"429 or outage"| F{"Residency allows another region?"}
     F -->|"yes"| X["Cross-region profile or second provider"]
     F -->|"no"| Q["Queue or fail fast"]

@@ -5,7 +5,7 @@ name: Checkpointing
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - training-adaptation/gradient-checkpointing
@@ -197,8 +197,8 @@ print(json.dumps(record, indent=1))      # ckpt-400: the final step is not the o
 ```
 
 - **Reading it.** `ckpt-600` has the best task success but tool-call validity fell 6 points, so the
-  release is `ckpt-400`. A keep-last-two retention rule would already have deleted `ckpt-200`, the
-  safest rollback target.
+  release is `ckpt-400`. A keep-last-one retention rule would already have deleted it, so retention must
+  protect the best gate-passing checkpoint until the release decision is made.
 
 ### Save and load the full state in PyTorch
 A compact pair for a single-process loop: full state, atomic rename, keep-last-*k* retention, and RNG

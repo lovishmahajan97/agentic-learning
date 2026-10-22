@@ -5,7 +5,7 @@ name: RBAC
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - backend-fundamentals/authentication-vs-authorization

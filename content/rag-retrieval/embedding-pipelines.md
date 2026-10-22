@@ -5,7 +5,7 @@ name: Embedding pipelines
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - rag-retrieval/chunking-strategies
@@ -436,8 +436,9 @@ collection until the comparison is done.
 ### Mini project
 **Build an idempotent ingest worker for an agent knowledge base (2-3 hours).**
 - **Goal:** keep a vector index in sync with a folder of documents under edits and deletes.
-- **Steps:** give each chunk a stable id from document id and position; hash content to skip unchanged
-  chunks; embed through one shared function with a concurrency limit; upsert, and delete chunks whose
-  document was removed; point a small agent's search tool at the index.
+- **Steps:** skip documents whose content hash is unchanged; give each chunk a content-addressed id
+  from model version, document id, chunk index and text; embed only ids not yet in the store, through
+  one shared function with a concurrency limit; upsert, then delete stale ids and the chunks of removed
+  documents; point a small agent's search tool at the index.
 - **Done when:** re-running the worker with no changes embeds nothing, an edited file updates only its chunks,
   a deleted file disappears from search results, and a golden-vector test passes.

@@ -5,7 +5,7 @@ name: MCP authentication / authorization / transport security
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/model-context-protocol
@@ -452,8 +452,11 @@ exchanged specifically for that upstream, logging the authenticated subject on e
 - **Steps:** build the server with an official MCP SDK; issue test tokens from a local identity provider
   or a stub authorization server; validate signature, expiry, audience and scope in middleware before any
   tool runs; return 401 with discovery metadata when no token is sent; connect a host and call both tools.
-- **Done when:** a read-scoped token can list but not write, a token minted for another audience gets
-  401, and the server log attributes every call to a user subject rather than a shared key.
+- **Done when:** a read-scoped token can call the read tool but gets `403 insufficient_scope` on the
+  write tool, a token minted for another audience gets 401, and the server log attributes every call to
+  a user subject rather than a shared key.
+- **Note:** the middleware example above scopes by JSON-RPC method, so every `tools/call` needs the write
+  scope; for this project, read `params.name` from the body and map each tool name to its own scope.
 
 ### Major project
 This lesson feeds the module Capstone (see the module guide): the billing-dispute agent exposes its

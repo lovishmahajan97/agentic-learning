@@ -5,7 +5,7 @@ name: Streaming (SSE)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - serving-inference/ttft
@@ -164,9 +164,10 @@ sequenceDiagram
     participant E as Model API or engine
     C->>P: POST /v1/agent
     P->>S: forward request
-    S-->>C: 200 text/event-stream plus connected comment
+    S-->>P: 200 text/event-stream plus connected comment
+    P-->>C: headers and comment, passed straight on
     E->>S: tokens and tool-call JSON fragments
-    S-->>C: event delta, flushed and unbuffered
+    S-->>C: event delta via proxy, unbuffered
     S-->>C: event tool_start, then keep-alive while tool runs
     S->>E: next call with tool result
     E->>S: final answer tokens
@@ -469,8 +470,10 @@ even that arrives late, the problem is an intermediary, not the model.
 - **End the run with one terminal event** so the client can tell a finished run from a dropped one.
 
 ### An agent's SSE stream drops halfway through a multi-step run. What should the system do?
-- **Treat it as a cancel, not a pause.** SSE streams are not resumable, so stop the agent loop and close
-  the upstream model stream to stop spend.
+- **Decide cancel or detach up front.** The model's stream cannot be replayed, so by default stop the
+  loop and close the upstream model stream to stop spend. For long background-style runs, some teams
+  instead keep the run going and persist its events, so a client reconnecting with `Last-Event-ID`
+  replays from that log.
 - **Check side effects.** Tools already executed (an email sent, a ticket filed) are not undone by the
   drop, so log them per run and make retries idempotent.
 - **Restart from a checkpoint** if the agent persists step state; otherwise rerun from scratch.

@@ -5,7 +5,7 @@ name: Middleware ordering
 kind: concept
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - fastapi-for-ai/asgi-lifecycle
@@ -379,9 +379,10 @@ in a layer inside CORS if the browser must read crash responses.
 ### Your agent traces show LLM calls and tool calls that cannot be linked to a run. Where do you look?
 - **Order first.** The layer that creates the run or trace ID must be outermost, before auth, limits and
   any logging layer, or early spans and rejected runs have no ID.
-- **Then propagation.** A `BaseHTTPMiddleware` runs downstream code in a separate task, so contextvars
-  set on one side are not visible on the other; set the ID in a pure ASGI layer that awaits the app in
-  the same task.
+- **Then propagation.** A `BaseHTTPMiddleware` runs downstream code in a separate task, so a contextvar
+  set downstream (say, a span the tracer opens in the endpoint) never propagates back up to the
+  middleware's after-response log or span; set the ID in a pure ASGI layer that awaits the app in the
+  same task.
 - **Verify:** count spans and log lines without a run ID per route; for agent routes it should be zero.
 
 ### Your front end cannot read the body of 500 responses, but 401s work fine. What is going on?

@@ -5,7 +5,7 @@ name: KEDA autoscaling
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - infra-capacity-economics/serverless-gpus
@@ -24,7 +24,7 @@ sources:
 ## TL;DR
 KEDA scales agent workers and the model servers behind them on real demand (task-queue depth, in-flight
 requests, Prometheus queries) and down to zero, because CPU and GPU utilisation mislead. It moves pod
-counts only: GPU cold starts still take minutes.
+counts only: nodes and GPU cold starts still take minutes.
 
 ## For agent builders
 - **Why it matters for agents.** A self-hosted agent platform has two layers to scale: agent workers
@@ -201,6 +201,9 @@ The vLLM metric names follow its Prometheus exporter and can change between vers
 Background agent runs are queued as Redis list entries; KEDA starts one Job per pending task, up to a cap
 sized to what the model tier can absorb. Check the Redis scaler's field names against the KEDA version you
 run.
+- **Why `accurate`:** each Job pops its task, so the list length counts only tasks nobody has started.
+  The default strategy subtracts running Jobs from that count again and starts too few Jobs; `accurate`
+  is KEDA's strategy for queues whose length excludes in-progress work.
 
 ```yaml
 apiVersion: keda.sh/v1alpha1
@@ -217,6 +220,8 @@ spec:
             image: ghcr.io/example/research-agent:2.3   # CPU pod: runs the loop, calls the model server
   pollingInterval: 15
   maxReplicaCount: 120              # caps concurrent runs, and so load on the GPU tier
+  scalingStrategy:
+    strategy: accurate              # list length excludes runs already popped by a Job
   triggers:
     - type: redis
       metadata:
@@ -238,6 +243,11 @@ How the agent layer drives the model layer (illustrative fractions; take yours f
 - **Capping runs caps GPUs:** the Job cap of 120 is how you keep the model tier inside quota; raise it
   only together with `maxReplicaCount` on the model ScaledObject.
 - **Faster tools raise GPU demand,** because runs spend a larger share of time waiting on the model.
+- **The run cap follows from the model tier:** at `maxReplicaCount: 8` and 12 requests per replica the
+  tier absorbs 96 in-flight requests, so 96 ÷ 0.6 = 160 concurrent runs is the ceiling; above it, runs
+  queue on the model instead of in Redis, where they time out mid-loop.
+- **The threshold of 12 came from chat-length prompts;** agent requests carry long transcripts, so
+  re-measure per-replica capacity with replayed agent traces before trusting it.
 
 ### Replica calculator: the HPA rule KEDA relies on
 A pure-Python model of the 1↔N loop, handy for choosing a threshold before touching the cluster. It applies
@@ -287,9 +297,11 @@ print(desired(66, 12, 6), desired(80, 12, 6))           # 6 (within 10%), 7 (sca
 - **Fallback replicas when the metrics source fails.** Use whenever the trigger depends on Prometheus. Set
   the `fallback` block (`failureThreshold`, `replicas`) to a safe mid-day count, as in the example. Monitor
   KEDA scaler errors so the fallback is not silently permanent.
-- **ScaledJob for queue-drained batch work.** Use for nightly or bursty batch inference. Create one Job per
-  batch of messages from a queue scaler so work is never killed mid-item, with the Job's GPU request in its
-  template. Monitor queue age and Job failures.
+- **ScaledJob for queue-drained batch work and agent runs.** Use for nightly batch inference and
+  background agent runs. Create one Job per batch of messages (or per run) from a queue scaler so work
+  is never killed mid-item, with any GPU request in the Job template; set `scalingStrategy` to
+  `accurate` when workers pop items, and cap `maxReplicaCount` at what the model tier serves. Monitor
+  queue age, Job failures and model-tier waiting requests.
 
 ## Trade-offs
 - **Queue depth vs threshold drift.** It tracks demand linearly and early, but needs a measured per-replica
@@ -372,11 +384,21 @@ autoscaler with GPU node pools. If scale-to-zero is wanted, activate from a gate
 - **Fixes:** a cron pre-warm before known peaks, a lower threshold for more headroom, faster weight storage,
   and `maxReplicaCount` matched to quota with alerts on Pending.
 
-### When would you not use KEDA for a GPU inference service?
-- **Sub-second bursty HTTP traffic** that needs request buffering while scaling from zero; a serverless GPU
-  platform handles that better.
-- **You already run Ray Serve,** whose own autoscaler fills the same role.
-- **You hope it fixes cold starts:** it cannot shorten node provisioning, image pulls or weight loads.
+### Agent workers scale on queue depth; during a spike the model tier saturates and runs time out. Fix it.
+- **Diagnose the coupling:** worker replicas multiply model requests (runs × share of time waiting on the
+  model), so an uncapped worker pool can outgrow `maxReplicaCount` on the GPU tier within one poll.
+- **Cap runs from model capacity:** 8 replicas × 12 requests ÷ 0.6 ≈ 160 concurrent runs; set the worker
+  `maxReplicaCount` there so excess work waits in the queue, not mid-loop on the model.
+- **Then watch both layers:** queue age for the agent tier, waiting requests and Pending GPU pods for the
+  model tier, and per-run timeouts in traces.
+
+### Why run each agent run as a KEDA ScaledJob instead of a ScaledObject-scaled worker Deployment?
+- **Scale-down safety:** the HPA deletes pods without knowing a run is mid-loop, while a Job runs to
+  completion, so a minutes-long run with tool side effects is never cut off.
+- **Queue semantics:** if workers pop tasks, the list length excludes running work, so set the
+  `accurate` scaling strategy or KEDA starts too few Jobs.
+- **When not:** for many short runs, pod start-up per run dominates; a Deployment with a long
+  `terminationGracePeriodSeconds` and a drain hook is cheaper.
 
 ### How would you pick the threshold for a request-count trigger, and when would you revisit it?
 - **Load-test one replica** at realistic prompt and output lengths and find the concurrency where TTFT
@@ -426,10 +448,11 @@ autoscaler with GPU node pools. If scale-to-zero is wanted, activate from a gate
 **Queue-driven agent workers with KEDA (2-3 hours).**
 - **Goal:** scale a pool of agent workers from zero on queue depth and show what happens to the model
   layer behind them.
-- **Steps:** run a local cluster (kind or minikube) with KEDA and Redis; write a worker that pops an
-  agent task, runs a short loop against a mock model service that sleeps per call, and acknowledges only
-  when done; add a ScaledObject or ScaledJob on the Redis list length with a sensible maximum; push 200
-  tasks and watch replicas; then lower the mock model's capacity and observe the queue.
+- **Steps:** run a local cluster (kind or minikube) with KEDA and Redis; write a worker that moves an
+  agent task to a processing list (Redis `LMOVE`), runs a short loop against a mock model service that
+  sleeps per call, and deletes the task only when done; add a ScaledObject or ScaledJob on the Redis list
+  length with a sensible maximum; push 200 tasks and watch replicas; then lower the mock model's capacity
+  and observe the queue.
 - **Done when:** you have a timeline of queue depth, worker replicas and completed tasks, showing scale
   from zero and back, no task lost during scale-down, and a note on where the mock model became the
   bottleneck.

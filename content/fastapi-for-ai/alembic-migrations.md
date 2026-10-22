@@ -5,7 +5,7 @@ name: Alembic migrations
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - fastapi-for-ai/sqlalchemy-sqlmodel
@@ -207,7 +207,8 @@ def upgrade() -> None:
     op.execute("CREATE EXTENSION IF NOT EXISTS vector")      # no-op where it already exists
     op.execute("SET lock_timeout = '5s'")
     op.add_column("chunks", sa.Column("embedding_v2", Vector(1024), nullable=True))   # catalog-only
-    with op.get_context().autocommit_block():                # build after the backfill, or now:
+    # Shown here for brevity; on a big table put this in a later revision, after the backfill.
+    with op.get_context().autocommit_block():
         op.execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_chunks_embedding_v2 "
                    "ON chunks USING hnsw (embedding_v2 vector_cosine_ops)")
 

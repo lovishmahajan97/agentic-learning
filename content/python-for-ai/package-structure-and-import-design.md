@@ -5,7 +5,7 @@ name: Package structure & import design
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - python-for-ai/dependency-injection-and-interface-boundaries
@@ -399,6 +399,14 @@ the network or environment at import time.
   OpenAI`, so it holds its own reference and the patch on the defining module does not touch it.
 - **Fix:** patch `myapp.services.rag.OpenAI`, or better, inject the client so no patching is needed.
 - **Prevent recurrence** by building clients in the composition root rather than at module top level.
+
+### New agent worker pods take far too long to pick up their first job after scale-out. How do you check whether imports are the cause?
+- **Measure first:** run `python -X importtime -c "import myapp.entrypoints.worker"` in the worker image
+  and sort by cumulative time; heavy modules such as `torch` or every vendor SDK show up at the top.
+- **Trace why they load:** usually a re-exporting `__init__.py` or a tool registry that imports every
+  adapter at top level, although this worker serves only two tools.
+- **Fix and verify:** minimal `__init__.py`, lazy imports inside heavy adapters, tools registered per
+  entrypoint in the composition root; re-measure and watch cold-start latency.
 
 ## Quiz
 ### Q: Why does a circular import often fail with "cannot import name X from partially initialized module"?

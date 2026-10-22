@@ -5,7 +5,7 @@ name: Loop detection
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agent-reliability/stopping-conditions-termination
@@ -200,7 +200,8 @@ Paste below the class above and run with plain Python.
 - **First loop:** reproduces the failing-test trace.
 - **Second loop:** two edits undo each other (text "a", then "b"). Every result differs, so the stale
   count never moves, but the A B A B cycle is caught at call 4. The second edit lists its keys in a
-  different order, which `canon()` normalizes away when that edit recurs.
+  different order from the first; `canon()` sorts keys, so a reordered repeat of the same edit would
+  still hash identically.
 
 ```python
 g = LoopGuard()
@@ -365,7 +366,8 @@ persists. Log both cases so the thresholds can be tuned from real traces rather 
   inform, block and abort.
 - **Steps:** build a fake model that replays a scripted list of tool calls (an exact repeat, an A B A B
   cycle, and a polling sequence whose status changes); implement `before()` and `after()` with canonical
-  argument hashing and result hashing; strip a timestamp field from results; set thresholds of three, four
-  and six.
-- **Done when:** the repeat and cycle scripts end `stuck` with logged evidence, the polling script finishes
-  without a false positive, and a short note records which rung resolved each case.
+  argument hashing and result hashing; strip a timestamp field from results; inform on the third identical
+  (call, result), block the fourth and abort on the sixth.
+- **Done when:** the exact-repeat script ends `stuck` on call six with logged evidence, the A B A B script
+  gets an inform naming period 2, the polling script finishes without a false positive, and a short note
+  records which rung resolved each case.

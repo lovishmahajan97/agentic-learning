@@ -5,7 +5,7 @@ name: Inter-annotator agreement
 kind: metric
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - evals/golden-dataset
@@ -291,8 +291,7 @@ criteria. Counts are illustrative; κ is computed with `cohen_kappa` above.
   through the same overlap.
 - **Same code for the agent's judges.** Score the LLM judge that grades agent traces against the
   adjudicated label with the exact function used for humans, and publish judge–human κ next to
-  human–human κ. Monitor both on every judge or
-  prompt change.
+  human–human κ. Monitor both on every judge or prompt change.
 
 ## Trade-offs
 - **Correctness vs explainability.** Chance-corrected statistics are harder to explain to stakeholders
@@ -328,8 +327,8 @@ criteria. Counts are illustrative; κ is computed with `cohen_kappa` above.
 
 ## When to use
 - **Measure before any agent-trace criterion gates a release,** at the start of every labeling effort,
-  continuously on an overlap sample during production
-  labeling, and whenever you evaluate an LLM judge against humans.
+  continuously on an overlap sample during production labeling, and whenever you evaluate an LLM judge
+  against humans.
 - **Compute per criterion and per annotator pair** with bootstrap intervals; a single global number hides
   the one criterion that is broken.
 - **Set the target by use:** labels that gate a release need agreement at the high end; preference labels

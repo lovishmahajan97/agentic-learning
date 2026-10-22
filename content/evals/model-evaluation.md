@@ -5,7 +5,7 @@ name: Model evaluation
 kind: concept
 difficulty: intro
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - evals/golden-dataset

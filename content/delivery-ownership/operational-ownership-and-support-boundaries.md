@@ -5,7 +5,8 @@ name: Operational ownership & support boundaries
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - delivery-ownership/incident-severity-and-escalation
   - delivery-ownership/slas
@@ -19,8 +20,20 @@ related:
 
 ## TL;DR
 Operational ownership means a named team is paged for a component, can change it, and answers for it.
-Support boundaries say where that stops and how issues cross. AI deployments span many parties, so
-without them incidents bounce between teams unfixed.
+Support boundaries say where that stops and how issues cross. An agent touches many owners' tools and
+data, so without them incidents bounce between teams unfixed.
+
+## For agent builders
+- **Why it matters for agents.** An agent is glue across other people's systems: a model provider, your
+  orchestration and prompts, tools wrapping other teams' APIs, and the customer's data. When a run fails,
+  someone must own each of those, and someone must own the agent's overall task success.
+- **Where it shows up in your stack.** The service catalog entry for the agent and each tool or tool
+  server, the on-call rotation that alerts route to, the escalation template, and the boundary table in
+  the deployment agreement.
+- **What you control.** Naming one Accountable owner per layer (including "agent behaviour" and "each
+  tool"), what evidence a ticket must carry (run ID, step, tool), and the hypercare exit criteria.
+- **What you can skip.** Formal ITIL process detail; a boundary table, a catalog and a tested escalation
+  route cover what an agent team needs.
 
 ## Why it exists
 - **A deployed AI system is a stack with many owners:** the model provider's API, your platform and
@@ -100,6 +113,19 @@ Make explicit what is new in AI systems; these are the questions most likely to 
 - **Model snapshot changes:** who decides when a provider snapshot changes.
 - **Harmful-output reports:** who responds.
 
+### Agent-specific boundaries
+Agents add layers that default to nobody:
+
+| Layer | Usual owner | Why it gets orphaned |
+|---|---|---|
+| Agent behaviour (tool choice, task success) | Agent team, via prompts and evals | Each tool team sees only its own calls |
+| Each tool's implementation and API | The team that owns the wrapped system | The agent team wrote the wrapper, so is assumed to own the system |
+| Tool permissions and scopes | Security or the system owner | Granted once at build time, never reviewed |
+| Actions taken on a user's behalf | Agent team for the decision, system owner for the effect | Both assume the other will reverse it |
+
+- **Tool contracts:** for each tool, record its owner, its error format and its on-call, because a tool
+  that changes its response shape breaks the agent with no error on either side.
+
 ## Diagram
 A ticket crosses the boundary with evidence; each side fixes its own factor, and nobody closes it as
 "not ours".
@@ -175,7 +201,24 @@ for p in check(RACI):
 # Harmful-output reports: 0 Accountable []
 ```
 
+### Worked ticket: an IT-helpdesk agent and three tool owners
+An internal agent resets passwords, checks laptop orders and files tickets, each through a different
+team's API (scenario illustrative).
+
+| Time | Event | Owner who acts |
+|---|---|---|
+| **Mon 09:00** | Tier 1 sees order-status answers saying "no orders found" for 30% of runs | Agent on-call (owns task success) |
+| **Mon 09:40** | Traces show `get_orders` returns an empty list with HTTP 200 since the procurement API's Friday release | Agent team routes to procurement on-call with run IDs |
+| **Mon 11:00** | Procurement confirms a renamed field; rolls forward a fix | Procurement (owns the tool's API) |
+| **Mon 12:00** | Agent team adds a contract test on the tool's response and an alert on empty-result rate | Agent team (owns its detection gap) |
+
+Neither team closed it as "not ours": procurement owned the cause, the agent team owned detection.
+
 ## Production patterns
+- **Catalog entry per agent tool.** When: an agent calls tools owned by other teams. How: register each
+  tool (or tool server) with its owning team, rotation, response contract and permissions, and route tool
+  error alerts there while task-success alerts go to the agent team. Monitor: tool calls whose owner
+  entry is missing or stale.
 - **Service catalog as source of truth.** When: more than a few components or teams. How: every component
   has an entry with owning team, on-call rotation, runbook link, dependencies and support hours, and
   alert routing reads from it. Monitor: entries whose owner or rotation no longer exists.
@@ -221,6 +264,9 @@ for p in check(RACI):
 - **Two parties marked Accountable for the same layer**, often "shared" data quality. Symptom: a known
   problem that stays open for weeks while each side waits for the other to schedule the fix. Fix: one
   Accountable per row.
+- **Assuming the agent team owns every tool it wraps.** Symptom: the agent on-call is paged for another
+  team's API outage and can only open tickets. Fix: tool owners carry the pager for their tool; the agent
+  team owns task success and the wrapper.
 
 ## When to use
 - **Use when:** before go-live of any production system; revisit at each phase change, reorganisation or
@@ -257,7 +303,7 @@ criteria the receiving team signs off. The FDE then becomes a tier 3 escalation,
 - **Why all three:** ownership without access gives helpless on-call; access without ownership gives
   drive-by changes nobody answers for.
 
-### A customer says answers are stale and the documents live in their system. How do you handle it?
+### A customer says your RAG agent's answers are stale and the documents live in their system. How do you handle it?
 - **Route, do not close.** Collect request IDs, trace retrieval, and send the cause to the customer's
   content owner with evidence.
 - **Own your side too.** Ask why your monitoring did not detect it, and add a freshness eval or alert as
@@ -280,6 +326,13 @@ criteria the receiving team signs off. The FDE then becomes a tier 3 escalation,
 - **Share of tickets reaching tier 3** that tier 1 or 2 could have resolved, and share escalated with
   complete evidence.
 - **Pages to builders after the hypercare exit date**, which should fall to near zero.
+
+### Your agent calls tools owned by four other teams. How do you set up ownership before launch?
+- **One row per layer:** agent behaviour and task success (your team), each tool's API (its owning team),
+  permissions (security or the system owner), and actions on a user's behalf.
+- **Tool contracts and routing:** each tool has a catalog entry, a response contract test and an on-call;
+  tool errors page the tool owner, task-success drops page you.
+- **Crossing points:** tickets carry run ID, step and tool name, so routing takes minutes.
 
 ## Quiz
 ### Q: Which combination makes a team a genuine operational owner of a component?
@@ -305,3 +358,24 @@ criteria the receiving team signs off. The FDE then becomes a tier 3 escalation,
 - [x] To make the transfer of ownership a deliberate, verified step rather than something that never happens
 > Without criteria such as a stable baseline, validated runbooks and alerts routed to the new owner,
 > builders stay informally on the hook indefinitely and the receiving team is never ready.
+
+## Use cases & projects
+### Use cases
+- **Internal agents over many team APIs.** Tool owners carry the pager for their APIs; the agent team owns
+  task success, prompts and evals.
+- **Agents deployed into a customer environment.** A boundary table splits the model endpoint, the agent,
+  the cluster and the customer's data sources before go-live.
+- **FDE-built agents after launch.** Hypercare with dated exit criteria moves support off the person who
+  built it.
+- **Agents acting on users' behalf.** Someone is named to reverse a wrong action, not just to fix the
+  agent that took it.
+
+### Mini project
+**Write and validate the ownership map for a small agent (1-2 hours).**
+- **Goal:** make every layer of an agent you have built owned by exactly one Accountable party.
+- **Steps:** list the agent's layers (model endpoint, orchestration and prompts, each tool, data sources,
+  permissions, actions on behalf of users); fill a RACI table and run the validator from the example over
+  it; write a one-page escalation template requiring run ID, step and tool name; add a contract test for
+  one tool's response shape.
+- **Done when:** the validator reports no problems, every tool has a named owner and rotation, and the
+  contract test fails when you rename a field in a fake tool response.

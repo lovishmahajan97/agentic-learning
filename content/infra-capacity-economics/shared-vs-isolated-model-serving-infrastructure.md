@@ -210,7 +210,7 @@ an eval sweep of 500 agent tasks at client concurrency 100. Illustrative numbers
 | Setup | Slots held by the sweep | Left for interactive agents | Effect |
 |---|---|---|---|
 | No tenant caps | ~100 of 144 | ~44 | interactive TTFT climbs as their steps queue behind eval steps |
-| Per-tenant cap of 24 in-flight sequences | 24 | 120 | sweep takes ~4× longer; interactive latency unchanged |
+| Per-tenant cap of 24 in-flight sequences | 24 | 120 | sweep takes ~4× longer (100 ÷ 24); interactive TTFT near baseline, though admitted eval steps still share the batch |
 | Sweep tagged batch, routed to its own pool | 0 | 144 | sweep speed set by the batch pool's size |
 
 - **Fan-out counts:** an agent issuing 3 parallel tool-result summaries holds 3 sequences, so caps must
@@ -418,8 +418,9 @@ along with its cost. Dedicated capacity is reviewed against their utilization ev
 **Prove a noisy-neighbour fix for agents (2-3 hours).**
 - **Goal:** show that a per-tenant in-flight cap protects an interactive agent from another tenant's
   fan-out on a shared endpoint.
-- **Steps:** put a small gateway in front of one model endpoint (local or hosted) that tags each call
-  with a tenant id; run tenant A as an interactive agent issuing one call at a time and tenant B as a
+- **Steps:** put a small gateway in front of one local model server with limited concurrency (a small
+  model on vLLM, or Ollama with a low `OLLAMA_NUM_PARALLEL`), because a hosted endpoint's pool is too big
+  to show contention; tag each call with a tenant id; run tenant A as an interactive agent issuing one call at a time and tenant B as a
   batch job firing 30 parallel sub-agent calls; measure tenant A's TTFT with no cap, then with a cap on
   tenant B's in-flight calls counted across its whole fan-out.
 - **Done when:** you have a before/after table of tenant A's p50 and p95 TTFT, tenant B's total runtime

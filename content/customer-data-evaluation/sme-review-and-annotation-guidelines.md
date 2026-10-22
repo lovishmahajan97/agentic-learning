@@ -5,7 +5,8 @@ name: SME review & annotation guidelines
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - evals/rubrics
   - evals/inter-annotator-agreement
@@ -17,14 +18,26 @@ related:
 ---
 
 ## TL;DR
-Guidelines are the written contract for how customer SMEs judge outputs: labels, definitions, decision
-order, boundary examples, an "unsure" path. Review protocol keeps judging blind, randomised and
-independent, with agreement measured. Without both, eval numbers inherit unmeasured expert noise.
+Guidelines are the written contract for how customer SMEs judge an agent's answers and actions: labels,
+definitions, decision order, boundary examples, an "unsure" path. Review protocol keeps judging blind,
+randomised and independent, with agreement measured, so eval numbers do not inherit expert noise.
+
+## For agent builders
+- **Why it matters for agents.** Your agent's eval score, your LLM judge and your acceptance bar all rest on
+  what SMEs call a pass. If the standard is private to each reviewer, a prompt change can "win" because a
+  friendlier reviewer saw its traces.
+- **Where it shows up in your stack.** The review card SMEs use on agent traces, the per-criterion labels
+  your harness stores, and the LLM-as-judge prompt, which should be derived from the same versioned file.
+- **What you control.** Which criteria cover the final answer versus the trajectory (right tool, grounded in
+  tool results, no forbidden action), how traces are shown to reviewers, blinding, and the agreement bar
+  before you trust a judge.
+- **What you can skip.** Choosing between agreement statistics in depth; know when to use Cohen's κ,
+  Fleiss' κ and Krippendorff's α, and always report agreement on the fail class.
 
 ## Why it exists
 - **Experts apply private standards.** Ask three senior experts "is this answer good?" and one fails it for
   a missing caveat, one for a slightly wrong tone, one passes anything factually correct. Each is
-  reasonable; together their disagreement is indistinguishable from model error.
+  reasonable; together their disagreement is indistinguishable from agent error.
 - **Unmanaged noise moves scores.** If the eval set is labelled this way, a prompt change can move the score
   just by changing which reviewer saw which items.
 - **"Trust the SMEs" is not enough.** Expertise tells you what one expert believes, but an eval needs a
@@ -40,7 +53,7 @@ independent, with agreement measured. Without both, eval numbers inherit unmeasu
 ### Two jobs, one guideline
 | | Annotation | Review |
 |---|---|---|
-| What the SME sees | only the input | the input, the system's output, sometimes a reference |
+| What the SME sees | only the input | the input, the agent's output or trace, sometimes a reference |
 | What they produce | the correct label or answer (the reference) | a verdict on the output |
 | Speed | slower | faster, because recognising an error is easier than producing the answer |
 | Bias | unanchored | anchored: a plausible output pulls the reviewer toward accepting it |
@@ -56,11 +69,19 @@ independent, with agreement measured. Without both, eval numbers inherit unmeasu
 3. **Operational definitions.** Observable conditions per label: "Fail on completeness if the answer omits
    an eligibility condition stated in the source policy".
 4. **Decision order.** Which criteria come first and which are disqualifying, so reviewers do not weigh a
-   tone problem against a factual error differently.
+   tone problem against a factual error differently. For agents, an unsafe action usually comes first.
 5. **Boundary examples.** Pairs of real cases just either side of each line, with the reason.
 6. **Unsure and out-of-scope paths.** A legitimate "cannot judge" label with a reason field, because forcing
    a choice on ambiguous items turns policy gaps into silent noise.
 7. **Rationale requirement.** A short free-text reason on every fail, citing the guideline section.
+
+### Agent-specific criteria
+- **Judge the trajectory only where it matters to the customer:** forbidden actions, required checks before
+  a write, and grounding (every claim traceable to a tool result), not "was this the ideal path".
+- **Show reviewers a readable trace:** the user turn, each tool call with its arguments and result, and the
+  final answer, so they judge what the agent saw rather than guessing.
+- **Separate answer and action verdicts,** because a correct reply after a wrong refund is still a failure,
+  and the two have different fixes.
 
 ### The review protocol
 - **Blind.** Hide which system, prompt version or model produced the output, and mix in reference answers,
@@ -92,14 +113,16 @@ fail-specific agreement = 2·n_both_fail / (2·n_both_fail + n_disagree)
 - **Iterate calibration rounds** until agreement is stable and adequate for the decision the labels support.
 - **There is no universal threshold.** κ bands such as Landis and Koch's are conventions, and a high-stakes
   acceptance set warrants more agreement than an exploratory error analysis.
+- **The human bar caps the judge:** an LLM judge cannot be shown to agree with "the standard" better than
+  the SMEs agree with each other.
 
 ## Diagram
 Calibration is a loop: low agreement is traced to the guideline section reviewers cite, that section is
-rewritten, and a fresh batch is labelled before scaling up.
+rewritten, and a fresh batch is labelled before scaling up or building the agent's LLM judge.
 
 ```mermaid
 flowchart TD
-    G["Guideline version N"] --> Q["Blind, shuffled review queue"]
+    G["Guideline version N"] --> Q["Blind, shuffled trace queue"]
     Q --> L["Independent labels plus rationale"]
     L --> S["Double-labelled subset"]
     S --> K["Raw, kappa, fail-specific agreement"]
@@ -112,9 +135,9 @@ flowchart TD
 ```
 
 ## Examples
-### Agreement on a benefits-policy calibration batch
-An HR customer's benefits-policy assistant. Two HR SMEs review 50 answers independently against
-guideline v0.3, labelling pass or fail and citing the section behind each fail.
+### Agreement on a benefits-policy agent calibration batch
+An HR customer's benefits-policy agent retrieves policy text and answers employees. Two HR SMEs review 50
+answers independently against guideline v0.3, labelling pass or fail and citing the section behind each fail.
 
 ```python
 from collections import Counter
@@ -150,18 +173,23 @@ print(f"agreement on fails {2 * both_fail / (2 * both_fail + disagree):.2f}")  #
 
 - **The fix is in G3,** not more reviewer training: "an answer is incomplete only if it omits a condition
   that changes the answer to the question asked", plus two boundary examples, then a fresh calibration batch.
+- **Only then build the judge:** a judge prompt written from v0.3 would have learned one reviewer's private
+  reading of completeness.
 
-### A one-page decision card (guideline excerpt)
+### A one-page decision card for agent traces (guideline excerpt)
 Long guidelines go unread, so reviewers work from a card like this and the full document holds the
-appendix. The section ids are what reviewers cite on each fail.
+appendix. The section ids are what reviewers cite on each fail, and the LLM judge prompt is generated from
+the same text.
 
 ```text
-Benefits assistant review card - guideline v0.4
+Benefits agent review card - guideline v0.4
 Scope: judge correctness for the employee's question under the cited policy.
        Do NOT judge style unless it misleads.
 Check in order; the first FAIL decides, cite its section.
+  A1 actions       FAIL if the agent changed an enrolment without the employee confirming.
   G1 accuracy      FAIL if any stated eligibility, amount or date contradicts the policy.
-  G2 grounding     FAIL if a claim has no support in the retrieved policy text.
+  G2 grounding     FAIL if a claim has no support in the retrieved policy text
+                   shown in the trace's tool results.
   G3 completeness  FAIL only if it omits a condition that changes the answer to the
                    question asked (e.g. a waiting period for a "can I enrol now?" question).
   G5 tone          FAIL only if wording could mislead the employee into a wrong action.
@@ -170,37 +198,40 @@ Boundary pair for G3: see appendix A, items 12 and 13.
 ```
 
 ## Production patterns
-- **Blinded, shuffled review queue.** Strip system and version identifiers before items reach reviewers,
+- **Blinded, shuffled review queue.** Strip system and version identifiers before traces reach reviewers,
   mix in reference answers, and shuffle with a per-reviewer seed. Monitor each reviewer's pass rate on the
   mixed-in references, because a reviewer who fails correct references is misreading the guideline.
 - **Known-answer check items.** Seed a small share of items whose correct label the policy owner has
   fixed, and track each reviewer's accuracy on them over time. Use drops as a prompt for a recalibration
   session, not as a performance score.
 - **Guideline as the single versioned source.** Keep the guideline in version control, store its version
-  with every label, and derive the LLM judge prompt from the same file. After each guideline change,
-  rerun judge-versus-human agreement before trusting the judge again.
+  with every label, and derive the agent's LLM judge prompt from the same file. After each guideline
+  change, rerun judge-versus-human agreement before trusting the judge again.
 - **Per-criterion agreement report.** After every double-labelled batch, compute κ and fail-specific
   agreement per criterion and list disagreements by cited section. Monitor the trend per section across
   guideline versions.
 - **Unsure-rate tracking.** Report the "cannot judge" share per reviewer and per criterion. A climbing rate
   goes to the next calibration session for boundary examples, or to the policy owner when the policy is silent.
+- **Trace rendering for reviewers.** Render each agent run as user turn, tool calls with arguments and
+  results, then final answer, with internal ids and model names removed. Monitor review time per trace;
+  a sharp rise usually means the rendering is too raw.
 
 ## Trade-offs
 - **Binary per-criterion labels vs gradation.** Higher agreement and clear diagnosis, but gradations of
-  quality are lost; when choosing between two good systems, add pairwise preference judgements alongside.
+  quality are lost; when choosing between two good agents, add pairwise preference judgements alongside.
 - **Detailed guidelines vs being read.** They raise consistency, but long documents go unread; past a few
   pages, move rarely needed detail into an appendix and keep a one-page decision card for reviewers.
 - **Review vs annotation.** Reviewing outputs costs less expert time than annotating from scratch, but
   anchors on the output; for golden references and hard strata, annotate unaided, and keep review for
   judging runs.
 - **Blind review vs context.** It removes version bias but hides context reviewers sometimes need, such as
-  which data source a system had; provide the input context, never the system identity.
+  which data source an agent had; provide the input context and tool results, never the system identity.
 - **"Unsure" label vs overuse.** It surfaces policy gaps honestly, but some reviewers overuse it; when its
   rate climbs, review those items in session and add boundary examples.
 
 ## Pitfalls
-- **Building references by having SMEs approve system outputs.** Symptom: a golden set that agrees
-  suspiciously well with the system that drafted it and scores a different system unfairly low.
+- **Building references by having SMEs approve agent outputs.** Symptom: a golden set that agrees
+  suspiciously well with the agent that drafted it and scores a different agent unfairly low.
 - **Using a single holistic 1–5 score.** Symptom: reviewers agree on the average but rarely on any
   individual item.
 - **Discussing items as a group before labelling.** Symptom: suspiciously high agreement that drops
@@ -211,13 +242,15 @@ Boundary pair for G3: see appendix A, items 12 and 13.
   nobody can attribute to the model or the definition change.
 - **Letting reviewers see which model produced each output.** Symptom: the new version wins by more in SME
   review than in blind or automated checks.
+- **Showing reviewers only the final answer for an acting agent.** Symptom: passes on runs that took a
+  forbidden action, found later in production audits. Fix: render the trace and add an action criterion.
 
 ## When to use
 - **Write guidelines first:** before any SME labels more than a calibration batch, and before you build an
   LLM judge, since the judge's prompt should be derived from the same document.
 - **Full protocol** (blind, randomised, double-labelled subset, κ) for acceptance sets and judge
   calibration.
-- **Lighter version** is fine for exploratory error analysis.
+- **Lighter version** is fine for exploratory error analysis of agent traces.
 - **Measure** agreement per criterion, unsure rate and guideline version.
 - **Interviews:** the strong signal is treating low agreement as a guideline defect and attributing
   disagreement to a specific criterion.
@@ -248,6 +281,13 @@ and blind to system identity, since discussion or version knowledge inflates agr
   reviewer toward accepting it: use it for judging runs.
 - **Both follow one guideline,** so "correct" means the same thing in the reference and in the verdict.
 
+### How would you design an SME review guideline for a tool-calling agent?
+- **Separate action and answer criteria:** forbidden actions and required checks first, then accuracy,
+  grounding in tool results, completeness and tone, each binary with an operational definition.
+- **Do not grade the ideal path:** many tool orders are fine, so judge only what the customer's policy cares about.
+- **Show the trace** with tool arguments and results, blind to version, and derive the judge prompt from the
+  same versioned card.
+
 ### How would you draft annotation guidelines for a new customer task in the first week?
 - **Start from real cases:** sit with two SMEs on a batch of real outputs and record why each passes or fails.
 - **Turn reasons into structure:** scope, per-criterion binary labels, operational definitions, decision
@@ -261,7 +301,7 @@ and blind to system identity, since discussion or version knowledge inflates agr
 - **Still report label-specific agreement** on the failure class, because chance-corrected statistics drop
   when that class is rare.
 
-### A new prompt version wins by 12 points in SME review but only 2 points in automated checks. What do you suspect?
+### A new agent prompt version wins by 12 points in SME review but only 2 points in automated checks. What do you suspect?
 - **Version leakage first:** reviewers may know which output is "new", so check blinding and whether
   outputs carry tells such as a changed format.
 - **Then order and anchoring:** confirm per-reviewer shuffling and that the two versions were interleaved,
@@ -300,3 +340,24 @@ and blind to system identity, since discussion or version knowledge inflates agr
 - [x] Otherwise the most senior or vocal reviewer's view becomes the label and real ambiguity is hidden
 > Independent labels reveal where the guideline is genuinely unclear. Discussion afterwards is valuable
 > for fixing the guideline, but before labelling it manufactures agreement.
+
+## Use cases & projects
+### Use cases
+- **Building an LLM judge for an agent.** The SME guideline becomes the judge prompt, and SME agreement sets
+  the bar the judge must reach.
+- **Reviewing agent traces before go-live.** Action and grounding criteria catch agents that answer
+  correctly but act unsafely.
+- **Comparing two agent versions fairly.** Blind, shuffled review stops the new version winning on reviewer
+  expectations.
+- **Onboarding new customer reviewers.** A one-page card and known-answer items let a new SME judge
+  consistently within a session.
+
+### Mini project
+**Write a trace review card and measure agreement (2 hours).**
+- **Goal:** produce a versioned review guideline for an agent and show one revision raising fail-specific
+  agreement.
+- **Steps:** collect 30 traces from a small RAG or tool-calling agent; draft a card with an action criterion
+  and three answer criteria; have two people label blind and shuffled; compute κ and fail-specific
+  agreement with `cohen_kappa`; rewrite the most-cited section and relabel 20 fresh traces.
+- **Done when:** you have guideline v1 and v2, agreement numbers for both rounds, and a list of
+  disagreements grouped by cited section.

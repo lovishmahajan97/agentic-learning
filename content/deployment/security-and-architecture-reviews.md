@@ -5,7 +5,8 @@ name: Security & architecture reviews
 kind: practice
 difficulty: core
 est_minutes: 18
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - deployment/security-questionnaires
   - deployment/compliance-constraints
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-A security and architecture review tests a proposed system's design before go-live: data flows, trust
-boundaries, identity, network paths and, for AI, prompt injection and tool permissions. Pass it with an
-accurate diagram, a threat model and evidence; leave with dated findings.
+A security and architecture review tests your agent's design before go-live: data flows, trust
+boundaries, tool credentials, network paths, prompt injection and excessive agency. Pass it with an
+accurate diagram, a threat model and evidence tests; leave with dated findings.
+
+## For agent builders
+- **Why it matters for agents.** Reviewers ask what an agent can do, with whose credentials, and what
+  stops a planted instruction in a retrieved document from turning into a tool call. The answer has to
+  rest on capability limits you built, not on the model obeying its prompt.
+- **Where it shows up in your stack.** Tool permission scopes, approval gates on consequential actions,
+  permission-filtered retrieval, trace destinations, model version pinning, and the evals and red-team
+  results you attach as evidence.
+- **What you control.** Designing tools so the threat model is short (draft-only email, internal
+  recipients enforced in code, read-only by default), and keeping evidence tests in CI so they stay true.
+- **What you can skip.** The governance mechanics of a customer's review board. Know the flow (intake,
+  pre-read, session, findings, decision) and what each finding outcome means.
 
 ## Why it exists
 - **A questionnaire captures claims; a review tests the design.** It cannot tell the buyer how your
@@ -46,7 +59,8 @@ accurate diagram, a threat model and evidence; leave with dated findings.
 ### The typical flow
 1. **Intake.** The sponsor files a request with a system description, data classification and owners.
    Data classification sets the depth: a system touching regulated personal data gets more scrutiny than
-   an internal FAQ bot.
+   an internal FAQ bot. An agent that takes actions usually lands in a deeper tier than one that only
+   answers.
 2. **Pre-read package.** You submit documents in advance, because reviewers want to come with questions,
    not discover the design in the meeting.
 3. **Review session.** Reviewers walk the diagram, probe boundaries and ask "what happens if" questions.
@@ -59,9 +73,11 @@ accurate diagram, a threat model and evidence; leave with dated findings.
 - **Architecture diagram** at container level (C4-style is common): every service, data store, external
   dependency and trust boundary, including model providers and observability tools.
 - **Data flow diagram** for each sensitive flow: what data, from where, to where, encrypted how, retained
-  how long. Reviewers scrutinize this most, because breaches follow data.
+  how long. Reviewers scrutinize this most, because breaches follow data. For an agent, a tool result is
+  a data flow too.
 - **Identity and access:** how users authenticate (their SSO), how services authenticate to each other
-  and to customer systems, which permissions each role and service account has, and why.
+  and to customer systems, which permissions each role and service account has, and why. List each agent
+  tool's credential separately.
 - **Network:** ingress and egress paths, private endpoints, VPNs, what is publicly reachable.
 - **Encryption and keys:** in transit, at rest, who holds keys, whether customer-managed keys are used.
 - **Logging and monitoring:** what is logged, where, for how long, whether prompts or outputs are included.
@@ -69,12 +85,14 @@ accurate diagram, a threat model and evidence; leave with dated findings.
   prompt injection (direct and via retrieved documents), sensitive information disclosure, excessive
   agency of tools, improper output handling (called insecure output handling in the 2023 list), vector
   and embedding weaknesses, and supply chain of models and datasets.
-- **Evidence:** penetration test summary, vulnerability scanning, SBOM, SOC 2 or ISO reports.
+- **Evidence:** penetration test summary, vulnerability scanning, SBOM, SOC 2 or ISO reports, plus agent
+  evals and red-team results for injection.
 
 ### Applying STRIDE at a boundary
 A threat model is not a list of scary words; it is the same six questions asked wherever data or control
 crosses a trust boundary. It works *because* boundaries are finite and enumerable, while "think of
-attacks" is not.
+attacks" is not. In an agent, the critical boundaries are retrieved text entering the prompt and model
+output becoming a tool call.
 
 | Letter | Question | At "retrieved document text enters the model prompt" |
 |---|---|---|
@@ -94,7 +112,8 @@ An architecture review board asks questions a security reviewer may not:
 - **Resilience:** what are the availability target and the recovery point and time objectives, and does
   the design meet them?
 - **Operations:** who operates it, and does its monitoring land in their tooling?
-- **Cost:** what does it cost at expected volume, and how does that scale?
+- **Cost:** what does it cost at expected volume, and how does that scale? Agents make several model
+  calls per task, so cost per task, not per call, is the number to bring.
 - **Exit:** can data and indexes be exported if the vendor is replaced?
 
 These exist *because* the customer will live with the system long after the project team moves on, so fit
@@ -115,8 +134,8 @@ with their estate matters as much as internal elegance.
 - **Record decisions as ADRs** so the reasoning survives staff changes.
 
 ## Diagram
-The review is a loop: findings return to the design until each one has a fix, a mitigation or a named
-acceptance.
+The review is a loop: findings return to the agent's design until each one has a fix, a mitigation or a
+named acceptance.
 
 ```mermaid
 flowchart TD
@@ -202,38 +221,81 @@ if __name__ == "__main__":
 - **Against the real system**, run the same three assertions through the deployed retrieval API with two
   test identities, and attach the run output to the finding.
 
+### Evidence test for excessive agency: the email tool enforces its limits in code
+The reviewer's question "what stops the agent emailing our customer list outside?" is answered by a tool
+whose limits do not depend on the prompt. The test feeds it what an injected instruction would ask for.
+
+```python
+"""The agent's email tool: drafts only, internal recipients only, enforced in code."""
+INTERNAL_DOMAINS = {"bank.example"}
+
+class ToolDenied(Exception):
+    pass
+
+def create_email_draft(to: list[str], subject: str, body: str, audit: list) -> dict:
+    outside = [a for a in to if a.rsplit("@", 1)[-1].lower() not in INTERNAL_DOMAINS]
+    if outside:
+        audit.append({"tool": "email", "denied": outside})
+        raise ToolDenied(f"recipients outside approved domains: {outside}")
+    audit.append({"tool": "email", "draft_to": to})
+    return {"status": "draft", "to": to}       # there is no send function for the agent to call
+
+def test_injected_external_recipient_is_denied():
+    audit = []
+    try:
+        create_email_draft(["attacker@evil.example"], "list", "all customers", audit)
+        assert False, "should have been denied"
+    except ToolDenied:
+        assert audit[-1]["denied"] == ["attacker@evil.example"]
+
+def test_internal_draft_allowed_and_logged():
+    audit = []
+    assert create_email_draft(["ops@bank.example"], "hi", "draft", audit)["status"] == "draft"
+    assert audit[-1]["draft_to"] == ["ops@bank.example"]
+```
+
+- **Why this convinces a reviewer.** It shows the control holds even when the model is fully
+  compromised, and the audit entry answers the repudiation question.
+
 ## Production patterns
 - **Reusable pre-read template.** Keep a standard package (container diagram, one DFD per sensitive
   flow, access matrix, STRIDE table per boundary, AI threats from the OWASP LLM list, evidence index) and
   update it per deployment. Track high findings per review; they should fall as the template matures.
+- **Tool inventory in the pre-read.** Generate a table of every agent tool (read or write, credential,
+  scope, approval required) from the tool registry, so the excessive-agency discussion starts from facts.
+  Regenerate it before each review.
 - **Diagram generated from or checked against production.** Reconcile the architecture diagram with the
   deployed inventory (cloud resource listings, egress destinations) before each review, because a
   missing service destroys reviewer confidence.
-- **Findings as tickets with dates.** Every finding gets an owner, severity, outcome and due date in the
-  tracker, mirrored to the customer's risk register. Monitor the percentage closed by due date.
-- **Expiring risk acceptances.** Each accepted risk records the approver and a review date, such as the
-  six-month TLS review above, and resurfaces automatically. Count acceptances past their date.
+- **Findings as tickets with dates and expiring acceptances.** Every finding gets an owner, severity,
+  outcome and due date in the tracker, mirrored to the customer's risk register. Each accepted risk
+  records the approver and a review date, such as the six-month TLS review above. Monitor the percentage
+  closed by due date and acceptances past their date.
 - **Change triggers for re-review.** New data sources, new agent tools, new model providers and new
   regions require a delta review before release; add the check to the release checklist.
-- **Evidence tests in CI.** Keep the permission-filter and log-destination checks as automated tests, so
-  the evidence stays true after go-live.
+- **Evidence tests in CI.** Keep the permission-filter, tool-limit and log-destination checks as
+  automated tests, plus a prompt-injection eval set, so the evidence stays true after go-live.
 
 ## Trade-offs
 - **Early vs late engagement.** Engaging reviewers at design stage finds structural problems while they
   are cheap, but the design may change and need re-review. Late engagement saves meetings but risks
-  findings that force a redesign.
+  findings that force a redesign, such as removing a write tool the agent's main flow depends on.
 - **Thorough pre-read vs preparation time.** It shortens the meeting and the follow-up cycle, but takes
   days to prepare. For a low-risk internal tool, a lightweight review with a short template is proportionate.
 - **Risk acceptance vs invisible debt.** Accepting risks with a named approver keeps launches moving, but
   accumulated accepted risks become invisible debt unless they carry expiry dates and are re-reviewed.
 - **Frameworks vs deployment specifics.** STRIDE and the OWASP LLM list give reviewers shared vocabulary,
   but checklists miss deployment-specific risks; the data-flow walkthrough is what finds those.
+- **Agent capability vs review depth.** Each write tool adds value and a threat-model row. Starting
+  read-only with draft-only actions passes review faster, and write tools can follow as delta reviews.
 
 ## Pitfalls
 - **A diagram that does not match production.** Symptom: a reviewer asks about a service the diagram
   omits, and the review loses confidence in everything else presented.
 - **Omitting the model provider and observability vendors from data flows.** Symptom: a high-severity
   finding for undisclosed data transfer, often discovered from a network-egress question.
+- **Relying on the system prompt as the control.** Symptom: the reviewer asks what happens if the prompt
+  is overridden and there is no answer. Fix: enforce limits in tool code and credentials, and show tests.
 - **Agreeing to findings without owners and dates.** Symptom: the same findings reappear at the next
   review, or block go-live at the last minute.
 - **Treating the review as a one-time gate.** Symptom: a later feature, such as a new agent tool or a
@@ -246,7 +308,8 @@ if __name__ == "__main__":
   identity or internal systems, or taking actions.
 - **Run your own internal review** for every new system and for significant changes: new data sources,
   new tools for an agent, new model providers, new regions.
-- **Scale the depth** to data classification and blast radius.
+- **Scale the depth** to data classification and blast radius; an agent's blast radius is the union of
+  its tools' permissions.
 - **Measure:** time from intake to approval, the number of high findings per review (it should fall as
   your template matures) and the percentage of findings closed by their due date.
 - **Interviews:** a strong candidate describes the pre-read package and names AI-specific threats with
@@ -288,6 +351,13 @@ anomalous tool use. The key point is that safety rests on capability limits, not
   unlogged action.
 - **Map each to a control:** permission-filtered retrieval, least-privilege tools, approval gates, and
   logs tying actions to user and source document.
+
+### You are adding a write tool (say, updating CRM records) to an approved agent. What do you bring to the delta review?
+- **The new data flow and credential:** what the tool writes, with which scoped role, and why read-only
+  was not enough.
+- **The new threat rows:** an injected instruction triggering a write, and an unlogged change; with
+  controls such as an approval gate, field-level limits and an audit log keyed to user and trace.
+- **Evidence:** tests showing denied out-of-scope writes, and injection eval results for the new tool.
 
 ### A reviewer raises a finding you think is overstated. How do you handle it?
 - **Do not argue it away.** Understand the risk they see and restate it in your own words.
@@ -332,3 +402,25 @@ anomalous tool use. The key point is that safety rests on capability limits, not
 - [ ] Ask the reviewer to downgrade the severity so it does not block
 > Formal acceptance makes the decision visible and owned, and a date ensures it is revisited. Deleting or
 > downgrading the finding hides the risk, which is what the review exists to prevent.
+
+## Use cases & projects
+### Use cases
+- **Getting an enterprise agent to production.** A bank's review of a SharePoint-backed assistant ends
+  with dated findings on permission filtering and trace destinations.
+- **Delta reviews for new tools.** Each new write tool, model provider or region triggers a short review
+  with its own threat rows and evidence tests.
+- **Internal design reviews of agent architectures.** A peer architect and a security engineer walk the
+  agent's boundaries before the first line of tool code.
+- **Answering excessive-agency questions with tests.** Tool limits enforced in code, plus injection evals,
+  replace "the prompt tells it not to".
+
+### Mini project
+**Assemble a review pre-read for a small agent (2-3 hours).**
+- **Goal:** produce the evidence pack a security reviewer would accept for a RAG agent with one draft-only
+  email tool.
+- **Steps:** draw the container diagram and one data-flow diagram; write the STRIDE table for "retrieved
+  text enters the prompt" and "model output becomes a tool call"; implement the retrieval and email-tool
+  evidence tests above against your agent; add five indirect-injection documents to your index and record
+  what the agent attempts.
+- **Done when:** every STRIDE row points to a control, both evidence tests pass in CI, the injection run
+  shows every external-recipient attempt denied and logged, and the pack fits on four pages.

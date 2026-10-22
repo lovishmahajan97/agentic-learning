@@ -5,7 +5,7 @@ name: Rate limiting
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - serving-inference/backpressure
@@ -23,9 +23,9 @@ sources:
 ---
 
 ## TL;DR
-An agent run spends many model calls of unknown size, so rate limiting must be token-weighted: per-run
-step and token budgets inbound, a shared provider-quota bucket outbound, reserving an estimate and
-settling on actual usage.
+Rate limiting bounds a caller's work per unit of time. Agent runs make many calls of unknown size, so
+weight it in tokens: per-run and per-tenant budgets inbound, a shared provider-quota bucket outbound,
+reserving an estimate and settling on actual usage.
 
 ## For agent builders
 - **Why it matters for agents.** One stuck agent in a tool cycle can burn a whole organisation's tokens

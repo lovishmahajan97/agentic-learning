@@ -5,7 +5,7 @@ name: Workflow orchestration (Temporal, Prefect, Airflow)
 kind: tool
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - reliability/durable-workflow-execution
@@ -504,8 +504,9 @@ is the achievable form of exactly-once.
 ### Mini project
 **Make an agent run survive a crash (2-3 hours).**
 - **Goal:** run a multi-step agent task as a durable workflow that resumes after the worker is killed.
-- **Steps:** model a four-step task (search, draft, wait for approval, send) as workflow steps with
-  recorded completion; give the send step an idempotency key; add retries with backoff on the model
+- **Steps:** start a local engine (for example the Temporal CLI's `temporal server start-dev`); model a
+  four-step task (search, draft, wait for approval, send) as activities plus a signal-based approval
+  wait, as in the agent-loop example; give the send step an idempotency key; add retries with backoff on the model
   call; kill the worker mid-run, restart it and send the approval signal.
 - **Done when:** the run resumes at the step it reached, the email or message is sent exactly once in
   your logs, and you can show where the run is from the orchestrator's state.

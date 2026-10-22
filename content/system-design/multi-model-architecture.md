@@ -5,7 +5,7 @@ name: Multi-model architecture
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - system-design/model-portfolio
@@ -170,6 +170,9 @@ class ToolResult(BaseModel):
     tool: str
     ok: bool
     data: dict                      # data, never instructions: the next prompt quotes it as data
+class Answer(BaseModel):
+    text: str
+    used_tools: list[str]
 
 async def run_task(task, tools, trace):
     plan = await llm_structured(MODELS["plan"], Plan, task=task, tools=list(tools))

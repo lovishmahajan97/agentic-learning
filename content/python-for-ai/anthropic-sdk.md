@@ -5,7 +5,7 @@ name: Anthropic SDK
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/openai-sdk

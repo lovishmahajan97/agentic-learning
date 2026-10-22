@@ -5,7 +5,7 @@ name: Citations / grounding
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - rag-retrieval/citation-correctness
@@ -250,7 +250,8 @@ print(resolve_span("partial refunds are prorated", chunk))                  # No
   escalations to humans.
 - **Risk-tiered failure policy plus audits.** High-risk surfaces drop unverified sentences or abstain;
   low-risk ones show an "unverified" marker. Run an NLI model or LLM judge on a daily sample of claim and
-  quote pairs, keep an unanswerable probe set that must abstain, and track support rate, not citation rate.
+  quote pairs with human review of disagreements, keep an unanswerable probe set that must abstain (alert
+  when abstention on it drops), and track support rate, not citation rate.
 
 ## Trade-offs
 - **Per-claim citations: trust vs friction.** They raise trust and auditability but make prose choppier,

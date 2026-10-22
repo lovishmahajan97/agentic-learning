@@ -5,7 +5,7 @@ name: API keys / OAuth2 / JWT
 kind: decision
 difficulty: core
 est_minutes: 22
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - fastapi-for-ai/dependency-injection

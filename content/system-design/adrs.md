@@ -5,7 +5,7 @@ name: ADRs (architecture decision records)
 kind: practice
 difficulty: intro
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - system-design/trade-off-analysis
@@ -403,12 +403,12 @@ the cost achieves parity", which would have made this review routine rather than
   are missing decisions.
 
 ### An ADR says write tools need human approval, but an agent just cancelled orders on its own. What happened?
-- **Likely cause:** the decision had no confirmation mechanism, so a new write tool was registered
-  without the approval flag and the decision was voided silently.
-- **Immediate:** stop the tool, then decide whether the code or the decision is wrong; if the decision,
-  write a superseding ADR rather than editing the old one.
-- **Lasting:** add a CI test over the tool registry that fails when any write tool lacks approval, and
-  cite the ADR number in the failure message.
+- **Contain first:** disable `cancel_order` (a kill switch or registry flag, not a redeploy), list the
+  affected runs from traces, and reverse the cancellations with the support team.
+- **Likely cause:** the tool was registered as a write without the approval flag, and nothing checked
+  the registry against the ADR, so the decision was voided without anyone deciding so.
+- **Lasting:** a CI test over the tool registry that fails when any write tool lacks approval and cites
+  the ADR number, plus a review rule that a new write tool links the autonomy ADR in its pull request.
 
 ### Code in production contradicts an accepted ADR. What happened and what do you change?
 - **Likely cause:** the decision had no confirmation mechanism, so a "just this once" shortcut, such as a

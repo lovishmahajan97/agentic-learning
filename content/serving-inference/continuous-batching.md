@@ -5,7 +5,7 @@ name: Continuous batching
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - serving-inference/batching-and-concurrency-limits
@@ -23,9 +23,9 @@ sources:
 ---
 
 ## TL;DR
-Continuous batching lets a serving engine admit and retire sequences every decode step, so hundreds of
-agent runs firing short, uneven tool-call steps share one GPU efficiently. It sets your fleet's throughput
-and every step's TPOT.
+Continuous batching admits and retires sequences every decode step, so one weight read serves dozens of
+agent runs' uneven tool-call steps, giving throughput an order of magnitude above naive servers. Its dials
+set your fleet's throughput and every step's TPOT.
 
 ## For agent builders
 - **Why it matters for agents.** Agent traffic is the skewed mix this was built for: a 30-token tool call
@@ -333,11 +333,12 @@ enter the conversation.
 - **Why LLMs need it:** output lengths vary from tens to thousands of tokens, so static batches idle most
   slots; classic models have fixed cost per request, so their batches finish together.
 
-### Why did paged KV memory matter so much for continuous batching?
-- **Orca already scheduled per iteration,** but reserved each sequence's maximum length contiguously, so few
-  sequences fit and batches stayed small.
-- **Blocks remove that cap:** sequences join, grow and leave without reservations or copies, so the batch
-  grows to what memory can actually hold.
+### When would you deliberately run smaller batches than the GPU could hold?
+- **Interactive products and agents with a TPOT budget:** every admitted sequence lengthens each step for
+  everyone, and an agent pays that on every step of its run.
+- **Long-tailed lengths:** optimistic admission near the memory limit invites preemption storms, as when
+  many agent runs reach late, long-transcript steps together.
+- **The cost** is lower tokens per GPU and more replicas, so do it per endpoint class, not fleet-wide.
 
 ### Your load test showed 3x throughput but production users say streaming stutters. Debug it.
 - **Check the length mix:** a uniform-length test hides both the gains and the interference of skewed real

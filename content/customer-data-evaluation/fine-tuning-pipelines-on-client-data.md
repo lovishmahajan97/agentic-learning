@@ -5,7 +5,8 @@ name: Fine-tuning pipelines on client data
 kind: practice
 difficulty: advanced
 est_minutes: 17
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - training-adaptation/fine-tune-vs-rag-vs-prompt-decision
   - training-adaptation/supervised-fine-tuning
@@ -18,9 +19,21 @@ related:
 ---
 
 ## TL;DR
-A repeatable, audited path from a customer's records to a deployed model, usually a per-customer
-adapter, with permission, redaction, leakage-safe splits, baseline evals and lineage. It must be a
-pipeline, not a notebook, because deprecations, deletion requests and new labels force reruns.
+A repeatable, audited path from a customer's records or agent traces to a per-customer adapter, with
+permission, redaction, leakage-safe splits, baseline evals and lineage. It must be a pipeline, because
+deprecations, deletion requests and new labels force reruns.
+
+## For agent builders
+- **Why it matters for agents.** The usual reason to fine-tune for an agent is distillation: a large
+  prompted agent works but is slow and costly at the customer's volume, so its successful tool-calling
+  traces train a smaller model for one step (routing, classification, a fixed-format tool call).
+- **Where it shows up in your stack.** Your trace store feeds the dataset; the eval harness and
+  per-customer regression suite gate the adapter; the serving layer loads one adapter per tenant.
+- **What you control.** Which traces qualify (successful, reviewed, permitted), how tool calls and
+  results are rendered in the model's chat template, the split unit (conversation or case), and the
+  gate against the prompted agent.
+- **What you can skip.** Training-loop internals and full fine-tuning; a per-customer LoRA adapter on a
+  standard trainer covers almost every agent use.
 
 ## Why it exists
 - **Sometimes fine-tuning is right.** Hundreds of house-specific labels, a rigid output format, a house
@@ -90,6 +103,17 @@ Where training runs is a separate decision:
 
 - **Distillation has its own terms.** If training targets are outputs of a large prompted model, check
   that model's terms too: some providers restrict using outputs to train other models.
+
+### Agent traces as training data
+Distilling an agent step adds four rules to steps 3-5:
+1. **Keep only qualifying traces.** Runs that completed the task and passed review or an automatic check;
+   training on failed or looping runs teaches the failure.
+2. **Render tool calls in the base model's own tool-calling format,** with the same tool schemas
+   production sends, because a model tuned against an old schema emits calls the adapter rejects.
+3. **Learn from the agent's turns, not the tools'.** Tool results and user turns are context; compute the
+   loss on assistant turns (tool calls and replies), which most fine-tuning stacks support as an option.
+4. **Redact tool results too.** CRM lookups and order APIs return the PII that ticket text omits.
+- **Split by conversation or case**, never by turn: turns of one run share almost all of their context.
 
 ### 6. Evaluate against the baseline
 - **Compare with the prompted baseline** on the customer's held-out golden set and regression suite.
@@ -190,6 +214,24 @@ customer's golden set:
   near-identical tickets from one case would sit on both sides, and the gap would surface only in
   production.
 
+### Agent scenario: distilling a routing step from agent traces
+A support agent on a large prompted model spends its first step choosing one of 30 queues and a tool.
+The team distils only that step (illustrative numbers, not a benchmark):
+
+| Stage | Count or result |
+|---|---|
+| Logged first-step traces | 60,000 |
+| Kept: run completed and routing confirmed by the human queue | 31,000, from 22,000 conversations |
+| Dropped after redacting tool results and dedup | 2,400 |
+| Test split by conversation at 15% | about 3,300 conversations |
+| Routing agreement with the human queue: prompted agent vs adapter | 90% vs 89% |
+| Tool-call schema validity on the tenant regression suite | 100% vs 99.6% |
+
+- **The adapter only replaces step one.** Later steps stay on the prompted model, so the decision is per
+  step, measured on the agent's own regression suite.
+- **The 0.4% invalid calls** are a gate item: they trace to an old tool schema in early traces, which is
+  exactly why rendering uses production's current schemas.
+
 ### Canary memorisation probe
 Plant random canary strings in a few training records before training, then prompt the tuned model with
 record prefixes and look for them (and for redacted-class patterns) in the output. `generate` is any
@@ -230,6 +272,10 @@ def probe(generate, records, canaries, prefix_chars=200, limit=500):
 - **Deletion runbook wired to the manifest** — for data-subject and contract-end requests. Look up record
   ids in manifests, rerun affected pipelines, then purge cached datasets, eval logs and old adapter
   versions. Monitor time from request to completed purge.
+- **Trace-qualification filter for agent distillation** — before every agent fine-tune. Select traces by
+  outcome (task completed, no human correction, no guardrail denial) and by tool-schema version, and
+  record the filter in the manifest. Monitor the kept share per run and the schema-validity rate of the
+  tuned model's tool calls.
 
 ## Trade-offs
 - **Per-customer adapters vs full fine-tuning.** Adapters isolate data and make deletion and retraining
@@ -258,6 +304,10 @@ def probe(generate, records, canaries, prefix_chars=200, limit=500):
   another's outputs, which is a cross-tenant leak.
 - **Treating the run as one-off.** Symptom: a deprecation notice for the base model and nobody able to
   reproduce the dataset or hyperparameters.
+- **Distilling every agent trace, good or bad.** Symptom: the tuned agent reproduces the prompted model's
+  loops and wrong tool choices more confidently. Fix: keep only completed, verified runs.
+- **Training on traces with an outdated tool schema.** Symptom: malformed or rejected tool calls after
+  deployment. Fix: re-render traces with current schemas or drop old-schema traces.
 
 ## When to use
 - **Use when** a prompted baseline has plateaued on a behaviour fine-tuning is good at, the customer
@@ -320,6 +370,14 @@ a small per-customer adapter rather than a shared multi-customer model.
 - **Why:** it answers "was record X used?", lets you rerun after a deprecation or deletion, and proves to
   auditors what the model contained.
 
+### You want to distil a customer's prompted support agent into a smaller model. How do you build the dataset?
+- **Pick one step to distil** (often routing or a fixed-format tool call) and measure it separately on the
+  agent's regression suite, rather than replacing the whole loop at once.
+- **Use only qualifying traces:** completed, verified, permitted for training, redacted including tool
+  results, rendered with current tool schemas in the base model's template.
+- **Split by conversation** and compute the loss on assistant turns, then gate against the prompted agent
+  on schema validity as well as accuracy.
+
 ## Quiz
 ### Q: Why should a fine-tuning dataset of support tickets be split by case rather than by individual ticket?
 - [ ] Case-level splits produce more training examples
@@ -344,3 +402,29 @@ a small per-customer adapter rather than a shared multi-customer model.
 - [x] Teaching output format, tone or label scheme, while retrieval supplies the changing catalogue facts
 > Facts in weights go stale and cannot be cited. Fine-tuning shapes stable behaviour; changing knowledge
 > belongs in retrieval, where it can be updated and grounded.
+
+## Use cases & projects
+### Use cases
+- **Distilling an agent's routing step.** A small per-tenant adapter replaces a large model's first
+  routing call at a fraction of the cost per request.
+- **House-format tool calls.** A customer's extraction agent must emit a rigid, custom schema that
+  prompting gets right most but not all of the time.
+- **Customer-hosted agents.** A regulated customer requires a self-hosted open model; an adapter trained
+  inside their boundary recovers quality lost by the switch.
+- **Deletion and contract-end requests.** Manifests show which traces trained which adapter, so a purge
+  becomes a pipeline rerun.
+
+### Mini project
+**Distil one agent step into a LoRA adapter, with lineage (2-3 hours).**
+- **Goal:** turn logged agent traces into a leakage-safe, manifest-backed dataset for one routing step.
+- **Steps:** generate or collect about 2,000 synthetic first-step traces with a conversation id, a tenant
+  and a chosen tool; filter to completed runs; redact phone numbers in tool results; split with
+  `split_and_manifest` using the conversation id as the group key; plant canaries with `make_canaries`;
+  render examples in a chat template; train a small adapter if you have a GPU, or stop at the dataset.
+- **Done when:** the manifest lists every train and test id with a hash, no conversation appears on
+  both sides, a near-duplicate check reports its removals, and (if trained) the probe finds no canaries.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): the utility's mandated move to a model in
+its own cloud tenancy is where an adapter trained inside that boundary would be evaluated against the
+prompted baseline before shadowing.

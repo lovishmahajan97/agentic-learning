@@ -5,7 +5,8 @@ name: Vector database architecture
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - rag-retrieval/vector-databases
   - rag-retrieval/ann-indexes
@@ -23,9 +24,20 @@ sources:
 ---
 
 ## TL;DR
-A vector database is an ANN index, a payload store and a query planner bolted together. The hard parts are
-not distance math but mutability, filtered search, memory residency and distribution; understand those
-four and any vendor comparison becomes a checklist.
+The vector database behind an agent's search and memory tools is an ANN index, a payload store and a query
+planner. Agents hit its hard parts directly: filtered search, deletes, memory residency and multi-tenancy
+across many users.
+
+## For agent builders
+- **Why it matters for agents.** An agent passes filters as tool arguments (product, date, user), and each
+  user's long-term memory is a tiny tenant. Selective filters that return fewer than k results make agents
+  retry, loop or answer from nothing, and a forgotten tenant filter leaks one user's memory to another.
+- **Where it shows up in your stack.** The `search_docs` and `recall_memory` tools, backed by Qdrant,
+  Weaviate, Milvus, pgvector or OpenSearch, with payload indexes on every field a tool can filter on.
+- **What you control.** Which filters the agent may set and which come from auth, payload indexes, the
+  multi-tenancy pattern, quantization and `ef`, and compaction after deletes.
+- **What you can skip.** HNSW construction details and DiskANN internals. Know that the graph must be in
+  RAM, deletes are tombstones, and filtered search needs a planner.
 
 ## Why it exists
 - **Exact search does not scale.** It is a dot product per stored vector. A million 1,536-dimensional float32
@@ -123,9 +135,20 @@ question, and the first thing to test when evaluating an engine.
   horizontal scaling.
 - The architecture above is the lens for deciding which of those you will actually hit.
 
+### What agents add to the workload
+- **Model-chosen filters.** The agent decides filter values at run time, so selectivity varies per call; a
+  narrow `product` plus `date` filter can match 0.1 % of points, exactly the case post-filtering fails.
+- **Memory as tenancy.** Per-user memory means as many tenants as users, each tiny, which is the "many small
+  tenants" pattern above, with the user id taken from the session, never from the model.
+- **Write-then-read in one run.** An agent that saves a memory and recalls it two steps later depends on
+  write visibility; eventual visibility shows up as "the agent forgot what I just told it".
+- **Deletes on request.** "Forget this" is a delete that must stop retrieval immediately, even though memory
+  is reclaimed only at compaction.
+
 ## Diagram
 Writes land in a log and a brute-force segment before background indexing; queries plan the filter by
-estimated selectivity, search every segment, skip tombstones and merge.
+estimated selectivity, search every segment, skip tombstones and merge. An agent's tool call is the
+"query vector + filter" box, with the tenant part of the filter supplied by auth.
 
 ```mermaid
 flowchart TD
@@ -231,6 +254,38 @@ def search(tenant_from_auth, query_vector, k=10):            # tenant comes from
 - **Neither behaviour shows on a toy collection,** because servers brute-force segments below their indexing
   threshold. Benchmark at realistic sizes.
 
+### Agent scenario: a memory tool on many tiny tenants
+The agent may choose a `topic` filter; the user id always comes from the session. The tool reports when it
+found fewer than k results so the agent widens the query instead of looping on the same call. It reuses
+`client` and `models` from the setup above, with `user_id` as the tenant-marked field.
+
+```python
+RECALL_TOOL = {
+    "name": "recall_memory",
+    "description": "Search this user's saved memories. Optionally narrow by topic.",
+    "input_schema": {"type": "object", "properties": {
+        "query": {"type": "string"}, "topic": {"type": "string"}}, "required": ["query"]},
+}
+
+def recall_memory(session, args, embed, k=5):
+    must = [models.FieldCondition(key="user_id", match=models.MatchValue(value=session.user_id))]
+    if args.get("topic"):                                     # model-chosen, so selectivity varies
+        must.append(models.FieldCondition(key="topic", match=models.MatchValue(value=args["topic"])))
+    points = client.query_points("memories", query=embed(args["query"]), limit=k,
+                                 query_filter=models.Filter(must=must)).points
+    return {"memories": [p.payload["text"] for p in points],
+            "found": len(points),
+            "hint": None if len(points) == k else "Fewer results than requested; retry without topic."}
+```
+
+| Agent memory at scale (illustrative) | Value |
+|---|---|
+| Users | 100,000 |
+| Memories per user | about 200 |
+| Points in the collection | 20 million |
+| One user's share | 0.001 %: post-filtering a top-1,000 returns about 0.01 results |
+| Bytes to scan one user exactly (1,024-dim float32, 4 KB each) | about 800 KB: trivial, so per-tenant indexing or exact scan |
+
 ## Production patterns
 - **Shadow exact search for recall.** Sample a few hundred real queries with their real filters each week, run
   them with exact search (Qdrant's `exact=True` search parameter, or a sequential scan in Postgres) and with
@@ -246,6 +301,10 @@ def search(tenant_from_auth, query_vector, k=10):            # tenant comes from
 - **Isolate whales, partition minnows.** Put the few very large tenants on dedicated shards or collections and
   keep many small tenants in one collection with per-tenant indexing. Monitor p99 latency per tenant size
   bucket, not just overall.
+- **Auth-scoped filters in the tool layer.** Agent teams build the tenant and ACL part of every filter inside
+  the tool handler from the session, and let the model set only content filters such as topic or date.
+  Monitor tool calls returning fewer than k results by filter combination, and repeated identical search
+  calls per run, which signal an agent stuck on an empty filter.
 
 ## Trade-offs
 - **HNSW vs IVF or disk-based indexes.** HNSW gives high recall at low latency but costs RAM for links plus
@@ -285,6 +344,8 @@ def search(tenant_from_auth, query_vector, k=10):            # tenant comes from
   settings. Repeat after a month of writes and deletes, because a fresh index is the best case.
 - **Start with pgvector** when the chunk tables already live in Postgres and the corpus is in the low
   millions; move to a dedicated engine when one of the mechanisms above is what you need.
+- **For agent memory,** test the write-then-read path and the smallest-user case first, because those are
+  where per-user memory differs from document search.
 - **Interviews:** explaining why a selective filter breaks naive ANN, and how segments and tombstones make
   deletes eventual, is the level expected of an architect.
 
@@ -345,11 +406,21 @@ exact search, measured separately at the smallest, median and largest tenant siz
   graph.
 - **The planner's threshold** sits between those, and the mid-sized tenants are what you benchmark.
 
+### Your agent keeps calling `search_docs` with the same narrow filter and getting nothing back. What is happening and what do you change?
+- **Mechanism:** the model-chosen filter is selective, and the engine (or an old pgvector without iterative
+  scans) post-filters, so few or zero results survive; the agent retries the same call.
+- **Engine side:** payload indexes on every tool-filterable field, iterative scans or filter-aware search, and
+  recall@k tested at that selectivity.
+- **Tool side:** return a `found` count and a hint to relax the filter, and cap identical repeated calls in
+  the agent loop.
+
 ### How do you design multi-tenancy for thousands of tenants of very different sizes?
 - **Many small tenants:** one collection with per-tenant index structure, so each is searched exactly or as a
   small graph.
 - **A few very large tenants:** dedicated shards or collections for isolation and predictable latency.
 - **Security:** a retrieval service derives the tenant from authentication and always applies the filter.
+- **Agent memory is the extreme case:** one tenant per user, each a few hundred points, so per-tenant
+  indexing or exact scan of the user's points, with the user id never taken from the model.
 
 ## Quiz
 ### Q: Why does an HNSW index need to be resident in RAM to perform well?
@@ -379,3 +450,25 @@ exact search, measured separately at the smallest, median and largest tenant siz
 > and doubling k′ to 200 still yields about one, so post-filtering returns almost nothing. Pre-filtering
 > yields a small candidate set that is cheap to scan exactly, which is why engines switch strategy based on
 > estimated selectivity.
+
+## Use cases & projects
+### Use cases
+- **Per-user agent memory.** One collection with per-user index structure serves hundreds of thousands of
+  tiny memory tenants, with the user id applied from the session.
+- **Filtered knowledge search for agents.** Payload indexes and a selectivity-aware planner keep
+  model-chosen filters (product, region, date) from returning empty results.
+- **Multi-tenant agent platforms.** Whale tenants on dedicated shards and minnows partitioned in one
+  collection keep p99 tool-call latency predictable.
+- **"Forget this" requests.** Deletes stop retrieval at once via tombstones, and compaction monitoring makes
+  sure memory and latency recover.
+
+### Mini project
+**Break and fix filtered search behind an agent tool (2-3 hours).**
+- **Goal:** reproduce the empty-results failure for a small tenant and fix it in the engine and in the tool.
+- **Steps:** run Qdrant locally; load 200,000 random vectors with a skewed `tenant` field (90 %, 9.5 %, 0.5 %);
+  measure recall@10 against exact search per tenant with and without a payload index and per-tenant
+  indexing; wrap search as an agent tool that applies the tenant from a session and returns `found` and a
+  hint; run a small agent that issues narrow-filter queries.
+- **Done when:** a table shows recall@10 and p99 latency per tenant before and after, the small tenant gets
+  10 results, and the agent's trace shows it relaxing the filter after a short result instead of repeating
+  the call.

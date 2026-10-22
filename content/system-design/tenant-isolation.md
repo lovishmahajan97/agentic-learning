@@ -5,7 +5,7 @@ name: Tenant isolation
 kind: pattern
 difficulty: advanced
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - system-design/multi-tenancy

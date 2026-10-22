@@ -5,7 +5,8 @@ name: SLAs / SLOs (and SLIs, error budgets)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - reliability/high-availability
   - reliability/fmea
@@ -22,9 +23,23 @@ sources:
 ---
 
 ## TL;DR
-An SLI measures what users care about; an SLO is its internal target over a window; an SLA is the looser
-external contract. The gap below 100 percent is the error budget. For AI, SLIs must capture "useful", not
-"returned 200".
+An SLI measures what users of your agent care about; an SLO is its internal target over a window; an SLA is
+the looser external contract. The gap below 100 percent is the error budget. Agent SLIs must capture "task
+done correctly", not "returned 200".
+
+## For agent builders
+- **Why it matters for agents.** An agent can return 200 on every call and still fail the task: wrong tool,
+  wrong record, a loop that hit the step budget, an answer three minutes late. SLOs on task completion,
+  latency, quality and cost are how you know the agent is healthy and when to stop shipping prompt and
+  model changes.
+- **Where it shows up in your stack.** Good and valid counters at your gateway, task-level outcomes from
+  agent traces, sampled eval pipelines for quality, burn-rate alerts in Prometheus-style tooling, and the
+  provider's SLA that caps what you can promise.
+- **What you control.** The one-sentence definition of a "good" agent task, the window and target, the
+  burn-rate alert tiers, and the error budget policy that freezes prompt and model changes when the budget
+  is spent.
+- **What you can skip.** Contract law. Know that the SLA sits below your SLO and that vendor SLAs cover
+  availability, not latency or quality.
 
 ## Why it exists
 - **Without targets, reliability is argued by anecdote.** Product wants features, operations wants
@@ -125,6 +140,16 @@ budget = (1 − SLO) × window
 - **Vendor SLAs usually cover availability only,** with service credits. They do not promise latency or
   quality, so your latency and quality SLOs must assume you absorb those risks yourself.
 
+### Defining a "good" agent task
+- **Count tasks, not calls.** One agent task makes many model and tool calls, and retries inside it are
+  invisible to the user; the event the user feels is the task.
+- **One sentence a query can implement,** for example: the run ended with a final answer, within the step
+  budget, under 2 minutes, with no failed side effect, and (on the sampled slice) passed the task grader.
+- **Valid tasks exclude** user cancellations and requests the agent correctly refused by policy; excluding
+  "the model got confused" would hide exactly the failures you need to see.
+- **Read it from traces.** Every run should end with a structured outcome (completed, budget exhausted,
+  tool failure, escalated) so the SLI is a count over run records, not a guess from logs.
+
 ## Diagram
 Counters feed the SLI, the SLO turns it into a remaining budget, burn rate decides who gets alerted, and
 the policy decides what the team does next.
@@ -171,6 +196,25 @@ seconds, and schema-valid output.
    upgrades are frozen until the rolling budget recovers.
 7. **The SLA was never at risk.** The external SLA of 99.5 percent, allowing 100,000 bad responses, was
    never close to breach; the internal SLO forced action two weeks before a customer could have noticed.
+
+### Worked month: a task-completion SLO for a support agent
+Illustrative numbers. SLO: 98 percent of valid tasks good over a rolling 30 days, where good means the run
+ended with a final answer, within its 25-step budget, under 2 minutes and with no failed side effect.
+
+| Quantity | Value |
+|---|---|
+| Tasks per month | 50,000, about 1,667 per day |
+| Budget | 2 percent, 1,000 bad tasks |
+| Days 1 to 10 at 1 percent bad | ~17 bad per day, burn rate 0.5, ~167 used |
+| Day 11: a tool schema change makes the model fill one argument wrong | bad rises to 3 percent, burn rate 1.5, ~50 bad per day |
+| Remaining budget | ~833 ÷ 50 ≈ 17 days, so a breach around day 27 |
+
+- **No call failed.** Every model and tool call returned 200; the failures were runs ending on the step
+  budget after repeated validation errors, which a call-level SLI would never count.
+- **The slow-burn ticket catches it** once the 3-day window is dominated by the 1.5× burn; the trace outcome
+  "budget exhausted" points straight at the tool.
+- **The policy applies:** the schema change is rolled back and prompt and tool changes need an eval gate
+  until the budget recovers.
 
 ### Budget table and multi-window burn-rate alerts, runnable
 Reproduces the budget table and evaluates the three alert tiers for the two incidents above (a rule fires
@@ -227,6 +271,9 @@ print("provider outage:  ", evaluate(outage))        # both pages and the ticket
 - **Pin model versions and gate changes on budget.** Call dated model snapshots rather than floating aliases,
   and make prompt or model changes check the remaining budget in CI or the deploy tool. Monitor eval pass
   rate per model version.
+- **Task-outcome SLI from agent traces.** Make every agent run emit one structured outcome record (status,
+  steps, duration, cost, side-effect check) and compute the task SLI from those records. Monitor the share
+  of runs ending on "budget exhausted" or "tool failure" per release and per tool.
 - **Budget review in sprint planning.** Show budget remaining per SLO at planning and in a monthly SLO
   review; apply the agreed policy (freeze or accelerate) mechanically. Monitor how many months the budget
   was exhausted and whether shipping behavior changed.
@@ -271,6 +318,8 @@ print("provider outage:  ", evaluate(outage))        # both pages and the ticket
   ten-fold latency degradation that blew your latency SLO, because their SLA only promises availability.
 - **Setting a quality SLO without pinning model versions.** Symptom: the eval pass rate drops with no deploy
   in the changelog, and the cause is a silent vendor model update.
+- **Counting agent calls instead of tasks.** Symptom: a 99.9 percent call SLI while users report that one
+  task in twenty never finishes. Fix: an SLI over run outcomes, with retries inside the run invisible.
 
 ## When to use
 - **Every user-facing service** needs at least one availability SLO and one latency SLO; an AI service adds a
@@ -326,6 +375,13 @@ the measurement.
   calibrated against human labels.
 - **Cost per successful task,** paired with quality, and availability measured after retries and fallbacks.
 
+### How would you define the SLOs for a tool-calling agent that resolves support tickets?
+- **Task SLI, not call SLI:** the fraction of valid runs that end with a final answer, within the step budget
+  and a time limit, with no failed side effect, read from structured run outcomes.
+- **Add quality and cost:** a sampled task-grader pass rate calibrated against human labels, and cost per
+  successful task, so neither can be traded away silently.
+- **Policy:** burn-rate alerts on each, and prompt, tool-schema and model changes gated on remaining budget.
+
 ### Where does the 14.4 burn-rate threshold come from, and why use burn rate at all?
 - **14.4 means 2 percent of a 30-day budget in one hour:** 30 days is 720 hours, and 0.02 × 720 = 14.4.
 - **Burn rate scales alerts to budget impact,** so a two-minute blip does not page while a persistent 3×
@@ -370,3 +426,24 @@ the measurement.
 > A two-minute blip consumes a sliver of budget and should not wake anyone; a persistent 0.3 percent
 > error rate on a 99.9 percent SLO burns at 3× and will breach within the window. Multi-window burn-rate
 > alerts distinguish the two; a single threshold cannot.
+
+## Use cases & projects
+### Use cases
+- **Launching a customer-facing agent.** A task-completion SLO, a latency SLO and a sampled quality SLO give
+  the team one shared definition of "the agent is healthy".
+- **Gating prompt and model changes.** Remaining error budget decides whether a new prompt, tool schema or
+  model version ships this week or waits.
+- **Negotiating an enterprise agent SLA.** Dependency ceilings and budget arithmetic show what availability
+  you can honestly sign and what redundancy a higher number needs.
+- **Catching slow regressions.** Slow-burn alerts on task outcomes surface a tool or prompt change that
+  quietly raised failures by a few points.
+
+### Mini project
+**Put an SLO on your agent (2-3 hours).**
+- **Goal:** define, measure and alert on a task-level SLO for a small tool-calling agent.
+- **Steps:** make each run emit a structured outcome (status, steps, duration, cost); write the one-sentence
+  "good task" definition; run 200 tasks from your eval set and compute the SLI; set a target slightly below
+  it; inject a regression (break one tool's schema) and replay outcomes through the burn-rate rules from the
+  runnable example above.
+- **Done when:** you have the SLI, SLO and budget written down, a burn-rate evaluation that fires the right
+  tier for the injected regression, and a one-paragraph error budget policy for prompt and model changes.

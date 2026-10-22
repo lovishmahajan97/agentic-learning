@@ -5,7 +5,8 @@ name: Adoption & value-realization measurement
 kind: metric
 difficulty: advanced
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - adoption/usage-analytics
   - scoping/baseline-measurement-before-deployment
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-Adoption measures whether the intended people use the system for the intended work; value realization
-measures whether that use changed a business outcome versus a baseline or comparison group. Keep them
+Adoption measures whether people actually hand the intended work to your agent; value realization
+measures whether that changed a business outcome versus a comparison group, net of run cost. Keep them
 apart: adoption leads weekly, realized value renews the contract.
+
+## For agent builders
+- **Why it matters for agents.** Agents are sold on projections like "the agent resolves 40% of tickets
+  end to end". Traces can show the agent finished runs; only an attributed outcome comparison shows that
+  handling time, backlog or cost actually moved.
+- **Where it shows up in your stack.** Run outcomes and takeovers from usage analytics feed the adoption
+  share; the customer's ticketing or claims system supplies the outcome; your provider bills and tool costs
+  supply the run-cost term.
+- **What you control.** The rollout calendar (staggered go-lives make attribution possible), the value
+  equation, guardrails such as reopen rate on agent-completed work, and how run cost and takeover cost are
+  counted.
+- **What you can skip.** Econometrics beyond difference-in-differences, placebo weeks and team-level
+  resampling; those three cover most agent deployments.
 
 ## Why it exists
 - **Every deployment is sold on a projection.** An ROI model says something like "25% faster claims
@@ -55,6 +69,14 @@ realized value ≈ eligible volume × adoption share × effect per assisted unit
 
 - **Decompose *because* a total shortfall is useless on its own.** You need to know which factor fell
   short to know what to fix.
+
+### Reading the equation for an agent
+- **Adoption share** is the share of eligible tasks the agent attempts *and* completes without a human
+  takeover; a run that ends in takeover is not assisted work, it is often extra work.
+- **Effect per assisted unit** is net: time saved on agent-completed tasks minus the time humans spend
+  reviewing, approving and redoing taken-over runs.
+- **Run cost** scales with steps and tool calls per task, so a looping agent erodes value even when its
+  completion rate holds.
 
 ### 2. Define adoption as a ladder, not a number
 - **Breadth:** share of eligible users active weekly.
@@ -114,18 +136,48 @@ fix it; guardrails decide whether a gain counts at all.
 
 ```mermaid
 flowchart TD
-    P["Projected value from ROI model"] --> R["Realized value, with a range"]
+    P["Projected value from agent ROI model"] --> R["Realized value net of run cost"]
     R --> G{"Guardrails held?"}
-    G -->|"no"| X["Not value: fix quality first"]
+    G -->|"no"| X["Not value: fix agent quality first"]
     G -->|"yes"| F{"Which factor fell short?"}
     F -->|"adoption share"| EN["Enablement and workflow fit"]
-    F -->|"effect per assisted unit"| ENG["Engineering: quality or task fit"]
+    F -->|"effect per assisted unit"| ENG["Engineering: agent quality, tools, takeovers"]
     F -->|"conversion"| OPS["Customer operations leadership"]
     A["Attribution: holdout, staggered DiD"] --> R
     PL["Placebo weeks"] -.->|"realistic range"| R
 ```
 
 ## Examples
+### Agent scenario: net value of a ticket-resolution agent
+A support agent attempts half of 10,000 eligible tickets a week. The per-ticket effects (10 minutes saved
+when it completes, 3 minutes lost when a human takes over) must come from a comparison design like the
+one below, not from trace self-reports. All numbers are illustrative.
+
+```python
+tickets = 10_000                       # eligible tickets a week
+attempt_share = 0.50                   # share of tickets routed to the agent
+saved_min, takeover_penalty_min = 10, 3
+run_cost_usd, hourly_usd = 0.40, 40    # model + tool cost per run, loaded human cost per hour
+
+def weekly_value(completion):
+    runs = tickets * attempt_share
+    resolved = runs * completion
+    taken_over = runs - resolved
+    net_min = resolved * saved_min - taken_over * takeover_penalty_min
+    return runs, net_min / 60, net_min / 60 * hourly_usd - runs * run_cost_usd
+
+for completion in (0.5, 0.7, 0.9):
+    runs, hours, value = weekly_value(completion)
+    print(f"completion={completion:.0%} runs={runs:.0f} net_hours={hours:.0f} value=${value:,.0f}/week")
+# completion=50% runs=5000 net_hours=292 value=$9,667/week
+# completion=70% runs=5000 net_hours=508 value=$18,333/week
+# completion=90% runs=5000 net_hours=725 value=$27,000/week
+```
+
+- **Completion rate is the steepest lever:** moving from 50% to 70% nearly doubles net value, because each
+  takeover both loses the saving and adds review time.
+- **Run cost is small here** ($2,000 a week) but grows with steps per task, so track it per completed task.
+
 ### Worked scenario: claims-intake assistant, staggered by region
 A claims-intake assistant for 200 eligible adjusters, each handling about 45 claims a week (9,000 claims a
 week in total). All numbers are illustrative.
@@ -184,8 +236,9 @@ print(f"projected {projected_h:.0f} h/week, DiD {effect} min/claim")
 
 ## Production patterns
 - **Signed measurement plan before go-live** — during scoping, write the baseline window, the value
-  equation, the attribution design and the guardrail thresholds into one page the sponsor and finance
-  agree. Monitor whether the baseline metric definition changes in the customer's systems mid-project.
+  equation (including agent run cost and takeover cost), the attribution design and the guardrail
+  thresholds into one page the sponsor and finance agree. Monitor whether the baseline metric definition
+  changes in the customer's systems mid-project.
 - **Rollout calendar as experiment design** — when a holdout is politically impossible, schedule regions or
   teams to go live weeks apart so not-yet-live groups are controls. Monitor a pre-period trend chart per
   group to confirm parallel trends before reading any DiD result.
@@ -197,7 +250,8 @@ print(f"projected {projected_h:.0f} h/week, DiD {effect} min/claim")
 - **Guardrail band written into the definition** — for example reopen rate within ±0.5 points of baseline;
   a breach voids the value claim for that period. Monitor guardrail metrics on the same cadence as value.
 - **90-day re-check before renewal** — recompute the per-assisted-unit effect after the launch team's
-  attention fades, because week-6 numbers can include novelty.
+  attention fades, because week-6 numbers can include novelty. For agents, also recompute run cost per
+  completed task and takeover rate, since model or tool changes since launch can move both.
 
 ## Trade-offs
 - **Randomised holdout vs goodwill.** It gives the most credible effect estimate but withholds a useful
@@ -209,6 +263,9 @@ print(f"projected {projected_h:.0f} h/week, DiD {effect} min/claim")
   renewal.
 - **Business outcomes vs speed of signal.** Outcomes take weeks to accumulate, so you also track leading
   indicators (adoption, acceptance) that move faster but prove nothing about value on their own.
+- **More agent autonomy vs measurable effect.** Letting the agent act without approval raises the saving
+  per task, but makes errors land in outcomes before anyone sees them; keep approval gates until
+  guardrails have held across a full checkpoint.
 
 ## Pitfalls
 - **Reporting usage as value.** The dashboard shows high weekly actives, but finance finds no change in
@@ -223,6 +280,9 @@ print(f"projected {projected_h:.0f} h/week, DiD {effect} min/claim")
   next region's result lands far outside it.
 - **Skipping guardrails.** Handling time improves while rework or complaints rise, discovered later
   through escalations instead of the measurement plan.
+- **Counting agent-completed runs as value.** The slide shows thousands of tasks "done by the agent", but
+  takeovers, human review time and run cost were never subtracted, so finance sees a smaller or negative
+  number. Fix: use the net effect and the run-cost term.
 
 ## When to use
 - **Set it up during scoping,** when you agree the baseline and the ROI model, and start reporting at the
@@ -261,7 +321,7 @@ method, give a range and confirm the guardrails held. Then I propose the specifi
 - **Merging them hides the diagnosis:** high usage can coexist with no outcome change, and a shortfall
   cannot be routed to an owner unless the factors are measured separately.
 
-### The sponsor refuses a holdout for a rollout across four regions. How do you design the measurement?
+### The sponsor refuses a holdout for a claims agent rolling out across four regions. How do you design the measurement?
 - **Stagger the go-live dates** so regions not yet live act as controls, and compute difference-in-
   differences against only not-yet-live groups.
 - **Check parallel pre-period trends** per region before go-live, and run placebo DiDs on pre-launch weeks
@@ -288,6 +348,14 @@ method, give a range and confirm the guardrails held. Then I propose the specifi
 - **Self-reported hours are not enough,** because unredeployed time never reaches a P&L.
 - **In the claims example,** a falling backlog showed the freed hours were absorbed rather than lost to slack.
 
+### Your agent completes 70% of the tickets it attempts. Why might its realized value still be disappointing?
+- **Takeovers cost time:** the 30% taken over can each add review and redo minutes, so net effect per task
+  is below the gross saving.
+- **Run cost and attempt share:** cost per run grows with steps and tool calls, and if the agent only
+  attempts half the eligible tickets, the adoption share caps the total.
+- **Attribution:** without a staggered rollout or holdout, the per-ticket saving itself is unproven, so
+  measure it with DiD before tuning prompts.
+
 ## Quiz
 ### Q: A staggered rollout shows the live region's handling time fell 8 minutes and the not-yet-live region's fell 3 minutes over the same weeks. What is the difference-in-differences estimate, and what does it assume?
 - [ ] 8 minutes, assuming the not-yet-live region is irrelevant
@@ -312,3 +380,24 @@ method, give a range and confirm the guardrails held. Then I propose the specifi
 - [ ] Adding guardrail metrics to the dashboard
 > The decomposition puts the entire gap in adoption, because each assisted unit delivers as projected.
 > Improving the model would raise an effect that is already on target and leave the real shortfall untouched.
+
+## Use cases & projects
+### Use cases
+- **Renewing an agent deployment.** A factor table (adoption share, net effect, conversion, run cost)
+  with placebo ranges answers "did the agent pay for itself?" in terms finance accepts.
+- **Choosing the next investment.** When the gap is attempt share or takeovers, the fix is routing,
+  enablement or agent quality; when it is conversion, it belongs to the customer's operations.
+- **Deciding on more autonomy.** Guardrails on agent-completed work (reopen rate, error rate) decide
+  whether approval gates can be relaxed.
+- **Rolling an agent out across teams.** A staggered go-live calendar turns the rollout itself into the
+  comparison group.
+
+### Mini project
+**Build a value report for a simulated agent rollout (2-3 hours).**
+- **Goal:** produce a defensible, ranged estimate of an agent's weekly net value.
+- **Steps:** simulate weekly handling times for two teams over 10 weeks, with the agent going live in
+  team A at week 5 and a shared drift in both; add agent run logs (completed, taken over, tool calls,
+  cost); compute DiD, a placebo spread from pre-launch weeks, adoption share and net value with the
+  run-cost and takeover terms.
+- **Done when:** a one-page table shows projected versus realized value by factor with a range, the
+  guardrail status, and the single factor you would invest in next.

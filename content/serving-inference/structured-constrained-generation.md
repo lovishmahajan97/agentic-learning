@@ -5,7 +5,7 @@ name: Structured / constrained generation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - prompting/structured-outputs-json-mode
@@ -182,7 +182,7 @@ compound per run (run failure = 1 − (1 − p)^10).
 | Setup | Per-call failure | Runs with at least one failure | Extra calls per 1,000 runs |
 |---|---|---|---|
 | Prompt-only JSON, 2% parse failures | 2% | about 18% | about 200 retries, more if retries fail |
-| Prompt-only JSON, 2% parse plus semantic retries | higher | higher still | each retry a full extra call |
+| Prompt-only JSON plus semantic validators (2% parse, 1% wrong values) | about 3% | about 26% | about 300, a full extra call each |
 | Constrained decoding, shape guaranteed | 0% parse | 0% from shape | 0 for shape |
 | Constrained plus semantic validators (say 1% wrong values) | 1% semantic | about 10% | about 100, spent only on meaning |
 
@@ -221,7 +221,8 @@ def route(user_msg: str, retries: int = 1) -> str:
             return "escalated"
         if r.query.strip():                                              # semantic check, not shape
             return TOOLS[r.tool](r.query)
-        msgs.append({"role": "user", "content": "query was empty; give a concrete query"})
+        msgs += [{"role": "assistant", "content": resp.choices[0].message.content},
+                 {"role": "user", "content": "query was empty; give a concrete query"}]
     return "escalated"
 
 print(route("I was charged twice for order 1182, please fix it."))

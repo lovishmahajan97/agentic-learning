@@ -5,7 +5,7 @@ name: Event-driven architecture
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - system-design/synchronous-vs-asynchronous-execution
@@ -24,9 +24,9 @@ sources:
 ---
 
 ## TL;DR
-Agents both emit and react to immutable facts ("DocumentUploaded", "RunCompleted") on a broker. That lets
-you trigger agents, feed RAG indexes and fan out run telemetry without coupling services; the price is
-eventual consistency, at-least-once delivery and no single stack trace.
+Services and agents record immutable facts ("DocumentUploaded", "RunCompleted") on a broker; any number
+of consumers react on their own schedule. Agents get triggered and RAG indexes refreshed without coupling,
+at the price of eventual consistency, at-least-once delivery and no single stack trace.
 
 ## For agent builders
 - **Why it matters for agents.** The pipeline that keeps your RAG index fresh is event-driven, and so is
@@ -143,7 +143,7 @@ An agent plays both roles, and each role has its own rule:
 | Role | Example | Rule |
 |---|---|---|
 | Consumer (trigger) | `TicketCreated` starts a triage agent | dedupe on `event_id` before starting a run, because a redelivery would start a second paid run |
-| Side-effecting tool | the agent issues a refund or posts a reply | pass an idempotency key derived from `event_id` plus step, so a retried run does not repeat the effect |
+| Side-effecting tool | the agent issues a refund or posts a reply | pass an idempotency key derived from `event_id` plus the tool and its target (the order id), so a retried run does not repeat the effect |
 | Producer (telemetry) | `RunCompleted` with tokens, cost, outcome | emit facts, not commands; billing, eval sampling and audit subscribe on their own |
 | Producer (handoff) | `DraftReady` for a human reviewer | key by conversation id so a later `DraftRevised` cannot overtake it |
 
@@ -270,9 +270,10 @@ def on_ticket_created(raw, db, run_agent, refund_api, publish):
         tx.insert("inbox", event_id=ev["event_id"])
         run_id = tx.insert("agent_runs", ticket_id=ev["aggregate_id"], status="running")
 
-    def refund_tool(order_id, amount_cents, step):
-        # 2. idempotency key from the event, not from a random uuid per attempt
-        key = f'{ev["event_id"]}:refund:{step}'
+    def refund_tool(order_id, amount_cents):
+        # 2. key from the event and the target, not a random uuid or a model-chosen step number,
+        #    so a restarted run that reaches the refund at a different step reuses the same key
+        key = f'{ev["event_id"]}:refund:{order_id}'
         return refund_api.create(order_id=order_id, amount=amount_cents, idempotency_key=key)
 
     result = run_agent(ticket=ev["payload"], tools={"refund": refund_tool})
@@ -307,8 +308,9 @@ only the six downstream services; counting the producer too gives the 99.3% here
 ## Production patterns
 - **Outbox relay instead of dual writes.** When a service changes its database and must emit an event,
   write the event row in the same transaction and relay it with a poller or change-data capture (for
-  example Debezium reading the outbox table). Monitor outbox backlog age; alert when the oldest
-  unpublished row exceeds your freshness budget.
+  example Debezium reading the outbox table). The relay can publish twice after a crash, so consumers
+  still dedupe on `event_id`. Monitor outbox backlog age; alert when the oldest unpublished row exceeds
+  your freshness budget.
 - **Idempotent producer settings on Kafka.** Set `acks=all` and `enable.idempotence=true` (the default
   since Kafka 3.0, but set it explicitly) so the producer's own send retries do not duplicate or reorder
   within a partition. This does not make consumers exactly-once;
@@ -450,8 +452,9 @@ than making indexing synchronous.
   second run of the agent for the same event.
 - **Dedupe the trigger.** Record `event_id` in an inbox table in the same transaction that creates the
   run row, and skip if it already exists.
-- **Dedupe the effects.** Give the reply and refund tools idempotency keys built from `event_id` and the
-  step, so even a restarted run cannot repeat them; monitor runs per event and duplicate-key hits.
+- **Dedupe the effects.** Give the reply and refund tools idempotency keys built from `event_id`, the tool
+  and its target (ticket or order id), not from a step counter that a re-planned run may number
+  differently, so even a restarted run cannot repeat them; monitor runs per event and duplicate-key hits.
 
 ### How would you fan out agent run data to billing, evals and audit without slowing the agent?
 - **Publish facts, not calls.** The agent emits `RunCompleted` with run id, tokens, cost and outcome;

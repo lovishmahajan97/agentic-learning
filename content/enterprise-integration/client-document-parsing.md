@@ -5,7 +5,8 @@ name: Client document parsing (PDF, scans, OCR)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - rag-retrieval/document-parsing
   - multimodal/ocr
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-Client documents mix born-digital PDFs, scans, faxes and protected files. Parse them by triage: detect
-each page's type, route it to the cheapest working method (text extraction, OCR, layout or vision model),
-score confidence, review doubtful pages, and keep page provenance.
+A RAG agent can only cite what parsing extracted. Client documents mix digital PDFs, scans and faxes, so
+triage each page to the cheapest working route (text layer, OCR, layout or vision model), score
+confidence, review doubtful pages, and keep page provenance.
+
+## For agent builders
+- **Why it matters for agents.** A scanned contract parsed to an empty string is invisible to the agent's
+  retrieval tool; a misread table digit becomes a confident wrong answer with a real citation. Most
+  "the agent doesn't know about X" reports on a document corpus are parsing failures.
+- **Where it shows up in your stack.** The ingestion pipeline before chunking and embedding, a
+  `parse_document` tool when users upload files mid-conversation, the citation metadata the agent returns,
+  and the eval set that checks the right page is retrieved.
+- **What you control.** Per-page routing rules, confidence thresholds tuned on the client's pages, which
+  routes may run outside the client boundary, and the provenance fields (file, page, box, route) returned
+  in every retrieval result.
+- **What you can skip.** OCR and layout-model internals; the RAG and multimodal lessons cover them. Know
+  the silent failures and the routing pattern.
 
 ## Why it exists
 - **Enterprise knowledge lives in messy documents.** Contracts, claims files, policies, invoices and
@@ -116,6 +130,17 @@ The details behind the harder rows:
   1% CER that lands on the digits of a limit is worse than 5% spread over boilerplate.
 - **Rerun the set** when you change a parser or a threshold.
 
+### 8. What the agent gets from parsing
+- **Retrieval results carry provenance and quality.** Each chunk returned by the agent's search tool
+  includes file, page, route and confidence, so the agent cites a page and can hedge on low-confidence
+  text instead of stating a misread number as fact.
+- **Critical values get a verify step.** For amounts or limits, the agent can call a tool that returns the
+  page image region or the field-validated value, rather than trusting one OCR read.
+- **Uploads mid-conversation use the same triage.** A `parse_document` tool runs the cheap routes inline
+  and returns "pages 4-6 need review" when they escalate, rather than handing the model empty text.
+- **Coverage gaps are explained.** When a file failed parsing, the tool says so ("encrypted, excluded"),
+  so the agent does not claim the document says nothing.
+
 ### Boundary and sensitivity
 Scanned documents frequently contain signatures, ID numbers and health or financial details. Where
 residency or contract requires it, OCR and any vision model must run inside the client's boundary, which
@@ -123,7 +148,8 @@ constrains which services you can use; settle this before choosing tools.
 
 ## Diagram
 Each page takes the cheapest route that passes its quality gate; low confidence escalates to stronger
-and costlier routes, and every route writes text with page provenance.
+and costlier routes, and every route writes text with page provenance that the agent's retrieval tool
+returns with each chunk.
 
 ```mermaid
 flowchart TD
@@ -212,6 +238,25 @@ print("limit ok:", "2,500,000" in ocr)            # False: the one field that ma
 print(f"hallucinated page CER {cer(ref * 3, ref):.0%}")  # 200%: insertions push CER past 100%
 ```
 
+### Agent tool: search results that carry parse quality
+The retrieval tool returns each chunk with its provenance so the model can cite and hedge. `index.search`
+stands for your vector store query; the field names are this lesson's convention.
+
+```python
+def search_policy_docs(query: str, user: str, k: int = 5) -> list[dict]:
+    hits = index.search(query, k=k, filter={"acl": user})
+    results = []
+    for h in hits:
+        m = h["metadata"]
+        results.append({
+            "text": h["text"],
+            "cite": f'{m["file"]} p.{m["page"]}',
+            "route": m["route"],                      # text_layer | ocr | escalate
+            "low_confidence": m["route"] != "text_layer" and (m.get("conf") or 0) < 80,
+        })
+    return results   # system prompt: quote numbers from low_confidence chunks only with a caveat
+```
+
 ### Worked scenario: route mix as a cost and staffing forecast
 Profiling a 1,500-document sample of an archive (illustrative numbers) gives a page-route mix to plan the
 backfill.
@@ -242,6 +287,10 @@ the 2% review share tells the client how many reviewer hours to book.
 - **In-boundary OCR where residency requires it.** Use when images may not leave the client network. Run a
   self-hosted engine (for example Tesseract) next to the data and reserve hosted services for approved
   classes. Monitor throughput against the backfill window, since self-hosted capacity is the bottleneck.
+- **Provenance and confidence in the agent's tool results.** Use for any RAG agent over parsed documents.
+  Return file, page, route and confidence with each chunk, and instruct the agent to caveat numbers from
+  OCR routes. Monitor the share of cited chunks that came from OCR or escalated routes, and user-reported
+  wrong numbers per route.
 
 ## Trade-offs
 - **Per-page routing vs simplicity.** It spends expensive OCR and vision calls only where needed, but adds
@@ -273,6 +322,9 @@ the 2% review share tells the client how many reviewer hours to book.
   which also breaks keyword search on names and terms.
 - **Discarding page numbers and positions.** Symptom: citations that point to a whole 200-page file, so
   users cannot verify answers and stop trusting them.
+- **Hiding parse failures from the agent.** Symptom: the agent answers "the contract does not mention a
+  termination clause" because the scanned pages were empty. Fix: tool results report excluded or
+  escalated pages so the agent says what it could not read.
 - **Evaluating the parser on public sample PDFs.** Symptom: a parser that looked accurate in testing and
   fails on the client's faxed, stamped and skewed originals.
 
@@ -327,6 +379,12 @@ reprocess from the stored raw files. Then add a coverage check per batch so empt
 - **Fix with structure recovery or escalation** for dense tables, plus a field-level check on amounts,
   since a 1% CER on a limit's digits is worse than 5% on boilerplate.
 
+### Users upload scanned PDFs to your agent mid-conversation. How do you design the parse tool?
+- **Run the same per-page triage inline:** text layer first, OCR for image pages, and return escalated
+  pages as "needs review" rather than empty text, so the agent never treats unread pages as blank.
+- **Return provenance and confidence** with the text and keep the parsed result for later turns, so
+  the agent cites pages and does not re-parse on every step.
+
 ### When would you send every page through a vision-language model?
 - **For a small corpus,** where per-page triage adds more maintenance than it saves and the cost is still
   affordable.
@@ -363,3 +421,25 @@ reprocess from the stored raw files. Then add a coverage check per batch so empt
 - [ ] Whether you can extract text layers from born-digital PDFs
 > Text-layer extraction and chunking can run anywhere approved, but a hosted OCR or vision service sends
 > page images to a third party. Residency constraints push OCR and vision models inside the boundary.
+
+## Use cases & projects
+### Use cases
+- **Claims and contract agents over scanned archives.** Per-page triage makes old scanned contracts
+  retrievable instead of silently empty.
+- **Agents that answer with amounts and limits.** Field-level checks and confidence in tool results stop
+  a misread digit from becoming a confident answer.
+- **Document upload in chat.** A parse tool with the same triage handles a user's scanned PDF inside a
+  conversation.
+- **Regulated deployments.** In-boundary OCR keeps document images inside the client network while the
+  agent still searches the extracted text.
+
+### Mini project
+**Parse a mixed PDF set for a citing agent (2-3 hours).**
+- **Goal:** a small RAG agent that answers from a mix of digital and scanned PDFs and cites page numbers
+  with confidence.
+- **Steps:** collect or make 10 PDFs including two scans and one hybrid file; run the per-page triage with
+  pdfplumber and Tesseract; chunk and index with file, page, route and confidence; build a search tool
+  that returns provenance; write 15 questions, three of them about numbers on scanned pages; measure CER
+  on three labelled pages.
+- **Done when:** every answer cites a page, questions on scanned pages are answered rather than missed,
+  and low-confidence numbers come with a caveat in the agent's reply.

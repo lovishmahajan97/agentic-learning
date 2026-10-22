@@ -257,7 +257,7 @@ An illustrative 1,000-run eval of a support agent with 6 tools, before and after
 
 | Setting | Bad arguments reaching a handler | Runs that crashed |
 |---|---|---|
-| Args cast with `as ToolArgs` | every malformed call (for example a missing `orderId`) | each one threw `TypeError` inside the tool |
+| Args cast with `as ToolArgs` | every malformed call (for example a missing `orderId`) | every call that dereferenced the missing field threw `TypeError` inside the tool; the rest ran on `undefined` |
 | Args `unknown`, parsed per tool | none: parse fails first | 0; the parse message went back to the model, which retried |
 
 ### Worked scenario: an SDK upgrade that made a field nullable
@@ -447,6 +447,6 @@ boundary, never mid-request.
   provider's events as a `StreamEvent` union with a `never` default; register three tools with `defineTool`;
   run the loop against a mocked model that sometimes sends malformed arguments; return parse errors to the
   model as tool results.
-- **Done when:** `tsc --noEmit` passes with zero `any` or `as` outside the brand factory, adding a fourth
+- **Done when:** `tsc --noEmit` passes with zero `any` and zero `as` casts (the `as const` idiom aside), adding a fourth
   event variant fails to compile, and malformed arguments produce a retry rather than a crash in your test
   run.

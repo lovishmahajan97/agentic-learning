@@ -5,7 +5,7 @@ name: Recall vs precision trade-off
 kind: concept
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - ml-fundamentals/precision-recall-f1
@@ -303,7 +303,7 @@ transcript for the rest of the run.
   self-contained the corpus units are.
 - **Agent retries vs stage-1 recall.** An agent can recover a missed passage by searching again, which
   lets you run a cheaper first stage, but each retry is a sequential model call plus a search; once
-  retries per task exceed one or two, buying recall in the tool is cheaper.
+  retries become routine rather than rare, buying recall in the tool is usually cheaper.
 
 ## Pitfalls
 - **Measuring only end-to-end accuracy.** Failures cannot be attributed to recall (never retrieved) or
@@ -443,11 +443,11 @@ in the candidate set.
 
 ### Mini project
 **Tune k and a reranker for an agent's search tool (2-3 hours).**
-- **Goal:** find the candidate depth and final k that give the agent high recall without flooding its
+- **Goal:** find the candidate depth k and final n that give the agent high recall without flooding its
   context.
 - **Steps:** build a small corpus and a golden set of about 30 questions with labelled relevant chunks;
   wrap retrieval as a `search` tool; measure recall@k and precision@k for several k values with and without
   a reranker; then run a simple tool-calling agent on the golden questions at two settings and log answer
   correctness and tool-result tokens.
 - **Done when:** you have a table of recall, precision, tokens per tool result and answer accuracy per
-  setting, and a one-paragraph recommendation for the default k with its reason.
+  setting, and a one-paragraph recommendation for the default k and n with the reason.

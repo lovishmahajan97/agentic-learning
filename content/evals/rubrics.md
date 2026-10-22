@@ -5,7 +5,7 @@ name: Rubrics
 kind: practice
 difficulty: intro
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - evals/llm-as-a-judge
@@ -65,8 +65,8 @@ gate catastrophic actions, and version it.
   answer that is accurate but incomplete splits graders down the middle, and you lose which half failed.
 
 ### Rubrics for agent runs
-An agent trace is graded on three layers, and each criterion is assigned to the cheapest grader that
-can apply it.
+An agent trace is graded on three layers (outcome, process, reply) plus gates that cut across them,
+and each criterion is assigned to the cheapest grader that can apply it.
 
 | Layer | Example criteria (binary) | Usually graded by |
 |---|---|---|

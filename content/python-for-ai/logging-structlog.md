@@ -5,7 +5,7 @@ name: logging / structlog
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - observability/logging
@@ -471,7 +471,7 @@ concurrent requests and asserts each line's ID matches.
 - **Goal:** make every run of a small tool-calling agent queryable from its logs alone.
 - **Steps:** configure structlog once for JSON on stdout and route stdlib logging from httpx and the SDK
   into it; bind `run_id` per run and `step` and `tool` per step with context variables; emit `llm_call`,
-  `tool_call` and `run_finished` events with latency and token counts; add a processor that redacts API
-  keys and truncates prompts and tool arguments; run 20 concurrent runs.
+  `tool_call` and `run_end` events with latency and token counts; add a processor that redacts API keys
+  and replaces raw prompts and tool arguments with hashes; run 20 concurrent runs.
 - **Done when:** a single `jq` filter on one `run_id` prints that run's steps in order, no secret appears in
   the output, and you can compute total tokens per run from the log lines.

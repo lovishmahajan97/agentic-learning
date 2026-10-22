@@ -5,7 +5,7 @@ name: Idempotency keys
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - fastapi-for-ai/timeouts
@@ -199,6 +199,9 @@ async def create(payload: dict, claim=Depends(idem)):
 
 - **The `tenant` header is a stand-in.** In production take the tenant from the authenticated
   principal, or a caller can scope keys into someone else's namespace.
+- **A missing header becomes 422 here, not 400.** `Header(...)` makes FastAPI's validation reject the
+  request. To return the draft's `400`, declare `idempotency_key: str | None = Header(None)` and raise
+  400 yourself when it is `None`.
 - **No owner token here.** This version omits the compare-and-set; the Postgres example below adds it.
 
 ### Agent tool executor with derived keys
@@ -210,10 +213,11 @@ import json
 
 SIDE_EFFECT_TOOLS = {"send_email", "create_ticket", "refund"}
 
-async def execute_tool(store, run_id: str, step: int, call: dict, tools: dict) -> dict:
+async def execute_tool(store, run_id: str, step: int, i: int, call: dict, tools: dict) -> dict:
     if call["name"] not in SIDE_EFFECT_TOOLS:
         return await tools[call["name"]](**call["args"])       # reads are safe to repeat
-    key = f"idem:tool:{run_id}:{step}:{call['name']}"           # stable across retries and resumes
+    # i = position of this call in the step's tool_calls, so two parallel calls don't collide
+    key = f"idem:tool:{run_id}:{step}:{i}:{call['name']}"       # stable across retries and resumes
     fp = json.dumps(call["args"], sort_keys=True)
     if not await store.set(key, json.dumps({"fp": fp, "state": "in_progress"}), nx=True, ex=120):
         rec = json.loads(await store.get(key) or "{}")
@@ -232,7 +236,7 @@ async def execute_tool(store, run_id: str, step: int, call: dict, tools: dict) -
 
 | Event | Without the wrapper | With it |
 |---|---|---|
-| Step 3 `send_email` succeeds, worker dies before checkpoint | — | result stored under `run_id:3` |
+| Step 3 `send_email` succeeds, worker dies before checkpoint | — | result stored under `run_id:3:0` |
 | Run resumes at step 3 | second email sent | stored result replayed, no email |
 | Model sees | two "sent" observations over two runs | one, identical to the first |
 
@@ -292,7 +296,7 @@ If the claim returns no row, read the existing record and apply steps 3-5 of the
   after an app restart). Monitor distinct keys per logical operation; more than one means a retry path
   mints new keys.
 - **Keys derived from run and step for agent tools** — in every agent runtime with side-effecting tools.
-  Build the key from run id, persisted step number and tool name, route those tools through one
+  Build the key from run id, persisted step number, call index and tool name, route those tools through one
   executor wrapper, and store the tool result for replay. Monitor side-effect calls per run step; more
   than one means a retry path bypasses the wrapper.
 - **Lease above the deadline, retention above the retry window** — on every keyed endpoint. Set the lease
@@ -464,7 +468,7 @@ reused key with a different body.
 **Make an agent's side-effecting tool safe to retry (1-2 hours).**
 - **Goal:** prove a retried or resumed agent step cannot perform its side effect twice.
 - **Steps:** build a fake `create_ticket` tool server in FastAPI that honours an `Idempotency-Key` header
-  with an atomic claim in Redis or Postgres; have a small agent executor derive the key from run id and
-  tool call id; inject a timeout after the server commits but before the reply arrives, then retry.
+  with an atomic claim in Redis or Postgres; have a small agent executor derive the key from run id,
+  step and call index; inject a timeout after the server commits but before the reply arrives, then retry.
 - **Done when:** the retry gets the replayed response, the ticket store holds exactly one ticket, and a
   reused key with a different body is rejected as a client error.

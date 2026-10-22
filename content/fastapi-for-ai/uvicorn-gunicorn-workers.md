@@ -5,7 +5,7 @@ name: Uvicorn / Gunicorn workers
 kind: tool
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - fastapi-for-ai/asgi-lifecycle
@@ -397,9 +397,11 @@ memory and DB connection limits allow it. If something blocks, fix it with an as
 **Show the per-worker state trap and fix it (1-2 hours).**
 - **Goal:** prove that an in-memory run registry breaks under several workers, then fix it.
 - **Steps:** build a FastAPI agent stub with `POST /runs` that stores a run in a dict and
-  `GET /runs/{id}` that reads it; run it under Gunicorn with Uvicorn workers and 4 workers; fire 50
-  create-then-read pairs and count the 404s; move the registry to Redis or SQLite and repeat; then add a
-  blocking `time.sleep` in one handler and watch `--timeout` kill the worker.
+  `GET /runs/{id}` that reads it, both returning `os.getpid()`; run it under Gunicorn with 4 Uvicorn
+  workers; fire 50 create-then-read pairs on a fresh connection per request (keep-alive would pin both
+  calls to one worker) and count the 404s; move the registry to Redis or SQLite and repeat.
+- **Then block the loop:** add `time.sleep(40)` in one handler and watch the default 30 s `--timeout`
+  kill that worker.
 - **Done when:** you have a before and after count of failed reads (non-zero, then zero) and a log line
   showing the heartbeat timeout killing the blocked worker.
 

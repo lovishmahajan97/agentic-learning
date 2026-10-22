@@ -382,7 +382,6 @@ returns, and confirm you can actually source 18T tokens without heavy repetition
 - **Then adjust** for prefix caching and per-step model choice, and validate against a week of real
   usage.
 
-
 ## Quiz
 ### Q: Why did Chinchilla (70B parameters, 1.4T tokens) outperform Gopher (280B parameters, 300B tokens) at similar training compute?
 - [ ] It used a better tokenizer

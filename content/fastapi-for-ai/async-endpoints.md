@@ -5,7 +5,7 @@ name: Async endpoints
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/async-await
@@ -154,7 +154,7 @@ one sync tool is offloaded, a semaphore caps concurrency, and each call gets its
 tool cannot hang the run. Failures go back to the model as tool results instead of crashing the step.
 
 ```python
-import asyncio, httpx
+import asyncio, anyio, httpx
 
 TOOL_SLOTS = asyncio.Semaphore(8)                 # per-process cap, sized to tool and provider quotas
 
@@ -172,7 +172,8 @@ async def run_tool(call: dict, client: httpx.AsyncClient) -> dict:
             if call["name"] == "web_search":
                 out = await asyncio.wait_for(web_search(call["args"]["q"], client), 15)
             elif call["name"] == "read_file":       # offload: never block the loop
-                out = await asyncio.wait_for(asyncio.to_thread(read_local_file, call["args"]["path"]), 15)
+                out = await asyncio.wait_for(       # timeout frees the step, not the thread
+                    anyio.to_thread.run_sync(read_local_file, call["args"]["path"]), 15)
             else:
                 out = f"unknown tool {call['name']}"
         except Exception as e:                    # timeout or tool error becomes an observation
@@ -192,7 +193,7 @@ The model asks for three tools in one turn (illustrative latencies). A 40-run bu
 | Sequential awaits | 2 + 3 + 1.5 = 6.5 s | unaffected: all waits yield |
 | `asyncio.gather` | max(2, 3, 1.5) = 3 s | unaffected |
 | `gather`, but one tool uses `requests` (1.5 s) | 3 s | the loop freezes 1.5 s per call: every stream and health check stalls |
-| `gather`, that tool via `asyncio.to_thread` | 3 s | unaffected; uses 1 of 40 pool threads |
+| `gather`, that tool via `anyio.to_thread.run_sync` | 3 s | unaffected; uses 1 of AnyIO's 40 threads |
 
 ### RAG endpoint: offload the reranker, fan out the calls
 The commented-out version blocks the loop twice: a CPU reranker and a sync HTTP call. The live version

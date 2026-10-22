@@ -5,7 +5,8 @@ name: Model & dataset provenance
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - data-architecture/data-lineage
   - data-architecture/training-data-pipelines
@@ -22,9 +23,23 @@ sources:
 ---
 
 ## TL;DR
-Provenance is the verifiable record of a model's or dataset's origin: exact input bytes, code,
-parameters, builder, licence and evaluations. A checkpoint is opaque about what it saw, so provenance
-replaces "trust me" with hashes, manifests and signatures.
+Provenance is the verifiable record of where the models, fine-tunes and datasets behind your agent came
+from: exact input bytes, code, parameters, builder, licence and evaluations. It replaces "trust me" with
+hashes, manifests and signatures you can diff when the agent regresses.
+
+## For agent builders
+- **Why it matters for agents.** Agent teams fine-tune routers, tool-calling models and judges on agent
+  traces, generate synthetic tool-use data with other models, and pull open-weight checkpoints from hubs.
+  When the agent regresses, a customer asks if their conversations trained it, or an agent benchmark
+  score looks too good, only build-time records answer.
+- **Where it shows up in your stack.** `revision` pins on hub downloads, the manifest attached to each
+  model in the registry (MLflow or similar), `safetensors` loading, eval-set digests in your agent eval
+  harness, and the release record of which model, prompt and tool versions an agent build ships with.
+- **What you control.** What every fine-tuning job writes beside its checkpoint, the gates before
+  promotion (contamination, licence, customer isolation), signing and verification at deploy, and
+  whether the agent release itself has a manifest.
+- **What you can skip.** Choosing between attestation and bill-of-materials formats. Completeness of the
+  manifest matters far more than its format.
 
 ## Why it exists
 - **The questions arrive months later.** A fine-tune lands in the registry as `router-v4.safetensors`.
@@ -67,7 +82,7 @@ Every training or fine-tuning run writes a manifest beside its output:
 
 - **Merged, distilled and adapter models list every parent** as an input, each with its own manifest
   digest, *because* a merge has several ancestors and the licence and contamination questions must be
-  answered for all of them.
+  answered for all of them. A LoRA adapter for a tool-calling agent lists its base model too.
 - **Completeness beats format.** Software supply-chain attestation formats (in-toto and SLSA-style
   provenance) and bill-of-materials formats with ML profiles (CycloneDX and SPDX both have them) are being
   adopted so registries and scanners can read manifests without bespoke parsers.
@@ -75,16 +90,22 @@ Every training or fine-tuning run writes a manifest beside its output:
   the model registry as the artifact's metadata, and commit it where the lineage system can link it to
   dataset versions.
 
-### Dataset documentation
+### The agent release manifest
+- **An agent is more than a checkpoint.** Its behaviour depends on the model id (hosted) or checkpoint
+  digest (self-hosted), the system prompt, the tool schemas, the retrieval index version and any judge or
+  router models.
+- **Record each as a digest in a release manifest,** written by the deploy pipeline, so "what changed
+  between Tuesday's agent and today's" is a diff rather than an investigation.
+- **Hosted models are pinned by dated model id** where the provider offers one, *because* an alias that
+  moves to a newer snapshot changes the agent without a deploy.
+
+### Background: dataset and model documentation
 - **Datasheets (Gebru et al.)** formalize what a dataset should answer: motivation, composition, collection
   process, preprocessing, intended uses, distribution and maintenance.
 - **The operational subset for an AI team:** source systems and their terms, consent or licence basis, PII
   handling applied, the filtering recipe and its parameters, known gaps, and the eval sets that must never
-  overlap with it.
-- **Store it next to the snapshot digest** as a structured file, so documentation and bytes are versioned
-  together.
-
-### Model documentation
+  overlap with it. Store it next to the snapshot digest as a structured file, so documentation and bytes
+  are versioned together.
 - **Model cards (Mitchell et al.)** cover intended use, out-of-scope use, training data summary, evaluation
   results by relevant slices, limitations and ethical considerations.
 - **Two layers:** the provenance manifest is the machine-readable backbone; the model card is the
@@ -97,7 +118,7 @@ Every training or fine-tuning run writes a manifest beside its output:
 ### Synthetic and model-generated data
 - **A generated dataset has more inputs than its seed data:** the generator model and revision, the prompt
   template version, the sampling parameters and the filter that kept or discarded outputs. Record all of
-  them.
+  them. Synthetic tool-use trajectories for agent fine-tuning are the common case.
 - **Why each matters:** the generator's errors and biases propagate into your model; a change of generator
   explains a change of downstream quality; and the generator's usage terms travel with its outputs.
 - **Terms are a counsel question:** some providers' terms restrict using outputs to train competing models,
@@ -112,7 +133,7 @@ Every training or fine-tuning run writes a manifest beside its output:
   and whether a dataset licence reaches the trained weights is a legal question. The graph surfaces every
   applicable term for counsel; it does not decide.
 - **Customer isolation is enforced here:** the manifest of any shared model must show no
-  customer-restricted dataset digests among its inputs.
+  customer-restricted dataset digests among its inputs, including customer agent traces.
 
 ### Integrity and supply chain
 - **A hash says what you have; a signature says who produced it.** Signing artifacts and manifests
@@ -127,23 +148,23 @@ Every training or fine-tuning run writes a manifest beside its output:
 - **Contamination check:** hash the eval set's examples and the training snapshot's examples; exact overlap
   is found by digest comparison without re-reading the pipeline. Hashes only catch exact copies, so
   normalize text before hashing and add n-gram or embedding-similarity checks for reformatted or paraphrased
-  leaks.
+  leaks. Agent eval tasks leak easily when production traces feed both training and eval sets.
 - **Data subject requests:** the dataset snapshot digests in a model's manifest, joined with lineage, answer
   whether a person's records contributed to a model.
 - **Reproduction:** the manifest is the command line: same base revision, snapshot, commit, parameters and
   seed. Bitwise identity is not guaranteed on GPUs, but the result should land within the known run-to-run
   variance.
-- **Incident response:** when a model misbehaves, compare its manifest with the last good one; the diff is
-  the list of suspects.
+- **Incident response:** when a model or agent misbehaves, compare its manifest with the last good one; the
+  diff is the list of suspects.
 
 ## Diagram
 Every input is reduced to a digest before training; gates run on the digests, and only a signed manifest
-lets the checkpoint into the registry.
+lets the checkpoint into the registry the agent deploys from.
 
 ```mermaid
 flowchart TD
     B["Base model at pinned revision"] --> H["Hash every input"]
-    D["Dataset snapshot"] --> H
+    D["Agent traces and datasets"] --> H
     G["Code commit and container digest"] --> H
     H --> C{"Eval overlap or licence conflict?"}
     C -->|"yes"| X["Block the run"]
@@ -152,10 +173,46 @@ flowchart TD
     K --> M["Job writes manifest with all digests"]
     M --> S["Sign manifest and checkpoint"]
     S --> R[("Model registry")]
-    R -->|"deploy verifies signature and digest"| P["Serving"]
+    R -->|"deploy verifies signature and digest"| P["Agent serving"]
 ```
 
 ## Examples
+### An agent release manifest and its diff
+The deploy pipeline hashes everything that shapes agent behaviour. Diffing two releases names the suspects
+when task success drops.
+
+```python
+import hashlib, json
+
+def digest(obj) -> str:
+    data = obj if isinstance(obj, bytes) else json.dumps(obj, sort_keys=True).encode()
+    return hashlib.sha256(data).hexdigest()[:12]
+
+def release_manifest(model_id, system_prompt, tools, index_version, router_ckpt_digest):
+    return {"model_id": model_id,                          # a dated id, never a moving alias
+            "system_prompt": digest(system_prompt.encode()),
+            "tools": {t["name"]: digest(t) for t in tools},
+            "index_version": index_version,
+            "router_checkpoint": router_ckpt_digest}
+
+def diff(a: dict, b: dict, prefix=""):
+    for k in sorted(set(a) | set(b)):
+        va, vb = a.get(k), b.get(k)
+        if isinstance(va, dict) and isinstance(vb, dict):
+            yield from diff(va, vb, prefix + k + ".")
+        elif va != vb:
+            yield f"{prefix}{k}: {va} -> {vb}"
+
+tools = [{"name": "search_docs", "input_schema": {"query": "string"}},
+         {"name": "refund", "input_schema": {"order_id": "string", "amount_usd": "number"}}]
+v3 = release_manifest("model-2025-01-15", "You are a support agent.", tools, "docs_v6", "9ab")
+tools[1]["input_schema"]["amount_usd"] = "integer"         # a tool schema edit nobody announced
+v4 = release_manifest("model-2025-01-15", "You are a support agent.", tools, "docs_v7", "c42")
+print(list(diff(v3, v4)))   # index_version, router_checkpoint and tools.refund changed
+```
+
+The model ids and digests here are placeholders; use your provider's dated model identifiers.
+
 ### A manifest writer for a fine-tuning run
 It hashes the dataset snapshot and base model files, captures code and environment identifiers, and writes
 a JSON manifest beside the checkpoint. The training call is a stub; everything around it is what
@@ -245,8 +302,9 @@ print(len(exact), "exact;", len(near), "near-duplicate;", len(evalset) - len(exa
 # 1 exact; 1 near-duplicate; 1 clean
 ```
 
-### Worked scenario: diffing manifests after a regression
-`router-v4` routes worse than `router-v3` in production. Diff the two manifests (illustrative values):
+### Worked scenario: diffing manifests after a router regression
+`router-v4`, a small fine-tuned model that picks which tool or sub-agent handles a request, routes worse
+than `router-v3` in production. Diff the two manifests (illustrative values):
 
 | Field | router-v3 | router-v4 | Suspect? |
 |---|---|---|---|
@@ -268,19 +326,19 @@ print(len(exact), "exact;", len(near), "near-duplicate;", len(evalset) - len(exa
   job-written manifest to the registered model (in MLflow, for example, `mlflow.log_dict(manifest,
   "manifest.json")` on the run), and have the promotion step reject artifacts without one. Monitor coverage:
   fraction of registry artifacts with complete manifests.
-- **Safetensors-only loading.** Use for any third-party or shared checkpoint. In Transformers pass
-  `use_safetensors=True` so a pickle file is refused rather than executed. Monitor registry artifacts still
-  stored as pickle-based formats.
-- **Sign at build, verify at deploy.** Use for artifacts that cross trust boundaries. Sign the manifest and
-  checkpoint in the build pipeline (Sigstore's `cosign sign-blob` is one option), and verify signature and
-  digest before the serving process loads weights. Monitor verification failures; each is a blocked
-  tampered or out-of-band artifact.
+- **Agent release manifest on every deploy.** Use for any agent in production. The deploy pipeline records
+  the dated model id, prompt and tool-schema digests, index version and checkpoint digests, and tags every
+  trace with the release id. Monitor eval and task-success deltas per release, attributed by manifest diff.
+- **Safetensors-only loading, signed at build and verified at deploy.** In Transformers pass
+  `use_safetensors=True` so a pickle file is refused rather than executed. Sign the manifest and checkpoint
+  in the build pipeline (Sigstore's `cosign sign-blob` is one option) and verify signature and digest before
+  the serving process loads weights. Monitor pickle-format artifacts and verification failures.
 - **Licence and isolation gate in CI.** Use before promoting shared models. Walk the manifest closure and
-  fail if any input carries a customer-restricted tag or an unreviewed licence. Monitor gate failures and
-  time to counsel review.
+  fail if any input carries a customer-restricted tag (including customer agent traces) or an unreviewed
+  licence. Monitor gate failures and time to counsel review.
 - **Contamination gate before training.** Use whenever eval sets exist. Run the digest and n-gram overlap
-  check between the training snapshot and every registered eval set, and record the result in the manifest.
-  Monitor overlap counts per run.
+  check between the training snapshot and every registered eval set, including agent task suites, and
+  record the result in the manifest. Monitor overlap counts per run.
 
 ## Trade-offs
 - **Exact inputs vs immutable storage.** Content-addressed snapshots make inputs exact but require immutable
@@ -292,12 +350,15 @@ print(len(exact), "exact;", len(near), "near-duplicate;", len(evalset) - len(exa
   skip it only for throwaway experiments that never reach a registry.
 - **Rich datasheets vs staleness.** Datasheets improve downstream decisions but are written by people and go
   stale. Keep the machine-written manifest authoritative and the prose as commentary on it.
-- **Reproducibility vs automatic patches.** Pinning base model revisions means security patches to a model
-  repo are not picked up automatically; make upgrading the revision an explicit, evaluated change.
+- **Reproducibility vs automatic patches.** Pinning base model revisions (or dated hosted model ids) means
+  improvements and security patches are not picked up automatically; make upgrading an explicit, evaluated
+  change.
 
 ## Pitfalls
 - **Referencing the base model by name without a revision.** Symptom: a reproduction attempt silently uses a
   newer upstream commit and lands outside the expected variance. Fix: pin the commit.
+- **Pointing the agent at a moving hosted model alias.** Symptom: tool-calling behaviour changes on a day
+  with no deploy. Fix: pin a dated model id and record it in the release manifest.
 - **Writing the model card from memory after the run.** Symptom: documented training data does not match the
   snapshot the job actually read. Fix: generate the card from the manifest.
 - **Hashing a dataset directory that was later edited in place.** Symptom: a manifest digest that matches
@@ -313,7 +374,7 @@ print(len(exact), "exact;", len(near), "near-duplicate;", len(evalset) - len(exa
 
 ## When to use
 - **Record provenance for every artifact that reaches a registry:** every fine-tune, merged model, dataset
-  snapshot used for training or evaluation, and eval set.
+  snapshot used for training or evaluation, and eval set; and a release manifest for every agent deploy.
 - **Notebook experiments** can skip signing but should still capture the manifest, since the one that works
   will be promoted.
 - **Measure:** coverage (fraction of registry artifacts with complete manifests), reproduction success rate
@@ -351,11 +412,19 @@ believe not", which does not survive a dispute.
 - **Model card:** human-readable intended use, limitations and sliced eval results that reference the
   manifest; written alone from memory it drifts from what actually ran.
 
-### Your benchmark scores jumped 9 points after a data refresh. How do you check for contamination?
+### Your agent's task success dropped 8 points after Thursday's release. How does provenance shorten the investigation?
+- **Diff the release manifests:** model id, prompt and tool-schema digests, index version and router or
+  judge checkpoints; the changed fields are the suspects.
+- **Diff the checkpoint manifests** for any fine-tuned component that changed: snapshot digests, synthetic
+  data generator, params.
+- **Isolate:** roll back one changed component at a time against the same agent eval set, whose digest
+  must match so scores are comparable.
+
+### Your agent benchmark scores jumped 9 points after a data refresh. How do you check for contamination?
 - **Exact overlap:** normalize and hash every eval example and every training example, then intersect the
   digests.
 - **Near overlap:** n-gram or embedding-similarity checks catch reformatted and paraphrased leaks that
-  hashes miss.
+  hashes miss, common when production traces feed both training and eval sets.
 - **Then diff manifests:** the new snapshot digest and any changed synthetic-data generator are the
   suspects.
 
@@ -402,3 +471,25 @@ believe not", which does not survive a dispute.
 > Pickle deserialization runs arbitrary Python, so an unverified checkpoint is an executable. A data-only
 > format combined with a verified digest or signature gives you an artifact that is both authentic and
 > inert to load.
+
+## Use cases & projects
+### Use cases
+- **Fine-tuning a tool-calling model on agent traces.** The manifest records which trace snapshot, base
+  revision and synthetic generator produced the checkpoint, and blocks customer-restricted traces from
+  shared models.
+- **Debugging an agent regression across releases.** A release manifest diff names the changed model,
+  prompt, tool schema or index in seconds.
+- **Proving agent benchmark integrity.** Eval-set digests and overlap checks show that task suites did not
+  leak into training data.
+- **Loading open-weight models for self-hosted agents.** Pinned revisions, safetensors and signature
+  checks stop lookalike or tampered checkpoints.
+
+### Mini project
+**Provenance for an agent release (2-3 hours).**
+- **Goal:** make two releases of a small agent diffable and their fine-tuned component auditable.
+- **Steps:** write a deploy script that emits a release manifest (model id, prompt digest, tool-schema
+  digests, index version); fine-tune or stub a tiny router with the manifest writer above; run the
+  contamination check between its training rows and a 30-task agent eval set; ship two releases with one
+  deliberate tool-schema change and one dataset change; tag traces with the release id.
+- **Done when:** `diff(v1, v2)` prints exactly the two changes, the contamination report shows zero exact and
+  near overlaps (or blocks the run), and any trace can be mapped to its release manifest.

@@ -5,8 +5,8 @@ name: safetensors
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: agentic
-agent_relevance: background
+status: agentic-verified
+agent_relevance: useful
 related:
   - python-for-ai/pytorch
   - python-for-ai/hugging-face

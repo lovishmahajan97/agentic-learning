@@ -5,7 +5,7 @@ name: Concurrency limits (semaphores)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - fastapi-for-ai/backpressure
@@ -211,7 +211,9 @@ async def chat(body: dict, request: Request):
 
 ### Agent step with capped parallel tool calls
 The model asks for several tools at once. Each call takes the shared tool slot only for its own duration,
-and a per-run limit stops one run from taking all of them. Timeouts become tool errors the model can see.
+and a per-run limit stops one run from taking all of them.
+- **A run's own extra calls queue** behind each other; only the wait for a shared slot is bounded.
+- **That timeout becomes a tool error** the model can see, not a failed run.
 
 ```python
 import asyncio
@@ -220,19 +222,16 @@ TOOL_SLOTS = asyncio.BoundedSemaphore(8)        # per worker, created in the lif
 PER_RUN_FANOUT = 3
 
 async def call_tool_capped(name, args, impl, run_sem, wait_s=1.0):
-    try:
-        async with asyncio.timeout(wait_s):
-            await run_sem.acquire()
-            try:
-                await TOOL_SLOTS.acquire()
-            except BaseException:
-                run_sem.release(); raise
-    except TimeoutError:
-        return {"tool": name, "error": "busy, retry later"}   # the model sees this as a result
-    try:
-        return {"tool": name, "result": await impl(**args)}
-    finally:
-        TOOL_SLOTS.release(); run_sem.release()
+    async with run_sem:                                   # queue behind this run's own calls
+        try:
+            async with asyncio.timeout(wait_s):           # Python 3.11+
+                await TOOL_SLOTS.acquire()                # bounded wait for a shared slot
+        except TimeoutError:
+            return {"tool": name, "error": "busy, retry later"}   # the model sees this as a result
+        try:
+            return {"tool": name, "result": await impl(**args)}
+        finally:
+            TOOL_SLOTS.release()
 
 async def run_tool_batch(tool_calls, registry):
     run_sem = asyncio.Semaphore(PER_RUN_FANOUT)            # one per agent run

@@ -5,7 +5,7 @@ name: Quantization quality evaluation
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - training-adaptation/quantization
@@ -416,5 +416,6 @@ way.
 - **Steps:** collect 50-100 agent tasks with known correct tool calls; run them on the full-precision and
   quantized builds with the same prompts and temperature 0; score tool-call validity, argument accuracy
   and end-to-end success per item; compute paired differences with a bootstrap confidence interval.
-- **Done when:** a script prints the per-metric deltas with intervals and exits non-zero when any interval
-  falls below your margin, and you can name the three items that regressed most.
+- **Done when:** a script prints the per-metric deltas with intervals and broke/fixed counts, exits
+  non-zero when any interval's lower bound is below minus your agreed margin, and you have read every
+  task that went from correct to wrong and noted its failing step.

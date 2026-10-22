@@ -5,7 +5,7 @@ name: Model Context Protocol (MCP)
 kind: tool
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/mcp-authentication-authorization-transport-security
@@ -87,7 +87,8 @@ remove authentication, trust decisions or tool-set curation.
 - **Roots:** the host tells a server which filesystem locations to work within. This is advisory, not an
   enforced sandbox.
 - **Elicitation** (newer revisions): a server asks the user for input mid-operation.
-- **Notifications** such as `tools/list_changed` let a server announce that its capabilities changed.
+- **Notifications** such as `tools/list_changed` (on the wire, `notifications/tools/list_changed`) let a
+  server announce that its capabilities changed.
 
 ### The wire
 1. **Messages are JSON-RPC 2.0.**
@@ -96,7 +97,7 @@ remove authentication, trust decisions or tool-set curation.
 
 | Transport | How | Use |
 |---|---|---|
-| **stdio** | Host spawns the server as a subprocess and talks over its standard streams | Simple, local, inherits the host's environment |
+| **stdio** | Host spawns the server as a subprocess and talks over its standard streams | Simple, local, runs as the host's OS user and inherits the host's environment unless the client trims it |
 | **Streamable HTTP** | HTTP POST with optional server-sent events for streaming | Remote servers; replaced the earlier HTTP-plus-SSE transport |
 
 - **Remote servers authenticate with OAuth 2.1** under the specification's authorization section; a separate
@@ -163,6 +164,8 @@ it supports; the server answers with the revision it will use and its own capabi
   review descriptions like code.
 - **Results are untrusted content.**
 - **stdio servers inherit the host's environment and credentials,** so run them with least privilege.
+  How much environment passes through depends on the client (the Python SDK passes a short default list
+  such as `PATH` and `HOME`, plus whatever you set in `env`), but the process can always read whatever files the host's OS user can.
 - **Every call is an extra hop** with its own latency and failure modes.
 
 ## Diagram
@@ -438,3 +441,14 @@ set and check latency and error rates per server before go-live.
   routes each `tool_use` to `tools/call`; map `isError` to `is_error`; kill the server mid-run.
 - **Done when:** the agent completes a task using only MCP tools, the excluded tool never appears in the
   request, and the dead server becomes an error result the model can see instead of a crashed loop.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): the billing-dispute agent reaches its
+billing API only through a remote MCP server you build and host yourself.
+- **Scope (multi-day):** a billing MCP server over Streamable HTTP with per-user OAuth scopes, typed
+  `outputSchema` results and honest `readOnlyHint` and `destructiveHint` annotations; a host that
+  allow-lists and prefixes its tools next to a ticketing and a policy server, maps both failure
+  channels, and gates the refund tool behind a durable human approval.
+- **Done when:** a token issued for another server or missing a scope is rejected, every billing call is
+  logged against a human subject, an unreviewed change to the `tools/list` output stops the host from
+  starting, and the seeded injection ticket never produces a refund call on the billing server.

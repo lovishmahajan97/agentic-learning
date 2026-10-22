@@ -5,7 +5,7 @@ name: Rate limiting (slowapi)
 kind: tool
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - fastapi-for-ai/api-keys-oauth2-jwt
@@ -156,10 +156,12 @@ An agent route is one HTTP request that becomes many upstream calls, so limits l
 - **Common combination:** a coarse edge limit (IP, DDoS) plus slowapi or custom limits per tenant in the app.
 
 ## Diagram
-Where each limit sits on an LLM request, which for an agent repeats at every model step: cheap coarse
-checks first, then per-caller request and token
-budgets in shared Redis, all before the paid upstream call. This is the intended order; with the
-decorator in the example below, the token dependency actually runs first (see the ordering detail).
+Where each limit sits on an LLM request (for an agent, the token check repeats at every model step):
+cheap coarse checks first, then per-caller request and token budgets in shared Redis, all before the
+paid upstream call.
+
+This is the intended order; with the decorator in the example below, the token dependency actually runs
+first (see the ordering detail).
 
 ```mermaid
 flowchart TD
@@ -276,7 +278,8 @@ Illustrative numbers: the transcript grows, so each step reserves more than the 
 | 10 | 24,000 | 25,024 | ~160k |
 | 12 | 28,000 | 29,024 | would reach ~216k: over 200k, reservation released, run paused |
 
-Assumes ~2k tokens added per step, all within one minute window. Five runs per minute passed slowapi;
+Assumes ~2k tokens added per step, actual usage equal to each reservation (reconciling a shorter reply
+lowers the total), and all steps within one minute window. Five runs per minute passed slowapi;
 one run alone exhausted the tenant's minute of tokens.
 
 ### Token bucket with token cost (runnable, pure Python)

@@ -5,7 +5,8 @@ name: Production feedback classification
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - evals/error-analysis
   - evals/llm-as-a-judge
@@ -18,9 +19,21 @@ related:
 ---
 
 ## TL;DR
-Turning raw signals (thumbs-down, comments, edits, escalations, tickets) into labelled failure modes with
-a severity and an owning component. A thumbs-down rate says something is wrong, not what or who fixes
-it; labelling whole traces against a grown taxonomy does.
+Turning an agent's raw feedback (thumbs-down, edits, escalations, tickets) into labelled failure modes
+with severity and an owning component. A thumbs-down rate says something is wrong; labelling whole agent
+traces against a grown taxonomy says what and who fixes it.
+
+## For agent builders
+- **Why it matters for agents.** An agent fails in more places than a chatbot: retrieval, tool choice,
+  tool arguments, tool errors, loops, guardrail denials, the final answer. "Wrong again" from a user
+  could be any of them, and each has a different owner and fix.
+- **Where it shows up in your stack.** Your tracing (trace ids on every step and feedback event), a
+  trace-level LLM classifier with a schema, review queues, and the regression suite that confirmed
+  failures feed.
+- **What you control.** The taxonomy (grown from real agent traces), what the classifier sees (the whole
+  trajectory), routing by severity and calibrated confidence, and prevalence estimates on random samples.
+- **What you can skip.** Fancy classifier training at first; an LLM classifier with a strict schema and a
+  weekly SME sample is enough until volume is high.
 
 ## Why it exists
 - **There is far more feedback than anyone can read.** Explicit signals are sparse and terse: a
@@ -48,6 +61,17 @@ it; labelling whole traces against a grown taxonomy does.
 A typical first taxonomy for a RAG assistant: retrieval miss, ignored context, unsupported claim, wrong
 format, over-refusal or over-blocking, outdated source, latency or timeout, out of scope, missing
 capability (a feature request), user error, and other.
+
+For a tool-calling agent, open coding usually adds trajectory categories that a RAG taxonomy lacks:
+
+| Agent category | Seen in the trace as | Typical owner |
+|---|---|---|
+| **Wrong tool chosen** | A plausible tool called when another fits the task | Prompt or tool descriptions |
+| **Bad tool arguments** | Right tool, invalid or wrong values (wrong order id, wrong date format) | Tool schema or prompt |
+| **Tool error not handled** | Tool returned an error; agent ignored it or invented a result | Agent loop |
+| **Loop or budget hit** | Repeated calls, stop at the step limit | Agent loop or prompt |
+| **Blocked by guardrail** | Denial event, user could not finish a legitimate task | Guardrails |
+| **Premature stop** | Agent answered before doing a required step | Prompt |
 
 ### 2. Add severity and owner as separate fields
 | Field | Says | Values |
@@ -208,6 +232,21 @@ Illustrative week (numbers invented for the walkthrough): 1,400 negative signals
 - **Count alone** would put outdated sources first anyway; **count × severity** makes the 40 refund cases
   jump the queue.
 
+### Agent scenario: one week of an order-support agent's escalations
+An order-support agent with five tools logs 600 escalations to humans in a week (illustrative numbers).
+The trace-level classifier, checked against a 100-item SME sample, groups them:
+
+| Category | Items | Severity | What the trajectory showed | Fix |
+|---|---|---|---|---|
+| Bad tool arguments | 210 | 2 | Order ids passed with a prefix the API rejects | Tool schema: pattern on the argument, plus a regression case |
+| Tool error not handled | 120 | 3 | Carrier API timeouts; agent told users "delivered" | Loop: surface tool errors, never invent results |
+| Loop or budget hit | 90 | 2 | Repeated `lookup_order` after the same error | Return structured errors the model can act on |
+| Legitimate escalation | 150 | 1 | Policy says a human decides | None: not a failure |
+| Other | 30 | – | Mixed | Next open-coding session |
+
+- **The 120 invented "delivered" answers go first** despite a lower count, because users acted on them.
+- **A comment-only classifier** would have called most of these "wrong answer", with no owner.
+
 ## Production patterns
 - **Stable trace ids on every feedback event** — from day one of a deployment. Attach the request's trace
   id (for example the OpenTelemetry trace id) to thumbs, edits and escalations so feedback joins to
@@ -224,6 +263,9 @@ Illustrative week (numbers invented for the walkthrough): 1,400 negative signals
 - **"Other" share alert** — always on. Alert when "other" or low-confidence share rises above its usual
   band, and schedule an open-coding session and taxonomy version bump. Monitor trends only within one
   taxonomy version.
+- **Step-level evidence in labels** — for agent traces. Require the classifier's `evidence` to name the
+  step index and tool call where the failure began, and route by the owner of that step. Monitor the share
+  of labels whose cited step a reviewer disagrees with, since misplaced blame sends fixes to the wrong team.
 
 ## Trade-offs
 - **LLM classifier vs small trained classifier.** The LLM handles free text and full traces with little
@@ -250,6 +292,11 @@ Illustrative week (numbers invented for the walkthrough): 1,400 negative signals
   traffic does not reproduce.
 - **Changing the taxonomy without versioning.** Symptom: a trend chart with a sudden jump that is a
   relabelling artifact, not a real change.
+- **Truncating long agent traces before classification.** Symptom: failures that began in an early tool
+  call get blamed on the final answer. Fix: pass a compact step list (tool, arguments, result status)
+  for every step, with full text only around errors.
+- **Counting every escalation as a failure.** Symptom: an alarming failure rate dominated by escalations
+  the customer's policy requires. Fix: a "legitimate escalation" category with severity 1.
 
 ## When to use
 - **Start when** a deployment produces more feedback than one person reads in a day; before that, read
@@ -310,6 +357,13 @@ then roll back for that tenant if the regression is real and severe.
 - **The trained classifier is cheaper and stable**, but needs retraining when the taxonomy changes; keep
   the LLM for new categories and low-confidence items.
 
+### How would you classify feedback on a multi-step tool-calling agent so each failure reaches the right team?
+- **Classify the trajectory:** every step's tool, arguments and result status, plus retrieval and
+  guardrail events, so the label can name where the failure began.
+- **Use agent categories from open coding** (wrong tool, bad arguments, unhandled tool error, loop,
+  premature stop, guardrail block) with an owner each.
+- **Rank by count × severity** and turn confirmed high-severity items into regression cases.
+
 ## Quiz
 ### Q: Why should the classifier see retrieved passages and tool calls, not only the user's comment?
 - [ ] Comments are too short to embed
@@ -334,3 +388,28 @@ then roll back for that tenant if the regression is real and severe.
 - [x] Feedback comes from a self-selected, negatively skewed group of users, so it over- or under-represents failures
 > Feedback is excellent for discovering and ranking failure modes, but its sample is biased. A random
 > traffic sample labelled with the same codebook gives the true rate.
+
+## Use cases & projects
+### Use cases
+- **Weekly triage for a deployed support agent.** Classified escalations and thumbs-down go to prompt,
+  tool, retrieval and guardrail owners with counts and severity.
+- **Post-release regression detection.** A jump in one agent category (say, bad tool arguments) after a
+  release points at the shared change that caused it.
+- **Customer reviews.** The FDE brings a classified summary showing which failures were fixed and which
+  are customer-content issues.
+- **Feeding the regression suite.** Confirmed, high-severity classified traces become blocking cases.
+
+### Mini project
+**Classify a week of synthetic agent traces (2-3 hours).**
+- **Goal:** turn 200 negative agent traces into owned, severity-ranked categories with measured accuracy.
+- **Steps:** generate 200 synthetic traces from a small order agent with injected failures (bad
+  arguments, unhandled tool errors, loops, legitimate escalations); open-code 50 by hand into a taxonomy;
+  extend the `Category` enum and `OWNER` map; classify all 200 with the `classify` function; hand-label
+  60 and compute per-class precision and recall and a calibrated threshold with `calibrated_threshold`.
+- **Done when:** you have a ranked count × severity table, per-class precision and recall, the calibrated
+  threshold, and the top two categories each turned into a regression case.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): classifying at least 100 simulated
+production signals for the utility's email agent at trace level, with per-class precision against human
+labels and one issue carried through to a product fix.

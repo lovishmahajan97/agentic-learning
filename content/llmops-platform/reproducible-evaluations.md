@@ -5,7 +5,8 @@ name: Reproducible evaluations
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - llmops-platform/experiment-tracking
   - llmops-platform/evaluation-frameworks
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-A reproducible eval can be re-run from a recorded manifest (dataset, bundle, scorers, code, environment)
-to the same conclusion, with raw outputs stored and leftover noise measured, because unpinned comparisons
-across weeks compare two different systems.
+A reproducible agent eval can be re-run from a recorded manifest (dataset, bundle, tools, scorers, code,
+environment) to the same conclusion, with raw trajectories stored and leftover noise measured, because
+unpinned comparisons across weeks compare two different agents.
+
+## For agent builders
+- **Why it matters for agents.** Agents amplify every source of drift: one different early tool choice
+  changes the rest of the run, live tools return new data each day, and memory or the clock leaks today's
+  state into the prompt. Without pins and repeats, "the new prompt helped" is unfalsifiable.
+- **Where it shows up in your stack.** The eval harness manifest, a record-and-replay tool layer, an
+  injected clock, a fresh memory store per task, dated model snapshots, and a scheduled sentinel run.
+- **What you control.** What gets pinned (model, prompts, tool schemas, index, recordings), how many
+  repeats per task, the temperature the eval runs at, and whether the comparison tool refuses mismatched
+  runs.
+- **What you can skip.** Chasing bit-exact agent runs through a hosted API. Aim for statistical
+  reproduction and a re-derivable manifest.
 
 ## Why it exists
 - **Almost nothing holds still by default.** "Did the prompt change help?" needs everything else fixed. The
@@ -61,11 +74,13 @@ Every run records a manifest; each field is there *because* a specific drift has
 | **Bundle** | model snapshot id (or weights digest), prompt versions, decoding parameters, seed where supported, tool and retrieval index snapshots | a dated snapshot, not an alias: the alias is the single most common cause of unexplained score changes |
 | **Scorers** | judge model snapshot, judge prompt and rubric version, scorer code version | the judge is a model |
 | **Environment** | git SHA, dependency lockfile hash, container image digest | tokenizers, SDK defaults and retry behaviour live in dependencies |
-| **Runtime inputs** | anything read at request time outside the bundle: the current date, a live tool or API result, a feature-flag value | frozen by injecting a fixed clock and replaying recorded tool responses; the recording's hash goes in the manifest |
-| **Run policy** | concurrency, timeout and retry settings, cache mode | timeouts recorded as zero scores make a provider incident look like a regression; a cache that ignores a pin hides a change |
+| **Runtime inputs** | anything read at request time outside the bundle: the current date, a live tool or API result, a feature-flag value, the agent's memory store contents | frozen by injecting a fixed clock and replaying recorded tool responses; the recording's hash goes in the manifest |
+| **Run policy** | concurrency, timeout and retry settings, cache mode, the agent's step budget | timeouts recorded as zero scores make a provider incident look like a regression; a cache that ignores a pin hides a change |
 
 - **Live tools break reproducibility:** an agent eval that calls a live search API is not reproducible next
   week whatever else you pin.
+- **Memory breaks it too.** An agent that writes to long-term memory during task 3 sees different context
+  in task 4; give each task a fresh or snapshotted memory store and record which.
 - **The run id is a hash of the manifest,** so two runs with identical pins are recognisably the same
   experiment.
 - **Store the manifest next to the raw outputs** in the experiment-tracking or evaluation store.
@@ -80,11 +95,13 @@ Every run records a manifest; each field is there *because* a specific drift has
 
 - **When one run suffices:** deterministic scorers on structured outputs from a locally pinned model can show
   a noise floor near zero. Measure it before assuming it.
+- **Agents usually need repeats.** A multi-step run compounds per-step sampling, so task success often
+  flips between repeats even with replayed tools.
 
 ### Two kinds of noise, two different tools
 | Noise | Source | Remedy | Measured by |
 |---|---|---|---|
-| **Generation noise** | run-to-run variation on the same items: sampling, non-deterministic serving, a model-graded scorer | repeats; averaging each item's score over its repeats shrinks it | spread across repeats |
+| **Generation noise** | run-to-run variation on the same items: sampling, non-deterministic serving, a model-graded scorer, a different tool path | repeats; averaging each item's score over its repeats shrinks it | spread across repeats |
 | **Item-sampling noise** | having evaluated these few hundred items rather than the whole population of requests | only more items; repeats do nothing | confidence interval over items (bootstrap over per-item scores) |
 
 - **A delta must clear both.** A perfectly deterministic run on 100 items still has an item-level interval
@@ -106,14 +123,14 @@ Every run records a manifest; each field is there *because* a specific drift has
   from stored outputs without re-calling the target, which is how you re-baseline after a judge upgrade.
 
 ## Diagram
-Every run is identified by its manifest; comparisons are refused across yardsticks, and a cache-free
-sentinel watches for drift the manifest cannot pin.
+Every agent eval run is identified by its manifest; comparisons are refused across yardsticks, and a
+cache-free sentinel watches for drift the manifest cannot pin.
 
 ```mermaid
 flowchart TD
-    M["Manifest: dataset, bundle, scorers, env, runtime inputs, policy"] --> ID["Run id = hash of manifest"]
-    ID --> RUN["Run k repeats, cache off for floor"]
-    RUN --> RO[("Raw outputs + manifest stored")]
+    M["Manifest: dataset, bundle, tools, scorers, env, policy"] --> ID["Run id = hash of manifest"]
+    ID --> RUN["Run k repeats, replayed tools, fixed clock"]
+    RUN --> RO[("Raw trajectories + manifest stored")]
     RO --> SC["Score with pinned scorers"]
     SC --> CMP{"Same dataset and scorer versions?"}
     CMP -->|"no"| REF["Refuse or label cross-version"]
@@ -162,6 +179,42 @@ def comparable(a: dict, b: dict) -> tuple[bool, dict]:
 #                                                               # over items (gate lesson) must also exclude it
 ```
 
+### Freezing an agent's world: replayed tools, fixed clock, fresh memory
+Pure Python, runnable. The agent sees a recorded world: tool calls are answered from a recording keyed by
+request hash, the clock is fixed, and each task gets an empty memory store. The recording's hash goes into
+the manifest's runtime inputs.
+
+```python
+import hashlib, json, datetime
+
+class FrozenWorld:
+    def __init__(self, recording: dict, now: str):
+        self.recording = recording                       # {request_hash: tool_result}
+        self.now = datetime.datetime.fromisoformat(now)  # injected clock: no "today" leaking in
+        self.misses = []
+
+    @staticmethod
+    def key(tool, args):
+        return hashlib.sha256(json.dumps([tool, args], sort_keys=True).encode()).hexdigest()[:16]
+
+    def call_tool(self, tool, args):
+        k = self.key(tool, args)
+        if k not in self.recording:                      # a new path: record it, never call live in an eval
+            self.misses.append((tool, args))
+            return {"error": "not in recording"}
+        return self.recording[k]
+
+    def new_memory(self):
+        return {}                                        # fresh per task, so task order cannot leak state
+
+rec = {FrozenWorld.key("search_orders", {"customer": "c42"}): [{"id": "1182", "status": "delivered"}]}
+world = FrozenWorld(rec, now="2025-06-01T09:00:00")
+print(world.call_tool("search_orders", {"customer": "c42"}))   # replayed
+print(world.call_tool("search_orders", {"customer": "c43"}))   # miss, logged
+recording_hash = hashlib.sha256(json.dumps(rec, sort_keys=True).encode()).hexdigest()[:12]
+runtime_inputs = {"clock": "2025-06-01T09:00:00", "tools": recording_hash, "memory": "fresh-per-task"}
+```
+
 ### Repeats per item, then a paired interval over items
 Pure Python, runnable, with synthetic scores. The candidate is truly 3 points better on every item, with
 three repeats each on 100 identical items. Repeats shrink generation noise, but the interval over items
@@ -207,6 +260,22 @@ manifests field by field explains it before anyone re-runs anything.
 - **Fix:** pin a dated model snapshot, re-run champion and candidate now with identical manifests except the
   prompt, cache off, repeats per item, paired interval over items.
 
+### Worked scenario: an agent's noise floor
+A research agent on 60 tasks with replayed tools, run five times on the same manifest. Illustrative numbers.
+
+| Repeat | Tasks succeeded | Success rate |
+|---|---|---|
+| 1 | 41 | 68.3% |
+| 2 | 44 | 73.3% |
+| 3 | 42 | 70.0% |
+| 4 | 39 | 65.0% |
+| 5 | 43 | 71.7% |
+
+- **The spread is 65.0% to 73.3%, about 8 points,** with nothing changed. A candidate that "wins by 5"
+  from one run each is inside the floor.
+- **Most flips trace to step one or two:** the agent picks a different first search query, so the rest of
+  the trajectory diverges. Averaging repeats per task, then pairing, is what makes a delta believable.
+
 ## Production patterns
 - **Harness refuses incomplete manifests** — for any eval that gates or is cited. Fail the run at start if a
   dataset hash, model snapshot, judge snapshot, lockfile hash or image digest is missing, or if any model id
@@ -217,6 +286,9 @@ manifests field by field explains it before anyone re-runs anything.
 - **Recorded tool responses for agent evals** — when the application calls live tools. Record tool responses
   once, replay them by request hash during evals, inject a fixed clock, and put the recording's hash in the
   manifest. Monitor replay misses, which mean the agent asked something new.
+- **Isolated memory per task** — for agents with long-term memory. Start each eval task from an empty or
+  snapshotted memory store and record the snapshot id in the manifest, so task order cannot change results.
+  Monitor results that change when task order is shuffled.
 - **Noise floor stored per metric** — before any gate trusts a delta. Re-measure the floor with repeats on
   the champion whenever the model, judge or dataset version changes, and store it with the baseline. Monitor
   floor width over time; a widening floor often means a provider-side change.
@@ -230,10 +302,12 @@ manifests field by field explains it before anyone re-runs anything.
   model-upgrade job with a full eval is the only sustainable answer.
 - **Quantified noise vs cost.** Repeated runs quantify noise at a multiple of the cost. Once a deterministic
   scorer on a locally pinned model shows a near-zero floor, a single run is enough, but only after the floor
-  has been measured.
+  has been measured. Agent runs cost several model calls each, so repeats bite harder.
 - **Production temperature vs cleanliness.** Evaluating at production temperature measures what ships but is
   noisier; evaluating at zero is cleaner and may measure a system you do not ship. The choice follows what
   production actually does.
+- **Replayed tools vs realism.** Replay makes agent evals repeatable and free, but a frozen recording cannot
+  show a tool whose live output has changed; keep a separate live-tool check outside the gate.
 - **Cheap cached re-runs vs hidden changes.** Content-addressed caching makes re-runs nearly free, yet a key
   that omits any pin hides a change. The sentinel run must bypass the cache, which is exactly the run you
   cannot make cheap.
@@ -251,6 +325,8 @@ manifests field by field explains it before anyone re-runs anything.
   identical runs (how many depends on the provider, output length and load), filed as a regression.
 - **Comparing runs scored by different judge versions.** Symptom: a "regression" that vanishes when both runs
   are re-scored from stored outputs with the same judge.
+- **Shared agent memory across eval tasks.** Symptom: results that change when the task file is reordered.
+  Fix: fresh or snapshotted memory per task, recorded in the manifest.
 
 ## When to use
 - **Always:** every eval that informs a decision gets a manifest; the rigour scales with the stakes.
@@ -292,6 +368,13 @@ otherwise it is not yet a result.
   has changed.
 - **Bit-exact** is realistic only for locally served models with deterministic kernels and fixed batching.
 
+### Your agent calls live web search and writes to long-term memory. How do you make its eval reproducible?
+- **Freeze the world:** record tool responses once and replay them by request hash, inject a fixed clock,
+  and put the recording's hash in the manifest.
+- **Isolate memory:** start each task from an empty or snapshotted store so earlier tasks cannot leak state.
+- **Then measure what is left:** repeats per task at production temperature, because the agent's own
+  sampling still changes trajectories; keep a separate live-tool check outside the gate.
+
 ### How would you know the model changed underneath you?
 - **A scheduled sentinel run:** a frozen reference bundle on a fixed subset, cache off, compared against its
   own noise floor.
@@ -306,7 +389,7 @@ otherwise it is not yet a result.
 - **Fix:** average repeats per item, then compute a paired bootstrap interval over items, and grow the set
   if the interval is too wide.
 
-### Should you evaluate at temperature zero to make results stable?
+### Should you evaluate an agent at temperature zero to make results stable?
 - **Only if production runs at zero.** An eval at zero of a system that ships at 0.7 measures a different
   system.
 - **Zero is not deterministic anyway** on hosted infrastructure, because batching and floating-point order
@@ -346,3 +429,24 @@ otherwise it is not yet a result.
 > Nothing in the sentinel's manifest changes between runs, so any movement beyond the noise floor must
 > come from something the manifest cannot pin. Candidate regressions are caught by the gate, not the
 > sentinel.
+
+## Use cases & projects
+### Use cases
+- **Comparing two agent prompts honestly.** Identical manifests except the prompt, replayed tools and
+  repeats per task turn "it feels better" into a delta with an interval.
+- **Catching provider drift.** A weekly sentinel on a frozen agent bundle alerts when success moves with no
+  change on your side.
+- **Customer acceptance.** An FDE hands over the manifest, recordings and raw trajectories so the customer
+  can re-run the agent eval in their environment.
+- **Debugging a flaky agent test.** The manifest and stored trajectories show whether a failure came from
+  the agent's sampling or from something that moved.
+
+### Mini project
+**Make a flaky agent eval reproducible (2-3 hours).**
+- **Goal:** turn an agent eval whose success rate wobbles run to run into one with a manifest, a frozen
+  world and a measured noise floor.
+- **Steps:** take a small agent that calls one live API; record its tool responses for 30 tasks into a
+  `FrozenWorld`; inject a fixed clock and fresh memory; build the manifest with the recording hash; run the
+  same manifest five times and compute the spread; compare two prompt versions with `paired_interval`.
+- **Done when:** the run id is identical across re-runs, replay misses are zero, you report the noise floor,
+  and the prompt comparison states clearly whether its interval excludes zero.

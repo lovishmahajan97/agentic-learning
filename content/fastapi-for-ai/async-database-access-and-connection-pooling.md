@@ -5,7 +5,7 @@ name: Async database access & connection pooling
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - fastapi-for-ai/sqlalchemy-sqlmodel
@@ -226,11 +226,12 @@ async def agent(conv_id: int, body: Ask, request: Request):
         if reply.tool_call is None:
             break
         transcript.append(await lookup_order(sessions, reply.tool_call.args["order_id"]))
+    answer = reply.text if reply.tool_call is None else "step budget exhausted"
 
     async with sessions() as s:               # final session: short write
-        s.add(Message(conv_id=conv_id, role="assistant", content=reply.text))
+        s.add(Message(conv_id=conv_id, role="assistant", content=answer))
         await s.commit()
-    return {"answer": reply.text}
+    return {"answer": answer}
 
 # Ask, Message, Order and call_model are the Pydantic model, ORM models and model client from other lessons.
 ```

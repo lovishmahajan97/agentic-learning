@@ -5,7 +5,7 @@ name: Type hints
 kind: concept
 difficulty: intro
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/mypy
@@ -45,7 +45,7 @@ and the validator its arguments must pass.
   template. The first symptom is `KeyError: 'content'` inside a retry loop, or a `TypeError` about
   concatenating `str` and `NoneType` two hours into an eval run.
 - **Docstrings do not hold.** They drift, nobody checks them, and a refactor that renames a field
-  silently breaks every caller, including the tool schema the model was trained against in your prompt.
+  silently breaks every caller, including the hand-written tool schema your prompt sends the model.
 - **Runtime assertions everywhere are not enough.** They catch the error only on the path that executes,
   and clutter every function with checks that belong to the contract, not the logic.
 - **One machine-readable contract serves three readers.** A checker walks the call graph without running

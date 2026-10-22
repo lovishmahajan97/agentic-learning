@@ -5,7 +5,7 @@ name: Structured logging
 kind: practice
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - fastapi-for-ai/middleware-ordering
@@ -33,8 +33,8 @@ Structured logging emits each event as one JSON object with named fields (`reque
 - **Where it shows up in your stack.** structlog (or stdlib `logging` with a JSON formatter) in the
   FastAPI service and the agent worker, a request middleware that binds `request_id` and tenant, and
   binding calls inside the agent loop for `run_id`, `step` and `tool`.
-- **What you control.** The event names and field schema (`agent_step_finished`, `tool_call_finished`,
-  `llm_call_finished`), what content may be logged (by default, only its shape), and how context crosses
+- **What you control.** The event names and field schema (`llm_call_finished`, `tool_call_finished`,
+  `agent_run_finished`), what content may be logged (by default, only its shape), and how context crosses
   into threads and queues.
 - **What you can skip.** Logging framework internals and handler zoo. One pipeline, one schema, JSON to
   stdout is enough; tracing tools (Langfuse, LangSmith, OpenTelemetry) cover the span view.
@@ -454,7 +454,7 @@ logs undercount.
   failing and why the run looped.
 - **Per-run and per-tenant cost.** Summing `prompt_tokens` and completion tokens from `llm_call_finished`
   events gives cost per run, per tenant and per model.
-- **Tool reliability reports.** `tool_call_finished` events with `tool`, status and `latency_ms` rank tools
+- **Tool reliability reports.** `tool_call_finished` events with `tool`, `outcome` and `latency_ms` rank tools
   by error rate and latency.
 - **Joining logs to traces.** A trace id on each line links the JSON events to the span tree in your
   tracing tool.
@@ -464,7 +464,7 @@ logs undercount.
 - **Goal:** answer "what did run X do, and what did it cost?" from logs alone.
 - **Steps:** add structlog with a JSON renderer to a FastAPI agent stub; bind `request_id` and tenant in a
   middleware with `contextvars`; bind `run_id`, `step` and `tool` inside the loop; emit
-  `agent_step_finished`, `tool_call_finished` and `llm_call_finished` events with token counts and
+  `llm_call_finished`, `tool_call_finished` and `agent_run_finished` events with token counts and
   `latency_ms`; run 10 runs with fake tools, one of which fails randomly.
 - **Done when:** a single `jq` command lists every step of one run in order, and another sums tokens per
   run, with no prompt text in any line.

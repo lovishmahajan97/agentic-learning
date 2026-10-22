@@ -5,7 +5,7 @@ name: Graceful shutdown & worker draining
 kind: practice
 difficulty: advanced
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - fastapi-for-ai/lifespan
@@ -164,24 +164,30 @@ from pathlib import Path
 DRAIN_FILE = Path("/tmp/draining")             # touched by the preStop hook
 
 async def run_agent(run_id: str, store, llm, tools, max_steps: int = 30):
-    state = await store.load(run_id)           # {"messages": [...], "step": n}
+    state = await store.load(run_id)       # {"messages": [...], "step": n, "pending": [...]}
     while state["step"] < max_steps:
-        if DRAIN_FILE.exists():                # step boundary: state is consistent
-            await store.save(run_id, state, status="interrupted")
-            yield f"event: resume\ndata: {json.dumps({'run_id': run_id})}\n\n"
-            return
-        reply = await llm.complete(state["messages"], tools=tools.schemas())
-        state["messages"].append(reply.message)
-        if not reply.tool_calls:
-            await store.save(run_id, state, status="done")
-            yield f"event: done\ndata: {json.dumps({'text': reply.text})}\n\n"
-            return
-        for call in reply.tool_calls:
-            # idempotency key: a resumed run that repeats this call does not repeat the side effect
-            result = await tools.call(call.name, call.arguments, idempotency_key=f"{run_id}:{call.id}")
-            state["messages"].append({"role": "tool", "tool_call_id": call.id, "content": result})
+        if not state.get("pending"):       # step boundary: no tool call half-done
+            if DRAIN_FILE.exists():
+                await store.save(run_id, state, status="interrupted")
+                yield f"event: resume\ndata: {json.dumps({'run_id': run_id})}\n\n"
+                return
+            reply = await llm.complete(state["messages"], tools=tools.schemas())
+            state["messages"].append(reply.message)
+            if not reply.tool_calls:
+                await store.save(run_id, state, status="done")
+                yield f"event: done\ndata: {json.dumps({'text': reply.text})}\n\n"
+                return
+            state["pending"] = [{"id": c.id, "name": c.name, "args": c.arguments}
+                                for c in reply.tool_calls]
+            await store.save(run_id, state, status="running")   # plan saved before side effects
+        for call in state["pending"]:
+            # a run resumed after a kill re-runs these with the same ids, so the same keys
+            result = await tools.call(call["name"], call["args"],
+                                      idempotency_key=f"{run_id}:{call['id']}")
+            state["messages"].append({"role": "tool", "tool_call_id": call["id"], "content": result})
+        state["pending"] = []
         state["step"] += 1
-        await store.save(run_id, state, status="running")   # checkpoint every step
+        await store.save(run_id, state, status="running")       # checkpoint every step
         yield f"event: step\ndata: {json.dumps({'step': state['step']})}\n\n"
 ```
 
@@ -189,6 +195,9 @@ async def run_agent(run_id: str, store, llm, tools, max_steps: int = 30):
   client, a tool registry); the shape, not a library API, is the point.
 - **The client treats `resume` like `reconnect`:** it calls a resume endpoint with the run id and lands on
   a pod that is not draining.
+- **Pending tool calls are saved before they run.** If the pod is SIGKILLed mid-step, the resumed run
+  replays the same calls with the same ids instead of asking the model again (which would return new ids
+  and new keys), so the tool's idempotency store turns each repeat into a no-op.
 
 ### Worked scenario: what one deploy costs a research agent
 Illustrative numbers: runs take ~20 steps of ~6 s each (about 120 s), each step costs about $0.02 in model
@@ -197,7 +206,7 @@ calls, and 40 runs are in flight when a rolling deploy starts.
 | Setup | What happens to the 40 runs | Lost model spend | Side effects |
 |---|---|---|---|
 | Defaults: grace 30 s, run in request, no checkpoints | most are SIGKILLed mid-run and restart from step 0 | ~40 × 10 steps × $0.02 ≈ $8 per deploy | unknown: some tool calls ran, none recorded |
-| Grace 150 s, no checkpoints | runs near the start still exceed the budget; deploys take minutes | lower, not zero | still unknown for the cut runs |
+| Grace 150 s, no checkpoints | typical runs finish, but any run longer than the drain budget is still cut; every pod takes up to 150 s to stop | lower, not zero | still unknown for the cut runs |
 | Drain flag plus per-step checkpoints | each run stops at its next step boundary (within ~6 s) and resumes on a new pod | at most the in-flight step per run | recorded, and idempotency keys stop duplicates |
 
 - **Ten deploys a day at the default setup** is ~$80 a day of discarded model calls, before counting
@@ -466,11 +475,15 @@ must be cut. Very long generations should become resumable or move to a job queu
 **Drain an agent loop on SIGTERM (2-3 hours).**
 - **Goal:** show that a deploy no longer loses agent runs.
 - **Steps:** build a FastAPI endpoint that runs a fake 8-step agent loop (one second per step) and writes a
-  checkpoint after each step; set a drain flag in lifespan shutdown and make `/readyz` return 503 once it
-  is set; make the loop stop and checkpoint at the next step boundary when the flag is set; start 20 runs,
-  send SIGTERM, then resume the unfinished runs from their checkpoints.
+  checkpoint after each step; add `POST /internal/drain` that touches a drain file, and make `/readyz`
+  return 503 and the loop checkpoint and stop at its next step boundary while the file exists.
+- **Then simulate a deploy:** run Uvicorn with `--timeout-graceful-shutdown 5`, start 20 runs, act as
+  preStop (call the drain endpoint, wait 2 seconds, send SIGTERM), then restart and resume the unfinished
+  runs from their checkpoints.
+- **Why not set the flag in lifespan shutdown:** that code runs only after in-flight requests have
+  drained, so the loop and `/readyz` would never see it.
 - **Done when:** every run either finished or resumed from its last checkpoint, no step ran twice, and
-  logs show readiness failing before the process exited.
+  `/readyz` returned 503 before SIGTERM was sent.
 
 ### Major project
 This lesson feeds the module Capstone (see the module guide), where a rolling restart during active

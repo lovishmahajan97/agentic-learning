@@ -5,7 +5,7 @@ name: BackgroundTasks
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - fastapi-for-ai/job-queues-and-durable-workers
@@ -396,7 +396,9 @@ double-charge. Keep `BackgroundTasks` for the non-financial trace and metrics wr
 **Agent follow-ups with a loss audit (1-2 hours).**
 - **Goal:** add after-response follow-ups to an agent endpoint and measure what a restart loses.
 - **Steps:** build a FastAPI agent route (a fake model plus one tool); add a trace write and a usage
-  counter as `BackgroundTasks`, each opening its own DB session and catching its own exceptions; send a
-  burst of requests and restart the server mid-burst; compare responses sent with traces stored.
+  counter as `BackgroundTasks`, each opening its own DB session and catching its own exceptions; make
+  the trace write slow (a sleep of a second or two); send a burst of requests and `kill -9` the server
+  mid-burst (a graceful restart drains pending tasks, so it would hide the loss); compare responses sent
+  with traces stored.
 - **Done when:** you have a short table of requests answered versus traces written, a list classifying
   each follow-up as loss-tolerant or queue-bound, and no follow-up shares the request's DB session.

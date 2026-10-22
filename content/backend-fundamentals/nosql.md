@@ -5,7 +5,7 @@ name: NoSQL
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - backend-fundamentals/database-design
@@ -277,10 +277,10 @@ tool result. Sizes are illustrative.
 | Steps into the run | Embedded tool results | Item size | Effect |
 |---|---|---|---|
 | 5 | 5 search results, ~8 KB each | ~40 KB | fine, but every append rewrites 40 KB |
-| 20 | plus 3 fetched pages, ~60 KB each | ~340 KB | appends slow, write units per step climb |
-| 25 | one more fetched page | over 400 KB | DynamoDB rejects the write, the run cannot checkpoint |
+| 20 | 16 search results plus 4 fetched pages, ~60 KB each | ~370 KB | appends slow, and each rewrite costs ~370 write units (1 per KB) |
+| 21 | one more fetched page | ~430 KB, over 400 KB | DynamoDB rejects the write, the run cannot checkpoint |
 
-- **Fix:** one item per step (partition `RUN#<id>`, sort `STEP#00000025`), large results in object
+- **Fix:** one item per step (partition `RUN#<id>`, sort `STEP#00000021`), large results in object
   storage with a pointer, and a small run header item for status.
 - **After the fix,** each append writes only the new step, and resume reads the last step with one
   strongly consistent `Query` with `ScanIndexForward=False, Limit=1`.

@@ -5,7 +5,8 @@ name: Image embeddings
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - multimodal/clip
   - multimodal/vision-language-models
@@ -23,9 +24,20 @@ sources:
 ---
 
 ## TL;DR
-An image embedding is a fixed-length vector from a neural encoder, placed so similar images sit close
-under cosine similarity. It turns images into something a vector index can search, cluster and
-deduplicate, and the encoder you pick decides what "similar" means.
+Image embeddings are the retrieval layer of a multimodal agent: fixed-length vectors that let a tool
+search, deduplicate or cluster millions of images in milliseconds, so only a handful reach the VLM. The
+encoder you pick decides what "similar" means.
+
+## For agent builders
+- **Why it matters for agents.** An agent cannot send a whole photo archive or page corpus to a VLM. The
+  embedding index narrows candidates to the top few, and its recall caps what the agent can ever answer:
+  a page the index misses is a page the agent never sees.
+- **Where it shows up in your stack.** Multimodal RAG over page images (ColPali-style), image search and
+  "find similar" tools, duplicate checks in intake agents, and the vector store behind them.
+- **What you control.** Encoder family per query type, one preprocessing function shared by index and
+  query, per-direction thresholds the tool uses to say "no match", quantisation, and versioned re-indexing.
+- **What you can skip.** How DINO or contrastive objectives are trained in detail. Know which family
+  gives which notion of similarity and how to measure recall@k.
 
 ## Why it exists
 - **Pixels are not comparable.** Raw pixel distance says a photo and its slightly cropped copy are far
@@ -104,9 +116,18 @@ Storage is simple arithmetic, `n_images × dim × bytes_per_value`:
   quantisation shrink it further at a recall cost you measure.
 - **Recovering recall.** Re-score the top candidates with full-precision vectors.
 
+### Embeddings as an agent tool
+1. **The agent calls a tool** such as "find pages about X" or "find photos like this upload".
+2. **The tool embeds the query** with the same encoder and preprocessing as the index and returns top-k
+  identifiers, scores and thumbnails or page references.
+3. **Only those candidates go to the VLM** with the question, so the expensive step sees a few images,
+  not thousands.
+- **Why the tool must say "nothing found".** Ranking always returns k items; without a tuned floor the
+  agent will reason confidently over irrelevant images.
+
 ## Diagram
 The same preprocessing and encoder must sit on both the index path and the query path; the encoder family
-chosen at the top decides what the neighbours mean.
+chosen at the top decides what the neighbours mean, and the threshold decides what the agent receives.
 
 ```mermaid
 flowchart TD
@@ -188,6 +209,19 @@ def load_for_embedding(path):
 Figures are raw vectors before index overhead; the recall cost of each quantisation step must be measured
 on your own labelled pairs.
 
+### Worked scenario: a manuals agent with and without retrieval
+An agent answers questions over 200 candidate diagram pages per product line. Illustrative numbers,
+assuming ~1,340 image tokens per page at 1024 pixels (see the VLM lesson's formula).
+
+| Design | Images sent to the VLM per question | Image input tokens |
+|---|---|---|
+| Send all candidate pages | 200 | ~268,000, far past most context budgets |
+| Embedding search, top-5 to the VLM | 5 | ~6,700 |
+| Embedding search, top-5, recall@5 of 0.8 on a golden set | 5 | ~6,700, but 1 question in 5 has no correct page in view |
+
+- **The lesson.** Retrieval cuts cost about 40×, and its recall@k becomes the agent's ceiling, so you
+  measure it separately from end-to-end answer accuracy.
+
 ## Production patterns
 - **Version the embedding space.** When: any persistent index. How: store model name and
   `PREPROC_VERSION` with every vector, build a new index on upgrade and switch an alias once recall@k on
@@ -204,6 +238,10 @@ on your own labelled pairs.
 - **Treat vectors as sensitive data.** When: user-uploaded or regulated images. How: apply the same
   access control, retention and deletion policy to the index as to the images. Monitor: deletion requests
   that reach both stores.
+- **Evaluate the retrieval tool apart from the agent.** When: any multimodal RAG agent. How: keep a golden
+  set of questions with their correct image or page IDs, and score recall@k of the tool on every index or
+  encoder change before running end-to-end agent evals. Monitor: recall@k and the share of agent failures
+  where the right image was never retrieved.
 
 ## Trade-offs
 - **One shared index vs visual fidelity.** Contrastive image-text encoders serve text and image queries
@@ -228,6 +266,9 @@ on your own labelled pairs.
   in CMYK garbage, so matches fail for a subset of uploads only.
 - **Forgetting that the index stores content.** Embeddings of sensitive images are still sensitive data
   and can be inverted or matched. Symptom: a privacy review that blocks launch.
+- **Blaming the LLM for retrieval misses.** Symptom: an agent that hallucinates answers about images it
+  was never shown. Fix: log the tool's returned IDs per step and check whether the correct image was in
+  the top-k before tuning prompts.
 
 ## When to use
 - **Use when** the job is search, deduplication, clustering, recommendation or nearest-neighbour
@@ -291,6 +332,12 @@ constraint the team stated.
 - **Escalate.** Re-rank with metadata or a VLM, then train an adapter on frozen embeddings, and only then
   fine-tune the encoder, measuring recall@k at each step.
 
+### Your multimodal RAG agent gives wrong answers about diagrams. How do you split the blame?
+- **Score retrieval alone.** Check recall@k on a golden set: if the right page is not in the top-k, the
+  VLM never had a chance, so fix the encoder, tiling or thresholds first.
+- **Then score reading.** For questions where retrieval succeeded, measure the VLM's answer accuracy with
+  the correct page given; that isolates resolution and prompt problems.
+
 ## Quiz
 ### Q: Why are image embeddings L2-normalised before they are stored in a vector index?
 - [ ] Normalisation compresses the vectors so they take less disk space
@@ -315,3 +362,24 @@ constraint the team stated.
 - [ ] The vector index only supports image vectors
 > In contrastive models, image and text vectors occupy separate regions, so a correct text-to-image match
 > scores well below a correct image-to-image match. Thresholds must be tuned per query direction.
+
+## Use cases & projects
+### Use cases
+- **Multimodal RAG over page images.** Late-interaction embeddings retrieve the right slide or manual page
+  so the agent's VLM reads two pages instead of two hundred.
+- **"Find similar" tools.** A shopping or support agent takes the user's photo and returns catalogue items
+  or past tickets that look alike.
+- **Intake deduplication.** A claims or moderation agent checks every upload against the archive and
+  escalates near-duplicates with the matching record attached.
+- **Agent memory for images.** Embeddings of images seen earlier in a session let the agent recall "the
+  screenshot from step 3" without keeping every image in context.
+
+### Mini project
+**Retrieval-first visual question answering (2-3 hours).**
+- **Goal:** build a tool that retrieves the top-5 page images for a question and measure how its recall
+  limits an agent's answers.
+- **Steps:** embed 300-1,000 page images with one encoder and a shared preprocessing function; write 40
+  questions with their correct page IDs; implement `find_pages(question, k)`; let a VLM answer from the
+  returned pages; score recall@5 and end-to-end accuracy separately.
+- **Done when:** you have both numbers, a count of failures caused by retrieval versus reading, and one
+  change (tiling, encoder or threshold) that moved recall@5.

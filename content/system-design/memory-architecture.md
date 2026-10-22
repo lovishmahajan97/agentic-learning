@@ -5,7 +5,7 @@ name: Memory architecture
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/agent-memory
@@ -23,8 +23,8 @@ sources:
 
 ## TL;DR
 Models are stateless and windows finite, so anything your agent remembers across turns, sessions or
-users lives outside the model and returns selectively. Memory architecture designs those scoped stores
-and their write, read, update and delete policies; the hard part is what to forget.
+users lives outside the model and returns selectively. Memory architecture designs scoped stores
+and their write, read, update and delete policies; the hard part is what to remember and forget.
 
 ## For agent builders
 - **Why it matters for agents.** An agent that runs for 200 turns or returns next week either replays
@@ -425,7 +425,7 @@ no retrieval, summary or extraction can surface it afterwards.
 **Add scoped, updatable memory to a chat agent (2-3 hours).**
 - **Goal:** give an agent long-term memory that updates facts, respects user scope and can be deleted.
 - **Steps:** create a typed-slot table for profile facts and a vector table for episodes, both keyed by
-  tenant and user; extract candidate memories after each session; overwrite a slot when a new fact
+  tenant and user; extract candidate memories from user turns only after each session; overwrite a slot when a new fact
   contradicts it; retrieve under a fixed token budget with the scope filters inside the query; add a
   delete-by-user command.
 - **Done when:** a scripted three-session test shows the corrected fact winning, a second user never sees

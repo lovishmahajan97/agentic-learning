@@ -5,7 +5,7 @@ name: Outbox / inbox patterns
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - system-design/event-driven-architecture
@@ -23,9 +23,9 @@ sources:
 ---
 
 ## TL;DR
-The **outbox** commits an agent's state change and its message (a run event, a pending tool action) in
-one transaction; the **inbox** records each processed message id with the consumer's effect.
-Together: effectively-once processing between databases over an at-least-once broker.
+The **outbox** commits an agent's state change and its message (run event, pending action) in one
+transaction for a relay to publish; the **inbox** records each processed message id with the consumer's
+effect. Together: effectively-once between databases over at-least-once delivery.
 
 ## For agent builders
 - **Why it matters for agents.** An agent runtime saves step results and also has to tell the world:
@@ -291,8 +291,11 @@ def execute_pending(conn, email_api, batch=20):        # action executor: at-lea
 | After commit, before send | n/a | executor picks the row up on restart |
 | Executor dies after send, before mark | n/a | resend with the same key; provider dedupes |
 
-The last row holds only if the provider honours the key; otherwise the executor needs its own record of
-sends, and a small duplicate window remains.
+- **The provider must honour the key.** The last row holds only if it does; otherwise the executor needs
+  its own record of sends, and a small duplicate window remains.
+- **Keep actions away from the event relay.** If `relay_once` above shares this table, it would publish
+  the `SendEmailPending` row and mark it published, and the email would never be sent. Use a separate
+  `pending_actions` table, or make each loop filter on its own `event_type`.
 
 ### Worked scenario: the high-water-mark relay that loses one event forever
 Two transactions take ids 100 and 101 but commit in the opposite order.
@@ -341,7 +344,9 @@ Two transactions take ids 100 and 101 but commit in the opposite order.
   volume or latency sensitivity makes table scans costly.
 - **Inbox vs naturally idempotent effects.** The inbox makes any handler idempotent regardless of its
   logic, yet adds a write and a growing table per consumer. When the effect is naturally idempotent (an
-  upsert keyed by aggregate id) the inbox is redundant and can be skipped.
+  upsert keyed by aggregate id, or a vector upsert with deterministic chunk ids) the inbox is redundant and
+  can be skipped; keep it for ledgers, counters and "send once" effects, where a duplicate changes the
+  result.
 - **Retention vs bloat.** Keeping outbox and inbox rows longer eases debugging and widens the dedupe window,
   but table size and index bloat grow linearly; retention must at least exceed the broker's maximum
   redelivery delay.
@@ -430,8 +435,9 @@ unpublished outbox row and on inbox duplicate rate.
   resumes at the earlier step, the model decides again and the email goes out again.
 - **Fix:** commit the checkpoint and a pending-action outbox row in one transaction; an executor sends
   with the row id as the provider's idempotency key.
-- **When to skip the inbox here:** if the effect is a naturally idempotent upsert, a redelivery overwrites
-  identical data; keep the inbox for ledgers, counters and "send once" effects.
+- **Persist the decision, not just the effect.** Store the model's chosen action with the checkpoint, so
+  a resumed run reads it back instead of re-asking the model and possibly choosing a different email;
+  monitor pending-action age and provider dedupe hits.
 
 ### A webhook from a ticketing system starts an agent run. How do you make sure each ticket gets exactly one run?
 - **Inbox on the sender's event id.** Insert it with `ON CONFLICT DO NOTHING` in the same transaction that
@@ -489,7 +495,7 @@ unpublished outbox row and on inbox duplicate rate.
 - **Emitting run events reliably.** `RunCompleted` is written as an outbox row in the same transaction as
   the final run state, so billing and eval sampling never miss a finished run.
 - **Deferring agent side effects.** An agent's decision to email a customer is committed as a pending row
-  with its checkpoint, and a relay sends it afterwards with a stable idempotency key.
+  with its checkpoint, and an executor sends it afterwards with a stable idempotency key.
 - **Deduplicating webhook-triggered runs.** An inbox keyed on the sender's event id stops a retried
   webhook from starting a second agent run.
 - **Applying slow tool callbacks.** A long-running tool that calls back hours later is applied once,

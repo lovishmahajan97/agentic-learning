@@ -5,7 +5,7 @@ name: Test doubles, mocks and fixtures
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/pytest
@@ -139,20 +139,22 @@ only for code whose correctness depends on what is below it, such as response pa
 
 ## Diagram
 The decision path for one agent dependency (the model, a tool, a store): first ask whether to double it
-at all, then what you verify, then where to cut the seam.
+at all, then what you verify, then where to cut the seam (the transport seam means `httpx.MockTransport`,
+`respx` or cassettes). Every doubled path ends at the same honesty check: one shared suite run nightly against the
+real backend.
 
 ```mermaid
 flowchart TD
-    D["Dependency in the code under test"] --> Q1{"Crosses the process boundary? LLM, HTTP, DB, clock"}
+    D["Dependency in the code under test"] --> Q1{"Crosses the process boundary?"}
     Q1 -->|"no, your own code"| R["Call the real code"]
-    Q1 -->|"yes"| Q2{"Is the call itself the requirement?"}
-    Q2 -->|"no, check the result"| S["Stub or fake, assert on state"]
-    Q2 -->|"yes, e.g. never charge twice"| M["Autospecced mock or spy, assert on calls"]
-    S --> Q3{"Does correctness depend on the SDK or wire format?"}
+    Q1 -->|"yes: LLM, HTTP, DB, clock"| Q2{"Is the call the requirement?"}
+    Q2 -->|"no, check the result"| S["Stub or fake, assert state"]
+    Q2 -->|"yes, e.g. never charge twice"| M["Autospecced mock or spy"]
+    S --> Q3{"Depends on SDK or wire format?"}
     M --> Q3
-    Q3 -->|"no"| I["Inject a fake at your own interface"]
-    Q3 -->|"yes"| H["Cut at HTTP transport: MockTransport, respx, cassettes"]
-    I --> K["Keep it honest: shared suite run against the real backend nightly"]
+    Q3 -->|"no"| I["Inject fake at your interface"]
+    Q3 -->|"yes"| H["Cut at the HTTP transport"]
+    I --> K["Nightly shared suite vs real backend"]
     H --> K
 ```
 

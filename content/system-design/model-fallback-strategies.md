@@ -5,7 +5,7 @@ name: Model fallback strategies
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - serving-inference/fallbacks
@@ -143,34 +143,37 @@ your traffic. An agent pays that penalty on every remaining step.
 - **Both belong in the runbook** before the first outage.
 
 ## Diagram
-One agent step walking the ladder: the breaker and the remaining deadline decide whether a rung is tried,
-the error class decides between failing over and stopping, and the bottom of the ladder hands off to
-degradation.
+One agent step walking the ladder: the breaker and remaining deadline decide whether a rung is tried, with
+a timeout of the smaller of its own and what remains. Request errors raise without tripping the breaker
+(every rung would fail alike); success checkpoints the step with `served_by` and `fallback_depth`.
 
 ```mermaid
 flowchart TD
-    R["Agent step with step and run deadlines"] --> N{"Next rung: budget left and breaker allows?"}
+    R["Agent step with deadlines"] --> N{"Budget left and breaker closed?"}
     N -->|"no, skip rung"| MORE{"More rungs?"}
-    N -->|"yes"| C["Call target, timeout = min of rung timeout and remaining"]
-    C -->|"success"| OK["Checkpoint, tag served_by and fallback_depth"]
-    C -->|"400, 401, policy refusal, context too long"| STOP["Raise: same error on every rung, breaker not tripped"]
-    C -->|"408, 429, 5xx, timeout"| F["Record failure on this breaker, jitter"]
+    N -->|"yes"| C["Call this rung"]
+    C -->|"success"| OK["Checkpoint and tag served_by"]
+    C -->|"400, 401, policy refusal, context too long"| STOP["Raise, breaker untouched"]
+    C -->|"408, 429, 5xx, timeout"| F["Record failure, jitter"]
     F --> MORE
     MORE -->|"yes, next rung is further in behaviour"| N
-    MORE -->|"no"| D["ServiceDegraded: hand off to graceful degradation"]
+    MORE -->|"no"| D["Hand off to degradation"]
 ```
 
 ## Examples
 ### Resuming an agent run on a fallback without replaying tools
-Each step is checkpointed after it completes; tools take an idempotency key derived from the run, step and
-arguments, so a failover that re-runs a step returns the stored result instead of acting twice.
-`complete` is the ladder below; `store` is any durable key-value store.
+Each step is checkpointed after it completes; tools take an idempotency key derived from the logical
+action (run, step, call index, tool), so a failover that re-runs a step returns the stored result instead
+of acting twice.
+
+The key leaves out the arguments on purpose: a fallback model redoing the step may phrase the same
+action's arguments differently. `complete` is the ladder below; `store` is any durable key-value store.
 
 ```python
 import hashlib, json
 
-def idem_key(run_id, step, tool, args):
-    raw = json.dumps([run_id, step, tool, args], sort_keys=True)
+def idem_key(run_id, step, call_index, tool):
+    raw = json.dumps([run_id, step, call_index, tool])   # the action, not its wording
     return hashlib.sha256(raw.encode()).hexdigest()
 
 async def run_tool_once(store, key, tool_fn, args):
@@ -180,18 +183,20 @@ async def run_tool_once(store, key, tool_fn, args):
     await store.set(f"tool:{key}", result)
     return result
 
-async def run_agent(store, run_id, tools, tool_schemas, max_steps=20):
-    state = await store.get(f"ckpt:{run_id}") or {"step": 0, "messages": []}   # resume point
+async def run_agent(store, run_id, task, tools, tool_schemas, max_steps=20):
+    state = (await store.get(f"ckpt:{run_id}")                                   # resume point
+             or {"step": 0, "messages": [{"role": "user", "content": task}]})
     while state["step"] < max_steps:
         resp = await complete(state["messages"], tools=tool_schemas, deadline=10.0)  # walks the ladder
         msg = resp["message"]
         state["messages"].append(msg)
         if not msg.get("tool_calls"):
             return msg["content"]
-        for tc in msg["tool_calls"]:
+        for i, tc in enumerate(msg["tool_calls"]):
+            name = tc["function"]["name"]
             args = json.loads(tc["function"]["arguments"])   # validate against the schema here too
-            key = idem_key(run_id, state["step"], tc["function"]["name"], args)
-            out = await run_tool_once(store, key, tools[tc["function"]["name"]], args)
+            key = idem_key(run_id, state["step"], i, name)
+            out = await run_tool_once(store, key, tools[name], args)
             state["messages"].append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(out)})
         state["step"] += 1
         await store.set(f"ckpt:{run_id}", state)            # checkpoint after the step, not before
@@ -206,7 +211,7 @@ Illustrative: each step costs ~$0.05 and ~4 s; steps 3 and 6 send customer email
 
 | Recovery design | What happens after the failure | Cost and effect |
 |---|---|---|
-| Restart the run on the fallback | Steps 1-7 run again | ~$0.35 and ~28 s wasted; both emails sent twice |
+| Restart the run on the fallback | Steps 1-6 run again before step 7 | ~$0.30 and ~24 s wasted; both emails sent twice |
 | Retry the step on the dead primary | Waits out timeouts until the run deadline | Run fails, user sees an error |
 | Checkpoint per step plus idempotency keys | Step 7 re-runs on the fallback rung | One extra call (~$0.05, ~4 s); no duplicate emails |
 
@@ -242,14 +247,15 @@ FAILOVER_ON = {408, 429, 500, 502, 503, 504}   # target-side failures; same-targ
 LADDER = [("primary-us", 3.0), ("primary-eu", 3.0), ("vendor-b-equivalent", 6.0)]   # (target, timeout s)
 breakers = {t: Breaker() for t, _ in LADDER}
 
-async def complete(messages, deadline=10.0):
+async def complete(messages, tools=None, deadline=10.0):
     start, last_err = time.time(), None
     for depth, (target, timeout) in enumerate(LADDER):
         remaining = deadline - (time.time() - start)
         if remaining <= 0 or not breakers[target].allow():
             continue                                    # out of budget, or breaker open: skip this rung
         try:
-            resp = await asyncio.wait_for(call_model(target, messages), timeout=min(timeout, remaining))
+            resp = await asyncio.wait_for(call_model(target, messages, tools),
+                                          timeout=min(timeout, remaining))
             breakers[target].record(ok=True)
             return {"served_by": target, "fallback_depth": depth, **resp}
         except ModelError as e:

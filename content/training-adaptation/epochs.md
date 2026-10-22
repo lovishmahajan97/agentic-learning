@@ -5,7 +5,7 @@ name: Epochs
 kind: concept
 difficulty: intro
 est_minutes: 11
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - training-adaptation/learning-rate

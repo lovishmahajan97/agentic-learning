@@ -5,7 +5,7 @@ name: GPU utilization & memory bandwidth
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - serving-inference/prefill-vs-decode
@@ -23,9 +23,9 @@ sources:
 ---
 
 ## TL;DR
-Every agent step pays decode time for its tool call; decode does about one FLOP per weight byte per
-sequence against roofline ridges of ~150-300, so it is bandwidth-bound. `nvidia-smi` GPU-Util says a
-kernel ran, not that the chip was busy.
+Each agent step decodes its tool call at about one FLOP per weight byte per sequence, far below roofline
+ridges of ~150-300, so small batches are bandwidth-bound. `nvidia-smi` GPU-Util says a kernel ran, not
+that the chip was busy.
 
 ## For agent builders
 - **Why it matters for agents.** An agent run is a chain of model calls, so per-step decode latency is
@@ -150,8 +150,9 @@ tracks bandwidth rather than TFLOPs.
   upgrade will help.
 
 ## Diagram
-The triage path for "agent steps are slow" once prefill is ruled out: compute the bandwidth floor first, then let the DCGM signals say
-whether to batch, cut bytes, or look at the host.
+The triage path for "agent steps are slow" once traces show decode, not prefill or tools, dominates:
+compute the bandwidth floor first, then let the DCGM signals say whether to batch, cut bytes, or look
+at the host.
 
 ```mermaid
 flowchart TD
@@ -234,12 +235,14 @@ time only, from the step floors above (prefill and tool execution come on top).
   scale out; shorter tool-call outputs buy back latency at any batch.
 
 ## Production patterns
-- **Dashboard profiling fields, not GPU-Util.** Use on every serving fleet. Enable `DCGM_FI_PROF_DRAM_ACTIVE`,
-  `DCGM_FI_PROF_PIPE_TENSOR_ACTIVE` and `DCGM_FI_PROF_SM_ACTIVE` in the DCGM exporter's metric list and
-  chart them next to tokens/s per card. Monitor the DRAM-vs-tensor signature to classify each service.
+- **Dashboard profiling fields, not GPU-Util.** Use on every serving fleet. Enable
+  `DCGM_FI_PROF_DRAM_ACTIVE`, `DCGM_FI_PROF_PIPE_TENSOR_ACTIVE` and `DCGM_FI_PROF_SM_ACTIVE` in the DCGM
+  exporter's metric list and chart them next to tokens/s per card. Monitor the DRAM-vs-tensor signature
+  to classify each service.
 - **Autoscale on queue depth or tokens/s.** Use instead of any utilisation-based scaling rule. Scale on
   the engine's waiting-requests gauge (vLLM exposes `vllm:num_requests_waiting`) or on tokens/s per card
-  against a tested ceiling. Monitor per-card throughput after scale-out: flat means you replicated idle hardware.
+  against a tested ceiling. Monitor per-card throughput after scale-out: flat means you replicated idle
+  hardware.
 - **Raise the batch limit against the agent run SLO.** Use when MBU is low and KV room allows. Increase
   the engine's concurrent-sequence cap (vLLM `--max-num-seqs`) in steps under a load test that replays
   real agent traces at target concurrency. Monitor time-per-output-token p95, preemptions and end-to-end
@@ -251,8 +254,8 @@ time only, from the step floors above (prefill and tool execution come on top).
   structured tool arguments, cap output tokens per step, and move long reasoning out of the hot loop
   where quality allows. Monitor output tokens per step and step latency in agent traces.
 - **Track MBU in a benchmark per release.** Use whenever the engine, model or card changes. Run a fixed
-  load test, compute bytes per step × steps per second ÷ peak bandwidth, and record it. Monitor regressions:
-  a drop in MBU with unchanged hardware points at host-side or engine changes.
+  load test, compute bytes per step × steps per second ÷ peak bandwidth, and record it. Monitor
+  regressions: a drop in MBU with unchanged hardware points at host-side or engine changes.
 
 ## Trade-offs
 - **Larger batches vs per-sequence latency.** Tokens/s rises nearly linearly while memory-bound, but each
@@ -356,7 +359,8 @@ Buy hardware only after per-card tokens/s approaches the bandwidth bound at the 
 - **Split the step:** from traces, separate prefill (new transcript tokens), decode (output tokens × step
   time) and tool execution; the model's share is often decode at a large batch.
 - **Check the floor:** at batch 64 and 4k context the H100 step floor is about 15 ms, so 150-token tool
-  calls cost ≈ 2.3 s each and ≈ 45 s per run before tools.
+  calls cost ≈ 2.3 s each and ≈ 45 s per run: decode at the bandwidth floor explains the whole run, and
+  no engine tuning will beat it at that batch.
 - **Levers:** cap concurrency per card for the run SLO, shorten tool-call outputs, keep prefixes cached
   so prefill stays small, or quantise to cut bytes per step.
 

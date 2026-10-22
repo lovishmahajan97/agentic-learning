@@ -5,7 +5,8 @@ name: Model integration
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - system-design/ai-gateway
   - system-design/model-selection
@@ -18,9 +19,21 @@ related:
 ---
 
 ## TL;DR
-Putting a different model behind a delivered system: a new provider, fine-tuned adapter or
-customer-mandated model. Models are not drop-in parts, so it takes an adapter, a capability check,
-re-tuned prompts and the customer's eval suite as the gate.
+Putting a different model behind a delivered agent: a new provider, fine-tuned adapter or
+customer-mandated model. Models are not drop-in parts for a tool-calling loop: it takes an adapter,
+capability check, ported prompts and the customer's suite as the gate.
+
+## For agent builders
+- **Why it matters for agents.** The agent loop branches on what the model returns: tool calls, their
+  arguments, the finish reason and token usage. Each of those differs across providers, so a model swap
+  can silently stop tools running, truncate answers or break the context budget.
+- **Where it shows up in your stack.** The model adapter under your agent loop (or a gateway such as
+  LiteLLM), the capability registry, the tokenizer used by the context packer, retry and fallback logic,
+  and per-tenant model routing.
+- **What you control.** The internal `Completion` contract, which capabilities a deployment requires,
+  per-model prompt versions, the error taxonomy, pinned versions and the gate: contract tests, regression
+  suite, shadow.
+- **What you can skip.** Each provider's full SDK surface; map only the fields your loop reads.
 
 ## Why it exists
 - **In customer work the model is often not your choice.** A bank requires inference inside its own cloud
@@ -91,6 +104,15 @@ re-tuned prompts and the customer's eval suite as the gate.
 5. **A per-tenant routing switch** with the old model as fallback.
 6. **Register what was deployed** (model id, version, adapter, prompt version) so incidents can be traced
    to a specific combination.
+
+### What a model swap changes inside the agent loop
+| Loop behaviour | What differs across models | What to test |
+|---|---|---|
+| **Tool-call detection** | Where calls live and how the finish reason names them | Loop runs a tool for every returned call |
+| **Parallel tool calls** | Some models return several calls per turn, some one, some none | Loop executes and returns results for all of them |
+| **Tool results back to the model** | The message shape that carries results and links them to call ids | Model reads the result instead of re-calling |
+| **Steps per task** | Weaker or differently tuned models re-plan and retry more | Steps and tokens per completed task, not per call |
+| **Stopping** | When the model ends its turn versus asks for another tool | Stop-reason mix and step-budget hits |
 
 ### Fallback models are integrations too
 - **If the router fails over** from the primary to a second model during an outage, that second model
@@ -206,6 +228,22 @@ print(chunks_that_fit(32_000, 4_000, 1_500, 4_000, 2_000, ratio=1.15))  # 9: pac
 check_caps("open-model-v2", 32_000, ["strict_json"])   # RuntimeError: lacks ['strict_json']
 ```
 
+### Agent scenario: migrating a support agent to a customer-hosted model
+A customer mandates an open-weight model on its GPUs for a 6-tool support agent. Readout on the
+customer's 200-case regression suite (illustrative numbers):
+
+| Measure | Hosted model | Open model, endpoint swapped only | After adapter, template and prompt port |
+|---|---|---|---|
+| Task pass | 182 / 200 | 131 / 200 | 176 / 200 |
+| Tool calls parsed | 100% | 88% (arguments arrived as strings) | 100% |
+| Median steps per task | 4 | 7 | 5 |
+| Step-budget hits | 1 | 19 | 3 |
+
+- **Most of the drop was mechanical.** Unparsed arguments and a missing chat template made the agent
+  re-call tools until the step budget, which looked like a weak model.
+- **The remaining gap** (182 versus 176, with paired flips listed) is the real model difference, which
+  the customer can now accept or reject with evidence.
+
 ## Production patterns
 - **Gateway with pinned model aliases** — when several providers or tenants are in play. Map internal
   names to exact provider versions in one place (for example LiteLLM proxy's `model_list` config) and pin
@@ -225,6 +263,10 @@ check_caps("open-model-v2", 32_000, ["strict_json"])   # RuntimeError: lacks ['s
 - **Fallback models in the suite** — whenever a router can fail over. Run the customer's regression suite
   on every configured fallback, with its own ported prompt, before enabling it. Monitor quality metrics
   tagged by serving model so a failover dip is visible.
+- **Recorded agent-loop contract test** — on every adapter or model change. Replay a few recorded
+  multi-step conversations (including one with parallel tool calls and one tool error) through the
+  adapter and the real loop, with stubbed tools. Assert that every call is parsed, executed and answered
+  with a linked result. Monitor steps per task and step-budget hits per model.
 
 ## Trade-offs
 - **Normalising adapter vs model-specific features.** Models become swappable, but a
@@ -250,6 +292,11 @@ check_caps("open-model-v2", 32_000, ["strict_json"])   # RuntimeError: lacks ['s
   that coincide exactly with the primary provider's outage window.
 - **Not mapping provider errors.** Symptom: retries hammering a model on non-retryable errors, or giving
   up immediately on rate limits.
+- **An agent loop that handles only the first tool call.** Symptom: on a model that returns parallel
+  calls, some tools never run and the model asks for them again, inflating steps. Fix: execute every
+  returned call and return all results, or disable parallel calls where the API allows it.
+- **Judging a new model by cost per token.** Symptom: a cheaper model that costs more per task because it
+  takes more steps. Fix: report cost and latency per completed task on the suite.
 
 ## When to use
 - **Treat every model change as an integration project:** a new provider, a customer-mandated deployment,
@@ -310,6 +357,13 @@ compare paired flips against the old model on the same suite.
 - **Pack deliberately** rather than letting the server error or truncate silently, and monitor chunks per
   request and context-length errors.
 
+### After swapping your agent's model, tasks take far more steps and often hit the step budget. How do you debug it?
+- **Check mechanics first:** are all tool calls parsed (arguments as string versus object), are parallel
+  calls all executed, and do results go back in the shape the new model expects, linked to call ids?
+- **Then check the chat template and stop tokens** if self-hosted, since a wrong template makes the model
+  ignore results and re-plan.
+- **Only then compare models** on paired flips, steps per task and cost per completed task.
+
 ## Quiz
 ### Q: Why should context budgeting use the target model's own tokenizer?
 - [ ] Tokenizers determine the model's sampling temperature
@@ -334,3 +388,29 @@ compare paired flips against the old model on the same suite.
 - [ ] Pinned versions have larger context windows
 > A moving alias can point at a new model at any time, invalidating the evals you gated on. Pinning makes
 > every change an explicit integration step with its own regression run.
+
+## Use cases & projects
+### Use cases
+- **Customer-mandated models.** A bank's agent must run on its cloud tenancy's models; the adapter and
+  capability entry make that a config change plus a gated port.
+- **Multi-provider agent platforms.** One agent loop runs on several providers per tenant, with typed
+  errors driving the same retries and fallbacks everywhere.
+- **Deploying fine-tuned adapters.** A new per-customer adapter is integrated and gated like any other
+  model change.
+- **Outage fallbacks.** A second model is pre-integrated and suite-tested so failover does not become a
+  quality incident.
+
+### Mini project
+**Make one agent loop run on two providers (2-3 hours).**
+- **Goal:** a tool-calling agent that works unchanged on two model APIs through one internal contract.
+- **Steps:** reuse `from_openai_chat` and `from_anthropic_messages` above; write a loop that branches only
+  on `Completion.finish`; add a capability entry per model and `check_caps` at startup; record three
+  conversations (one with parallel tool calls, one with a tool error) and replay them through both
+  adapters with stubbed tools; log steps, tokens and finish reasons per model.
+- **Done when:** all three conversations complete on both providers, an unknown finish value raises, and
+  you have a per-model table of steps per task and cost per completed task.
+
+### Major project
+This lesson feeds the module Capstone (see the module guide): integrating the utility's mandated model
+in its own cloud tenancy, with a report on adapter changes, tokenizer and context effects, prompt
+porting and paired flips on the regression suite.

@@ -5,7 +5,7 @@ name: Quantization (INT8/INT4, GPTQ, AWQ, GGUF)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - training-adaptation/peft
@@ -137,7 +137,8 @@ QLoRA sits in between: a frozen 4-bit base with trainable adapters that learn ar
   output error on calibration data.
 - **Why it generalises.** No gradient and no weight reconstruction, so AWQ runs fast, overfits calibration
   less than GPTQ, and transfers well across domains and modalities.
-- **Kernels.** Both ship with fast INT4 GPU kernels (Marlin, ExLlama) in vLLM, SGLang and TensorRT-LLM.
+- **Kernels.** Both run on fast INT4 GPU kernels: Marlin and ExLlama-style kernels in vLLM and SGLang,
+  and TensorRT-LLM's own INT4 weight-only kernels.
 
 ### GGUF: a container, not a method
 - **What it is.** The single-file format of llama.cpp (it replaced the older GGML format in 2023). One
@@ -166,20 +167,21 @@ QLoRA sits in between: a frozen 4-bit base with trainable adapters that learn ar
   web text.
 
 ## Diagram
-Read it as the decision path from where the agent model runs to the format; every branch ends at the
-same agent eval gate against the bf16 parent.
+Read it as the decision path from where the agent model runs to the format; GPTQ and AWQ both land at
+about 4.16 bits per weight with group 128. Every branch ends at the same gate: tool-call validity, task
+success and tokens per second against the bf16 parent.
 
 ```mermaid
 flowchart TD
     M[("bf16 master checkpoint")] --> T["Where does it run?"]
-    T -->|"GPU with native FP8"| F["FP8 weights, activations and KV cache"]
-    T -->|"must fit a smaller or single GPU"| C["Calibrate on in-domain data"]
-    C --> G["GPTQ: compensate rounding error column by column"]
-    C --> A["AWQ: rescale salient channels, then round"]
-    G --> I4["INT4 per-group, about 4.16 bits per weight"]
+    T -->|"GPU with native FP8"| F["FP8 weights, activations, KV cache"]
+    T -->|"must fit one smaller GPU"| C["Calibrate on agent traces"]
+    C --> G["GPTQ: error compensation"]
+    C --> A["AWQ: rescale salient channels"]
+    G --> I4["INT4 per-group, g = 128"]
     A --> I4
-    T -->|"local agent: laptop, CPU or edge"| U["Convert to GGUF, Q4_K_M or Q5_K_M"]
-    F --> E["Agent evals vs bf16: tool-call validity, task success, tokens per second"]
+    T -->|"laptop, CPU or edge"| U["GGUF: Q4_K_M or Q5_K_M"]
+    F --> E["Agent eval gate vs bf16"]
     I4 --> E
     U --> E
 ```
@@ -287,7 +289,7 @@ def tool_call_validity(call_model, cases, tools):
     """cases: [{"messages": [...], "expect_tool": "search_orders"}]; tools: {name: required_arg_names}."""
     ok_json = ok_tool = ok_args = 0
     for c in cases:
-        raw = call_model(c["messages"])            # returns the model's tool-call text
+        raw = call_model(c["messages"])            # tool-call text: {"name": ..., "arguments": {...}}
         try:
             call = json.loads(raw)
         except json.JSONDecodeError:
@@ -473,9 +475,9 @@ quality drops too far, the honest options are two GPUs with FP8 or a smaller mod
 ### Mini project
 **Quantization eval gate for a tool-calling agent (2-3 hours).**
 - **Goal:** find the cheapest precision of one open model that keeps your agent's tool calls valid.
-- **Steps:** pick a small open model with a chat template that supports tools; get its bf16 weights
-  plus two quantized variants (for example a `Q4_K_M` GGUF and an 8-bit build); run the same 50 scripted
-  tool-calling tasks against each; record schema-valid calls, correct tool names, task success and
-  tokens per second.
+- **Steps:** pick a small open model (1-4B) with a chat template that supports tools; get three builds
+  in one runtime so speed is comparable (for example F16, `Q8_0` and `Q4_K_M` GGUF files served by
+  llama.cpp's OpenAI-compatible `llama-server`); run the same 50 scripted tool-calling tasks against
+  each; record schema-valid calls, correct tool names, task success and tokens per second.
 - **Done when:** a table ranks the three builds, names the one you would ship and states the regression
   threshold you used to decide.

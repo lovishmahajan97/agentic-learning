@@ -34,7 +34,7 @@ is found by vector distance.
   the wrong context and nothing errors.
 - **Where it shows up in your stack.** The embedding model behind your vector store (pgvector, Qdrant and
   similar), the retriever object in agent frameworks, and the memory store an agent writes to between
-  sessions. The LLM's own token embedding table you never touch directly.
+  sessions. You never touch the LLM's own token embedding table directly.
 - **What you control.** Which embedding model and version, dimension, normalization, chunk size, query
   and passage prefixes, and whether lexical search runs alongside. Each changes what the agent's search
   tool returns.
@@ -422,8 +422,6 @@ set covering old documents, run before the cutover.
   and cost fewer prompt tokens.
 - **Measure two things.** Shortlist recall (was the correct tool in the top few, from labelled traces) and
   end-to-end tool-choice accuracy. Rewrite vague tool descriptions first, since they are what gets embedded.
-- **Background:** tying the LLM's own input and output tables (about 38.6M of ~124M parameters in GPT-2
-  small; untied in Llama-2) is unrelated to this and never something you tune here.
 
 ## Quiz
 ### Q: Why is an embedding lookup mathematically identical to a linear layer applied to a one-hot vector?

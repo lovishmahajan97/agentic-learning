@@ -5,7 +5,7 @@ name: Health / readiness endpoints
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - fastapi-for-ai/lifespan
@@ -487,7 +487,8 @@ endpoint serves dashboards.
 - **Steps:** add `/livez` (process only) and `/readyz` (checkpoint store reachable, tool registry loaded,
   drain flag clear) to a FastAPI agent stub; run it locally with a fake tool backend; stop the tool
   backend and confirm both probes stay healthy while the agent reports the tool as unavailable; stop the
-  checkpoint store and confirm only readiness fails.
+  checkpoint store and confirm only readiness fails (acceptable here only because no run can start
+  without it).
 - **Done when:** a written table lists each dependency failure and the probe result you observed, and no
   shared dependency appears in the liveness check.
 

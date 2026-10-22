@@ -5,7 +5,7 @@ name: LLM-as-a-judge
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - evals/judge-calibration-and-bias
@@ -23,9 +23,9 @@ sources:
 ---
 
 ## TL;DR
-LLM-as-a-judge has a model grade an agent's open outputs or trajectories against a rubric. It scales
-grading, but is only as good as its measured agreement with humans: judges carry position, verbosity
-and self-preference biases.
+A model grades an agent's open outputs or trajectories against a rubric, often with a reference. It
+scales grading but is only as good as its measured human agreement: judges carry position, verbosity
+and self-preference biases and grade confidently, right or wrong.
 
 ## For agent builders
 - **Why it matters for agents.** Much of what makes an agent good cannot be asserted in code: is the
@@ -241,10 +241,12 @@ def judge_grounding(trace: list[dict], reply: str, max_chars=2000) -> dict:
 | Human-labeled ungrounded replies | 40 |
 | Caught by the judge (failure recall) | 34 of 40, 85% |
 | Grounded replies wrongly failed | 6 of 110 |
-| Misses traced to truncated tool output | 4 of the 6 missed failures |
+| Wrong fails traced to truncated tool output | 4 of the 6 wrongly failed |
 
-- **Reading it:** most misses come from `max_chars` cutting the field the reply cited, so raise the
-  limit for that tool or pass only the cited fields, then re-run calibration before gating on it.
+- **Reading it:** most wrong fails come from `max_chars` cutting the field the reply cited, so the judge
+  saw a supported claim as unsupported. Raise the limit for that tool or pass only the cited fields.
+- **The 6 missed failures need a rubric fix:** read their reasons, add them as anchors, then re-run
+  calibration before gating on 85% failure recall.
 
 ### Pairwise in both orders, plus the corrected pass rate
 Pure Python. Counts order-consistent wins, treats flips as ties, tests the decisive items, and applies
@@ -455,8 +457,9 @@ feeds back into the rubric and triggers re-calibration when the generator change
 **Build and calibrate a groundedness judge for a RAG agent (2-3 hours).**
 - **Goal:** create a judge you can trust to grade one criterion on agent replies.
 - **Steps:** collect 50 replies with the tool results each was based on; label each by hand as grounded
-  or not; write a judge prompt for that single criterion with anchors and a yes/no verdict plus reason;
-  run it, swapping the order of inputs where relevant; measure agreement with your labels and read every
-  disagreement; revise the rubric once and re-measure.
-- **Done when:** you have an agreement number before and after the revision, a list of the judge's error
-  patterns, and a stated threshold below which the judge may not gate a release.
+  or not, making sure at least 15 are ungrounded; write a judge prompt for that single criterion with
+  anchors and a reason-then-verdict JSON reply; run it; measure agreement, kappa and recall on
+  ungrounded replies, and read every disagreement; revise the rubric once and re-measure.
+- **Done when:** you have agreement and failure recall before and after the revision, a list of the
+  judge's error patterns, and a stated failure-recall threshold below which the judge may not gate a
+  release.

@@ -5,7 +5,8 @@ name: Health checks
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - fastapi-for-ai/health-readiness-endpoints
   - backend-fundamentals/kubernetes
@@ -19,9 +20,21 @@ sources:
 ---
 
 ## TL;DR
-Health checks tell infrastructure whether an instance should get traffic or be restarted. Liveness,
-readiness, startup and synthetic end-to-end checks answer different questions, so they stay separate;
-mixing them turns a degraded dependency into a total outage.
+Health checks tell infrastructure whether an agent service instance should get traffic or be restarted.
+Liveness, readiness, startup and synthetic agent-task checks answer different questions; mixing them
+turns one slow LLM provider or tool into a total outage.
+
+## For agent builders
+- **Why it matters for agents.** Your agent depends on an LLM provider, a vector store and several tools,
+  all outside the process. Wire any of them into liveness and one provider blip restarts the whole fleet,
+  killing every in-flight agent run.
+- **Where it shows up in your stack.** `/livez`, `/readyz` and `/startupz` endpoints in the agent's API
+  server, Kubernetes probe settings, a pre-stop delay and grace period for long runs, and a scheduled
+  golden agent task from outside the cluster.
+- **What you control.** What each probe checks (local only), probe timing from measured load times, the
+  per-replica in-flight budget for agent runs, how long draining waits, and the golden task's assertions.
+- **What you can skip.** Health-checking every tool on each probe. Report tool and provider health
+  through metrics, alerts and the synthetic check, never through restart or routing probes.
 
 ## Why it exists
 - **Infrastructure cannot see inside an instance.** Without checks, traffic keeps flowing to a process
@@ -34,7 +47,7 @@ mixing them turns a degraded dependency into a total outage.
 - **A single deep check wired to restarts is dangerous.** Checking every dependency (database, vector
   store, LLM provider) in the restart probe means one provider blip fails every instance at once: a
   fleet-wide restart storm with cold model loads on top.
-- **"Healthy" is not one question.** Restart, route traffic, and "does the product work end to end" have
+- **"Healthy" is not one question.** Restart, route traffic, and "does the agent work end to end" have
   different answers and consequences, so each gets its own check and scope.
 
 ## How it works
@@ -44,7 +57,7 @@ mixing them turns a degraded dependency into a total outage.
 | **Liveness** | Is this process irrecoverably stuck? | Event loop responds, no deadlocked worker | Restart (kubelet, after repeated failures) |
 | **Readiness** | Can it serve a request successfully right now? | Model loaded, GPU usable, not overloaded, not shutting down | Remove from Service endpoints, no restart |
 | **Startup** | Has slow initialisation finished? | Weights loaded, GPU warmed, in-memory index built | Liveness and readiness wait until it passes |
-| **Synthetic end-to-end** | Does the product produce a correct answer? | Golden request through the real entry point | Alert and dashboard, never restart |
+| **Synthetic end-to-end** | Does the agent complete a known task correctly? | Golden task through the real entry point, tools included | Alert and dashboard, never restart |
 
 ### Liveness: should this process be restarted?
 - **Check only what a restart would fix:** the event loop responds, a worker thread is not deadlocked.
@@ -63,6 +76,9 @@ mixing them turns a degraded dependency into a total outage.
   and wait before exit.
 - **Kubernetes removes a terminating pod from endpoints itself, but asynchronously**, so the usual pattern
   is a short pre-stop delay plus a graceful-shutdown timeout longer than the longest stream.
+- **Agent runs can outlast any sensible grace period.** A multi-minute tool-calling run should checkpoint
+  its state so another replica can resume it, rather than forcing a grace period long enough for the
+  slowest run.
 
 ### Startup: has slow initialisation finished?
 - **Loading weights, warming a GPU or building an in-memory index can take minutes.** A startup probe
@@ -72,10 +88,12 @@ mixing them turns a degraded dependency into a total outage.
 
 ### Synthetic end-to-end checks
 - **Probes describe one instance, not the product.** A synthetic check runs from outside on a schedule:
-  a fixed golden request through the real entry point (auth, retrieval, model, guardrails), asserting on
-  the answer, for example that it cites the expected document.
+  a fixed golden request through the real entry point (auth, retrieval, model, tools, guardrails),
+  asserting on the answer, for example that it cites the expected document.
 - **It catches what probes never see:** a stale index, an expired credential to a customer system, a model
-  silently changed behind an alias.
+  silently changed behind an alias, a tool whose schema changed so every call fails.
+- **For agents, assert on the path too:** the expected tool was called, the step count stayed under budget,
+  and no write tool fired on a read-only task.
 - **Results feed alerts and dashboards, not restarts.**
 
 ### Probe timing is arithmetic, not taste
@@ -103,7 +121,7 @@ reaction_time ≈ periodSeconds × failureThreshold   (+ up to timeoutSeconds pe
 
 ## Diagram
 Kubernetes runs the startup probe first; after it passes, liveness and readiness run independently and
-trigger different actions.
+trigger different actions. Draining lets in-flight agent runs finish or checkpoint.
 
 ```mermaid
 stateDiagram-v2
@@ -116,14 +134,16 @@ stateDiagram-v2
     Ready --> Restarted: liveness fails threshold times
     NotReady --> Restarted: liveness fails threshold times
     Ready --> Draining: termination signal
-    Draining --> [*]: in-flight streams finished
+    Draining --> [*]: in-flight runs finished or checkpointed
     Restarted --> Starting
 ```
 
 ## Examples
 ### FastAPI service with separate probes
-A FastAPI service that loads a model at startup, separates liveness from readiness and reports
-overload. The model loader is a stand-in for real initialisation. It runs as a background task because
+A FastAPI agent service that loads a model at startup, separates liveness from readiness and reports
+overload. The model loader is a stand-in for real initialisation.
+
+It runs as a background task because
 an `await` inside the lifespan would delay the server from accepting connections until loading ends:
 probes would see connection refused rather than a 503 with a reason.
 
@@ -167,11 +187,11 @@ async def readyz(resp: Response):
     return {"ready": not reasons, "reasons": reasons}
 ```
 
-- **No check calls the LLM provider or the vector store.** Their health is reported by metrics and a
-  separate synthetic check, so an upstream outage degrades the service instead of emptying the load
+- **No check calls the LLM provider, the vector store or any tool.** Their health is reported by metrics
+  and a separate synthetic check, so an upstream outage degrades the agent instead of emptying the load
   balancer.
-- **A real deployment increments and decrements `in_flight`** around each generation (including the whole
-  duration of a streamed response).
+- **A real deployment increments and decrements `in_flight`** around each agent run (including the whole
+  duration of a streamed response and every tool call in between).
 - **Draining is configured in the platform**, for example a Kubernetes pre-stop delay, rather than by
   overriding the server's own signal handling.
 
@@ -206,10 +226,42 @@ spec:
             command: ["sleep", "10"]      # let endpoint removal propagate before SIGTERM
 ```
 
+### A golden agent task as a synthetic check
+Run from outside the cluster every few minutes. It sends a fixed task through the public entry point and
+asserts on the answer and the path. The endpoint and response fields are those of your own agent API;
+the ones here are illustrative.
+
+```python
+import time, httpx
+
+GOLDEN = {"task": "What is the excess on policy P-1001 for water damage?"}
+
+def synthetic_check(base_url, token):
+    t0 = time.monotonic()
+    r = httpx.post(f"{base_url}/v1/agent/runs", json=GOLDEN,
+                   headers={"Authorization": f"Bearer {token}"}, timeout=60)
+    took = time.monotonic() - t0
+    r.raise_for_status()
+    run = r.json()                                   # {"answer", "citations", "tool_calls"}
+    tools = [c["tool"] for c in run["tool_calls"]]
+    failures = []
+    if "lookup_policy" not in tools: failures.append("expected tool not called")
+    if "doc-P-1001" not in run["citations"]: failures.append("expected document not cited")
+    if len(tools) > 6: failures.append(f"{len(tools)} tool calls, budget 6")
+    if any(t.startswith("update_") for t in tools): failures.append("write tool on read-only task")
+    if took > 20: failures.append(f"slow: {took:.1f}s")
+    return failures                                  # empty list = pass; alert after 2 in a row
+```
+
+- **Every probe can be green while this fails:** an expired credential to the policy system, a renamed tool
+  parameter, or a stale index all break the golden task without touching any instance's local state.
+- **Keep it read-only and cheap:** one fixed task per critical path, so the check costs a handful of model
+  calls per run and can never change customer data.
+
 ### Worked scenario: the 90-second provider blip
 | Design | What happens during a 90-second provider outage |
 |---|---|
-| Provider checked in **liveness** | Every pod fails together, all restart, each reloads weights; recovery takes many minutes after the provider is back |
+| Provider checked in **liveness** | Every pod fails together, all restart, each reloads weights; recovery takes many minutes after the provider is back, and every in-flight agent run is lost |
 | Provider checked in **readiness** | No restarts, but every pod goes unready; zero endpoints for roughly the outage's duration, so even the fallback cannot be served |
 | Provider in **metrics and synthetic check only** | Pods stay ready; requests use the fallback model or return a clear error; an alert links to the runbook |
 
@@ -223,9 +275,12 @@ spec:
 - **Pre-stop delay plus graceful timeout.** Add a short pre-stop sleep so endpoint removal propagates, and
   set `terminationGracePeriodSeconds` above the longest stream; the server should finish in-flight
   requests on SIGTERM. Monitor client-side disconnects and truncated streams during deploys.
-- **Golden-request synthetic check.** Run a scheduled job (every few minutes) from outside the cluster
-  that sends a fixed question through the public entry point and asserts on a cited document ID. Alert
-  on consecutive failures and track synthetic latency separately from real traffic.
+- **Checkpointed agent runs.** For runs longer than the grace period, persist state after each tool step
+  so a run interrupted by a deploy resumes on another replica instead of restarting. Monitor runs resumed
+  versus runs lost per deploy.
+- **Golden-task synthetic check.** Run a scheduled job (every few minutes) from outside the cluster that
+  sends a fixed task through the public entry point and asserts on a cited document ID, the tools called
+  and the step count. Alert on consecutive failures and track synthetic latency separately.
 - **Capacity-aware readiness with autoscaling.** Fail readiness at a per-replica in-flight budget, and
   pair it with a horizontal autoscaler and a front-door rate limit so the fleet never reaches zero ready
   endpoints. Monitor the fraction of replicas reporting "at capacity".
@@ -240,9 +295,9 @@ spec:
 - **Graceful shedding vs empty endpoints.** Load-based readiness ("at capacity") sheds traffic gracefully,
   but if every replica hits capacity at once the service has no endpoints; pair it with autoscaling and a
   front-door rate limit.
-- **End-to-end proof vs cost and drift.** Synthetic checks prove end-to-end correctness, but each costs a
-  real model call and can drift from real usage; keep them few, cheap and representative of the critical
-  path.
+- **End-to-end proof vs cost and drift.** Synthetic checks prove end-to-end correctness, but each costs
+  real model and tool calls and can drift from real usage; keep them few, cheap and representative of the
+  critical path.
 
 ## Pitfalls
 - **Checking the LLM provider or database in liveness.** Symptom: every pod restarts at once during a short
@@ -250,16 +305,18 @@ spec:
 - **No startup probe for a service loading large weights.** Symptom: pods killed by liveness during model
   loading and stuck in a restart loop. Fix: a startup probe sized to the worst case.
 - **Exiting without draining**, so new requests still arrive during shutdown. Symptom: streamed responses
-  cut off mid-answer on every deploy or scale-down. Fix: pre-stop delay and graceful timeout.
+  and agent runs cut off mid-answer on every deploy or scale-down. Fix: pre-stop delay, graceful timeout,
+  and checkpoints for long runs.
 - **Only shallow HTTP pings.** Symptom: instances that report healthy while every request fails because
   the model never loaded or a GPU is in an error state. Fix: readiness checks model and GPU state.
-- **Treating green probes as proof the product works.** Symptom: all-green dashboards while users get wrong
-  answers from a stale index, which only a synthetic end-to-end check would have caught.
+- **Treating green probes as proof the agent works.** Symptom: all-green dashboards while users get wrong
+  answers from a stale index or a broken tool, which only a synthetic end-to-end check would have caught.
 
 ## When to use
-- **Every deployed service:** liveness and readiness.
+- **Every deployed agent service:** liveness and readiness.
 - **Slow initialisation:** add a startup probe.
-- **Customer-facing AI system:** at least one synthetic end-to-end check on the critical path.
+- **Customer-facing agent:** at least one synthetic golden task on the critical path, asserting on answer
+  and tool path.
 - **Decide scope by the action triggered:** restart, route away, or alert.
 - **Measure:** probe failure counts, restart counts, ready replica count and synthetic pass rate, with each
   health alert linked to a runbook.
@@ -301,22 +358,23 @@ slow loads are not killed.
 - **Then short liveness and readiness**, which Kubernetes only starts after startup passes, so hangs are
   still detected quickly later.
 
-### Users see streamed answers cut off during every deploy. What do you change?
+### Agent runs take several minutes and are cut off during every deploy. What do you change?
 - **Drain properly:** a short pre-stop delay so endpoint removal propagates, then a grace period longer than
-  the longest stream so in-flight requests finish.
-- **Verify:** count truncated streams and client disconnects during a rollout before and after the change.
+  the typical run so in-flight requests finish.
+- **Checkpoint long runs:** persist state after each tool step so a run on a terminating pod resumes on
+  another replica; verify by counting runs resumed versus lost and truncated streams per rollout.
 
-### All probes are green but users report wrong answers. What check is missing?
+### All probes are green but users report the agent gives wrong answers. What check is missing?
 - **A synthetic end-to-end check:** probes describe local instance state, so a stale index, expired
-  customer credential or model silently changed behind an alias leaves every probe green.
-- **Design it:** a golden request through the real entry point, asserting on a cited document, feeding
-  alerts rather than restarts.
+  customer credential, broken tool or model silently changed behind an alias leaves every probe green.
+- **Design it as a golden task:** sent through the real entry point, asserting on a cited document, the
+  tools called and the step count, feeding alerts rather than restarts.
 
-### When would you put a dependency into readiness after all?
-- **When it is per-instance:** a local GPU or a sidecar only that pod uses, where routing away from this
-  replica actually helps.
-- **Not for shared dependencies:** if every replica shares it, all go unready together and nothing,
-  not even a fallback, can be served.
+### Should the agent's readiness probe check that its tools are reachable?
+- **No, for shared tools:** if every replica checks the same CRM or search API and it fails, all go unready
+  together and nothing, not even a degraded answer, can be served.
+- **Yes, for per-instance dependencies:** a local GPU or a sidecar only that pod uses, where routing away
+  from this replica actually helps. Tool health belongs in metrics, alerts and the synthetic task.
 
 ## Quiz
 ### Q: What happens in Kubernetes when a pod fails its readiness probe but passes liveness?
@@ -342,3 +400,25 @@ slow loads are not killed.
 - [ ] A pod that is shutting down
 > Probes check one instance's local condition. A stale index leaves every instance healthy while
 > answers are wrong, which only a check asserting on real end-to-end output can detect.
+
+## Use cases & projects
+### Use cases
+- **Self-hosted model behind an agent.** A startup probe sized to cold weight loads stops restart loops
+  when nodes scale up.
+- **Agents depending on a hosted LLM provider.** Local-only liveness and readiness keep the fleet serving a
+  fallback during a provider blip instead of restarting.
+- **Long-running tool-calling agents.** Draining plus checkpointing keeps deploys from killing
+  multi-minute runs.
+- **RAG agents over customer content.** A golden-task synthetic check catches stale indexes, expired
+  connector credentials and broken tools that every probe misses.
+
+### Mini project
+**Health checks for a toy agent service (1-2 hours).**
+- **Goal:** an agent API whose probes survive a provider outage and whose synthetic check catches a broken
+  tool.
+- **Steps:** build a FastAPI agent with `/livez`, `/readyz` (model loaded, in-flight budget) and
+  `/startupz`; stub the LLM provider and one tool behind a switch; write a golden-task script asserting
+  on the tool called and a cited ID; flip the provider switch off and then break the tool's schema.
+- **Done when:** with the provider down, readiness stays green and requests get a clear degraded answer;
+  with the tool broken, every probe stays green while the synthetic check reports the exact failure two
+  runs in a row.

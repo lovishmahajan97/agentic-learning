@@ -5,7 +5,7 @@ name: Tooling (Promptfoo, RAGAS, DeepEval, Braintrust, LangSmith, Langfuse)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - evals/eval-harness
@@ -34,7 +34,7 @@ by where traces live and how much grading you own.
   into a test case. Picking the wrong one means hand-copying traces into spreadsheets.
 - **Where it shows up in your stack.** LangChain and LangGraph trace into LangSmith automatically and
   into Langfuse through its LangChain callback handler; a hand-rolled loop or another SDK uses LangSmith's
-  `@traceable`, Langfuse's decorator or OpenTelemetry. Promptfoo or DeepEval run in CI; RAGAS scores the
+  `@traceable`, Langfuse's `@observe` decorator or OpenTelemetry. Promptfoo or DeepEval run in CI; RAGAS scores the
   retrieval step.
 - **What you control.** The target adapter that runs your agent per item, which scorers grade the final
   state and which grade the trajectory, the pinned judge model and library version, sampling rate for
@@ -270,7 +270,8 @@ A LangGraph agent evaluated on a LangSmith dataset with two of your own scorers:
 on the trajectory. The target runs the full loop per item and returns the tool calls it made.
 
 ```python
-# assumes LANGSMITH_API_KEY and tracing env vars are set; dataset "support-agent-v3" exists
+# assumes langsmith 0.2+ (evaluators may take outputs/reference_outputs and return a bool),
+# LANGSMITH_API_KEY and tracing env vars set, and a dataset "support-agent-v3" that already exists
 from langsmith.evaluation import evaluate
 from my_agent import agent          # compiled LangGraph graph, e.g. create_react_agent(model, tools)
 
@@ -519,6 +520,7 @@ numbers are components, not the verdict.
 - **Steps:** take a small tool-calling agent and instrument it with LangSmith's `@traceable`, Langfuse's
   decorator or OpenTelemetry; write a target adapter that runs the agent per dataset item; add one
   outcome scorer and one trajectory scorer (for example, was the right tool called); run 15-20 items
-  through a CI library and log the run to the platform; pin the judge model and library version.
+  through a CI library and log the run to the platform; repeat with a second prompt version; pin the
+  library version (and the judge model, if you add a judge scorer).
 - **Done when:** two runs of different prompt versions appear side by side in the platform with per-item
   scores and full trajectories, and the CI job fails when you break the agent on purpose.

@@ -5,7 +5,7 @@ name: Eval harness
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - evals/golden-dataset
@@ -231,8 +231,9 @@ def agent_target(item, config):
     tools = {name: (lambda f: lambda **a: f(db, **a))(f) for name, f in TOOLS.items()}
     messages, trace, t0, tokens = [{"role": "user", "content": item["input"]["message"]}], [], time.time(), 0
     for step in range(config["max_steps"]):            # e.g. 10
-        action = agent_step(messages, config)          # -> {"tool": name, "args": {...}} or {"final": text}
+        action = agent_step(messages, config)          # -> {"tool", "args"} or {"final"}, plus "usage_tokens"
         tokens += action["usage_tokens"]
+        messages.append({"role": "assistant", "content": action})   # the call precedes its result
         if tokens > config["max_tokens"] or time.time() - t0 > config["max_seconds"]:
             raise BudgetExceeded(f"step {step}")
         if "final" in action:
@@ -255,12 +256,13 @@ def grade_agent(out, item):                            # outcome first, path onl
 | Passed (state, path and budget) | 291 of 360 |
 | Failed on final state | 41 |
 | Failed on forbidden or missing tool | 16 |
-| `BudgetExceeded` (reported as errors, not dropped) | 12 |
+| `BudgetExceeded` (recorded as failures, not dropped) | 12 |
 
 - **Reading it:** the 12 budget errors cluster on 4 tasks where the agent re-calls `lookup_order` in a
   loop; the stored trace shows the tool returned an error string the prompt never explains.
-- **One adjustment to `run_eval`:** do not retry `BudgetExceeded`, because it is a deterministic agent
-  failure, not a transient provider error; retry only rate limits and timeouts.
+- **One adjustment to `run_eval`:** catch `BudgetExceeded` before the generic handler and record the
+  run as failed (`pass = False`), without retrying, because it is an agent failure, not a transient
+  provider error; retry and report as errors only rate limits and timeouts.
 
 ### A CI gate against a baseline
 Pure Python. It compares graded results from a baseline and a candidate run on the same items, fails on
@@ -485,5 +487,6 @@ per-slice interval that says whether six points at that n is signal at all.
   tokens per run; retry transient errors and record any that still fail as errors, not passes; write a
   run manifest (model id, prompt hash, sampling settings, dataset and grader versions); store each
   trajectory; grade final state with code; diff per task against a saved baseline run.
-- **Done when:** two runs with the same manifest give comparable results, errors are reported separately
-  from failures, and the diff lists which tasks flipped and links to their traces.
+- **Done when:** two runs of the unchanged baseline give you a noise-floor flip count, errors are
+  reported separately from failures, and the diff of a changed prompt lists flipped tasks with their
+  traces next to that floor.

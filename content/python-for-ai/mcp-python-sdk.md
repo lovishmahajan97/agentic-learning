@@ -5,7 +5,7 @@ name: MCP Python SDK
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/model-context-protocol
@@ -477,5 +477,16 @@ inside a FastMCP tool does not do this, because it is returned to the client as 
 - **Done when:** the agent completes a two-step task using both tools, recovers from the deliberate tool
   error, and the same server also works unchanged in one existing MCP host.
 
-The module guide's Capstone is the major project that combines this server with the module's other
-lessons into a working agent.
+### Major project
+**Production ticket-tools MCP server with its own host agent (multi-day).**
+- **Goal:** one Python MCP server that serves support-ticket tools to an IDE or desktop host over stdio
+  and to a fleet of your own agents over Streamable HTTP, from the same tool code.
+- **Scope:** FastMCP tools for search, read and create with `Literal` and bounded arguments; an
+  `asyncpg` pool in `lifespan`; errors written for the model; `ctx` progress on slow searches;
+  `stateless_http=True` behind auth and origin checks; a host agent with a step budget and a curated
+  tool list; a CI job that snapshots `list_tools()` output.
+- **Done when:** an existing host and your agent both list and call the tools, a bad argument comes back
+  as an `isError` result the agent recovers from, nothing but JSON-RPC reaches stdout, and three replicas
+  behind a round-robin balancer serve calls with zero "session not found" errors.
+- **Module tie-in:** the module Capstone (see the module guide) is a ticket-triage pipeline; as a stretch,
+  expose its classifier through this server so any MCP host can triage a ticket on demand.

@@ -98,8 +98,10 @@ A good router does not round-robin. The usual signals, in rough order of value:
 - **Replicas expose the load signals as metrics.** vLLM publishes running/waiting request counts and
   KV-cache usage.
 - **Simple affinity** is consistent (or rendezvous) hashing on a fixed-length prompt prefix, so adding a
-  replica remaps only a small share of keys. For agents, hashing a run id keeps all steps together even
-  though the shared system prompt is identical across runs.
+  replica remaps only a small share of keys.
+- **For agents, hash the run id instead.** Every run shares the same system prompt, so a prefix hash
+  sends all runs to one replica; a run-id hash keeps each run's steps together while spreading runs
+  across the pool.
 - **Advanced affinity** tracks which prefixes each replica actually holds, for example a radix tree of
   cached prefixes.
 - **Always spill over** to least-loaded when the preferred replica is saturated, *because* affinity is
@@ -193,7 +195,7 @@ print("replicas:", replicas_needed(6_000, 1_500))      # -> ceil(5.2)+1 = 7
 
 pool = [Replica(f"r{i}", max_seqs=48) for i in range(7)]
 
-def route(prompt: str, run_id: str | None = None, prefix_chars: int = 2048) -> Replica:
+def route(prompt: str, run_id: str = "", prefix_chars: int = 2048) -> Replica:
     # Agents: key on the run id so all steps share a replica. Otherwise hash the shared prefix,
     # which only works if that prefix (system prompt) is at least prefix_chars long.
     key = hashlib.sha1((run_id or prompt[:prefix_chars]).encode()).hexdigest()

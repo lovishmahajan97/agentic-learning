@@ -5,7 +5,7 @@ name: OpenAPI contract testing
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - fastapi-for-ai/openapi-docs
@@ -429,7 +429,8 @@ run against the last released schema, not the previous commit.
   replaced by a schema-valid fake; replay ten recorded tool-call arguments from agent traces against the
   new request schemas.
 - **Done when:** adding an optional field passes, renaming a required argument fails the diff, and a
-  handler that returns an undeclared field is caught by the fuzz run.
+  handler that breaks its declared response (returns `None` for a required string, which FastAPI turns
+  into a 500) is caught by the fuzz run.
 
 ### Major project
 This lesson feeds the module Capstone (see the module guide), which requires an OpenAPI snapshot diff

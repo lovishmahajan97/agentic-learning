@@ -358,6 +358,8 @@ answer also notes decode is bandwidth-bound, so higher concurrency raises per-re
 - **Goal:** show how much a stable prefix saves across a 10-step tool-calling loop.
 - **Steps:** build a tiny agent with two fake tools; run it twice, once with a stable system prompt and tool
   list, once with a timestamp injected at the top of the prompt; log input, cached-input and output tokens
-  per step from the provider usage fields (or vLLM metrics when self-hosting).
+  per step from the provider usage fields (or vLLM metrics when self-hosting). Make the stable prefix
+  longer than the provider's minimum cacheable length (often around 1,024 tokens) and, on APIs that need
+  it, mark the cache breakpoint explicitly, or nothing will be cached in either run.
 - **Done when:** you have a per-step table and a chart showing cached tokens climbing in the stable run and
   staying near zero in the timestamped run, plus a one-paragraph explanation of why.

@@ -5,7 +5,7 @@ name: Redis caching
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - backend-fundamentals/redis
@@ -253,6 +253,8 @@ async def get_or_compute(r, key: str, compute, ttl: int, wait_s: float = 5.0):
 
 ### Caching a read-only agent tool
 Only pure, read-only tools are cached; the key carries the tool name, its schema version and the tenant.
+For a retrieval tool such as `search_docs`, also put the index version in `args` (or the prefix), so a
+re-index changes the key. Like the lock example, it omits the fail-open `try` for brevity.
 
 ```python
 import hashlib, json
@@ -294,9 +296,9 @@ Illustrative inputs: *t_r* = 1 ms, *t_m* = 800 ms, 1,000,000 calls a month.
   version in the key prefix (`llm:v3:{tenant}:{sha}`) and bump it in the same deploy as the change.
   Monitor the hit rate of the new namespace climbing back up after a bump.
 - **Fail-open client with tight timeouts.** Give the client short read and connect timeouts
-  (`socket_timeout=0.2` as in the example, plus `socket_connect_timeout`, which is a separate setting whose
-  default is seconds in recent redis-py) and catch `RedisError`, so a slow or unreachable Redis degrades
-  to a miss. Monitor cache error counts and p99 cache latency alongside agent step latency.
+  (`socket_timeout=0.2` as in the example, plus `socket_connect_timeout`, a separate setting that falls
+  back to `socket_timeout` when unset in redis-py, so set it explicitly) and catch `RedisError`, so a slow
+  or unreachable Redis degrades to a miss. Monitor cache error counts and p99 cache latency alongside agent step latency.
 - **Dedicated cache instance with an LRU policy.** When the cache would share Redis with sessions, agent
   memory or rate limits, give it its own instance with `maxmemory` set and `maxmemory-policy allkeys-lru`.
   Monitor `evicted_keys` and `used_memory` from `INFO`.

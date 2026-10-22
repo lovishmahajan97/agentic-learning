@@ -5,7 +5,7 @@ name: CPU offloading
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - serving-inference/gpu-memory-optimization
@@ -206,7 +206,7 @@ tokens. Decode time only, from the step times above; prefill and tool time are e
 
 | Placement | Speed | Decode per run |
 |---|---|---|
-| 40 layers resident, 40 streamed | about 1.2 tokens/s | about 62 min |
+| 40 layers resident, 40 streamed | 800 ms per token, about 1.2 tokens/s | about 60 min |
 | Only 10% (4 GB) offloaded | 160 ms per token, about 6 tokens/s | about 12 min |
 | Whole model resident (hypothetical) | roughly 25 tokens/s | about 3 min |
 
@@ -405,6 +405,7 @@ transfer time first, then predict the gain of each option before they buy anythi
 - **Goal:** quantify the per-token and per-run cost of offloading part of a model behind a small agent.
 - **Steps:** run a quantized GGUF model in llama.cpp with `-ngl` set to all layers, then to about 90% and
   50% of layers; drive a 5-step scripted tool-calling loop against each; record tokens per second and
-  total run time; add a startup check that fails if any layer lands on the CPU when you expect full GPU.
+  total run time; add a startup check that parses the load log's "offloaded N/M layers to GPU" line and
+  fails if N is less than M when you expect full GPU.
 - **Done when:** you have a table of layers on GPU versus tokens per second and run time, and the guard
   fails loudly on the 50% setup.

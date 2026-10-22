@@ -5,7 +5,8 @@ name: Productizing repeated customer solutions
 kind: practice
 difficulty: advanced
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - customer-data-evaluation/feedback-loops-to-product
   - adoption/feature-request-triage
@@ -18,9 +19,21 @@ related:
 ---
 
 ## TL;DR
-When the field builds the same solution for a third customer, make it product: one shared core,
-per-customer configuration, extension points for unique parts. Too early bakes in the wrong
-abstraction; too late leaves N diverging forks whose upkeep scales with customers.
+When the field builds the same agent for a third customer, make it product: one shared agent core,
+per-tenant configuration, extension tools for unique parts. Too early bakes in the wrong abstraction;
+too late leaves N diverging forks.
+
+## For agent builders
+- **Why it matters for agents.** Agent forks drift fast: each customer's system prompt, tool set and
+  few-shot examples get tuned separately, so a model upgrade means re-tuning and re-evaluating N prompts
+  and N tool lists. A shared core lets you upgrade, fix and evaluate the agent once.
+- **Where it shows up in your stack.** One prompt template with slots, a tool registry with per-tenant
+  allowlists, connectors exposed as tools behind one interface, tenant-scoped memory and retrieval
+  indexes, model aliases routed centrally, and per-tenant regression suites in CI.
+- **What you control.** What is tenant config (prompt variables, enabled tools, thresholds, step caps)
+  versus extension code (a proprietary connector tool), the upgrade window, and the release gate.
+- **What you can skip.** Platform-strategy theory and pricing models. The rule of three, the difference
+  buckets and the break-even arithmetic are what you use.
 
 ## Why it exists
 - **The first build is bespoke on purpose.** A forward-deployed engineer is paid to make one customer
@@ -85,6 +98,21 @@ Diff the instances component by component and put each difference in one bucket:
   that tenant's regression suite, *because* changing a clause description changes prompt text, and
   prompt text changes behaviour as surely as a code change does.
 
+### What agents add to the core
+| Agent part | Shared core | Per-tenant |
+|---|---|---|
+| System prompt | one template, tuned per model upgrade | slot values: tone, categories, policies, few-shot examples |
+| Tools | registry, schemas, timeouts, idempotency, audit | allowlist of enabled tools, approval rules, credentials |
+| Connectors | tool interface and error handling | extension tool for a proprietary system |
+| Memory and retrieval | storage, retrieval code, isolation checks | tenant-scoped namespace or index |
+| Loop limits | defaults and hard maximums | step cap and budget within those maximums |
+| Evals | core suite for loop behaviour | regression suite from the tenant's real tasks |
+
+- **Tenant isolation is part of the core,** *because* a shared agent that can read another tenant's
+  memory or call another tenant's tools is a security incident, not a bug.
+- **Enabled tools are config, tool code is not.** Turning a tool on for a tenant is a reviewed config
+  change gated by that tenant's suite; writing a new tool is an extension.
+
 ### 5. Migrate the forks
 1. **Move existing customers onto the product, least-divergent first.**
 2. **Gate each move** on their regression suite showing parity with the fork's behaviour.
@@ -100,12 +128,12 @@ Diff the instances component by component and put each difference in one bucket:
   than custom code, and engineering hours per customer per month.
 
 ## Diagram
-The decision path for each difference found when diffing forks; only configuration and extensions
+The decision path for each difference found when diffing agent forks (prompt, tools, connectors, limits); only configuration and extensions
 enter the product, and one-offs stay as priced services work.
 
 ```mermaid
 flowchart TD
-    D["Difference between forks"] --> Q1{"Any reason it differs?"}
+    D["Difference between agent forks"] --> Q1{"Any reason it differs?"}
     Q1 -->|"no"| A["Accident: converge on one"]
     Q1 -->|"yes"| Q2{"Expressible as data?"}
     Q2 -->|"yes"| C["Configuration: versioned schema"]
@@ -193,6 +221,43 @@ for n in (1, 2, 3, 10):
   the honest case is made with all recurring changes, not one.
 - **Too early is visible:** at one customer the saving is negative, so no number of upgrades pays back.
 
+### Agent scenario: one support-triage agent core, many tenants
+The support-triage forks from Check yourself become one agent core. Each tenant gets a config that
+fills prompt slots and picks tools from the shared registry; the escalation rule engine becomes an
+extension tool only the tenant that needs it enables.
+
+```python
+from pydantic import BaseModel, Field, model_validator
+
+REGISTRY = {"search_kb": "read", "create_ticket": "write", "route_to_queue": "write",
+            "run_escalation_rules": "write"}           # tools the core implements (or extensions)
+
+class AgentTenantConfig(BaseModel):
+    tenant_id: str
+    categories: list[str]                              # prompt slot
+    tone: str = "concise and polite"                   # prompt slot
+    queue_map: dict[str, str]                          # category -> destination queue
+    enabled_tools: list[str]
+    approval_required: list[str] = Field(default_factory=list)
+    max_steps: int = Field(8, ge=1, le=15)             # core sets the hard maximum
+    memory_namespace: str                              # tenant-scoped memory and retrieval
+
+    @model_validator(mode="after")
+    def check_tools(self):
+        unknown = set(self.enabled_tools) - REGISTRY.keys()
+        if unknown:
+            raise ValueError(f"unknown tools: {sorted(unknown)}")
+        if not self.memory_namespace.startswith(self.tenant_id):
+            raise ValueError("memory namespace must be scoped to the tenant")
+        return self
+```
+
+| Change | With 4 agent forks | With one core and 4 configs |
+|---|---|---|
+| Model upgrade | re-tune 4 prompts and tool descriptions, 4 eval runs | tune 1 template, run 4 tenant suites |
+| New tool for everyone | implement 4 times | add to registry, enable per tenant |
+| Fifth customer | a fifth fork | a config file, plus an extension only if truly unique |
+
 ## Production patterns
 - **Validate tenant config at deploy time** — when configs live in a repository, load each one with the
   schema in CI (with Pydantic v2, `CustomerConfig.model_validate` on the parsed file) so a bad threshold
@@ -210,6 +275,10 @@ for n in (1, 2, 3, 10):
 - **Configuration share as a delivery metric** — for each deployment, measure how much is configuration
   and extensions versus custom code changes to the core. Monitor time to onboard and engineering hours
   per customer per month as the count grows.
+- **Per-tenant tool allowlists and namespaces** — load the enabled tools and the memory or index namespace
+  from tenant config at run start, and have the core refuse any tool call or retrieval outside them.
+  Run a cross-tenant isolation test in every release. Monitor refused out-of-scope calls per tenant; any
+  non-zero count deserves a look.
 
 ## Trade-offs
 - **Early productizing vs the wrong seam.** It avoids fork divergence, but with fewer than three examples
@@ -223,6 +292,9 @@ for n in (1, 2, 3, 10):
   winding down.
 - **Refusing one-offs vs strategic deals.** Refusing keeps the core clean, but can lose a strategic deal;
   accept them as services work outside the core, priced to cover their ongoing maintenance.
+- **Per-tenant prompt freedom vs upgradeability.** Letting tenants edit free-form instructions fits each
+  customer better, but every free-form block must be re-evaluated on model upgrades; it flips toward
+  structured slots once more than a few tenants share the agent.
 
 ## Pitfalls
 - **Abstracting from a single deployment.** Symptom: the second customer needing changes inside the
@@ -237,9 +309,14 @@ for n in (1, 2, 3, 10):
   releases at once, with each fix backported by hand, which is the fork problem again.
 - **Productizing without per-customer regression suites.** Symptom: a core release that silently breaks
   one customer's edge cases, discovered from their support ticket.
+- **Sharing agent memory or indexes across tenants.** Symptom: an agent quoting another customer's
+  ticket or document. Fix: tenant-scoped namespaces enforced by the core, with an isolation test per
+  release.
+- **Putting tenant branches inside tool code.** Symptom: `if tenant == ...` checks spreading through
+  shared tools. Fix: move the difference into config or a separate extension tool.
 
 ## When to use
-- **Use when:** the same solution shape appears for the third customer, onboarding time per customer has
+- **Use when:** the same agent shape (prompt, tools, loop) appears for the third customer, onboarding time per customer has
   stopped falling, or a model upgrade or security fix has to be applied in several places.
 - **Avoid when:** the domain is still being discovered and each customer teaches you something new about
   the shape.
@@ -301,13 +378,21 @@ customer onboards onto the product, not a fifth fork, which is the first proof t
   310 hours per upgrade, so a 600-hour extraction repays in about two upgrades.
 - **Then add security and bug fixes,** which shorten the payback further.
 
-### After productizing, a core release silently broke one customer. What went wrong and what do you change?
+### After productizing your agent, a core release silently broke one customer. What went wrong and what do you change?
 - **Likely missing or weak per-customer regression suites,** so the shared core suite passed while that
   tenant's edge cases failed.
 - **Change the release gate:** every tenant's suite runs against the release candidate, and canary
   tenants get it first.
 - **Check for a forked prompt or a config change** that bypassed review, since prompt text changes
   behaviour like code.
+
+### Three customers run forked copies of your agent with different tool sets. How do you turn them into one agent core?
+- **Diff the forks by agent part:** prompt text, tool list, tool descriptions, connectors, loop limits and
+  memory; classify each difference as configuration, extension, accident or one-off.
+- **Build the core:** one prompt template with slots, a tool registry with per-tenant allowlists, tenant
+  scoped memory, and hard limits the config can only lower.
+- **Migrate with evidence:** each tenant's regression suite from its real tasks must show parity before
+  its fork is retired.
 
 ## Quiz
 ### Q: Why is the third instance, rather than the first, the usual point to extract a product?
@@ -333,3 +418,24 @@ customer onboards onto the product, not a fifth fork, which is the first proof t
 - [x] Onboarding time and per-customer maintenance hours fall as the customer count grows
 > The point is that delivery cost per customer declines. More options or accepting everything usually
 > raises cost, and field feedback is the input productizing depends on.
+
+## Use cases & projects
+### Use cases
+- **Forward-deployed agent teams.** The third support, contract-review or research agent built for a
+  customer is the signal to extract a shared agent core.
+- **Model upgrades across many tenants.** One prompt template and per-tenant suites turn a model swap
+  from N re-tuning projects into one tuning pass plus N automated gates.
+- **Multi-tenant agent platforms.** Tool allowlists, tenant-scoped memory and config validation let a new
+  customer onboard with a config file instead of a code change.
+- **Deciding what to refuse.** The difference buckets give the field a principled answer when one
+  customer asks for logic nobody else needs.
+
+### Mini project
+**Collapse three agent forks into one core (2-3 hours).**
+- **Goal:** replace three copies of a small tool-calling agent with one core plus three tenant configs.
+- **Steps:** write three variants of a triage agent that differ in categories, tone, enabled tools and
+  one custom tool; classify every difference into the four buckets; build the config model with a tool
+  allowlist and memory namespace check; write five regression tasks per tenant and run them against both
+  the forks and the core.
+- **Done when:** all three tenants pass their suites on the core, a fourth tenant onboards with only a
+  config file, and a cross-tenant tool call or memory read is refused by the core.

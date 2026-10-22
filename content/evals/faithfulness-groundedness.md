@@ -5,7 +5,7 @@ name: Faithfulness / groundedness
 kind: metric
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - evals/hallucination-evaluation
@@ -245,6 +245,8 @@ trace = [
 reply, ctx = trace[-1]["content"], grounding_context(trace)
 print(unsupported_numbers(reply, ctx))   # []  every figure is in a tool result
 print(actions_taken(trace))              # ['get_order(8812)', "search_policy('refund window')"]
+# Claims "order 8812 can be refunded", "it is 12 days old", "it is inside the 30-day window"
+#                                    -> SUPPORTED by the two tool results.
 # Claim "a $240 refund was issued" -> NOT_FOUND: no refund tool was ever called.
 # Claim "refunded to your card"    -> NOT_FOUND: no tool result mentions the payment method.
 ```

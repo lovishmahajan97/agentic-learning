@@ -5,7 +5,7 @@ name: GraphRAG
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - rag-retrieval/knowledge-graphs

@@ -5,7 +5,7 @@ name: Agent trajectory evaluation
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agent-reliability/task-completion-rate
@@ -408,6 +408,7 @@ figures.
 - **Steps:** write 10 tasks with initial state, goal, success predicate and required actions (for example
   `lookup_order` before `refund`); run each task 5 times against fake tools; implement outcome,
   ordered-subsequence, redundant-call and forbidden-tool scorers; compute per-run pass rate and pass^3
-  per task; label the first failing step of each failure.
-- **Done when:** you have a per-task table with pass rate and pass^3, a failure-class histogram, and at
-  least one run that a final-answer check would pass but your policy check fails.
+  per task; label the first failing step of each failure; add one scripted trajectory that reaches the
+  right end state through a forbidden `delete_order` call.
+- **Done when:** you have a per-task table with pass rate and pass^3, a failure-class histogram, and the
+  scripted forbidden-path run passes a final-answer check but fails your policy check.

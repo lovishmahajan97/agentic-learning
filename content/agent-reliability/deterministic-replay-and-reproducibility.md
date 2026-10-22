@@ -5,7 +5,7 @@ name: Deterministic replay & reproducibility
 kind: concept
 difficulty: advanced
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agent-reliability/durable-execution-and-checkpointing
@@ -414,9 +414,10 @@ this recording warn that it predates the change.
 ### Mini project
 **Record, replay and fork an agent run (2-3 hours).**
 - **Goal:** make one tool-calling agent fully replayable and use a fork to test a fix.
-- **Steps:** route LLM calls, tool calls, `time.now()` and `uuid4()` through one effect interface keyed
-  by `(step, call_id)`; record a run that makes a mistake; replay it offline; change one line of
-  orchestration and confirm replay refuses; fork at the step before the mistake with a fixed prompt and
-  fake side-effecting tools.
-- **Done when:** replay reproduces the run with zero live calls, the code change raises a
-  non-determinism error, and the fork shows whether the fix changes the decision, run at least 20 times.
+- **Steps:** route LLM calls, tool calls, clock reads (`datetime.now()`) and `uuid4()` through one effect
+  interface keyed by `(step, call_id)`; record a run that makes a mistake; replay it offline; change how
+  the prompt is assembled (so a request hash changes) and confirm replay refuses; fork at the step before
+  the mistake with a fixed prompt and fake side-effecting tools.
+- **Done when:** replay reproduces the run with zero live calls, the prompt change raises a
+  non-determinism error, and 20 forks show how often the fixed decision now appears (a smoke check; proving
+  a rate change needs the N from the sample-size formula).

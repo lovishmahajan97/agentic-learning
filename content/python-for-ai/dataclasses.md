@@ -5,7 +5,7 @@ name: dataclasses
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/type-hints
@@ -427,7 +427,8 @@ explicit immutable key (a tuple of the fields) and cache on that instead.
 **Trace an agent run with frozen records (1-2 hours).**
 - **Goal:** record every step of a tool-calling loop as dataclasses and use them to stop loops.
 - **Steps:** define a frozen, slotted `Step` with `repr=False` on the tool output and a `Run` with a
-  `default_factory` list of steps and a budget; append a `Step` per tool call; keep a set of
-  (tool, arguments) keys and stop when one repeats three times; export the run as JSON.
-- **Done when:** a scripted run that repeats a call stops at the third repeat, the repr stays short with
-  large outputs, and the exported trace lists every step with its cost.
+  `default_factory` list of steps and a budget; append a `Step` per tool call; keep a
+  `collections.Counter` of (tool, canonical argument JSON) keys and stop when any key reaches three;
+  export the run as JSON.
+- **Done when:** a scripted run that issues the same call over and over stops on its third occurrence,
+  the repr stays short with large outputs, and the exported trace lists every step with its cost.

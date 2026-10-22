@@ -5,7 +5,7 @@ name: Knowledge distillation
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - training-adaptation/supervised-fine-tuning
@@ -80,8 +80,11 @@ Why temperature matters, for teacher logits [6, 2, 1]:
 
 | *T* | Distribution | Mass on the two wrong answers | p₂/p₃ = e^(1/T) |
 |---|---|---|---|
-| 1 | [0.976, 0.018, 0.007] | about 2.5%: almost no gradient | about 2.7 |
-| 4 | [0.605, 0.222, 0.173] | 40%: the student learns the ranking | 1.3 |
+| 1 | [0.976, 0.018, 0.007] | about 2.4%: almost no gradient | about 2.7 |
+| 4 | [0.604, 0.222, 0.173] | 40%: the student learns the ranking | 1.3 |
+
+Exact values: the top entry at *T* = 4 is 0.60445 (0.604, not 0.605, to three places), and the tail at
+*T* = 1 is 2.44% (under 2.5%).
 
 - **At *T* = 1** a confident teacher is almost one-hot, so information in small probabilities is invisible.
 - **Raising *T*** flattens the distribution and amplifies the ratios between wrong answers. The ranking
@@ -157,20 +160,20 @@ L = α · T² · KL( p_teacher(T) ‖ p_student(T) )  +  (1 − α) · CE( y, p_
   the recipe behind several open small-model families, and why the two topics sit together here.
 
 ## Diagram
-The decision path for a distillation pipeline: tokenizer and logit access pick the regime, and every
-regime ends in the same held-out evaluation on real traffic. The on-policy pass hangs off the white-box
-branch because the teacher must score every token the student writes.
+The decision path for distilling an agent step: tokenizer and logit access pick the regime, and every
+regime ends in the same eval on held-out agent tasks plus a general benchmark. The on-policy pass hangs
+off the white-box branch (α·T²·KL plus CE) because the teacher must score every token the student writes.
 
 ```mermaid
 flowchart TD
-    P[("Prompts from real traffic")] --> Q["Shared tokenizer and teacher logits?"]
-    Q -->|"yes"| WB["White-box: teacher pass, cache top-k logits"]
-    Q -->|"no, text only"| BB["Black-box: generate teacher responses"]
-    WB --> KD["Train student: alpha T^2 KL plus (1 - alpha) CE"]
-    BB --> F["Verifier filter or rejection sampling"]
-    F --> SFT["Plain SFT on surviving responses"]
-    KD --> OP["Optional on-policy pass: teacher scores student samples"]
-    OP --> E["Eval on held-out real traffic plus a general benchmark"]
+    P[("Teacher agent logs: real traffic")] --> Q["Shared tokenizer and logits?"]
+    Q -->|"yes"| WB["White-box: cache top-k logits"]
+    Q -->|"no, text only"| BB["Black-box: teacher trajectories"]
+    WB --> KD["Train student: soft KL plus CE"]
+    BB --> F["Verifier filter: task passed"]
+    F --> SFT["Per-step SFT on survivors"]
+    KD --> OP["Optional on-policy pass"]
+    OP --> E["Eval: held-out tasks, general benchmark"]
     KD -->|"skip on-policy"| E
     SFT --> E
 ```
@@ -322,7 +325,8 @@ which is why the kept entries are renormalised.
 
 ## Pitfalls
 - **Leaving *T* = 1 and α high.** Soft targets are nearly one-hot, so the student learns nothing beyond
-  SFT. Symptom: the distilled model matches the plain fine-tuning baseline exactly.
+  SFT. Symptom: the distilled model matches the plain fine-tuning baseline exactly. Fix: sweep *T* in
+  roughly 1–4 and log the soft term separately.
 - **Distilling across tokenizers with a naive logit loss.** Vocabularies do not align, so the KL is
   meaningless. Symptom: loss plateaus high or goes NaN. Fix: align tokens or use sequence-level
   distillation.

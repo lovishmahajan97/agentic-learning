@@ -5,7 +5,7 @@ name: Reflection / self-critique
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/agent-loop
@@ -28,9 +28,9 @@ brings new information (a failing test, a tool error, a verifier, a fresh rubric
 with no new signal can turn right answers wrong.
 
 ## For agent builders
-- **Why it matters for agents.** "Review before submit" is one of the most common steps added to coding,
-  research and writing agents, and one of the most commonly wasted. Whether it helps is decided by the
-  evidence the critic sees, so the design work is building the evaluator, not the critique prompt.
+- **Why it matters for agents.** Teams often add a "review before submit" step to coding, research and
+  writing agents, and it is often wasted. Whether it helps is decided by the evidence the critic sees, so
+  the design work is building the evaluator, not the critique prompt.
 - **Where it shows up in your stack.** The evaluator-optimizer workflow (generator and critic nodes with a
   conditional edge back, as in LangGraph's reflection examples); output guardrails that validate a final
   answer (OpenAI Agents SDK); test runners and schema validators as tools; LLM-as-judge evaluators in
@@ -372,9 +372,10 @@ support rate before and after rather than trusting that more iterations means be
 **Measure when reflection helps a small coding agent (2-3 hours).**
 - **Goal:** compare no reflection, plain "look again" reconsideration and test-grounded critique on 15
   small Python functions with unit tests.
-- **Steps:** generate a first solution; in one arm ask the model to review itself with no new evidence;
-  in another feed the failing test output back; cap at three revisions and keep the best-scoring
-  version; log pass rate, tokens and how often a correct answer became wrong after revision.
+- **Steps:** generate a first solution; in one arm ask the model to review itself with no new evidence
+  and return its last revision; in another feed the failing test output back and keep the best-scoring
+  version; cap both at three revisions; run the tests on every attempt in both arms for logging only;
+  log pass rate, tokens and how often a correct answer became wrong after revision.
 - **Done when:** you have a table of pass rate and cost per arm, and a count of right-to-wrong flips that
   shows whether ungrounded critique hurt.
 

@@ -5,7 +5,7 @@ name: Tooling (Unsloth, Axolotl, TRL)
 kind: tool
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - training-adaptation/peft
@@ -205,7 +205,9 @@ row = {"tools": TOOLS, "messages": [
 
 text = tok.apply_chat_template(row["messages"], tools=row["tools"], tokenize=False)
 print(text)                                    # inspect: tool schema, tool call, tool result, answer
-assert "lookup_order" in text and "8812" in text
+# The tool name is already in the schema and 8812 in the user turn, so assert on the rendered
+# call arguments, which only appear if the template emitted the assistant's tool call.
+assert '"order_id": "8812"' in text, "tool call was not rendered"
 
 with open("agent_sft.jsonl", "w") as f:        # keep only runs that passed your agent eval
     f.write(json.dumps(row) + "\n")
@@ -250,7 +252,7 @@ trainer = SFTTrainer(model=model, args=args, train_dataset=ds,
 trainer.train()
 trainer.save_model()                     # writes the adapter only
 
-# Unsloth variant: from unsloth import FastLanguageModel
+# Unsloth variant (import unsloth before trl and transformers): from unsloth import FastLanguageModel
 # model, tok = FastLanguageModel.from_pretrained(name, max_seq_length=2048, load_in_4bit=True)
 # model = FastLanguageModel.get_peft_model(model, r=16, lora_alpha=32, target_modules=[...])
 # then build SFTTrainer(model=model, ...) with peft_config=None.
@@ -259,8 +261,10 @@ trainer.save_model()                     # writes the adapter only
 What the trainer does with one row is the part worth verifying by hand:
 1. **Render.** The `messages` list goes through Qwen's ChatML template, in which each turn becomes
    `<|im_start|>{role}\n{content}<|im_end|>`, then is tokenised.
-2. **Mask.** With `assistant_only_loss`, every system and user token gets label −100, so only the
-   assistant span contributes to the loss.
+2. **Mask.** With `assistant_only_loss`, every system, user and tool-result token gets label −100, so
+   only the assistant span contributes to the loss. TRL builds that mask from `{% generation %}` markers
+   in the chat template; stock templates without them (Qwen2.5's among them) cannot produce it, so patch
+   the template or switch to prompt/completion rows.
 3. **Pack.** Rendered rows are concatenated into 2,048-token sequences. With a padding-free /
    position-id-aware attention path each row restarts its positions, so it cannot attend to its neighbour.
 
@@ -315,7 +319,7 @@ print("IGNORED:\n", tok.decode(ids[~trained])[:600])          # system and user 
 - **Pre-flight label check and Unsloth benchmark.** Run the batch-decoding snippet on every new dataset
   and record the share of tokens carrying loss; a sudden jump toward 100% means masking broke. Before
   standardising on Unsloth, run about 50 steps with stock PEFT and with Unsloth and compare tokens per
-  second and `torch.cuda.max_memory_allocated()`.
+  second and `torch.cuda.max_memory_allocated()`; adopt it only where the gain shows up.
 - **Evaluate the artifact you ship, inside the agent.** If serving needs one checkpoint, merge into the
   bf16 base (PEFT's `merge_and_unload()`), then re-run the held-out agent eval (task success, tool-call
   validity) on the merged model behind the real serving stack, not just the adapter in a notebook.
@@ -468,16 +472,19 @@ adapter or merge it into the bf16 base.
   chat template you serve with fixes calls that arrive as plain text or malformed JSON.
 - **Reproducible fine-tunes across a team.** An Axolotl YAML checked in beside the agent code makes the
   run reviewable and repeatable when the base model or the trace set changes.
-- **Preference tuning from agent feedback.** Thumbs-up and thumbs-down pairs from production become DPO
-  data in TRL, nudging tone or tool choice without a full RL setup.
+- **Preference tuning from agent feedback.** A preferred and a rejected answer to the same prompt become
+  DPO pairs in TRL; unpaired thumbs-up and thumbs-down ratings fit TRL's `KTOTrainer` instead. Either
+  nudges tone or tool choice without a full RL setup.
 
 ### Mini project
 **LoRA a small model on your agent's tool-call traces (2-3 hours).**
 - **Goal:** fine-tune a small instruct model so it emits your agent's tool calls in a format your serving
   stack parses, and prove it with a held-out agent eval.
-- **Steps:** export 200-500 successful traces with their tool schemas; convert them to chat rows and run
-  the tool-call render check from Examples; print which tokens the loss sees; train a LoRA with TRL
-  `SFTTrainer` (or Unsloth on one GPU); serve base and tuned models behind the same agent loop and run 50
-  held-out tasks.
+- **Steps:**
+  1. Export 200-500 successful traces with their tool schemas and convert them to chat rows.
+  2. Run the tool-call render check from Examples, then print which tokens the loss sees.
+  3. Train a LoRA on a 1-2B instruct model with TRL `SFTTrainer` (or Unsloth on one GPU).
+  4. Serve base and tuned models behind the same agent loop (for example vLLM with `--enable-lora`)
+     and run 50 held-out tasks.
 - **Done when:** you have parse-success and task-success rates for base versus tuned model, the loss mask
   shows only assistant turns, and the adapter loads and calls tools correctly in the serving engine.

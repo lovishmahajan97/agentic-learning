@@ -5,7 +5,7 @@ name: Durable execution & checkpointing
 kind: concept
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agent-reliability/state-persistence-and-conversation-recovery
@@ -176,10 +176,11 @@ sequenceDiagram
     W->>S: save intents, key from run, step, index
     W->>T: execute with idempotency key
     T-->>W: result
-    W->>S: save result
-    Note over W,T: crash before save result
+    Note over W,T: crash before the result is saved
+    W->>S: new worker claims lease, loads intents
     W->>T: resume re-sends same key
     T-->>W: first result, no new effect
+    W->>S: save result
 ```
 
 ## Examples
@@ -435,7 +436,7 @@ attempts and a second ticket appears.
 - **Goal:** show that a run killed between executing a tool and recording its result resumes without a
   duplicate side effect.
 - **Steps:** write a 5-step agent loop whose tool appends a row to a local "tickets" table; save a
-  checkpoint (transcript, step index, budgets, pending intents with keys derived from run id and step) to
+  checkpoint (transcript, step index, budgets, pending intents with keys from run id, step and call index) to
   SQLite before tools run; add a dedup table keyed by idempotency key; kill the process at random points
   with an injected exception and resume under the same run id.
 - **Done when:** across 50 randomized crash-and-resume trials the tickets table holds exactly one row per

@@ -5,7 +5,8 @@ name: Vector store sizing
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - data-architecture/vector-database-architecture
   - data-architecture/embedding-versioning-re-indexing-strategy
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-Vector store cost is set by RAM-resident bytes: `vectors × (dim × bytes_per_dim + graph_overhead +
-payload)`, times replicas and build headroom. Every input is knowable before choosing a vendor, and the
-arithmetic often flips the choice between pgvector and a dedicated cluster.
+The store behind an agent's search and memory tools costs RAM-resident bytes, `vectors × (dim ×
+bytes_per_dim + graph_overhead + payload)` times replicas and headroom, and QPS set by tool calls per agent
+turn. Do the arithmetic before picking a vendor.
+
+## For agent builders
+- **Why it matters for agents.** Agents multiply both terms: per-user memory adds vectors with every
+  conversation, and one agent turn can issue several search calls, so retrieval QPS is a multiple of user
+  traffic. Both decide whether pgvector suffices or a cluster is needed.
+- **Where it shows up in your stack.** The collection behind `search_docs` and `recall_memory`, its
+  quantization and on-disk settings, the managed-tier quote, and the latency budget each tool call gets
+  inside the agent's step.
+- **What you control.** Chunk size, embedding dimension and precision, where chunk text lives, how many
+  memories per user you keep, and how many retrieval calls the agent may make per turn.
+- **What you can skip.** Product-quantization theory. The eight-step checklist and the calculator below are
+  what you need.
 
 ## Why it exists
 - **Teams size vector stores by feel.** They pick a managed tier that "looks big enough" or the instance with
@@ -117,8 +130,17 @@ The line between "must be in RAM" and "may be on disk" is set by access pattern.
 - **Budget for the collection to double** during that window, or migrate tenant by tenant so the overlap is
   bounded; the re-indexing lesson in this module covers the strategy.
 
+### Agent-specific inputs
+- **Memory vectors grow with users, not documents.** `memory_vectors = active_users × memories_per_user`, and
+  without a retention or consolidation policy `memories_per_user` only rises.
+- **Retrieval QPS is tool calls, not user requests.** `peak_QPS = peak_agent_turns_per_second ×
+  retrieval_calls_per_turn`; a planner that searches four times per turn quadruples the QPS bound.
+- **Latency budget is per step.** A 100 ms search inside a ten-step agent run is a second of wall-clock, so
+  size for p99 per call at that QPS, not for a single query.
+
 ## Diagram
-The estimate is a chain of multiplications; each decision box is a lever that changes one term.
+The estimate is a chain of multiplications; each decision box is a lever that changes one term. For agents,
+the QPS input is agent turns times retrieval calls per turn.
 
 ```mermaid
 flowchart TD
@@ -132,7 +154,8 @@ flowchart TD
     S --> H["x 1.5 build headroom"]
     H --> R["x replicas = cluster RAM"]
     R --> N{"Nodes = max of RAM bound and QPS bound"}
-    Q["Peak QPS / measured QPS per node"] --> N
+    T["Agent turns x search calls per turn"] --> Q["Peak QPS / measured QPS per node"]
+    Q --> N
     R -.->|"x 2 during re-embedding"| M["Migration window"]
 ```
 
@@ -222,6 +245,39 @@ print(nodes_needed(90, 32, 1200, 400))      # migration window doubles RAM: (3, 
   unless it also speeds traversal.
 - **The migration window** doubles the RAM line, so check it still fits before an embedding upgrade.
 
+### Agent scenario: sizing memory and tool-call QPS for an assistant
+An assistant agent serves 100,000 active users and keeps about 200 memories each, embedded at 1,024
+dimensions with int8 quantization and 200 B of ids and filters per point. At peak it handles 300 agent
+turns per second, and the planner averages 4 retrieval calls per turn. Illustrative assumptions throughout.
+
+```python
+import math
+
+def agent_store(users, memories_per_user, dim, bytes_per_dim=1.0, M=16, payload_bytes=200,
+                headroom=1.5, turns_per_s=300, calls_per_turn=4):
+    n = users * memories_per_user
+    ram = n * (dim * bytes_per_dim + 2 * M * 4 + payload_bytes) * headroom
+    return {"vectors": n, "ram_per_replica_gb": ram / 1e9, "peak_qps": turns_per_s * calls_per_turn}
+
+r = agent_store(100_000, 200, 1024)
+print(r)                                   # 20,000,000 vectors, about 40.6 GB per replica, 1,200 QPS
+print(nodes_needed(2 * r["ram_per_replica_gb"], 32, r["peak_qps"], 400))   # (3, 3, 3)
+```
+
+| Line item | Arithmetic | Result |
+|---|---|---|
+| Memory vectors | 100,000 × 200 | 20 million |
+| int8 vectors + links + payload | 20 M × (1,024 + 128 + 200) B | ≈ 27 GB |
+| With 1.5× headroom, per replica | × 1.5 | ≈ 40.6 GB |
+| Peak retrieval QPS | 300 turns/s × 4 calls | 1,200, the same figure as the node-count example |
+| Cap calls at 2 per turn | 300 × 2 | 600 QPS: the throughput bound drops from three nodes to two |
+| Also consolidate to 100 memories per user | 10 M vectors, ≈ 20.3 GB per replica, ≈ 40.6 GB for two | RAM bound drops to two nodes as well |
+
+- **The agent design is a sizing lever.** Halving retrieval calls per turn moved the QPS bound as much as any
+  index setting, but the node count only falls once the RAM bound falls too.
+- **Memory retention is the other lever.** Consolidating to 100 memories per user halves the RAM line, and
+  together the two changes take the cluster from three nodes to two.
+
 ## Production patterns
 - **Size from measured chunk statistics.** Run the real chunker over a sample of a few thousand documents and
   use the p50 and p95 chunks per document, not the mean of document lengths. Re-run when chunking changes and
@@ -237,6 +293,9 @@ print(nodes_needed(90, 32, 1200, 400))      # migration window doubles RAM: (3, 
 - **Bound the migration window.** Re-embed tenant by tenant or collection by collection, and delete the old
   vectors as each slice cuts over, so the doubling applies to one slice at a time. Track RAM per collection
   through the migration.
+- **Budget retrieval calls per agent turn.** Agent teams log search calls per turn from traces, cap them in
+  the agent loop, and feed the measured p95 into the QPS bound. Pair it with a memory retention or
+  consolidation job, and monitor memory vectors per active user and p99 latency per tool call.
 
 ## Trade-offs
 - **Quantization vs recall.** It cuts RAM by 4× (int8) to 32× (binary) and speeds traversal, but costs recall
@@ -268,6 +327,8 @@ print(nodes_needed(90, 32, 1200, 400))      # migration window doubles RAM: (3, 
 ## When to use
 - **Do the arithmetic** whenever a vector store is chosen, a tier is upgraded, a chunking or embedding change
   is proposed, or a tenant is onboarded with a known corpus.
+- **Redo it for agents when** you add long-term memory, change the planner so it searches more per turn, or
+  launch to a larger user base, because each changes a term directly.
 - **Measure** the real chunks-per-document distribution from a sample rather than assuming the mean, recall
   before and after any quantization, and QPS under production-shaped filters.
 - **What the number tells you:** whether pgvector in the existing database suffices, whether quantization is
@@ -312,12 +373,19 @@ labelled query set to confirm quantization did not change the top-k, and load-te
   about two thirds leaves no room for a 1.5× build peak.
 - **Fix:** quantize, move payload out, or add memory, then re-test compaction under load.
 
-### When is quantization not worth it?
-- **When the collection already fits unquantized with headroom:** it adds configuration and a recall check
-  for no saving that matters.
-- **When recall loss on your model is large:** binary codes in particular need heavy oversampling and
-  rescoring.
-- **Otherwise** int8 is a 4× RAM cut that rescoring mostly makes invisible.
+### You are adding per-user long-term memory to an agent with 100,000 users. How do you size the store?
+- **Vectors:** users × memories per user, about 20 million at 200 each, growing unless a retention or
+  consolidation policy caps it.
+- **Bytes:** at 1,024 dimensions int8 with 200 B payload, about 27 GB steady state and 40.6 GB per replica with
+  headroom.
+- **Throughput:** peak agent turns per second × memory and search calls per turn, then nodes as the max of
+  the RAM and QPS bounds.
+
+### After launching a planning agent, retrieval p99 doubled though the corpus did not change. Why?
+- **QPS is tool calls, not users:** a planner that searches several times per turn multiplies retrieval
+  traffic, so the throughput bound, not memory, is now binding.
+- **Check traces** for search calls per turn and compare peak QPS with measured QPS per node.
+- **Fix:** cap or batch calls per turn, cache repeated queries within a run, or add nodes for the QPS bound.
 
 ### Estimate memory for 200,000 documents of 4,000 tokens, 400-token chunks with 50 overlap, 1,024 dimensions.
 - **Vectors:** ceil(4,000 / 350) = 12 chunks per document, so 2.4 million vectors.
@@ -358,3 +426,23 @@ labelled query set to confirm quantization did not change the top-k, and load-te
 > Background maintenance builds a new segment or graph before releasing the old one. Without free memory
 > for that overlap, compaction and re-indexing trigger out-of-memory failures even though steady-state
 > queries fit.
+
+## Use cases & projects
+### Use cases
+- **Choosing pgvector or a cluster for an agent's knowledge base.** The calculator shows whether the corpus
+  fits beside the existing Postgres data once quantized and with text moved out.
+- **Adding long-term memory to an assistant agent.** Users × memories per user is a new, growing vector line
+  that needs a retention policy before it needs a bigger tier.
+- **Capacity for planning agents.** Retrieval QPS is agent turns times search calls per turn, so a planner
+  change can require nodes even when the corpus is unchanged.
+- **Budgeting an embedding-model upgrade.** The migration window doubles the RAM line under a live agent.
+
+### Mini project
+**Build a sizing sheet from your agent's own traces (1-2 hours).**
+- **Goal:** size the vector store for an agent from measured inputs rather than guesses.
+- **Steps:** run the real chunker on a sample of 1,000 documents and record p50 and p95 chunks per document;
+  run 50 agent tasks and count retrieval calls per turn from the traces; plug both into
+  `vector_store_bytes`, `agent_store` and `nodes_needed`; compare float32 and int8, text in engine and out.
+- **Done when:** a one-page table gives RAM per replica, cluster RAM, peak QPS and node count for each
+  option, names the binding bound, and states the one change (quantization, payload placement or calls per
+  turn) that most reduces cost.

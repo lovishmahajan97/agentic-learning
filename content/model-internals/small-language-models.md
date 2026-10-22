@@ -177,9 +177,9 @@ print(f"all frontier ${all_frontier:.4f}/task, mixed ${mixed:.4f}/task, "
 # all frontier $0.0939/task, mixed $0.0554/task, saving 41%
 ```
 
-- **Reading.** Seven of ten calls moved, but the saving is 41%, because the three planner calls carry
-  most of the tokens. The next lever is a shorter planner prompt (stable prefix, prompt caching), not more
-  SLM steps.
+- **Reading.** Seven of ten calls moved, but the saving is only 41%: the three planner calls carry about
+  half the tokens at frontier prices, so they are about 89% of the mixed bill. The next lever is a shorter
+  planner prompt (stable prefix, prompt caching), not more SLM steps.
 - **Latency.** The SLM steps also return faster, so wall-clock per task drops on every step that moved.
 
 ### Cost model and escalation rule for a ticket classifier

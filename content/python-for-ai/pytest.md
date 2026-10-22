@@ -5,7 +5,7 @@ name: pytest
 kind: tool
 difficulty: intro
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/pytest-asyncio
@@ -172,10 +172,10 @@ flowchart TD
     P --> F["Select lane with -k and -m"]
     F --> G["Resolve fixture graph by argument name"]
     G --> CF[("conftest.py: fake_llm, nearest wins")]
-    CF --> U["Setup: run fixtures up to yield, honouring scope"]
-    U --> T["Call the test: agent loop with scripted replies"]
+    CF --> U["Setup fixtures up to yield"]
+    U --> T["Run test: loop with fake model"]
     T --> D["Teardown in reverse setup order"]
-    D --> O["Report: pass, fail with operand values, skip, xfail"]
+    D --> O["Report pass, fail, skip, xfail"]
     D -->|"next test reuses cached higher-scope fixtures"| G
 ```
 
@@ -360,8 +360,9 @@ The fix that teams use is the xdist docs pattern: guard startup with a file lock
   because a stuck model call or event loop otherwise hangs CI until the job limit. Track which tests hit
   the timeout.
 - **Order-independence and shared fakes.** Run with `pytest-randomly` so order changes every run and
-  replay failures with `--randomly-seed=<n>`. Keep `fake_llm`, settings overrides and a temp workspace in
-  the root `conftest.py`, and shadow them in `tests/integration/conftest.py` with real clients.
+  replay failures with `--randomly-seed=<n>`; monitor the flake rate per test id. Keep `fake_llm`,
+  settings overrides and a temp workspace in the root `conftest.py`, and shadow them in
+  `tests/integration/conftest.py` with real clients.
 
 ## Trade-offs
 - **Concise injection vs hidden wiring.** Fixtures by name are short, but `conftest.py` hides where a

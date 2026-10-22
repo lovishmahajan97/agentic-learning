@@ -5,7 +5,7 @@ name: Model portfolio
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - system-design/model-selection
@@ -26,8 +26,9 @@ eval baselines, cost card, data classes and retirement plan. Agents spend most t
 routing here cuts the bill most.
 
 ## For agent builders
-- **Why it matters for agents.** Agentic tasks are a small share of requests but most of the spend,
-  because each runs several calls over a large context. Routing routine agent steps (summarising tool
+- **Why it matters for agents.** Agentic tasks are often a small share of requests but most of the
+  spend (87% of it from 5% of requests in the example below), because each runs several calls over a
+  large context. Routing routine agent steps (summarising tool
   results, formatting) to a cheaper tier is usually the biggest cost lever you have.
 - **Where it shows up in your stack.** Your agent code names a logical model (`workhorse`,
   `classifier-small`) per step or role; the gateway's routing table maps it to a pinned vendor model,

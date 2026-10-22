@@ -5,7 +5,7 @@ name: Tool-result interpretation
 kind: concept
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/tool-calling

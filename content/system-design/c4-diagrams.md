@@ -5,7 +5,7 @@ name: C4 diagrams
 kind: practice
 difficulty: intro
 est_minutes: 11
-status: agentic
+status: agentic-verified
 agent_relevance: background
 related:
   - system-design/ai-solution-architecture
@@ -135,9 +135,10 @@ flowchart TD
 
 ## Examples
 ### Structurizr DSL: an agent with tools, a sandbox and a Dynamic view of one run
-The Context view shows four arrows leaving the system: model provider, CRM (read and write), email and
-the sandbox's package mirror. The Dynamic view numbers one run; Structurizr checks each step against the
-model, so deleting a relationship breaks the build instead of leaving a stale story.
+The Context view shows three arrows leaving the system: model provider, CRM (read and write) and email.
+The Dynamic view numbers one run; Structurizr checks each step against the model, so deleting a
+relationship breaks the build instead of leaving a stale story. The DSL is line-based: an opening `{`
+ends its line and every closing `}` sits on a line of its own.
 
 ```
 workspace "Refund Agent" "Investigates and resolves refund tickets" {
@@ -163,20 +164,32 @@ workspace "Refund Agent" "Investigates and resolves refund tickets" {
         runner  -> email   "Sends approved customer emails via" "REST"
     }
     views {
-        systemContext agentSys "Context"    { include * autolayout lr }
-        container     agentSys "Containers" { include * autolayout lr }
+        systemContext agentSys "Context" {
+            include *
+            autolayout lr
+        }
+        container agentSys "Containers" {
+            include *
+            autolayout lr
+        }
         dynamic agentSys "OneRun" "One refund run" {
             rep -> api "Starts a run for ticket 4812"
             runner -> gateway "Asks for the next action"
             runner -> crm "Reads the order (tool call)"
             runner -> sandbox "Runs refund eligibility check (tool call)"
             runner -> store "Checkpoints step and pauses for approval"
+            rep -> api "Approves the proposed refund"
             runner -> email "Sends the approved reply"
             autolayout lr
         }
         styles {
-            element "External" { background #999999 color #ffffff }
-            element "Database" { shape Cylinder }
+            element "External" {
+                background #999999
+                color #ffffff
+            }
+            element "Database" {
+                shape Cylinder
+            }
         }
     }
 }
@@ -192,6 +205,8 @@ workspace "Refund Agent" "Investigates and resolves refund tickets" {
   build, instead of the request story silently going stale.
 - **What the rendered Context view reveals:** two arrows leave the system, to the CRM and to the model
   provider. The second is the data egress a privacy review asks about first.
+- **Compressed for the page:** the one-line `{ include * autolayout lr }` and style blocks below save
+  space; the real DSL needs each statement on its own line and each `}` alone, as in the example above.
 
 ```
 workspace "Support Copilot" "Drafts ticket replies grounded in the knowledge base" {

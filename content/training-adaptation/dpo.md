@@ -5,7 +5,7 @@ name: DPO
 kind: concept
 difficulty: advanced
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - training-adaptation/rlhf
@@ -93,7 +93,8 @@ Differentiating the loss gives `−β·σ(r̂_l − r̂_w)·[∇log π_θ(y_w|x)
 
 ### Sequence log-probabilities
 - **Each term is a sum** of per-token log-probabilities over response tokens only, prompt masked. In
-  multi-turn agent pairs, tool results inside the response stay masked too, as in SFT.
+  agent pairs, keep tool results out of the response: standard DPO trainers score every response token,
+  so end each pair at the diverging assistant turn, or mask tool tokens yourself as in SFT.
 - **Cache the reference.** It is frozen, so its log-probs for the dataset can be computed once. Training
   memory drops to one trainable model plus stored numbers, versus RLHF's four networks.
 - **LoRA trick:** disable the adapter for the reference forward pass instead of loading a second copy.
@@ -150,7 +151,7 @@ flowchart TD
 ## Examples
 ### Turning agent runs into DPO pairs
 Two runs of the same task that share a history and then diverge make a natural pair: the shared prefix
-is the prompt, each run's continuation is chosen or rejected. The output is the conversational
+is the prompt, and each run's first diverging assistant turn is chosen or rejected. The output is the conversational
 prompt / chosen / rejected format TRL's DPO trainer accepts.
 
 ```python
@@ -161,11 +162,14 @@ def shared_prefix(a, b):
     return n
 
 def runs_to_pair(run_good, run_bad):
-    """Each run is a list of chat messages; returns None if they never diverge."""
+    """Each run is a list of chat messages. Pair only the first diverging step, and only if both
+    sides of it are assistant turns (a tool result that differed is not the agent's decision)."""
     n = shared_prefix(run_good, run_bad)
     if n == min(len(run_good), len(run_bad)):
+        return None                                   # the runs never diverge
+    if run_good[n]["role"] != "assistant" or run_bad[n]["role"] != "assistant":
         return None
-    return {"prompt": run_good[:n], "chosen": run_good[n:], "rejected": run_bad[n:]}
+    return {"prompt": run_good[:n], "chosen": [run_good[n]], "rejected": [run_bad[n]]}
 
 history = [{"role": "system", "content": "Support agent. Tools: get_order, refund."},
            {"role": "user", "content": "Refund order A-1042, it arrived broken."}]
@@ -174,10 +178,11 @@ good = history + [{"role": "assistant", "content": "", "tool_calls": [{"type": "
 bad = history + [{"role": "assistant", "content": "Could you confirm your order number?"}]  # needless ask
 
 pair = runs_to_pair(good, bad)
-print(len(pair["prompt"]), "shared messages;", "chosen calls", pair["chosen"][0]["tool_calls"][0]
-      ["function"]["name"], "| rejected:", pair["rejected"][0]["content"])
-# Label which run is better with users, experts or a calibrated judge; only the step where they diverge
-# is compared, so the pair isolates one decision.
+call = pair["chosen"][0]["tool_calls"][0]["function"]["name"]
+print(len(pair["prompt"]), "shared messages; chosen calls", call, "| rejected:", pair["rejected"][0]["content"])
+# 2 shared messages; chosen calls refund | rejected: Could you confirm your order number?
+# Label which run is better with users, experts or a calibrated judge. Only the step where they diverge
+# is kept, so the pair isolates one decision and contains no tool-result tokens to score.
 ```
 
 ### The DPO loss from sequence log-probs
@@ -367,8 +372,8 @@ artefacts.
 ### Your agent works but takes too many steps. How would you use DPO to fix it?
 - **Build pairs from its own runs:** for each task, keep runs that share a history and then diverge, and
   label the shorter successful path as chosen over the detour or needless question.
-- **Train one round** at β around 0.1 with one epoch, masking tool results, and watch chosen log-prob
-  alongside the margin.
+- **Train one round** at β around 0.1 with one epoch, with each pair ending at the diverging assistant
+  turn so no tool results are scored, and watch chosen log-prob alongside the margin.
 - **Gate on held-out tasks:** steps per task must fall without task success or a capability suite
   regressing, then regenerate pairs from the new model for the next round.
 
@@ -444,5 +449,6 @@ artefacts.
   from your current agent model for 50 shared histories; label the best and worst step with a rubric or a
   calibrated judge; write conversational prompt, chosen and rejected records; hold out 10 pairs and note
   the β you would start with.
-- **Done when:** you have a pairs file, a held-out set, a labelling agreement check on 10 pairs, and a
-  short plan for the metrics you would watch, including chosen log-probability.
+- **Done when:** you have a pairs file, a held-out set, an agreement rate between your own labels and
+  the judge's (or a second rater's) on 10 pairs, and a short plan for the metrics you would watch,
+  including chosen log-probability.

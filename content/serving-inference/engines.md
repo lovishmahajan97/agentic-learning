@@ -5,7 +5,7 @@ name: Engines (vLLM, SGLang, TGI, TensorRT-LLM, Ollama, llama.cpp)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - serving-inference/model-serving
@@ -24,9 +24,9 @@ sources:
 ---
 
 ## TL;DR
-When you self-host an agent's model, the engine decides how many agent loops run at once, whether shared
-prefixes are reused, and whether tool calls parse. vLLM, SGLang, TGI and TensorRT-LLM serve fleets;
-llama.cpp and Ollama run local agents.
+An inference engine owns batching, KV memory, kernels and the API. For a self-hosted agent it decides how
+many runs fit, whether prefixes are reused and whether tool calls parse. vLLM, SGLang, TGI and
+TensorRT-LLM serve fleets; llama.cpp and Ollama run locally.
 
 ## For agent builders
 - **Why it matters for agents.** Agent traffic is many calls per run over long, repeated prefixes with
@@ -168,9 +168,10 @@ They differ in emphasis, hardware reach, model format and how much work it takes
 | Structured arguments and plans | grammar-constrained or guided decoding | invalid-JSON rate with and without it |
 | Fan-out to parallel sub-agents | continuous batching across the parallel calls | step latency at peak fan-out |
 
-- **Tool calling is engine-specific.** In vLLM, tool calls in the OpenAI format need tool-choice support
-  enabled and a parser matching the model family set at startup (see the engine's tool-calling docs);
-  other engines have their own switches. Without them the call arrives as plain text the agent cannot run.
+- **Tool calling is engine-specific.** In vLLM, OpenAI-format tool calls need `--enable-auto-tool-choice`
+  plus a `--tool-call-parser` matching the model family (for example `llama3_json` for Llama 3.1) at
+  startup; other engines have their own switches. Without them the request is rejected or the call arrives
+  as plain text the agent cannot run.
 
 ## Diagram
 Start at the top with where the agent's model runs, then let traffic shape and operational budget pick
@@ -451,8 +452,8 @@ fixed.
   prefix; benchmark both on recorded agent traces.
 - **Settings from KV arithmetic:** a 20-step run reaches ~34.5k tokens, so `--max-model-len` must exceed
   that and only about 11 such runs fit on 80 GB with an 8B GQA model; cap concurrent runs to match.
-- **Gate on behaviour:** tool-calling parser and template enabled and a contract suite passing before any
-  traffic moves.
+- **Gate on behaviour:** tool-calling parser and template enabled (in vLLM, `--enable-auto-tool-choice`
+  and `--tool-call-parser`) and a contract suite passing before any traffic moves.
 
 ## Quiz
 ### Q: Which engine's distinctive workflow compiles the model ahead of time for a specific GPU architecture and configuration?

@@ -5,7 +5,7 @@ name: Document parsing (OCR, layout, tables)
 kind: concept
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - multimodal/ocr
@@ -185,8 +185,9 @@ def read_document(path: str, pages: list[int] | None = None, min_conf: float = 8
     """Tool: read pages of an uploaded PDF. Returns text per page plus parse-quality flags."""
     out = []
     with pdfplumber.open(path) as pdf:
-        wanted = pages or list(range(1, min(len(pdf.pages), 10) + 1))   # never dump 300 pages at once
-        for n in wanted:
+        total = len(pdf.pages)
+        wanted = pages or list(range(1, min(total, 10) + 1))            # never dump 300 pages at once
+        for n in (p for p in wanted if 1 <= p <= total):
             page = pdf.pages[n - 1]
             text, source, shaky = page.extract_text() or "", "text-layer", []
             if len(text.strip()) < 50:                                   # scanned page: OCR it
@@ -195,8 +196,9 @@ def read_document(path: str, pages: list[int] | None = None, min_conf: float = 8
                 words = [(w, float(c)) for w, c in zip(d["text"], d["conf"]) if w.strip()]
                 text, source = " ".join(w for w, _ in words), "ocr"
                 shaky = [w for w, c in words if c < min_conf and any(ch.isdigit() for ch in w)]
-            out.append({"page": n, "source": source, "text": text[:4000], "low_conf_numbers": shaky})
-    return {"total_pages": len(pdf.pages), "pages": out}
+            out.append({"page": n, "source": source, "text": text[:4000],
+                        "truncated": len(text) > 4000, "low_conf_numbers": shaky})
+    return {"total_pages": total, "pages": out}                         # agent asks for more by range
 
 # Tool description shown to the model (plain words):
 # "Reads pages of the uploaded PDF. If low_conf_numbers is non-empty, do not state those values as

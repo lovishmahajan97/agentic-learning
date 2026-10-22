@@ -5,7 +5,7 @@ name: Error analysis
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - evals/golden-dataset

@@ -162,6 +162,21 @@ The diff has three classes:
 - **It is the customer artefact.** The reconciliation report is what you show the customer when they ask
   whether your copy matches their system of record.
 
+### Inside the agent's tool loop
+An agent adds two retry layers that a plain integration does not have, and both repeat writes.
+1. **Adapter retry.** The tool adapter retries transient errors (408, 429, 5xx) with backoff before the
+   model ever sees them, because a model shown a raw 503 often re-plans instead of waiting.
+2. **Model retry.** When the adapter gives up, the error goes back to the model as a tool result, and the
+   model may call the same tool again with slightly different arguments. Derive the operation id from the
+   run id plus the step's intent (for example `run_id + "create_ticket" + incident_id`), not from the
+   argument bytes, so a reworded retry still maps to the same ledger entry.
+3. **Resume retry.** A durable-execution runtime that replays a crashed run re-executes the step after the
+   last checkpoint. The ledger must already hold the operation id, or the replay writes again.
+- **Return outcomes, not exceptions.** Tell the model "already created, ticket INC42" or "outcome unknown,
+  do not retry, reconciliation will resolve it", because a model told only "timeout" will try again.
+- **Non-retryable errors go to the model.** A 400 or 422 is something the model can fix (bad arguments);
+  a 403 is something a human must grant, so it becomes an approval or escalation, not a loop.
+
 ### How the three fit
 | Path | Steps |
 |---|---|
@@ -173,8 +188,8 @@ The first two make the system fast and mostly right; the third makes it eventual
 tells you when the first two have failed.
 
 ## Diagram
-Live events and outbound writes are both idempotent; reconciliation reads the source independently and
-feeds its repairs back through the same apply path.
+Live events feeding the agent's index and the agent's outbound tool writes are both idempotent;
+reconciliation reads the source independently and feeds its repairs back through the same apply path.
 
 ```mermaid
 flowchart TD
@@ -285,6 +300,19 @@ print(by_delivery_id(deliveries))  # {'INC1': 'open'}   wrong: closed ticket reo
 print(by_version(deliveries))      # {'INC1': 'closed'} right: stale update dropped
 ```
 
+### Agent scenario: one "create ticket" call, three retries
+A support agent calls `create_ticket` during an incident. Timeline of one run (illustrative numbers).
+
+| Event | Without ledger and external id | With ledger and upsert by external id |
+|---|---|---|
+| Call 1 times out after 30 s; the server had committed | 1 ticket exists | 1 ticket, ledger entry `unknown` |
+| Adapter retry after backoff | 2 tickets | upsert updates the same ticket |
+| Model re-plans and calls the tool again | 3 tickets | same operation id, ledger returns the saved result |
+| Worker crashes, run resumes from checkpoint | 4 tickets | ledger hit, no call made |
+| Hourly reconciliation | nothing to resolve | `unknown` resolved by external-id lookup |
+
+Four tickets for one incident pages four on-call engineers at the customer; the ledger version makes one.
+
 ### Worked scenario: a week of repair counts
 An hourly reconciliation over the last 3 days of changes, plus a nightly full-id sweep (illustrative
 numbers).
@@ -316,6 +344,10 @@ The Wednesday spike paged on-call within the hour; no user had reported a stale 
 - **Ledger plus upsert for outbound writes.** Use when an agent writes into a system of record. Claim an
   operation id as `unknown`, write with the operation id in an external-id field, and resolve every
   `unknown` entry by lookup in the reconciliation run. Monitor the age of the oldest `unknown` entry.
+- **Operation ids derived from intent, not arguments.** Use when the model can retry a tool on its own.
+  Build the id from the run id, the tool name and the business key (incident id, order id), so a reworded
+  second call hits the same ledger entry. Monitor duplicate-suppressed calls per run; a high count means
+  the model is looping and needs a better tool result message.
 
 ## Trade-offs
 - **Aggressive retries vs the customer's quota.** More retries raise the chance a transient failure heals
@@ -346,6 +378,9 @@ The Wednesday spike paged on-call within the hour; no user had reported a stale 
 - **A delivery-id dedupe TTL shorter than the source's redelivery window.** Symptom: duplicate notes or
   double-applied updates that cluster after a source outage or an admin's bulk "resend events", exactly
   when redeliveries arrive late. Fix: size the TTL from the window, or switch to versions.
+- **Hashing the tool arguments as the operation id.** Symptom: duplicates appear only when the model
+  retries, because its second call words the description differently. Fix: derive the id from run, tool
+  and business key, never from free-text arguments.
 - **Comparing source timestamps with timestamps generated on your side** (different clocks, different
   time zones). Symptom: records are perpetually judged stale and re-fetched every run, so the repair count
   never reaches zero. Fix: store and compare the source's own version.
@@ -418,6 +453,12 @@ move the webhook acknowledgement to after the durable write.
 - **Better: store last-applied version per record.** It is bounded by the number of records, never
   expires and rejects arbitrarily late replays.
 
+### Your agent's write tool returns an error and the model calls it again. How do you stop duplicates?
+- **Make the tool idempotent below the model.** Derive the operation id from run, tool and business key,
+  claim it in the ledger, and upsert by external id, so any number of repeats produce one effect.
+- **Change what the model sees.** Return "already done, here is the id" or "outcome unknown, do not
+  retry" as the tool result, and count suppressed duplicates per run as a loop signal.
+
 ## Quiz
 ### Q: An integration already retries failed calls and deduplicates events by record id and version. Why does it still need a reconciliation job?
 - [ ] To re-run retries that exceeded the attempt cap
@@ -444,3 +485,25 @@ move the webhook acknowledgement to after the durable write.
 > A healthy job's repair set changes between runs and trends to zero. The same set recurring means the
 > diff is detected but the repair never makes source and target compare equal, typically because the
 > two sides are not compared like for like; monitor the job's repair outcome, not just its diff.
+
+## Use cases & projects
+### Use cases
+- **Agents that file tickets or update records.** A ledger plus upsert by external id keeps a timed-out
+  `create_ticket` from becoming four tickets when the adapter, the model and a resume all retry.
+- **RAG assistants over a customer's ticketing system.** Version-keyed inbound dedupe stops a late webhook
+  from reopening a closed issue in the agent's answers.
+- **Index freshness guarantees.** Hourly reconciliation with an alerted repair count is the evidence that
+  the agent's knowledge matches the system of record.
+- **Durable agent runs that resume after crashes.** The ledger makes replayed steps no-ops instead of
+  repeated side effects.
+
+### Mini project
+**Make a write tool safe under every kind of retry (2-3 hours).**
+- **Goal:** an agent with a `create_ticket` tool against a fake API that produces exactly one ticket per
+  intent, however often it is retried.
+- **Steps:** build a fake ticket API that randomly times out after committing; wrap it in an adapter with
+  classified retries and backoff; add a ledger keyed on run id, tool and incident id plus upsert by
+  external id; run a 10-step agent loop, kill the process mid-run and resume; finally write a
+  reconciliation function that resolves every `unknown` entry.
+- **Done when:** 50 runs with injected timeouts and crashes leave exactly 50 tickets, the ledger has no
+  `unknown` entries after reconciliation, and you can show the per-run count of suppressed duplicates.

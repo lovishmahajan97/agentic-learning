@@ -5,7 +5,8 @@ name: Incremental synchronization & CDC
 kind: pattern
 difficulty: advanced
 est_minutes: 18
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - enterprise-integration/webhooks
   - enterprise-integration/enterprise-connectors
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-Incremental sync copies only what changed; change data capture (CDC) reads every insert, update and
-delete from the database log. Watermarks are simple but miss deletes and late commits, so the mechanism
-you pick sets how fresh and costly an AI index is.
+An agent's RAG index is a copy of moving sources. Incremental sync copies only what changed; CDC reads
+every insert, update and delete from the database log. Your mechanism decides how stale, leaky and
+expensive the agent's answers are.
+
+## For agent builders
+- **Why it matters for agents.** An agent that cites a closed ticket, a deleted contract or a document whose
+  permissions were revoked is failing at sync, not at reasoning. Freshness and deletes in the index set the
+  ceiling on how trustworthy retrieval-backed answers can be.
+- **Where it shows up in your stack.** The ingestion job that feeds your vector store, the cursor or
+  replication slot it reads from, the hash gate in front of the embedding model, and the "as of" metadata
+  your retrieval tool can return to the agent.
+- **What you control.** Mechanism per source, the overlap window, delete and permission propagation,
+  re-embedding only on text change, and whether the agent falls back to a live fetch when a record is newer
+  than the index.
+- **What you can skip.** Running Kafka and Debezium yourself for a pilot. Start with a watermark plus soft
+  deletes, learn the failure modes below, and move to log-based CDC when the numbers demand it.
 
 ## Why it exists
 - **The index is a derived copy of a moving source.** Tickets are edited, records reassigned, documents
@@ -34,7 +48,8 @@ you pick sets how fresh and costly an AI index is.
   day has about 10,000 changes daily. A nightly reload re-reads and potentially re-embeds 2 million records
   to apply them, about 200 times the necessary work, hammers source APIs, and still leaves up to 24 hours of
   staleness.
-- **Reloads hide "what changed?"**, so downstream consumers cannot react to specific changes.
+- **Reloads hide "what changed?"**, so downstream consumers cannot react to specific changes, such as
+  triggering an agent when a ticket's status flips.
 - **`updated_at > last_run` is where subtle bugs live:**
   - hard-deleted rows never match the query;
   - rows from transactions that commit after your run but carry an earlier timestamp are skipped forever;
@@ -77,7 +92,7 @@ The log records what the database needs for replication, which is not always wha
   right shard, say) must set `REPLICA IDENTITY FULL` and pay for larger log records.
 - **Untouched TOASTed values may be placeholders.** Large out-of-line column values that an update did not
   touch may arrive as a placeholder, so a consumer that blindly writes `after` can overwrite a document body
-  with it.
+  with it, and the agent will then retrieve and quote the placeholder.
 - **Transactions arrive as per-row events.** A consumer can observe a multi-row transaction half-applied
   unless it groups by transaction ID.
 - **Schema changes flow through the same pipeline.** A renamed or retyped column changes the event shape,
@@ -101,6 +116,16 @@ The log records what the database needs for replication, which is not always wha
 - **Hash-gate re-embedding**, *because* many updates touch only metadata, such as a status or assignee, not
   the text. Update metadata in place; re-embed only when the text changed.
 - **Route permission changes through the same path**, or the index serves revoked content.
+- **Store `source_updated_at` and `indexed_at` on every chunk**, *because* the agent's retrieval tool can
+  then tell the model how old a fact is.
+
+### Freshness the agent can see
+- **Index lag is a fact the agent should know.** Return each hit's source modified time and the current
+  sync lag with retrieval results.
+- **Fall back to a live read for volatile fields.** If the question is about current status and the lag
+  exceeds the field's tolerance, the agent calls a live lookup tool instead of trusting the index.
+- **Read-your-writes for agent actions.** When an agent updates a record through a tool, the index will not
+  show it until the next sync or CDC event, so the agent should trust its own tool result, not a re-retrieval.
 
 ### Operating it
 - **Persist cursors transactionally with the applied changes** (or after them, with idempotent replays).
@@ -112,7 +137,7 @@ The log records what the database needs for replication, which is not always wha
 
 ## Diagram
 Snapshot first, then stream from the recorded log position; the consumer's LSN guard and hash gate keep
-replays and metadata churn cheap.
+replays and metadata churn cheap before anything reaches the agent's index.
 
 ```mermaid
 flowchart TD
@@ -209,6 +234,32 @@ print(apply_change(idx, {"op": "u", "before": {"id": 7}, "source": {"lsn": 120},
                          "after": {"id": 7, "status": "open", "body": "old"}}))         # skip
 ```
 
+### A freshness-aware retrieval tool for the agent
+Runnable standard library: each hit carries its age, and the tool tells the agent to use a live lookup
+when a volatile field is staler than its tolerance.
+
+```python
+import time
+
+SYNC_STATE = {"tickets": {"high_water": time.time() - 900}}      # last full pass 15 minutes ago
+TOLERANCE_S = {"status": 300, "body": 86_400}                     # status must be < 5 min old
+INDEX = [{"id": "T-12", "status": "open", "body": "VPN drops hourly", "source_updated_at": time.time() - 3600}]
+
+def search_tickets(query: str, field_needed: str = "body") -> dict:
+    lag = time.time() - SYNC_STATE["tickets"]["high_water"]
+    hits = [h for h in INDEX if query.lower() in h["body"].lower()]
+    advice = None
+    if lag > TOLERANCE_S.get(field_needed, 3600):
+        advice = f"index is {lag/60:.0f} min behind; call get_ticket_live for current {field_needed}"
+    return {"hits": hits, "index_lag_s": round(lag), "advice": advice}
+
+print(search_tickets("vpn")["advice"])                   # None: body tolerates a day of lag
+print(search_tickets("vpn", field_needed="status")["advice"])   # index is 15 min behind; call get_ticket_live ...
+```
+
+- **The model decides with facts, not guesses:** lag and age are in the tool result, so the agent can
+  caveat an answer or make the live call.
+
 ### Worked incident: a stalled replication slot
 A consumer was decommissioned but its slot was left behind. Figures are illustrative.
 
@@ -223,12 +274,26 @@ A consumer was decommissioned but its slot was left behind. Figures are illustra
 The fix was a slot-lag alert at a fraction of free disk, a runbook to drop orphaned slots, and the cap as a
 last line of defence.
 
+### Worked scenario: embedding cost for a support agent's ticket index
+Illustrative: 2 million tickets, 10,000 changed rows a day, of which about 1,500 have text changes (most
+changes are status or assignee updates).
+
+| Strategy | Re-embeds per day | Staleness |
+|---|---|---|
+| Nightly full reload | 2,000,000 | up to 24 hours |
+| Watermark sync, no hash gate | about 30,000 (10,000 changes × about 3 overlapping runs) | about 5 to 15 minutes |
+| Watermark sync with hash gate | about 1,500 | about 5 to 15 minutes |
+| Log-based CDC with hash gate | about 1,500 | seconds |
+
 ## Production patterns
 - **Alert on retained WAL per slot.** Query `pg_replication_slots` with
   `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)` on a schedule and page well before it threatens free
   disk; agree the threshold with the customer's DBA. Monitor inactive slots as well as lagging ones.
 - **Heartbeats for quiet databases.** On low-traffic sources, configure the connector's heartbeat (Debezium
   has `heartbeat.interval.ms`) so the slot's confirmed position keeps advancing. Monitor slot position age.
+- **Freshness metadata in every retrieval result.** Store source modified time and index time per chunk, and
+  return them plus current sync lag from the agent's search tool. Monitor sync lag per source against the
+  freshness target agreed for the agent's use case.
 - **Schema registry plus tolerant consumers.** Register change-event schemas, ignore unknown added fields,
   and fail loudly on removed or retyped ones you depend on. Monitor consumer deserialization errors after
   every source migration.
@@ -247,6 +312,8 @@ last line of defence.
   expire and semantics vary per vendor, so you still need a full-resync path.
 - **Wider overlap vs re-reads.** A wider window catches later-committing transactions but re-reads more rows
   each run; cheap with idempotent, hash-gated upserts and expensive without them.
+- **Fresher index vs live tool calls.** Lower sync lag lets the agent answer from retrieval alone; a staler
+  index is cheaper to run but pushes volatile questions to live lookups that cost source API calls per step.
 
 ## Pitfalls
 - **`updated_at > last_run` with the worker's clock and no overlap.** Symptom: a small, steady number of
@@ -261,6 +328,8 @@ last line of defence.
   be routed because `before` holds only the key.
 - **Saving the cursor before changes are applied.** Symptom: changes lost permanently after a worker crash
   mid-batch.
+- **Hiding index age from the agent.** Symptom: the agent states a ticket is "open" minutes after it closed,
+  with no caveat. Fix: return lag and modified time with hits, and a live lookup tool.
 
 ## When to use
 - **Full reloads:** small sources and early pilots.
@@ -317,10 +386,20 @@ tombstone table, or move to log-based CDC, which emits delete events, plus perio
 - **Cap it** with `max_slot_wal_keep_size` on PostgreSQL 13+, accepting that an invalidated slot forces a
   re-snapshot.
 
-### Why must the snapshot-to-stream hand-off record a log position first?
-- **Changes keep happening during the snapshot.** Recording the position first and streaming from it means
-  none are lost.
-- **Overlap is then harmless** because upserts are idempotent and guarded by LSN.
+### Your support agent told a customer a ticket was still open, but it closed ten minutes earlier. How do you fix the system?
+- **Measure first:** sync lag for the ticket source at that moment, and whether the close event was
+  applied, delayed or lost.
+- **Make age visible:** return source modified time and index lag with each hit, so the agent can caveat.
+- **Route volatile fields live:** for status questions beyond the lag tolerance, the agent calls a live
+  lookup tool; for the pipeline, move toward CDC or webhooks if the target is seconds.
+
+### Embedding spend for the agent's index doubled with no change in document volume. Where do you look?
+- **The re-embed ratio:** if it rose toward 1, the hash gate broke or a migration started touching text
+  columns.
+- **Overlap and replays:** a wider overlap window or a reset cursor re-processes rows, harmless only when
+  hash-gated.
+- **Metadata churn:** a new bulk job updating status or ACLs is cheap with in-place metadata updates and
+  expensive without them.
 
 ## Quiz
 ### Q: Why can a watermark query on updated_at miss rows even with a correct clock?
@@ -346,3 +425,25 @@ tombstone table, or move to log-based CDC, which emits delete events, plus perio
 - [ ] Delete and re-insert every changed document
 > Embeddings depend on text, so metadata-only changes should update filters like status or ACL without calling
 > the embedding model; batching reduces frequency but not the wasted re-embeds.
+
+## Use cases & projects
+### Use cases
+- **Support and IT agents over ticket databases.** CDC or watermark sync keeps status, assignee and ACLs
+  current in the index, with hash-gated re-embedding.
+- **Contract and policy assistants.** Delete propagation removes documents withdrawn for legal reasons
+  before the agent can cite them.
+- **Agents over SaaS sources.** Graph delta tokens or Salesforce Change Data Capture feed the index without
+  database access.
+- **Event-driven agents.** A CDC stream of status changes triggers follow-up agents ("ticket reopened,
+  summarise history for the new assignee").
+
+### Mini project
+**Fresh, delete-aware ticket index for a RAG agent (2-3 hours).**
+- **Goal:** keep a small agent's ticket index current with watermark sync, deletes and hash-gated
+  re-embedding, and expose freshness to the agent.
+- **Steps:** create a local PostgreSQL `tickets` table with `updated_at` and `deleted_at`; write the
+  watermark sync with overlap and keyset paging; store a content hash and timestamps per chunk; build a
+  `search_tickets` tool that returns index lag; run a script that edits statuses, edits bodies and deletes rows.
+- **Done when:** deleted tickets vanish from search within one run, status-only edits cause zero re-embeds,
+  a long open transaction's row still appears after commit, and the agent caveats or calls a live lookup when
+  lag exceeds the status tolerance.

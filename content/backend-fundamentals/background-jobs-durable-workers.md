@@ -5,7 +5,7 @@ name: Background jobs / durable workers
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - backend-fundamentals/message-queues
@@ -488,7 +488,8 @@ of the oldest queued job and the dead count.
   crash without repeating tool calls.
 - **Steps:** create `jobs` and `run_steps` tables; adapt the worker above so the handler loops over agent
   steps, checkpointing each into `run_steps` with a unique `(run_id, step)`; give the agent a fake
-  side-effecting tool that writes to a ledger with the step id as an idempotency key; start two workers,
-  `kill -9` one mid-run, and let the lease expire.
+  side-effecting tool that writes to a ledger with the step id as an idempotency key.
+- **Crash test:** add the small sweeper that moves orphaned jobs at 5 attempts to `dead`, shorten the
+  lease to ~20 s for the test, start two workers, `kill -9` one mid-run, and let the lease expire.
 - **Done when:** the run completes on the surviving worker, the ledger has exactly one entry per tool
   step, steps re-executed after the crash is at most one, and a job that always crashes ends in `dead`.

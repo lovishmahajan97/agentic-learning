@@ -5,7 +5,7 @@ name: Kubernetes
 kind: tool
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - backend-fundamentals/docker
@@ -346,7 +346,8 @@ Checkpointing turns "raise the grace period forever" into a bounded, per-step bu
   log does. Alert on restart counts and Pods Pending beyond a few minutes.
 - **Isolate agent tools with NetworkPolicy and ServiceAccounts.** Give each tool server its own
   ServiceAccount with minimal RBAC, and a NetworkPolicy so only agent Pods can reach it and sandbox Pods
-  can reach nothing internal. Audit denied connections after enabling.
+  can reach nothing internal. NetworkPolicy only bites if the CNI enforces it (Calico or Cilium do; some
+  defaults do not), so test a denied connection after enabling.
 - **Evals as CronJobs on the production image.** Run the agent eval suite nightly as a CronJob pinned to the
   deployed digest, writing scores to your metrics store. Alert when a score drops versus the last run.
 
@@ -517,5 +518,7 @@ across a rollout.
   fake 10-step agent (sleep plus a fake tool call per step) and writes a checkpoint after each step; add
   readiness and liveness probes and a SIGTERM handler that finishes the current step; enqueue 20 runs and
   run `kubectl rollout restart` mid-way.
-- **Done when:** all 20 runs complete with exactly 10 steps each, none restarts from step 1, and
-  `kubectl get events` shows clean terminations rather than SIGKILLs.
+- **Done when:** all 20 runs complete with exactly 10 steps each, none restarts from step 1, and every old
+  worker's log (follow it with `kubectl logs -f` during the restart, since deleted Pods take their logs
+  with them) ends with "step finished, exiting" well inside
+  the grace period, not mid-step.

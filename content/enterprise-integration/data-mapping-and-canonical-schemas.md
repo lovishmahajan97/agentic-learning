@@ -5,7 +5,8 @@ name: Data mapping & canonical schemas (schema mapping)
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - data-architecture/data-contracts
   - scoping/domain-modeling
@@ -20,9 +21,21 @@ sources:
 ---
 
 ## TL;DR
-A canonical schema is your one internal model of business concepts; schema mapping is the per-source,
-versioned translation into it. With N sources and M consumers you maintain about N + M mappings instead
-of N × M, and every component reads one shape.
+A canonical schema is the one shape your agent's tools read and write; schema mapping is the per-source,
+versioned translation into it. N sources and M consumers need about N + M mappings, not N × M, and one
+tool schema serves every customer.
+
+## For agent builders
+- **Why it matters for agents.** Without a canonical model every tool schema, retrieval filter and prompt
+  has to know each customer's field names and codes. With one, the agent's `update_case(status=...)` tool
+  takes the same closed enum for every tenant, and the adapter maps it to that tenant's source code.
+- **Where it shows up in your stack.** Tool argument and result schemas, metadata filters in the vector
+  store, the mapping layer inside each tool adapter, and the eval harness that compares agent outputs
+  field by field.
+- **What you control.** Which concepts are canonical, the closed enums the model may emit, the reverse
+  crosswalk for write tools, and quarantine of values the mapping does not know.
+- **What you can skip.** Enterprise-wide data modelling. Model only the concepts your agent reasons about
+  and keep the rest in extensions.
 
 ## Why it exists
 - **Every client represents the same concepts differently.** One CRM's "Account" is another's
@@ -104,6 +117,17 @@ Mapping is more than renaming, and the layers fail in different ways:
 - **Track per-field null and quarantine rates per source** after each load, because a sudden rise is
   usually a source-side change rather than a data trend.
 
+### The canonical schema is the agent's tool contract
+- **Tool schemas use canonical types.** A write tool's JSON schema declares `status` as the canonical enum
+  (`open`, `pending`, `resolved`, `closed`), so the model never sees or invents a tenant's source codes,
+  and argument validation rejects anything else before the adapter runs.
+- **Tool results return canonical records,** trimmed to the fields the agent needs, with source detail
+  left in extensions. The same prompt then works across Zendesk, ServiceNow and Jira tenants.
+- **The adapter does both directions.** Inbound it maps source to canonical for results; outbound it uses
+  the reverse crosswalk and the kept source value, so the agent's write changes only what it meant to.
+- **Retrieval filters are canonical fields.** A filter such as `status = open AND product = X` works for
+  every tenant only because mapping produced queryable canonical values at ingestion.
+
 ### LLM-assisted mapping
 - **Good for *proposing*.** Given source field names, descriptions and sample values, an LLM drafts a field
   table and crosswalk quickly.
@@ -111,8 +135,9 @@ Mapping is more than renaming, and the layers fail in different ways:
   it should not be the runtime mapping.
 
 ## Diagram
-A source record passes through the mapping layers in order; anything without a crosswalk entry goes to
-quarantine and back to the data owner, and the original value is kept for write-back.
+A source record passes through the mapping layers in order before the agent's tools can read it;
+anything without a crosswalk entry goes to quarantine and back to the data owner, and the original value
+is kept for the agent's write-back.
 
 ```mermaid
 flowchart TD
@@ -202,6 +227,31 @@ naive = {v: k for k, v in CROSSWALK.items()}                 # inverted many-to-
 print(naive["pending"])                                      # K: every W ticket would become K
 ```
 
+### A canonical write tool for an agent
+The model sees one tool schema for every tenant; the adapter validates against the canonical enum and
+writes back through `to_source` from the fixture above. `client` stands for the tenant's API wrapper.
+
+```python
+UPDATE_STATUS_TOOL = {
+    "name": "update_ticket_status",
+    "description": "Set a ticket's status. Use only the listed values.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"ticket_id": {"type": "string"},
+                       "status": {"type": "string", "enum": ["open", "pending", "resolved", "closed"]}},
+        "required": ["ticket_id", "status"],
+    },
+}
+
+def run_update_status(args: dict, canonical_store: dict, client) -> dict:
+    if args["status"] not in REVERSE:                       # validate before any write
+        return {"error": f"status must be one of {sorted(REVERSE)}"}
+    rec = dict(canonical_store[args["ticket_id"]], status=args["status"])
+    code = to_source(rec)                                    # exact round trip when meaning unchanged
+    client.patch(args["ticket_id"], {"Stat": code})
+    return {"ticket_id": args["ticket_id"], "status": args["status"]}   # canonical result to the model
+```
+
 ### Worked scenario: counting translations
 | Sources × consumers | Point-to-point (N × M) | Canonical (N + M) |
 |---|---|---|
@@ -227,6 +277,9 @@ With one source and one consumer both columns are 1 versus 2, which is why mappi
 - **LLM-drafted, human-approved crosswalks.** Use when onboarding a large unfamiliar schema. Prompt with
   field names, descriptions and sample values, then have the data owner approve each value mapping before
   it is frozen as config. Monitor the share of proposals the owner changes.
+- **Canonical enums in tool schemas.** Use for every agent tool that takes a categorical argument. Declare
+  the canonical values as an enum in the tool's input schema and validate in the adapter before mapping
+  back. Monitor rejected tool arguments per tool; a rise means the model or the prompt drifted.
 
 ## Trade-offs
 - **N + M vs upfront modelling.** A canonical schema turns N × M translations into roughly N + M, but
@@ -257,6 +310,9 @@ With one source and one consumer both columns are 1 versus 2, which is why mappi
 - **Writing back through an inverted many-to-one crosswalk.** Symptom: source records whose status changes
   from `K` to `W` when the assistant updates an unrelated field, and the client's reports shifting for no
   visible reason.
+- **Exposing source codes in tool schemas.** Symptom: the agent writes `W` for one tenant and `pending`
+  for another, and a prompt tuned on one customer fails on the next. Fix: canonical enums in the tool,
+  mapping inside the adapter.
 - **Letting the LLM interpret raw source records at query time instead of mapping.** Symptom: filters and
   permissions that do not work and answers that vary across model versions.
 
@@ -314,6 +370,12 @@ everything else in extensions, and let the LLM draft the mapping for review, not
 - **Always quarantine** when the value drives filters, routing or access, because a defaulted value makes
   every downstream result for that category silently wrong.
 
+### How do you design an agent's ticket tools so one prompt works for every customer's helpdesk?
+- **Canonical schema as the tool contract:** tool inputs and results use canonical fields and closed
+  enums, never source field names or codes.
+- **Mapping lives in the per-tenant adapter,** inbound for results and reverse crosswalk for writes, with
+  round-trip fixtures so the agent's writes change only what it intended.
+
 ### What do you monitor on mappings in production?
 - **Per-field null rate and quarantine rate per source after each load;** a sudden rise usually means a
   source-side change, not a data trend.
@@ -344,3 +406,24 @@ everything else in extensions, and let the LLM draft the mapping for review, not
 - [ ] It stores the LLM's interpretation of each field
 > Source fields without a canonical home are kept rather than dropped. If a consumer later needs one, it
 > can be promoted and backfilled from stored data instead of negotiating a new pull from the client.
+
+## Use cases & projects
+### Use cases
+- **One support agent across many helpdesks.** Canonical ticket tools let the same prompt and evals run
+  on Zendesk, ServiceNow and Jira tenants.
+- **Agents that write back to systems of record.** Reverse crosswalks and kept source values stop the
+  agent from silently rewriting statuses it did not mean to change.
+- **Filtered retrieval for RAG agents.** Canonical metadata fields make filters such as status or product
+  work identically for every tenant.
+- **Fast onboarding of a new tenant.** An LLM drafts the crosswalk, the data owner approves it, and the
+  agent's tools work unchanged.
+
+### Mini project
+**Canonical tools over two fake helpdesks (2 hours).**
+- **Goal:** one agent with `get_ticket` and `update_ticket_status` tools that works against two sources
+  with different field names and status codes.
+- **Steps:** define a canonical ticket schema; write declarative mappings for two fake sources, one with a
+  many-to-one crosswalk; build adapters that map results inbound and writes back through a reverse
+  crosswalk; add quarantine for unknown codes; run the same 8-task agent script against both sources.
+- **Done when:** both sources pass the same tasks with one prompt, round-trip fixtures pass, and an
+  injected unknown code lands in quarantine instead of reaching the model.

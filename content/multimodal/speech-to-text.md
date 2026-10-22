@@ -5,7 +5,8 @@ name: Speech-to-text (Whisper)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - multimodal/tts
   - multimodal/vision-language-models
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-Speech-to-text (ASR) turns audio into a transcript. Whisper, an encoder-decoder transformer, reads a
-30-second log-Mel spectrogram and generates text; trained on roughly 680,000 hours of weakly labelled
-audio, it is robust across accents, noise and languages.
+Speech-to-text (ASR) is the ears of voice and call-analytics agents. Whisper reads 30-second log-Mel
+spectrograms; trained on roughly 680,000 hours of weakly labelled audio, it is robust but batch-only, so
+live agents need streaming ASR.
+
+## For agent builders
+- **Why it matters for agents.** In a voice agent every transcript error becomes a wrong tool argument
+  (a misheard account number, a misspelled product), and ASR latency sits at the front of every turn.
+  In batch agents that summarise calls, hallucinated text during silence becomes fake evidence.
+- **Where it shows up in your stack.** faster-whisper or whisper.cpp for recordings, a streaming ASR API
+  or streaming-native model for live turns, VAD and endpointing in the voice pipeline, and transcript
+  text passed into the agent's context or tools.
+- **What you control.** Batch versus streaming per surface, VAD settings, `initial_prompt` vocabulary,
+  confidence flags passed to the agent, confirmation of entities before tools act on them, PII redaction.
+- **What you can skip.** Mel filterbank maths and the conv stack details. Know the 30-second window, the
+  hallucination guards, WER normalisation and real-time factor.
 
 ## Why it exists
 - **Voice is useless to text systems until transcribed.** Call centres, meetings, dictation, voice agents
@@ -113,6 +126,16 @@ can hallucinate fluent text or loop on a phrase. The reference implementation's 
 - **Streaming-native models** (RNN-transducer or chunked-attention encoders, as in several managed ASR
   APIs) emit words as they arrive with sub-second delay.
 - **For a live voice agent,** that difference drives the architecture more than the error rate does.
+
+### ASR inside an agent turn
+1. **Endpointing.** VAD or the streaming ASR decides the user has stopped speaking; too eager cuts them
+  off, too patient adds dead air to every turn.
+2. **Final transcript to the LLM.** The agent receives text, ideally with word confidences, and decides
+  on a reply or a tool call.
+3. **Confirm before acting.** Entities that feed tools (amounts, account numbers, names) are read back or
+  validated, because a misheard digit is a wrong action, not just a typo.
+- **Why partials matter.** Streaming partial transcripts let the agent start retrieval or warm a tool
+  before the user finishes, hiding part of the latency.
 
 ### Measuring it
 ```
@@ -226,6 +249,22 @@ Illustrative numbers; measure RTF on your own hardware and audio before committi
 VAD here is both a quality fix (fewer hallucinations) and a cost cut, because silence is decoded at the
 same price as speech.
 
+### Agent scenario: one voice-agent turn, batch versus streaming ASR
+Illustrative latency budget for "what is the status of ticket 4471?"; measure each stage in your own
+traces, since vendors and hardware vary widely.
+
+| Stage | Pseudo-streaming Whisper (chunked) | Streaming-native ASR |
+|---|---|---|
+| End-of-speech detection (silence wait) | ~500 ms | ~500 ms |
+| Final transcript after end of speech | ~1,000 ms (re-decode last chunk) | ~200 ms (partials already in) |
+| LLM decides tool call, tool runs | ~800 ms | ~800 ms, retrieval started on partials |
+| Time until the agent starts replying (before TTS) | ~2,300 ms | ~1,500 ms |
+
+- **Read it as a budget.** ASR is the only stage here where switching architecture removes most of its
+  share; the silence wait is a tuning choice, and LLM plus tool time is unchanged.
+- **Then guard the action.** If the transcript says "ticket 4471" with a low-confidence word on "71", the
+  agent should confirm the number before calling the ticket tool.
+
 ## Production patterns
 - **VAD in front of every batch job.** When: recordings with hold music, silence or long pauses. How:
   `vad_filter=True` with `min_silence_duration_ms` tuned on sample calls. Monitor: share of audio removed
@@ -242,6 +281,9 @@ same price as speech.
 - **Redact PII in transcripts before storage.** When: calls carry names, card or account details. How:
   run PII detection on transcript text with word timestamps, so the same spans can also be muted in the
   audio. Monitor: redaction recall on a labelled sample.
+- **Confirm low-confidence entities before tool calls.** When: voice agents that act on numbers, names or
+  dates. How: pass word probabilities with the transcript and instruct the agent to read back any entity
+  below a threshold before calling the tool. Monitor: confirmations per session and wrong-action rate.
 
 ## Trade-offs
 - **Zero-shot robustness vs domain fine-tuning.** Weak supervision at scale buys robustness, but a model
@@ -271,6 +313,9 @@ same price as speech.
   summary that credits the customer with the agent's promise.
 - **Forgetting the transcript contains PII.** Symptom: a compliance finding over stored call text nobody
   classified, since the audio was treated as the sensitive asset and the text was not.
+- **Letting a voice agent act on a misheard entity.** Symptom: the agent opens the wrong account or books
+  the wrong date, and the trace shows a transcript error, not an LLM error. Fix: confirm low-confidence
+  entities and validate them against the system of record before the tool runs.
 
 ## When to use
 - **Use Whisper-class models** for offline or near-real-time transcription where accuracy across
@@ -334,6 +379,12 @@ product name while users and search break on it.
 - **Cut input first.** VAD removes silence that costs the same to decode as speech; measure RTF on your
   own audio and concurrency before buying.
 
+### Your voice agent books appointments on the wrong day about 1 time in 50. How do you debug it?
+- **Split ASR from reasoning.** Pull traces for the failures and compare audio, transcript and tool
+  arguments; if the transcript already says the wrong day, it is an ASR error, not an LLM one.
+- **Fix at the right layer.** Add date terms to the vocabulary prompt, pass word confidences to the
+  agent, and require a spoken confirmation of the date before the booking tool runs.
+
 ## Quiz
 ### Q: Why does Whisper process audio in fixed 30-second windows?
 - [ ] Audio files longer than 30 seconds cannot be stored as spectrograms
@@ -358,3 +409,22 @@ product name while users and search break on it.
 - [ ] It replaced the transformer with a recurrent network for streaming
 > Earlier models trained on curated thousands of hours and were brittle off-benchmark; Whisper scaled to
 > hundreds of thousands of weakly supervised hours and generalised to unseen datasets without tuning.
+
+## Use cases & projects
+### Use cases
+- **Live voice agents.** Phone support or booking agents use streaming ASR for each user turn, with
+  entity confirmation before tool calls.
+- **Call-analytics agents.** Recorded calls are transcribed in batch with VAD, then an agent summarises,
+  tags intent and files follow-up tickets.
+- **Meeting assistants.** Transcripts with timestamps and diarization feed an agent that extracts action
+  items and links each to the moment it was said.
+- **Voice input for existing agents.** A dictation layer lets field workers drive a text agent hands-free.
+
+### Mini project
+**Transcript-to-ticket agent with honest uncertainty (2-3 hours).**
+- **Goal:** turn 10 recorded support calls into tickets, flagging anything the ASR was unsure of.
+- **Steps:** transcribe with faster-whisper, VAD on, an `initial_prompt` of product names; pass segments
+  with low-confidence flags to an agent that calls a `create_ticket` tool; hand-label two calls and
+  compute normalised WER and entity accuracy.
+- **Done when:** each call yields a ticket whose uncertain fields are marked, and you report WER, entity
+  accuracy and RTF for the run.

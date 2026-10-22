@@ -5,7 +5,7 @@ name: Learning rate
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - ml-fundamentals/learning-rate-schedulers
@@ -24,9 +24,9 @@ sources:
 ---
 
 ## TL;DR
-The learning rate is the optimiser's step size, the first knob to check when an agent fine-tune
-misbehaves: too high and the model forgets its tool-call format or diverges, too low and LoRA learns
-nothing. Peak, warmup and decay are set together.
+The learning rate is the optimiser's step size and its most sensitive setting, the first to check when
+an agent fine-tune misbehaves: too high breaks the tool-call format or diverges, too low and LoRA learns
+nothing. Set peak, warmup and decay together.
 
 ## For agent builders
 - **Why it matters for agents.** When you fine-tune a model on agent trajectories (tool selection,

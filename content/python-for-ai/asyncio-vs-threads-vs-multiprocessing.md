@@ -5,7 +5,7 @@ name: asyncio vs threads vs multiprocessing
 kind: decision
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/asyncio
@@ -270,8 +270,9 @@ What to expect (one laptop run, illustrative, not a benchmark):
   `"forkserver"`) when the parent has threads or CUDA, instead of relying on the platform default. Watch
   for intermittent worker hangs, the fork-with-threads fingerprint.
 - **Batch CPU tasks and split them out.** Send hundreds of small documents per task (`chunksize=` or explicit
-  batches), and run RAG parsing and chunking as queue-fed workers scaled separately from the I/O-bound
-  agent API tier. Monitor tasks/s, queue depth and age of the oldest job.
+  batches), tuning the size empirically against throughput, and run RAG parsing and chunking as queue-fed
+  workers scaled separately from the I/O-bound agent API tier. Monitor tasks/s, the parent process's CPU,
+  queue depth and age of the oldest job.
 - **Size server workers against memory.** Each Uvicorn/Gunicorn worker process duplicates models and pools,
   so set the worker count from the memory budget, not only from cores. Monitor RSS per worker.
 

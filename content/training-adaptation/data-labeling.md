@@ -5,7 +5,7 @@ name: Data labeling
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - training-adaptation/data-curation
@@ -23,8 +23,9 @@ sources:
 ---
 
 ## TL;DR
-For agent teams, labeling means grading traces: right tool, right arguments, did the run succeed. Those labels become your eval set, your LLM-judge calibration and any fine-tuning
-data, so their agreement sets the ceiling on everything you measure.
+Labeling turns tickets and agent traces into measurable targets: classes, demonstrations, preferences,
+per-step grades (right tool, right arguments, run succeeded). They become your eval set, LLM-judge
+calibration and fine-tuning data, so human agreement caps everything you measure.
 
 ## For agent builders
 - **Why it matters for agents.** Agent quality is judged per step and per run, and nobody can grade that
@@ -146,7 +147,8 @@ Agreement measures noise on the overlap; it does not tell you *which* single-lab
    learning formalises this by estimating, per class, the threshold above which a disagreement is likely
    a label error.
 3. **Review the top of the list by hand** rather than auto-relabeling, because the model's confident
-   disagreements also include genuinely hard cases it gets wrong.
+   disagreements also include genuinely hard cases it gets wrong. A confident-learning library such as
+   cleanlab automates the ranking; track the fraction of reviewed items that are actually relabeled.
 
 ### Why agreement rather than accuracy
 - **There is no external truth.** The labels are the truth you are constructing.
@@ -270,8 +272,9 @@ suspects = np.argsort(given_label_prob)[:200]       # lowest-confidence labels f
 
 ## Production patterns
 - **Trace annotation queues.** Route sampled production traces, thumbs-down runs and judge low-confidence
-  runs into an annotation queue in your tracing tool, labeled per step against a written rubric. Monitor
-  queue age and the share of labeled traces that become golden-set items.
+  runs into an annotation queue in your tracing tool, labeled per step against a written rubric. Fill it
+  by quotas per task type and failure class, not uniformly, so rare failures get enough items. Monitor
+  queue age, per-class counts and the share of labeled traces that become golden-set items.
 - **Overlap plus seeded gold.** During production labeling, give 5–10% of items to two annotators and
   mix in gold items with known answers. Monitor kappa on the overlap per week and the gold pass rate per
   annotator; a falling pass rate flags drift or inattention before the batch is accepted.
@@ -367,6 +370,8 @@ analysis can isolate a bad batch instead of discarding the whole dataset.
 - **Fleiss' kappa:** three or more raters on nominal labels, the usual choice for a multi-rater pilot.
 - **Krippendorff's alpha:** when some items are missing labels, or the scale is ordinal (rubric 1–5),
   because it can count a 4-vs-5 disagreement as smaller than a 1-vs-5 one.
+- **Whichever you pick:** bootstrap an interval on a small pilot and read the confusion matrix, because
+  one number hides which classes the guideline fails to separate.
 
 ### You want an LLM judge to grade every agent run in CI. How do you decide whether to trust it?
 - **Treat it as a rater:** have humans label a pilot of a few hundred steps or runs, adjudicate, and
@@ -406,8 +411,8 @@ analysis can isolate a bad batch instead of discarding the whole dataset.
   falling rate flags drift or inattention before a batch is accepted.
 - **Versioned guidelines:** store guideline version and annotator id on every record, and relabel or split
   by version when the guideline changes, so the model does not learn a blend of two definitions.
-- **Demonstrations versus preferences:** when the run also collects SFT data, a smaller expert
-  demonstration set establishes behaviour and cheaper preference comparisons refine it at scale.
+- **Recheck any LLM judge in the loop:** compare it with the weekly human overlap, because a judge that
+  drifts or meets a new tool silently changes what "pass" means.
 
 ## Quiz
 ### Q: Why report Cohen's kappa instead of the raw percentage of items two annotators agree on?
@@ -452,7 +457,7 @@ analysis can isolate a bad batch instead of discarding the whole dataset.
 **Label agent traces and measure agreement (2-3 hours).**
 - **Goal:** produce a small labeled trace set and know how much to trust it and an LLM judge.
 - **Steps:** collect 50 traces from a toy tool-calling agent; write a one-page rubric with per-step labels;
-  have two people (or you twice, a day apart) label all 50; compute Cohen's kappa per label; adjudicate
+  have two people label all 50 independently (alone, relabel a day later without looking); compute Cohen's kappa per label; adjudicate
   disagreements and refine the rubric; then run an LLM judge with the same rubric and compute its kappa
   against the adjudicated labels.
 - **Done when:** you have a JSONL of adjudicated labels, a table of kappa per label for human-human and

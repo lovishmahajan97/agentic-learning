@@ -5,7 +5,8 @@ name: Experiment tracking (MLflow, W&B)
 kind: tool
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - llmops-platform/model-registry
   - llmops-platform/reproducible-evaluations
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-Experiment tracking stores every training or eval run (params, code and data versions, step metrics,
-artifacts) so runs can be compared, reproduced and promoted. MLflow and W&B share that data model and
-differ in hosting, UI and ecosystem.
+Experiment tracking records every agent eval or fine-tuning run (params, code and data versions, step
+metrics, artifacts) so configurations can be compared, reproduced and promoted. MLflow and W&B share that
+data model and differ in hosting, UI and ecosystem.
+
+## For agent builders
+- **Why it matters for agents.** Agent tuning is a search over prompt versions, models, tool sets, step
+  budgets and retrieval settings. Without a run per configuration, "did the new planner prompt help, and
+  what did it cost per task" is answered from memory.
+- **Where it shows up in your stack.** MLflow or W&B runs for agent eval sweeps and for fine-tuning a model
+  on agent traces; observability platforms (Langfuse, LangSmith, W&B Weave, MLflow tracing) for the
+  per-run traces those evals came from.
+- **What you control.** Which knobs are params (prompt version, model snapshot, tool-set hash,
+  `max_steps`), which outcomes are metrics (success rate, steps, tokens and cost per task), and logging
+  per-task trajectories as artifacts.
+- **What you can skip.** Sweep orchestration and system metrics unless you fine-tune. Most agent teams need
+  runs, params, a handful of metrics and an artifact per eval.
 
 ## Why it exists
 - **Runs outpace memory.** Week one is a spreadsheet of learning rates and scores. By week three it is
@@ -31,29 +45,30 @@ differ in hosting, UI and ecosystem.
   edited in place since.
 - **Fine-tuning is combinatorial.** LoRA rank, learning rate, data mix, epochs and base model revision
   interact, so a result without its full configuration cannot be reproduced or trusted.
-- **LLM app evals are experiments too.** A prompt version, model snapshot, dataset version and judge
-  configuration go in; scores come out. Results in notebook cells and Slack screenshots cannot answer "did
-  the last three prompt changes help on the refund slice" without re-running everything.
+- **LLM app and agent evals are experiments too.** A prompt version, model snapshot, tool set, dataset
+  version and judge configuration go in; scores come out. Results in notebook cells and Slack screenshots
+  cannot answer "did the last three prompt changes help on the refund slice" without re-running everything.
 - **Logs and file names fail because comparison and lineage are the whole job.** You must filter a thousand
   runs by parameter, overlay metric curves, and follow a model version back to its run, data and commit:
   a database with a specific schema and a UI on top, which is what a tracker is.
 
 ## How it works
 ### The data model both tools share
-| Concept | What it is | Why |
-|---|---|---|
-| **Experiment** (MLflow) / **project** (W&B) | groups runs | one place to compare |
-| **Parameters** | fixed at start, treated as immutable | changing them mid-run would make comparisons meaningless |
-| **Metrics** | time series against a step or epoch | see divergence or over-fitting at step *k*, not just the final number |
-| **Artifacts** | files: checkpoints, per-item eval outputs, plots, configs | error analysis and lineage |
-| **Tags** | free-form labels | filtering |
-| **Captured context** | git commit, command line, Python environment, optionally system metrics such as GPU utilisation | reproducibility |
+| Concept | What it is | Why | For an agent eval run |
+|---|---|---|---|
+| **Experiment** (MLflow) / **project** (W&B) | groups runs | one place to compare | one agent, such as `support-agent` |
+| **Parameters** | fixed at start, treated as immutable | changing them mid-run would make comparisons meaningless | prompt version, model snapshot, tool-set hash, `max_steps` |
+| **Metrics** | time series against a step or epoch | see divergence or over-fitting at step *k*, not just the final number | success rate, mean steps, cost per task |
+| **Artifacts** | files: checkpoints, per-item eval outputs, plots, configs | error analysis and lineage | per-task trajectories |
+| **Tags** | free-form labels | filtering | `slice`, `triggered_by` |
+| **Captured context** | git commit, command line, Python environment, optionally system metrics such as GPU utilisation | reproducibility | git commit of the agent loop |
 
 - **Param immutability differs by tool.** MLflow rejects re-logging a param with a different value. W&B
   lets `config` be updated, but that is an escape hatch, not the model.
 - **System metrics:** W&B records them by default; MLflow does once system-metrics logging is switched on.
-- **Runs can be nested** for hyperparameter sweeps.
-- **Everything is queryable:** "all runs where `lora_r=16` sorted by `eval_acc`" is one call.
+- **Runs can be nested** for hyperparameter sweeps, or for one parent agent eval with a child run per slice.
+- **Everything is queryable:** "all runs where `lora_r=16` sorted by `eval_acc`" is one call, and so is
+  "all agent runs on model X sorted by success rate".
 
 ### What happens when you call `log`
 Both clients are thin writers to a store; their transport explains several sharp edges.
@@ -98,17 +113,19 @@ Both clients are thin writers to a store; their transport explains several sharp
 - **Distinguishing pieces:**
   - **Artifacts:** versioned datasets and models with an automatic lineage graph (which run consumed which
     artifact version and produced which).
-  - **Sweeps:** a built-in hyperparameter search orchestrator that schedules agents across machines.
+  - **Sweeps:** a built-in hyperparameter search orchestrator that schedules agents across machines (sweep
+    "agents" are worker processes, not LLM agents).
   - **Tables** for per-example analysis in the UI, and **Reports** for sharing.
   - **Weave:** its toolkit for tracing and evaluating LLM applications.
 - **Why teams pick it:** the UI. **Why they do not:** cost per seat, and metrics and artifacts leave the
   network unless you self-host.
 
-### How an LLM team uses either
+### How an agent team uses either
 | Run type | Params | Metrics | Artifacts | Then |
 |---|---|---|---|---|
-| Fine-tuning | `base_model`, `base_revision`, `lora_r`, `lr`, `train_set` version hash, `git_sha` | train and eval loss per step | adapter directory, per-item eval outputs | register the adapter as a model version so lineage flows into the registry |
+| Fine-tuning (for example on agent traces) | `base_model`, `base_revision`, `lora_r`, `lr`, `train_set` version hash, `git_sha` | train and eval loss per step | adapter directory, per-item eval outputs | register the adapter as a model version so lineage flows into the registry |
 | Evaluation | prompt version, model snapshot, dataset hash, judge config | aggregate and per-slice scores | per-item outputs file | error analysis starts from the run page |
+| Agent eval | the evaluation params plus tool-set hash and `max_steps` | success rate, mean steps, tokens and cost per task | per-task trajectories | compare configurations on success and cost together |
 
 The tracker becomes the place where "what did we try and what happened" is answered.
 
@@ -116,19 +133,19 @@ The tracker becomes the place where "what did we try and what happened" is answe
 - **Data residency or regulated environments** push toward self-hosted MLflow or a W&B server.
 - **Already on Databricks:** you get MLflow for free.
 - **Research-heavy teams running sweeps daily** usually prefer W&B's UI and sweep orchestration.
-- **LLM application teams** increasingly keep traces and evals in an observability platform such as
-  Langfuse or LangSmith and use the tracker only for training.
+- **LLM application and agent teams** increasingly keep traces and evals in an observability platform such
+  as Langfuse or LangSmith and use the tracker only for training.
 - **The important decision** is one system of record per artifact class, not one tool for everything.
 
 ## Diagram
-A run writes params once, metrics per step and artifacts by reference; registering from the run carries
-lineage into the registry.
+An agent eval or training job writes params once, metrics per step and artifacts (trajectories,
+checkpoints) by reference; registering from the run carries lineage into the registry.
 
 ```mermaid
 flowchart TD
-    J["Training or eval job"] -->|"params once at start"| T["Tracking server"]
+    J["Agent eval or training job"] -->|"params once at start"| T["Tracking server"]
     J -->|"metrics per step, batched"| T
-    J -->|"large files"| A[("Artifact store: bucket")]
+    J -->|"trajectories, checkpoints"| A[("Artifact store: bucket")]
     T --> DB[("Backend store: runs, params, metrics")]
     A -.->|"reference only"| DB
     DB --> Q["Search and compare runs"]
@@ -137,6 +154,33 @@ flowchart TD
 ```
 
 ## Examples
+### Logging an agent eval run to MLflow
+One run per agent configuration. `run_agent_suite` is your harness, returning one record per task with
+success, steps, cost and the trajectory. The tool-set hash makes a changed tool description a different
+param, so runs stay comparable.
+
+```python
+import hashlib, json, mlflow
+
+tools = json.load(open("agent/tools.json"))                  # the tool schemas the agent sees
+cfg = {"prompt": "support_agent@v14", "model": "vendor-model-2025-04-14",
+       "tools_hash": hashlib.sha256(json.dumps(tools, sort_keys=True).encode()).hexdigest()[:12],
+       "max_steps": 12, "golden_set": "agent-golden-v3@71ab02"}
+
+mlflow.set_experiment("support-agent")
+with mlflow.start_run(run_name=f"{cfg['prompt']}-{cfg['model']}"):
+    mlflow.log_params(cfg)
+    results = run_agent_suite(cfg)                           # one dict per task
+    n = len(results)
+    mlflow.log_metrics({
+        "success_rate": sum(r["success"] for r in results) / n,
+        "mean_steps": sum(r["steps"] for r in results) / n,
+        "cost_per_task_usd": sum(r["cost_usd"] for r in results) / n,
+        "step_budget_hit_rate": sum(r["steps"] >= cfg["max_steps"] for r in results) / n,
+    })
+    mlflow.log_dict({"tasks": results}, "trajectories.json")  # error analysis starts here
+```
+
 ### The same LoRA run logged to MLflow and to W&B
 The same LoRA fine-tuning run logged two ways. Parameters are fixed at the start, metrics are
 step-indexed, artifacts are files, and the dataset and code versions are logged as params so the run is
@@ -179,6 +223,19 @@ run.log_artifact(art)                                                 # becomes 
 run.finish()
 ```
 
+### Worked scenario: three agent configurations, one decision
+Illustrative numbers from a 120-task agent golden set. Sorting on success alone picks the wrong run.
+
+| Run | Params that differ | Success rate | Mean steps | Cost per task | Step-budget hits |
+|---|---|---|---|---|---|
+| A | planner prompt v13 | 0.78 | 5.2 | $0.041 | 3 |
+| B | planner prompt v14 | 0.80 | 8.9 | $0.077 | 14 |
+| C | prompt v14, `max_steps` 8 | 0.79 | 6.0 | $0.048 | 9 |
+
+- **B "wins" on success by 2 points,** which on 120 tasks is within noise, while nearly doubling cost.
+- **The step-budget hit count explains it:** v14 makes the agent explore more, so trajectories in the
+  artifact are where you look next.
+
 ### Worked scenario: the run table hides the best checkpoint
 Pure Python, runnable. Two runs from one sweep; ranking by the last logged value (what the run table
 sorts on) picks the wrong one.
@@ -209,6 +266,9 @@ for run, c in curves.items():      # log these as their own metrics so the track
 - **Still check the curve:** a single peak can be luck that the next seed will not repeat.
 
 ## Production patterns
+- **One run per agent configuration** — whenever you tune an agent. Log prompt version, model snapshot,
+  tool-set hash and `max_steps` as params, and success, steps and cost per task as metrics, so the run
+  table compares quality and cost side by side. Monitor how many promoted agent versions link to a run.
 - **Self-hosted MLflow with real stores** — when data must stay in your network. Run the tracking server
   against a SQL database (`--backend-store-uri`) and a bucket for artifacts, behind your SSO proxy, rather
   than the default local file store. Monitor database size, artifact bucket growth and server latency on
@@ -221,9 +281,9 @@ for run, c in curves.items():      # log these as their own metrics so the track
   values to spot over-fitting.
 - **Offline logging for air-gapped jobs** — when training nodes have no egress. Set `WANDB_MODE=offline` and
   upload later with `wandb sync` from a node that can reach the server. Monitor runs left un-synced.
-- **Artifact retention tied to the registry** — when per-item outputs and checkpoints pile up. Apply bucket
-  lifecycle rules to run artifacts, but exclude anything a registered model version references. Monitor
-  storage growth and any registry version whose source URI no longer resolves.
+- **Artifact retention tied to the registry** — when per-item outputs, trajectories and checkpoints pile up.
+  Apply bucket lifecycle rules to run artifacts, but exclude anything a registered model version
+  references. Monitor storage growth and any registry version whose source URI no longer resolves.
 
 ## Trade-offs
 - **Self-hosted MLflow vs operations.** It keeps data in your network and costs nothing in licences, but you
@@ -233,7 +293,7 @@ for run, c in curves.items():      # log these as their own metrics so the track
   run the self-hosted server.
 - **Per-item artifacts vs storage.** Logging every per-item output makes error analysis one click away, at
   the cost of storage that grows with runs times dataset size; sample or compress once eval sets reach six
-  figures.
+  figures. Agent trajectories are many times larger than single answers, so this flips sooner.
 - **Autologging vs signal.** It captures params and metrics with zero code, but also whatever the framework
   decides is interesting, which can bury the three numbers you care about under three hundred.
 - **Training tracker vs observability platform for evals.** The tracker unifies history; the observability
@@ -256,10 +316,12 @@ for run, c in curves.items():      # log these as their own metrics so the track
   console.
 - **Running evals outside the tracker "because it is just a prompt change".** Symptom: a team arguing from
   memory about whether version 11 or 12 did better on the hard slice.
+- **Logging agent success without cost or steps.** Symptom: a promoted configuration that wins by a point
+  and doubles the bill. Fix: log cost, tokens and steps per task in every agent eval run.
 
 ## When to use
-- **Use from** the first fine-tuning run or the first eval you intend to compare against a later one, which
-  is essentially always.
+- **Use from** the first fine-tuning run or the first agent eval you intend to compare against a later one,
+  which is essentially always.
 - **Choose MLflow** when you need self-hosting, already run Databricks, or want the registry and model
   packaging in the same system.
 - **Choose W&B** when sweep orchestration, the UI and artifact lineage are worth the subscription, and data
@@ -299,6 +361,14 @@ artifacts, with the adapter registered from the run so the registry version carr
 - **Artifacts** are files (checkpoints, per-item outputs, plots) stored in a bucket with only a reference in
   the run.
 
+### What would you log for each agent eval run, and why?
+- **Params:** prompt version, model snapshot, tool-set hash, `max_steps` and golden-set version, because
+  each one changes agent behaviour and must be filterable.
+- **Metrics:** success rate plus mean steps, cost per task and step-budget hits, because a success gain that
+  doubles cost is usually not a win.
+- **Artifacts:** per-task trajectories, because the reason a configuration lost lives in the tool calls, not
+  in the aggregate.
+
 ### A search for `params.lr > 0.001` returns runs with lr = 0.0002. What is going on?
 - **MLflow stores params as strings,** so the comparison is lexicographic, not numeric.
 - **Fix:** log values you will range-query as metrics or as tags you control with a sortable format, and
@@ -319,9 +389,9 @@ artifacts, with the adapter registered from the run so the registry version carr
 - **Fix:** log evals at the current or a later step, or under a separate metric axis, and watch the console
   for the warning.
 
-### When would you not put LLM eval runs in the training tracker?
+### When would you not put agent eval runs in the training tracker?
 - **When evals start from production traces:** an observability platform such as Langfuse or LangSmith
-  links each eval to the traces it came from.
+  links each eval to the agent traces it came from.
 - **The cost** is split history between two systems, so define which one is the record for eval runs.
 - **Keep training** runs, adapters and lineage into the registry in the tracker.
 
@@ -349,3 +419,23 @@ artifacts, with the adapter registered from the run so the registry version carr
 - [ ] The model card's free-text description
 > Lineage is captured at training time in the run; registering from the run carries that link into the
 > version. An alias says where a model is deployed, not where it came from.
+
+## Use cases & projects
+### Use cases
+- **Tuning an agent's planner prompt.** Each prompt version is a run with success, steps and cost, so the
+  team picks on evidence rather than the last demo.
+- **Choosing a model for an agent.** Runs across model snapshots on the same golden set show the
+  success-versus-cost frontier.
+- **Fine-tuning on agent traces.** The LoRA run logs the trace dataset version and base revision, and the
+  adapter is registered from the run.
+- **Explaining a regression.** Per-task trajectories logged as artifacts let you diff tool calls between
+  the champion run and the candidate run.
+
+### Mini project
+**Track an agent configuration sweep (1-2 hours).**
+- **Goal:** pick an agent configuration on success and cost together, with every run reproducible.
+- **Steps:** run MLflow locally; take a small tool-calling agent and 30 tasks; run four configurations (two
+  prompt versions times two `max_steps` values); log params, success rate, mean steps, cost per task and
+  trajectories per run; query the runs sorted by success, then by cost.
+- **Done when:** you can name the chosen run, show its params, open one failed task's trajectory from the
+  run page, and re-run it from the logged params to the same result.

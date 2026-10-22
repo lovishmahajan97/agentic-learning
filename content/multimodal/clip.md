@@ -5,7 +5,8 @@ name: CLIP
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - multimodal/image-embeddings
   - multimodal/vision-language-models
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-CLIP trains image and text encoders with a contrastive loss so images and their captions land close in
-one vector space. Free-form text labels let it classify and search images by description, zero-shot; its
-encoders became the standard VLM vision front end.
+CLIP aligns image and text encoders in one vector space, which gives your agent a cheap image-search and
+zero-shot routing tool and supplies the vision tower inside most VLMs. Its scores are uncalibrated, so
+thresholds decide whether the agent trusts a match.
+
+## For agent builders
+- **Why it matters for agents.** When an agent must find "the photo of the cracked bumper" among
+  millions, or route an uploaded image to the right workflow, a CLIP-style embedding plus a nearest
+  neighbour lookup costs milliseconds, while sending every candidate image to a VLM costs thousands of
+  tokens each.
+- **Where it shows up in your stack.** Multimodal RAG indexes, a `search_images(query)` style tool behind
+  your agent, zero-shot classifiers for intake routing, and the vision encoder of the VLM you call.
+- **What you control.** The checkpoint (pinned per index), prompt templates for labels, per-direction
+  thresholds, a "no match" path the agent can act on, and how many candidates you pass to a VLM.
+- **What you can skip.** Training CLIP yourself and the scaling details of the loss. Know the loss shape,
+  the modality gap and why scores need per-task thresholds.
 
 ## Why it exists
 - **Supervised classifiers have a closed vocabulary.** An ImageNet model knows 1,000 nouns and nothing
@@ -126,7 +139,8 @@ L            = (L_img→txt + L_txt→img) / 2
 
 ## Diagram
 A batch of pairs goes through two encoders into one space; the N × N similarity matrix is trained so the
-diagonal wins in both directions.
+diagonal wins in both directions. Your agent's search tool later reuses just the two encoders and the
+cosine step.
 
 ```mermaid
 flowchart TD
@@ -223,6 +237,38 @@ print(round(info_nce(imgs, matched, scale=1.0), 3), round(math.log(N), 3))      
 The first rows explain why CLIP needed huge batches; the last rows are the storage line in a catalogue
 search plan, before any index overhead.
 
+### Agent tool: text-to-image search with a "no match" answer
+An agent's retrieval tool over a pre-embedded catalogue. It returns at most k candidates above a tuned
+cosine floor, and an explicit empty result otherwise, so the agent asks a clarifying question instead of
+describing an unrelated photo.
+
+```python
+import numpy as np, torch
+from transformers import CLIPModel, CLIPProcessor
+
+NAME = "openai/clip-vit-base-patch32"        # must match the checkpoint that built the index
+model = CLIPModel.from_pretrained(NAME).eval()
+proc = CLIPProcessor.from_pretrained(NAME)
+index = np.load("catalogue_vecs.npy")         # [n_images, 512], L2-normalised at build time
+ids = open("catalogue_ids.txt").read().split()
+TEXT_TO_IMAGE_FLOOR = 0.24                    # illustrative; tune on labelled pairs, this direction only
+
+def search_images(query: str, k: int = 5) -> dict:
+    # Tool exposed to the agent: find catalogue photos matching a short visual description.
+    with torch.no_grad():
+        q = model.get_text_features(**proc(text=[f"a photo of {query}"], return_tensors="pt",
+                                           padding=True, truncation=True))   # 77-token limit
+    q = (q / q.norm(dim=-1, keepdim=True)).numpy()[0]
+    sims = index @ q
+    top = np.argsort(-sims)[:k]
+    hits = [{"id": ids[i], "score": round(float(sims[i]), 3)} for i in top
+            if sims[i] >= TEXT_TO_IMAGE_FLOOR]
+    return {"hits": hits, "note": None if hits else "no confident match; ask the user to refine"}
+```
+
+- **The floor is per direction.** Cross-modal cosines sit in a narrow low band, so tune it on your own
+  labelled pairs and never reuse it for image-to-image search.
+
 ## Production patterns
 - **Pin the checkpoint as an index dependency.** When: any persisted embedding index. How: store the model
   name (for example `openai/clip-vit-base-patch32`) and preprocessing version beside every vector; a
@@ -238,6 +284,9 @@ search plan, before any index overhead.
   share of images landing on the escape class.
 - **Upgrade to a linear probe.** When: you have tens of labels per class. How: fit logistic regression on
   frozen embeddings and compare against zero-shot on the same split. Monitor: accuracy and drift.
+- **Retrieve with CLIP, reason with a VLM.** When: an agent must answer a question about the right image
+  among many. How: the search tool returns the top few candidates, and only those go to the VLM with the
+  question. Monitor: recall@k of the search step and image tokens per agent run.
 
 ## Trade-offs
 - **Open vocabulary vs fine-grained accuracy.** No labelling cost, but accuracy on fine-grained or
@@ -262,6 +311,9 @@ search plan, before any index overhead.
   text-to-image silently returns garbage for image-to-image.
 - **Truncating long descriptions silently at 77 tokens.** Symptom: a detailed query's later constraints
   have no effect on the results. Fix: keep queries short or split constraints into filters.
+- **Letting the agent write long search queries.** An LLM tends to pass a full paragraph to the search
+  tool. Symptom: results ignore half the request. Fix: describe the tool as taking a short visual
+  description and move dates, SKUs or prices into structured filter arguments.
 
 ## When to use
 - **Use when** you need to search, filter, cluster or coarsely classify images by description without
@@ -320,11 +372,17 @@ evaluate recall@k on labelled "similar item" judgements.
 - **Fine-grained, costly decisions.** Medical or industrial parts need a supervised or probed model;
   CLIP can narrow candidates first.
 
-### You must embed a 10-million-image catalogue. What do you plan for?
+### Your agent's image-search tool must cover a 10-million-image catalogue. What do you plan for?
 - **Storage.** 512-dimensional float32 vectors are 2,048 bytes each, about 20.5 GB raw, roughly half in
   float16, before index overhead.
 - **Versioning.** Pin the checkpoint and preprocessing; any change is a full re-embed into a new index,
   so budget GPU hours and an alias swap rather than mixing versions.
+
+### Your support agent describes the wrong product photo with confidence. How do you debug retrieval?
+- **Log the tool call.** Check the query the agent sent, the top-k scores and whether any hit cleared the
+  tuned floor; a long query may have been truncated at 77 tokens.
+- **Then fix the contract.** Return an explicit "no confident match" result the agent is instructed to
+  act on, and measure recall@k on labelled queries before blaming the LLM.
 
 ## Quiz
 ### Q: In CLIP's contrastive loss, where do the negative examples come from?
@@ -350,3 +408,24 @@ evaluate recall@k on labelled "similar item" judgements.
 - [ ] Grouping stock photos by scene type
 > Captions rarely encode counts or precise spatial relations, so the contrastive objective never rewarded
 > learning them. Retrieval, filtering and scene grouping are exactly what caption matching teaches.
+
+## Use cases & projects
+### Use cases
+- **Multimodal RAG for agents.** Text queries retrieve relevant photos, diagrams or slides that the
+  agent then passes to a VLM for the actual answer.
+- **Intake routing.** A zero-shot classifier sends uploaded images (receipt, damage photo, ID document,
+  screenshot) to the right agent workflow before any expensive call.
+- **Duplicate and fraud checks.** Image-to-image similarity flags a claim photo already seen in the
+  archive, and the agent attaches the match to its review note.
+- **Guardrail prefilters.** Cheap embedding filters screen uploads for off-topic content before an agent
+  reasons over them.
+
+### Mini project
+**Build an image-search tool for an agent (2-3 hours).**
+- **Goal:** give a tool-calling agent a `search_images` tool over a few thousand photos with a tuned
+  "no match" result.
+- **Steps:** embed the photos with one pinned CLIP checkpoint; label 100 query-image pairs plus 50
+  queries with no correct image; pick a text-to-image cosine floor from the precision-recall curve; wire
+  the tool into an agent loop and run 30 user requests.
+- **Done when:** you report recall@5 on the labelled queries, the rate at which the agent correctly says
+  nothing matches, and three failure cases with their cause.

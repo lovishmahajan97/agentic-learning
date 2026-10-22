@@ -5,7 +5,7 @@ name: Trade-off analysis
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - system-design/nfrs
@@ -395,13 +395,15 @@ measured pilot rather than a bet.
 - **Name the flip:** in a router the escalation share is the flip input; in the illustrative example the
   router breaks an $0.08 ceiling above about 33% escalation, so chart it and record it as a trigger.
 
-### Walk me through deciding between a large hosted model and a small self-hosted one for an agent platform.
-- **Filter:** residency, licence, security review, and whether anyone can operate GPUs.
-- **Options:** hosted large, self-hosted small, and a hybrid where the small model escalates hard cases.
-- **Evidence:** task success on your golden set, p95 latency under load, cost per successful task,
-  operational burden, each graded.
-- **Decide on the flip:** compute break-even volume and utilisation, compare with the forecast range, and
-  keep the choice behind a gateway.
+### A teammate wants to replace your single agent with a planner and three executor agents. How do you decide?
+- **Options:** the current single agent, planner plus executors, and a hybrid (single agent with a
+  planning step or one specialised sub-agent), plus "defer".
+- **Evidence, graded:** task success on the long-task slice of the golden set, steps and tokens per run,
+  p95 run time, and debugging cost (traces per task, failure attribution), measured on a spike rather than
+  asserted from a framework demo.
+- **Name the flip:** typically task length or tool count; if multi-agent only wins on tasks above some
+  length, route those tasks to it and keep the rest on the single agent.
+- **Reversibility:** keep both behind one run interface so the choice is a routing rule, not a rewrite.
 
 ### Self-hosting looked cheaper on paper but the bill is higher. What went wrong?
 - **Utilisation was typed in, not derived:** a fleet sized for peak with a peak-to-average ratio of 2

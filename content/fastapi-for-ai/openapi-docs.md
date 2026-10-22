@@ -5,7 +5,7 @@ name: OpenAPI docs
 kind: tool
 difficulty: intro
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - fastapi-for-ai/pydantic-request-response-models
@@ -227,6 +227,9 @@ print(tools[0]["name"], tools[0]["input_schema"]["properties"]["model"]["enum"])
 
 - **Strip `x_route` before sending** the list to the model API; it is your dispatcher's lookup, not part of
   the tool definition.
+- **Deliberately minimal.** It reads only the JSON body, so path and query parameters must be merged into
+  the schema too, and a recursive model would loop forever in `resolve`. The argument field is
+  `input_schema` in Anthropic's API and `parameters` in OpenAI's.
 - **The model gets exactly your `Field` text.** Improving a description here is the cheapest fix for an
   agent that keeps passing bad arguments.
 

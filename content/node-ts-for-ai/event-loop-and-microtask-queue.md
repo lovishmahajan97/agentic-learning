@@ -245,7 +245,10 @@ A gateway holds 2,000 SSE streams. One route parses tool results of up to 20 MB 
 | One core at 100%, provider latency normal, memory flat | CPU work inside the process, not upstream |
 | `monitorEventLoopDelay` p99 ≈ 500 ms, utilization moderate | A few long callbacks, not saturation |
 | CPU profile: `JSON.parse` under the tool-result handler | The culprit |
-| Fix: parse in a worker thread, cap tool-result size | p99 lag back under 10 ms (illustrative) |
+| Fix: cap tool-result size, parse and trim in a worker thread so only the needed fields come back | p99 lag back under 10 ms (illustrative) |
+
+- **Why "and trim":** `postMessage` structured-clones the reply, and the main thread pays to deserialize it,
+  so sending the whole 20 MB parsed object back would move much of the stall rather than remove it.
 
 ## Production patterns
 - **Keep the agent loop thin; offload heavy steps.** Agent teams keep orchestration (model calls, tool

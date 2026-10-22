@@ -5,7 +5,7 @@ name: KV-cache memory estimation
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - model-internals/kv-cache
@@ -124,9 +124,10 @@ transcript_tokens(step n) = prefix_tokens + (n − 1) × tokens_appended_per_ste
 - **Use the step-count distribution:** the p50 step count gives steady-state demand, the p95 or the step
   cap gives the tail you must fit or preempt. Averaged over a run, each agent holds roughly the cache of
   its midpoint step.
-- **Idle time between steps matters.** While a tool runs the request has finished, so its blocks are free
-  to reuse, unless prefix caching keeps them resident for the next step (which is the point of caching,
-  and also why cached blocks compete for the pool).
+- **Idle time between steps matters.** While a tool runs the request has finished, so its blocks return
+  to the pool. With prefix caching they stay as evictable cached blocks: they still count as free, so
+  other requests can reclaim them, and a busy pool or a slow tool can evict the prefix before the next
+  step arrives.
 
 ### Running the numbers for common shapes
 Illustrative, computed from public config values:
@@ -212,7 +213,7 @@ tokens per step; runs take 10 steps at p50 and 25 at p95.
 | End of a p95 run, step 25 | 6,000 + 24 × 1,500 = 42,000 | ~9 | ~18 |
 
 ```python
-def transcript(step, prefix=6000, per_step=1500):
+def transcript(step, prefix=6000, per_step=1500):   # current step's output (~100s of tokens) omitted
     return prefix + (step - 1) * per_step
 
 for label, seq in (("mid p50", (6000 + transcript(10)) // 2), ("p50 end", transcript(10)),
@@ -431,6 +432,7 @@ will have higher TPOT because every step reads all 40 caches.
 - **Goal:** predict how many concurrent agent runs one replica holds, then check it against the engine.
 - **Steps:** write a script that reads a model's `config.json`, computes bytes per token, and turns prefix
   size, tokens per step and maximum steps into a final transcript length; compute runs per GPU for two
-  models and an fp16 versus FP8 cache; then start vLLM and compare with the cache blocks in its startup log.
+  models and an fp16 versus fp8 cache; then start vLLM on a GPU and compare with the KV-cache size in
+  its startup log.
 - **Done when:** your estimate and the engine's log agree within your stated workspace margin, and you have
   a table of runs per GPU for each model and cache precision.

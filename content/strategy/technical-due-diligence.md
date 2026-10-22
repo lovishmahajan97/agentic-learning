@@ -5,7 +5,8 @@ name: Technical due diligence
 kind: practice
 difficulty: advanced
 est_minutes: 17
-status: crisp
+status: agentic
+agent_relevance: background
 related:
   - strategy/vendor-evaluation
   - data-architecture/model-and-dataset-provenance
@@ -17,9 +18,21 @@ related:
 ---
 
 ## TL;DR
-Technical due diligence on an AI company, product or team (acquisition, investment or strategic
-partnership) tests whether the technical claims behind a deal are true and what keeping them true will
-cost, before the price is fixed.
+Technical due diligence on an AI or agent company (acquisition, investment or strategic partnership)
+tests whether claims like "our agent resolves 80% of tickets" hold on your data, and what keeping them
+true will cost, before the price is fixed.
+
+## For agent builders
+- **Why it matters for agents.** Agent products are sold on completion rates, autonomy and margins that
+  are easy to overstate: "resolved" may mean the agent replied, not that the task was done, and agent
+  steps multiply inference cost. You may be the engineer asked to test such a claim, or the team whose
+  agent is being tested.
+- **Where it shows up in your stack.** Your traces, eval sets, tool credentials and billing data are the
+  evidence diligence asks for; a sandbox replay of real tasks is the core test.
+- **What you control.** Keeping agent evals on held-out data, end-state checks, scoped tool credentials
+  and trace-to-invoice reconciliation, so your own agent would pass the same scrutiny.
+- **What you can skip.** Deal instruments (escrow, warranties, earn-out mechanics) and legal process;
+  recognise the three finding classes and leave the rest to the deal team.
 
 ## Why it exists
 - **Deals are priced on claims:** "proprietary model", "95% accuracy", "data moat", "70% gross margin",
@@ -39,7 +52,9 @@ cost, before the price is fixed.
   Diligence turns claims into evidence first.
 
 ## How it works
-For AI, diligence centres on six questions:
+### Background
+For AI, diligence centres on six questions; steps 1-8 below work through them, and the agent-specific
+checks follow:
 
 | # | Question |
 |---|---|
@@ -124,14 +139,25 @@ Beyond the usual application review, ask the AI-specific questions:
 
 This converts technical findings into decisions the deal team can act on.
 
+### 9. Agent-specific checks
+When the product is an agent, add these tests to steps 2, 5 and 6:
+
+| Claim to test | Test | Why |
+|---|---|---|
+| Completion or "resolution" rate | Replay your real tasks in a sandbox and check the end state, not the final message | An agent can reply confidently and leave the task undone |
+| Autonomy level | Read traces for how often a human approved, edited or redid the agent's actions | "Autonomous" may hide a human review queue in the cost base |
+| Cost per task | Steps and tokens per completed task on your tasks versus the target's traces | Harder inputs mean more steps, and cost scales with them |
+| Blast radius | List each tool credential's scopes and what one injected instruction could do with them | Over-scoped write access transfers with the deal |
+| Reproducibility | Re-run a sample of logged trajectories and compare outcomes | Unpinned models or prompts make reported results unrepeatable |
+
 ## Diagram
-Each headline claim becomes a hypothesis tested by its own evidence workstream; every finding ends in one
-of three classes the deal team can act on.
+Each headline claim becomes a hypothesis tested by its own evidence workstream (for an agent, a sandbox
+replay of your tasks); every finding ends in one of three classes the deal team can act on.
 
 ```mermaid
 flowchart TD
     T["Deal thesis: headline claims"] --> H["Claims as testable hypotheses"]
-    H --> E["Independent eval on your sample"]
+    H --> E["Sandbox replay of your tasks"]
     H --> DM["Dependency and license map"]
     H --> DR["Data rights and provenance"]
     H --> UE["Usage-sensitive margin model"]
@@ -223,6 +249,22 @@ print(f"3x, +25% rates {gross_margin(4000, 900 * 3 * 1.25, 400):.1%}")   # illus
 - **Two compounding risks** (more tokens per task, a lapsed discount) take margin from about 68% to single
   digits unless pricing passes costs through.
 
+### Worked scenario: testing a support agent's "80% resolved" claim
+A partner sells a ticket-resolution agent. The acquirer replays 150 of its own tickets in a sandbox with
+mock CRM and email tools. All figures are illustrative.
+
+| Step | Finding |
+|---|---|
+| Target's definition of resolved | The agent sent a final reply; no check that the ticket's end state was correct |
+| End state checked on 150 tickets | 62% completed; the interval at 150 is about ±8 points, so the gap to 80% is real |
+| Steps per ticket | about 9 on the acquirer's tickets versus about 5 in the target's traces, so cost per ticket is roughly 1.8× |
+| Human involvement | traces show a review queue where staff edit a share of replies before sending |
+| Tool scopes | the CRM credential can write to every customer account, not only the ticket's |
+
+- **Classification:** not a deal-breaker; a price adjustment for the completion and cost gap, and a
+  remediation item to scope tool credentials per ticket.
+- **The definition was the finding.** Agree "completed" as a checked end state before comparing numbers.
+
 ## Production patterns
 - **Clean-room independent eval** — when data cannot flow freely, have the target run its system on your
   sample under NDA while you hold labels and score, or use a clean team. Report accuracy per segment with
@@ -239,6 +281,11 @@ print(f"3x, +25% rates {gross_margin(4000, 900 * 3 * 1.25, 400):.1%}")   # illus
 - **Findings mapped to deal instruments** — each finding carries a class and a remedy: walk away, a price
   change, escrow or warranty, an earn-out tied to accuracy on your own held-out set, or a costed
   remediation item. Monitor that every finding has an owner on the deal team.
+- **Sandbox trajectory replay for agent claims** — run the target's agent on your tasks against mock or
+  sandboxed tools, check end states, and compare steps and tokens per task with its production traces.
+  Report completion with its interval and the share of runs that needed a human.
+- **Tool-scope audit** — export every credential the agent uses and its scopes, and walk through what a
+  prompt-injected document could make it do. Record each over-scoped credential as a costed remediation.
 
 ## Trade-offs
 - **Independent re-testing vs time.** Re-testing on your own data gives the most reliable evidence, but
@@ -251,6 +298,9 @@ print(f"3x, +25% rates {gross_margin(4000, 900 * 3 * 1.25, 400):.1%}")   # illus
   and distribution; judge the cost of switching, not the dependency itself.
 - **Strict findings vs reasonable deals.** Strict findings protect the buyer but can kill reasonable deals;
   classifying into deal-breaker, adjustment and remediation keeps the response proportionate.
+- **Sandbox replay vs realism.** Replaying agent tasks against mock tools is safe and repeatable, but mocks
+  hide real API latency, errors and data quirks; where risk is high, add a small supervised run on real
+  read-only systems.
 
 ## Pitfalls
 - **Accepting the target's accuracy number on its own eval set.** Symptom: after closing, quality drops on
@@ -265,12 +315,17 @@ print(f"3x, +25% rates {gross_margin(4000, 900 * 3 * 1.25, 400):.1%}")   # illus
   documents retrievable by another through a shared index or response cache.
 - **Interviewing only founders.** Key-person risk and undocumented systems surface only when that person
   leaves after the earn-out period.
+- **Accepting an agent's "resolution rate" without its definition.** Symptom: after closing, customers
+  reopen tickets the agent marked done. Fix: define completion as a checked end state and replay your own
+  tasks before pricing.
 
 ## When to use
 - **Use for** any acquisition, investment or strategic partnership where AI is part of the value.
 - **Use a lighter form** for a critical vendor whose failure would hurt you (see vendor evaluation, which
   covers the comparative selection process).
 - **Scale depth** to deal size and to how much value depends on the AI claims.
+- **For agent products, always include** a sandbox replay of your tasks, a tool-scope audit and cost per
+  completed task from traces.
 - **Outputs to aim for:** an independent accuracy number on your data broken down by segment, a dependency
   and license map, an AI-layer security summary, a data-rights summary, a usage-sensitive margin model,
   and a classified findings list.
@@ -330,6 +385,14 @@ The answer changes the valuation, not necessarily the decision.
 - **Agent blast radius** under prompt injection, prompt and output logging retention, and whether
   third-party checkpoints are loaded in formats that can execute code.
 
+### A target says its agent "resolves 80% of tickets autonomously". How do you test it?
+- **Pin the definition:** resolved must mean a checked end state, and autonomous must mean no human edited
+  or approved the action; read traces for review queues.
+- **Replay your tasks** in a sandbox with mock or read-only tools, report completion with its interval,
+  and compare steps and tokens per task against the target's own traces.
+- **Audit tool scopes** for blast radius under prompt injection, and price each gap as an adjustment or a
+  remediation item.
+
 ## Quiz
 ### Q: What is the single most informative test in AI technical due diligence?
 - [ ] Reviewing the target's architecture diagram
@@ -354,3 +417,25 @@ The answer changes the valuation, not necessarily the decision.
 - [ ] Random accuracy, because prompts are model-specific
 > Iterating on prompts against an eval set fits the system to those examples, just like training on test
 > data. The reported score overstates performance on genuinely new inputs.
+
+## Use cases & projects
+### Use cases
+- **Acquiring an agent startup.** The acquirer replays its own tasks through the target's agent and
+  prices the gap between claimed and checked completion.
+- **Choosing a critical agent partner.** A lighter diligence pass tests the partner's tool scopes, trace
+  retention and cost per task before its agent touches your systems.
+- **Preparing your own agent for scrutiny.** An agent team keeps held-out evals, end-state checks and
+  trace-to-invoice reconciliation ready for an investor or enterprise buyer.
+- **Stress-testing an agentic roadmap's margin.** Finance asks what a multi-step agent feature does to
+  gross margin, and traces supply tokens per task.
+
+### Mini project
+**Diligence pack for a small agent (2-3 hours).**
+- **Goal:** test a tool-calling agent's headline claim the way an acquirer would.
+- **Steps:** take any small agent (your own or an open-source example) and write its claim as a number;
+  build 30 held-out tasks with checkable end states and mock tools; replay them and log completion, steps,
+  tokens and human-needed runs; list every tool credential and its scope; compute cost per completed task
+  and a margin at 3× tokens.
+- **Done when:** you have the claim versus your measured number with its interval, a scope table with any
+  over-scoped tool flagged, and a findings list where each item is a deal-breaker, adjustment or
+  remediation.

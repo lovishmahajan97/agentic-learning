@@ -5,7 +5,7 @@ name: Fallbacks
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - system-design/model-fallback-strategies
@@ -257,15 +257,18 @@ tools = [search_tickets, create_ticket]          # your @tool functions
 primary = ChatAnthropic(model="primary-model", timeout=10, max_retries=1).bind_tools(tools)
 second = ChatOpenAI(model="evaluated-fallback-model", timeout=10, max_retries=1).bind_tools(tools)
 
+# Transient errors only. Newer SDK versions raise dedicated classes for 503 and 529 (overloaded)
+# that are not InternalServerError subclasses, so include them when the installed SDK defines them.
+TRANSIENT = ("RateLimitError", "InternalServerError", "ServiceUnavailableError",
+             "OverloadedError", "APIConnectionError")   # APITimeoutError subclasses APIConnectionError
 agent_llm = primary.with_fallbacks(
     [second],
-    exceptions_to_handle=(anthropic.RateLimitError, anthropic.InternalServerError,
-                          anthropic.APITimeoutError, anthropic.APIConnectionError),
+    exceptions_to_handle=tuple(getattr(anthropic, n) for n in TRANSIENT if hasattr(anthropic, n)),
 )
 
 msg = agent_llm.invoke(history)                  # same transcript, either model
-for call in msg.tool_calls:                      # check the step's idempotency key before executing
-    run_tool_once(call, key=f"{run_id}:{step}:{call['name']}")
+for i, call in enumerate(msg.tool_calls):        # key is stable across models: run, step, position
+    run_tool_once(call, key=f"{run_id}:{step}:{i}:{call['name']}")
 ```
 
 ### Worked scenario: a 15-step support agent during a 529 burst
@@ -391,10 +394,12 @@ failing over tool-executing turns without idempotency keys, which would duplicat
 - **Verify continuously** by routing a few percent of live traffic to it, and watch its 429 rate during
   primary incidents, because an untested backup fails in the first real outage.
 
-### Why can you not just switch models when a stream fails halfway?
-- **Tokens are already on the user's screen,** and a different model will not continue the same sentence.
-- **Decide before the first byte;** after that, restart under a new message id so the client discards the
-  partial answer, or surface an error with a retry button.
+### When would you deliberately not add a fallback?
+- **When a worse answer is worse than none,** such as medical triage, where failing closed is correct.
+- **When the backup changes compliance posture,** for example moving data to a vendor or region the
+  customer has not approved.
+- **When the fallback has not been evaluated** against the product's accuracy bar, or, for an agent,
+  against your tool-selection and argument evals, since an unevaluated rung fails the run one step later.
 
 ### Your agent's primary model times out at step 9, right after emitting a create_ticket call. How should the fallback behave?
 - **Find out whether the tool ran.** The timeout may have fired after dispatch, so look up the step's

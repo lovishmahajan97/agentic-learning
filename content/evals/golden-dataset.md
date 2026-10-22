@@ -5,7 +5,7 @@ name: Golden dataset (eval dataset)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - evals/model-evaluation

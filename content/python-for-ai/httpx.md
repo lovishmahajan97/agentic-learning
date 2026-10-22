@@ -5,7 +5,7 @@ name: httpx
 kind: tool
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/asyncio
@@ -27,8 +27,8 @@ your agent waits, fans out and fails.
 
 ## For agent builders
 - **Why it matters for agents.** One agent step can stream a completion and then run three tool calls
-  in parallel. Whether that step takes 2 s or hangs for ten minutes is decided by connection pools,
-  per-phase timeouts and an outer deadline, all httpx settings.
+  in parallel. Whether that step takes 2 s or hangs for ten minutes is decided by the connection pool
+  and per-phase timeouts (httpx settings) plus the outer deadline you add with `asyncio.timeout`.
 - **Where it shows up in your stack.** Inside provider SDKs (`AsyncOpenAI(http_client=...)`), in your
   own tool functions that call internal APIs, in streaming from self-hosted model servers, and in tests
   through `MockTransport`.

@@ -67,15 +67,15 @@ streaming; pool them and transfer or share large data.
 - **What does not survive.** Functions and symbols throw a `DataCloneError`; class instances arrive as plain
   objects with prototype and methods gone, so a `Tokenizer` object cannot be sent, only the data to rebuild
   one.
-- **Cloning is O(size) on the sender.** Sending a 100 MB string copies 100 MB, and the copy blocks the sending
-  thread.
+- **Cloning is O(size) on both ends.** Sending a 100 MB string copies 100 MB: serializing blocks the sending
+  thread, and deserializing blocks the receiver, so a huge result cloned back stalls the main loop too.
 - **Design consequence:** the message is a job description (a file path, an id, a small payload); large data
   is transferred or shared, not cloned.
 
 ### Transfer and shared memory
 | Mechanism | Cost | Semantics | Use for |
 |---|---|---|---|
-| Structured clone | O(size), on sender | Independent copies | Small job descriptions and results |
+| Structured clone | O(size), on sender and receiver | Independent copies | Small job descriptions and results |
 | Transfer: `postMessage(value, [arrayBuffer])` | O(1) | Ownership moves; sender's view becomes detached (length 0) | A `Float32Array` of embeddings or a `Buffer` of file bytes, and the result buffer back |
 | `SharedArrayBuffer` | No copy | Genuinely shared memory; `Atomics` for sync (`Atomics.add`, `Atomics.wait`/`notify`) | Data both sides read concurrently |
 

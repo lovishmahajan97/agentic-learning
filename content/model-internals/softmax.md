@@ -34,6 +34,7 @@ evicting a long agent session's first tokens breaks it.
   calibrated correctness estimate.
 - **Where it shows up in your stack.** The `temperature` request parameter, `logprobs` on hosted APIs,
   classifier heads in guardrail and routing models, and attention kernels inside the serving engine.
+  Some reasoning models fix or restrict `temperature`, so check the model's docs before tuning it.
 - **What you control.** Temperature per agent step (planner vs tool-argument filling vs creative
   drafting), whether probabilities are calibrated before thresholds use them, and softmax versus sigmoids
   when training a multi-label classifier for the agent.

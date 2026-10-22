@@ -5,7 +5,7 @@ name: Reference architectures
 kind: pattern
 difficulty: intro
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - system-design/ai-solution-architecture
@@ -268,9 +268,10 @@ ops_copilot = match_shapes(acts=True, steps_known=False, person_waiting=True,
                            needs_corpus=True, persistent_state=True, many_teams=True)
 for name, plan in (("refunds", refunds), ("ops copilot", ops_copilot)):
     print(name, "->", "; ".join(plan))
-# refunds -> approval gate ...; workflow (4); batch extraction (2) + review queue; retrieval (1); platform layer (6) underneath
-# ops copilot -> approval gate ...; agent (3) with step budgets; interactive: latency budget + streaming;
-#                retrieval (1); memory (5); platform layer (6) underneath
+# refunds -> approval gate + validation contract on the action path; workflow (4);
+#            batch extraction (2) + review queue; retrieval (1); platform layer (6) underneath
+# ops copilot -> approval gate + validation contract on the action path; agent (3) with step budgets;
+#                interactive: latency budget + streaming; retrieval (1); memory (5); platform layer (6) underneath
 ```
 
 For the ops copilot the composition becomes concrete: read-only tools (log search, runbook retrieval)

@@ -5,7 +5,7 @@ name: GPU memory optimization (VRAM math)
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - model-internals/kv-cache
@@ -26,7 +26,7 @@ sources:
 ## TL;DR
 How many agents one GPU serves is a four-line ledger: weights, KV cache, activation peaks, overhead plus
 fragmentation. Subtract them from usable VRAM and every knob is a term you shrink; guessing causes
-out-of-memory pages and 20%-utilized GPUs.
+OOM alerts at peak and 20%-utilized GPUs.
 
 ## For agent builders
 - **Why it matters for agents.** Agent transcripts grow every step (system prompt, tool schemas, each tool

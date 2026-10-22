@@ -5,7 +5,7 @@ name: pass@k
 kind: metric
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - evals/benchmarking
@@ -130,7 +130,8 @@ pass@k ≈ 1 − Π_{i = n − c + 1}^{n} (1 − k / i)
 
 ## Diagram
 The evaluation pipeline for an agent or a code model: run n times per task at a fixed temperature,
-verify each final state in a sandbox, estimate per task, then average. The dotted path is the pooled shortcut that overestimates.
+verify each final state in a sandbox, estimate per task, then average. The dotted path is the pooled
+shortcut that overestimates.
 
 ```mermaid
 flowchart TD
@@ -240,7 +241,7 @@ print(f"{'mean':18s} {mean(lambda n, c: c / n):6.2f} {mean(lambda n, c: pass_at_
 | Reading | Consequence |
 |---|---|
 | pass@3 = 0.96 overall | only reachable if the agent can retry safely and something checks each attempt |
-| pass^3 = 0.55 overall | a user doing three such tasks a week sees all succeed about half the time |
+| pass^3 = 0.55 overall | a user who runs the same task three times sees all three succeed about half the time (averaged over tasks) |
 | cancel_after_ship at pass^3 = 0.03 | one flaky task drags the reliability number; fix it first |
 
 ### Worked scenario: why concavity matters
@@ -363,7 +364,7 @@ rerun similar queries daily, report pass^k as well, since reliability is what th
 - **Then report pass@1 and pass^k,** for example a task with p = 0.6 has pass^4 = 0.6^4 ≈ 13% for a
   four-run reliability promise.
 
-### Your coding agent solves 78% of tasks on one run and 96% "within 3 tries". What do you put on the release report?
+### Your agent solves 78% of tasks on one run and 96% "within 3 tries". What do you put on the release report?
 - **pass@1 as the user-facing number,** unless the product really retries: a test-gated "edit, run tests,
   retry" loop with an attempt cap does approach pass@k, at up to 3× the cost.
 - **pass^k for the reliability promise,** computed per task from repeated runs with C(c, k) / C(n, k);

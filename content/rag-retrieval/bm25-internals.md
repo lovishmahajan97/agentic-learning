@@ -5,7 +5,7 @@ name: BM25 internals
 kind: concept
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - rag-retrieval/inverted-indexes
@@ -157,7 +157,7 @@ Nothing needs the document text at query time:
   corpora are not comparable.
 - So fusing BM25 with dense scores needs rank-based methods or per-query normalization.
 - **Agent consequence:** never hand raw BM25 scores to the model as "confidence", and never gate a tool's
-  results on a fixed raw cutoff, because agent queries vary far more in length than human ones.
+  results on a fixed raw cutoff, because the same agent writes one-term and eight-term queries.
 
 ## Diagram
 Follow one term of an agent's tool query through scoring: the analyzer defines the term, IDF comes from
@@ -189,7 +189,7 @@ factor is 1.0 and each matching term adds its IDF (illustrative).
 | Query | Matching terms and IDF | Score of the right document | Passes 8.0? |
 |---|---|---|---|
 | Agent: "error E4012 fuser overheating printer" | E4012 4.56, fuser 4.56, error 0.51, printer 0.0005 | ≈ 9.6 | yes |
-| Human retry: "E4012" | E4012 4.56 | ≈ 4.56 | no, tool returns nothing |
+| Agent retry, short: "E4012" | E4012 4.56 | ≈ 4.56 | no, tool returns nothing |
 | Agent query reworded: "E4012 meaning" | E4012 4.56, meaning ~0 | ≈ 4.6 | no |
 
 - **The right document is top-ranked in all three,** yet the tool hides it in two, and the agent reports

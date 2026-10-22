@@ -5,7 +5,7 @@ name: Query decomposition
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - rag-retrieval/query-rewriting
@@ -27,7 +27,7 @@ an agent it is one turn with several parallel search calls: independent parts fa
 chain, which is multi-hop retrieval.
 
 ## For agent builders
-- **Why it matters for agents.** "Compare A and B" is the most common question shape an agent fails with
+- **Why it matters for agents.** "Compare A and B" is a question shape an agent routinely fails with
   one search. Emitting one search call per facet, in parallel, fixes recall without adding sequential
   steps; chaining dependent facets is the agent loop doing multi-hop.
 - **Where it shows up in your stack.** Parallel tool calls in the provider APIs (several tool calls in one
@@ -121,8 +121,8 @@ chain, which is multi-hop retrieval.
 
 - **The agent decides the split, your executor enforces the rules.** Cap the calls per step, split the
   chunk budget across them, and return an explicit "no evidence" result for an empty facet.
-- **Every call needs its own result.** Return one result per tool-call id (most provider APIs expect
-  this), including for calls you skipped, so the agent knows which facets were not searched.
+- **Every call needs its own result.** Return one result per tool-call id (the major provider APIs
+  require this), including for calls you skipped, so the agent knows which facets were not searched.
 
 ## Diagram
 Watch the two branches after planning (by a planner prompt or the agent's own tool calls): atomic
@@ -442,7 +442,7 @@ measurement would catch. A third is cost: without a gate, every simple question 
   steps.
 - **Steps:** write about 15 comparison questions over a small corpus with labelled evidence per facet;
   run them once as a single search and once with the agent instructed to emit one `search` call per facet
-  in the same response; require each sub-answer to state "insufficient evidence" when its facet returns
-  nothing; log calls per step, facet coverage and answer correctness.
+  in the same response; have the tool return `no_evidence` for an empty facet and require the answer to
+  say "insufficient evidence" for it; log calls per step, facet coverage and answer correctness.
 - **Done when:** you have a table comparing facet coverage, total tool calls, latency and accuracy for both
   modes, plus one trace where a missing facet was correctly reported instead of guessed.

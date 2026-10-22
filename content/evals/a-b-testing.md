@@ -5,7 +5,7 @@ name: A/B testing
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - evals/offline-vs-online-evaluation

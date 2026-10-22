@@ -5,7 +5,7 @@ name: Frameworks (LangGraph, LangChain, LlamaIndex, Pydantic AI, DSPy)
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/agent-loop
@@ -24,9 +24,9 @@ sources:
 ---
 
 ## TL;DR
-Agent frameworks package your agent's plumbing: LangChain integrates, LangGraph runs resumable state
-machines, LangSmith traces and evaluates, LlamaIndex retrieves, Pydantic AI types, DSPy compiles prompts.
-Pick the thinnest layer that solves your agent's hard part.
+Agent frameworks package your agent's plumbing: LangChain integrates, LangGraph runs typed resumable
+state machines, LangSmith traces, LlamaIndex retrieves, Pydantic AI is type-first, DSPy compiles prompts.
+Each trades speed for abstraction you must understand, so pick the thinnest layer for your hard part.
 
 ## For agent builders
 - **Why it matters for agents.** Almost every agent job posting and codebase names a stack: LangChain

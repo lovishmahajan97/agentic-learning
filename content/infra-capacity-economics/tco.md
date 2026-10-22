@@ -5,7 +5,7 @@ name: TCO (total cost of ownership)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - infra-capacity-economics/break-even-analysis
@@ -305,7 +305,10 @@ loaded engineer-year of $200k, one forced model migration a year.
 - **Use when** a decision commits money or people for more than a few months: build versus buy, hosted API
   versus self-hosting, choosing a vector database, agent platform or serving platform, signing a
   committed-use contract, or moving workloads on-prem.
-- **Avoid when** the experiment is cheap and reversible; run the pilot agent and measure instead.
+- **Avoid when** the experiment is cheap and reversible; run the pilot agent and measure instead. A full
+  model pays off once commitments exceed a quarter or so.
+- **Keep it short when one constraint decides anyway,** such as data that cannot leave a region; a
+  one-page estimate still makes the premium being paid for the constraint known.
 - **Measure** loaded people cost, cost per successful task, migration frequency and adoption, because those
   dominate.
 - **Revisit** at renewal or when a provider changes price or retires a model.
@@ -374,7 +377,7 @@ scenarios for volume and API price cuts, and the assumption that flips the answe
 - **But do not run past the model generation you build on;** keep the horizon short and model at least one
   forced migration and re-evaluation as a cost inside it.
 - **Then treat migration frequency as a scenario input,** measured from how long the last swap actually
-  took. A full TCO model pays off once commitments exceed a quarter or so; below that, pilot and measure.
+  took.
 
 ## Quiz
 ### Q: Why should two options be compared at equal quality on your evals before comparing TCO?

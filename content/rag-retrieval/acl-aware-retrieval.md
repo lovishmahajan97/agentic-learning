@@ -5,7 +5,7 @@ name: ACL-aware retrieval
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - rag-retrieval/metadata-filtering
@@ -113,7 +113,7 @@ hybrid search and before reranking, so no ranking stage ever scores a chunk the 
 |---|---|---|
 | What | index the permissions with the content | ask the source system per candidate at query time |
 | Speed | fast, scales | one source-API call per candidate, hits rate limits |
-| Freshness | only as fresh as the last ACL sync: a user removed from a group at 09:00 keeps seeing results until payloads update | always correct |
+| Freshness | only as fresh as the last ACL sync: a direct share revoked at 09:00 keeps surfacing until payloads update | always correct |
 | Alone? | yes, with a freshness gap | no, because of the post-filter selectivity problem |
 
 The practical design is a hybrid:

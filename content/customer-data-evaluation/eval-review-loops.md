@@ -5,7 +5,8 @@ name: Eval review loops
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - evals/error-analysis
   - evals/eval-driven-development
@@ -18,16 +19,27 @@ related:
 ---
 
 ## TL;DR
-The recurring cycle of running the customer eval, reading failures with SMEs, attributing each to the
-system, a label, a guideline gap or the grader, fixing the right thing, and re-running with regression
-checks. A score says how much is wrong, not why.
+The weekly cycle of running your agent's customer eval, reading failing traces with SMEs,
+attributing each to the agent, a label, a guideline gap or the grader, then fixing and re-running with
+regression checks. A score says how much is wrong, not why.
+
+## For agent builders
+- **Why it matters for agents.** An agent fails in more places than a single prompt: the plan, a tool
+  choice, a tool's arguments, a bad tool result, or the final answer. The review loop is how you find
+  which, instead of rewriting the system prompt every time the number drops.
+- **Where it shows up in your stack.** Your eval harness and its run manifest, the tracing tool you read
+  trajectories in, the LLM judge, the flip report in CI, and a weekly review meeting with the customer's SMEs.
+- **What you control.** Which traces get read (failures plus random passes), the cause taxonomy, the
+  attribution step before any fix, version pinning, the judge audit sample and the holdout discipline.
+- **What you can skip.** Fancy dashboards early on. A spreadsheet of coded traces and three small scripts
+  (tally, corrected pass rate, flip report) carry a pilot.
 
 ## Why it exists
-- **The eval is not an oracle.** The tempting workflow after a golden set and first prompt exist is
-  "change the prompt, re-run, watch the number". But a failing case can mean three things: the system is
+- **The eval is not an oracle.** The tempting workflow after a golden set and first agent prompt exist is
+  "change the prompt, re-run, watch the number". But a failing case can mean three things: the agent is
   wrong; the reference label is wrong; or the guideline never defined the case, so neither is clearly right.
 - **Label and guideline errors are common early,** because the dataset was labelled before anyone saw how
-  the system fails. Tune only the system and you "fix" correct behaviour to match wrong labels, and the
+  the agent fails. Tune only the agent and you "fix" correct behaviour to match wrong labels, and the
   customer's experts reject the result in production.
 - **Automated graders drift from experts.** At scale most customer evals use an LLM judge, because SMEs
   cannot review every output of every run. The drift is invisible from the score: lenient on confident
@@ -39,22 +51,22 @@ checks. A score says how much is wrong, not why.
 
 ## How it works
 ### One iteration
-1. **Run** the current system on the iteration set (never the holdout) and grade with the automated
+1. **Run** the current agent on the iteration set (never the holdout) and grade with the automated
    grader. Record system, prompt, dataset and grader versions together, because a score is only comparable
-   when all four are pinned.
+   when all four are pinned. For agents, pin tool versions and fixtures too.
 2. **Select for review:** all failures in high-stakes strata, a random sample of other failures, and a
    random sample of *passes*. Passes are included because grader leniency only shows up there.
-3. **Read and code failures.** Engineers and SMEs assign each item a cause from a small, evolving taxonomy
-   (retrieval missed the clause, misread table, wrong policy precedence, format violation, and so on).
-   Open coding first, then cluster, because a fixed taxonomy invented upfront misses failure modes you did
-   not anticipate.
+3. **Read and code failures.** Engineers and SMEs read each trace and assign a cause from a small, evolving
+   taxonomy (retrieval missed the clause, misread table, wrong policy precedence, format violation, wrong
+   tool, loop, and so on). Open coding first, then cluster, because a fixed taxonomy invented upfront
+   misses failure modes you did not anticipate.
 4. **Attribute each item:** system error, label error, guideline gap, or grader error. This step is what
    distinguishes a review loop from error analysis alone.
 5. **Route the fix:**
 
    | Attribution | Goes to |
    |---|---|
-   | System error | prompt, retrieval or code backlog, ordered by frequency × cost |
+   | System error | prompt, retrieval, tool or code backlog, ordered by frequency × cost |
    | Label error | relabelling with SME sign-off |
    | Guideline gap | the policy owner, then guideline, labels and judge prompt updated together |
    | Grader error | judge recalibration |
@@ -63,6 +75,17 @@ checks. A score says how much is wrong, not why.
    every item that flipped from pass to fail, because averages hide regressions offset by gains elsewhere.
 7. **Report** a short note to the customer: score with interval, top failure clusters, decisions taken,
    and what changed in labels or guideline (so score movement is explainable).
+
+### Where in the agent the system error lives
+Locate the first step in the trace that went wrong, because later steps usually inherit it:
+
+| First bad step | Typical fix |
+|---|---|
+| Plan or tool choice | system prompt procedure, tool descriptions |
+| Tool arguments | argument schema, validation, examples |
+| Tool result (stale, empty, wrong) | the tool or retrieval index, not the prompt |
+| Reading a good result wrongly | glossary, output contract |
+| Looping or stopping early | stop conditions, step budget |
 
 ### How much to read, and in what order
 - **Read failures until new cause categories stop appearing.** In practice the first few dozen usually
@@ -96,15 +119,15 @@ p_true ≈ p_judge × (1 − f_pass) + (1 − p_judge) × r_fail
 - **Rerun the automated eval on every change;** reserve human review for the cadence.
 
 ## Diagram
-Each reviewed item is attributed before anything is fixed, so label, guideline and grader errors are not
-"fixed" by changing the system.
+Each reviewed trace is attributed before anything is fixed, so label, guideline and grader errors are not
+"fixed" by changing the agent.
 
 ```mermaid
 flowchart TD
-    R["Run iteration set, versions pinned"] --> S["Select: failures plus random passes"]
-    S --> C["Read and code causes with SMEs"]
+    R["Run agent on iteration set, versions pinned"] --> S["Select: failures plus random passes"]
+    S --> C["Read traces, code causes with SMEs"]
     C --> A{"Attribute each item"}
-    A -->|"system"| B["Prompt, retrieval, code backlog"]
+    A -->|"system"| B["Prompt, tool, retrieval backlog"]
     A -->|"label"| L["Relabel with SME sign-off"]
     A -->|"guideline gap"| P["Policy owner rules"]
     A -->|"grader"| J["Recalibrate judge"]
@@ -142,7 +165,25 @@ curr = {"q1": True, "q2": True, "q3": False, "q4": False}
 print(flips(prev, curr))                                         # (['q3'], ['q2'])
 ```
 
-### Worked loop: three weeks on a support-answer assistant (numbers illustrative)
+### Coding agent traces by first bad step
+A review sheet row per failing trace; the tally tells you whether to work on tools, retrieval or the prompt.
+
+```python
+from collections import Counter
+
+reviewed = [  # one row per failing trace, coded by an engineer and an SME together
+    {"id": "t07", "attribution": "system", "first_bad_step": "tool_result", "cause": "stale release note"},
+    {"id": "t11", "attribution": "system", "first_bad_step": "tool_choice", "cause": "skipped tier lookup"},
+    {"id": "t19", "attribution": "label",  "first_bad_step": None,          "cause": "pre-pricing-change ref"},
+    {"id": "t23", "attribution": "system", "first_bad_step": "tool_result", "cause": "stale release note"},
+    {"id": "t31", "attribution": "grader", "first_bad_step": None,          "cause": "short answer penalised"},
+]
+system = [r for r in reviewed if r["attribution"] == "system"]
+print(Counter(r["first_bad_step"] for r in system).most_common())
+# [('tool_result', 2), ('tool_choice', 1)]: fix the retrieval tool before touching the prompt
+```
+
+### Worked loop: three weeks on a support agent with a docs-search tool (numbers illustrative)
 A software customer. Iteration set of 300 items, holdout of 100; an LLM judge grades correctness against
 references.
 
@@ -150,24 +191,24 @@ references.
 
 | Attribution of the 66 failures | Count | Detail |
 |---|---|---|
-| System errors | 31 | 19 retrieval returned an outdated release note, 12 wrong product-tier logic |
+| System errors | 31 | 19 retrieval tool returned an outdated release note, 12 wrong product-tier logic |
 | Label errors | 14 | references written before a pricing change |
 | Guideline gaps | 9 | is a workaround acceptable when a fix exists? |
 | Judge errors | 12 | correct answers marked wrong for being shorter than the reference |
 | False passes in the 30 sampled passes | 4 | judged lenient because they sounded confident |
 
 - **Correcting the headline:** f_pass ≈ 4/30 ≈ 0.13 and r_fail = 26/66 ≈ 0.39 (the label and judge errors,
-  where the system was right). So p_true ≈ 0.78 × 0.87 + 0.22 × 0.39 ≈ 0.76, before the 9 guideline gaps
+  where the agent was right). So p_true ≈ 0.78 × 0.87 + 0.22 × 0.39 ≈ 0.76, before the 9 guideline gaps
   are ruled on.
 - **Right by accident:** about 30 false passes and 26 false fails nearly cancel. A grader whose errors cancel
   on this mix will not cancel on the next one, so the judge is fixed anyway.
-- **Decisions:** filter retrieval by release version; relabel 14 items; the product owner rules "a
+- **Decisions:** filter the search tool by release version; relabel 14 items; the product owner rules "a
   workaround is acceptable only if the answer also states the fix version"; the judge prompt now grades
   content not length and checks stated version numbers.
 
 **Week 2:**
-- **Measurement first:** after relabelling and the judge update, the *same* week-1 system scores 81%. The
-  improvement is measurement, not the model, and is reported as such.
+- **Measurement first:** after relabelling and the judge update, the *same* week-1 agent scores 81%. The
+  improvement is measurement, not the agent, and is reported as such.
 - **Why not 87% already:** the 26 recovered label and length errors alone would suggest about 87%, but
   the stricter version check also turns some previously lenient passes into failures; the week-1 pass
   sample implied there were dozens of them.
@@ -183,11 +224,11 @@ references.
 - **Outcome:** the customer now trusts the number enough to use it in the acceptance test.
 
 ## Production patterns
-- **Pinned run manifest.** Every eval run writes system, prompt, dataset and grader versions (plus the code
-  commit) into its result record, and the comparison report refuses to diff runs whose dataset or grader
-  versions differ. Monitor how often teams hit that refusal; frequent hits mean labels churn too fast.
+- **Pinned run manifest.** Every eval run writes system, prompt, dataset, grader and tool versions (plus
+  the code commit) into its result record, and the comparison report refuses to diff runs whose dataset or
+  grader versions differ. Monitor how often teams hit that refusal; frequent hits mean labels churn too fast.
 - **Rescore the baseline on every measurement change.** When labels or the judge prompt change, a job
-  re-runs the previous system version on the new labels and grader, and the report shows measurement
+  re-runs the previous agent version on the new labels and grader, and the report shows measurement
   change and system change as separate lines.
 - **Flip report as a merge gate.** For each candidate change, list every pass-to-fail item per stratum and
   require a named reviewer to accept each flip in high-stakes strata. Monitor flip counts per release.
@@ -196,13 +237,16 @@ references.
   remembering that a 40-item sample moves several points on noise.
 - **Attribution mix over time.** Record the system, label, guideline and grader shares each cycle. Label
   and guideline shares should shrink as the dataset matures; if they do not, fix the guideline process
-  before tuning the system further.
+  before tuning the agent further.
+- **Production traces into the loop.** After launch, sample real agent traces each week (random plus
+  user-flagged), grade them with the same judge and add confirmed failures to the iteration set. Monitor
+  the share of new failure categories found in production versus in the eval.
 
 ## Trade-offs
 - **Deep SME review vs expert time.** Reviewing every failure gives accurate attribution but consumes
   expert time; once judge and SME agree well, review a sample of failures and all high-stakes ones.
 - **Truthful labels vs a moving baseline.** Fixing labels and guidelines makes the score more truthful but
-  moves the baseline, so trends are harder to read; always re-score the previous system version on the new
+  moves the baseline, so trends are harder to read; always re-score the previous agent version on the new
   labels before comparing.
 - **Weekly cadence vs engineering pace.** It keeps SMEs engaged but can feel slow to engineers; run
   automated evals continuously and keep human review weekly.
@@ -219,11 +263,13 @@ references.
 - **Repeatedly tuning on the same visible items.** Symptom: a widening gap between iteration and holdout scores.
 - **Silently editing labels.** Symptom: the customer asks why last week's 82% is now 79% with no system
   change, and nobody can explain it.
+- **Fixing the last step of a trace.** Symptom: prompt edits about "reading results carefully" that change
+  nothing, because the first bad step was a stale tool result.
 
 ## When to use
-- **Start** the first time you have a system, a golden set and an automated grader, and keep it running
+- **Start** the first time you have an agent, a golden set and an automated grader, and keep it running
   through the pilot and into production with real traffic samples.
-- **Why it matters:** it is the main mechanism for converting SME expertise into system improvements and a
+- **Why it matters:** it is the main mechanism for converting SME expertise into agent improvements and a
   trusted acceptance metric.
 - **Skip the heavy human part** only when grader-to-SME agreement is high and stable and the task is not
   high-stakes.
@@ -254,6 +300,12 @@ improvement to the customer.
   anything is fixed, because only system errors should change the system.
 - **Grader audit:** a random sample of passes and a judge-versus-SME sample catch the errors a score hides.
 - **Customer trust:** SMEs see the failures and the decisions, so the final number is one they accept at go-live.
+
+### Your agent's task success drops after a release. How do you use traces to find the cause?
+- **Flip report first:** list the pass-to-fail items per stratum, so you read the changed cases, not a sample.
+- **Find the first bad step** in each trace: plan, tool choice, arguments, tool result, reading or stopping,
+  because later steps inherit the error.
+- **Check pinned versions:** a tool, index or fixture change can explain the drop without any prompt change.
 
 ### The judge says 78%. Review finds 4 of 30 sampled passes are wrong and 26 of 66 failures are actually right. What is the real pass rate?
 - **Apply the correction:** p_true ≈ 0.78 × (1 − 0.13) + 0.22 × 0.39 ≈ 0.76.
@@ -305,3 +357,22 @@ improvement to the customer.
 - [x] The team is overfitting fixes to the specific cases it repeatedly reviews
 > The iteration set is read every cycle, so fixes can become case-specific. The untouched holdout
 > estimates generalisation; a widening gap means improvements are not transferring.
+
+## Use cases & projects
+### Use cases
+- **Weekly pilot reviews with customer SMEs.** The loop turns failing agent traces into prompt, tool and
+  guideline fixes the customer has seen and agreed.
+- **Release gating for agent changes.** Flip reports and pinned manifests show whether a prompt or tool
+  change regressed any high-stakes stratum.
+- **Keeping an LLM judge honest.** A random weekly audit catches a judge drifting toward lenient passes.
+- **Post-launch improvement.** Sampled production traces feed new failure categories back into the eval set.
+
+### Mini project
+**Run one review cycle on a toy agent (2-3 hours).**
+- **Goal:** take a small agent through run, review, attribution, fix and re-run, and show measurement versus
+  system change separately.
+- **Steps:** build a docs-search agent over 20 short documents with one deliberately stale doc; run 40 eval
+  questions with an LLM judge; review all failures and 10 random passes; code first bad step and
+  attribution; fix one label, the judge prompt and the stale doc; rescore the old agent, then the fixed one.
+- **Done when:** you have an attribution tally, a corrected pass rate, a flip report, and a two-line report
+  separating the measurement change from the agent change.

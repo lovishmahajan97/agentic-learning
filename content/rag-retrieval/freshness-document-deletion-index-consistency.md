@@ -5,7 +5,7 @@ name: Freshness, document deletion and index consistency
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - rag-retrieval/embedding-pipelines
@@ -188,24 +188,28 @@ The agent never sees raw index hits. The tool drops tombstoned and superseded ch
 `version` and `modified_at` with each passage so the agent can cite them and your evals can check them.
 
 ```python
+import logging
+log = logging.getLogger("tools.search_docs")
+
 def search_docs(query: str, k: int = 5, include_archived: bool = False,
                 *, index, manifest, tombstones, doc_meta) -> list[dict]:
     """Tool exposed to the agent. Over-fetch, then filter, so stale hits do not eat the k slots."""
     hits = index.search(query, k=k * 3)
-    out, seen = [], set()
+    out, dropped = [], 0
     for h in hits:
         d, v = h.meta["doc_id"], h.meta["version"]
         if d in tombstones or manifest.get(d) != v:       # deleted, or an old version still lingering
+            dropped += 1
             continue
         meta = doc_meta[d]
         if meta["status"] == "archived" and not include_archived:
             continue                                      # superseded policy: hidden unless asked for
         out.append({"doc_id": d, "version": v, "modified_at": meta["modified_at"],
                     "text": h.text, "superseded_by": meta.get("superseded_by")})
-        seen.add(d)
         if len(out) == k:
             break
-    return out                                            # log len(hits) - len(out) as "dropped" per call
+    log.info("search_docs dropped_stale=%d", dropped)     # rising count = reconciliation lagging
+    return out
 
 # Tool schema description shown to the model (plain words, no hidden policy):
 # "Searches current company documents. Results include modified_at. Set include_archived=true only
@@ -510,5 +514,7 @@ monitoring so the next leak pages someone instead of waiting for a customer.
   reconciles a manifest of indexed `doc_id`s against the folder listing; wrap search as a tool that
   returns `version` and `modified_at`; edit 3 files, delete 2, run the sync, then ask the agent questions
   whose old answers are now wrong.
+- **Watch the breaker:** 2 deletions out of 20 documents is 10%, so a `max_frac=0.05` circuit breaker
+  trips; raise it for this corpus size and confirm it still refuses an empty listing.
 - **Done when:** a probe query for each deleted document returns nothing, the agent's answers cite only
   current versions, and a log shows the reconciliation step found exactly the 2 deletions.

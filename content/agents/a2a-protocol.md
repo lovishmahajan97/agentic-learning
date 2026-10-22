@@ -5,8 +5,8 @@ name: A2A protocol (Agent2Agent)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
-agent_relevance: core
+status: agentic-verified
+agent_relevance: useful
 related:
   - agents/model-context-protocol
   - agents/mcp-authentication-authorization-transport-security
@@ -435,6 +435,6 @@ differently from `input-required` in the user-facing flow.
   arrives with the trace showing each state change.
 
 ### Major project
-The module Capstone (see the module guide) builds a billing-dispute agent on MCP tools. A2A is a
-stretch goal there: put one lookup behind a peer agent served over A2A, so the investigation exercises
-task states and untrusted-artifact handling next to the MCP tools.
+The module Capstone (see the module guide) builds a billing-dispute agent on MCP tools and does not
+require A2A. As an optional stretch, put one lookup behind a peer agent served over A2A, so the
+investigation exercises task states and untrusted-artifact handling next to the MCP tools.

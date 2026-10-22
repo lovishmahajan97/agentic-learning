@@ -5,7 +5,7 @@ name: A100 / H100 / L4 selection
 kind: decision
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - infra-capacity-economics/gpu-sizing
@@ -21,9 +21,9 @@ sources:
 ---
 
 ## TL;DR
-Pick each card in an agent stack by its first binding constraint: fit (long agent contexts), per-step
-decode (bandwidth), then cost per token at real load. L4: cheap 24 GB. A100: 40/80 GB, no FP8. H100:
-80 GB, ~3.35 TB/s, FP8.
+Pick each agent-stack card by its first binding constraint: fit (long contexts), per-step decode
+(bandwidth), then cost per token at load. L4: cheap 24 GB. A100: 40/80 GB, no FP8. H100:
+80 GB, ~3.35 TB/s, FP8, cheapest per token when busy.
 
 ## For agent builders
 - **Why it matters for agents.** A self-hosted agent stack has several GPU jobs with different
@@ -207,6 +207,8 @@ prefill and tool time come on top).
 | A100 80 GB | ≤125 tokens/s | ≈ 1.2 s | ≈ 24 s | about 12 |
 | H100 80 GB | ≤200 tokens/s | ≈ 0.75 s | ≈ 15 s | about 12 |
 
+- **These are weights-only floors.** Near the end of a run each step also reads the session's KV cache
+  (~4 GB at 32k tokens), which adds roughly a quarter to every figure; the ranking does not change.
 - **The L4 fails the latency gate for interactive agents** even though the weights fit: almost three
   minutes of decode per run, before any batching slows it further.
 - **The L4 still earns its place** in the same stack as the embedder and reranker, where inputs are short
@@ -265,8 +267,8 @@ bandwidth ceiling is not realistic, which strengthens the case for the H100 in s
 - **Reserve the baseline, burst elsewhere.** Use when traffic has a steady floor and peaks. Commit to
   reserved capacity for the floor on the card that is cheapest per token when busy, and absorb peaks with
   on-demand or serverless capacity. Monitor reserved-card utilisation; idle reservations are sunk cost.
-- **Pack small models with MIG.** Use for embeddings, rerankers or several small models that need isolation
-  on A100 or H100. Expose MIG profiles through the GPU Operator and request them as separate resources.
+- **Pack small models with MIG.** Use for embeddings, rerankers or several small models that need
+  isolation on A100 or H100. Expose MIG profiles through the GPU Operator and request them as separate resources.
   Monitor per-instance memory and latency, because each slice gets a fraction of bandwidth.
 - **Re-run the selection on a schedule.** Use whenever prices, quotas, models or SLOs change, and at least
   at each budget cycle. Keep the planner inputs in version control next to the capacity plan. Monitor

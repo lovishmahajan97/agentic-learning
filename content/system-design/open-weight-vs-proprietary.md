@@ -5,7 +5,7 @@ name: Open-weight vs proprietary
 kind: decision
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - system-design/self-host-vs-api

@@ -5,7 +5,8 @@ name: System reliability
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - reliability/high-availability
   - reliability/fault-tolerance
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-System reliability is the probability the system does the right thing for users over time. Owning it
-means four levers: fail less often, fail smaller, notice sooner, recover faster. For AI, "right"
-includes answer quality, so a fully-up system can be unreliable.
+An agent is reliable when it completes the right task for users over time. Owning that means four
+levers: fail less often, fail smaller, notice sooner, recover faster. "Right" includes answer quality,
+so a fully-up agent can be unreliable.
+
+## For agent builders
+- **Why it matters for agents.** Per-step failures compound: ten tool calls at 99 percent each finish
+  about 90 percent of tasks. An agent that fails mid-workflow also leaves half-done side effects, so
+  reliability is designed into the loop, not bolted on afterwards.
+- **Where it shows up in your stack.** Tool-call timeouts and retry budgets, idempotency keys on tools
+  that write, checkpointed run state your orchestrator can resume, fallback models behind a feature flag,
+  pinned model snapshots and quality evals on sampled agent traces.
+- **What you control.** Which errors you retry, how many steps a run may take, whether a tool is safe to
+  call twice, what the agent does when a dependency is down, and how fast you can roll back a prompt or
+  model.
+- **What you can skip.** Hardware redundancy theory and the MTBF versus MTTF naming debate beyond knowing
+  conventions differ. The impact formula and composition arithmetic are what you use.
 
 ## Why it exists
 - **Delivered AI systems fail differently from demos.** They fail at 3 a.m. when a provider rate-limits
@@ -108,6 +122,21 @@ expected for a failure mode ≈ frequency × mean_duration × mean_blast_radius
   resumable state, not just retries.
 - **Nondeterminism**: the same input sometimes fails, so "could not reproduce" is not evidence of a fix.
 
+### The four levers inside an agent loop
+| Lever | What it looks like in the agent |
+|---|---|
+| Fail less often | eval gate on prompt, tool-schema and model changes; pinned model snapshot; validated tool arguments |
+| Fail smaller | per-step timeout, step cap per run, per-tenant quota, degraded mode (smaller model, retrieval-only answer, handoff) |
+| Notice sooner | task-completion rate and sampled quality evals on agent traces, not only HTTP status |
+| Recover faster | checkpointed run state, idempotent tools so a resumed run does not repeat writes, one-step prompt rollback |
+
+- **Resumable beats restartable.** A run that checkpoints after each completed tool call can resume at
+  step 7 instead of repeating steps 1-6, *because* repeating them costs tokens and, for writes, creates
+  duplicates.
+- **Retry only what is transient.** Timeouts, HTTP 429 and 5xx are worth a bounded retry; a tool that
+  rejects the arguments the model produced needs the error fed back to the model or a stop, not a
+  blind retry.
+
 ### The ownership loop
 1. **Define SLOs**, including a quality SLO (for example, the pass rate of an automated evaluation on
    sampled production traffic), *because* availability alone cannot see the silent failures above.
@@ -129,14 +158,14 @@ stage, and the loop at the bottom decides what gets funded next.
 
 ```mermaid
 flowchart TD
-    C["Change or dependency fault"] --> F["Failure in production"]
+    C["Prompt change or tool fault"] --> F["Failure in production"]
     F --> D["Detected"]
     D --> G["Diagnosed"]
     G --> R["Recovered"]
     L1["Lever 1: eval gates, canaries"] -.->|"fewer failures"| C
     L2["Lever 2: bulkheads, degradation"] -.->|"smaller blast radius"| F
     L3["Lever 3: symptom and quality alerts"] -.->|"faster detect"| D
-    L4["Lever 4: rollback, traces, runbooks"] -.->|"faster diagnose, recover"| G
+    L4["Lever 4: rollback, checkpoints, traces"] -.->|"faster diagnose, recover"| G
     R --> W["Weekly review: rank by impact"]
     W -->|"fund cheapest lever"| L1
 ```
@@ -192,6 +221,43 @@ A quarter's incident history, reduced to per-month averages with the impact form
   about 45 user-minutes.
 - **A second provider is last,** *because* it addresses the 15-minute row while costing the most.
 
+### Agent loop with retry budget, idempotent writes and checkpoints
+A minimal sketch of the recover-faster and fail-smaller levers inside one agent run. `call_tool`,
+`save_checkpoint` and the error classes stand in for your own orchestrator and tool client.
+
+```python
+import time, uuid
+
+TRANSIENT = (TimeoutError, ConnectionError)   # plus your client's 429 / 5xx error types
+MAX_STEPS, MAX_RETRIES = 12, 2
+
+def run_agent(task, plan_next_step, call_tool, save_checkpoint, state=None):
+    state = state or {"run_id": str(uuid.uuid4()), "step": 0, "history": []}
+    while state["step"] < MAX_STEPS:
+        action = plan_next_step(task, state["history"])      # model call
+        if action["type"] == "final":
+            return {"status": "done", "answer": action["text"]}
+        # same key on every retry or resume, so the tool server can drop duplicates
+        key = f'{state["run_id"]}:{state["step"]}'
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                result = call_tool(action["tool"], action["args"], idempotency_key=key, timeout=20)
+                break
+            except TRANSIENT:
+                if attempt == MAX_RETRIES:
+                    return {"status": "handoff", "reason": "tool unavailable", "state": state}
+                time.sleep(2 ** attempt)                       # backoff; add jitter in production
+        state["history"].append({"action": action, "result": result})
+        state["step"] += 1
+        save_checkpoint(state)                                 # resume here, not from step 0
+    return {"status": "handoff", "reason": "step cap", "state": state}
+```
+
+- **What it buys:** a 1 percent transient failure per call becomes about 0.01 percent with one retry
+  (this sketch allows two), the 90.4 percent versus 99.90 percent shown above.
+- **What it does not buy:** a deterministic bug fails every attempt, and without the idempotency key a
+  retried write (a refund, a ticket update) may run twice.
+
 ## Production patterns
 - **Pinned model versions with a promotion step** — when calling a hosted model, reference a dated
   model snapshot rather than a floating alias, and promote a new version only after it passes the eval
@@ -211,6 +277,9 @@ A quarter's incident history, reduced to per-month averages with the impact form
   utilisation and rejections.
 - **Detect, diagnose, recover timestamps in every postmortem** — record the three durations as fields,
   not prose, so the weekly review can see which lever is failing. Monitor their medians per quarter.
+- **Idempotency keys and checkpoints for agent runs** — derive a key from run id and step for every tool
+  call that writes, have the tool side drop repeats, and persist run state after each step so a crashed
+  or timed-out run resumes. Monitor duplicate-write rejections, resumed runs and task-completion rate.
 
 ## Trade-offs
 - **Redundancy vs cost and rot.** It raises availability for independent failures, but doubles cost and
@@ -225,6 +294,9 @@ A quarter's incident history, reduced to per-month averages with the impact form
 - **Automatic vs manual failover.** Automatic failover recovers in seconds, but a flapping health check
   can cause the outage it guards against; prefer manual failover where minutes of recovery are
   contractually acceptable.
+- **Agent retries vs latency and cost.** Bounded retries lift task completion sharply for transient
+  failures, but every retried model call adds tokens and seconds; it flips against retrying when failures
+  are deterministic or the run is already near its latency budget, where a handoff is better.
 
 ## Pitfalls
 - **Measuring reliability only as HTTP success.** Symptom: green dashboards during a week of customer
@@ -238,10 +310,15 @@ A quarter's incident history, reduced to per-month averages with the impact form
   postmortems while the team feels busy.
 - **Assuming failures are independent when computing redundancy.** Symptom: both "redundant" providers
   failing together because they share a region, quota or upstream.
+- **Restarting failed agent runs from step 0.** Symptom: duplicate tickets or refunds and doubled token
+  spend after a crash. Fix: checkpoint after each step and pass an idempotency key on writes.
+- **Tracking only HTTP errors for an agent.** Symptom: runs that loop to the step cap or end without an
+  answer count as successes. Fix: alert on task-completion rate per agent and tool.
 
 ## When to use
-- **Start on day one:** reliability ownership begins the day a system has users who depend on it, not
-  after the first outage.
+- **Start on day one:** reliability ownership begins the day an agent has users who depend on it, not
+  after the first outage; idempotent tools and step caps are cheapest to add before the first write tool
+  ships.
 - **Before launch:** run a readiness review against the four levers: how changes are gated, how failures
   are contained, which symptom alerts exist, and how long rollback takes.
 - **In operation:** let the error budget and the ranked failure list decide what to fund, and measure
@@ -271,7 +348,7 @@ same detection gap and needs a freshness check. A second provider is worth less 
 because it addresses the smallest slice of downtime.
 
 ## Interview questions
-### What does "reliable" mean for an LLM system, and how is it different from "available"?
+### What does "reliable" mean for an LLM agent, and how is it different from "available"?
 - **Reliable means doing the right thing for users over time,** which includes answer quality, not just
   returning responses.
 - **Available is narrower:** a system can serve HTTP 200 on every request while a model update or stale
@@ -307,6 +384,14 @@ because it addresses the smallest slice of downtime.
   because halving any term halves the impact.
 - **Let the error-budget policy decide timing,** agreed in advance so it is not re-argued at each launch.
 
+### Your agent crashed at step 6 of 9 after creating a ticket and issuing a refund. How should a retry behave?
+- **Resume, do not restart:** load the checkpoint written after step 6 and continue from step 7, so the
+  model does not re-plan and repeat earlier writes.
+- **Make writes idempotent:** each tool call carries a key built from run id and step, so a replayed
+  refund is rejected as a duplicate by the tool side.
+- **Escalate if unsure:** if the last write's outcome is unknown, reconcile against the target system or
+  hand off to a human rather than guess.
+
 ## Quiz
 ### Q: Which change most directly reduces MTTR rather than failure frequency?
 - [ ] Adding an evaluation gate before prompt changes reach production
@@ -331,3 +416,24 @@ because it addresses the smallest slice of downtime.
 - [ ] Because quality monitoring replaces availability monitoring
 > Reliability means doing the right thing for users. Silent quality regressions produce 200 responses,
 > so they need their own SLO and monitoring alongside availability, not instead of it.
+
+## Use cases & projects
+### Use cases
+- **Agents that write to customer systems.** Ticketing, refunds or CRM updates need idempotent tools and
+  resumable runs so a crash or retry never duplicates a business action.
+- **Agents on a single hosted model provider.** Rate limits and regional outages are the common
+  dependency failure; timeouts, retry budgets and a degraded-mode flag keep runs finishing.
+- **Prompt and model upgrades.** Most incidents are change-induced, so eval gates, canaries and one-step
+  rollback are the first reliability investment for an agent team.
+- **Quarterly reliability planning.** Ranking failure modes by frequency × duration × blast radius
+  decides whether the next sprint goes to detection, rollback or a second provider.
+
+### Mini project
+**Make a flaky agent finish its tasks (2-3 hours).**
+- **Goal:** raise the task-completion rate of a 10-step tool-calling agent without duplicating writes.
+- **Steps:** build an agent whose tools fail transiently 1 percent of the time and whose one write tool
+  records every call; run 500 tasks and measure completion; add a bounded retry with backoff, an
+  idempotency key per run and step, and a checkpoint after each step; inject crashes mid-run and resume
+  from the checkpoint.
+- **Done when:** completion climbs from about 90 percent toward 99.9 percent, the write tool shows zero
+  duplicate effects after resumes, and you can name which failures retries could not fix.

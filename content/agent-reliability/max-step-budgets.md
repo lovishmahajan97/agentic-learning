@@ -5,7 +5,7 @@ name: Max-step budgets
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agent-reliability/stopping-conditions-termination
@@ -122,17 +122,17 @@ When any dimension is exceeded:
 - **Withhold tools on that call** so the model summarises instead of acting.
 
 ## Diagram
-Before every call the harness projects the cost; the soft warning and the hard stop both come from that
-projection, not only from the fraction used.
+Before every call the harness projects the cost (`used + context + max_tokens`); the soft warning and the
+hard stop both come from that projection, not only from the fraction used.
 
 ```mermaid
 flowchart TD
-    S["Next loop iteration"] --> P{"used + context + max_tokens within limit?"}
+    S["Next loop iteration"] --> P{"Projected cost within limit?"}
     P -->|"no"| W["Wrap-up call from reserve, no tools"]
     W --> X["Checkpoint, return partial"]
-    P -->|"yes"| L{"Room for only one more call, or over 80%?"}
+    P -->|"yes"| L{"Last affordable call or over 80%?"}
     L -->|"yes, not yet warned"| N["Inject finish-up warning"]
-    L -->|"no"| M["Call model"]
+    L -->|"no, or already warned"| M["Call model"]
     N --> M
     M --> C["Charge usage from API response"]
     C --> D{"Submit accepted?"}
@@ -397,4 +397,4 @@ larger payloads. Report the exhaustion rate by task class rather than lowering t
   near their p95 plus margin; charge from response usage fields; project `used + context + max_tokens`
   before each call; reserve one call for the wrap-up; then force a stuck run with a tool that always fails.
 - **Done when:** the stuck run ends `partial` with a summary and checkpointed counters, no run overshoots
-  its token limit, and a short table compares exhaustion rate before and after the change.
+  its token limit, and replaying the 30 successful tasks under the new limits cuts none of them off.

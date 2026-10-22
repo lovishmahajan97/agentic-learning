@@ -5,7 +5,8 @@ name: NeMo Guardrails
 kind: tool
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - safety-security/input-output-guardrails
   - safety-security/llama-guard
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-NeMo Guardrails is NVIDIA's open-source toolkit that runs programmable "rails" around an LLM at five
-points: input, dialogue, retrieval, tool execution and output. Rails are declared in Colang and YAML, and
-it orchestrates classifiers like Llama Guard rather than being one.
+NeMo Guardrails is NVIDIA's open-source toolkit for wrapping an agent or chat app in programmable "rails"
+at five points: input, dialogue, retrieval, tool execution and output. Rails are Colang and YAML config,
+and it orchestrates classifiers like Llama Guard rather than being one.
+
+## For agent builders
+- **Why it matters for agents.** An agent accumulates checks: moderation on input, a topic policy, a filter
+  on retrieved chunks, checks around tool calls, PII masking on output. NeMo gives them one configurable
+  home, so policy changes per customer become config diffs instead of edits to the agent loop.
+- **Where it shows up in your stack.** An `LLMRails` object in front of (or wrapping) your agent's model
+  calls, a config directory per deployment, Python actions registered as rails, and integrations that wrap
+  an existing LangChain chain.
+- **What you control.** Which rails run, which are deterministic actions versus embedding matches versus
+  LLM self-checks, which model the checks use, and how many model calls each turn makes.
+- **What you can skip.** Dialog rails and Colang flows if your agent only needs input and output checks;
+  and any idea that rails are a security boundary. Injection still needs scoped tools and taint rules.
 
 ## Why it exists
 - **Hand-rolled guardrails converge on the same mess:** an if-statement before the model call, a regex
@@ -54,6 +67,9 @@ optional `prompts.yml` (templates for LLM-based checks) and one or more Colang f
 | 3 | **Retrieval rails** | run over RAG chunks before they enter the prompt, so poisoned or sensitive context can be dropped |
 | 4 | **Execution rails** | wrap actions and tool calls with checks on their inputs and outputs |
 | 5 | **Output rails** | inspect the reply: self-check, fact-checking against retrieved context, hallucination checks, PII masking, moderation |
+
+- **For a RAG agent,** retrieval rails are the hook for dropping untrusted chunks, and execution rails the
+  hook for checking tool inputs and outputs; both are checks, not a replacement for tool authorization.
 
 ### Canonical forms and embeddings
 1. **Define:** in Colang 1.0, `define user ask about competitors` followed by example utterances.
@@ -87,7 +103,7 @@ call.
 - **`single_call`:** this dialog option asks the LLM for all three steps in one prompt, falling back to
   separate calls if parsing fails.
 - **Input and output rails only, no user canonical forms:** largely skips the loop and calls the main model
-  once for the answer.
+  once for the answer. This is the usual shape when the rails wrap an existing agent.
 - **So "NeMo adds latency" has no fixed answer.** It depends on which calls your config leaves in; count
   them rather than guess.
 
@@ -110,7 +126,7 @@ call.
 
 ## Diagram
 A request passes five rail stages; the dialog stage is where a matched intent plus a predefined message
-can answer with no LLM call at all.
+can answer with no LLM call at all, and execution rails sit around the agent's tool calls.
 
 ```mermaid
 flowchart TD
@@ -196,6 +212,19 @@ The self-check rails are themselves LLM calls on the `main` model unless you con
   message depends on version and configuration, which is exactly what the summary settles.
 - **Count, do not reason.** The `explain()` summary is the source of truth for latency and cost per turn.
 
+### Worked scenario: a call budget for a rails-wrapped agent
+A support agent averages three tool-calling steps per user turn. Rough call counts per turn by config
+(illustrative, assuming one model call per agent step):
+
+| Config | Rail calls | Agent calls | Total per turn |
+|---|---|---|---|
+| Full dialog rails, LLM self-check on input and output | 2 checks + up to 3 dialog steps | 3 | up to 8 |
+| Input and output self-checks only | 2 | 3 | 5 |
+| Llama Guard input check in parallel, regex output action | 1 (off the critical path) | 3 | 4, with ~3 on the critical path |
+
+- **The cheapest shape for most agents** keeps dialog rails off, runs content checks on a small separate
+  model, and turns must-never-miss rules into deterministic actions.
+
 ### A deterministic output rail as a custom action
 For checks that must never miss and need no language understanding (an account-number format, a blocked
 term list), write a Python action and call it from an output flow instead of an LLM self-check.
@@ -241,8 +270,9 @@ async def check_no_account_number(context: Optional[dict] = None) -> bool:
 - **Separate, smaller model for LLM-based checks.** Do not run self-check rails on the same model and
   account as main generation; assign them a smaller model per the toolkit's per-task model configuration.
   Monitor self-check latency and how often checker and generator are jailbroken together in red-team runs.
-- **Call budget per turn.** Record the `explain()` LLM-call summary in staging for representative turns and
-  alert when the median calls per turn rises after a config change. Track time to first token per stage.
+- **Call budget per turn.** Record the `explain()` LLM-call summary in staging for representative agent
+  turns and alert when the median calls per turn rises after a config change. Track time to first token
+  per stage.
 
 ## Trade-offs
 - **Declarative rails vs a framework in the path.** Policy becomes reviewable and swappable per customer, but
@@ -256,6 +286,8 @@ async def check_no_account_number(context: Optional[dict] = None) -> bool:
   checks that cannot be done otherwise.
 - **Predefined bot messages vs user experience.** Safe and auditable but robotic. The flip point is when
   product metrics show users abandoning after canned deflections.
+- **Rails around an agent vs inside your own loop.** Wrapping keeps policy separate from agent code, but
+  checks that need tool scopes or principals belong in your tool dispatcher, where that context exists.
 
 ## Pitfalls
 - **Over-broad canonical-form examples.** Symptom: a sudden rise in refusals on ordinary queries after a rail
@@ -272,8 +304,8 @@ async def check_no_account_number(context: Optional[dict] = None) -> bool:
   a customer complains.
 
 ## When to use
-- **Use when:** you need several kinds of checks composed around a conversational product, especially
-  topical control, and policy must differ per deployment or be readable by non-engineers.
+- **Use when:** you need several kinds of checks composed around a conversational product or agent,
+  especially topical control, and policy must differ per deployment or be readable by non-engineers.
 - **Skip when:** you need one moderation call or one schema validation; call the classifier or validator
   directly.
 - **Before relying on it:** build adversarial and benign test sets, measure block rate on the first and
@@ -330,6 +362,13 @@ English and the bank's other supported languages.
   output rails only.
 - **So count calls** with the `explain()` summary rather than guessing.
 
+### You are adding NeMo Guardrails to an existing tool-calling agent. Which rails do you turn on, and where do other checks live?
+- **Turn on input and output rails first** (content safety, PII masking, deterministic actions) and leave
+  dialog rails off, so the agent loop still plans and calls tools itself.
+- **Use retrieval and execution rails** for chunk filtering and tool input or output checks where helpful.
+- **Keep authorization in the tool dispatcher:** scopes, ownership checks and taint rules need the
+  principal and tool registry, which the rails config does not own.
+
 ### When would you not use NeMo Guardrails?
 - **When you need one check:** a single moderation call or one schema validation is cheaper as direct code
   than a framework, a DSL and a runtime in the request path.
@@ -367,3 +406,25 @@ English and the bank's other supported languages.
 - [ ] They only work with OpenAI models as the main engine
 > Intent matching knows only the examples it was given, so coverage and precision both depend on example
 > quality; this is why rails need adversarial and benign test sets like any other code.
+
+## Use cases & projects
+### Use cases
+- **Branded customer agents with topic limits.** Embedding-matched intents and flows deflect competitor or
+  off-topic questions cheaply and auditably.
+- **Per-customer policy on one agent platform.** A `RailsConfig` directory per tenant lets an FDE change
+  rules without touching agent code.
+- **Regulated assistants.** Deterministic actions for must-never-miss patterns plus an LLM self-check on a
+  small model cover account numbers and advice rules.
+- **RAG agents with untrusted corpora.** Retrieval rails drop chunks without the right tags before they
+  enter the prompt.
+
+### Mini project
+**Wrap a small agent in rails and count the cost (2-3 hours).**
+- **Goal:** add input, output and topical rails to a toy agent and measure block rate, false refusals and
+  model calls per turn.
+- **Steps:** build or reuse a simple support agent; create a config directory with a competitor intent
+  (`embeddings_only` on), an input self-check and the account-number action as an output rail; write 20
+  benign and 20 adversarial prompts, including paraphrases and one other language; run them and record
+  `explain()` call counts per turn.
+- **Done when:** you report block rate, false-refusal rate and median model calls per turn, then turn
+  dialog rails off and show how the call count changes.

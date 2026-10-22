@@ -5,7 +5,7 @@ name: Data consistency
 kind: concept
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - system-design/distributed-systems
@@ -24,9 +24,9 @@ sources:
 ---
 
 ## TL;DR
-Your agent reads copies: a RAG index, a memory store, a cache, a replica. Consistency decides what those
-reads may return, from linearizable to eventual. Keep a few invariants strong (permissions, token
-quotas, idempotency keys); let index and memory lag visibly.
+Consistency means invariants inside one database (ACID's C) and what reads of copies (a RAG index, agent
+memory, a cache, a replica) may return, from linearizable to eventual. Keep permissions, token quotas and
+idempotency keys strong; let index, cache and memory lag visibly.
 
 ## For agent builders
 - **Why it matters for agents.** An agent acts on what it reads. A stale memory read makes it repeat a

@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-Each agent task fans out into many model calls, each able to queue. Near full utilization waiting grows
-non-linearly (75% to 95% busy is about 20× the mean wait in a 16-slot fleet), and an 8-step agent pays
-it eight times.
+Each agent task fans out into many model calls, each able to queue. Waiting grows non-linearly near full
+utilization (going from 75% to 95% busy raises mean wait about 20× in a 16-slot fleet), and an 8-step
+agent pays it eight times. Little's law, M/M/c and Kingman predict the knee.
 
 ## For agent builders
 - **Why it matters for agents.** One user task becomes 5-20 LLM calls plus tool calls, so the arrival
@@ -286,8 +286,9 @@ The p99 grows faster than the mean, so an SLO on p99 binds long before the mean 
 - **Cap concurrency and reject fast.** When load can exceed capacity, cap in-flight sequences per replica
   (for example vLLM's `--max-num-seqs`) and bound the gateway queue; beyond it return 429 or 503 with a
   `Retry-After` header. Monitor queue depth, queue wait p99 and rejection rate.
-- **Size from tasks, not calls alone.** Multiply task rate by measured calls per task (from traces) and
-  by the retry rate, then run Little's law and an M/M/c tail estimate. Autoscale on slot occupancy or
+- **Size from task traffic and the SLO, not from cost.** Multiply task rate by measured calls per task
+  (from traces) and by the retry rate, then run Little's law and add headroom from an M/M/c tail estimate
+  against the step's queue-wait budget. Autoscale on slot occupancy or
   queue wait rather than CPU, and alert when occupancy stays above the planned ρ or calls per task drift.
 - **Separate queues for long and batch agents.** Route offline or long-horizon agent runs to their own
   pool or a lower-priority class, so interactive agents see lower Cs. Monitor each class's queue wait and

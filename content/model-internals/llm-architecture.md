@@ -397,6 +397,6 @@ turn would pay prefill over it unless it is prefix-cached, so transcribing once 
 - **Goal:** show the cost and latency difference between scoring with the agent LLM and with an encoder.
 - **Steps:** take 200 query-document pairs; score relevance once by prompting a decoder-only chat model and
   once with a cross-encoder reranker; log latency, tokens and agreement with a small set of hand labels;
-  wire the faster option in as the agent's filter step.
+  wire the cheaper option that still meets your accuracy bar in as the agent's filter step.
 - **Done when:** you have a table of time, cost and accuracy for both approaches and a short note on which
   one the agent should use for this step and why.

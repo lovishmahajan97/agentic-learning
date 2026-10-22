@@ -5,7 +5,7 @@ name: Long-context vs RAG
 kind: decision
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - model-internals/context-window
@@ -160,14 +160,14 @@ SYS, MANUAL, STEPS = 4_000, 150_000, 20
 for name, prefix, new in [("preloaded", SYS + MANUAL, 1_500), ("search tool", SYS, 1_500 + 600)]:
     print(f"{name:<12} uncached ${run_cost(prefix, STEPS, new, cached=False):.2f}"
           f"  cached ${run_cost(prefix, STEPS, new):.2f} per run")
-# preloaded    uncached $10.10  cached $1.50 per run
+# preloaded    uncached $10.09  cached $1.50 per run
 # search tool  uncached $1.44  cached $0.26 per run
 # Ignores cache-write premiums and embedding/vector-store costs.
 ```
 
 | Per day at 1,000 runs (illustrative) | Preloaded manual | Search tool |
 |---|---|---|
-| Uncached | ≈ $10,100 | ≈ $1,440 |
+| Uncached | ≈ $10,090 | ≈ $1,440 |
 | Cached, warm through the run | ≈ $1,500 | ≈ $260 |
 | Context used at step 20 | ≈ 182k tokens | ≈ 44k tokens |
 
@@ -327,7 +327,7 @@ revisit when one changes.
   middle, distractors), and one shared prompt cannot enforce per-user permissions.
 
 ### You are building a support agent over a 150,000-token manual. Do you preload it or give the agent a search tool?
-- **Do the per-run arithmetic:** the corpus is re-sent on every step, so a 20-step run is about 3 million
+- **Do the per-run arithmetic:** the corpus is re-sent on every step, so a 20-step run is over 3 million
   input tokens uncached; with a warm cache roughly $1.50 per run versus about $0.26 for a search tool at
   illustrative prices.
 - **Check the window:** corpus plus a late-step transcript (about 182k tokens at step 20) must fit the

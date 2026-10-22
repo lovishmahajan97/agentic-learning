@@ -5,7 +5,8 @@ name: Model lifecycle & deprecation policy
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - llmops-platform/model-registry
   - llmops-platform/ci-cd-for-prompts-and-models
@@ -23,9 +24,20 @@ sources:
 ---
 
 ## TL;DR
-A lifecycle policy names a model version's states, who may move it and what evidence each move needs; the
-deprecation half dates retirements, freezes new pins, migrates consumers with evaluation and archives.
-Without it, every sunset is an unplanned migration.
+Every agent pins a model that will be retired. A lifecycle policy names a version's states and the evidence
+each move needs; the deprecation half dates retirements, freezes new pins, migrates agents with evaluation
+and archives. Without it, every sunset is an emergency.
+
+## For agent builders
+- **Why it matters for agents.** Your agent's tool choice, refusal behaviour and output format are tuned
+  to one model snapshot. When that snapshot retires, the successor may call tools differently, tokenize
+  your long system prompt into more tokens or hit a lower quota, so every sunset is an agent migration.
+- **Where it shows up in your stack.** Provider deprecation pages, the model id pinned in your agent's
+  config or bundle, the model registry, and the CI check that rejects pins to deprecated versions.
+- **What you control.** Pinning snapshot ids, watching sunset dates, running your agent eval suite (task
+  completion, tool-call accuracy, cost per task) on the successor, and canarying the switch.
+- **What you can skip.** Designing the platform-wide state machine, unless you run the platform; consume
+  its dates and freeze rules instead.
 
 ## Why it exists
 - **Models do not stay still.** Providers retire snapshots on published schedules and ship successors that
@@ -118,6 +130,14 @@ policy around them.
 
 The checklist covers each, *because* the regressions that slip through are typically a cost or a 429
 surprise, not a quality drop.
+
+**Agents add task-level checks to the migration.** Run the agent eval suite end to end, not just
+single-turn prompts:
+- **Tool-call accuracy and argument validity** per tool, because successors differ in how strictly they
+  follow tool schemas.
+- **Steps and tokens per task**, because a model that plans differently changes cost even at equal price.
+- **Behaviour at approval gates and refusals**, because a more cautious or bolder successor shifts how
+  often the agent asks a human.
 
 **Provider models cannot be archived as weights.** Once the vendor retires a snapshot, its behaviour can
 never be re-run. Archive the bundle (prompts, parameters, tool schemas), the evaluation evidence and logged
@@ -237,6 +257,20 @@ Illustrative numbers for one bundle moving to a successor model.
 - **Takeaway:** quality alone would have promoted it; the checklist caught a cost rise, a context squeeze
   and a quota cut before the canary did.
 
+### Worked migration: a research agent on a successor model
+Illustrative numbers from running a 200-task agent eval suite on both snapshots.
+
+| Agent metric | Old snapshot | Successor | Read |
+|---|---|---|---|
+| Task completion | 78% | 81% | better |
+| Mean steps per task | 5.2 | 7.0 | plans in smaller steps |
+| Input tokens per task (whole transcript, re-sent each step) | 41k | 63k | steps × tokenizer change compound |
+| Invalid tool arguments | 0.8% | 2.9% | stricter date format expected by one tool |
+| Cost per task at equal per-token price | $0.12 | $0.18 | +50% |
+
+- **Decision:** migrate, but first fix the date argument in the tool description and cap steps, then
+  re-run the suite; a single-prompt golden set would have shown only the completion gain.
+
 ## Production patterns
 - **Inventory from gateway telemetry.** Group gateway request logs by resolved model id, bundle and owning
   team over a trailing window (for example 30 days) and join with registry pins; any caller missing from
@@ -259,6 +293,9 @@ Illustrative numbers for one bundle moving to a successor model.
 - **Pre-sunset record capture for provider models.** Before the sunset, replay a representative sample
   through the old snapshot and archive inputs, outputs, bundle and eval evidence. Monitor that the archive
   exists before retirement is approved.
+- **Agent eval suite as the migration gate.** When a successor is announced, the upgrade job runs every
+  agent's task-level suite (completion, tool-call accuracy, steps and cost per task) on it and opens a PR
+  with the diff. Monitor how many agents have a passing successor run before the freeze date.
 
 ## Trade-offs
 - **Long notice vs version sprawl.** Consumers get time to evaluate properly, but more versions stay alive,
@@ -290,6 +327,9 @@ Illustrative numbers for one bundle moving to a successor model.
 - **Validating the successor on quality alone.** Symptom: a migration passes every eval, then blows the
   monthly cost forecast or hits 429s, because tokenization, pricing or quota differ. Fix: the full
   migration checklist.
+- **Migrating an agent on single-turn evals.** Symptom: the new model scores well per prompt, then agents
+  take more steps and send invalid tool arguments in production. Fix: task-level agent evals on the
+  successor.
 
 ## When to use
 - **Write the policy as soon as more than one team depends on a model** you serve or pin, or you depend on
@@ -347,7 +387,7 @@ cannot migrate in time, the fallback is a short, dated exception, not an unrevie
 - **Either way, decide explicitly** per deployment and log the reported model version so an upgrade is
   visible.
 
-### A successor matches the old model on your golden set. What else could break in migration?
+### A successor matches the old model on your agent's golden set. What else could break in migration?
 - **Cost:** a new tokenizer can raise token counts per request, so spend rises even at the same price.
 - **Capacity:** rate limits and quota may differ, producing 429s at peak.
 - **Behaviour at the edges:** refusal rate, structured-output and tool-calling strictness, default
@@ -358,6 +398,14 @@ cannot migrate in time, the fallback is a short, dated exception, not an unrevie
   sample outputs are the only record once the snapshot is gone.
 - **Capture it before sunset,** by replaying a representative sample while the model still answers.
 - **Bound it** by the compliance retention period, because the archive is sensitive data.
+
+### How would you evaluate a successor model for a tool-calling agent before the old one retires?
+- **Run the task-level suite end to end:** completion, tool-call accuracy and argument validity per tool,
+  steps and tokens per task, and approval or refusal behaviour.
+- **Compare cost per task, not per call,** because a successor that plans in more steps multiplies the
+  re-sent transcript.
+- **Fix, re-run, then canary:** adjust tool descriptions and step caps where it regressed, and ramp by
+  session with task-level guards.
 
 ## Quiz
 ### Q: Why does a sound lifecycle forbid moving a version directly from production to retired?
@@ -383,3 +431,24 @@ cannot migrate in time, the fallback is a short, dated exception, not an unrevie
 - [ ] To seed the training data for the next fine-tune
 > Archival is about reproducibility and accountability for past decisions, for a defined retention
 > period. Rolling back to a retired version is not a goal; the successor has its own rollback target.
+
+## Use cases & projects
+### Use cases
+- **Provider sunsets a snapshot your agents pin.** Inventory every agent on it, freeze new pins and
+  migrate each with its own task-level eval.
+- **Moving agents to a cheaper or faster model.** The same lifecycle gates apply even when nobody forced
+  the change.
+- **Retiring an internal fine-tune.** A platform team retiring an agent-tuned model gives agent teams
+  notice, a successor and brownouts.
+- **Embedding model upgrades under RAG agents.** The embedder and its indexes move through the lifecycle
+  together.
+
+### Mini project
+**Successor readiness report for an agent (2-3 hours).**
+- **Goal:** decide with evidence whether an agent can move to a successor model before a sunset.
+- **Steps:** pick two models from one provider; run a 30-task agent suite on both, logging completion,
+  steps, input tokens, invalid tool arguments and cost per task; write the deprecation plan dates (announce,
+  freeze, brownout, sunset) for an assumed sunset; add a CI check that fails if the agent config pins the
+  old model after the freeze date.
+- **Done when:** a one-page report shows the metric diff, the fixes needed, the dated plan, and the CI
+  check failing on a test config that still pins the old model.

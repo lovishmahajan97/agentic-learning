@@ -5,7 +5,8 @@ name: Drift
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - llmops-platform/model-monitoring
   - llmops-platform/golden-dataset-strategy
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-Drift is any change between the conditions you validated under and the ones you serve: inputs, the right
-answer, or (in LLM apps) the model, prompt, corpus, embedder or judge. Detect it against a reference
-window; act only if outcomes changed.
+Drift is any change between the conditions your agent was validated under and the ones it serves:
+tasks, the right answer, or the model, prompt, tools, corpus, embedder or judge. Detect it against a
+reference window; act only if outcomes changed.
+
+## For agent builders
+- **Why it matters for agents.** An agent depends on more moving parts than a model: the provider model
+  behind an alias, tool APIs whose responses change shape, a RAG corpus that ages, and users who start
+  asking for tasks you never tested. Any of these shifts behaviour with no error raised.
+- **Where it shows up in your stack.** Task and intent mix in your traces, tool-call mix and tool error
+  rates, retrieval scores, the reported response model id, and a frozen probe set of agent tasks run on
+  a schedule.
+- **What you control.** Pinning model snapshots, embedders and judges, hashing the resolved bundle
+  (prompt plus tool schemas), the reference window, and which slices get extra judging when they shift.
+- **What you can skip.** Deriving PSI or two-sample test theory; know what each detects, the rule-of-thumb
+  cut-offs, and that only labels reveal concept drift.
 
 ## Why it exists
 - **Every evaluation is a snapshot.** A golden set, a canary and a benchmark all say "acceptable on
@@ -80,6 +93,8 @@ each with its own detector and fix:
 | **Embedding** | embedder upgraded but index built with the old one; vectors no longer share a space | collapse in retrieval scores on a fixed probe set | version embeddings with the index; re-index together |
 | **Judge** | the LLM-as-a-judge alias updates; every quality series steps that day | re-score a fixed, human-labelled calibration set on a schedule | re-calibrate and pin |
 | **Feedback loop** | users learn which phrasings work; outputs enter the system's own corpus or training data | only by comparing against held-out, never-served data | keep held-out data |
+| **Tools (agents)** | an upstream API adds fields, renames an enum or paginates differently; the agent misreads results or sends stale arguments | tool error and retry rate per tool; schema validation on tool responses | version tool adapters; validate responses |
+| **Agent memory** | long-term memory accumulates outdated or agent-written notes that steer later runs | memory age at retrieval; probe tasks run with empty versus populated memory | expiry and review policies for memory |
 
 ### Detecting it
 Detection compares a **reference window** (the validated traffic, or the same period last cycle) with a
@@ -226,6 +241,23 @@ Illustrative week for a support assistant; the probe set splits each case in one
 | Retrieval scores down, citations irrelevant | dropped on retrieval probes | embedder upgraded last night | embedding drift | re-index with the new embedder, or revert it |
 | Returns intent up to 33% (PSI 0.10) | stable | judged error rate on returns unchanged | covariate shift, harmless | add returns cases to the golden set, advance reference |
 
+### Worked scenario: tool drift in an order-lookup agent
+Illustrative numbers. The order API started returning `status: "in_transit"` where it used to return
+`"shipped"`, with no change on the agent side.
+
+| Signal | Reference week | This week | Read |
+|---|---|---|---|
+| `get_order` error rate | 0.4% | 0.5% | flat: the call succeeds |
+| Tool-call PSI (which tool is called) | | 0.18 | the agent now calls `escalate` far more often |
+| Frozen probe set (40 agent tasks, recorded tool results) | 38/40 | 38/40 | stable, so the agent itself did not change |
+| Live probe (same tasks, live tools) | 38/40 | 29/40 | the world changed: a tool |
+| Escalation rate | 6% | 14% | users feel it |
+
+- **Diagnosis:** recorded versus live probes split agent drift from tool drift in one step; the new enum
+  value was not in the tool description, so the model treated it as unknown and escalated.
+- **Fix:** validate tool responses against a versioned schema in the adapter, update the tool description,
+  and add the new status to the golden set.
+
 ## Production patterns
 - **Resolved-bundle hash on every trace.** Compute a hash over model id, prompt text, tool schemas and
   decoding parameters at request time and attach it to the trace; alert when a hash appears that the
@@ -245,6 +277,9 @@ Illustrative week for a support assistant; the probe set splits each case in one
 - **Library-backed drift reports.** Tools such as Evidently compute per-column drift tests (PSI, KS,
   Jensen–Shannon and others) between a reference and current dataset; run them as a scheduled job on
   logged features. Monitor the share of drifted columns per slice, not a single global flag.
+- **Recorded and live agent probes.** Run the same agent tasks twice on a schedule: once against recorded
+  tool results, once against live tools. If only the live run drops, a tool or corpus drifted; if both
+  drop, the model or prompt did. Monitor the gap between the two pass rates.
 
 ## Trade-offs
 - **Label-free detectors: cheap and immediate vs blind to concept drift.** PSI, embedding tests and
@@ -274,6 +309,9 @@ Illustrative week for a support assistant; the probe set splits each case in one
   complaints from a segment with no representation in it. Fix: feed confirmed shifts into the set.
 - **PSI with empty buckets and no smoothing.** Symptom: infinite or NaN scores that crash the job or get
   silently clipped, hiding exactly the new categories that signal drift. Fix: epsilon smoothing.
+- **Trusting tool responses to keep their shape.** Symptom: an agent quietly escalates or answers wrongly
+  after an upstream API change, with tool error rate flat. Fix: schema-validate tool responses and alert on
+  the tool-call mix.
 
 ## When to use
 - **Every production system needs it**, because every system runs longer than its validation data stays
@@ -323,7 +361,7 @@ being obvious in embedding space.
 - **Why it matters:** the fixes differ (extend coverage versus update corpus, policy text and labels),
   and only one can be caught without labels.
 
-### Every quality metric dropped overnight across all tenants and nobody deployed. What do you check?
+### Every quality metric of your RAG agent dropped overnight across all tenants and nobody deployed. What do you check?
 - **Re-run the frozen probe set:** if it dropped too, a component changed, not the world.
 - **Then check components in order:** the model id reported in responses (alias update), the resolved
   bundle hash (an out-of-band prompt edit), the embedder version on the index, and the judge model.
@@ -336,6 +374,14 @@ being obvious in embedding space.
   error rate with the reference window.
 - **Act only if outcomes changed;** if they did not, add the new cases to the golden set and advance the
   reference.
+
+### Your agent's escalation rate doubled but no deploy happened and the model id is unchanged. How do you find the cause?
+- **Split agent from environment:** re-run probe tasks with recorded tool results and with live tools; a
+  drop only in the live run points at a tool or corpus, not the model or prompt.
+- **Check the tool-call mix and per-tool responses:** a PSI jump in which tools are called, or new values in
+  a tool's response, usually names the culprit.
+- **Fix at the adapter:** validate and normalise tool responses, update tool descriptions, and add the new
+  cases to the golden set.
 
 ### When would you use a classifier two-sample test instead of PSI?
 - **For high-dimensional inputs** such as text embeddings, where bucketing is meaningless.
@@ -376,3 +422,24 @@ being obvious in embedding space.
 > A single divergence number says how far apart two windows are. A trained discriminator can be
 > inspected: the inputs it is surest belong to the new window are the new kind of traffic, which is
 > what you need to extend the golden set and prompt.
+
+## Use cases & projects
+### Use cases
+- **Provider alias updates under an agent.** The frozen probe set and the response model id show the model
+  moved, not the users.
+- **Tool APIs changing shape.** Tool-call mix and response validation catch an upstream change before the
+  escalation rate does.
+- **Stale RAG corpora.** Document age at retrieval and groundedness against the current source of truth
+  reveal answers that are confidently out of date.
+- **New task types arriving.** Intent PSI and embedding two-sample tests show users asking the agent for
+  things your golden set never covered.
+
+### Mini project
+**Drift triage for a tool-calling agent (2-3 hours).**
+- **Goal:** tell model drift, tool drift and task-mix drift apart with three cheap checks.
+- **Steps:** build a small agent with two tools and 30 probe tasks; record tool results once; compute a
+  bundle hash and an intent PSI over logged tasks; then inject three changes in turn (change the prompt
+  out of band, change a tool's response enum, shift the task mix) and run recorded and live probes after
+  each.
+- **Done when:** a short report correctly labels each injected change from the evidence (hash alert,
+  recorded-versus-live gap, PSI with stable outcomes) without you looking at what you changed.

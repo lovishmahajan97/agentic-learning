@@ -5,7 +5,7 @@ name: Timeouts
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - serving-inference/streaming
@@ -257,7 +257,7 @@ print(asyncio.run(call_tool(slow_search, {"q": "refund policy"}, remaining_s=20)
 | 6 LLM calls, `max_tokens` 300, TTFT p99 2 s, TPOT 30 ms | about 6 × (2 + 9) = 66 s at worst, so cap tokens or steps |
 | Same with `max_tokens` 150 | about 6 × (2 + 4.5) = 39 s |
 | 3 tools at 3 s timeout each | 9 s |
-| Remaining margin | about 12 s for queueing and the final answer |
+| Remaining margin, with the 150-token cap | 60 − 39 − 9 ≈ 12 s for queueing and the final answer |
 
 ### Worked scenario: the 60-second wall
 A non-streaming endpoint behind a load balancer with the default 60 s idle timeout, TTFT p99 8 s, TPOT

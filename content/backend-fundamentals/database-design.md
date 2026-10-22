@@ -5,7 +5,7 @@ name: Database design
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - backend-fundamentals/sql
@@ -274,8 +274,9 @@ print(plan[-1][-1])   # SEARCH messages USING INDEX messages_by_conversation (co
 ```
 
 ### Agent scenario: a run that crashes mid-tool-call
-An agent with a `send_invoice` tool crashes after the tool succeeded but before the step was saved. On
-resume it replays step 7. The schema decides what happens.
+An agent with a `send_invoice` tool inserts the step-7 row (with its idempotency key) before calling the
+tool and marks it done afterwards. It crashes after the tool succeeded but before the step was marked
+done. On resume it replays step 7. The schema decides what happens.
 
 ```sql
 CREATE TABLE agent_runs (
@@ -305,9 +306,9 @@ CREATE INDEX agent_steps_by_run ON agent_steps (run_id, step_no);
 
 | Design | What the replay of step 7 does |
 |---|---|
-| No unique key, no idempotency key | second invoice sent, two step-7 rows, cost report double-counts |
-| `UNIQUE (run_id, step_no)` only | duplicate row rejected, but the invoice API was already called twice |
-| Both keys, key passed to the tool | insert conflicts, the tool's own idempotency check returns the first result |
+| No unique key, no idempotency key | second step-7 row inserted, second invoice sent, cost report double-counts |
+| `UNIQUE (run_id, step_no)` only | duplicate row rejected, but the step is not marked done, so the worker calls the invoice API again and a second invoice goes out |
+| Both keys, key passed to the tool | insert conflicts, the worker reuses the existing row's key, and the invoice API deduplicates on it and returns the first invoice |
 
 ### Worked scenario: renaming a column with zero downtime
 The team wants `messages.content` renamed to `body` on a large, hot table while three app versions roll out.

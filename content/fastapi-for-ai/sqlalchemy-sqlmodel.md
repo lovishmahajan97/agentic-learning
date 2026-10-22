@@ -5,7 +5,7 @@ name: SQLAlchemy / SQLModel
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - fastapi-for-ai/async-database-access-and-connection-pooling
@@ -253,36 +253,41 @@ print(queries_for(selectinload(Conversation.messages)))  # 2: one SELECT + one I
 ```
 
 ### A safe DB tool for an agent (Core, bound parameters)
-The model picks the arguments; Core turns them into bound parameters, the schema bounds them, and a row
-cap keeps the tool result small enough for the context window. Runnable against in-memory SQLite.
+The model picks the filter arguments; Core turns them into bound parameters, the schema bounds them,
+and a row cap keeps the tool result small enough for the context window. Runnable against in-memory SQLite.
+- **The tenant never comes from the model.** The customer is taken from the caller's auth context,
+  because bound parameters stop SQL injection but not a prompt that asks for another customer's rows.
 
 ```python
 from pydantic import BaseModel, Field
 from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine, insert, select
 
 meta = MetaData()
-orders = Table("orders", meta, Column("id", Integer, primary_key=True),
-               Column("customer", String), Column("status", String))
+orders = Table("orders", meta, Column("id", Integer, primary_key=True), Column("customer", String),
+               Column("item", String), Column("status", String))
 engine = create_engine("sqlite://")
 meta.create_all(engine)
 with engine.begin() as c:
-    c.execute(insert(orders), [{"customer": "acme", "status": "shipped"},
-                               {"customer": "acme", "status": "pending"}])
+    c.execute(insert(orders), [{"customer": "acme", "item": "laptop", "status": "shipped"},
+                               {"customer": "acme", "item": "mouse", "status": "pending"},
+                               {"customer": "globex", "item": "laptop", "status": "shipped"}])
 
 class FindOrders(BaseModel):                       # the tool's JSON schema, shown to the model
-    customer: str = Field(max_length=64)
+    item: str | None = Field(default=None, max_length=64)
     status: str | None = Field(default=None, pattern="^(pending|shipped|cancelled)$")
 
-def find_orders(args: dict) -> list[dict]:
+def find_orders(args: dict, customer: str) -> list[dict]:   # customer: from auth, not the model
     a = FindOrders.model_validate(args)            # reject malformed model output
-    stmt = select(orders.c.id, orders.c.status).where(orders.c.customer == a.customer)
+    stmt = select(orders.c.id, orders.c.item, orders.c.status).where(orders.c.customer == customer)
+    if a.item:
+        stmt = stmt.where(orders.c.item == a.item)
     if a.status:
         stmt = stmt.where(orders.c.status == a.status)
     with engine.connect() as c:                    # in production: a read-only DB role
         return [dict(r._mapping) for r in c.execute(stmt.limit(20))]   # cap rows for the context
 
-print(find_orders({"customer": "acme"}))
-print(find_orders({"customer": "acme' OR '1'='1"}))   # [] : a bound value, never SQL
+print(find_orders({}, customer="acme"))                        # acme's 2 orders, never globex's
+print(find_orders({"item": "x' OR '1'='1"}, customer="acme"))  # [] : a bound value, never SQL
 ```
 
 ### Worked scenario: the list endpoint that slowed down in production

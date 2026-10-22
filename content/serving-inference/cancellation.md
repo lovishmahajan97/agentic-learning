@@ -5,7 +5,7 @@ name: Cancellation
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - serving-inference/timeouts
@@ -114,6 +114,8 @@ close the next connection, and side-effecting tools must survive being interrupt
   and any sub-agents; a stop must reach every leaf, not only the HTTP response.
 - **Structured concurrency does the fan-out.** Start parallel tools inside an `asyncio.TaskGroup` (Python
   3.11+) so cancelling the run cancels them all, and each tool's `finally` closes its own connection.
+  Catch ordinary tool errors inside each tool wrapper, because a `TaskGroup` also cancels the sibling
+  tools when one child raises.
 - **Check before each step.** Between steps, check a cancel flag or deadline so the loop does not start
   a new model call after the user pressed stop.
 - **Persist what finished.** Record completed steps and tool results so a restarted run can resume or

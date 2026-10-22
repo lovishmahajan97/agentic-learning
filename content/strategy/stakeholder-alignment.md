@@ -5,7 +5,8 @@ name: Stakeholder alignment
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: background
 related:
   - adoption/stakeholder-management
   - adoption/exec-communication
@@ -17,9 +18,21 @@ related:
 ---
 
 ## TL;DR
-Stakeholder alignment gets everyone who funds, approves, operates, uses or can veto an AI system to agree,
-before building, on the goal, success metric, acceptable error rate, failure handling and decision rights.
-For a probabilistic system, "does it work?" needs an agreed operating point.
+Stakeholder alignment gets everyone who can fund, approve or veto an agent to agree, before building, on
+its goal, success metric, acceptable error rate, which actions need approval, and who can pause it. An
+agent's "does it work?" needs an agreed operating point.
+
+## For agent builders
+- **Why it matters for agents.** An agent takes actions, so the late veto is sharper: compliance, security
+  and finance each care which tool calls it may make alone. Without agreement up front, a working agent
+  sits in pilot because nobody agreed what it may do.
+- **Where it shows up in your stack.** The agreement becomes configuration you implement: the escalation
+  threshold, the approval gate per tool or action class, refund or spend limits, the audit sample and the
+  kill switch with a named owner.
+- **What you control.** Producing the evidence (a threshold trade-off table from your agent eval, a
+  same-slice human baseline) and putting every agreed limit in config, not code.
+- **What you can skip.** Running the stakeholder meetings and change-management detail; know what goes on
+  the one-pager so you can build exactly what it says.
 
 ## Why it exists
 - **More parties than a typical feature.** A business owner who wants a cost or speed gain, operators whose
@@ -40,6 +53,11 @@ For a probabilistic system, "does it work?" needs an agreed operating point.
   stakeholder management.
 
 ## How it works
+### Background
+Steps 1-7 are the general alignment method for any AI system: map the people, separate goals from red
+lines, measure the human baseline, choose an operating point on a measured curve, pre-wire, write one page
+and re-align at gates. Step 8 is what an agent adds.
+
 ### 1. Map who matters and what each can do
 | Column | What to record |
 |---|---|
@@ -101,9 +119,20 @@ A written artefact matters *because* memories of verbal agreements diverge withi
 - **If results move the trade-off** (accuracy lower than hoped, costs higher), re-open the decision
   explicitly rather than drifting.
 
+### 8. What an agent adds to the one-pager
+| Section | What to agree for an agent |
+|---|---|
+| Action classes | Which tool calls are read-only, reversible or irreversible, and which run without approval |
+| Approval gates | Who approves consequential actions, and the limit (amount, scope) above which approval is required |
+| Escalation threshold | When the agent hands off to a human: low confidence, step budget hit, or a red-line topic |
+| Budgets | Steps and spend per task, so a looping agent stops before it costs real money |
+| Kill switch | Who can pause the agent, how fast, and what happens to tasks in flight |
+
+- **Why each needs an owner:** these are the decisions a veto holder would otherwise make at launch.
+
 ## Diagram
 Alignment is a sequence: constraints and a fair baseline come before the trade-off curve, and veto holders
-see the evidence privately before the meeting that ratifies the operating point.
+see the evidence privately before the meeting that ratifies the agent's operating point and limits.
 
 ```mermaid
 flowchart TD
@@ -113,7 +142,7 @@ flowchart TD
     C --> PW["Pre-wire veto holders one-to-one"]
     PW --> R["Meeting ratifies operating point"]
     R --> OP["One-pager: metric, red lines, rollback, owners"]
-    OP --> P["Production with audited sample"]
+    OP --> P["Agent in production, audited sample"]
     P -->|"rollback trigger hit"| RB["Fall back to humans"]
     P -->|"each gate"| G{"Trade-off moved?"}
     G -->|"yes"| C
@@ -202,6 +231,23 @@ for n in (50, 300, 1000):
 - **Agree the window size and the response** (pause and re-audit, or immediate fallback) in the one-pager,
   so a noisy reading does not restart the negotiation.
 
+### Worked scenario: agreeing a refund agent's approval limit
+A support agent can issue refunds through a tool. Operations wants a short approval queue; finance's red
+line is wrong-refund cost under $1,000 per month. The team replays a month of tickets through the agent
+offline and projects each limit. All figures are illustrative.
+
+| Auto-approve limit | Refunds the agent issues alone | Projected wrong-refund cost per month | Approvals queued per day |
+|---|---|---|---|
+| $25 | 45% | $300 | 120 |
+| $50 | 70% | $900 | 66 |
+| $200 | 92% | $4,800 | 18 |
+
+- **$200 breaches finance's red line; $25 swamps the approvers.** $50 meets both with little margin.
+- **The one-pager records** $50 as provisional, finance as owner of the wrong-refund trigger, a rolling
+  audit of auto-issued refunds, and operations holding the kill switch.
+- **The engineer implements exactly that:** the limit in config, an approval gate on the refund tool above
+  it, and an audit sample of the rest.
+
 ## Production patterns
 - **One-page decision record in version control** — store the one-pager (goal, metric with baseline and
   target, red lines, operating point, rollback trigger, owners, review date) next to the system's eval
@@ -217,6 +263,11 @@ for n in (50, 300, 1000):
   error at every gate.
 - **Pre-wire log** — before each decision meeting, record which veto holders saw the evidence one-to-one and
   what they raised. Monitor objections that first appear in the group meeting; each one is a missed pre-wire.
+- **Agreed limits as agent config** — put approval limits, escalation thresholds, step and spend budgets
+  per task in versioned config that names its owner from the one-pager. Monitor actions taken above each
+  limit (should be zero) and the approval-queue length.
+- **Owned kill switch** — give the named owner a tested way to pause the agent or drop it to draft-only
+  mode without a deploy. Monitor time to pause in drills and tasks left in flight when it fires.
 
 ## Trade-offs
 - **Up-front alignment vs speed.** It prevents late vetoes but delays the start; for a reversible internal
@@ -228,6 +279,9 @@ for n in (50, 300, 1000):
 - **Showing the full error trade-off vs sponsor comfort.** It builds trust with risk owners but exposes
   failure rates some sponsors would rather not see; hiding them only moves the discovery to launch, where it
   costs more.
+- **Tight approval gates vs agent usefulness.** Approving every action keeps risk owners comfortable but
+  turns the agent into a drafting tool with a queue; loosen gates per action class as audited evidence
+  accumulates.
 
 ## Pitfalls
 - **Aligning on vision instead of numbers.** Symptom: a successful pilot that nobody can approve because
@@ -243,12 +297,17 @@ for n in (50, 300, 1000):
   same, easier claims.
 - **Decision rights left implicit.** When production metrics wobble, two executives give contradictory
   instructions and the team freezes.
+- **Agreeing the agent's goal but not its actions.** Symptom: security blocks launch on discovering the
+  agent can send email or issue refunds alone. Fix: put action classes, approval limits and the kill-switch
+  owner on the one-pager before build.
 
 ## When to use
 - **Use before significant build work** on any AI system that changes a workflow, touches regulated data,
   or needs sign-off from people outside the building team, which is most of them.
 - **Revisit** at each roadmap gate and whenever evidence moves the trade-off.
 - **Skip the heavy version** for internal experiments that are cheap to stop.
+- **Never skip it for agents that write** to systems of record, move money or message customers; agree
+  action classes and approval limits first.
 - **Measure alignment** by whether a launch decision can be made from the one-pager and the latest eval
   without a new negotiation.
 - **Interviews:** describe turning conflicting goals into a choice on a measured trade-off curve.
@@ -298,11 +357,21 @@ rate.
 - **Never skip it** when the system changes a workflow, touches regulated data, or needs sign-off from
   people outside the building team, because those are exactly the late vetoes.
 
-### How would you design the rollback trigger for an automated decision system?
+### How would you design the rollback trigger for an agent or automated decision system?
 - **Tie it to the red line:** for example, audited production error on auto-routed items above 4%, with a
   named owner (compliance in the claims case) and a defined response.
 - **Size the audit window** so noise alone rarely trips it; with true error at 3.2% and a 4% trigger, even
   300 audited claims give a false rollback about 17% of the time.
+- **For an agent, define the fallback mode:** drop to draft-only or approval-on-every-action rather than
+  switching off, so work continues while the owner re-audits.
+
+### Your agent can issue refunds and update accounts. What must stakeholders agree before you build it?
+- **Action classes:** which tool calls are read-only, reversible or irreversible, and which may run
+  without a human.
+- **Limits and owners:** the approval limit per action class from an offline replay, the escalation
+  threshold, step and spend budgets per task, and who owns each trigger.
+- **The kill switch:** who can pause the agent or drop it to draft-only, and how in-flight tasks are
+  handled; then implement all of it as config.
 
 ## Quiz
 ### Q: Why separate stakeholders' hard constraints from their outcome goals?
@@ -328,3 +397,24 @@ rate.
 - [ ] To satisfy a requirement of most model providers
 > Without a baseline, every AI error is compared with an imagined error-free process. Measuring today's
 > error rate and cost gives an agreed, achievable bar for the go/no-go decision.
+
+## Use cases & projects
+### Use cases
+- **Launching a customer-facing agent.** Support, compliance and finance agree which replies and refunds
+  the agent sends alone before the first line of agent code.
+- **Unblocking an agent stuck in pilot.** A one-pager with a replay-based trade-off table turns "is it good
+  enough?" into choosing a limit everyone has seen.
+- **Raising an agent's autonomy.** Audited evidence at the current limit is presented against the
+  one-pager to justify a higher approval limit.
+- **Handling an agent incident.** The named kill-switch owner drops the agent to draft-only mode without a
+  meeting, because the response was agreed in advance.
+
+### Mini project
+**Alignment one-pager and config for a refund agent (1-2 hours).**
+- **Goal:** turn three stakeholders' goals into an agreed agent limit and the config that enforces it.
+- **Steps:** write each stakeholder's outcome and red line; simulate 200 refund requests with amounts and
+  a mock agent correctness rate; tabulate share auto-issued, projected wrong-refund cost and queue length
+  for three limits; pick the operating point; write the one-pager with action classes, owners and kill
+  switch; express the limits as a config file and a gate function the refund tool calls.
+- **Done when:** the table, the one-pager and a test showing a refund above the limit is routed to approval
+  all agree, and pausing the agent switches it to draft-only.

@@ -5,7 +5,7 @@ name: Multi-agent systems
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/multi-agent-patterns
@@ -24,7 +24,7 @@ sources:
 
 ## TL;DR
 A multi-agent system splits one task across loops with their own instructions, tools and context.
-Build one only when one agent's context, tools or privileges stop scaling: duplicated
+Build one only when one agent's context, tools or privileges stop scaling, because duplicated
 context, compounding errors and harder tracing mean each split must buy a named gain.
 
 ## For agent builders

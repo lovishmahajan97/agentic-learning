@@ -5,7 +5,7 @@ name: Shared httpx AsyncClient
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/httpx
@@ -27,8 +27,8 @@ client per upstream per worker in the lifespan.
 
 ## For agent builders
 - **Why it matters for agents.** A single agent run makes many outbound calls in sequence: model, tool,
-  model, tool. Each cold connection adds roughly two round trips of setup, so a 10-step loop can spend
-  about a second just shaking hands before any token is generated.
+  model, tool. Each cold connection adds two to three round trips of setup (TCP, TLS 1.3, maybe DNS), so
+  at an illustrative 40 ms round trip a 10-call loop spends about a second just on handshakes.
 - **Where it shows up in your stack.** The OpenAI and Anthropic SDK clients (built on httpx), your own
   tool calls to search, CRM or internal APIs, vector database HTTP clients, and every `StreamingResponse`
   that relays model tokens to the user.
@@ -121,7 +121,8 @@ client per upstream per worker in the lifespan.
 - **With the optional `h2` dependency and `http2=True`,** many concurrent requests multiplex over one
   connection per origin, which reduces socket count.
 - **But measure it:** a single TCP connection can then become the bottleneck, and providers differ in
-  support, so it is not a default.
+  support, so it is not a default. Compare throughput, tail latency and error rates against an HTTP/1.1
+  pool under realistic streaming load before switching.
 
 ## Diagram
 One client lives for the whole worker: the lifespan builds it, every agent step borrows a pooled

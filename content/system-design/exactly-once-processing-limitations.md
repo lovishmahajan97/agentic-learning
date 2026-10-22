@@ -5,7 +5,7 @@ name: Exactly-once processing limitations
 kind: concept
 difficulty: advanced
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - system-design/outbox-inbox-patterns
@@ -24,9 +24,9 @@ sources:
 ---
 
 ## TL;DR
-Your agent's tool calls cannot be delivered exactly once over a lossy network; you can only build
-exactly-once *effects* from at-least-once delivery plus deduplication committed with the effect. Every
-"exactly-once" feature stops there; external APIs and LLM calls are outside.
+Exactly-once *delivery* over a lossy network is impossible; exactly-once *effect* is buildable from
+at-least-once delivery plus deduplication committed with the effect. Every "exactly-once" feature, Kafka
+transactions included, stops there; your agent's external APIs and LLM calls are outside.
 
 ## For agent builders
 - **Why it matters for agents.** Every agent retries: the model call times out, the worker is preempted,
@@ -442,5 +442,7 @@ response round trip plus one write, which is small but not zero.
 - **Steps:** write a stub model that returns random tool arguments; write a fake `send_email` tool that
   records calls and dedupes on an idempotency key; store generated arguments in a `step_results` table
   before acting; inject a crash after each phase in turn; rerun the step after every crash.
-- **Done when:** across all crash points the fake tool records one email per step with the same
-  arguments, and removing the memoisation visibly produces differing duplicate emails.
+- **Done when:** across all crash points the fake tool records one email per step whose arguments match
+  the stored row; turning off the tool's key dedupe produces exactly one duplicate, at the crash between
+  send and mark; and removing the memoisation shows extra model calls on every retry that crashed before
+  the send.

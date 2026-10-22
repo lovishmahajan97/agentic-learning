@@ -5,7 +5,7 @@ name: Conversation / execution identifiers
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agent-reliability/state-persistence-and-conversation-recovery
@@ -140,7 +140,7 @@ idempotency keys.
 ```mermaid
 flowchart TD
     U["User submits turn t_41"] --> P["POST with client-minted turn id"]
-    P -->|"network timeout, client resends"| D{"Run exists for t_41?"}
+    P -->|"first POST or client resend"| D{"Run exists for t_41?"}
     D -->|"yes"| S["Return existing run stream, nothing minted"]
     D -->|"no"| R["Server mints run r_a, attempt 1"]
     R -->|"crash at step 3"| C["Resume r_a from checkpoint"]

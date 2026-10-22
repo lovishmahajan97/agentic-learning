@@ -5,7 +5,8 @@ name: SLAs
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - reliability/slas-slos
   - delivery-ownership/incident-severity-and-escalation
@@ -21,13 +22,26 @@ sources:
 ---
 
 ## TL;DR
-An SLA is a contract, not a dashboard: covered service, exact measurement, exclusions and remedies.
-Delivery owners run service SLAs (availability, latency) and support SLAs (response by severity), and
-commit only to what dependencies and on-call can back.
+An SLA for an agent is a contract: covered service, exact measurement, exclusions and remedies. A
+multi-step agent chains model, tools and retrieval, so commit only to what that chain and on-call can
+back.
+
+## For agent builders
+- **Why it matters for agents.** One agent run makes many model and tool calls in series, so its
+  availability is the product of every dependency on the path, and one slow step blows a latency
+  promise. The SLA you can sign is set by your loop design, not by your model provider's headline.
+- **Where it shows up in your stack.** Model provider quotas and SLAs, tool and vector-store
+  dependencies, per-run step and token caps, fallback model routing, and the attainment query over your
+  agent's request logs.
+- **What you control.** The unit you promise on (a run, not a model call), step and token caps that bound
+  run latency, which tools are on the critical path, fallbacks, and the notice you give before a model or
+  prompt change.
+- **What you can skip.** Contract law and credit negotiation tactics. Know the allowance table, the
+  dependency-ceiling product and why quality stays out of the uptime percentage.
 
 ## Why it exists
 - **The buyer needs a written promise.** An enterprise is about to route a business process through your
-  AI system. Procurement, legal and their operations team need to know what happens when it is down at
+  agent. Procurement, legal and their operations team need to know what happens when it is down at
   2 a.m., how fast someone answers, and what they are owed if it keeps happening.
 - **Unwritten expectations get set anyway.** Without an SLA they come from the best week of the pilot,
   what a salesperson said on a call, or the customer's experience with a hyperscaler. Every outage then
@@ -133,13 +147,28 @@ Two commercial facts shape this:
 - **Throughput**: the SLA applies within contracted rate limits, *because* a 10x burst would otherwise
   turn a provider quota into your breach.
 
+### What agents add
+- **Promise on the run, not the call.** Define a valid request as one agent run (user task in, answer or
+  explicit handoff out), *because* that is what the customer experiences. A run that retries a tool five
+  times and then succeeds is good; one that hits the step cap without an answer is bad.
+- **Calls per run multiply the ceiling.** If every run makes several model calls and tool calls in
+  series, each with its own failure rate, the run's availability is the product, not the model's number.
+  Retries and fallbacks raise it back; measure the run-level number, not the per-call one.
+- **Latency needs a bounded loop.** Run latency is roughly steps × (model time + tool time), so a p95
+  promise needs a step cap, a token cap per call and a wall-clock budget per run, with a graceful
+  "partial answer plus handoff" when the budget runs out.
+- **Agent actions need their own terms.** If the agent writes to customer systems, say what happens on a
+  failed or duplicated action (idempotent tools, reconciliation), *because* an uptime number says nothing
+  about a wrong write.
+
 ## Diagram
-Read it top to bottom: the ceiling bounds the SLO, the SLO bounds the SLA, and every incident flows into
-the monthly attainment and credit decision.
+Read it top to bottom: the agent's dependencies set the ceiling, the ceiling bounds the SLO, the SLO
+bounds the SLA, and every incident (a provider outage, a broken tool, a bad prompt deploy) flows into the
+monthly attainment and credit decision.
 
 ```mermaid
 flowchart TD
-    D["Dependency SLAs"] --> C["Ceiling: own x product of deps"]
+    D["Model, tool, vector store SLAs"] --> C["Ceiling: own x product of deps"]
     C --> S["Internal SLO below ceiling"]
     S --> A["Signed SLA below SLO"]
     I["Incident"] --> E{"Excluded by contract?"}
@@ -223,6 +252,37 @@ The month has 30 days, so 43,200 minutes and an allowance of 216 minutes.
 - **The asymmetry:** your provider bill is $6,000, so even a 10 percent provider credit returns $600
   against the $4,000 you owe.
 
+### Worked scenario: run-level availability of a support agent
+A support agent's typical run makes 4 model calls, 2 tool calls to the customer's ticketing API and 1
+vector-store query, all in series. Per-call success rates are illustrative, taken from a month of logs.
+
+| Path | Per-call success | Calls per run | Run success |
+|---|---|---|---|
+| Model provider | 99.9 percent | 4 | 0.999⁴ ≈ 99.60 percent |
+| Ticketing tool | 99.5 percent | 2 | 0.995² ≈ 99.00 percent |
+| Vector store | 99.95 percent | 1 | 99.95 percent |
+| Whole run, no retries | | 7 | ≈ 98.56 percent |
+| Whole run, one retry per failed call | | | ≈ 99.99 percent (if failures are independent) |
+
+- **The lesson:** the per-call numbers look like "three nines", but without retries one run in about 70
+  fails, far below a 99.5 percent run-level SLA.
+- **Retries are not free:** each retry adds latency, so the step cap and wall-clock budget must leave room
+  for them, and correlated outages (a provider region down) defeat retries entirely; only a fallback model
+  or region helps there.
+
+```python
+def run_success(per_call, calls, retries=0):
+    fail = (1 - per_call) ** (retries + 1)      # assumes independent failures
+    return (1 - fail) ** calls
+
+parts = [(0.999, 4), (0.995, 2), (0.9995, 1)]   # model, ticketing tool, vector store
+for r in (0, 1):
+    total = 1.0
+    for p, n in parts:
+        total *= run_success(p, n, r)
+    print(f"retries={r}: run success {total:.2%}")  # 98.56%, 99.99%
+```
+
 ## Production patterns
 - **Contract-exact SLI query** — when signing any SLA, write the attainment query first and attach its
   definition (measurement point, bad-minute rule, valid-request filter) to the contract. Run the same
@@ -240,6 +300,12 @@ The month has 30 days, so 43,200 minutes and an allowance of 216 minutes.
 - **Tested fallback before raising the number** — when sales asks for a higher tier, first run a
   scheduled failover drill to a secondary provider or region and record the switch time. Monitor
   fallback success rate and the drill's measured switch time against the allowance.
+- **Run-level SLI from agent traces** — emit one record per agent run (run id, outcome, steps, wall-clock
+  time, which dependency failed) and compute attainment over runs, not model calls. Monitor run success
+  rate, step-cap hits and the dependency most often named in failed runs.
+- **Bounded agent loops** — set a step cap, a per-call token cap and a wall-clock budget per run, and
+  return a partial answer with a human handoff when the budget runs out. Monitor run latency p95 against
+  the contracted bound and the share of runs ending in handoff.
 
 ## Trade-offs
 - **Tighter SLA vs cost.** It wins enterprise deals and premium pricing, but each step multiplies the
@@ -256,6 +322,9 @@ The month has 30 days, so 43,200 minutes and an allowance of 216 minutes.
   workaround.
 - **Automatic vs claim-based credits.** Automatic credits build trust and avoid claim disputes, but cost
   money on breaches nobody noticed; claim-based credits are cheaper but make every breach a negotiation.
+- **Retries and fallbacks vs run latency.** Retrying failed tool and model calls lifts run-level
+  availability sharply, but every retry spends latency budget; it flips against retries when the latency
+  bound is tight or failures are correlated, where a fallback model or region is the better spend.
 
 ## Pitfalls
 - **Signing the number sales promised without computing the dependency ceiling.** Symptom: breaching in
@@ -270,13 +339,18 @@ The month has 30 days, so 43,200 minutes and an allowance of 216 minutes.
   partial error rate that your probe calls 100 percent available while the customer's users saw failures.
 - **Changing the model or prompt without the notice the contract requires.** Symptom: a customer
   escalating a "silent regression" that is also a contractual violation.
+- **Measuring the agent per model call.** Symptom: the dashboard shows 99.9 percent while customers see
+  failed runs every day, because one run makes many calls. Fix: compute the SLI per run from traces.
+- **Unbounded agent loops under a latency promise.** Symptom: p95 run latency breached by a few runs that
+  looped 30 steps. Fix: step, token and wall-clock caps with a graceful handoff.
 
 ## When to use
-- **Use when:** any production deployment a customer pays for and depends on, and internal platforms
-  other teams build on.
+- **Use when:** any production agent deployment a customer pays for and depends on, and internal agent
+  platforms other teams build on.
 - **Pilots and proofs of concept:** skip formal credits, but still write down response expectations so
   the pilot does not set an unspoken bar.
-- **Before signing:** compute the dependency ceiling, confirm the on-call staffing behind every support
+- **Before signing:** compute the dependency ceiling per agent run (calls per run times per-call
+  rates), confirm the on-call staffing behind every support
   commitment, and check that the metric can be computed from data both sides can see.
 - **While operating:** track SLA attainment monthly, alert on the stricter internal SLO, and review the
   contract whenever architecture or providers change.
@@ -333,13 +407,21 @@ unbounded. I would also add a model-change notice clause and define latency per 
 - **Offer options:** sign 99.5 percent now, or 99.9 only after a tested cross-region or cross-provider
   fallback raises the provider term.
 
-### How do you handle answer quality and latency for an LLM feature in an SLA?
+### How do you handle answer quality and latency for an LLM agent in an SLA?
 - **Quality** goes into acceptance criteria, recurring eval reports and a regression-remediation
   commitment, not an uptime-style percentage neither side measures the same way.
 - **Latency** is defined as time to first token or per-request latency under a token cap, because output
   length drives total latency.
 - **Model changes** get a notice clause and, where possible, version pinning, so a model swap is not a
   silent contract violation.
+
+### Your agent makes about seven model and tool calls per run. How do you define and defend its availability SLI?
+- **Define the unit as a run:** a valid user task that ends in an answer or an explicit handoff within the
+  wall-clock bound counts as good; errors, step-cap exhaustion and timeouts count as bad.
+- **Compute the ceiling per run:** multiply per-call success rates by calls per run, then show how retries
+  and a fallback model lift it, assuming independent failures and naming the correlated ones.
+- **Defend it with traces:** one record per run with the failing dependency, so exclusions and credits are
+  argued from evidence.
 
 ## Quiz
 ### Q: Why should the internal SLO be stricter than the external SLA?
@@ -365,3 +447,24 @@ unbounded. I would also add a model-change notice clause and define latency per 
 - [ ] Credits from the provider will fully cover the credits you owe
 > Serial dependencies multiply, so any additional failure source pushes you below the provider's number.
 > There is no fixed one-nine rule, and provider credits are usually far smaller than what you owe.
+
+## Use cases & projects
+### Use cases
+- **Enterprise support or operations agents.** The customer routes tickets or back-office tasks through
+  the agent and procurement asks for availability, latency and Sev1 response terms before go-live.
+- **Agent platforms serving internal teams.** Product teams building on your shared agent runtime need a
+  written run-level availability and latency target to plan their own commitments.
+- **Choosing a model provider or fallback.** The dependency-ceiling arithmetic decides whether a second
+  provider or region is required for the tier sales wants to sell.
+- **Model and prompt upgrades.** The model-change notice clause sets how far ahead you announce a swap
+  and whether the customer can pin a version.
+
+### Mini project
+**Run-level SLA report for a toy agent (2-3 hours).**
+- **Goal:** compute a contract-style monthly attainment for an agent from its own run traces.
+- **Steps:** build a small tool-calling agent with two fake tools that fail at configurable rates; run it
+  a few hundred times with and without one retry and with a step cap; log one record per run (outcome,
+  steps, duration, failing dependency); compute run success, p95 run latency, budget used against a 99.5
+  percent allowance and the credit tier from the calculator above.
+- **Done when:** you have a one-page report comparing per-call and per-run availability, showing what
+  retries buy and cost in latency, and naming the SLA number you would sign for this agent.

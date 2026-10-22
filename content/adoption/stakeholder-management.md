@@ -5,7 +5,8 @@ name: Stakeholder management
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - strategy/stakeholder-alignment
   - adoption/exec-communication
@@ -17,23 +18,37 @@ related:
 ---
 
 ## TL;DR
-Stakeholder management means knowing who can help, block or be affected by an AI deployment and engaging
-each on purpose, because AI projects often stall on a late "no" from someone never engaged, not on the
-model.
+Stakeholder management means knowing who can help, block or be affected by your agent and engaging each
+on purpose, because agent projects often stall on a late "no" from security, a data owner or a team lead
+never engaged, not on the model.
+
+## For agent builders
+- **Why it matters for agents.** An agent that reads company data and calls tools that change records
+  triggers more reviews than a chatbot: data access per tool, credentials, vendor risk, audit and rollback.
+  Each reviewer holds a veto and has a queue, and the queue often sets your launch date.
+- **Where it shows up in your stack.** The tool inventory (read vs write, which system, which
+  credentials), the data-flow diagram from user to model to tools, approval gates, audit logs and the kill
+  switch are what reviewers read.
+- **What you control.** Design tools with narrow scopes so reviews are easier, prepare the review package
+  before anyone asks, back-schedule approvals from go-live, and put eval error rates in every sponsor
+  update so expectations stay real.
+- **What you can skip.** Stakeholder theory beyond the power-interest grid and RACI. A register with a
+  weekly staleness check covers most agent projects.
 
 ## Why it exists
-- **AI deployments touch many groups.** The sponsor funds it, a process owner's team uses it, IT runs the
-  integration, security and legal review the data flow, a data owner controls source-system access,
-  procurement handles the contract, and in some regions a works council or union must be consulted when
-  work changes.
+- **Agent deployments touch many groups.** The sponsor funds it, a process owner's team uses it, IT runs
+  the integration, security and legal review the data flow and tool access, a data owner controls
+  source-system access, procurement handles the contract, and in some regions a works council or union must
+  be consulted when work changes.
 - **Each can slow or stop the project, and each defines success differently.** The sponsor wants a
   business metric, users want less tedium and no blame, security wants no new exposure, the data owner
   wants no surprises.
-- **Sending company data to a model triggers reviews** (data classification, residency, vendor risk) that
-  ordinary tools may not, and those reviewers have real veto power.
+- **Sending company data to a model, and letting it act through tools, triggers reviews** (data
+  classification, residency, vendor risk, access control) that ordinary tools may not, and those reviewers
+  have real veto power.
 - **Probabilistic quality needs expectation management.** A sponsor who heard "it works" in the demo will
   treat a 5% error rate as a failure unless someone set that expectation early; expectations drift away
-  from what the system can deliver.
+  from what the agent can deliver.
 - **The naive approaches fail.** Talking mostly to the sponsor and friendly champion optimizes for people
   already on your side, so blockers surface when they block (at the security review or go-live, when
   changes cost most). A weekly email to everyone is noise to most and too shallow for the few who decide.
@@ -42,8 +57,8 @@ model.
 ### 1. Identify everyone, including the quiet vetoes
 - **List people and groups, not departments.** For each, ask: can they approve, block, fund, or are they
   affected?
-- **Probe for the roles AI projects forget:** data owners, security, privacy, legal, compliance, IT
-  operations, team leads of end users, and employee representatives.
+- **Probe for the roles agent projects forget:** data owners for every system a tool touches, security,
+  privacy, legal, compliance, IT operations, team leads of end users, and employee representatives.
 - **Ask each stakeholder "who else should I talk to?"**, *because* informal vetoes are often invisible on
   the org chart.
 
@@ -72,13 +87,14 @@ measure:
 
 - **Most "irrational" resistance becomes predictable** once you see the project from their scorecard.
 - **The fix is usually to change what the project costs them** (a complete review package, a protected
-  target during the pilot, a narrower data scope), not to argue harder about the benefits.
+  target during the pilot, a narrower data scope or a read-only tool), not to argue harder about the
+  benefits.
 
 ### 3. Define decision rights
-- **For each key decision** (scope, data access, go-live, rollback), agree who is responsible,
-  accountable, consulted and informed (RACI).
+- **For each key decision** (scope, data access, tool permissions, go-live, rollback), agree who is
+  responsible, accountable, consulted and informed (RACI).
 - **Why:** it prevents the classic stall where three people each think another one approves the release,
-  *because* an AI go-live usually needs sign-off from several functions.
+  *because* an agent go-live usually needs sign-off from several functions.
 
 ### 4. Sequence by lead time, not by friendliness
 - **Some approvals have long, fixed lead times:** a security or vendor-risk review queue, a data-access
@@ -86,13 +102,13 @@ measure:
 - **Lay them out like a project plan and work backwards from go-live**, *because* the latest-starting
   long-lead review sets the real launch date regardless of how fast the engineering goes.
 - **Worked case:** go-live is in ten weeks and the security queue is running at six, so the review package
-  must be submitted by week four, which means the data-flow design must be stable before then.
+  must be submitted by week four, which means the data-flow design and tool list must be stable before then.
 
 ### 5. Plan engagement per person
 | Who | Engagement |
 |---|---|
 | Manage-closely stakeholders | One-to-ones and early drafts |
-| Security and legal | Architecture and data-flow documentation before they ask |
+| Security and legal | Architecture, data-flow and tool-permission documentation before they ask |
 | Users and team leads | Workshops and pilots |
 | Executives | Short decision-focused updates |
 
@@ -135,9 +151,9 @@ flowchart TD
 
 ## Examples
 ### A stakeholder register with an overdue-attention check
-A minimal stakeholder register, the kind an FDE keeps alongside the project plan, with a check that flags
-where attention is overdue. The rule encodes the grid: high-power people who are not supporters, or whom
-nobody has spoken to recently, need action this week.
+A minimal stakeholder register, the kind an FDE keeps alongside the agent project plan, with a check that
+flags where attention is overdue. The rule encodes the grid: high-power people who are not supporters, or
+whom nobody has spoken to recently, need action this week.
 
 ```python
 from datetime import date
@@ -176,26 +192,60 @@ What the check flags on this data:
 
 | Who | Flag | Action |
 |---|---|---|
-| Marc | Skeptic with a veto, 48 days without contact | Send the data-flow package and book a review |
-| Lena | Neutral data owner, 30 days | Confirm access terms |
-| Tom | Team lead blocking adoption | One-to-one about what he fears, usually blame for AI errors or his team's metrics |
+| Marc | Skeptic with a veto, 48 days without contact | Send the data-flow and tool-permission package and book a review |
+| Lena | Neutral data owner, 30 days | Confirm access terms for the claims-lookup tool |
+| Tom | Team lead blocking adoption | One-to-one about what he fears, usually blame for agent errors or his team's metrics |
 
 The sponsor and the champion need nothing this week.
 
+### Which reviews does the agent's tool list trigger?
+The tool inventory drives the approval plan. This sketch maps each tool to the reviews it triggers and
+back-schedules them from go-live. Lead times are the ones from the scenario below; the tool list is
+illustrative.
+
+```python
+GO_LIVE_WEEK = 10
+LEAD_WEEKS = {"security": 6, "data_access": 3, "works_council": 8}   # 3 and 8 illustrative
+
+tools = [
+    # name, system, writes?, touches personal data?
+    ("search_claims",   "claims DB",  False, True),
+    ("get_policy",      "policy API", False, False),
+    ("update_claim",    "claims DB",  True,  True),
+]
+
+def reviews_for(tool):
+    name, system, writes, personal = tool
+    out = {"security"} if writes or personal else set()
+    if personal:
+        out.add("data_access")
+    return out
+
+needed = set().union(*(reviews_for(t) for t in tools))
+needed.add("works_council")          # the agent changes how adjusters work
+for r in sorted(needed, key=lambda r: GO_LIVE_WEEK - LEAD_WEEKS[r]):
+    print(f"{r:14} submit by week {GO_LIVE_WEEK - LEAD_WEEKS[r]}")
+# works_council  submit by week 2
+# security       submit by week 4
+# data_access    submit by week 7
+# Dropping update_claim (read-only pilot) would not remove security here,
+# but it usually makes that review shorter and the package smaller.
+```
+
 ### Worked scenario: back-scheduling approvals from go-live
-Go-live is in ten weeks. Lay out each long-lead approval and find its latest start; the security figure
-comes from the case above, the others are illustrative.
+Go-live for a claims agent is in ten weeks. Lay out each long-lead approval and find its latest start; the
+security figure comes from the case above, the others are illustrative.
 
 | Approval | Lead time (weeks) | Latest submission week | Prerequisite |
 |---|---|---|---|
-| Security review queue | 6 | 4 | Data-flow design stable |
+| Security review queue | 6 | 4 | Data-flow design and tool list stable |
 | Data-access request | 3 (illustrative) | 7 | Data scope agreed with owner |
 | Works-council consultation | 8 (illustrative) | 2 | Impact on roles written down |
 
 - **The binding constraint is the works council**, not engineering: it must start in week 2, so the
   role-impact statement is due before any build is finished.
-- **Security is next:** the data-flow design must stabilize by week 4, which forces architecture decisions
-  early.
+- **Security is next:** the data-flow design and the agent's tool permissions must stabilize by week 4,
+  which forces architecture decisions early.
 - **Friendliness is irrelevant to the order.** Engaging the friendliest reviewer first would leave the
   project waiting in a queue after the build is done.
 
@@ -204,14 +254,18 @@ comes from the case above, the others are illustrative.
   put every approval on the project plan as a dependency with a latest-start date. Monitor the gap between
   planned and actual submission dates each week.
 - **Review package ready before the ask** — prepare the architecture and data-flow diagram, data
-  classification, storage location and retention, vendor terms, access controls and logging as one bundle.
-  Monitor the number of reviewer follow-up questions and the time from submission to decision.
+  classification, storage location and retention, vendor terms, access controls and logging as one bundle,
+  plus the agent's tool inventory with read or write scope, approval gates and kill switch. Monitor the
+  number of reviewer follow-up questions and the time from submission to decision.
+- **Least-privilege tools as a negotiating lever** — when a reviewer balks, offer a read-only pilot, a
+  narrower data scope or a human approval on every write before arguing benefits. Monitor which tool
+  scopes each review approved, and re-submit only the delta when you widen them.
 - **Register with automated staleness flags** — keep the register in a sheet or tracker and run a weekly
   check like the one above (high power and not a supporter, or no contact past a threshold). Monitor how
   many high-power entries are stale at each weekly review.
-- **RACI in the project charter** — write the RACI for scope, data access, go-live and rollback into the
-  charter the sponsor signs. Monitor decisions that slip past their due date, which usually point at an
-  unclear accountable owner.
+- **RACI in the project charter** — write the RACI for scope, data access, tool permissions, go-live and
+  rollback into the charter the sponsor signs. Monitor decisions that slip past their due date, which
+  usually point at an unclear accountable owner.
 - **Eval-anchored expectations** — include the current eval error rate, the baseline and the mitigation in
   every sponsor update from the first demo onward. Monitor whether the sponsor can restate the expected
   error rate unprompted.
@@ -227,23 +281,27 @@ comes from the case above, the others are illustrative.
   one source of truth that every message draws from.
 - **Open error rates vs alarm.** Sharing the error rate sets realistic expectations but can alarm cautious
   stakeholders unless paired with the mitigation and the baseline.
+- **Broad tool access vs review speed.** Write tools across several systems make a more capable agent but
+  pull in more reviewers and longer queues; start narrow and widen with evidence.
 
 ## Pitfalls
 - **Talking mainly to supporters.** Symptom: a surprise "no" from security or legal at the go-live review.
 - **Leaving decision rights implicit.** Revealed when go-live waits for weeks because nobody knows who
   signs off.
 - **Ignoring team leads of end users.** Shows up as adoption varying sharply between teams with the same
-  tool.
+  agent.
 - **Letting the sponsor's expectations drift from the eval results.** A normal error rate is then read as
   project failure.
 - **Never updating the map after reorganizations.** Discovered when a new executive cancels a project they
   never heard of.
 - **Engaging long-lead reviewers by friendliness rather than lead time.** Revealed when the build is done
   and the project waits weeks in a review queue.
+- **Adding a write tool after security signed off.** Symptom: a second review, or a reviewer who feels
+  misled. Fix: treat any new tool or wider scope as a change that goes back to the reviewer.
 
 ## When to use
-- **Use when** an AI deployment crosses team boundaries, needs data access from another owner, or requires
-  security or compliance review, which covers most enterprise work.
+- **Use when** an agent crosses team boundaries, needs data access from another owner, calls tools in
+  systems you do not own, or requires security or compliance review, which covers most enterprise work.
 - **Timing:** build the map in the first week of scoping and review it weekly through rollout and
   hypercare.
 - **Measure indirectly:** no late vetoes, decisions made on schedule, approvals submitted ahead of each
@@ -261,19 +319,27 @@ comes from the case above, the others are illustrative.
 **A:** Now: treat it as legitimate, not an obstacle. I would meet them immediately with a complete package (architecture and data-flow diagram, data classification, where data is stored and for how long, vendor terms, access controls, logging) and ask for their specific concerns in writing so we can resolve them one by one. I would tell the sponsor honestly that go-live may move. Earlier: security has a veto on any system that sends company data to a model, so they belong in the high-power quadrant from week one, with their review lead time on the plan and the data-flow design reviewed before integration was built. I would also ask what they are accountable for, because a package that answers their specific exposure questions moves faster than one that argues the business value.
 
 ## Interview questions
-### What is a power-interest grid, and what do you add to it for an AI project?
+### What is a power-interest grid, and what do you add to it for an agent project?
 - **Definition:** a two-by-two of power and interest giving four strategies: manage closely, keep
   satisfied, keep informed, monitor; it tells you where finite engagement effort goes.
 - **Add stance with evidence** (supporter, neutral, skeptic, blocker) and what each person is measured on,
   because resistance becomes predictable from their scorecard.
-- **For AI specifically**, probe for data owners, security, privacy and works councils, who hold vetoes
-  but rarely appear in the first list.
+- **For agents specifically**, probe for the data owner of every system a tool touches, security, privacy
+  and works councils, who hold vetoes but rarely appear in the first list.
+
+### What goes in the security review package for an agent that can write to a customer system?
+- **Data flow:** what leaves the company, to which model provider, stored where and for how long, plus
+  vendor terms and data classification.
+- **Tool inventory:** each tool, the system it calls, read or write, the credential it uses and its scope,
+  and which actions need human approval.
+- **Controls:** audit logs of every tool call, rate limits, a kill switch and the rollback path for a
+  wrong write, with eval results on the write actions.
 
 ### A team lead is quietly steering his team away from the pilot. How do you handle it?
-- **One-to-one first**, to learn what he fears: blame for AI errors, or the pilot denting his team's
+- **One-to-one first**, to learn what he fears: blame for agent errors, or the pilot denting his team's
   throughput.
 - **Change what the project costs him:** a protected target during the pilot, a clear rule on who owns
-  AI errors, involvement in the pilot review.
+  agent errors, involvement in the pilot review.
 - **Escalate only with options** if that fails, and tell him before you do.
 
 ### Your go-live date is set by engineering estimates. Why might that be wrong?
@@ -281,13 +347,14 @@ comes from the case above, the others are illustrative.
   not shrink when engineering speeds up.
 - **The latest-starting long-lead review sets the real date.** With a six-week security queue and go-live in
   ten weeks, the package is due in week four.
-- **So** back-schedule approvals first and let them drive when designs must be stable.
+- **So** back-schedule approvals first and let them drive when designs and the tool list must be stable.
 
-### When is a full stakeholder map overkill?
-- **A small internal tool used by one team**, with no new data access and no security or compliance
-  review, needs only a short list of approvers.
-- **It flips back** as soon as the tool crosses team boundaries or sends company data to a model, because
-  those bring vetoes you cannot see from inside the team.
+### Security approved a read-only agent. Product now wants it to update records. How do you handle it?
+- **Treat it as a new review**, not a tweak: send the delta (new tool, scope, credential, approval gate,
+  rollback) to the same reviewer before building it into the release.
+- **Offer staged options:** human approval on every write first, then wider autonomy once eval and
+  override data show it is safe.
+- **Re-plan the date** around that reviewer's queue and tell the sponsor now, not at go-live.
 
 ### How do you escalate a blocker without burning the relationship?
 - **Tell the blocker first**, so the escalation is not a surprise.
@@ -320,3 +387,24 @@ comes from the case above, the others are illustrative.
 - [ ] Send his team additional training materials
 > Blockers usually have a concrete concern. Understanding it allows a real fix; mandating through the
 > sponsor tends to produce compliance theatre, and more training does not address his objection.
+
+## Use cases & projects
+### Use cases
+- **Getting a tool-using agent through security review.** A complete package with the tool inventory and
+  controls, submitted ahead of the queue, avoids the two-weeks-before-launch veto.
+- **Widening an agent from read-only to write actions.** Each new tool scope goes back to the reviewers
+  and data owners, on their lead times.
+- **Agents that change frontline work.** Team leads and employee representatives are stakeholders whose
+  consultation can set the launch date.
+- **Keeping a sponsor through an agent pilot.** Eval-anchored expectations and a second senior supporter
+  protect the project from one bad week or one reorg.
+
+### Mini project
+**A review plan generated from your agent's tool list (1-2 hours).**
+- **Goal:** turn an agent's tool definitions into a stakeholder and approval plan.
+- **Steps:** list the tools of an agent you have built (or a sample of 4-6) with system, read or write,
+  credential and data sensitivity; map each to the reviews and data owners it triggers; assign
+  illustrative lead times and back-schedule from a go-live week; build a five-person register and run the
+  staleness check; draft a one-page review package outline.
+- **Done when:** you have a table of tools to reviewers, a latest-submission week per approval, the
+  register flags for this week, and one change (a narrower tool scope) that shortens the plan.

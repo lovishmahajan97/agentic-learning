@@ -5,7 +5,7 @@ name: GPU infrastructure
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - infra-capacity-economics/gpu-sizing
@@ -243,7 +243,8 @@ for volume, mb_s in [("network volume", 100), ("local NVMe (illustrative)", 3000
 
 ### Worked scenario: one bad node in an agent fleet
 Ten replicas serve the agent's model behind a round-robin load balancer. One node has a GPU throwing XID
-errors, so about 1 in 10 calls fails. Agent runs average 20 model calls.
+errors, so about 1 in 10 calls fails. Treat calls as independent draws (round-robin is close to that when
+many sessions interleave).
 
 | Caller | Calls per unit of work | Chance a unit touches the bad replica |
 |---|---|---|
@@ -253,6 +254,8 @@ errors, so about 1 in 10 calls fails. Agent runs average 20 model calls.
 
 - **Without a per-call retry** that lands on another replica, most long runs fail somewhere mid-loop,
   after spending tokens and tool side effects on earlier steps.
+- **A retry is safe here** because a model call has no side effects; retrying a tool call that writes
+  needs an idempotency key, which is a separate design problem.
 - **With cordon-on-XID**, the bad node leaves the pool and the exposure drops to zero; the retry only has
   to cover the minutes before the health check fires.
 
@@ -267,9 +270,10 @@ errors, so about 1 in 10 calls fails. Agent runs average 20 model calls.
 | Queue grows 20 minutes after scale-up | Procurement | Cloud says "insufficient capacity" | Reservations, quota headroom, fallback region |
 
 ## Production patterns
-- **Fail-fast GPU init container.** Use on every GPU workload behind an agent (LLM, embedder, reranker). Run `nvidia-smi` from an `nvidia/cuda`
-  base image with the same CUDA version as the server, as in the example above. Monitor init-container
-  failure counts per node: a cluster of failures marks a mis-provisioned node pool.
+- **Fail-fast GPU init container.** Use on every GPU workload behind an agent (LLM, embedder,
+  reranker). Run `nvidia-smi` from an `nvidia/cuda` base image with the same CUDA version as the server,
+  as in the example above. Monitor init-container failure counts per node: a cluster of failures marks a
+  mis-provisioned node pool.
 - **Driver first, image second.** Use whenever you bump a base image. Roll the new driver across every GPU
   node pool, verify, then release the image with the newer CUDA runtime. Monitor driver version per node
   (feature discovery labels or the node image version) and block the rollout while versions are mixed.

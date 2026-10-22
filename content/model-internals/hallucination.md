@@ -162,6 +162,7 @@ TOOLS = {   # the live registry: name -> JSON Schema for the arguments
     "refund": {"type": "object", "required": ["order_id", "amount"], "additionalProperties": False,
                "properties": {"order_id": {"type": "string"}, "amount": {"type": "number", "minimum": 0}}},
 }
+SIDE_EFFECTS = {"refund"}   # state-changing tools: IDs must come from a tool result, not the model
 
 def check_call(call, seen_ids):
     """Return an error to reflect back to the model, or None if the call may run."""
@@ -172,8 +173,8 @@ def check_call(call, seen_ids):
         validate(args, TOOLS[name])                          # invented or mistyped arguments
     except ValidationError as e:
         return f"invalid arguments for {name}: {e.message}"
-    if "order_id" in args and args["order_id"] not in seen_ids:   # invented identifier
-        return f"order_id {args['order_id']} never appeared in a tool result; look it up first"
+    if name in SIDE_EFFECTS and args["order_id"] not in seen_ids:   # invented identifier
+        return f"order_id {args['order_id']} never appeared in a tool result; call get_order first"
     return None
 
 seen = {"A1043"}                     # IDs that actually came back from tools in this run
@@ -184,10 +185,12 @@ for call in [{"name": "issue_refund", "arguments": {"order_id": "A1043", "amount
     print(check_call(call, seen))
 # unknown tool 'issue_refund'; available: ['get_order', 'refund']
 # invalid arguments for refund: '20' is not of type 'number'
-# order_id A9999 never appeared in a tool result; look it up first
+# order_id A9999 never appeared in a tool result; call get_order first
 # None
 ```
 
+- **Why only side-effecting tools.** A lookup such as `get_order` must accept IDs the user typed, or the
+  agent could never find a new order; a wrong lookup fails harmlessly, a wrong refund does not.
 - **Reflect, then cap.** Return the error string to the model as the tool result, allow one or two
   retries, then stop or escalate, so a confused model cannot loop forever.
 
@@ -407,8 +410,8 @@ hallucinate" to the prompt and call it done.
 ### Your support agent refunded an order that does not exist. How do you stop this class of error?
 - **Name the type:** a structural or identifier hallucination; the model produced a plausible ID instead of
   one returned by a lookup tool.
-- **Guard mechanically:** validate tool names and arguments against the schema, and reject any ID that did
-  not appear in a tool result this run, returning the error to the model.
+- **Guard mechanically:** validate tool names and arguments against the schema, and reject a refund on any
+  ID that did not come back from a lookup tool this run, returning the error to the model.
 - **Gate the action:** side-effecting tools such as refunds get a verification step or human approval, and
   the eval set gains cases that tempt the agent to guess an ID.
 

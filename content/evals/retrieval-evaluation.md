@@ -5,7 +5,7 @@ name: Retrieval evaluation (recall@k, MRR, NDCG)
 kind: metric
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - rag-retrieval/recall-vs-precision-trade-off
@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-An agent's answer is only as good as what its search or memory tool returns, so score the retriever
-alone: recall@k (did evidence get in?), MRR (first hit how high?), NDCG (graded ranking right?).
-Matching k to the context budget matters most.
+An agent's answer is only as good as what its search tool returns, so score the retriever alone:
+recall@k (evidence in?), MRR (first hit how high?), NDCG (graded ranking right?). Matching k to the
+context budget and honest judgments matter more than formulas.
 
 ## For agent builders
 - **Why it matters for agents.** When a RAG agent answers wrongly, the first question is whether the
@@ -262,7 +262,7 @@ print(f"run-level recall = {recall(seen, relevant):.2f}, "
 | Reading | Action |
 |---|---|
 | d9 never retrieved by any call | the evidence is missing for this run whatever the agent does next: check indexing and whether d9 matches the agent's phrasing |
-| Call 3 repeats call 1 with a year appended | wasted call; 20% of the results the agent read were duplicates |
+| Call 3 restates call 1 with a year appended | it adds no new relevant item; across the run, 3 of the 15 results the agent read (20%) were duplicates |
 | Run-level recall 0.67 | the answer can at best be partly grounded; faithfulness checks will show the gap |
 
 ## Production patterns

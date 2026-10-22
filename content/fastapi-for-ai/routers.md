@@ -5,7 +5,7 @@ name: Routers (APIRouter)
 kind: pattern
 difficulty: intro
 est_minutes: 11
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - fastapi-for-ai/dependency-injection
@@ -138,7 +138,7 @@ Users start runs; the agent loop calls tool endpoints with a service token; oper
 Each group is guarded once at the router level.
 
 ```python
-# app/routers/agents.py, tools.py, admin.py shown together for brevity
+# app/main.py: the agents, tools and admin routers would each live in app/routers/; one file for brevity
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
@@ -427,8 +427,9 @@ separate internal service, so the public stack cannot accidentally inherit body 
 - **Steps:** create `runs`, `tools` and `admin` modules, each with an `APIRouter`; attach them with
   `include_router` using a prefix, a tag and a group dependency (user auth, service token, admin); add a
   test that walks `app.routes` and fails if any route under `/tools` or the admin prefix lacks its guard.
-- **Done when:** `/docs` shows the three tagged groups, requests without the right credential get 401 or
-  403 on every guarded route, and the route-walk test fails when you delete one router-level dependency.
+- **Done when:** `/docs` shows the three tagged groups, a wrong credential gets 401 or 403 on every guarded
+  route (a missing required header gets 422, as in the test above), and the route-walk test fails when you
+  delete one router-level dependency.
 
 ### Major project
 This lesson feeds the module Capstone (see the module guide): the document question-answering service

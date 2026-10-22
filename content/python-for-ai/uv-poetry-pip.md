@@ -5,7 +5,7 @@ name: uv / poetry / pip
 kind: tool
 difficulty: intro
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - python-for-ai/lockfiles-and-dependency-pinning
@@ -34,7 +34,7 @@ machine. uv covers pip, pip-tools, virtualenv, pyenv and pipx, much faster.
 - **Where it shows up in your stack.** `uv add langgraph langchain-openai langsmith` writes ranges to
   `pyproject.toml` and exact versions to `uv.lock`; `uv sync --locked` rebuilds that environment in CI,
   in the agent's Docker image and in eval runners. `uvx` and PEP 723 scripts give code-executing agents a
-  throwaway environment per script.
+  throwaway environment per script: a dependency boundary, not a security sandbox.
 - **What you control.** Which packages are direct dependencies, dependency groups for dev and evals,
   per-package indexes (CUDA `torch` for a self-hosted embedder), the tool version, and when upgrades
   happen: in their own pull request, gated on the eval suite.
@@ -231,7 +231,7 @@ evals = ["langsmith>=0.1", "pandas>=2"]
 |---|---|---|
 | Production image | `uv sync --locked --no-dev` | runtime dependencies only, exact lock versions |
 | CI unit tests | `uv sync --locked` then `uv run pytest` | runtime plus the default `dev` group |
-| Eval runner | `uv sync --locked --group evals` | runtime plus eval tooling, same runtime versions as production |
+| Eval runner | `uv sync --locked --group evals` | runtime plus the default `dev` group and eval tooling (add `--no-dev` to drop dev tools), same runtime versions as production |
 | Agent-generated script | `uv run --with pandas analysis.py` in the sandbox | a throwaway environment, nothing added to the service |
 | Framework upgrade | `uv lock --upgrade-package langgraph` in its own pull request | one package moved, eval suite decides whether it merges |
 

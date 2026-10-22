@@ -5,7 +5,7 @@ name: Judge calibration & bias
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - evals/llm-as-a-judge
@@ -262,8 +262,8 @@ print(bootstrap(judge, human, p_obs=0.82))     # roughly (0.75, 0.85) on this se
 ```
 
 - **Why 100 human-fail items:** with only 20, the standard error of TNR grows by about √5 ≈ 2.2×
-  (it scales with 1/√n), and the corrected interval widens with it. The 0.05 floor on TPR + TNR − 1 is an illustrative guard, not a
-  standard.
+  (it scales with 1/√n), and the corrected interval widens with it.
+- **The 0.05 floor** on TPR + TNR − 1 is an illustrative guard, not a standard.
 
 ### Agent scenario: a "ticket resolved" judge that read only the final reply
 A support agent calls `lookup_order`, `issue_refund` and `send_email` tools. The team calibrates a
@@ -365,8 +365,9 @@ def judge_view(trace, include_tools=True):
 
 ## When to use
 - **Use when a judge gates a decision:** agent prompt or tool releases, model swaps, fine-tune
-  selection, vendor comparisons, and any critic step inside the agent loop. Calibrate once per combination of judge model, judge prompt and task, and again whenever
-  any of the three changes.
+  selection, vendor comparisons, and any critic step inside the agent loop.
+- **Calibrate once per combination** of judge model, judge prompt and task, and again whenever any of
+  the three changes (for an agent, a new tool counts as a task change).
 - **Measure three numbers:** position inconsistency rate, agreement with humans next to human–human
   agreement (split into TPR and TNR for pass/fail judges), and the judge's length preference relative to
   humans.

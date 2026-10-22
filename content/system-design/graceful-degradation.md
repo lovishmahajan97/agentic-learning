@@ -5,7 +5,7 @@ name: Graceful degradation
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - system-design/model-fallback-strategies
@@ -61,7 +61,7 @@ change the provider; degradation changes the function.
 | Level | What the user gets | Typical contents |
 |---|---|---|
 | **0, full** | The best answer | Strong model, tools, reranking, a verifier |
-| **1, reduced** | Visibly still an answer; cheaper and faster | Smaller model, fewer retrieved passages, no reranker, lower `max_tokens`, agent loops capped at one step |
+| **1, reduced** | Visibly still an answer; cheaper and faster | Smaller model, fewer retrieved passages, no reranker, lower `max_tokens`, agent loops capped at fewer steps (as few as one step) |
 | **2, cached or precomputed** | A known-good answer | Cached answer to a similar question, precomputed summary, FAQ entry, scoped to the same tenant |
 | **3, non-AI** | The product as it was before the feature | Keyword search results, a template, the raw documents, a form |
 | **4, honest unavailability** | A way to proceed | A clear message, the rest of the product working, a human handoff, a link, try later |

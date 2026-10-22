@@ -5,7 +5,7 @@ name: Metadata filtering
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - rag-retrieval/ann-indexes
@@ -354,7 +354,8 @@ or filtered traversal step 1 returns 10 correct hits, and the run ends in two ca
 - **Dates stored as strings in mixed formats.** Range predicates compare lexically; "newest document"
   queries return old content or nothing for certain date windows. Fix: integer timestamps.
 - **Re-embedding to change metadata.** A status or ACL change is a payload update and should cost
-  milliseconds, not an embedding job.
+  milliseconds, not an embedding job. Re-embedding burns budget, delays the change (bad for an ACL
+  revoke) and can introduce version skew if the embedding model has moved on.
 - **Accepting `tenant_id` or ACL values from the client or the model.** Symptom: cross-tenant leakage the
   moment someone edits a request body or a prompt injection sets a tool argument. Fix: derive them from
   identity.

@@ -5,7 +5,7 @@ name: Caching strategy & cache invalidation
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - serving-inference/caching
@@ -175,16 +175,18 @@ The last two terms are what people forget.
 
 ## Diagram
 The request path through the response caches, cheapest check first, and the two invalidation routes:
-versions in the key make old entries unreachable, while document events purge through the reverse index.
+versions in the key (model, prompt, index and embedding versions plus tenant) make old entries
+unreachable, while document events purge through the reverse index; the model call uses a static-first
+prompt so the provider or engine reuses the prefix.
 
 ```mermaid
 flowchart TD
-    Q["Request: tenant, model, params, messages"] --> K["Build key with model, prompt, index and embed versions plus tenant"]
-    K --> E{"Exact hit with current doc versions?"}
+    Q["Request with tenant and params"] --> K["Build versioned, tenant-scoped key"]
+    K --> E{"Exact hit, doc versions current?"}
     E -->|"yes"| R1["Return cached answer"]
-    E -->|"no"| S{"Semantic hit above threshold, same scope?"}
+    E -->|"no"| S{"Semantic hit, same scope?"}
     S -->|"yes, borderline verified"| R2["Return cached answer, labelled"]
-    S -->|"no"| L["Single-flight lock, call model with static-first prompt"]
+    S -->|"no"| L["Single-flight lock, call model"]
     L -->|"prefix reuse in provider or engine"| M["Model response"]
     M --> C{"Complete, not refused?"}
     C -->|"yes"| W[("Store answer, doc versions, reverse index")]
@@ -364,8 +366,9 @@ for threshold, hit, false_hit in ((0.97, 0.30, 0.003), (0.92, 0.45, 0.012)):
   byte-identical across requests and steps. Monitor the engine's prefix-cache hit rate and time to first
   token.
 - **TTL-tagged read-only tool cache.** Declare per tool whether it is read-only and how volatile its data
-  is, cache only reads, and include tool version and tenant in the key. Monitor tool-cache hit rate, the
-  age of served results and any incident traced to a stale tool result.
+  is (seconds for prices, hours for catalogue data), cache only reads, include tool version and tenant in
+  the key, and jitter TTLs (for example up to 10% of the TTL) so popular keys do not expire together.
+  Monitor hit rate, the age of served results, and latency or cost spikes at TTL multiples.
 - **Version bump plus warm-up replay.** Put every dependency version in the key, and after a deploy replay
   the most frequent recent queries against the new version before shifting traffic. Monitor hit rate in
   the first hour after deploy and p95 latency during the cold window.
@@ -374,8 +377,7 @@ for threshold, hit, false_hit in ((0.97, 0.30, 0.003), (0.92, 0.45, 0.012)):
   purge counts per erasure request and any hit whose source document no longer exists.
 - **Sampled false-hit audit.** Send a small share of semantic hits (say 1%) to a judge or reviewer that
   asks whether the cached answer addresses the new query. Monitor false-hit rate per threshold and per
-  feature, and tighten the threshold when it rises. Jitter TTLs (for example up to 10% of the TTL) so
-  popular keys do not expire together.
+  feature, and tighten the threshold when it rises.
 
 ## Trade-offs
 - **Hit rate vs false hits.** Looser keys and lower similarity thresholds raise both together; the right

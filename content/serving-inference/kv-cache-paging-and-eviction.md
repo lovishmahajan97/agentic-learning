@@ -5,7 +5,7 @@ name: KV-cache paging & eviction
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - serving-inference/pagedattention
@@ -22,17 +22,18 @@ sources:
 ---
 
 ## TL;DR
-Paging stores each agent step's KV cache in fixed-size blocks behind a block table, so transcripts grow
-without fragmenting the pool. Eviction handles overflow: preempt sequences, drop cached prefixes (an idle
-agent's transcript), or lossily drop tokens.
+Paging stores KV cache in fixed-size blocks behind a block table, like OS virtual memory, so agent
+transcripts grow without reserving their maximum or fragmenting the pool. Eviction handles overflow:
+preempt sequences, drop cached prefixes (an idle agent's transcript), or lossily drop tokens.
 
 ## For agent builders
 - **Why it matters for agents.** While your agent waits on a tool, its transcript's blocks are
-  unreferenced cached prefix, first in line for LRU eviction. Under load, a slow tool means the next step
-  re-prefills the whole transcript; an oversubscribed pool also preempts steps mid-generation.
+  unreferenced cached prefix, eligible for LRU eviction and closer to the front of the queue the longer
+  the tool runs. Under load, a slow tool means the next step re-prefills much of the transcript; an
+  oversubscribed pool also preempts steps mid-generation.
 - **Where it shows up in your stack.** Self-hosted engines: vLLM's preemption counter and block metrics,
   SGLang's radix cache, host-memory prefix tiers (SGLang's hierarchical cache, LMCache with vLLM). Hosted
-  APIs hide it, but cache-hit fields in usage reveal evictions.
+  APIs hide it, but cached-token fields in usage reveal misses.
 - **What you control.** Admission limits (`max_num_seqs`, `max_model_len`), whether long-lived agent
   prefixes get a host-memory tier, routing steps back to the same replica, and keeping in-sequence token
   eviction off unless an agent eval approves it.
@@ -428,8 +429,9 @@ there is slack. Measure preemptions per minute after each change and stop when i
 ### Mini project
 **Watch a transcript get evicted during a tool wait (2-3 hours).**
 - **Goal:** reproduce the slow-tool eviction effect and show one fix.
-- **Steps:** serve a small model with vLLM and prefix caching on; run one agent whose tool sleeps 30 s while
-  a load generator fills the cache pool with unrelated long prompts; record cached tokens and TTFT on the
-  step after the tool; repeat with lower background load or more pool headroom.
+- **Steps:** serve a small model with vLLM and prefix caching on, shrinking the pool (a low
+  `--gpu-memory-utilization`) so it fills quickly; run one agent whose tool sleeps 30 s while a load
+  generator sends unrelated long prompts; record cached tokens (usage details or the engine's prefix-cache
+  metrics) and TTFT on the step after the tool; repeat with lower background load or more pool headroom.
 - **Done when:** you have both runs' post-tool TTFT and cached-token counts, plus the preemption and
   prefix-hit metrics from `/metrics` that explain the difference.

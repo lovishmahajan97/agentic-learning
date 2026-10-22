@@ -5,7 +5,7 @@ name: Model selection
 kind: decision
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - evals/model-evaluation
@@ -385,8 +385,9 @@ land in the costly category.
   budget, then pin the version and keep a second source.
 
 ### How does choosing a model for a multi-step agent differ from choosing one for a single call?
-- **Errors compound.** At 0.95 per-step tool accuracy, a 10-step run succeeds about 60% of the time
-  versus about 85% for 0.98 over 8 steps, so you score whole runs, not turns.
+- **Errors compound.** A cheap model at 0.95 per-step tool accuracy that needs 10 steps succeeds about
+  60% of the time, versus about 85% for a strong model at 0.98 over 8 steps, so you score whole runs,
+  not turns.
 - **Cost and latency are per run.** Weaker models often take more steps, and each step re-sends the
   transcript, so measure steps per run and summed tokens from the eval traces.
 - **Roles can differ.** A strong planner with a cheaper model for routine tool steps is often the

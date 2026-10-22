@@ -5,7 +5,7 @@ name: Tokens per second
 kind: metric
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - serving-inference/tpot
@@ -132,8 +132,9 @@ Cost per million output tokens on self-hosted hardware is
 ### Agent traffic changes the shape
 - **Short outputs, long prompts.** Tool-call steps emit tens of tokens over prompts of thousands, so the
   short-answer row of the Little's law table is the agent's normal case.
-- **Input tokens/s is the binding number.** Each step re-sends the transcript, so input volume can be
-  tens of times output volume; track it separately or the GPU looks idle while prefill is saturated.
+- **Uncached input tokens/s is often the binding number.** Each step re-sends the transcript, so input
+  volume can be tens of times output volume; track it separately (net of prefix-cache hits) or output
+  tokens/s looks low while prefill is saturated.
 - **The unit is the task.** Users and budgets care about seconds and dollars per completed agent run,
   which is tokens per step × steps, divided by the rates above.
 
@@ -253,6 +254,12 @@ print(f"replica gives {agg:,.0f} out tok/s -> {math.ceil(need_out / agg)} replic
 | Is output capacity enough? | Yes, about 1,250 of ~2,272 tok/s | Output tokens/s says "one replica" |
 | What else is needed? | ~66,667 input tok/s, 53× the output | Measure prefill load before trusting that |
 | Cheapest lever | Prefix caching, so each step prefills only its new tokens | Cuts the input term, not the output one |
+
+- **Why the input term matters.** For an 8B model, the TTFT lesson's illustrative prefill rule (about
+  4.5e14 effective FLOP/s, `2 × N` FLOPs per token) gives roughly 28,000 prefill tokens/s per GPU, so
+  66,667 uncached input tok/s is over two GPUs of prefill alone.
+- **With prefix caching** most of each step's 8k tokens are already cached, and the uncached input rate
+  can fall several-fold.
 
 ## Production patterns
 - **Report cost and time per agent run.** Sum input and output tokens per run from usage fields and

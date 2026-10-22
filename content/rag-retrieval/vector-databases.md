@@ -5,7 +5,7 @@ name: Vector databases (pgvector, Qdrant, Pinecone, Weaviate, Milvus, Chroma)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - rag-retrieval/ann-indexes
@@ -215,6 +215,9 @@ import uuid
 from qdrant_client import QdrantClient, models
 
 client = QdrantClient(url="http://localhost:6333")
+if not client.collection_exists("memories"):
+    client.create_collection("memories", vectors_config=models.VectorParams(
+        size=1536, distance=models.Distance.COSINE))           # size = your embedder's dimension
 client.create_payload_index("memories", field_name="user_id",
                             field_schema=models.PayloadSchemaType.KEYWORD)
 
@@ -469,6 +472,7 @@ when hybrid sparse-dense search and quantization become requirements.
 - **Goal:** build `remember` and `recall` tools on a real vector store and measure filtered recall.
 - **Steps:** create a collection with user id, timestamp and model name as metadata, plus a filter index on
   user id; load notes for 50 users; expose `remember(text)` and `recall(query)` tools to a small agent; test
-  save-then-recall in one task and measure recall and latency at two `ef_search` values.
+  save-then-recall in one task and measure recall and latency at two search-width values (pgvector
+  `hnsw.ef_search`, or `hnsw_ef` in Qdrant's `SearchParams`).
 - **Done when:** recall never returns another user's notes, a fact saved in one step is found in the next,
   and a table shows recall and p95 latency per `ef_search` setting.

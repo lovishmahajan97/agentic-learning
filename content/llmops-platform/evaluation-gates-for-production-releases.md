@@ -5,7 +5,8 @@ name: Evaluation gates for production releases
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - llmops-platform/ci-cd-for-prompts-and-models
   - llmops-platform/canary-shadow-deployments
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-An evaluation gate is an automated policy that passes, blocks or flags a candidate bundle for review
-using absolute floors, a paired non-inferiority test against the champion, per-slice floors and cost and
-latency budgets, with every override recorded.
+An evaluation gate is an automated policy that passes, blocks or flags a candidate agent bundle for
+review using absolute floors (including forbidden actions), a paired non-inferiority test against the
+champion, per-slice floors and cost, step and latency budgets, with overrides recorded.
+
+## For agent builders
+- **Why it matters for agents.** An agent that acts (refunds, emails, edits records) can do harm a chatbot
+  cannot, and its failures are rare and sampled. The gate is where "never issues an unauthorised refund"
+  becomes an enforced floor rather than a hope.
+- **Where it shows up in your stack.** A gate step in CI after the agent eval, a versioned policy file
+  next to the agent's code, the registry promotion that reads the verdict, and the canary after it.
+- **What you control.** Which agent metrics are floors (forbidden actions, injection resistance, schema
+  validity), the non-inferiority margin on task success, budgets on steps, tokens and cost per task, and
+  how many repeats safety items get.
+- **What you can skip.** Deriving bootstrap theory. Know that the test is paired, that you read the lower
+  bound against −δ, and that inconclusive means review.
 
 ## Why it exists
 - **Without a gate, release testing is "someone looked" or "the aggregate went up".** Both reach users. The
@@ -45,22 +58,24 @@ latency budgets, with every override recorded.
 ## How it works
 ### Four kinds of criteria
 1. **Absolute floors.** The safety and adversarial set at or near 100% pass, schema validity above a
-   threshold, zero PII leakage, the regression set at 100%.
+   threshold, zero PII leakage, the regression set at 100%. For agents, add zero forbidden tool actions
+   and resistance to instructions planted in tool results.
    - Not relative to the champion *because* "no worse than before" is not acceptable for a safety property:
      a flawed champion must not license a flawed candidate.
    - Checked over repeats: run each safety item *k* times and require every repeat to pass, *because* an
      answer that is unsafe one time in ten is unsafe for the user who draws it, and a single run would let
      it through nine times out of ten.
-2. **Non-inferiority against the champion.** The candidate's primary metric must not be worse than the
-   champion's by more than a margin δ, with confidence, on the same dataset and scorer version, paired by
-   item.
+2. **Non-inferiority against the champion.** The candidate's primary metric (task success for an agent)
+   must not be worse than the champion's by more than a margin δ, with confidence, on the same dataset and
+   scorer version, paired by item.
    - δ is set per metric from product risk (one or two points on a pass rate is a common illustrative
      choice) and can never be tighter than the measured noise floor.
 3. **Per-slice floors.** The same test per slice with a wider margin (smaller n), or an absolute minimum per
    slice, *because* the aggregate is a traffic-weighted average that hides rare, high-value cases.
 4. **Operational budgets.** p95 latency, cost per request and output tokens measured in the same run,
    *because* a prompt that scores two points higher at three times the tokens is a cost regression the
-   quality metric cannot see.
+   quality metric cannot see. For agents, also mean steps per task and the share of runs that hit the step
+   budget, since extra loops cost both money and latency.
 
 ### The statistics of the relative gate
 1. **Pair by item.** For each item *i*, *dᵢ* = candidate score − champion score. Item difficulty is the
@@ -110,7 +125,7 @@ Depth follows blast radius, the ladder from the CI/CD lesson.
 |---|---|---|
 | **PR** | smoke set | hard floors on a small safety subset block; everything else warns |
 | **Merge and nightly** | full set | all four criteria |
-| **Release candidate** | full set plus sealed holdout, repeats to establish the noise floor | all four, plus human sign-off for high-risk applications |
+| **Release candidate** | full set plus sealed holdout, repeats to establish the noise floor | all four, plus human sign-off for high-risk applications (agents with irreversible actions usually qualify) |
 | **Canary** | online metrics against the champion's live traffic | automatic rollback trigger, *because* offline evals cannot see distribution shift in real traffic |
 | **Full rollout** | — | only after the canary window closes clean |
 
@@ -124,18 +139,18 @@ Depth follows blast radius, the ladder from the CI/CD lesson.
   a scorer is flaky. Recalibrate the gate rather than keep overriding it.
 
 ## Diagram
-Floors short-circuit to block; the paired interval decides pass, block or review per slice; budgets can
-still block; and the canary is the last gate.
+Floors short-circuit to block; the paired interval decides pass, block or review per slice; step, cost and
+latency budgets can still block; and the canary is the last gate.
 
 ```mermaid
 flowchart TD
-    C["Candidate and champion re-run on same items"] --> F{"Absolute floors met over k repeats?"}
+    C["Candidate and champion agents on same tasks"] --> F{"Floors met over k repeats?"}
     F -->|"no"| B["Block"]
     F -->|"yes"| P["Paired bootstrap CI per slice"]
     P --> D{"Where is the interval vs minus delta?"}
     D -->|"upper below"| B
     D -->|"spans"| R["Needs review: bigger run or human"]
-    D -->|"lower above"| O{"Latency and cost budgets ok?"}
+    D -->|"lower above"| O{"Step, cost, latency budgets ok?"}
     O -->|"no"| B
     O -->|"yes"| K["Canary vs champion live traffic"]
     K -->|"online regress"| RB["Auto rollback"]
@@ -220,6 +235,45 @@ for k, v in verdicts.items():
 | Refunds **review** | interval [−15, +5] spans −δ = −4 | add refund items or repeats, or a human reads the 4 flipped items |
 | Overall **review** | any review without a block | the release waits on the slice, not on a re-run until green |
 
+### Feeding agent trajectories into the gate
+Continues the gate above. Agent runs are reduced to the gate's inputs: forbidden actions and injection
+resistance become floors computed over *k* repeats, task success becomes the paired score, and steps and
+cost become budgets. `runs[task_id]` holds one record per repeat from your agent eval.
+
+```python
+def agent_gate_inputs(runs: dict, safety_ids: set, k: int):
+    safe_tasks = [t for t in safety_ids if all(r["forbidden_actions"] == 0 and r["followed_injection"] is False
+                                               for r in runs[t][:k])]        # every repeat must pass
+    ids = sorted(runs)
+    success = [statistics.mean(r["success"] for r in runs[t]) for t in ids]  # repeats averaged per task
+    all_runs = [r for t in ids for r in runs[t]]
+    return {"floors": {"safety": len(safe_tasks) / len(safety_ids),
+                       "schema_valid": statistics.mean(r["valid_tool_args"] for r in all_runs),
+                       "regression": 1.0},                                    # computed the same way in practice
+            "scores": {"all": success},
+            "ops": {"p95_latency_ms": sorted(r["latency_ms"] for r in all_runs)[int(0.95 * len(all_runs))],
+                    "cost_per_request": statistics.mean(r["cost_usd"] for r in all_runs),
+                    "mean_steps": statistics.mean(r["steps"] for r in all_runs)}}
+
+agent_policy = {**policy, "margins": {"all": 0.02},
+                "budgets": {**policy["budgets"], "cost_per_request": 0.06}}
+# gate(agent_gate_inputs(cand_runs, SAFETY, k=5), agent_gate_inputs(champ_runs, SAFETY, k=5), agent_policy)
+# Add "mean_steps" to the budget loop in gate() to block a release that loops more than the champion.
+```
+
+### Worked scenario: an agent release that improved success and still blocked
+A refund agent, 300 tasks plus 50 safety tasks run 5 times each. Illustrative numbers.
+
+| Check | Champion | Candidate | Verdict |
+|---|---|---|---|
+| Forbidden refunds over 250 safety runs | 0 | 1 (one repeat of one task) | **block**: the floor is absolute |
+| Task success, paired 95% CI on the delta | | +2.3 [+0.4, +4.2] | pass, and an improvement is claimable |
+| Mean steps per task | 5.8 | 6.1 | within budget |
+| Cost per task | $0.044 | $0.047 | within budget |
+
+The candidate is better on average and still cannot ship, because one in 250 safety runs issued a refund
+it must never issue. A single run per safety task would have had a good chance of missing it.
+
 ## Production patterns
 - **Gate policy as reviewed config** — for every application with a gate. Keep floors, margins and budgets
   in a versioned file in the repository (like the `policy` dict above) and require an owner's review on
@@ -227,9 +281,12 @@ for k, v in verdicts.items():
 - **Champion re-run in the same job** — whenever the gate compares. Run champion and candidate side by side
   on the same dataset version, scorer version and infrastructure, rather than reading a stored score.
   Monitor how often the champion's fresh score drifts from its stored one; that drift is your sentinel.
-- **Safety floors over repeats** — at production temperature. Run each safety and injection item *k* times
-  and require every repeat to pass before release. Monitor the per-item failure count across repeats, not
-  just the pass rate.
+- **Safety floors over repeats** — at production temperature. Run each safety, injection and
+  forbidden-action item *k* times and require every repeat to pass before release. Monitor the per-item
+  failure count across repeats, not just the pass rate.
+- **Step and cost budgets for agents** — whenever a release can change how the agent loops. Gate on mean
+  steps, step-budget hit rate and cost per task measured in the same run as success. Monitor the gap
+  between offline and canary cost per task.
 - **Overrides with expiry in the registry** — when the business must ship past a review verdict. Record
   approver, reason and expiry next to the promotion, and re-gate when the override expires. Monitor override
   rate and the "gate was right" rate.
@@ -248,6 +305,8 @@ for k, v in verdicts.items():
 - **Slice coverage vs false alarms.** Per-slice gates catch hidden regressions, and every added slice adds a
   chance of a false alarm. Past a handful of slices, make slice verdicts review-only or correct for multiple
   comparisons.
+- **Repeats for safety vs eval cost.** Five repeats on every safety task multiply the most expensive part of
+  an agent eval by five; it is worth it for irreversible actions and can be relaxed for read-only agents.
 - **Cost-aware releases vs infrastructure variance.** Gating on cost and latency prevents expensive
   "improvements" but ties quality releases to infrastructure variance; measure both bundles in the same run
   on the same infrastructure.
@@ -266,9 +325,11 @@ for k, v in verdicts.items():
   the gate had blocked.
 - **Gating only on the smoke set.** Symptom: the nightly full run discovers what the PR gate missed, after
   the merge.
+- **Gating an agent on success without step or cost budgets.** Symptom: a release that passes and the
+  monthly bill rises because the agent now loops through extra tool calls.
 
 ## When to use
-- **Use wherever** a change to code, prompt, model, parameters or index can reach users.
+- **Use wherever** a change to code, prompt, tool schema, model, parameters or index can reach users.
 - **Start small:** hard floors plus one paired non-inferiority test on the primary metric; add slices as
   error analysis reveals them, and configure block versus warn per stage.
 - **Measure the gate:** pass, block and review rates, override rate, time to verdict, the "gate caught it"
@@ -308,6 +369,14 @@ should say "no regression" until then.
   rule flakes and teaches people to re-run until green.
 - **Improvements are claimed separately,** only when the interval's lower bound is above zero.
 
+### What would you put in the release gate for an agent that can issue refunds?
+- **Absolute floors over repeats:** zero forbidden refunds and zero followed injections across *k* repeats
+  of every safety task, plus tool-argument validity and the regression set at 100%.
+- **Relative test:** paired non-inferiority on task success against the re-run champion, with a refunds
+  slice that has its own margin.
+- **Budgets:** mean steps, step-budget hits and cost per task, then a canary and human sign-off because the
+  action is irreversible.
+
 ### Why is the comparison paired, and how much does it help?
 - **Item difficulty cancels** in the per-item difference, and it is the largest source of variance.
 - **The interval width then depends on the discordant fraction:** for pass/fail scores the variance of the
@@ -320,9 +389,9 @@ should say "no regression" until then.
   version.
 - **Fix:** measure the floor with repeats, set δ above it, and always re-run the champion in the same job.
 
-### Which criteria must be absolute rather than relative, and how do you check them with sampled outputs?
-- **Absolute:** safety and adversarial pass rate, PII leakage, schema validity, the regression set, because
-  a flawed champion must not license a flawed candidate.
+### Which criteria must be absolute rather than relative, and how do you check them on a sampled agent?
+- **Absolute:** safety and adversarial pass rate, PII leakage, schema validity, the regression set and
+  forbidden agent actions, because a flawed champion must not license a flawed candidate.
 - **Check over repeats:** run each safety item *k* times and require every repeat to pass; a single run lets a
   one-in-ten unsafe answer through most of the time.
 - **Floors short-circuit** the gate to block before any relative test runs.
@@ -361,3 +430,24 @@ should say "no regression" until then.
 > "No worse than the champion" is the wrong standard for a safety property, since a flawed champion would
 > license a flawed candidate. Helpfulness is legitimately relative, and latency belongs to the operational
 > budget rather than to a safety floor.
+
+## Use cases & projects
+### Use cases
+- **Releasing an agent that takes actions.** Forbidden-action floors over repeats keep a refund or
+  email agent from shipping a rare unsafe behaviour.
+- **Model upgrades for an agent fleet.** The paired test on task success against the re-run champion
+  decides pass, block or review instead of a hunch.
+- **Controlling agent cost.** Step and cost-per-task budgets block a release that wins a point by looping
+  twice as much.
+- **Customer go-live.** An FDE turns the customer's acceptance criteria into floors and margins, so go-live
+  is a recorded verdict.
+
+### Mini project
+**A release gate for a tool-calling agent (2-3 hours).**
+- **Goal:** a CI step that returns pass, block or review for an agent candidate against its champion.
+- **Steps:** take an agent eval that produces per-task records over 5 repeats; write a policy file with a
+  forbidden-action floor, a 2-point success margin and cost and step budgets; reduce runs with
+  `agent_gate_inputs`; run `gate`; seed one candidate with a rare forbidden action and another with extra
+  loops.
+- **Done when:** the forbidden-action candidate blocks on the floor, the looping candidate blocks on a
+  budget, an unchanged bundle passes against itself, and every verdict prints its interval.

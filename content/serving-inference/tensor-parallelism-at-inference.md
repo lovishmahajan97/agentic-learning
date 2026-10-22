@@ -5,7 +5,7 @@ name: Tensor parallelism at inference
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - training-adaptation/distributed-training
@@ -286,7 +286,8 @@ prefill and tool time are extra. Illustrative, not a benchmark.
 
 ## Pitfalls
 - **TP across PCIe-only GPUs or across nodes.** Decode can end up slower than a single GPU with a
-  quantized model. Symptom: tokens/s barely improves or regresses as TP grows.
+  quantized model. Symptom: tokens/s barely improves or regresses as TP grows. Fix: keep each TP group
+  inside one NVLink node and scale with replicas or pipeline parallelism beyond it.
 - **A TP degree that does not divide the KV head count.** It forces KV replication. Symptom: less cache
   capacity than the per-GPU arithmetic predicted.
 - **Assuming TP = 2 doubles throughput.** Throughput per GPU usually drops relative to two replicas,
@@ -416,8 +417,9 @@ first principles alone.
 **Compare TP degree against replicas for an agent run (2-3 hours, needs a multi-GPU node).**
 - **Goal:** measure how tensor parallelism changes end-to-end agent run time versus how replicas change
   runs per minute.
-- **Steps:** serve one model with `--tensor-parallel-size` 1 and 2 (or 2 and 4); run the same 10-step
-  scripted agent loop against each and record TPOT and total run time; then run 8 agents concurrently
-  against each setup; check the GPU topology with `nvidia-smi topo -m` before you start.
+- **Steps:** check the GPU topology with `nvidia-smi topo -m` first; on two GPUs, serve a model that fits
+  one GPU as one `--tensor-parallel-size 2` instance, then as two TP = 1 replicas behind a round-robin
+  client; run the same 10-step scripted agent loop once against each setup and record TPOT and total run
+  time; then run 8 agents concurrently against each setup and record runs per minute.
 - **Done when:** you have a table of TPOT, single-run time and runs per minute per setup, and a one-line
   recommendation for an interactive agent versus a batch agent workload.

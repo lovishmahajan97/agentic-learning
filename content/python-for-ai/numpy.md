@@ -165,7 +165,7 @@ tool_vecs /= np.linalg.norm(tool_vecs, axis=1, keepdims=True)    # (200, 768) / 
 
 def route(query_vec: np.ndarray, k: int = 5) -> list[tuple[str, float]]:
     q = np.asarray(query_vec, dtype=np.float32)
-    q /= np.linalg.norm(q)
+    q = q / np.linalg.norm(q)          # new array: never mutate the caller's vector
     scores = tool_vecs @ q                                     # (200,)
     top = np.argpartition(-scores, k)[:k]
     top = top[np.argsort(-scores[top])]
@@ -214,10 +214,30 @@ print(np.shares_memory(head, docs), np.shares_memory(picked, docs))  # True Fals
 - **Scale limit.** Past a few million vectors, exact search like this is replaced by an approximate index.
 
 ### Worked scenario: batched exact search as the recall baseline for an agent's retriever
-`Q @ D.T` for many eval queries materialises a huge block. A `batched_topk(Q, D, k=10, batch=1_000)`
-helper loops over query slices, computes `Q[s:s + batch] @ D.T`, keeps `argpartition` top-k per row with
-`np.take_along_axis`, and discards the block. Its output is ground truth to compare with the vector
+`Q @ D.T` for many eval queries materialises a huge block. Processing queries in batches bounds the
+temporary, keeping only k results per row; the output is ground truth to compare with the vector
 database's answers.
+
+```python
+import numpy as np
+
+def batched_topk(Q, D, k=10, batch=1_000):
+    """Q (m, d) and D (n, d), both L2-normalized float32. Returns (m, k) indices and scores."""
+    idx = np.empty((len(Q), k), dtype=np.int64)
+    val = np.empty((len(Q), k), dtype=np.float32)
+    for s in range(0, len(Q), batch):
+        S = Q[s:s + batch] @ D.T                        # (b, n) block of scores
+        part = np.argpartition(-S, k, axis=1)[:, :k]     # (b, k), unordered
+        top = np.take_along_axis(S, part, axis=1)
+        order = np.argsort(-top, axis=1)                 # sort only k per row
+        idx[s:s + batch] = np.take_along_axis(part, order, axis=1)
+        val[s:s + batch] = np.take_along_axis(top, order, axis=1)
+    return idx, val
+
+def recall_at_k(exact_ids, db_ids):
+    """Share of the exact top-k that the vector database also returned, per query, averaged."""
+    return np.mean([len(set(e) & set(r)) / len(e) for e, r in zip(exact_ids, db_ids)])
+```
 
 | Plan (768-d float32, 1,000,000 docs) | Peak score block |
 |---|---|

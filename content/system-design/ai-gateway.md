@@ -5,7 +5,7 @@ name: AI gateway (LiteLLM proxy, Portkey)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - python-for-ai/litellm
@@ -263,8 +263,9 @@ print(r.choices[0].message.content)
 - **Moving `fast` to a different model** is a config change and a canary, not a deploy of every service.
 
 ### Portkey config: fallback with retries
-The same idea declared as a Portkey config. Check field names against the current Portkey docs; the shape
-is a `strategy` over `targets`.
+The same idea declared as a Portkey config. Check field names against the current Portkey docs (newer
+versions can name providers from a model catalog instead of `virtual_key`); the shape is a `strategy` over
+`targets`.
 
 ```json
 {
@@ -303,11 +304,11 @@ Illustrative numbers for one team key.
   are shared. Monitor gateway-side limit hits against provider 429s; a gap means counters are not shared.
 - **Cooldowns tuned to the provider, one retry layer.** Set how many failures put a deployment into
   cooldown and for how long (`allowed_fails` and `cooldown_time` in LiteLLM's `router_settings`), and turn
-  off duplicate retries in the SDK or agent loop for the same errors. Monitor deployments in cooldown and
-  attempts per agent step.
+  off duplicate retries in the SDK or agent loop for the same errors. Monitor deployments in cooldown,
+  the share of each alias's traffic each deployment actually serves, and attempts per agent step.
 - **Fail open on soft budgets.** Decide explicitly what happens when Postgres is down; for internal
-  traffic, let requests through and reconcile spend later (LiteLLM documents a general setting for
-  allowing requests when the database is unavailable). Monitor database health and unreconciled spend.
+  traffic, let requests through and reconcile spend later (LiteLLM's `allow_requests_on_db_unavailable`
+  in `general_settings`). Monitor database health and unreconciled spend.
 - **Streaming, tool calls and health in CI.** After every gateway upgrade, compare time-to-first-token
   through the gateway with a direct call, replay a tool-calling eval through it, and wire the proxy's
   liveness and readiness endpoints into the load balancer. Monitor added latency at p50 and p99, tool-call

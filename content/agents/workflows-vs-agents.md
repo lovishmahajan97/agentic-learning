@@ -5,7 +5,7 @@ name: Workflows vs agents
 kind: decision
 difficulty: intro
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/agent-loop

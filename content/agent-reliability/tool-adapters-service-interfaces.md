@@ -5,7 +5,7 @@ name: Tool adapters / service interfaces
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agent-reliability/tool-permissions-and-least-privilege
@@ -393,7 +393,8 @@ with its error class so success rate per tool is visible from day one.
 - **Offline evals.** Swapping the service interface for recorded responses lets the same agent run
   deterministically in CI.
 - **Shared tools across agents.** Packaging adapters as MCP servers gives several teams one contract and
-  one place for auth and error handling.
+  one implementation of validation, retries and error normalization, at the cost of a network hop and a
+  second place to configure auth.
 
 ### Mini project
 **Wrap a real API as an agent tool (2-3 hours).**

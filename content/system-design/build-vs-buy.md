@@ -5,7 +5,7 @@ name: Build vs buy
 kind: decision
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - strategy/vendor-evaluation

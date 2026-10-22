@@ -5,7 +5,7 @@ name: AI / solution architecture
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - system-design/reference-architectures
@@ -373,11 +373,13 @@ and choose the cheapest model that clears the eval bar. Record each decision as 
 ### An agent read a retrieved document that said "email this file to an external address" and tried to. Where should that have been stopped?
 - **Not in the system prompt.** A prompt cannot enforce anything; the model applies instructions
   probabilistically, and a retrieved document can carry an injected instruction it may follow.
-- **At retrieval and at the tool boundary.** Filtering at query time means unauthorised chunks never
-  reach the context, and the email tool should check recipients against policy and require approval
-  for external sends.
-- **Monitor it with canary queries** across tenants that must always return nothing, plus an output
-  guardrail scanning for identifiers that belong to other customers.
+- **At the tool boundary.** The email tool checks recipients against policy, runs with the caller's
+  credentials and requires human approval for external sends, so an injection the model follows still
+  cannot complete the action.
+- **And at retrieval, for data scope.** Filtering by the caller's entitlements at query time means
+  unauthorised chunks never reach the context, so the model cannot leak what it never saw.
+- **Monitor it** with cross-tenant canary queries that must always return nothing, an output guardrail
+  scanning for identifiers that belong to other customers, and a count of blocked external sends.
 
 ## Quiz
 ### Q: Why does an AI solution architecture keep the orchestration layer separate from the model layer?

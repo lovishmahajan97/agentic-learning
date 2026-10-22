@@ -5,7 +5,7 @@ name: Job queues & durable workers (Celery / ARQ + job-status endpoint)
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - backend-fundamentals/background-jobs-durable-workers
@@ -254,6 +254,9 @@ def summarize_corpus(self, job_id: str, corpus_id: str):
 Each step is persisted before the next starts, so a redelivered job resumes at the last finished step
 and a side-effecting tool sees the same idempotency key on a retry. `ctx["agent"]` and `db` are
 placeholders for your agent step function and data layer.
+- **The key only covers an identical retry.** A crash between `call_tool` and `append_step` re-runs step
+  n, and the model may then propose a different call under the same key. When that matters, persist the
+  tool decision first and execute it from the stored record on resume.
 
 ```python
 MAX_STEPS = 15
@@ -473,4 +476,5 @@ cases the row, not the broker, is what the status endpoint and the on-call engin
   mark success or failure; add a GET status endpoint; make the fake tool record an idempotency key.
 - **Done when:** a client can submit, poll progress to completion and see a failure reported cleanly;
   killing the worker mid-run and restarting it finishes the job without running the side-effecting tool
-  twice.
+  twice (with ARQ a killed job is picked up again only once its in-progress marker expires, so use a
+  short `job_timeout` while testing).

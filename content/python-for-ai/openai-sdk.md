@@ -5,7 +5,7 @@ name: OpenAI SDK
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/anthropic-sdk
@@ -175,7 +175,7 @@ MODEL = os.environ.get("AGENT_MODEL", "gpt-4o-mini")
 client = OpenAI(timeout=20.0, max_retries=1)          # per step: worst case ~2 × 20 s + backoff
 
 tools = [{"type": "function", "function": {
-    "name": "get_order", "description": "Look up an order by id",
+    "name": "get_order", "description": "Look up an order by id", "strict": True,
     "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}},
                    "required": ["order_id"], "additionalProperties": False}}}]
 

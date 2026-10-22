@@ -437,3 +437,26 @@ breaker's half-open probes without a thundering herd.
 > The fallback carries no traffic in normal operation, so nothing exercises it between drills. A cheap
 > periodic request turns months of silent decay into an alert within minutes of the configuration
 > breaking.
+
+## Use cases & projects
+### Use cases
+- **Proving multi-provider fallback for an agent.** Canaries plus injected 503s show the secondary model
+  accepts your tool schemas and stays within quality and cost budgets.
+- **Hardening the agent loop against 429 storms.** Injected rate limits reveal whether backoff, step budgets
+  and cost caps hold or the agent loops.
+- **Testing tool-failure handling.** Making one tool slow, failing or empty shows whether the agent adapts,
+  retries sensibly, or fabricates an answer.
+- **RAG staleness drills.** Serving an old index snapshot tests whether freshness alerts and groundedness
+  checks catch stale answers.
+- **Customer go-live game days.** Cutting a customer's SSO or ERP connector shows their operations team how
+  the agent degrades.
+
+### Mini project
+**Run a chaos experiment on your agent's tool layer (2-3 hours).**
+- **Goal:** state a hypothesis about how your agent handles a failing tool, test it, and turn the result
+  into a fix or a regression test.
+- **Steps:** wrap your agent's tools with the `ChaosTool` adapter above; pick 30 tasks from your eval set;
+  run them clean as the control; run them again with one tool at 50 percent errors, then with empty results;
+  record task completion, steps per task, calls to the failed tool and cost per task.
+- **Done when:** you have a written hypothesis, a control-versus-fault table, at least one finding with a
+  fix, and the faulted run added to CI so it repeats on every release.

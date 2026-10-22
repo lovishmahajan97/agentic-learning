@@ -5,7 +5,7 @@ name: UploadFile
 kind: tool
 difficulty: intro
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - fastapi-for-ai/request-size-limits-and-upload-security
@@ -444,4 +444,6 @@ on a properly sized volume.
   copy each file in chunks to local or object storage while hashing it; start a background agent run with
   the keys; give the agent a `read_document(key)` tool.
 - **Done when:** the agent quotes the PDF in a later step, a duplicate upload is recognised by its hash,
-  and passing the `UploadFile` object instead of a key reproduces the closed-file error in a test.
+  and a test that hands the `UploadFile` object to a task outliving the request (for example one started
+  with `asyncio.create_task`) reproduces the closed-file error. Plain `BackgroundTasks` may not show it,
+  because current FastAPI closes uploads only after they finish.

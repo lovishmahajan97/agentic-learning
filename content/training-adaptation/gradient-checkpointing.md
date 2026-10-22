@@ -5,8 +5,8 @@ name: Gradient checkpointing
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
-agent_relevance: background
+status: agentic-verified
+agent_relevance: useful
 related:
   - training-adaptation/checkpointing
   - training-adaptation/peft
@@ -175,8 +175,10 @@ calls and results that bring the p95 trace to ~16k tokens. Target: QLoRA on one 
 
 - **The decision:** keep whole trajectories and turn both levers on, because truncation trains the model
   on agents that never finish.
-- **What remains to check:** the logits tensor over the vocabulary also grows with s, so verify the real
-  peak with `torch.cuda.max_memory_allocated()` on the longest trace before the full run.
+- **What remains to check:** the logits tensor over the vocabulary also grows with s. With a 128k-152k
+  vocabulary, fp32 logits at 16k are ~8-10 GB on their own, so use a fused or chunked cross-entropy
+  (for example Liger Kernel via `use_liger_kernel=True`) and verify the real peak with
+  `torch.cuda.max_memory_allocated()` on the longest trace before the full run.
 
 ### Pre-flight: size the run from your agent traces
 Pure Python with a tokenizer, no GPU: measure trace lengths the way the trainer will render them, then
@@ -188,6 +190,7 @@ from transformers import AutoTokenizer
 
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
 
+# Defaults are a Llama-7B-class shape; copy layers, h and a from your model's config.json.
 def act_gb(s, layers=32, h=4096, a=32, flash=True, ckpt=True):
     per_layer = (34 * s * h + (0 if flash else 5 * a * s * s)) / 1e9   # bf16, b = 1
     return layers * s * h * 2 / 1e9 + per_layer if ckpt else per_layer * layers
@@ -196,7 +199,8 @@ lengths = []
 with open("agent_traces.jsonl") as f:          # rows: {"messages": [...], "tools": [...]}
     for line in f:
         row = json.loads(line)
-        ids = tok.apply_chat_template(row["messages"], tools=row.get("tools"), tokenize=True)
+        ids = tok.apply_chat_template(row["messages"], tools=row.get("tools"),
+                                      tokenize=True, return_dict=False)
         lengths.append(len(ids))
 
 lengths.sort()
@@ -336,8 +340,8 @@ Reading the output for a QLoRA run on a 24 GB card (~4 GB of 4-bit weights):
   "checkpointing" for resumability, loses a multi-day run, and discovers nothing was ever written. Fix:
   configure save checkpoints separately.
 - **Reentrant mode with frozen embeddings in a LoRA run.** Symptom: a flat loss curve on your tool-call
-  traces and adapter gradients that are `None`. Fix: `enable_input_require_grads()` or
-  `use_reentrant=False`.
+  traces, adapter gradients that are `None`, and a PyTorch warning that no checkpoint input requires
+  grad. Fix: `enable_input_require_grads()` or `use_reentrant=False`.
 - **Still OOM at long context after enabling it.** Symptom: the peak fell a lot but stalls at a floor of
   several GB per live block, because eager attention materialises that block's s² score tensors (~10 GB
   for one 7B layer at 8k) during recompute. Fix: only FlashAttention/SDPA removes them.
@@ -474,9 +478,13 @@ cuts stored activations to one block input per layer (~67 MB each, ~2 GB total) 
 **Fit a 16k-token agent trace on one GPU (1-3 hours).**
 - **Goal:** measure what gradient checkpointing buys when fine-tuning a small model on full agent
   trajectories, and confirm the adapters actually receive gradients.
-- **Steps:** export or synthesise 50 tool-calling traces as chat rows with a `tools` field; render them
-  with the model's chat template and record lengths; run a few QLoRA steps on a small instruct model with
-  checkpointing off, then on with `use_reentrant=False`, then on with the reentrant default and frozen
-  embeddings; log peak memory with `torch.cuda.max_memory_allocated()`, step time and LoRA gradient norms.
+- **Steps:**
+  1. Export or synthesise 50 tool-calling traces as chat rows with a `tools` field; render them with the
+     model's chat template and record lengths.
+  2. Run a few QLoRA steps on a small instruct model with checkpointing off, then on with
+     `use_reentrant=False`. Log peak memory with `torch.cuda.max_memory_allocated()`, step time and LoRA
+     gradient norms.
+  3. Reproduce the trap in a plain PyTorch loop with `checkpoint(..., use_reentrant=True)` and frozen
+     embeddings, because recent Transformers and PEFT call `enable_input_require_grads()` for you.
 - **Done when:** you have a table of peak memory and step time for each setting, the longest trace fits
   untruncated with checkpointing on, and you can show the reentrant run's zero gradient norms and the fix.

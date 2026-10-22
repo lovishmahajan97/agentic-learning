@@ -5,7 +5,7 @@ name: Citation correctness
 kind: metric
 difficulty: advanced
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - rag-retrieval/citations-grounding
@@ -135,7 +135,7 @@ flowchart TD
     U --> X
     X -->|"supported by uncited passage"| M["Misattribution: re-citation pass"]
     X -->|"supported by nothing"| I["Invention or parametric: abstain or fix retrieval"]
-    F --> R["Report recall, precision, contradiction rate with bootstrap CI"]
+    F --> R["Report recall, precision, contradictions, CI"]
 ```
 
 ## Examples

@@ -5,7 +5,7 @@ name: Prefill vs decode
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - model-internals/kv-cache
@@ -23,13 +23,13 @@ sources:
 
 ## TL;DR
 Every agent step has two phases with opposite hardware profiles. Prefill reads the whole transcript at
-once, is compute-bound and sets TTFT; decode writes the tool call token by token, is bandwidth-bound and
-sets TPOT. Agents are prefill-heavy.
+once, is compute-bound and sets TTFT; decode emits the reply token by token, is bandwidth-bound and sets
+TPOT. Mixing them on one GPU causes interference.
 
 ## For agent builders
-- **Why it matters for agents.** An agent step is usually a long prompt (system prompt, tool schemas,
-  transcript) and a short output (a tool call). So prefill, not decode, is most of each step's GPU work,
-  and it grows every step unless the prefix is reused.
+- **Why it matters for agents.** Agents are prefill-heavy: a step is usually a long prompt (system
+  prompt, tool schemas, transcript) and a short output (a tool call). Prefill grows every step unless the
+  prefix is reused, while decode per step stays roughly flat.
 - **Where it shows up in your stack.** Provider usage fields that report input, cached-input and output
   tokens separately and price them differently; TTFT and TPOT histograms and `--enable-chunked-prefill`
   on self-hosted engines such as vLLM.
@@ -200,8 +200,9 @@ print(f"TTFT {pre_full*1e3:.0f} ms -> {pre_cached*1e3:.0f} ms, decode {dec:.2f} 
 - **Read it as:** a single step looks decode-heavy, but prefill grows every step while decode stays flat.
   Without reuse, a 12-step run prefills ~171,000 tokens (~3 s) for a 6k prefix plus 1.5k per step; with
   reuse it prefills roughly the transcript once.
-- **Shorter tool calls help less than you think.** Halving output tokens saves ~0.3 s here; a stable prefix
-  saves ~0.34 s on this step and more on every later one.
+- **Over a run, a stable prefix beats shorter tool calls.** Halving output tokens saves ~0.3 s on every
+  step; a stable prefix saves ~0.34 s on this step and more on every later one, because the transcript
+  it avoids re-reading keeps growing.
 
 ## Production patterns
 - **Treat agent steps as prefill-heavy traffic.** Keep the prefix stable and append-only, trim tool

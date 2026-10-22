@@ -5,7 +5,7 @@ name: Model merging
 kind: concept
 difficulty: advanced
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - training-adaptation/peft
@@ -32,9 +32,9 @@ model's serving cost, but interference nothing corrects.
 - **Why it matters for agents.** A self-hosted agent often needs several skills in one model: reliable
   tool-call formatting, your domain, and good conversation. Merging a tool-use fine-tune with an instruct
   tune can give one model all three without routing every step or retraining on data you do not have.
-- **Where it shows up in your stack.** mergekit YAML configs for full checkpoints, adapter-combination
-  helpers in PEFT for LoRA adapters, and many community "merged" models on model hubs that you might be
-  tempted to put behind an agent.
+- **Where it shows up in your stack.** mergekit YAML configs for full checkpoints, PEFT's
+  `add_weighted_adapter` (linear, TIES and DARE combination types) for LoRA adapters, and many community
+  "merged" models on model hubs that you might be tempted to put behind an agent.
 - **What you control.** Which parents (same base revision only), the method and density, λ, and the eval
   gate: tool-call validity, task success, chat-template behaviour and refusals, scored against each
   parent.
@@ -159,27 +159,30 @@ Four-parameter walkthrough (trim to top 50%, two entries each):
 
 ## Diagram
 Follow one tensor through a TIES or dare_ties merge of, say, a tool-use tune and a chat tune: deltas are
-taken against the shared base, sparsified, sign-voted, averaged among agreeing tasks, then added back and
-gated by agent evals before the merge replaces routed specialists.
+taken against the shared base, optionally DARE-dropped and rescaled by 1 / (1 - p), trimmed, sign-voted
+and averaged among agreeing tasks. The result is added back and gated by agent evals before it replaces
+routed specialists.
 
 ```mermaid
 flowchart TD
-    B[("Shared base weights")] --> T["Task vectors: tau_i = fine-tune_i minus base"]
-    F[("Fine-tunes of the same base revision")] --> T
-    T --> D["Optional DARE: drop random p, rescale by 1 / (1 - p)"]
-    D --> TR["Trim: keep top k% of each tau by magnitude"]
-    TR --> EL["Elect: per-parameter sign with more total magnitude"]
-    EL --> DM["Disjoint merge: average only agreeing entries"]
-    DM --> M["theta = base + lambda times tau_merged"]
+    B[("Shared base weights")] --> T["Task vectors: fine-tune minus base"]
+    F[("Fine-tunes, same base revision")] --> T
+    T --> D["Optional DARE: drop and rescale"]
+    D --> TR["Trim: keep top k%"]
+    TR --> EL["Elect sign per parameter"]
+    EL --> DM["Disjoint merge: agreeing entries"]
+    DM --> M["theta = base + lambda tau_merged"]
     B --> M
-    M --> G["Agent evals: tool calls, tasks, template, safety"]
-    G -->|"fails"| R["Fall back to routed specialists"]
+    M --> G["Agent evals: tools, tasks, template, safety"]
+    G -->|"passes"| S["Ship one merged model"]
+    G -->|"fails"| R["Keep routed specialists"]
 ```
 
 ## Examples
 ### TIES merge over Hugging Face state dicts
-PyTorch. All checkpoints must share the base model and tensor shapes. It works tensor by tensor, so peak
-memory is one tensor times the number of models, and copies non-float buffers unchanged.
+PyTorch. All checkpoints must share the base model and tensor shapes. It works tensor by tensor, so the
+extra working memory is one tensor times the number of models (the loaded state dicts themselves must
+still fit in CPU RAM), and it copies non-float buffers unchanged.
 
 ```python
 import torch
@@ -447,8 +450,9 @@ conversational gain is measurable; otherwise fall back to routing.
 **Merge two adapters and gate the result on an agent suite (2-3 hours).**
 - **Goal:** combine a tool-use skill and a style or domain skill into one model and prove whether it
   holds both.
-- **Steps:** take two LoRA adapters (or full fine-tunes) trained from the same base revision; build a
-  small grid of merges (linear plus TIES at two densities); score each candidate and both parents on 40
+- **Steps:** take two LoRA adapters trained from the same base revision (yours from the PEFT mini
+  project, or two public adapters for one small base); build a small grid with PEFT's
+  `add_weighted_adapter` (linear plus TIES at two densities); score each candidate and both parents on 40
   tool-calling tasks, 20 style or domain prompts and 15 refusal prompts.
 - **Done when:** a table shows every candidate against both parents, and you either ship the best merge
   or document why a router over the two specialists is the better path.

@@ -5,7 +5,7 @@ name: Retrieval failure diagnosis
 kind: practice
 difficulty: advanced
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - evals/retrieval-evaluation
@@ -148,7 +148,7 @@ flowchart TD
     F -->|"yes"| R{"Gold in candidates at k=100?"}
     R -->|"no"| G4["Recall: representation, BM25, rewriting"]
     R -->|"yes"| K{"Gold in final top-k and context?"}
-    K -->|"no"| G5["Ranking or context assembly: reranker, fusion, budget"]
+    K -->|"no"| G5["Ranking or context: reranker, budget"]
     K -->|"yes"| G6["Generation: grounding prompt or model"]
 ```
 

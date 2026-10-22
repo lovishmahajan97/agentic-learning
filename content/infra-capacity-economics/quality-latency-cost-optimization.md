@@ -5,7 +5,7 @@ name: Quality–latency–cost optimization
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - system-design/model-routing-cascading
@@ -97,7 +97,8 @@ run_latency ≈ Σ over sequential steps of (TTFT + n_out · TPOT) + tool time
 ```
 
 - **Context grows, so input cost grows per step.** Each step re-sends the system prompt, tool schemas and
-  the transcript so far; without prompt caching, input cost rises roughly quadratically with steps.
+  the transcript so far; without prompt caching, a run's total input cost rises roughly quadratically
+  with its step count.
 - **Output length is paid once per step.** A tool call is usually a short JSON object; letting the model
   narrate its reasoning in every step multiplies decode time by the step count.
 - **Steps are sequential.** Parallel tool calls in one step overlap tool time, but model calls in a chain
@@ -237,6 +238,9 @@ for name, (n_out, cache, q) in configs.items():
 
 - **Output caps fix latency, caching fixes cost.** Each lever moved a different axis, exactly as the
   decomposition predicts. In a real system caching would also cut TTFT, which this sketch holds constant.
+- **The sketch flatters caching slightly.** Some providers bill cache writes above the base input price
+  (Anthropic charges a premium on the write, then a fraction on reads), and caches expire after minutes
+  of idle time, so check cached-token counts in the usage fields rather than assuming every step hits.
 - **Divide by the run success rate.** `c / q` assumes independent retries; check the success rate did not
   fall after capping output, or the cheaper run is a false win.
 
@@ -334,7 +338,7 @@ pays both models' latency, once per escalated agent step.
   extraction) and hard ones (planning, final answer). How: run easy steps on the small model, escalate on a
   verifier failure or low confidence. Monitor escalation rate against `1 − s/l`, and escalated p95 apart.
 - **Step and token budgets per run.** When: every agent loop. How: a max-steps limit and a per-run token
-  budget enforced in code (LangGraph exposes a recursion limit; most SDKs have a max-turns setting). Monitor
+  budget enforced in code (LangGraph's `recursion_limit` in the run config, `max_turns` on the OpenAI Agents SDK runner). Monitor
   steps per run p95 and the share of runs ending on the budget.
 - **Batch path for offline agent work.** When: nobody waits on the result (backfills, nightly enrichment,
   eval sweeps). How: send it through the provider's batch endpoint, which trades a completion window of
@@ -507,8 +511,8 @@ successful task so a regression is caught in days rather than at the next invoic
 **Build the frontier for a small tool-calling agent (2-3 hours).**
 - **Goal:** pick a shippable configuration for a 3-tool agent from measured quality, latency and cost per
   run, not from intuition.
-- **Steps:** write 30-50 eval tasks with a pass/fail check; run the agent under 4-6 configurations (two
-  model tiers, with and without an output cap, with and without a small-first cascade); log success, wall
+- **Steps:** write 30-50 eval tasks with a pass/fail check; run the agent under 4-6 configurations picked
+  from two model tiers, an output cap on or off, and a small-first cascade on or off; log success, wall
   time, steps and tokens per run from the usage fields; compute cost per successful task; plot quality
   against cost and mark dominated points.
 - **Done when:** you have a table and a scatter plot with the Pareto frontier marked, a chosen

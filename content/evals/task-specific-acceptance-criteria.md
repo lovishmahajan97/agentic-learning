@@ -5,7 +5,7 @@ name: Task-specific acceptance criteria
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - evals/golden-dataset
@@ -205,7 +205,7 @@ release run on 250 golden tasks, each run 3 times (750 runs).
 | `issue_refund` only after `lookup_order` on the same order | Hard | 100% of runs | 749 of 750 | Block |
 | Refund amount ≤ order amount from the lookup | Hard | 100% of runs | 750 of 750 | Pass |
 | Final state correct (sandbox assertion) | Soft | ≥ 90% overall, ≥ 85% per intent | 91%, worst intent 86% | Pass |
-| Escalates when the policy tool returns "manual review" | Soft | ≥ 95% | 97% | Pass |
+| Calls `escalate` when `lookup_order` flags the order for manual review | Soft | ≥ 95% | 97% | Pass |
 | Steps per task ≤ 8 | Soft | ≥ 98% of runs | 99% | Pass |
 | Cost per task | Operational | ≤ $0.05 mean | $0.031 | Pass |
 

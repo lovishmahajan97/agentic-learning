@@ -5,7 +5,8 @@ name: Centralized vs federated AI platform
 kind: decision
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - strategy/platform-strategy
   - llmops-platform/ai-control-plane-vs-data-plane
@@ -22,9 +23,20 @@ sources:
 ---
 
 ## TL;DR
-Pure centralization becomes a ticket queue; pure federation becomes duplicated gateways, spend and no
-inventory. Most organisations want a thin mandatory core (identity, model access, budgets, audit,
-telemetry) with domain-owned prompts, evals, corpora and agents.
+Pure centralization becomes a ticket queue for every agent team; pure federation becomes duplicated
+gateways, spend and no inventory. Most organisations want a thin mandatory core (identity, model access,
+budgets, audit, telemetry) with domain-owned prompts, evals, tools and agents.
+
+## For agent builders
+- **Why it matters for agents.** It decides what you build yourself and what you inherit: whether your
+  agent gets model access, tracing, judges and quotas from a gateway and template, or whether you wire
+  provider keys, tracing and guardrails per agent.
+- **Where it shows up in your stack.** The gateway virtual key your agent calls with, its per-team
+  quota and priority class, the paved-road agent template, and the CI conformance check on your bundle.
+- **What you control.** Your agent's prompts, tools, golden set, rubrics and thresholds, which stay with
+  your team, plus registering the agent and its tools in the inventory.
+- **What you can skip.** Team Topologies and Data Mesh theory; know the mandatory core, the paved road and
+  why quality ownership stays with you.
 
 ## Why it exists
 - **Adoption outruns any decision.** A team can reach production with a provider API key and a credit
@@ -88,6 +100,17 @@ shared keys share the budget:
   can judge an output.
 - **Federating these is not a concession;** it is the only way the quality bar means anything.
 - **The platform supports, not imposes:** a shared eval harness, judge services, templates and training.
+
+### Where agents and tools fall
+Agents add one ownership question chat apps did not raise: who owns the tools.
+
+| Item | Owner | Why |
+|---|---|---|
+| Agent design, prompts, step budgets, golden tasks | domain team | only they can judge task success |
+| Domain tools (claims lookup, refund API) | domain team, registered centrally | they know the semantics; the platform needs the inventory |
+| Shared tools (web search, document parsing, code sandbox) | platform, on the paved road | built once, secured once |
+| Tool permission and approval policy for consequential actions | central rules, domain-set values | the audit must be complete; thresholds are domain judgement |
+| Agent traces and cost per task | central pipeline, domain dashboards | attribution only works when complete |
 
 ### The paved road
 The shared-but-optional layer between mandatory and federated:
@@ -196,6 +219,21 @@ print("\n".join(errs) or "conformant")   # spans missing mandatory keys: ['app.c
 sys.exit(1 if errs else 0)
 ```
 
+### Worked scenario: shipping a new agent under each platform model
+Illustrative effort for one support team shipping a ticket-triage agent with three tools.
+
+| Task | Federated, no core | Hub and spoke with paved road |
+|---|---|---|
+| Model access and keys | buy a key, negotiate quota: 2 days | self-service virtual key: under an hour |
+| Tracing for runs, steps and tool calls | build and wire: 5 days | inherited from the agent template |
+| Shared tools (search, document parsing) | build or wrap: 4 days | import from the paved road |
+| Guardrails and approval gates | design per team: 3 days | template defaults, domain thresholds |
+| Agent golden set and rubric | 4 days | 4 days: stays with the team either way |
+| Total | ~18 days | ~5 days |
+
+- **The domain work does not shrink,** which is the point: the core removes undifferentiated plumbing,
+  not the team's ownership of agent quality.
+
 ## Production patterns
 - **Gateway as the only egress to providers.** Revoke direct provider keys on a dated schedule and block
   provider API domains at the network egress proxy except from the gateway. Monitor the share of provider
@@ -216,6 +254,9 @@ sys.exit(1 if errs else 0)
 - **Enabling engineers, time-boxed.** Platform engineers embed with a team for a few weeks to adopt the
   paved road, then leave. Monitor how many teams are on the template and whether they stay after the
   embed ends.
+- **Agent and tool registry in the inventory.** Each agent registers its tools, their side-effect class
+  (read-only, reversible, consequential) and approval rules; CI rejects an agent manifest calling an
+  unregistered tool. Monitor unregistered tool calls seen in traces.
 
 ## Trade-offs
 - **Centralized access: pooled pricing and one enforcement point vs bottleneck risk.** You also get a
@@ -249,6 +290,8 @@ sys.exit(1 if errs else 0)
 - **Pooling provider keys without per-team quotas.** Symptom: a customer-facing assistant throwing 429s
   every night when another team's batch job runs, then that team asking for its own key back. Fix:
   per-team quotas and priority classes.
+- **Every agent team wrapping the same tools.** Symptom: five web-search or PDF-parsing tools with
+  different timeouts, auth and security holes. Fix: shared tools on the paved road, domain tools registered.
 
 ## When to use
 - **Decide explicitly when the second team starts an LLM project;** the cheapest moment to make the gateway
@@ -309,12 +352,20 @@ taking their work over.
 - **Instead:** offer a shared harness, judge services and templates, and let domains own content and
   thresholds.
 
-### A shared gateway pools provider keys. What new failure does that create?
-- **Shared quota:** provider rate limits are typically per account or project, so one team's batch job can
-  starve another team's interactive traffic.
-- **Mitigation:** per-team quotas, priority classes (interactive before batch) and separate pools or
-  projects for heavy batch work.
-- **Monitor:** 429s per team and quota headroom at peak.
+### Ten teams are building agents. Which parts of an agent would you centralize and which leave with the team?
+- **Centralize:** model access and keys, per-team quotas, the trace pipeline for runs and tool calls, the
+  tool inventory with side-effect classes, and shared tools such as search or a code sandbox.
+- **Leave with the team:** agent design, prompts, domain tools, step budgets, golden tasks and acceptance
+  thresholds, because only the domain can judge task success.
+- **Bridge with a paved road:** an agent template with tracing, approval gates and eval harness pre-wired.
+
+### Your agent's tool calls start failing with 429s every night, though its traffic is flat. What is going on in the platform?
+- **Pooled quota:** provider rate limits are typically per account or project, so another team's batch
+  job consumes the shared key, and a multi-step agent hits the limit on every step.
+- **Fix in the core:** per-team virtual keys with tokens-per-minute limits, a priority class that serves
+  interactive agents before batch, and separate pools for heavy batch work. Monitor 429s per team and
+  quota headroom at peak.
+- **Interim:** retries with backoff in the agent loop, bounded by the step budget.
 
 ### When would you deliberately allow a federated data plane?
 - **Residency or isolation requirements:** a business unit that must keep traffic in a region or network
@@ -348,3 +399,24 @@ taking their work over.
 - [ ] A paved road covers infrastructure, a mandate covers prompts
 > The paved road competes with building it yourself and wins on convenience; mandates are reserved
 > for the few things that must be complete to work. Both can be checked in CI.
+
+## Use cases & projects
+### Use cases
+- **Many teams shipping agents at once.** A gateway, trace pipeline and agent template stop each team
+  rebuilding the same plumbing.
+- **Agents with consequential tools in a regulated firm.** A central tool inventory with side-effect
+  classes answers "which agents can move money" as a query.
+- **Quota contention between agents and batch jobs.** Per-team virtual keys and priority classes keep
+  interactive agents responsive.
+- **Shared tools.** Web search, document parsing and a code sandbox built once on the paved road, with
+  domain tools left to their teams.
+
+### Mini project
+**Conformance check for agent manifests (1-2 hours).**
+- **Goal:** replace a review meeting with a CI check that every agent manifest must pass.
+- **Steps:** define an agent manifest (name, model pin, tools with side-effect class, approval rules,
+  span keys); extend the conformance script above to reject unregistered agents, unapproved models,
+  unregistered tools, consequential tools without an approval rule and missing mandatory span keys; write
+  three manifests, one conformant and two violating.
+- **Done when:** the check exits non-zero with a specific message for each violating manifest, passes the
+  conformant one, and runs as a CI step on every push.

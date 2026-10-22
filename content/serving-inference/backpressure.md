@@ -5,7 +5,7 @@ name: Backpressure
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - serving-inference/batching-and-concurrency-limits
@@ -23,9 +23,9 @@ sources:
 ---
 
 ## TL;DR
-One agent run fans out into many model and tool calls, so overload arrives faster than with chat.
-Backpressure bounds admission per run, measures queue wait, and rejects the excess fast with 429 or 503
-plus `Retry-After`.
+Backpressure is how an overloaded stage tells its feeder to slow down instead of buffering. Agent runs
+fan out into many calls, so bound admission per run, measure queue wait, and reject the excess fast with
+429 or 503 plus `Retry-After`.
 
 ## For agent builders
 - **Why it matters for agents.** A user turn is not one request: a ReAct loop often makes 5-20 model calls
@@ -284,12 +284,13 @@ async def agent_loop(task):
 ```
 
 ### Worked scenario: ten users, one agent each
-Illustrative: each run takes about 10 model calls of ~4 s, with 3 parallel tool calls per step.
+Illustrative: each run takes about 10 steps of ~4 s, and at each step the planner fans out to 6 parallel
+sub-agent model calls. The engine serves about 32 concurrent calls well.
 
 | Setup | Model calls in flight at peak | What users see |
 |---|---|---|
-| No run admission, no fan-out cap | 10 runs × parallel sub-calls, often over 32 | everyone's step latency doubles, many runs time out at step 7-9 |
-| Run admission at 8, fan-out cap 4 | at most 8 runs, calls capped at 32 | 8 runs finish at normal speed, 2 get an instant "busy, retry in a few seconds" |
+| No run admission, no fan-out cap | 10 runs × 6 = 60, nearly 2× capacity | everyone's step latency roughly doubles, many runs time out at step 7-9 |
+| Run admission at 8, fan-out cap 4 | 8 runs × 4 = 32, at capacity | 8 runs finish at normal speed, 2 get an instant "busy, retry in a few seconds" |
 | Same, plus priority to admitted runs | in-progress steps go first | no run is abandoned halfway, so no tokens are wasted on unfinished work |
 
 ## Production patterns

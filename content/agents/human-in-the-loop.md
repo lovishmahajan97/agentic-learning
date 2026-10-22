@@ -5,7 +5,7 @@ name: Human-in-the-loop
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/approval-gates-for-consequential-actions
@@ -369,9 +369,11 @@ so the customer can widen autonomy on evidence rather than on trust.
 ### Mini project
 **Review queue with canaries and graduated autonomy (2-3 hours).**
 - **Goal:** put a person in front of a toy refund agent and measure whether the review is real.
-- **Steps:** have the agent propose decisions on 200 synthetic refund requests; pause each proposal into
-  a SQLite queue with an effect-first preview; review them in a tiny CLI that records decision, reason
-  and time; insert 10 known-bad canaries; compute agreement per class and run `review_worth_it` from the
+- **Steps:** have the agent propose decisions on 60 synthetic refund requests in two classes ($50 or
+  less, above $50), so a person can review them all in well under an hour; pause each proposal into a
+  SQLite queue with an effect-first preview; review them in a tiny CLI that records decision, reason
+  and time; insert 6 known-bad canaries; compute agreement per class and run `review_worth_it` from the
   examples to decide which class to automate.
 - **Done when:** you have agreement and decision time per class, a canary catch rate, and a config row
-  per class (block, audit or auto) justified by those numbers.
+  per class (block, audit or auto) justified by those numbers, with a note that 30 items per class is
+  far too few to graduate a class in production (see the audit-window example).

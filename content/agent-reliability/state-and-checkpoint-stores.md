@@ -5,7 +5,7 @@ name: State & checkpoint stores
 kind: decision
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agent-reliability/durable-execution-and-checkpointing
@@ -398,5 +398,6 @@ audit policy, and tenant-scoped deletion covers the blobs too.
   write a `save_step()` that inserts events, upserts the checkpoint and updates the run only if the caller
   still holds the lease; store payloads over a size threshold as files keyed `tenant/run_id/seq`; time 100
   steps.
-- **Done when:** a second worker cannot write after taking over an expired lease from the first, a crash
-  mid-transaction leaves no half-written step, and you report p50 and p95 write latency per step.
+- **Done when:** once a second worker takes over an expired lease, the first worker's next `save_step()`
+  writes nothing and stops, a crash mid-transaction leaves no half-written step, and you report p50 and p95
+  write latency per step.

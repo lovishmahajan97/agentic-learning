@@ -5,7 +5,8 @@ name: AI incident response
 kind: practice
 difficulty: core
 est_minutes: 17
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - security-governance-compliance/audit-trails
   - security-governance-compliance/ai-risk-management
@@ -23,32 +24,44 @@ sources:
 
 ## TL;DR
 AI incident response is a prepared process to detect, contain, investigate and learn from AI failures:
-harmful outputs at scale, data leakage, injection-triggered actions, bias, silent provider model changes.
-The system is often "up" while harming people, with no stack trace.
+wrong answers at scale, data leakage, injection-triggered tool calls, silent model changes. Agents need
+per-tool kill switches, because they stay "up" while doing harm.
+
+## For agent builders
+- **Why it matters for agents.** An agent manipulated by text in a web page makes a perfectly valid API
+  call; a RAG agent quoting a superseded policy returns HTTP 200. Nothing pages anyone. You need content
+  signals to detect it and levers finer than "turn the agent off" to contain it.
+- **Where it shows up in your stack.** Feature flags evaluated in the tool executor (per tool, intent and
+  tenant), the degraded mode your agent falls back to, the audit trail and traces that record model, prompt,
+  retrieved documents and tool calls per run, and the regression suite you run after every index refresh.
+- **What you control.** Which kill switches exist before the first incident, snapshotting prompt, config,
+  index and model before any fix, scoping affected users from logged runs, and verifying a fix as a failure
+  rate over many runs.
+- **What you can skip.** Writing your own severity framework from scratch. Reuse the SRE process (severity,
+  incident commander, postmortem) and add the AI-specific detection, levers, evidence and people.
 
 ## Why it exists
 - **Many AI incidents trip no standard alert.** A support assistant quoting a wrong refund policy returns
-  HTTP 200 in 800 ms. An agent manipulated by text in a web page makes a perfectly valid API call. A
-  provider model update makes the classifier, say, 10 points worse on one language, and dashboards stay
-  green.
+  HTTP 200 in 800 ms. An agent manipulated by text in a web page makes a perfectly valid API call. A provider
+  model update makes the classifier, say, 10 points worse on one language, and dashboards stay green.
 - **The first signal is often external:** a screenshot on social media, a customer escalation or a
   journalist.
-- **Teams without a plan improvise in exactly the wrong ways.** No kill switch exists, so the feature
-  cannot be switched off quickly. The prompt is patched live without capturing the old one, so the
-  failure cannot be reproduced. Nobody knows which users got bad outputs, so nobody can be notified.
-- **Legal clocks start at awareness, not root cause.** A GDPR personal data breach must normally be
-  reported to the supervisory authority within 72 hours of becoming aware of it. The EU AI Act requires
-  providers of high-risk systems to report serious incidents to market surveillance authorities, generally
-  within 15 days and faster for the gravest cases. Triage must decide early whether personal data or a
-  high-risk system is involved.
-- **"Our SRE process covers it" is half right.** Severity levels, incident commanders and postmortems
-  carry over. Missing: AI-specific detection, containment levers, evidence to preserve, and the people to
-  involve (legal, privacy, responsible AI, the model vendor).
+- **Teams without a plan improvise in exactly the wrong ways.** No kill switch exists, so the feature cannot
+  be switched off quickly. The prompt is patched live without capturing the old one, so the failure cannot
+  be reproduced. Nobody knows which users got bad outputs, so nobody can be notified.
+- **Legal clocks start at awareness, not root cause.** A GDPR personal data breach must normally be reported
+  to the supervisory authority within 72 hours of becoming aware of it. The EU AI Act requires providers of
+  high-risk systems to report serious incidents to market surveillance authorities, generally within 15
+  days and faster for the gravest cases. Triage must decide early whether personal data or a high-risk
+  system is involved.
+- **"Our SRE process covers it" is half right.** Severity levels, incident commanders and postmortems carry
+  over. Missing: AI-specific detection, containment levers, evidence to preserve, and the people to involve
+  (legal, privacy, responsible AI, the model vendor).
 
 ## How it works
 ### 1. Prepare
 - **Taxonomy and severity.** Define AI incident types (harmful output, factual error at scale, data
-  exposure, security abuse such as injection or jailbreak, unfair outcome, unauthorized action,
+  exposure, security abuse such as injection or jailbreak, unfair outcome, unauthorized action by an agent,
   third-party model change) with severity based on harm to people and the organization, not uptime.
 - **Containment levers built in advance,** because the time to build a kill switch is not during the
   incident:
@@ -58,21 +71,23 @@ The system is often "up" while harming people, with no stack trace.
   - pinning or rolling back the model and prompt version;
   - pulling a document from the retrieval index.
 - **Evidence.** Audit trails and traces recording model version, prompt version, retrieved documents and
-  tool calls per request, retained long enough to investigate.
+  tool calls per request and per agent step, retained long enough to investigate.
 - **Runbooks and contacts.** Legal and privacy on call, the provider's security contact, a comms owner.
 
 ### 2. Detect
 Combine signals, *because* no single one is reliable:
 - **Content signals:** online evaluations on sampled traffic (groundedness, policy violations), guardrail
   trigger rates, injection detector hits.
+- **Action signals (agents):** spikes in calls to a sensitive tool, external recipients, approval-gate
+  rejection rates, runs hitting step budgets.
 - **Human signals:** user feedback and complaint spikes, override rates by human reviewers, an obvious way
   for staff and customers to report a bad output.
 - **Change signals:** eval deltas after any dependency change.
 
 ### 3. Contain
 - **Stop the harm first, diagnose second.**
-- **Use the narrowest lever that stops it:** one tool before the whole agent, one tenant before all
-  tenants, one document before the index.
+- **Use the narrowest lever that stops it:** one tool before the whole agent, one tenant before all tenants,
+  one document before the index.
 - **Preserve state before changing it:** snapshot the current prompt, config and model version so the
   failure can be reproduced.
 
@@ -81,20 +96,19 @@ Combine signals, *because* no single one is reliable:
   correlated with a deploy, index refresh or provider update), and why (root cause).
 - **Look in the usual places.** AI root causes typically live in input data, retrieved content, prompt or
   config, model version, tool permissions, or user behaviour.
-- **Reproduce with the recorded versions as a rate.** Outputs are stochastic, so measure a failure rate
-  over many runs instead of trusting one reproduction.
+- **Reproduce with the recorded versions as a rate.** Outputs are stochastic, so measure a failure rate over
+  many runs instead of trusting one reproduction.
 - **Scope is a number, not a feeling.**
-  1. Count requests in the onset window whose recorded inputs match the failure condition (retrieved the
-     bad document, hit the changed model version, called the abused tool). This bounds who might be
-     affected.
-  2. Of those, count outputs that actually went wrong, judged by re-running a check on the *logged*
-     outputs. This decides who is notified.
+  1. Count requests in the onset window whose recorded inputs match the failure condition (retrieved the bad
+     document, hit the changed model version, called the abused tool). This bounds who might be affected.
+  2. Of those, count outputs that actually went wrong, judged by re-running a check on the *logged* outputs.
+     This decides who is notified.
 
 ### 5. Verify the fix with a rate, not a run
 - **Zero failures in *n* independent runs does not mean a zero failure rate.**
 - **Rule of three:** the 95% upper bound on the true rate is about 3/n.
-- **So ten clean runs only show the rate is probably below about 30%;** to claim below 1% you need roughly
-  300 clean runs across the failing cases.
+- **So ten clean runs only show the rate is probably below about 30%;** to claim below 1% you need roughly 300
+  clean runs across the failing cases.
 - **Size verification to the harm:** a wrong leave policy and a leaked salary file deserve different bounds.
 
 ### 6. Remediate and notify
@@ -112,9 +126,9 @@ snapshotted before anything changes.
 
 ```mermaid
 flowchart TD
-    S["Signal: eval, complaint, override spike"] --> T["Triage: severity by harm"]
+    S["Signal: eval, tool spike, complaint"] --> T["Triage: severity by harm"]
     T -->|"personal data or high-risk system"| L["Page legal: 72 h or 15 day clocks"]
-    T --> C["Contain with narrowest lever"]
+    T --> C["Contain: disable tool, intent or tenant"]
     C --> P["Snapshot prompt, config, index, model"]
     P --> I["Investigate: scope, onset, root cause"]
     I --> F["Fix and verify as a failure rate"]
@@ -124,6 +138,35 @@ flowchart TD
 ```
 
 ## Examples
+### Per-tool kill switch in the agent's tool executor
+Flags are read at call time, so flipping one contains the incident without a deploy. A disabled tool
+returns a structured refusal the model can relay, and the run keeps going for everything else.
+
+```python
+FLAGS = {  # in production: a feature-flag service evaluated per request
+    ("send_email", "*"): False,            # incident: email tool disabled for every tenant
+    ("issue_refund", "tenant-42"): False,  # one tenant contained, others unaffected
+}
+
+def tool_enabled(tool: str, tenant: str) -> bool:
+    for key in ((tool, tenant), (tool, "*")):
+        if key in FLAGS:
+            return FLAGS[key]
+    return True
+
+def execute_tool(tool: str, args: dict, tenant: str, run_id: str, step: int, registry: dict) -> dict:
+    if not tool_enabled(tool, tenant):
+        # audit the blocked attempt: a spike here is itself an incident signal
+        print(f"audit run={run_id} step={step} tool={tool} status=blocked_by_flag")
+        return {"error": "tool_unavailable", "message": f"{tool} is temporarily disabled. "
+                "Tell the user a human will follow up."}
+    return registry[tool](**args)
+
+registry = {"send_email": lambda to, body: {"sent": to}, "lookup_order": lambda oid: {"status": "shipped"}}
+print(execute_tool("send_email", {"to": "x@evil.example", "body": "..."}, "tenant-7", "run-51", 4, registry))
+print(execute_tool("lookup_order", {"oid": "A1"}, "tenant-7", "run-51", 5, registry))
+```
+
 ### Sizing verification and scope from the audit trail
 How many clean re-runs justify closing, and how many people to notify? The exact bound for zero failures
 solves (1 − p)ⁿ = 0.05; the rule of three approximates it.
@@ -159,7 +202,7 @@ print(scope(records, "leave-policy-2019.pdf"))            # (2, {'u1'}): 2 expos
 ```
 
 ### Worked timeline: HR policy assistant
-An HR policy assistant used by 8,000 employees (times and counts illustrative).
+An HR policy RAG assistant used by 8,000 employees (times and counts illustrative).
 
 | Time | What happened |
 |---|---|
@@ -175,50 +218,53 @@ An HR policy assistant used by 8,000 employees (times and counts illustrative).
 - **New KRI:** share of answers citing documents older than policy effective dates.
 
 ## Production patterns
-- **Kill switch per intent, tool and tenant.** Put the AI path behind a feature flag with targeting by
-  tenant and intent, plus a separate flag per agent tool, all evaluated at request time so a flip takes
-  effect without a deploy. Monitor time from page to containment in every incident.
+- **Kill switch per intent, tool and tenant.** Put the AI path behind a feature flag with targeting by tenant
+  and intent, plus a separate flag per agent tool checked in the tool executor, all evaluated at request time
+  so a flip takes effect without a deploy. Monitor time from page to containment in every incident.
 - **Degraded mode that is tested.** Ship a fallback (search results, canned answer with policy link, human
   queue) and exercise it in a game day each quarter. Monitor that the fallback path still returns
   successfully, since an untested fallback fails when needed.
 - **Snapshot-before-change runbook step.** The first action after containment records the live prompt
-  version, config hash, index version and model identifier into the incident ticket. Check in postmortems
-  that every incident has one.
-- **Index refresh as a monitored change.** Treat ingestion runs, index refreshes and provider model
-  updates like deploys: record them on the same change timeline and run the regression suite after each.
-  Monitor eval deltas per change event.
-- **Tabletop exercises with legal in the room.** Simulate a prompt injection that triggers an action, or a
-  data leak through retrieval, and walk the GDPR 72-hour and EU AI Act reporting decisions. Track time to
+  version, config hash, index version, tool list and model identifier into the incident ticket. Check in
+  postmortems that every incident has one.
+- **Index refresh as a monitored change.** Treat ingestion runs, index refreshes, tool additions and provider
+  model updates like deploys: record them on the same change timeline and run the regression suite after
+  each. Monitor eval deltas per change event.
+- **Tabletop exercises with legal in the room.** Simulate a prompt injection that triggers an agent action, or
+  a data leak through retrieval, and walk the GDPR 72-hour and EU AI Act reporting decisions. Track time to
   the notification decision.
 
 ## Trade-offs
 - **Broad kill switches vs lost function.** They contain any incident in seconds but take down useful
-  functionality; finer levers per tool, intent or tenant cost more to build and pay off once the system
-  has many users.
-- **Full prompt retention vs sensitive data.** Full prompts and outputs make scoping affected users exact
-  but expand the sensitive data you hold; hashed references plus a shorter full-content window is a common
-  middle ground.
-- **Rollback speed vs availability.** Rolling back to the previous model or prompt is fast, but
-  unavailable when the provider has retired the old version; contracts with deprecation notice and pinned
-  versions keep that option open.
+  functionality; finer levers per tool, intent or tenant cost more to build and pay off once the system has
+  many users.
+- **Full prompt retention vs sensitive data.** Full prompts, tool results and outputs make scoping affected
+  users exact but expand the sensitive data you hold; hashed references plus a shorter full-content window is
+  a common middle ground.
+- **Rollback speed vs availability.** Rolling back to the previous model or prompt is fast, but unavailable
+  when the provider has retired the old version; contracts with deprecation notice and pinned versions keep
+  that option open.
 - **Sensitive monitors vs noise.** Low thresholds catch incidents early but page people for noise; tune on
   labelled history and route low-confidence signals to review queues, not pagers.
 
 ## Pitfalls
-- **Hot-fixing the prompt in production without snapshotting the old one.** Symptom: a postmortem that
-  cannot reproduce or explain the original failure.
-- **Relying on uptime and error-rate alerts.** Symptom: customers or the press detect the incident before
-  the team does.
-- **Reproducing once and declaring the fix works.** Symptom: the same failure reappears at a lower but
-  non-zero rate, because outputs are stochastic.
-- **No way to identify affected users.** Symptom: a blanket notification to everyone, or none at all.
-- **Leaving legal and privacy out until the end.** Symptom: a missed notification deadline.
+- **Hot-fixing the prompt in production without snapshotting the old one.** Symptom: a postmortem that cannot
+  reproduce or explain the original failure. Fix: snapshot step first in the runbook.
+- **Relying on uptime and error-rate alerts.** Symptom: customers or the press detect the incident before the
+  team does. Fix: online evals and tool-call anomaly alerts.
+- **Reproducing once and declaring the fix works.** Symptom: the same failure reappears at a lower but non-zero
+  rate, because outputs are stochastic. Fix: verify as a rate over many runs.
+- **No way to identify affected users.** Symptom: a blanket notification to everyone, or none at all. Fix:
+  per-run evidence with user and retrieved document IDs.
+- **Leaving legal and privacy out until the end.** Symptom: a missed notification deadline. Fix: page them at
+  triage when personal data may be involved.
 
 ## When to use
 - **Every production AI system:** at least a kill switch, a degraded mode, an incident category in the
   on-call process and request-level evidence.
-- **High-risk tiers, acting tools or regulated data:** full runbooks, tabletop exercises (for example, a
-  simulated prompt injection that triggers an action), and pre-agreed notification paths.
+- **High-risk tiers, acting tools or regulated data:** full runbooks, per-tool kill switches, tabletop
+  exercises (for example, a simulated prompt injection that triggers an action), and pre-agreed notification
+  paths.
 - **Measure:** time to detect, time to contain, and the share of incidents first reported externally.
 - **Interviews:** the signal is "contain before diagnose", the specific levers, and treating stochastic
   reproduction with rates rather than single runs.
@@ -245,8 +291,8 @@ the previous version if available, open a vendor ticket, and add the cases to th
 ### How is AI incident response different from a normal SRE incident process?
 - **Detection differs:** the system often returns fast HTTP 200s while the content is wrong, so you need
   online evals, complaint spikes and override rates, not just latency and errors.
-- **Containment and evidence differ:** levers are intents, tools, documents and model versions, and you
-  must snapshot prompt, index and model before changing anything.
+- **Containment and evidence differ:** levers are intents, tools, documents and model versions, and you must
+  snapshot prompt, index and model before changing anything.
 - **People differ:** legal, privacy, responsible AI and the vendor join early, because notification clocks
   start at awareness.
 
@@ -255,6 +301,14 @@ the previous version if available, open a vendor ticket, and add the cases to th
   config and versions.
 - **Triage legally:** personal data is involved, so legal starts the GDPR 72-hour assessment now.
 - **Scope from the trail:** runs that fetched the page and called the tool, then which sends contained data.
+
+### What would you build into an agent before launch so that incidents are containable?
+- **Per-tool, per-intent and per-tenant flags** checked in the tool executor at call time, returning a
+  structured refusal the model can relay instead of crashing the run.
+- **A tested degraded mode** (human queue or search-only) and pinned model and prompt versions you can roll
+  back to.
+- **Per-step evidence** (run ID, step, tool, arguments, retrieved document IDs) so scope is a query, plus
+  alerts on sensitive tool-call spikes.
 
 ### You fixed the bug and 10 re-runs are clean. Can you close the incident?
 - **Not for anything serious.** By the rule of three, 10 clean runs only bound the failure rate below about
@@ -267,8 +321,8 @@ the previous version if available, open a vendor ticket, and add the cases to th
 - **The trade-off is build cost,** which pays off once the system has many users and tenants.
 
 ### How do you decide whom to notify after a bad-output incident?
-- **Two numbers:** exposed requests that matched the failure condition, then the subset whose logged
-  outputs actually failed a re-run check.
+- **Two numbers:** exposed requests that matched the failure condition, then the subset whose logged outputs
+  actually failed a re-run check.
 - **Notify the second set,** as with the 187 of 312 conversations in the HR example, and confirm regulator
   duties with legal.
 
@@ -296,3 +350,24 @@ the previous version if available, open a vendor ticket, and add the cases to th
 - [ ] Re-running requests violates audit trail integrity
 > A single success is weak evidence for a probabilistic system. Measuring the failure rate across many runs
 > and pinning the cases in a regression suite shows the fix works and keeps it from silently regressing.
+
+## Use cases & projects
+### Use cases
+- **Injection-triggered tool calls.** Disabling one tool for one agent contains an exfiltration attempt while
+  the rest of the product keeps serving.
+- **Stale or poisoned retrieval.** Pulling one document and re-running the regression suite after each index
+  refresh closes a RAG incident and stops it recurring.
+- **Silent provider model updates.** The model ID in the audit trail plus a regression suite separates "the
+  provider changed" from "we changed".
+- **Notifying the right users.** Per-run evidence turns "who saw the wrong answer" into a query instead of a
+  blanket email.
+
+### Mini project
+**Incident game day for a small agent (2-3 hours).**
+- **Goal:** prove you can contain, scope and verify a fix for an agent incident in under 30 minutes.
+- **Steps:** give a RAG agent a send-email tool and per-tool flags read at call time; log run ID, step, tool
+  and retrieved document IDs; plant a document with an injected instruction to email data out; run 50 user
+  questions; detect the tool-call spike, flip the flag, snapshot config, scope affected runs from the log,
+  remove the document, and re-run the failing cases until the rule of three supports your claimed rate.
+- **Done when:** you have a timeline table like the HR example with time to contain, exposed and harmed
+  counts, and the regression cases added to CI.

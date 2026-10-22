@@ -5,7 +5,7 @@ name: Pruning
 kind: concept
 difficulty: advanced
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: background
 related:
   - training-adaptation/quantization
@@ -135,21 +135,22 @@ Reported findings from that line of work:
 widely adopted way to cut FLOPs per token; see that lesson.
 
 ## Diagram
-The pipeline behind a pruned agent model: quantization is tried first, the granularity choice decides
-whether hardware can cash in the cut, and recovery plus agent and safety evals sit between every stage.
+The pipeline behind a pruned agent model: quantization is tried first, and pruning starts only when depth
+or parameter count is the limit. Granularity decides whether hardware can cash in the cut (2:4 gives up
+to 2x matmul on Ampere and later), and recovery plus agent and safety evals follow.
 
 ```mermaid
 flowchart TD
-    P[("Dense parent model")] --> Q["Try quantization first: does it hit the target?"]
+    P[("Dense parent model")] --> Q["Quantization hits the target?"]
     Q -->|"yes"| S["Ship quantized model after evals"]
-    Q -->|"no: depth or parameter count is the limit"| C["Score importance on production prompts"]
-    C --> U["Unstructured: best accuracy, no GPU speedup"]
-    C --> T["2:4: up to 2x matmul on Ampere and later"]
-    C --> R["Structured: heads, neurons, layers, smaller dense model"]
-    T --> D["Recover: distil from the dense parent"]
+    Q -->|"no: depth or size limits"| C["Score importance on agent prompts"]
+    C --> U["Unstructured: no GPU speedup"]
+    C --> T["2:4 semi-structured"]
+    C --> R["Structured: heads, neurons, layers"]
+    T --> D["Recover: distil from parent"]
     R --> D
     D --> QZ["Quantize last"]
-    QZ --> E["Agent task, safety and step latency evals"]
+    QZ --> E["Agent task, safety, latency evals"]
     P -.->|"teacher"| D
 ```
 
@@ -423,8 +424,10 @@ track task evals and safety evals, not perplexity, and verify the KV cache budge
 ### Mini project
 **Evaluate a pruned model as an agent step (1-2 hours).**
 - **Goal:** decide whether a pruned-and-distilled small model can replace its parent for one agent step.
-- **Steps:** pick a pruned model whose model card names its parent; write 40 routing or tool-selection
-  tasks and 15 prompts the agent should refuse; run both models on them; record schema-valid outputs,
-  task accuracy, refusal rate and latency per call.
+- **Steps:** pick a pruned-and-distilled model whose model card names its parent (NVIDIA's Minitron
+  checkpoints are one family), using instruct variants or few-shot prompts if only base weights exist;
+  write 40 routing or tool-selection tasks and 15 prompts the agent should refuse; run both models in the
+  same engine and precision; record schema-valid outputs, task accuracy, refusal rate and latency per
+  call.
 - **Done when:** a side-by-side table shows the quality, safety and latency deltas, with a one-paragraph
   ship or no-ship decision.

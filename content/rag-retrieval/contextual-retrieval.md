@@ -5,7 +5,7 @@ name: Contextual retrieval
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - rag-retrieval/chunking-strategies
@@ -244,7 +244,7 @@ def save_memory(user_id, conversation, note, today):
     memory_store[mid] = {"note": note, "context": context, "user_id": user_id}   # bare note for display
     return {"status": "saved", "id": mid}
 
-# note:    "Prefers the annual plan; renewal is next month."
+# note:    "Prefers the annual plan; renewal is next month."    (saved with today = 2026-10-22)
 # context, illustrative: "Memory about Dana Lee (account acme-ops) from a billing conversation; the
 #          renewal date mentioned is in November 2026."
 # A later search for "acme-ops renewal annual plan" now matches on both legs.
@@ -294,8 +294,9 @@ Illustrative: 2,000 documents of 20,000 tokens with 50 chunks each, using the ra
 - **Matching vs generation context.** Versus parent-document retrieval it fixes matching rather than
   generation context; the two compose, and using only one leaves the other failure mode in place.
 - **Index-side fix vs per-call fixes in an agent.** Contextual retrieval adds nothing to each of the
-  agent's search calls, whereas rewriting or HyDE add to every call; the index-side fix flips to worse
-  only when corpus churn makes re-contextualising cost more than the per-call fixes would.
+  agent's search calls, whereas rewriting or HyDE add to every call; it flips to worse when corpus churn
+  makes re-contextualising cost more than the per-call fixes would, or when the failure is on the query
+  side (vague or follow-up queries), which no index change repairs.
 
 ## Pitfalls
 - **Embedding only the context or only the chunk** instead of the concatenation. The symptom is no
@@ -323,8 +324,8 @@ Illustrative: 2,000 documents of 20,000 tokens with 50 chunks each, using the ra
   similar documents, heavy pronouns and references, tables and figures whose rows are meaningless without
   headers.
 - **Try structural prefixes first;** they are free.
-- **Prefer it over query-side fixes for agents** that search many times per task, since the cost is paid
-  once per chunk instead of on every search call.
+- **Prefer it to a query-side fix for agents** that search many times per task, when failure analysis
+  shows either would close the gap, since the cost is paid once per chunk instead of on every search call.
 - **Avoid for** corpora that fit in the context window, corpora that change faster than you can afford to
   re-contextualise, and collections of short self-contained records that never lost context.
 - **Measure:** retrieval failure rate or recall@20 on a golden set before and after, with and without

@@ -5,7 +5,7 @@ name: GRPO
 kind: concept
 difficulty: advanced
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - training-adaptation/rlhf
@@ -24,8 +24,8 @@ sources:
 
 ## TL;DR
 GRPO is PPO without the value model: sample a group of agent rollouts per task and use the group's
-reward mean and spread as the baseline. With a verifiable reward (a sandbox end-state check) it is the
-usual way to RL-train agents.
+reward mean and spread as the baseline. With a verifiable reward (a sandbox end-state check) it is a
+common way to RL-train agents.
 
 ## For agent builders
 - **Why it matters for agents.** Agent tasks often have checkable outcomes: tests pass, the ticket was
@@ -164,8 +164,9 @@ flowchart TD
 
 ## Examples
 ### A verifiable reward for an agent rollout
-The reward checks the sandbox's end state, not the transcript's claims, and adds small terms for valid
-calls. Pure Python; the rollout and state dictionaries stand in for your sandbox's records.
+The reward checks the sandbox's end state, not the transcript's claims, scores zero for any malformed
+call, and mildly penalises steps past a budget of four. Pure Python; the rollout and state dictionaries
+stand in for your sandbox's records.
 
 ```python
 from statistics import mean, stdev
@@ -188,6 +189,7 @@ group = [  # 4 of G rollouts for one task, with the end state each produced
 r = [agent_reward(calls, st, expected) for calls, st in group]
 adv = [round((x - mean(r)) / (stdev(r) + 1e-4), 2) for x in r]
 print("rewards:", r, "advantages:", adv)
+# rewards: [1.0, 0.0, 0.85, 0.0] advantages: [1.0, -0.86, 0.72, -0.86]
 # The direct two-call success gets the biggest push; the detour still beats the wrong close and the
 # malformed call. Train only on the agent's own tokens; tool-result tokens are masked.
 ```

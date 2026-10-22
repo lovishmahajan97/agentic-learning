@@ -232,8 +232,10 @@ The tool schemas follow the common JSON-schema tool format; adapt the field name
 ### Worked scenario: an internal support assistant at 58 percent
 Illustrative numbers. Three sources: the product documentation site (about 4,000 pages), the support
 team's Confluence space (about 9,000 pages accumulated over six years) and a Google Drive folder of PDFs
-(about 2,500 files). Everything is chunked and embedded behind the agent's search tool; the eval set of 300
-support questions scores 58 percent "answer correct" as judged by the support leads.
+(about 2,500 files).
+
+Everything is chunked and embedded behind the agent's search tool; the eval set of 300 support questions
+scores 58 percent "answer correct" as judged by the support leads.
 
 **Failure analysis of the 126 wrong answers:**
 

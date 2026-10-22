@@ -306,10 +306,12 @@ The same change request, with and without injection.
 - **One contract suite for fakes and real adapters.** Run the same interface tests against the fake on
   every commit and against the real SDK (sandbox key or recorded responses) nightly, so the fake cannot
   drift. Monitor the nightly job; a red run means the fake lies.
-- **Reverse-order shutdown and import bans.** The root keeps disposers; on `SIGTERM` it closes the HTTP
-  server, then workers, then `pool.end()` and the Redis client. An ESLint `no-restricted-imports` rule
-  that forbids `openai`, `@anthropic-ai/sdk` and `pg` in service folders keeps the seam honest. Monitor
-  shutdown duration and CI lint failures.
+- **Reverse-order shutdown from the root.** The root keeps a list of disposers registered as it builds
+  the graph; on `SIGTERM` it closes the HTTP server, then agent workers, then `pool.end()` and the Redis
+  client. Monitor shutdown duration against the orchestrator's grace period.
+- **Ban infrastructure imports outside the root.** An ESLint `no-restricted-imports` rule that forbids
+  `openai`, `@anthropic-ai/sdk` and `pg` in agent and service folders keeps the seam honest. Monitor CI
+  lint failures.
 
 ## Trade-offs
 - **Explicit wiring vs boilerplate.** Every dependency is visible and testable, but signatures and the

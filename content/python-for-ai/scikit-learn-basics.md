@@ -190,10 +190,13 @@ def route(embedding: np.ndarray) -> str:
 |---|---|---|
 | Every request runs the agent | 10,000 | 10,000 × 4 × $0.01 = $400 |
 | Router handles 60% confidently | 4,000 | 4,000 × 4 × $0.01 = $160 |
-| Router precision above threshold | 0.95 (measured) | 5% of the 6,000 routed are wrong: 300 bad answers a day to review |
 
-The decision is the threshold: raising it sends more traffic to the agent (cost) and fewer wrong cheap
-answers (quality). Monitor both.
+- **The quality side.** If precision above the threshold measures 0.95, then 5% of the 6,000 requests
+  the router keeps are wrong: 300 bad cheap answers a day to review.
+- **The extra cost.** Each request still needs one embedding call for the router, usually a small
+  fraction of an agent run; include it in the comparison.
+- **The decision is the threshold.** Raising it sends more traffic to the agent (cost) and fewer wrong
+  cheap answers (quality). Monitor both.
 
 ### Intent classifier baseline for support tickets
 An intent classifier for support tickets, the kind of baseline you build before deciding an LLM router
@@ -241,9 +244,27 @@ Suppose 4,000 tickets across 6 intents, with `billing` at 40% of them:
 - **The decision.** If the pipeline reaches a macro-F1 close to an LLM prompt on the same test set, the
   classifier is the cheaper, faster router.
 - **Swapping in embeddings is a small change:** drop `TfidfVectorizer` and pass the `(n_samples, dim)`
-  embedding matrix as `X`; splits, scoring and baseline stay identical. For grouped evaluation on
-  precomputed embeddings, use `cross_validate(clf, X, y, groups=groups, cv=GroupKFold(n_splits=5),
-  scoring=["f1_macro", "accuracy"])` keyed on customer ID, with `C=1.0`.
+  embedding matrix as `X`; splits, scoring and baseline stay identical, as the next example shows.
+
+### Grouped evaluation on precomputed embeddings
+Same task with sentence embeddings, evaluated so one customer's tickets never sit on both sides of a
+split.
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GroupKFold, cross_validate
+
+df = pd.read_parquet("tickets_embedded.parquet")   # columns: customer_id, intent, embedding
+X = np.vstack(df["embedding"].to_numpy()).astype(np.float32)   # (n_samples, dim)
+y, groups = df["intent"].to_numpy(), df["customer_id"].to_numpy()
+
+clf = LogisticRegression(C=1.0, max_iter=1000, class_weight="balanced")
+res = cross_validate(clf, X, y, groups=groups, cv=GroupKFold(n_splits=5),
+                     scoring=["f1_macro", "accuracy"])
+print(res["test_f1_macro"].mean(), res["test_f1_macro"].std())
+```
 
 ### Worked TF-IDF weights
 Four training documents (`n` = 4), default `smooth_idf=True`:
@@ -424,8 +445,8 @@ real score will be lower but will predict production.
 **Embedding router with an LLM fallback (1-3 hours).**
 - **Goal:** route requests to one of four agent skills with a classifier, and hand only uncertain cases to
   the LLM.
-- **Steps:** label 400 requests across four routes; embed them; build a `Pipeline` with logistic
-  regression; split by user so one user's requests never appear in both train and test; compare macro-F1
+- **Steps:** label 400 requests across four routes (draft them with an LLM, then review the labels by
+  hand); embed them; build a `Pipeline` with logistic regression; split by user so one user's requests never appear in both train and test; compare macro-F1
   against `DummyClassifier`; pick a probability threshold below which the request goes to the LLM router.
 - **Done when:** you report macro-F1 versus the dummy baseline, the share of requests sent to the LLM at
   your threshold, and the accuracy of the requests the classifier keeps.

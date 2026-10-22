@@ -178,20 +178,32 @@ per_run = (steps.group_by("run_id")
                         pl.col("n_steps").quantile(0.95).alias("p95_steps"),
                         pl.col("in_tokens").mean().alias("mean_in_tokens")))
 
-print(pl.collect_all([per_tool, per_run]))   # both plans share one optimized execution pass
+print(pl.collect_all([per_tool, per_run]))   # collects both plans in one call, in parallel
 ```
 
 - **What to act on:** a tool at the top of `error_rate` with many calls, or a p95 step count creeping
   toward your loop's step budget, which means runs are hitting the cap instead of finishing.
 
 ### Worked scenario: turning agent transcripts into a clean fine-tuning set
-Raw JSONL with a field that is "always an integer" until it is not. The pipeline:
-1. **Scan with a schema:** `scan_ndjson("raw/sft.jsonl", ...)` with an explicit `schema=` (`id`,
-   `prompt`, `completion`, `source` as `pl.String`, `quality` as `pl.Float64`).
-2. **Filter:** keep `quality >= 0.7`.
-3. **Normalise:** `str.strip_chars()` and `str.to_lowercase()` on the prompt into a `key`.
-4. **Dedupe and write:** `unique(subset=["key"], keep="first", maintain_order=True)`, then
-   `clean/sft.parquet`.
+Raw JSONL with a field that is "always an integer" until it is not. An explicit schema fails fast and
+predictably, and the dedupe runs in parallel native code.
+
+```python
+import polars as pl
+
+schema = {"id": pl.String, "prompt": pl.String, "completion": pl.String,
+          "source": pl.String, "quality": pl.Float64}
+lf = (
+    pl.scan_ndjson("raw/sft.jsonl", schema=schema)       # no inference from the first rows
+      .filter(pl.col("quality") >= 0.7)                  # judge or human grade per transcript
+      .with_columns(pl.col("prompt").str.strip_chars().str.to_lowercase().alias("key"))
+      .unique(subset=["key"], keep="first", maintain_order=True)   # deterministic output order
+      .drop("key")
+)
+clean = lf.collect()
+print(clean.height, clean.null_count())                  # rows kept, nulls per column
+clean.write_parquet("clean/sft.parquet")
+```
 
 | Stage | Rows (illustrative) | Why |
 |---|---|---|
@@ -365,7 +377,8 @@ streaming engine.
 **Lazy daily rollup over agent traces (1-2 hours).**
 - **Goal:** compute daily cost and tool error rates from a large trace dataset with a lazy Polars query.
 - **Steps:** generate or export a few million step rows to Parquet (run ID, date, model, tool, status,
-  tokens, prompt text); write a `scan_parquet` query with an explicit schema that groups by date, model
-  and tool; check with `explain()` that the prompt text column is not read; run it with `collect`.
+  tokens, prompt text) with explicit column types; write a `scan_parquet` query that groups by date,
+  model and tool and ends with an explicit `.sort(...)`; check with `explain()` that the prompt text
+  column is not read; run it with `collect`.
 - **Done when:** the rollup is deterministic across two runs, `explain()` shows only the needed columns,
   and you have timed it against the same query in eager pandas on the same files.

@@ -5,7 +5,8 @@ name: Golden dataset creation with client SMEs
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - evals/golden-dataset
   - evals/inter-annotator-agreement
@@ -17,9 +18,21 @@ related:
 ---
 
 ## TL;DR
-A versioned set of the customer's real inputs with reference answers their own experts agreed on, so
-"good enough?" is settled by the customer's judgement. The hard parts are expert time, sampling,
-disagreement, data governance and formal sign-off.
+A versioned set of the customer's real tasks with reference outcomes their own experts agreed on, so
+"is the agent good enough?" is settled by the customer's judgement. The hard parts are expert time,
+sampling, disagreement, data governance and formal sign-off.
+
+## For agent builders
+- **Why it matters for agents.** Every prompt, tool or model change to a customer's agent needs a fixed
+  yardstick. Without an SME-built set, "the agent got better" means the engineer liked a few transcripts.
+- **Where it shows up in your stack.** A JSONL file of task inputs, frozen tool fixtures, reference final
+  answers or acceptance criteria and expected key actions, read by your eval harness in CI and on
+  milestone runs against the holdout.
+- **What you control.** What an item records for an agent (final answer, required and forbidden tool
+  calls, end state), how the set is sized per segment, where labelling runs, and the version id stamped
+  on every eval result.
+- **What you can skip.** Building a custom labelling UI on day one. A spreadsheet or a self-hosted
+  open-source tool inside the customer's tenant is enough until volume demands more.
 
 ## Why it exists
 - **Only the customer's experts can define the standard,** and they define it case by case. The project
@@ -38,8 +51,8 @@ disagreement, data governance and formal sign-off.
 
 ## How it works
 ### 1. Anchor the dataset to a decision
-- **Write down what it will decide:** prompt iteration, model choice, or go-live acceptance. This sets the
-  size, the error tolerance and who must sign off.
+- **Write down what it will decide:** prompt iteration, model choice, or go-live acceptance of the agent.
+  This sets the size, the error tolerance and who must sign off.
 - **Signatures differ:** an acceptance dataset needs the business owner's signature; an iteration dataset
   only needs the working SMEs.
 - **Size follows from the precision the decision needs,** per segment that has its own threshold:
@@ -56,7 +69,7 @@ At p = 0.9 and E = 0.05 that is about 140 items, for EACH segment with its own b
 - **Agree** where the data lives, who may see it, and whether de-identification is needed, before anyone labels.
 - **Expect the tool to run inside the customer's environment;** labelling tools often must.
 - **Why first:** a governance blocker found after SMEs have labelled 200 exported records means throwing
-  the work away.
+  the work away. The same rule covers the tool fixtures an agent eval replays.
 
 ### 3. Sample from production, stratified
 - **Draw candidates from real recent traffic,** stratified by the segments the business cares about.
@@ -80,8 +93,12 @@ Each item stores more than an answer, because each field answers a later questio
 | rationale citing the guideline section | lets an engineer tell a model error from a label error later |
 | ambiguous / difficulty flag | ambiguous items are scored separately, not silently counted |
 | labeller, guideline version, date | a definition change can then be traced to the labels it affects |
+| agent items: tool fixtures, required and forbidden actions | an agent run is scored on what it did, not only what it said, and fixtures make runs repeatable |
 
-- **Decide early: from scratch or correct a pre-label** (model output or engineer draft).
+- **Ask SMEs for outcomes and key actions, not full trajectories.** Many tool sequences are acceptable;
+  experts can say "must check the policy before approving" and "must never close a litigated claim"
+  far more reliably than they can write the one correct path.
+- **Decide early: from scratch or correct a pre-label** (agent output or engineer draft).
 - **Pre-labels can cut expert time substantially but anchor reviewers toward the draft,** so measure how
   often SMEs change them; a change rate near zero on hard items signals rubber-stamping.
 
@@ -89,8 +106,8 @@ Each item stores more than an answer, because each field answers a later questio
 - **Fixed fraction labelled by two experts;** compute chance-corrected agreement (Cohen's κ) per category.
 - **Disagreements go to an adjudicator,** normally the policy owner.
 - **Persistent disagreement in a category is a policy gap.** Resolve it as a written rule, not by majority
-  vote, because the model will be judged against the rule in production.
-- **Agreement caps what the metric can show:** if two experts agree on 85% of items, a model "scoring" 95%
+  vote, because the agent will be judged against the rule in production.
+- **Agreement caps what the metric can show:** if two experts agree on 85% of items, an agent "scoring" 95%
   against one of them is partly fitting that expert's quirks.
 
 ### 7. Freeze, version and sign off
@@ -100,11 +117,12 @@ Each item stores more than an answer, because each field answers a later questio
 
 ### 8. Refresh on a schedule
 - **Production drifts:** add newly sampled cases each cycle and retire items that no longer reflect policy.
+- **Tools drift too:** when a tool's response schema changes, re-record the affected fixtures and bump the version.
 - **Never edit a label silently;** changes go through the same review and bump the version.
 
 ## Diagram
 The calibration loop runs before scale-up, and disagreements become written policy rather than votes;
-only a frozen, signed version is the acceptance standard.
+only a frozen, signed version is the acceptance standard for the agent.
 
 ```mermaid
 flowchart TD
@@ -114,7 +132,7 @@ flowchart TD
     D --> E["Calibration batch, independent labels"]
     E -->|"experts split"| F["Policy owner rules, guideline revised"]
     F --> E
-    E -->|"agreement acceptable"| G["Scale up: label plus rationale"]
+    E -->|"agreement acceptable"| G["Scale up: outcome, actions, rationale"]
     G --> H["Double-label subset, adjudicate"]
     H --> I["Freeze version, split holdout"]
     I --> J["Business owner sign-off"]
@@ -122,6 +140,36 @@ flowchart TD
 ```
 
 ## Examples
+### A golden item for a claims agent, and a scorer that reads it
+The SME supplies the outcome and the key actions; the fixture freezes what the tools returned so every
+agent version is scored on the same world.
+
+```python
+item = {
+    "id": "claims-0412", "version": "1.0", "segment": "litigation",
+    "input": "FNOL: rear-end collision, third party named, attorney letter attached.",
+    "fixtures": {"get_policy": {"status": "active", "deductible": 500},
+                 "get_claim_history": {"prior_claims": 1}},
+    "reference": {"route": "litigation_desk"},
+    "required_actions": ["get_policy"],          # must check coverage before routing
+    "forbidden_actions": ["close_claim"],        # never close a claim with an attorney letter
+    "rationale": "Guideline 4.2: attorney letter -> litigation desk",
+    "labeller": "adj-2", "guideline_version": "g3", "ambiguous": False,
+}
+
+def score(item, trace):
+    """trace: {'tool_calls': [names in order], 'final': {...}} from one agent run."""
+    calls = trace["tool_calls"]
+    return {
+        "outcome": trace["final"].get("route") == item["reference"]["route"],
+        "required": all(a in calls for a in item["required_actions"]),
+        "no_forbidden": not any(a in calls for a in item["forbidden_actions"]),
+    }
+
+trace = {"tool_calls": ["get_policy", "route_claim"], "final": {"route": "litigation_desk"}}
+print(score(item, trace))   # {'outcome': True, 'required': True, 'no_forbidden': True}
+```
+
 ### Sizing calculator and agreement check
 Plug in the pass rate, the half-width the decision needs, and the minutes per item.
 
@@ -156,7 +204,7 @@ adj2 = ["fast"] * 6 + ["std"] * 3 + ["subro"]
 print(round(cohen_kappa(adj1, adj2), 2))  # 0.46, although raw agreement is 70%
 ```
 
-### Worked plan: commercial-insurance claims triage pilot (numbers illustrative)
+### Worked plan: commercial-insurance claims triage agent pilot (numbers illustrative)
 The customer offers three senior adjusters for two hours a week each, six expert-hours weekly. Target: a
 400-item set.
 
@@ -164,13 +212,13 @@ The customer offers three senior adjusters for two hours a week each, six expert
 |---|---|---|
 | 1 | Claims can be labelled only inside the customer's tenant, so the tool is deployed there and policyholder names are masked; stratified sample by line of business and claim size band | 600 candidates from the last quarter; litigation flags (roughly 3% of claims) oversampled to 40 of 400 slots instead of the 12 a proportional sample gives |
 | 2 | 30-item calibration batch labelled by all three adjusters independently | at an assumed 4 minutes per item, 90 labels, about 6 hours: the whole week's budget |
-| 2 | High agreement on fast-track routing; split on "potential subrogation" | 8 of 30 cases; the claims director rules subrogation applies only when a third party is named in the first notice, and the rule goes into the guideline and the prompt |
+| 2 | High agreement on fast-track routing; split on "potential subrogation" | 8 of 30 cases; the claims director rules subrogation applies only when a third party is named in the first notice, and the rule goes into the guideline and the agent prompt |
 | 3 to 8 | Single-label 400 items, double-label 20% | about 27 plus 5, roughly 32 expert-hours: five to six weeks of offered time, shown to the sponsor up front rather than promising three weeks; one 45-minute adjudication session per week |
 | 9 | Version 1.0 frozen, stratified split | 240 iteration / 160 holdout; 16 litigation items land in the holdout |
 
 Before anyone signs, the FDE runs the interval arithmetic in front of the sponsor:
 - **Overall:** on 160 holdout items, 90% routing accuracy carries about ±5 points (√(0.9·0.1/160) ≈ 0.024).
-- **Litigation:** on 16 items, an 85% floor carries about ±17 points, which cannot separate a good system
+- **Litigation:** on 16 items, an 85% floor carries about ±17 points, which cannot separate a good agent
   from a poor one.
 - **Signed bar:** 90% overall on the holdout, and 85% on litigation measured on those 16 plus 60
   litigation claims sampled and labelled after iteration ends (about 4 more expert-hours). That gives
@@ -182,11 +230,14 @@ Before anyone signs, the FDE runs the interval arithmetic in front of the sponso
   runs happened, because every look erodes its independence.
 - **Versioned dataset files.** Keep the set as JSONL with a version number and changelog in git, or in a
   data-versioning tool such as DVC for large files, and record the dataset version and content hash in
-  every eval result. Monitor label churn between versions.
+  every agent eval result. Monitor label churn between versions.
+- **Frozen tool fixtures per item.** Record the tool responses an item needs and replay them in the eval
+  harness instead of calling live systems, so a score change means the agent changed, not the customer's
+  data. Monitor fixture misses (the agent called a tool the item has no fixture for).
 - **Labelling inside the customer's tenant.** Deploy a self-hostable labelling tool (Label Studio is one
   open-source option) in the customer's cloud account or VPC, with masking applied before records reach
   the UI. Monitor that no export paths leave the tenant.
-- **Pre-label change-rate tracking.** When SMEs correct model drafts, log whether each draft was changed
+- **Pre-label change-rate tracking.** When SMEs correct agent drafts, log whether each draft was changed
   and report the change rate per difficulty stratum each week. A rate near zero on hard items is the
   rubber-stamping alarm.
 - **Weekly agreement report.** Compute κ per category on the double-labelled subset and send any category
@@ -201,6 +252,8 @@ Before anyone signs, the FDE runs the interval arithmetic in front of the sponso
   intervals are tighter than the decision needs, spend the time on rare strata instead.
 - **Early freeze vs early mistakes.** A stable target, but early mistakes freeze too; keep a short revision
   window after the first full eval run before declaring the acceptance version.
+- **Outcome-only vs action-level labels.** Outcome labels are cheap and robust to many valid paths; adding
+  required and forbidden actions catches unsafe agents that land on the right answer, at extra SME time.
 
 ## Pitfalls
 - **Engineers writing reference answers while SMEs only spot-check.** Symptom: a high eval score followed by
@@ -214,10 +267,12 @@ Before anyone signs, the FDE runs the interval arithmetic in front of the sponso
 - **Signing a segment threshold the holdout is too small to test.** Symptom: a go/no-go meeting where a
   3-item swing in a 16-item segment decides the outcome.
 - **Skipping the formal sign-off.** Symptom: the acceptance bar is renegotiated after results come in.
+- **Scoring agents against one exact trajectory.** Symptom: valid alternative tool orders fail and the
+  team starts "fixing" correct behaviour. Fix: label outcomes plus required and forbidden actions.
 
 ## When to use
-- **Use for** any deployment where the customer's experts, not a public benchmark, decide whether outputs
-  are acceptable, which is nearly every enterprise deployment.
+- **Use for** any agent deployment where the customer's experts, not a public benchmark, decide whether
+  outputs are acceptable, which is nearly every enterprise deployment.
 - **Start in the first two weeks of a pilot,** in parallel with the first prototype, because SME
   scheduling and data access are the long poles.
 - **A vendor-built iteration set is fine for day-one debugging,** but it must never be the acceptance standard.
@@ -250,6 +305,12 @@ reduced confidence explicitly, because the risk is theirs to accept.
   output, which then discredits both the score and the team.
 - **Sign-off needs ownership:** a set the customer built is one the business owner can sign as the bar.
 
+### What does a golden item need for a tool-calling agent that it does not need for a classifier?
+- **Frozen tool fixtures,** so each run sees the same world and score changes reflect the agent, not live data.
+- **Required and forbidden actions** from the SME (check coverage first, never close a litigated claim),
+  because a right answer reached through an unsafe action still fails the customer.
+- **Outcome rather than one exact path,** since many tool orders are valid and SMEs cannot reliably write the one true trajectory.
+
 ### How many golden items do you need for a go-live decision?
 - **Work from the decision:** n ≈ 1.96² · p(1−p) / E² per segment that has its own threshold; at p = 0.9
   and E = 0.05 that is about 140.
@@ -258,24 +319,25 @@ reduced confidence explicitly, because the risk is theirs to accept.
   sponsor the weeks it costs before promising a date.
 
 ### Two experts agree on 85% of calibration items. What does that tell you?
-- **A ceiling on the metric:** a model scoring far above 85% against one expert is partly fitting that
+- **A ceiling on the metric:** an agent scoring far above 85% against one expert is partly fitting that
   expert's quirks, not policy.
 - **Look per category:** use Cohen's κ, because raw agreement overstates consistency when one label dominates.
 - **Fix the cause:** categories with persistent splits go to the policy owner for a written rule, then the
   guideline and the affected labels are updated.
 
-### When would you use model pre-labels, and what is the risk?
+### When would you use agent pre-labels, and what is the risk?
 - **Use when** expert time is the binding constraint and the task has many easy items, because correcting
   a draft is faster than labelling from scratch.
-- **Risk:** anchoring, where reviewers accept plausible drafts and the set inherits the model's errors,
+- **Risk:** anchoring, where reviewers accept plausible drafts and the set inherits the agent's errors,
   inflating its own score.
 - **Control:** measure the change rate per difficulty stratum, and keep some items labelled from scratch to compare.
 
-### Data cannot leave the customer's environment. How do you build the set?
+### Data cannot leave the customer's environment. How do you build the set and run agent evals?
 - **Bring the tool to the data:** deploy labelling inside the customer's tenant, with de-identification or
   masking applied before records are shown.
+- **Run the harness there too:** fixtures recorded from customer systems are customer data, so the eval job
+  runs in the same boundary.
 - **Store only what you may:** keep record ids so items can be traced and deleted if the customer revokes a record.
-- **Do it first:** settle access before labelling starts, because labels made in the wrong place are wasted expert time.
 
 ## Quiz
 ### Q: Two adjusters disagree on a category in a quarter of calibration cases. What should happen?
@@ -301,3 +363,23 @@ reduced confidence explicitly, because the risk is theirs to accept.
 - [ ] It matches the distribution of a public benchmark
 > Authority comes from the customer's agreement, not size or vendor expertise. Without sign-off, the
 > bar tends to be renegotiated after results are seen.
+
+## Use cases & projects
+### Use cases
+- **Go-live acceptance for a customer agent.** A signed, frozen set and threshold decide whether a claims,
+  support or operations agent launches.
+- **Regression suite for agent changes.** Every prompt, tool-schema or model upgrade runs the iteration
+  split in CI before merge.
+- **Model or vendor selection.** Two candidate models run the same agent on the same fixtures, scored
+  against SME outcomes rather than public benchmarks.
+- **Safety gating of write actions.** Forbidden-action labels catch agents that reach the right answer
+  through an action the customer never allows.
+
+### Mini project
+**Build a 30-item agent golden set with fixtures (2-3 hours).**
+- **Goal:** create a small, versioned golden set for a tool-calling agent and score two agent versions on it.
+- **Steps:** pick a toy domain (refund requests); write 30 items with input, tool fixtures, reference outcome,
+  required and forbidden actions and a rationale; have a colleague label 10 independently and compute κ;
+  write a harness that replays fixtures and applies `score`; run a weak and a strong prompt.
+- **Done when:** the set is a versioned JSONL file, κ on the overlap is reported, and you have a table of
+  outcome, required-action and forbidden-action pass rates for both agent versions.

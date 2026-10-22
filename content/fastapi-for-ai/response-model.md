@@ -5,7 +5,7 @@ name: response_model
 kind: concept
 difficulty: core
 est_minutes: 11
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - fastapi-for-ai/pydantic-request-response-models

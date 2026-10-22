@@ -33,8 +33,9 @@ mid-run failures into deploy-time crashes.
   plain-Python worker, an eval runner and a background job queue; one class shared by all of them.
 - **What you control.** The prefix, the source order (env vs secret files), nested groups per tool,
   constraints such as `Field(gt=0)`, and `SecretStr` so a logged config or trace never shows a key.
-- **What you can skip.** Writing custom sources unless you read from a vault; the five built-in sources
-  cover almost every deployment.
+- **What you can skip.** Writing custom sources. The four default sources (init kwargs, env vars, dotenv,
+  secret files) cover most deployments, and the package ships optional ones (YAML, TOML, JSON files and
+  cloud secret stores) you enable in `settings_customise_sources`.
 
 ## Why it exists
 - **Everything is a string.** With `os.environ.get` scattered through the code, `TIMEOUT="30"` must be
@@ -195,7 +196,7 @@ An agent averages 6 steps per run; the search tool is first called on step 4. So
 
 | Approach | When it fails | Cost before the failure is visible |
 |---|---|---|
-| `float(os.environ[...])` inside the tool | Step 4 of every run | 3 model calls per run wasted, user sees an error |
+| `float(os.environ[...])` inside the tool | Step 4 of every run | 4 model calls per run wasted (steps 1-3 plus the call that requested search), user sees an error |
 | Typed `Settings()` at startup | Deploy | Zero runs; the rollout stops and names the field |
 
 ### Making mounted secret files authoritative
@@ -378,8 +379,8 @@ settings without a restart.
   at startup, so a bad deploy fails the health check instead of the first user run.
 - **Per-environment agent behaviour.** Staging runs a cheap model with tracing on; production runs a
   stronger model with tighter step limits, all from the same `Settings` class.
-- **Tool feature flags.** Boolean fields enable or disable individual tools per tenant or environment,
-  parsed correctly so `"false"` really means off.
+- **Tool feature flags.** Boolean fields enable or disable individual tools per environment or
+  deployment, parsed correctly so `"false"` really means off. Per-tenant choices belong in request data.
 - **Eval runners.** The eval harness reuses the agent's `Settings`, overriding only the model and dataset
   path, so evaluated and deployed configs cannot drift apart.
 

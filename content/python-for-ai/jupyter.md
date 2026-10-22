@@ -5,7 +5,7 @@ name: Jupyter
 kind: tool
 difficulty: intro
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - python-for-ai/pandas
@@ -314,12 +314,15 @@ Then I would move the comparison into a script or eval harness so it can be re-r
 - **Fix:** restart the kernel, which reliably frees the memory, load the model once in an early cell, and
   avoid displaying large tensors.
 
-### `pip install` succeeded in a cell, but the next cell raises `ModuleNotFoundError`. Why?
-- **`!pip` runs whichever `pip` is first on the server's `PATH`,** which may belong to another
-  environment than the kernel's.
-- **Use `%pip`,** which installs with the kernel's own interpreter.
-- **Prevent it per project:** register the environment with `python -m ipykernel install --user --name`
-  and select that kernel.
+### When would you not use a notebook for agent work?
+- **For anything scheduled, reused or served,** such as the agent loop itself or its eval harness,
+  because notebooks are hard to test, type-check and monitor; that logic belongs in a package the
+  notebook imports.
+- **For results others will rely on, unless re-run cleanly,** because out-of-order state can produce
+  numbers the visible code does not explain, such as a prompt that "wins" against a stale variant.
+- **Environment drift is a smaller version of the same risk:** `!pip` can install into another
+  interpreter (a `pip install` that succeeds, then `ModuleNotFoundError`), so use `%pip` and a registered
+  project kernel.
 
 ### How do you keep notebooks safe and reviewable in a team repository?
 - **Strip outputs on commit** with `nbstripout --install`, because saved outputs bloat diffs and can carry

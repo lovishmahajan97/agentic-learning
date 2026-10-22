@@ -5,7 +5,8 @@ name: Supply-chain security for models & datasets
 kind: practice
 difficulty: core
 est_minutes: 17
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - python-for-ai/safetensors
   - python-for-ai/hugging-face
@@ -23,9 +24,23 @@ sources:
 ---
 
 ## TL;DR
-Hub models and datasets are dependencies that can execute code on load, hide backdoors in weights, and
-carry poisoned data. Treat them as build artifacts: pinned, hashed, scanned, signed, quarantined and
-loaded with least capability, because nobody can review ten billion floats.
+The open-weight models, adapters, chat templates and datasets behind your agent are dependencies that can
+run code on load, hide backdoors and carry poisoned data. Treat them as build artifacts: pinned, hashed,
+scanned, signed, quarantined, loaded with least capability.
+
+## For agent builders
+- **Why it matters for agents.** A backdoored model inside an agent does not just say something wrong; it
+  can pick a tool and arguments on a trigger phrase. The chat template also decides how tool calls are
+  formatted, so a swapped template changes agent behaviour without touching a weight.
+- **Where it shows up in your stack.** Self-hosted models in vLLM or similar engines, LoRA adapters
+  fine-tuned for tool use, embedding models for RAG, `tokenizer_config.json` chat templates, and the
+  datasets you fine-tune or evaluate agents on.
+- **What you control.** Safetensors only, `trust_remote_code=False`, pinned commit hashes and per-file
+  SHA-256, an internal registry with quarantine, and behavioural acceptance evals that include tool-calling
+  and refusal behaviour.
+- **What you can skip.** If you only call hosted APIs, the artifact pipeline is your provider's job; you
+  still own your fine-tuning and eval datasets. Backdoor detection research is also skippable: there is no
+  general detector, so limit blast radius instead.
 
 ## Why it exists
 - **Software supply chains have a decade of tooling** (lockfiles, CVE databases, signed packages, SBOMs).
@@ -37,7 +52,7 @@ loaded with least capability, because nobody can review ten billion floats.
   from the repo on every load.
 - **3. Weights cannot be reviewed.** A backdoor (behaviour triggered by a specific input, otherwise
   invisible) was shown in classifiers by Gu et al. in 2017 and in LLMs by Hubinger et al. in 2024, where
-  trigger behaviour survived standard safety training.
+  trigger behaviour survived standard safety training. Nobody can review ten billion floats.
 - **4. Datasets are often lists of URLs, not content.** Carlini et al. showed in 2024 that buying expired
   domains referenced in web-scale datasets controls what future downloaders receive; about US$60 would
   have bought control of 0.01% of LAION-400M or COYO-700M.
@@ -59,7 +74,7 @@ loaded with least capability, because nobody can review ten billion floats.
 | **Licence and provenance** | not security in the narrow sense, but the same pipeline: gated models, consent and usage restrictions on datasets |
 
 - **Templates are code.** A malicious chat template can inject hidden instructions into every prompt
-  without touching a weight.
+  without touching a weight; for an agent that includes how tool definitions and tool results are framed.
 - **Templates can execute.** A 2024 vulnerability in llama-cpp-python showed that rendering an untrusted
   template outside a sandbox could execute code on the server.
 - **So configs are part of the artifact,** not metadata around it.
@@ -87,16 +102,16 @@ loaded with least capability, because nobody can review ten billion floats.
 6. **Dataset provenance.** Snapshot content rather than URLs, hash the snapshot, store it immutably, keep a
    manifest. For URL-indexed sets, verify per-item hashes captured at curation time, the mitigation
    Carlini et al. recommend. Deduplicate and inspect outliers.
-7. **Behavioural acceptance.** Run your eval suite, including safety and refusal behaviour, on every
-   ingested model or adapter, and compare with the publisher's reported numbers for the same checkpoint. A
-   large unexplained gap suggests you do not have the weights you think you have. Backdoor detection in
-   general is unsolved, so this is a sanity check, not a guarantee.
+7. **Behavioural acceptance.** Run your eval suite, including safety, refusal and (for agents) tool-call
+   behaviour, on every ingested model or adapter, and compare with the publisher's reported numbers for the
+   same checkpoint. A large unexplained gap suggests you do not have the weights you think you have.
+   Backdoor detection in general is unsolved, so this is a sanity check, not a guarantee.
 8. **Least privilege at load time.** Convert, scan and evaluate in a sandbox with no network and no
    production secrets, because the first time an artifact executes anything is during these steps.
 
 ## Diagram
-An artifact moves from the public hub to serving only through quarantine, checks and signing; serving
-nodes never talk to the hub.
+An artifact moves from the public hub to the agent's serving cluster only through quarantine, checks and
+signing; serving nodes never talk to the hub.
 
 ```mermaid
 flowchart TD
@@ -198,6 +213,22 @@ print(meta["w"]["shape"], struct.unpack("<2f", st[8 + n + start:8 + n + end]))
 - **The lesson:** any file-format check that only looks at the extension misses this; the format itself
   decides whether loading can run code.
 
+### Worked scenario: accepting a community tool-calling fine-tune
+A team wants a community LoRA that tops a function-calling leaderboard to power an internal agent with a
+ticketing tool and a shell-free deploy tool. The acceptance run on their own suite (illustrative numbers):
+
+| Check | Base model | Community fine-tune | Verdict |
+|---|---|---|---|
+| Format and code | safetensors, no remote code | safetensors, no remote code | pass |
+| Tool-call accuracy on 200 internal tasks | 81% | 90% | better |
+| Refusal on 50 unsafe tool requests | 94% | 62% | fail: safety stripped |
+| Calls `deploy` unprompted on 30 odd-token probes | 0 of 30 | 2 of 30 | investigate as a possible trigger |
+
+- **Decision:** reject for the agent with a deploy tool, because two unprompted consequential calls is
+  exactly the backdoor-shaped behaviour scanning cannot see.
+- **Alternative:** reproduce the fine-tune in-house from an audited tool-calling dataset, or use the
+  community adapter only behind read-only tools.
+
 ## Production patterns
 - **Offline serving nodes.** Serving and training jobs load only from the registry path, with the Hugging
   Face client forced offline (`HF_HUB_OFFLINE=1`) and network egress to public hubs blocked. Monitor
@@ -205,6 +236,9 @@ print(meta["w"]["shape"], struct.unpack("<2f", st[8 + n + start:8 + n + end]))
 - **Ingestion CI job.** A pipeline per new model or revision: fetch, then work in a no-network sandbox
   with no secrets, reject pickle files, run picklescan or modelscan, record SHA-256 for every file, run evals, then
   promote. Track scan coverage at ingestion (target 100%) and time from upstream release to promotion.
+- **Agent acceptance evals in the promotion gate.** Before a model or adapter can back an agent, run
+  tool-call accuracy, refusal on unsafe tool requests and unprompted-consequential-call probes against
+  the base model. Block promotion on any regression in safety metrics, not just on task accuracy.
 - **Signed artifacts verified at deploy.** Sign the promoted bundle with `cosign sign-blob` (or sign an OCI
   artifact that wraps it) and verify the signature in the deploy step before load. Monitor the share of
   production models with a verified signature.
@@ -226,6 +260,9 @@ print(meta["w"]["shape"], struct.unpack("<2f", st[8 + n + start:8 + n + end]))
 - **Snapshotting dataset content vs storage and licensing.** It removes split-view poisoning and makes
   training reproducible, at the cost of storing terabytes you previously only referenced and taking on
   licence obligations for holding copies.
+- **Community fine-tunes vs in-house training.** A community tool-calling adapter is free and fast, but
+  its provenance is unverifiable; reproducing it from an audited dataset costs GPU time and data work and
+  is the only way to trust it behind consequential tools.
 
 ## Pitfalls
 - **`torch.load` on community checkpoints on a laptop with cloud credentials.** Symptom: a security alert
@@ -237,8 +274,8 @@ print(meta["w"]["shape"], struct.unpack("<2f", st[8 + n + start:8 + n + end]))
 - **Treating a leaderboard score as evidence of safety.** Symptom: a fine-tune that performs well on the
   benchmark has had its refusal behaviour stripped, discovered by a customer.
 - **Reviewing weights, ignoring tokenizer and chat template.** Symptom: the model behaves differently in
-  your serving stack than in the reference implementation, or unexplained text appears in rendered prompts
-  in your traces.
+  your serving stack than in the reference implementation, tool calls are parsed wrongly, or unexplained
+  text appears in rendered prompts in your traces.
 - **Building datasets from live URLs at training time.** Symptom: the training data differs from what was
   audited, and model behaviour nobody can reproduce.
 
@@ -247,6 +284,8 @@ print(meta["w"]["shape"], struct.unpack("<2f", st[8 + n + start:8 + n + end]))
   adapters, embedding models, tokenizers, and every dataset used for training or evaluation.
 - **Lighter version for experiments:** safe formats and no remote code at minimum, because laptops hold
   credentials too.
+- **Avoid over-investing when:** your agent only calls a hosted API; then focus on your own fine-tuning
+  and eval datasets and on vendor review.
 - **Measure:** the fraction of production models served from the registry (target 100%), the share of
   artifacts with recorded hashes and signatures, scan coverage at ingestion, and time from upstream release
   to promoted availability.
@@ -293,6 +332,14 @@ dataset.
 - **Fix** by pinning a commit hash, verifying hashes and the file set on every load, and serving only from
   the internal registry.
 
+### What would you require before a self-hosted model can back an agent with consequential tools?
+- **Artifact floor:** safetensors, no remote code, pinned commit, hashed file set including the chat
+  template, served from the signed registry.
+- **Agent acceptance evals:** tool-call accuracy, refusal on unsafe tool requests and probes for unprompted
+  consequential calls, compared with the base model.
+- **Blast-radius limits anyway:** typed tools, approval gates and least-privilege credentials, because a
+  trained-in backdoor can pass every check.
+
 ### What can artifact scanning not catch, and what do you do about it?
 - **It cannot catch backdoors trained into the weights** or subtle data poisoning, because those are
   ordinary floats; there is no general detector.
@@ -337,3 +384,24 @@ dataset.
 > Scanners detect dangerous code and integrity failures, but backdoored behaviour is encoded in ordinary
 > floating-point weights; only behavioural evaluation, provenance and limiting blast radius address it,
 > and none of them fully.
+
+## Use cases & projects
+### Use cases
+- **Self-hosting the model behind an agent.** The registry, pins and hash checks decide which exact bytes
+  pick your agent's tools in production.
+- **Adopting tool-calling adapters.** Behavioural acceptance with refusal and unprompted-call probes is how
+  teams vet community LoRAs before wiring them to real tools.
+- **Fine-tuning on agent traces.** Snapshotted, hashed datasets keep the training data identical to what
+  was audited and reproducible later.
+- **Answering an enterprise security review.** The AI-BOM and signatures show which model, adapter and
+  dataset power each agent deployment.
+
+### Mini project
+**Build an acceptance gate for agent models (2-3 hours).**
+- **Goal:** a script that decides whether a small open-weight model may back a two-tool agent.
+- **Steps:** download a small model by pinned commit with the safe loader above; record hashes and verify
+  the file set; write 20 tool-calling tasks, 10 unsafe tool requests and 10 odd-token probes for a fake
+  `deploy` tool; run them against the base model and one fine-tune; emit a pass or fail report with
+  per-check numbers and an AI-BOM JSON listing model, revision and hashes.
+- **Done when:** the gate fails on a tampered `tokenizer_config.json`, reports tool-call accuracy and
+  refusal rate for both models, and blocks promotion on any refusal regression.

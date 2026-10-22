@@ -5,7 +5,8 @@ name: Platform strategy
 kind: decision
 difficulty: advanced
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - llmops-platform/centralized-vs-federated-ai-platform
   - llmops-platform/ai-control-plane-vs-data-plane
@@ -17,14 +18,27 @@ related:
 ---
 
 ## TL;DR
-Platform strategy decides which AI capabilities are provided once as a shared internal product and which
-stay with teams. Platformise what is widely needed, low-variance or risky organisation-wide; leave
-differentiating parts with teams; build after demand appears.
+Platform strategy decides which agent capabilities are shared internal products and which stay with
+teams. Platformise what is widely needed, low-variance or risky organisation-wide (gateway, tool
+credentials, traces); leave agent logic with teams; build after demand appears.
+
+## For agent builders
+- **Why it matters for agents.** Every agent team needs model access, tool credentials, trace logging,
+  per-run budgets and an approval step. The platform boundary decides whether you get those from a
+  shared core or build them yourself, and whether your agent can be audited and its model swapped.
+- **Where it shows up in your stack.** The gateway endpoint and per-team key your agent calls, the model
+  alias it requests, the trace schema its steps are logged in, and shared tool servers (for example MCP
+  servers in front of internal systems) with scoped credentials.
+- **What you control.** Calling the platform's stable interfaces instead of a vendor SDK, tagging every
+  request with team and feature, and keeping your agent loop, prompts and tool selection team-owned.
+- **What you can skip.** Funding-model politics and org design detail; know the three scoring questions
+  and the break-even inequality well enough to argue where your agent's needs belong.
 
 ## Why it exists
 - **The same needs recur.** Past a couple of AI projects, every team needs an API key to a model
   provider, prompt and cost logging, document ingestion, an eval set and harness, PII redaction and a
-  review UI. Left alone, each team builds its own.
+  review UI. Agent teams add tool wrappers with credentials and an approval step. Left alone, each team
+  builds its own.
 - **Duplication has visible costs:** duplicated engineering, and several contracts with the same provider
   at worse prices.
 - **And invisible ones:** no single inventory of where models are used, no consistent data-retention
@@ -44,6 +58,8 @@ differentiating parts with teams; build after demand appears.
 - **List what each current and roadmapped use case needs, layer by layer:** model access, routing and
   fallback, secrets, prompt and model registry, retrieval and ingestion, evaluation, observability and
   cost attribution, guardrails, human review.
+- **For agents, add the agent-specific layers:** tool access to internal systems, tool credentials and
+  scopes, trajectory tracing, per-run step and spend budgets, approval gates, and sandboxes for code tools.
 - **The inventory is the demand signal.** Without it, the platform is designed from imagination.
 
 ### 2. Score each capability on three questions
@@ -109,9 +125,21 @@ such as tokens once usage is significant.
 - **Why:** the centralisation that gives you one place to swap a model also gives you one place to break
   all of them.
 
+### 9. Where agent capabilities usually land
+| Agent capability | Variance | Externality | Usual home |
+|---|---|---|---|
+| Tool credentials and scopes for internal systems | low | high (over-scoped access, leaked secrets) | mandatory core |
+| Trajectory traces in one schema | low | high (audit, incident replay) | mandatory core |
+| Per-run step and spend budgets | low | high (runaway loops burn shared spend) | mandatory core |
+| Shared tool servers for common systems (CRM, tickets) | medium | medium | paved road |
+| Approval-gate service and review UI | medium | medium | paved road |
+| Agent loop, planning, prompts, tool selection | high | low | team-owned |
+
+- **The pattern:** what an agent is *allowed* to touch and spend is central; how it *decides* stays local.
+
 ## Diagram
-Run each capability through this decision path: externalities pull it into the core even at low demand,
-while high variance keeps it with teams however many need it.
+Run each capability, agent tool credentials included, through this decision path: externalities pull it
+into the core even at low demand, while high variance (agent loops) keeps it with teams.
 
 ```mermaid
 flowchart TD
@@ -124,7 +152,7 @@ flowchart TD
     N -->|"yes"| E{"Break-even holds?"}
     E -->|"yes"| PAVED["Paved road default"]
     E -->|"no"| TEAM
-    CORE --> I["Stable interface: gateway, trace schema"]
+    CORE --> I["Stable interface: gateway, tools, traces"]
     PAVED --> I
 ```
 
@@ -189,6 +217,21 @@ illustrative):
 6. **Agent frameworks stay team-owned:** only two teams use them and their needs differ, so a shared
    abstraction now would freeze the wrong design.
 
+### Worked scenario: shared tool access for agent teams
+Two, then four, agent teams each wrap the CRM API as a tool with their own service account. Plug the
+break-even inequality in ($k per year, illustrative); the incident term is the expected cost of an
+over-scoped credential letting an agent write where it should only read.
+
+| Case | Teams cost (n × c_team + incident) | Platform cost (C + n × c_adopt + coord) | Decision |
+|---|---|---|---|
+| n=2, c_team 30, incident 50 | 60 + 50 = 110 | 60 + 10 + 10 = 80 | centralise |
+| n=2, no incident term | 60 | 80 | leave with teams |
+| n=4, incident 50 | 120 + 50 = 170 | 60 + 20 + 10 = 90 | centralise |
+
+- **Same shape as the gateway:** least-privilege tool credentials justify a shared tool server early,
+  because one agent's mis-scoped key is everyone's audit finding.
+- **What each team keeps:** which tools its agent sees, the tool descriptions in its prompt, and its loop.
+
 ## Production patterns
 - **Gateway with per-team keys and budgets** — as the first core release, put an OpenAI-compatible proxy
   (open-source such as LiteLLM's proxy, or a commercial gateway) in front of approved models, issue one key
@@ -205,6 +248,12 @@ illustrative):
   how often teams request bypass routes.
 - **Exception register for off-road teams** — any team leaving the paved road records owner, reason and a
   review date. Monitor the count; a rising number means the paved road no longer fits.
+- **Per-run budgets for agents in the gateway** — tag each request with an agent run ID and cap steps or
+  spend per run, so one looping agent cannot exhaust a team's budget. Monitor runs that hit the cap and
+  spend per completed task.
+- **Scoped tool credentials from the core** — agents get short-lived, least-privilege credentials for
+  each internal system through a shared tool layer instead of team-held service accounts. Monitor tool
+  calls denied by scope and any credential used outside its registered agent.
 
 ## Trade-offs
 - **Mandatory core vs latency and autonomy.** One inventory, one audit trail and one place to swap models,
@@ -218,6 +267,9 @@ illustrative):
   need them.
 - **Chargeback vs adoption.** Chargeback aligns usage with cost but taxes adoption; prefer showback until
   the platform is the default path and token spend is material.
+- **Shared tool servers vs agent-specific tools.** One tool server per internal system removes duplicate
+  wrappers and centralises scopes, but its generic tool descriptions may suit no agent well; let teams
+  wrap or rename tools on top when their eval shows tool-selection errors.
 
 ## Pitfalls
 - **Building a comprehensive platform before any consumer exists.** Symptom: a polished system with low
@@ -232,12 +284,16 @@ illustrative):
   show up as provider invoices finance cannot map to any registered workload.
 - **Running the gateway like an internal tool rather than tier-one infrastructure.** A single gateway
   incident takes down every AI feature at once, followed by teams asking for bypass routes.
+- **Leaving agent tool credentials with each team.** Symptom: service accounts with write scopes nobody
+  remembers granting, and no way to say which agent made a change. Fix: issue scoped credentials from the
+  core and log every tool call against an agent run ID.
 
 ## When to use
 - **Use when:** two or three teams are building on models, or earlier if a compliance or spend externality
   already exists.
 - **Start with the thin core:** gateway, identity, budgets, logging. Add paved-road components when demand
-  is proven and variance is low.
+  is proven and variance is low. For agents, add scoped tool credentials and trajectory traces to the core
+  as soon as the first agent can write to a system of record.
 - **Measure:** adoption, time to first production call, share of traffic and spend through the core, lead
   time on the platform's top consumer requests, and the number of approved exceptions (a rising count
   means the paved road no longer fits).
@@ -297,6 +353,14 @@ so convergence later is cheap.
   where policy allows, decided before the first incident.
 - **Numbers to watch:** added p99 latency, error rate per upstream model, and share of traffic through it.
 
+### Three agent teams each built their own CRM tool wrapper. What, if anything, do you centralise?
+- **Centralise access, not behaviour.** Move credentials, scopes and audit logging of CRM calls into a
+  shared tool server or tool layer, because over-scoped write access is an organisation-wide risk.
+- **Leave the agent side with teams:** which tools each agent sees, how they are described in its prompt,
+  and its loop and planning, since those vary by use case.
+- **Check the economics:** run the break-even with the incident term, and track tool-call errors per team
+  after migration so the shared wrapper does not hurt tool selection.
+
 ## Quiz
 ### Q: Which capability is the strongest candidate for the mandatory platform core?
 - [ ] A chunking strategy tuned for one team's contracts
@@ -321,3 +385,25 @@ so convergence later is cheap.
 - [ ] It has no effect, because the costs are the same either way
 > Billing teams for a platform they could bypass makes bypassing look cheaper locally. Showback first
 > builds cost awareness without that incentive, and chargeback works once the core is unavoidable.
+
+## Use cases & projects
+### Use cases
+- **Onboarding the second agent team.** The platform gives them a gateway key, a model alias, a trace
+  schema and scoped tool credentials on day one, so they build only their agent loop.
+- **Swapping a model under every agent.** A deprecated model is replaced by remapping an alias once each
+  agent team's evals pass on the replacement.
+- **Containing a runaway agent.** Per-run budgets in the gateway stop one looping agent before it
+  exhausts its team's monthly spend.
+- **Auditing what an agent did.** One trace store answers which agent run made a CRM change, with which
+  credential, after which tool result.
+
+### Mini project
+**A thin agent platform core (2-3 hours).**
+- **Goal:** put a small gateway in front of a tool-calling agent that enforces per-run budgets and logs
+  every step in one trace schema.
+- **Steps:** write a proxy function that every model call goes through, adding team, feature and run-ID
+  tags; cap steps and spend per run; route tool calls through a wrapper that checks a per-agent scope list;
+  write each model call and tool call as one trace record; run a mock agent with two tools, including one
+  forced loop.
+- **Done when:** the looping run is stopped at the cap, an out-of-scope tool call is denied and logged, and
+  a per-feature cost report and a single run's full trajectory can both be printed from the trace store.

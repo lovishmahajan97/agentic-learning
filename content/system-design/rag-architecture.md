@@ -5,7 +5,7 @@ name: RAG architecture
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - rag-retrieval/chunking-strategies
@@ -310,11 +310,11 @@ each time and burns its whole search budget before giving up.
 - **Golden query set as a CI gate.** Keep labeled (query, expected chunk ids) pairs per domain and
   compute recall@k and reranker precision on every chunking, embedding or prompt change. Add the queries
   your agent actually wrote from traces, since they differ from human queries. Fail the build on a
-  regression beyond a threshold you set.
+  regression beyond a threshold you set, and monitor faithfulness separately on sampled live traffic.
 - **One trace per request, one span per search.** Emit query, rewritten query, retrieved ids and scores,
   final prompt and answer under one trace id (for example as OpenTelemetry span attributes, viewed in
-  LangSmith or Langfuse). Classify each failure as "retrieval missed" or "model ignored the passage", and
-  monitor search calls per task.
+  LangSmith or Langfuse). Review traces tagged by user feedback, classify each failure as "retrieval
+  missed" or "model ignored the passage", and monitor search calls per task.
 - **Index lag and deletion tracking.** Drive ingestion from source change events where possible and
   propagate deletes as tombstones. Monitor lag as source `updated_at` minus indexed time, and alert
   when deleted documents still appear in citations.

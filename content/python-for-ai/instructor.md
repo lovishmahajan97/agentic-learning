@@ -5,7 +5,7 @@ name: Instructor
 kind: tool
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/pydantic

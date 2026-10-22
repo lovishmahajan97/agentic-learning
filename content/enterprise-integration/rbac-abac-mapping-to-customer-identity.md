@@ -5,7 +5,8 @@ name: RBAC / ABAC mapping to customer identity
 kind: pattern
 difficulty: advanced
 est_minutes: 17
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - enterprise-integration/sso-iam-integration
   - enterprise-integration/scim-provisioning
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-Mapping is the per-tenant layer that turns customer IdP group IDs into your roles (RBAC) and customer
-attributes into policy inputs (ABAC). Keep it as config keyed by immutable IDs, evaluated per request,
-because retrieval and agents are where wrong mappings leak.
+Every agent tool call and retrieval needs an allow or deny for this user. The mapping layer turns customer
+IdP group IDs into your roles (RBAC) and attributes into policy inputs (ABAC), kept as per-tenant config
+and evaluated per request.
+
+## For agent builders
+- **Why it matters for agents.** Retrieval and tool calls are where wrong mappings leak. An agent can
+  paraphrase a restricted document or run an action the user could never click, so the allow or deny must
+  happen in code before the model sees data or a tool executes.
+- **Where it shows up in your stack.** The retrieval filter in front of the vector store, a gate wrapped
+  around every tool your agent runtime exposes, the list of tools offered to the model per user, and the
+  decision log next to your agent traces.
+- **What you control.** The rule that effective permission = user rights ∩ agent scope, fail-closed
+  defaults, which tools a principal is even shown, and per-tenant mapping config keyed by immutable group IDs.
+- **What you can skip.** Formal access-control theory and building your own policy language. Pick an
+  in-process function first, and Cedar, OPA or OpenFGA when rules or object graphs grow.
 
 ## Why it exists
 - **Nobody designed the two sides to fit.** A customer's Entra or Okta directory has groups like
@@ -80,6 +93,8 @@ channels, Salesforce public groups), not the IdP groups your role bindings use. 
 1. **At login (OIDC/SAML) and on SCIM updates**, build the principal: stable user key, group IDs (including
    nested groups resolved by the IdP or Graph), mapped roles and attributes.
 2. **Cache with a short TTL** and invalidate on SCIM events.
+3. **Hand the principal to the agent runtime, not to the model.** Tools read it from the session; the model
+   never supplies user, tenant or role as an argument.
 
 ### Enforcing
 - **One policy decision point**, *because* scattered `if` statements cannot be audited.
@@ -96,6 +111,10 @@ channels, Salesforce public groups), not the IdP groups your role bindings use. 
   and generation, never by asking the model to withhold.
 - **Agents:** effective permission = user permission ∩ agent's granted scope. The agent never gains rights
   the user lacks, and a broadly entitled user does not make a narrow agent broad.
+- **Tool exposure:** offer the model only tools the principal may call, *and* re-check at execution,
+  because the model can still emit a call to a tool name it saw elsewhere (or was told about by injected text).
+- **Resource-level checks inside tools:** a `read_ticket(id)` tool allowed by role must still check that
+  this ticket is visible to this user, because the model picks the ID.
 - **Audit:** log the decision inputs (principal, rule matched) so a customer can ask "why could Ana see this?"
 
 ## Diagram
@@ -160,6 +179,40 @@ print(can_act(ana, "query", agent_scope={"export"}))                       # Fal
   denies the AMER deal.
 - **The agent cannot amplify her.** An agent scoped only to `export` cannot query on her behalf.
 
+### Gating every agent tool call
+Runnable standard library, reusing the idea above: the runtime filters the tool list per principal and
+re-checks each call, including the resource the model chose.
+
+```python
+AGENT_SCOPE = {"deal_assistant": {"query", "summarize"}}
+TOOL_ACTION = {"search_deals": "query", "summarize_deal": "summarize", "export_deals": "export"}
+USER_ACTIONS = {"ana": {"query", "export"}}            # from role bindings
+DEAL_REGION = {"D-1": "EMEA", "D-2": "AMER"}
+USER_REGION = {"ana": "EMEA"}
+
+def allowed_actions(user: str, agent: str) -> set:
+    return USER_ACTIONS.get(user, set()) & AGENT_SCOPE.get(agent, set())   # intersection
+
+def tools_for_model(user: str, agent: str) -> list[str]:
+    return [t for t, a in TOOL_ACTION.items() if a in allowed_actions(user, agent)]
+
+def execute(user: str, agent: str, tool: str, args: dict) -> dict:
+    action = TOOL_ACTION.get(tool)
+    if action not in allowed_actions(user, agent):
+        return {"error": f"denied: {tool} not permitted", "rule": "user ∩ agent scope"}
+    deal = args.get("deal_id")
+    if deal and DEAL_REGION.get(deal) != USER_REGION.get(user):
+        return {"error": f"denied: {deal} outside your region", "rule": "abac.region"}
+    return {"ok": f"{tool}({args})"}
+
+print(tools_for_model("ana", "deal_assistant"))                    # ['search_deals'] only
+print(execute("ana", "deal_assistant", "export_deals", {}))        # denied: not in agent scope
+print(execute("ana", "deal_assistant", "search_deals", {"deal_id": "D-2"}))  # denied: ABAC
+```
+
+- **Denials go back to the model as tool results** with a reason, so the agent can explain instead of
+  retrying, and the rule name lands in the decision log.
+
 ### Query-time resolution of source principals
 Pure Python, runnable. Documents keep source principal IDs; each user gets a cached set of principals they
 hold, built from the crosswalk and synced source-group membership.
@@ -199,16 +252,21 @@ print(visible({"confluence:user:unknown-guest"}, held))   # False: unresolved gr
 - **Mapping as versioned, reviewed config.** Store each tenant's `role_bindings`, `attribute_map` and
   policies as data with change history, edited through an admin UI or reviewed change, never in code.
   Monitor unmapped-user counts per tenant after each change.
+- **A tool gate in the agent runtime.** Wrap every tool with one check (user ∩ agent scope, then the
+  resource-level rule) and filter the tool list shown to the model per principal. Monitor denied tool calls
+  by tool and rule; a spike often means a prompt or injection is pushing the agent toward a forbidden tool.
 - **Fail closed with a data-quality alarm.** Deny when a required attribute is missing, and alert when the
   missing rate for `region` or `department` exceeds a threshold you agree with the customer. Monitor
   denied-request reasons.
 - **Externalised policies when rules grow.** Move rules to an engine such as Cedar, where the regional rule is
   `permit (principal, action == Action::"read", resource) when { principal.region == resource.region };`,
-  or to OpenFGA/SpiceDB for folder-and-share graphs. Monitor decision latency on the request path.
+  or to OpenFGA/SpiceDB for folder-and-share graphs. Monitor decision latency on the request path, which
+  is paid on every agent step.
 - **Decision logs that answer "why".** Log principal, resource, action and the rule that matched for every
-  retrieval and agent decision. Monitor by sampling: a customer admin reviews a set of decisions each quarter.
+  retrieval and agent decision, linked to the agent trace. Monitor by sampling: a customer admin reviews a
+  set of decisions each quarter.
 - **Canary users per sensitive group.** Keep test users in HR, legal and each region, and run scheduled
-  retrieval queries as them that must and must not return known documents. Alert on any wrong answer.
+  agent queries as them that must and must not return known documents. Alert on any wrong answer.
 
 ## Trade-offs
 - **RBAC reviewability vs role explosion.** Role bindings are easy for customer admins to review, but
@@ -217,10 +275,14 @@ print(visible({"confluence:user:unknown-guest"}, held))   # False: unresolved gr
 - **ABAC compactness vs attribute quality.** Decisions depend on the customer's directory; if `department` is
   blank for a third of users, policies silently deny or over-grant.
 - **Carried ACLs vs live checks.** Carrying source ACLs keeps you consistent with existing permissions, but
-  inherits their mistakes and lags by a sync cycle. Live checks against the source are exact but slow.
+  inherits their mistakes and lags by a sync cycle. Live checks against the source are exact but slow, and
+  an agent may make several retrieval calls per answer.
 - **Central engine vs in-process library.** A central policy engine gives auditability and consistent
   decisions but adds a dependency on the request path. An in-process library is faster and enough while
   rules stay simple.
+- **Hiding tools vs showing and denying.** Hiding forbidden tools keeps the model from trying them and saves
+  prompt tokens; showing them and returning denials lets the agent explain what the user cannot do. Either
+  way the execution-time check is mandatory.
 
 ## Pitfalls
 - **Binding roles to group display names.** Symptom: a customer renames a group and all its members lose or
@@ -231,6 +293,8 @@ print(visible({"confluence:user:unknown-guest"}, held))   # False: unresolved gr
   answers, paraphrased.
 - **Agents with a service identity broader than the user.** Symptom: an agent completes an action the user
   could not perform directly in the UI.
+- **Checking the tool but not the resource.** Symptom: a user allowed to `read_ticket` gets another team's
+  ticket because the model guessed its ID. Fix: resource-level check inside the tool.
 - **Index-time expansion for large groups.** Symptom: index write volume and permission lag spike whenever
   HR moves people between big groups.
 - **Ignoring nested groups.** Symptom: users whose access comes through a parent group see nothing.
@@ -239,6 +303,8 @@ print(visible({"confluence:user:unknown-guest"}, held))   # False: unresolved gr
 - **Use when** a second customer brings its own directory, and before any AI feature indexes customer content.
 - **Start with** role bindings by group ID plus carried source ACLs.
 - **Add ABAC** when customers ask for regional, classification or clearance restrictions.
+- **Gate every tool** from the first agent release; retrofitting permissions after tools ship is how
+  incidents happen.
 - **Measure:** unmapped-user counts per tenant, denied-request reasons, and periodic access reviews where a
   customer admin checks a sample of decisions.
 - **Interviews:** explain how user rights, agent scope and document ACLs combine, and where the decision is
@@ -294,6 +360,13 @@ everything.
 - **Fix it upstream:** alert on missing-attribute rate, agree a cleanup or fallback attribute with the IAM
   admin, and test before rollout.
 
+### Where exactly do you enforce permissions in a tool-calling agent, and why not in the system prompt?
+- **Three places in code:** the retrieval filter before ranking, the tool list offered per principal, and a
+  gate at execution that re-checks the action and the specific resource.
+- **Not the prompt**, because instructions can be overridden by injected content or ignored, and the model
+  chooses IDs and arguments you must not trust.
+- **Log each decision with the trace**, so a customer can see why the agent could or could not act.
+
 ## Quiz
 ### Q: Why should role bindings reference IdP group object IDs rather than names?
 - [ ] IDs are shorter, so tokens are smaller
@@ -318,3 +391,23 @@ everything.
 - [ ] When users belong to only one group each
 > Expressing attribute combinations as roles multiplies them, one per combination; ABAC states the rule once
 > over attributes, at the cost of depending on attribute quality.
+
+## Use cases & projects
+### Use cases
+- **ACL-aware RAG assistants.** Retrieval filters on source ACLs and region or classification attributes
+  before ranking, so answers never paraphrase restricted content.
+- **Tool-gated action agents.** A deal or support agent sees only the tools its scope and the user's role
+  allow, with resource checks inside each tool.
+- **Multi-tenant agent platforms.** Each customer's mapping config binds its own group IDs to your roles
+  without code changes.
+- **Access reviews and audits.** Decision logs linked to agent traces answer "why could Ana see this?"
+
+### Mini project
+**Permission gate for a three-tool agent (2-3 hours).**
+- **Goal:** enforce user ∩ agent scope plus one ABAC rule on every tool call and retrieval of a small agent.
+- **Steps:** define two tenants' mapping configs keyed by fake group IDs; build `search_deals`,
+  `read_deal` and `export_deals` tools; filter the tool list per principal; add a region rule inside
+  `read_deal`; log each decision with the rule matched; try a prompt that asks the agent to export or to
+  read another region's deal.
+- **Done when:** forbidden tools never execute, cross-region reads return a denial the agent explains, a
+  renamed group display name changes nothing, and the decision log names the rule for every call.

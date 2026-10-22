@@ -5,7 +5,7 @@ name: Memory & performance profiling
 kind: practice
 difficulty: advanced
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - python-for-ai/gil
@@ -462,8 +462,8 @@ unbounded (a real leak). Then fix, rerun the same workload, and confirm RSS stay
 **Profile a slow, leaky agent worker (2-3 hours).**
 - **Goal:** find and fix one latency problem and one memory problem in a small agent service.
 - **Steps:** build an agent with three independent fake tools that each sleep, called one after another,
-  and a session store that keeps every transcript forever; time 50 runs; attach `py-spy` to confirm where
-  the worker waits; take `tracemalloc` snapshots before and after 500 sessions and compare top allocations;
+  and a session store that keeps every transcript forever; time 50 runs; attach `py-spy` with `--idle`
+  to confirm where the worker waits (without it, sleeping threads are left out); take `tracemalloc` snapshots before and after 500 sessions and compare top allocations;
   run the independent tools concurrently and cap or evict session history.
 - **Done when:** you have a before/after table of p50 run latency and process memory, the snapshot diff
   points at the session store, and memory stays flat after the fix.

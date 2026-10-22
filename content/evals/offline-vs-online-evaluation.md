@@ -5,7 +5,7 @@ name: Offline vs online evaluation
 kind: decision
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - evals/a-b-testing

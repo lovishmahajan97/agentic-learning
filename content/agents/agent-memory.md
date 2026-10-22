@@ -5,7 +5,7 @@ name: Agent memory (short-term, long-term, episodic)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/memory-retrieval-update-deletion-policies
@@ -410,8 +410,8 @@ where the agent must answer with the latest value.
 **Add scoped, dated long-term memory to a chat agent (2-3 hours).**
 - **Goal:** an agent that remembers user facts across sessions, prefers the newest value and never shows
   one user's facts to another.
-- **Steps:** extract facts at session end into a store with user id, timestamp and source; supersede
-  near-duplicates instead of appending; filter by user before scoring; blend relevance with a small
+- **Steps:** extract facts at session end into a store with user id, timestamp and source; accept
+  writes only from user turns and verified tool results; supersede near-duplicates instead of appending; filter by user before scoring; blend relevance with a small
   recency term; render the top facts with dates in a labelled block; write a test set of 10 users whose
   details change between sessions plus a cross-user canary.
 - **Done when:** the agent answers with the latest value for every changed detail, the canary returns no

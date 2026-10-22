@@ -5,7 +5,7 @@ name: LiteLLM
 kind: tool
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/openai-sdk
@@ -464,7 +464,7 @@ silent permanent failover with worse quality is noticed.
 **Route one agent across two providers (2-3 hours).**
 - **Goal:** run the same tool-calling agent on two providers and prove the fallback works.
 - **Steps:** write one agent loop with a single tool using LiteLLM; configure a primary and a fallback
-  model; run 10 tasks on each; force a primary failure (for example an invalid model name) and confirm
-  the fallback serves; log per-task cost and tool-call parse success.
+  model in a `Router`; run 10 tasks on each; force a primary failure (point the primary deployment at an
+  unreachable `api_base`) and confirm the fallback serves; log per-task cost and tool-call parse success.
 - **Done when:** you have a per-provider table of success, cost and latency, plus a note on any parameter
   that behaved differently or was dropped.

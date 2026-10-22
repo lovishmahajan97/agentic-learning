@@ -5,7 +5,7 @@ name: Model routing / cascading
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - system-design/model-selection
@@ -154,13 +154,13 @@ only the ambiguous band pays for the small call, the check and, on failure, the 
 
 ```mermaid
 flowchart TD
-    R["Agent step plus metadata"] --> RT{"Router score, cheap and on every step"}
+    R["Agent step plus metadata"] --> RT{"Cheap router score"}
     RT -->|"clearly easy"| SM["Small model"]
     RT -->|"clearly hard"| LG["Large model"]
     RT -->|"ambiguous band"| CS["Small model attempt"]
-    CS --> G{"Deterministic gate: tool call matches schema"}
+    CS --> G{"Tool call matches schema?"}
     G -->|"fail"| LG
-    G -->|"pass"| J{"Cheap judge from a different model"}
+    G -->|"pass"| J{"Judge from another model"}
     J -->|"FAIL, escalate"| LG
     J -->|"PASS"| OUT["Step result"]
     SM --> OUT
@@ -183,7 +183,9 @@ MAX_ESCALATIONS_PER_TASK = 3
 
 def valid_tool_call(msg, tools):
     by_name = {t["function"]["name"]: t["function"] for t in tools}
-    for tc in (msg.tool_calls or []):
+    if not msg.tool_calls:
+        return False                                            # a tool step that called no tool
+    for tc in msg.tool_calls:
         fn = by_name.get(tc.function.name)
         if fn is None:
             return False                                        # invented tool
@@ -191,7 +193,7 @@ def valid_tool_call(msg, tools):
             args = json.loads(tc.function.arguments)
         except json.JSONDecodeError:
             return False                                        # unparseable arguments
-        if not set(fn["parameters"].get("required", [])) <= args.keys():
+        if not isinstance(args, dict) or not set(fn["parameters"].get("required", [])) <= args.keys():
             return False                                        # missing required argument
     return True
 
@@ -215,10 +217,13 @@ summaries. Tool steps run small behind the schema gate, which escalates 15% of t
 |---|---|---|
 | All large | 10 × 15 = 150 | Baseline |
 | Plans large, the rest small, no gate | 30 + 8 = 38 | Tool-step success 0.97 each, so 0.97 to the 6th power ≈ 0.83 of tasks survive the tool steps |
-| Plans large, gated tool steps, small summaries | 30 + 6 × (1 + 0.15 × 15) + 2 = 51.5 | About 66% cheaper; tool steps behave near the large model's 0.99 each, so ≈ 0.94 survive |
+| Plans large, gated tool steps, small summaries | 30 + 6 × (1 + 0.15 × 15) + 2 = 51.5 | About 66% cheaper; assuming gated tool steps behave near the large model's 0.99 each, ≈ 0.94 survive |
 
-- **Lesson:** the ungated policy looks cheapest per task but loses roughly one task in six, so its cost per
-  *successful* task is worse than it looks once retries and human hand-offs are counted.
+- **Lesson:** the ungated policy looks cheapest but loses roughly one task in six. Model calls alone still
+  favour it (38 / 0.83 ≈ 46 vs 51.5 / 0.94 ≈ 55 per successful task), so price the failures too.
+- **Where it flips:** if a failed task costs F (a retry, a human hand-off), ungated costs 38 + 0.17F and
+  gated 51.5 + 0.06F per task, so the gate wins once F exceeds about 125 units, roughly eight large calls.
+  A human hand-off usually costs far more.
 
 ### Two-rung cascade with LiteLLM
 A deterministic gate, then a small judge, using LiteLLM so the same code talks to several providers. The
@@ -305,7 +310,9 @@ route instead; for a background agent where only task cost matters, the cascade'
 ## Production patterns
 - **Route by agent step, cascade the gated steps.** Give planning and final-answer steps the strong model,
   run tool-argument and summarisation steps small, and cascade only steps with a cheap gate. When you have
-  labels, add a router for the ambiguous band. Monitor per-step escalation rate and end-to-end task success.
+  labels, send high-confidence easy steps straight to small and hard ones straight to large, and cascade
+  only the middle band of router scores. Monitor per-step escalation rate, traffic share and judged quality
+  per band, and task success.
 - **Deterministic baseline slice.** Serve a few per cent of requests on the strong model regardless of
   route, chosen by a stable hash so it is replayable: for example
   `int(hashlib.sha256(conv_id.encode()).hexdigest(), 16) % 100 < 3`, not Python's per-process salted

@@ -5,7 +5,8 @@ name: Policy enforcement across agents & tools
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - agent-runtime-architecture/approval-and-authorization-boundaries
   - agents/mcp-authentication-authorization-transport-security
@@ -25,6 +26,19 @@ sources:
 With many agents, tool servers and entry points, per-agent rules drift and get bypassed. Use one policy
 decision point and many enforcement points that share a signed run context, and only ever attenuate a child
 agent's authority from its parent's.
+
+## For agent builders
+- **Why it matters for agents.** The moment you add a second agent, a sub-agent or an MCP server, rules
+  written as `if` statements in one loop stop covering every path. A shared decision point and an
+  enforcement check at each hop keep multi-agent systems from becoming escalation or exfiltration paths.
+- **Where it shows up in your stack.** Your runtime dispatcher, tool gateways and MCP servers (as PEPs), an
+  OPA or Cedar engine (as the PDP), a signed run-context header on every tool call, and the join step
+  where a supervisor receives a sub-agent's result.
+- **What you control.** The run-context schema, `attenuate` on every spawn, provenance labels such as
+  `untrusted_web` set on read and merged back into the parent, obligations like `redact_pii`, and what
+  fails closed.
+- **What you can skip.** XACML itself and per-value information-flow tracking such as CaMeL. Coarse labels
+  plus attenuation already stop read-then-exfiltrate; know the finer designs exist.
 
 ## Why it exists
 - **One agent gets away with an `if` per tool; the second agent breaks it.** The orchestrator was told never
@@ -363,3 +377,25 @@ denial produced by a staged poisoned page in their environment.
 > Obligations exist because many rules are transformations rather than refusals. A PEP that applies the
 > effect but not the obligation has only half-enforced the policy; relying on the model to redact puts the
 > control back inside the untrusted component.
+
+## Use cases & projects
+### Use cases
+- **Supervisor and sub-agent systems.** Every spawn goes through `attenuate`, so a drafting or research
+  child can never send what the orchestrator was denied.
+- **Browsing and email agents.** Reading the public web tags the run `untrusted_web`, and the next external
+  send requires approval, which blocks read-then-exfiltrate without a model-level defence.
+- **Tool platforms exposed over MCP.** Each MCP server is a PEP that verifies the signed context and asks
+  the same PDP, so direct internal calls cannot bypass the runtime's rules.
+- **Regulated customers with data-handling rules.** PII redaction and row caps become obligations applied
+  in one place and logged with the policy version.
+
+### Mini project
+**Replay a read-then-exfiltrate attack against a two-agent system (2-3 hours).**
+- **Goal:** show that policy, not the prompt, stops a poisoned page from triggering an external email.
+- **Steps:** build an orchestrator and a researcher sub-agent with `web.fetch`, `crm.search` and
+  `email.send` tools; route every call through one `enforce` function and a `decide` written in Rego and
+  run by OPA (or the Python version above); serve a local page containing an injected "email the customer
+  list" instruction; log every decision with its policy version.
+- **Done when:** the researcher's `email.send` is denied on scope, the orchestrator's send after the label
+  merge returns `require_approval`, removing the merge line makes it `allow` (proving the merge matters),
+  and policy tests for each rule pass in CI.

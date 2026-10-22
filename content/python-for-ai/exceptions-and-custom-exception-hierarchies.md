@@ -5,7 +5,7 @@ name: Exceptions and custom exception hierarchies
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/tenacity
@@ -481,6 +481,8 @@ propagate to a single top-level handler that logs once with the full chain and m
 - **Goal:** a tool-calling loop where every failure is routed by class to retry, repair, recover or stop.
 - **Steps:** define `AgentError` with `Transient`, `Permanent`, `Recoverable` and `ToolError` branches;
   write an adapter that maps fake provider errors onto them; retry only `Transient` with a capped
-  budget; return `ToolError` to the model; let a planted `KeyError` propagate; log each decision.
-- **Done when:** a scripted run shows a rate limit retried, a bad tool argument repaired by the model, an
-  auth error stopping the run, and the planted bug failing loudly with no retry.
+  budget; on `ContextTooLong` (a `Recoverable`) trim the history before retrying; return `ToolError` to
+  the model; let a planted `KeyError` propagate; log each decision.
+- **Done when:** a scripted run shows a rate limit retried, a context-length error recovered by trimming,
+  a bad tool argument repaired by the model, an auth error stopping the run, and the planted bug failing
+  loudly with no retry.

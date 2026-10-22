@@ -5,7 +5,7 @@ name: Model serving
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - serving-inference/engines
@@ -28,8 +28,8 @@ call is a stateful loop of unknown length whose KV cache grows while it runs, so
 model, decides how fast every agent step returns.
 
 ## For agent builders
-- **Why it matters for agents.** One agent task is 5 to 50 sequential model calls, each blocked on the
-  previous one. Task latency is the sum of every step's queueing, prefill and decode, so serving behaviour
+- **Why it matters for agents.** One agent task is several to dozens of sequential model calls, each
+  blocked on the previous one. Task latency is the sum of every step's queueing, prefill and decode, so serving behaviour
   multiplies across the loop instead of showing up once.
 - **Where it shows up in your stack.** The base URL your agent framework points at: a provider API, or a
   self-hosted engine (vLLM, SGLang, TGI) behind an OpenAI-compatible endpoint, plus the gateway, router
@@ -182,16 +182,17 @@ print(f"TTFT={first*1000:.0f} ms, chunks={n}, "
 ```
 
 ### Agent scenario: timing every step of a tool-calling loop
-Point the same client at the engine from an agent loop and log per-step latency and token counts. Tool
-calling on a self-hosted engine needs the server started with its tool-call parsing options enabled (see
-your engine's docs for the parser that matches your model).
+Point the same client at the engine from an agent loop and log per-step latency and token counts.
+- **Use a tool-trained model.** Llama 3.1 Instruct was trained for tool calls; the original Llama 3 was not.
+- **Enable tool parsing on the server.** In vLLM that is `--enable-auto-tool-choice` plus a
+  `--tool-call-parser` matching the model's format (check the vLLM tool-calling docs for the name).
 
 ```python
 import time, json
 from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
-MODEL = "meta-llama/Meta-Llama-3-8B-Instruct"
+MODEL = "meta-llama/Llama-3.1-8B-Instruct"   # serve this one for the agent run
 tools = [{"type": "function", "function": {
     "name": "search_docs", "description": "Search internal docs",
     "parameters": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}}}]

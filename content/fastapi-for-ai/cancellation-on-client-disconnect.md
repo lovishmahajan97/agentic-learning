@@ -5,7 +5,7 @@ name: Cancellation on client disconnect
 kind: pattern
 difficulty: advanced
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - fastapi-for-ai/asgi-lifecycle
@@ -67,6 +67,9 @@ children, clean up in `finally`, and shield the accounting.
 - **Recent Starlette cancels the iterator.** For a `StreamingResponse`, it runs the body iterator alongside
   a task that listens for `http.disconnect` and cancels the iterator when it arrives, so an `async for`
   over the provider stream receives `CancelledError`.
+- **That listener depends on the server.** Starlette uses it when the server reports an ASGI spec version
+  below 2.4, as Uvicorn's HTTP protocol does; for 2.4 servers it stops only when the next `send` fails,
+  which waits for the next chunk.
 - **Belt and braces.** The exact behaviour has changed across releases, so also check `is_disconnected()`
   between chunks, and open the upstream stream with `async with` so leaving the block closes the
   upstream connection.

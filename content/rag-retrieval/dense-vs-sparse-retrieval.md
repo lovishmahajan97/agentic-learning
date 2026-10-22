@@ -5,7 +5,7 @@ name: Dense vs sparse retrieval
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - rag-retrieval/bm25-internals
@@ -170,8 +170,8 @@ flowchart TD
 
 ## Examples
 ### One fused search tool vs two tools for the agent
-Two ways to expose retrieval. Separate tools let the model pick, but models often pick the wrong one;
-a single tool that runs both arms and fuses is the safer default. The routing regex mirrors the
+Two ways to expose retrieval. Separate tools let the model pick, but it will misroute some queries
+(an id sent to semantic search); a single tool that runs both arms and fuses is the safer default. The routing regex mirrors the
 identifier detector below.
 
 ```python

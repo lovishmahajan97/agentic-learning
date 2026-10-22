@@ -283,6 +283,37 @@ except RuntimeError as e:
 - **Cheap when writers touch disjoint data;** it degrades into retry storms when many writers rewrite the
   same partitions, and that is when you serialize writers through one job instead.
 
+### Agent scenario: a trace table for evals and deletion
+Agent steps land in a Delta table in batches; an eval pins the version it scored; a user's deletion request
+removes their steps in one commit. Same `deltalake` package as above.
+
+```python
+import pyarrow as pa
+from deltalake import DeltaTable, write_deltalake
+
+traces = "s3://ai-lake/silver/agent_steps"
+
+steps = pa.table({
+    "run_id": ["r-17", "r-17"], "step": [1, 2], "user_id": ["u-42", "u-42"],
+    "tool": ["search_docs", "create_ticket"], "ok": [True, True],
+    "latency_ms": [420, 1310], "date": ["2026-10-01", "2026-10-01"],
+})
+write_deltalake(traces, steps, mode="append", partition_by=["date"])   # batch flush, not per step
+
+dt = DeltaTable(traces)
+eval_snapshot = dt.version()            # store this next to the agent prompt and model id in the eval record
+
+dt.delete("user_id = 'u-42'")           # commits a new version without the user's rows
+# The rows still exist in eval_snapshot until vacuum removes files older than the retention window,
+# so the deletion SLA and the eval-reproducibility window are the same setting.
+```
+
+| Question | Where the answer comes from |
+|---|---|
+| Did the agent eval drop because of the prompt or the data? | re-run the old prompt against `eval_snapshot` of the chunk table |
+| Which tool fails most for tenant X this week? | scan of the trace table, partition-pruned by date |
+| Is user u-42 gone everywhere? | delete commit, then vacuum after retention, then purge the vector index and memory store |
+
 ## Production patterns
 - **Scheduled compaction per table.** For tables fed by streaming appends, run `OPTIMIZE` (Delta) or the
   `rewrite_data_files` procedure (Iceberg on Spark) on a schedule, after ingestion windows. Monitor file
@@ -297,6 +328,9 @@ except RuntimeError as e:
 - **Merge-on-read for CDC tables.** For continuously upserted tables, enable deletion vectors (Delta) or
   merge-on-read deletes (Iceberg, Hudi) and compact regularly so read-time merge cost stays bounded. Monitor
   scan time and the number of delete files per data file.
+- **Batched trace sink for agents.** Agent teams buffer step events (from OpenTelemetry or their own logger)
+  and append them to a date-partitioned trace table every few minutes, then compact daily. Monitor append
+  lag, small-file count and the share of runs with a complete step sequence.
 
 ## Trade-offs
 - **Open files vs operations work.** Any engine can read the data without copies, but you now operate
@@ -336,7 +370,10 @@ except RuntimeError as e:
 - **Measure** file count and average file size per table, bytes scanned versus rows returned (skipping
   effectiveness), snapshot retention versus storage growth, and time from deletion request to physical
   removal.
-- **Day to day,** the lakehouse is where the RAG pipeline's stage tables and the training manifest live.
+- **Day to day,** the lakehouse is where the RAG pipeline's stage tables, the agent trace table and the
+  training manifest live.
+- **Use for agents when** you need to replay, evaluate or fine-tune on agent runs across teams, or prove a
+  user's agent history was deleted; a single small agent can log to Postgres instead.
 - **Interviews:** explain how an atomic commit over immutable files yields ACID, and why the vector index is
   derived from a table rather than being the source.
 
@@ -380,17 +417,25 @@ resolve the same table and access policy.
   date or tenant so writers touch disjoint data.
 - **Then serialize** the remaining hot writers through one job, and track retries per table.
 
+### An agent eval score dropped overnight with no prompt change. How does the lakehouse help you find out why?
+- **Every eval records the snapshot it read:** compare the chunk and embedding table versions of the two runs,
+  and re-run yesterday's prompt against today's snapshot and vice versa.
+- **If the data moved,** the table log shows which commits landed (a re-chunk merge, a backfill, a delete), so
+  the drop traces to a pipeline change.
+- **If nothing moved,** look at the model, the tools or the eval itself.
+
 ### When would you not put data in a lakehouse?
 - **Request-path serving:** sub-100 ms lookups belong in Postgres, a key-value store or the vector database,
   because object storage has high per-request latency.
 - **Small single-service data:** a few gigabytes owned by one service is simpler in Postgres.
 - **Keep the lakehouse as the source** those serving stores are rebuilt from.
 
-### A customer asks you to prove a user's data is deleted. What do you check?
+### A customer asks you to prove a user's data, including their agent traces, is deleted. What do you check?
 - **The delete commit:** a `DELETE` or `MERGE` produced a new version without the rows.
 - **Old snapshots:** the rows still exist in prior versions until snapshot expiry and vacuum run, so check
   retention (Delta's default vacuum threshold is 7 days) and that the job ran.
-- **Derived stores:** the vector index, caches and any materialized training snapshots must also be purged.
+- **Derived stores:** the vector index, caches, the agent's long-term memory store and any materialized
+  training snapshots must also be purged.
 
 ### Why do training runs record a snapshot id, and what can break it?
 - **Reproducibility:** re-reading a pinned version returns identical rows, so a regression can be traced to a
@@ -427,3 +472,23 @@ resolve the same table and access policy.
 > Time travel works precisely because old files are retained. A delete commits a new version without the
 > rows, but the previous version remains readable until its files are expired, so the retention job is
 > part of the deletion guarantee.
+
+## Use cases & projects
+### Use cases
+- **Agent trace warehouse.** Every step of every run lands in one table that cost reports, failure analysis
+  and fine-tuning exports all read through the same catalog.
+- **Reproducible agent evals.** Each eval run records the chunk-table snapshot it retrieved from, so a score
+  change is attributed to data or to the agent.
+- **Source of truth for retrieval indexes.** The vector store behind an agent's search tool is rebuilt from
+  versioned chunk and embedding tables after an outage or vendor move.
+- **Deletion requests across agent data.** One `DELETE` commit plus vacuum, followed by purges of the index and
+  memory store, gives an auditable answer to "is this user gone?"
+
+### Mini project
+**Pin agent evals to lakehouse snapshots (1-2 hours).**
+- **Goal:** show that an agent eval score change can be traced to a data commit.
+- **Steps:** with the `deltalake` package on a local directory, write a small chunk table; build an in-memory
+  index from it and run 10 scripted questions through a tiny retrieval agent, recording `dt.version()`;
+  merge a change that breaks one answer; re-run; then re-run the old prompt against the old version.
+- **Done when:** a two-row table shows score and snapshot version per run, the table history names the commit
+  that caused the drop, and time travel to the old version restores the original score.

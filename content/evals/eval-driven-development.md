@@ -5,7 +5,7 @@ name: Eval-driven development
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - evals/golden-dataset
@@ -376,10 +376,10 @@ latency or benign refusals exceed budget, or if the judge cannot yet be trusted 
 - **Two differences:** the checks are probabilistic and graded with thresholds and *k* samples, and the
   suite grows from production traces and error analysis, not from the specification alone.
 
-### The team ships prompt changes daily. How do you structure eval gates so they do not slow it down?
-- **Tier by cost:** deterministic graders on every commit, a judge-graded smoke subset per pull request,
-  the full set nightly, human review or an online A/B before release, because a gate that takes an
-  hour gets skipped.
+### Your agent team ships prompt and tool-description changes daily. How do you structure eval gates so they do not slow it down?
+- **Tier by cost:** deterministic outcome and trajectory graders on every commit, a judge-graded smoke
+  subset per pull request, the full task set nightly, human review or an online A/B before release,
+  because a gate that takes an hour gets skipped.
 - **Make it trustworthy:** *k* samples per item, a tolerance band sized from repeated baseline runs
   (roughly 2-3 standard deviations), per-slice floors and a list of regressed items, so it does not flake.
 - **Promote judges carefully:** a judge blocks merges only after its agreement with human labels is

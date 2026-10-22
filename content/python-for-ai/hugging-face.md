@@ -5,7 +5,7 @@ name: Hugging Face (transformers, datasets, tokenizers, accelerate, PEFT, TRL)
 kind: tool
 difficulty: core
 est_minutes: 22
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - python-for-ai/pytorch
@@ -214,6 +214,8 @@ from peft import LoraConfig
 from trl import SFTConfig, SFTTrainer
 
 # Each row: {"messages": [{"role": "user", ...}, {"role": "assistant", ...}]}
+# Agent traces also hold assistant tool_calls and role "tool" messages; how the tool
+# schemas are passed (for example a "tools" column) depends on your TRL version.
 ds = load_dataset("json", data_files="support_chats.jsonl", split="train")
 ds = ds.train_test_split(test_size=0.05, seed=0)
 

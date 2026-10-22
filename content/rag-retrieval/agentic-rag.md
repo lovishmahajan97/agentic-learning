@@ -5,7 +5,7 @@ name: Agentic RAG
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/agent-loop

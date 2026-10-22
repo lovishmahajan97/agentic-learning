@@ -5,7 +5,8 @@ name: AI roadmap
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - scoping/ai-use-case-discovery
   - scoping/roi-model
@@ -17,13 +18,27 @@ related:
 ---
 
 ## TL;DR
-An AI roadmap is a sequenced portfolio of use cases, each a hypothesis with an evidence gate, plus the
-shared capabilities early bets build for later ones. It commits to outcomes and learning milestones, not
-to named models or dates for everything.
+An AI roadmap for agents is a sequenced portfolio of agent use cases, each a hypothesis with an eval
+gate, plus the shared capabilities early agents build for later ones. It commits to outcomes and earned
+autonomy, not named models or dates.
+
+## For agent builders
+- **Why it matters for agents.** The roadmap decides which agent you build first, how much autonomy it
+  starts with, and which shared pieces (model gateway, tool layer, eval harness, approval UI) it must
+  leave behind. A badly sequenced roadmap means every agent team rebuilds its own tool wrappers and evals.
+- **Where it shows up in your stack.** As gate criteria you must meet: a task-completion bar on an
+  offline agent eval, a cost per task at production volume, and an autonomy level (draft, act with
+  approval, act alone) written into the roadmap row.
+- **What you control.** How fast you turn a roadmap row into a re-runnable agent eval on real tasks, and
+  reporting results in the gate's terms (completion rate, cost per task, tool-error rate) so go or stop is
+  obvious.
+- **What you can skip.** Portfolio-finance detail and long-horizon theme planning; know the value formula,
+  the feasibility axes and the gate idea well enough to argue for or against an agent project.
 
 ## Why it exists
 - **AI projects fail on data, evaluation and adoption, not models.** The roadmap schedules those
-  constraints explicitly, because they are what actually stalls a use case.
+  constraints explicitly, because they are what actually stalls a use case. Agents add two more: whether
+  the tools (APIs with the right scopes) exist, and what a wrong action costs.
 - **The naive plan is a list.** Twenty workshop ideas, each championed by someone, none compared on the
   same terms; the most exciting ones are staffed in parallel with promised dates.
 - **Three things then go wrong.**
@@ -72,6 +87,11 @@ will kill the project:
 | **Error tolerance** | What does a wrong output cost, and is there a human checkpoint? Drafting with review tolerates errors that autonomous decisions do not. |
 | **Risk class** | Regulatory, privacy and reputational exposure (feeds the AI inventory and risk tiering). |
 | **Integration effort** | Read-only assistance is cheap; writing back into systems of record is not. |
+| **Tool readiness (agents)** | Do APIs exist for every action the agent needs, with scoped credentials, or must someone build them first? |
+| **Action reversibility (agents)** | Can a wrong tool call be undone (a draft, a ticket comment) or not (a refund, an email sent)? |
+
+- **For an agent, the weakest axis is often tool readiness.** A great model with no write API to the
+  claims system is a chatbot, not an agent, so the missing API becomes a foundation on the roadmap.
 
 ### 3. Sequence for capability, not just for score
 - **Early projects:** high-feasibility, moderate-value, and they *build reusable assets*: an access path
@@ -123,10 +143,23 @@ What each gate measures changes as the item matures:
 - **A living artefact:** each row has owner, stage, gate criterion, latest eval result, cost per item, and
   next decision date.
 - **Governance reuses it:** this is also what the AI inventory needs.
+- **For agents, add an autonomy column** so reviewers see at a glance which agents act without a human.
+
+### 8. Gate autonomy, not just accuracy (agents)
+An agent's roadmap row climbs an autonomy ladder, and each rung is its own gate:
+
+| Rung | The agent | Gate evidence |
+|---|---|---|
+| Draft | Proposes actions; a human executes them | Offline task-completion rate on real tasks, cost per task |
+| Act with approval | Executes after a human approves each consequential tool call | Approval rate, how often reviewers edit or reject the proposed call |
+| Act alone (low-risk actions) | Executes reversible actions without review | Production error rate on those actions, rollback path, an owner on call |
+
+- **Why a ladder:** the cost of a wrong action changes per rung, so the evidence bar must too.
+- **Reversible actions climb first**, because a mistake there costs a correction, not an incident.
 
 ## Diagram
-Follow one use case through its stages: every arrow forward is a gate with a pre-agreed criterion, and
-every stage has an exit to stop or wait.
+Follow one agent use case through its stages: every arrow forward is a gate with a pre-agreed
+criterion, every stage has an exit to stop or wait, and the pilot is where the agent first acts.
 
 ```mermaid
 flowchart TD
@@ -134,8 +167,8 @@ flowchart TD
     S --> B{"Build, buy or wait?"}
     B -->|"wait"| W["Parked with re-eval trigger"]
     W -.->|"new model ships"| F
-    B -->|"build or buy"| F["Feasibility eval on real data"]
-    F -->|"meets bar"| P["Pilot: do users act on it?"]
+    B -->|"build or buy"| F["Agent eval on real tasks"]
+    F -->|"meets bar"| P["Pilot: agent acts with approval"]
     F -->|"kill condition"| K["Stopped"]
     P -->|"workflow metric moved"| PR["Production: full-volume cost, owner"]
     P -->|"no adoption"| K
@@ -212,6 +245,21 @@ Applying the value formula to the claims-email triage item. All inputs are illus
 - **Price per item moves the answer more than accuracy here:** the same use case loses about 70% of its
   value at $0.50 per item, which is why run cost is priced at production volume.
 
+### Worked scenario: single call or agent at the feasibility gate
+The same triage item, evaluated on 300 labelled tasks two ways: one model call per email, or an agent
+that looks up the policy and claim history with tools before routing. Same volume, value per unit,
+capture rate and review cost as above; all numbers are illustrative.
+
+| Variant | Completion (automation share) | Cost per task | Run cost per year | Annual value |
+|---|---|---|---|---|
+| Single call | 0.72 | $0.01 | $1,200 | 103,680 − 16,200 = $87,480 |
+| Agent, ~6 tool steps | 0.88 | $0.06 | $7,200 | 126,720 − 22,200 = $104,520 |
+| Agent that loops to ~20 steps | 0.88 | $0.20 | $24,000 | 126,720 − 39,000 = $87,720 |
+
+- **The agent earns its place only with a step budget.** Better completion is worth about $17k a year
+  here, and an unbounded loop spends all of it on tokens.
+- **So the gate records cost per task, not cost per call**, and the roadmap row carries the step budget.
+
 ## Production patterns
 - **Portfolio register as one table** — for any organisation with more than a handful of candidates, keep
   one sheet or tracker with owner, stage, gate criterion, latest eval result, cost per item and next
@@ -227,6 +275,12 @@ Applying the value formula to the claims-email triage item. All inputs are illus
   rather than a debate.
 - **Baseline before pilot** — measure the current workflow's cycle time, cost per item and error rate
   before the pilot starts, so the pilot gate can say by how much the system beats the old process.
+- **Autonomy level per agent row** — record the agent's current rung (draft, act with approval, act
+  alone) and the evidence needed for the next one. Monitor reviewer edit and reject rates on proposed tool
+  calls; promote only when they stay low over an agreed window.
+- **Agent eval suite as the gate artefact** — each agent row links to a re-runnable trajectory eval on
+  real tasks that reports completion rate, tool-error rate and cost per task. Monitor that every gate
+  decision cites a run of it, not a demo.
 
 ## Trade-offs
 - **Feasible first vs headline value first.** Starting with modest, feasible use cases builds foundations
@@ -239,6 +293,8 @@ Applying the value formula to the claims-email triage item. All inputs are illus
   with hard gates.
 - **Early foundations vs unused platform.** Shared foundations lower marginal cost later, but risk a
   platform with no users; build each foundation only when a scheduled use case needs it.
+- **Agent vs single model call.** An agent with tools lifts completion on messy tasks but multiplies cost
+  and failure points per task; if a single call already clears the gate, the agent is not worth it yet.
 
 ## Pitfalls
 - **Ranking by excitement or executive sponsorship alone.** Symptom: a pilot graveyard where several
@@ -253,12 +309,16 @@ Applying the value formula to the claims-email triage item. All inputs are illus
   how much it beats the old process, so the next item gets no funding.
 - **Treating a pilot pass as production readiness.** Costs and error rates jump at full volume or on input
   types the hand-picked pilot users never sent, and the item slides back to "almost done".
+- **Scheduling full autonomy as a date.** The roadmap says "agent auto-approves refunds in Q3" and the
+  team ships it without approval-rate evidence; the first wrong refunds end the programme. Fix: gate each
+  autonomy rung on measured evidence, reversible actions first.
 
 ## When to use
 - **Use when:** there are more candidate use cases than people to build them, which is almost immediately.
 - **Keep it short-horizon and evidence-driven:** the quarter's commitments in detail, the rest as ranked
   hypotheses; review quarterly or when the model market moves.
-- **Measure each item** with its gate metric: offline eval score, cost per item, adoption in pilot.
+- **Measure each item** with its gate metric: offline eval score, cost per item, adoption in pilot. For
+  agents: task-completion rate, cost per task and the reviewer reject rate at the current autonomy rung.
 - **Measure the portfolio:** time from idea to feasibility verdict, the share of items with a gate decision
   in the last quarter, and the kill rate. A kill rate of zero is not a sign of good ideas; it means the
   gates are not being applied.
@@ -309,9 +369,10 @@ in production. The savings case stays on the roadmap, with evidence gates instea
   foundations it needs as part of the project rather than assuming they exist.
 - **The cost** is a higher chance of a visible stall, so set expectations with explicit evidence gates.
 
-### How do you estimate a use case's value before you know its accuracy?
+### How do you estimate an agent use case's value before you know its task-completion rate?
 - **Use the formula:** volume × value per unit × capture rate × automation share − (run cost + review
-  cost).
+  cost). For an agent, automation share is the completion rate on real tasks and run cost is cost per
+  task (all steps and retries), not per call.
 - **Report a range.** Automation share is unknown until the feasibility eval, so give pessimistic and
   expected values, and price run cost at production volume, since $0.02 versus $0.50 per item can flip
   the answer.
@@ -322,6 +383,13 @@ in production. The savings case stays on the roadmap, with evidence gates instea
   wasted when the next model release ships.
 - **Attach a trigger:** keep the feasibility eval re-runnable and re-run it whenever a new model joins
   the approved set, with an owner and a review date on the item.
+
+### A sponsor wants the support agent to issue refunds on its own next quarter. How do you put that on the roadmap?
+- **As an autonomy ladder, not a date.** Start with the agent drafting refunds for a human, then acting
+  with per-call approval, then acting alone only below a refund amount where mistakes are cheap.
+- **Each rung has a gate:** offline completion on real tickets, then reviewer approve and edit rates,
+  then a production error rate with a rollback path and an owner on call.
+- **Foundations first:** a scoped refund API, an approval UI and audit logging are roadmap items too.
 
 ## Quiz
 ### Q: Why score feasibility as the minimum of its axes rather than their average?
@@ -347,3 +415,24 @@ in production. The savings case stays on the roadmap, with evidence gates instea
 - [ ] Build all four foundations as a standalone platform project before any use case
 > Sequencing for capability lets cheaper, feasible projects build the shared assets while producing value.
 > Building foundations with no consuming use case risks an unused platform; dropping it discards the value.
+
+## Use cases & projects
+### Use cases
+- **Choosing the first agent.** A team with ten agent ideas picks the one with ready tools and reversible
+  actions, so its eval harness and tool layer carry the next three.
+- **Promoting an agent's autonomy.** A support agent moves from drafting replies to sending low-risk ones
+  only after reviewer reject rates stay low for the agreed window.
+- **Parking an agent on a capability gap.** A document-heavy agent that misses the bar waits with a
+  trigger to re-run its eval when a new model joins the approved set.
+- **Defending an agent budget.** Cost per task at production volume, not a demo, decides whether an agent
+  beats a single model call.
+
+### Mini project
+**Score and gate three agent ideas (2-3 hours).**
+- **Goal:** turn three agent ideas into roadmap rows with a feasibility verdict backed by a small eval.
+- **Steps:** write each idea as a workflow step with volume and value per unit; score every feasibility
+  axis, including tool readiness and action reversibility; for the top one, build a 30-task eval and a tiny
+  tool-calling agent with two mock tools; log completion rate, steps and cost per task; apply the value
+  formula with a pessimistic and an expected automation share.
+- **Done when:** you have a portfolio table with a build, buy or wait call per idea, the agent eval result
+  in the gate's terms, a step budget, and a stated autonomy rung with the evidence needed for the next.

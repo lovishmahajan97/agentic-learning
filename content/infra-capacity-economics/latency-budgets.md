@@ -128,7 +128,7 @@ iteration no longer fits, the loop jumps to the final answer.
 
 ```mermaid
 flowchart TD
-    E["Edge: task deadline = now + 15 s"] --> L{"Time left covers one more step plus answer?"}
+    E["Edge: task deadline = now + 15 s"] --> L{"Time left for step plus answer?"}
     L -->|"yes"| M["Model call: pick tool"]
     M --> T["Tool call with its own timeout"]
     T --> D{"Model says done?"}
@@ -195,7 +195,11 @@ async def run_agent(task, remaining_s, call_model, run_tool, max_steps=8):
         if dl.remaining() < STEP_P95 + ANSWER_P95:
             partial = True             # no room for another step: answer with what we have
             break
-        step = await asyncio.wait_for(call_model(transcript), dl.remaining() - ANSWER_P95)
+        try:
+            step = await asyncio.wait_for(call_model(transcript), dl.remaining() - ANSWER_P95)
+        except asyncio.TimeoutError:
+            partial = True             # slow model step: keep the answer budget, stop exploring
+            break
         if step.get("final"):
             return step["text"], False
         try:                           # each tool gets at most what the loop can spare
@@ -213,7 +217,7 @@ async def run_agent(task, remaining_s, call_model, run_tool, max_steps=8):
 - **The stop rule** is "time left covers one more step plus the answer", not a fixed step count, so a slow
   gateway or slow tool automatically leaves fewer iterations.
 - **A timed-out tool becomes an observation** the model can route around, instead of an exception that
-  kills the task.
+  kills the task; a timed-out model step ends the loop but still leaves the answer step its budget.
 
 ### Deadline-aware stages in a RAG step
 ```python
@@ -296,12 +300,13 @@ for n in (1, 10, 50, 100):          # fan-out: chance at least one call hits its
 - **Run independent stages and tools concurrently.** Start moderation and retrieval together with
   `asyncio.gather`, and execute parallel tool calls from one model turn together. Block on the moderation
   verdict before generation. Monitor how often retrieval work is wasted on blocked requests.
-- **Budget spans in tracing.** Tag each span (model step, tool call) with its allocation as an attribute,
-  and alert on the end-to-end p95 and p99 rather than on component averages. Monitor the share of
-  requests taking the degraded path.
-- **Re-budget on every pipeline change.** Treat the budget table as a reviewed artifact, so adding a
-  reranker, a guardrail, a new tool or more retrieved chunks requires updating the numbers. Monitor TTFT
-  and task p95 after each "quality" change, and hedge only idempotent reads, with a cap.
+- **Budget spans, and re-budget on every change.** Tag each span (model step, tool call) with its
+  allocation as an attribute, alert on end-to-end p95 and p99 rather than component averages, and treat the
+  budget table as a reviewed artifact: a new reranker, guardrail, tool or more retrieved chunks means new
+  numbers. Monitor the degraded-path share, TTFT and task p95 after each "quality" change.
+- **Hedge only idempotent reads, with a cap.** Send a second copy after the p95 delay for retrieval, cache
+  or read-only tool calls, never for tools with side effects, and limit hedges to a small fraction of
+  traffic. Monitor extra load from hedging and turn it off under saturation.
 
 ## Trade-offs
 - **Tight per-step allocations vs churn.** They make regressions visible early, but over-precise budgets

@@ -5,7 +5,7 @@ name: Batching & concurrency limits
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - serving-inference/continuous-batching
@@ -273,7 +273,8 @@ async def main(runs: int = 30):
     print(f"{runs} runs, {runs * 12} calls, {time.perf_counter() - t0:.1f}s")
 
 asyncio.run(main())
-# Without MAX_FANOUT the first runs grab all 48 slots and later runs' planning calls queue behind them.
+# Without MAX_FANOUT the first runs to finish planning queue 10 calls each and fill all 48 slots, so
+# later runs wait for whole fan-outs; with it, no run holds more than 4 slots at once.
 ```
 
 ## Production patterns

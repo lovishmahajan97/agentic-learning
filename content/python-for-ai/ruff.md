@@ -5,7 +5,7 @@ name: ruff
 kind: tool
 difficulty: intro
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - python-for-ai/mypy
@@ -290,8 +290,9 @@ repos:
 - **CI annotations, no writes.** Run `ruff check --output-format github` and `ruff format --check` in the
   pipeline, so findings appear inline on the pull request and nothing is fixed in a throwaway checkout.
 - **Stricter rules for tool code.** Agent tools run on model-chosen input, so give the tools package the
-  full `S`, `ASYNC` and `BLE` families with a nested config in that directory that inherits the root one
-  and uses `extend-select`, and require review of any `noqa` there.
+  full `S`, `ASYNC` and `BLE` families with a nested `ruff.toml` in that directory that sets
+  `extend = "../pyproject.toml"` and uses `extend-select`, because a nested config replaces the root one
+  unless it extends it. Require review of any `noqa` there.
   Monitor `noqa` comments in the tools package separately from the rest of the repo.
 - **Triage with statistics.** Before enabling a new family, run `ruff check --select ASYNC --statistics`
   to see counts per rule, fix the defect classes first (`ASYNC`, `B006`, `RUF006`, `S608`), then enable

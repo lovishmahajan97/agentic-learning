@@ -5,7 +5,8 @@ name: Golden dataset strategy
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - evals/golden-dataset
   - evals/dataset-contamination
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-The platform view of golden data: a portfolio of tiered, versioned sets, each with an owner, an
-admission workflow fed by production failures, and a size set by the smallest regression it must detect,
-because one static set goes stale, leaks and is mis-sized.
+An agent's golden data is a portfolio of tiered, versioned task sets, each with an owner, intake from
+failed production runs, and a size set by the smallest regression it must detect, because one static set
+goes stale, leaks and is mis-sized.
+
+## For agent builders
+- **Why it matters for agents.** Every agent eval and release gate is only as good as its task set. A set
+  written before you added a refund tool cannot see refunds failing, and a set copied into few-shot
+  examples measures memory, not the agent.
+- **Where it shows up in your stack.** Datasets in your eval platform (Braintrust, LangSmith, Langfuse) or
+  content-hashed JSONL in the repo, a "trace to dataset" button in observability, and a regression item in
+  every agent bug-fix PR.
+- **What you control.** What an agent item holds (task, starting state, tool fixtures, expected final
+  state, forbidden actions), the tiers and their sizes, who may change an expected outcome, and the
+  contamination check against prompts and fine-tuning data.
+- **What you can skip.** Exotic sampling theory. The half-width formula, per-slice quotas and pairing are
+  enough to size agent task sets.
 
 ## Why it exists
 - **The single file fails four ways.** Most teams start with fifty examples the first engineer wrote in an
@@ -46,17 +60,26 @@ because one static set goes stale, leaks and is mis-sized.
   loop, the way a mature team treats its test suite rather than a folder of scripts.
 
 ## How it works
+### What an agent item holds
+- **Task input:** the user request plus any conversation history the agent starts with.
+- **Starting state and tool fixtures:** the environment the tools see (accounts, orders, files), or
+  recorded tool results, so the run is repeatable and side-effect free.
+- **Expected outcome:** a final state or answer criteria, not one exact tool sequence, because agents
+  often reach the same correct state by different valid paths.
+- **Constraints:** forbidden actions (no refund above a limit, no email to external addresses) and an
+  optional step budget, scored as floors.
+
 ### A portfolio, not a file
 Each tier has a purpose, a size and a cadence; tiers exist *because* cost multiplied by run frequency must
 stay affordable while the release gate stays powerful. Sizes are illustrative.
 
 | Tier | Size | Runs | Job |
 |---|---|---|---|
-| **Smoke** | tens to a couple of hundred, stratified | every PR | catch catastrophic breakage (broken template, parser that no longer matches), not two-point drifts |
+| **Smoke** | tens to a couple of hundred, stratified | every PR | catch catastrophic breakage (broken template, parser that no longer matches, a tool schema the model can no longer call), not two-point drifts |
 | **Full** | hundreds to low thousands, per-slice quotas | merge, nightly, release candidates | the set gates are computed on |
-| **Slice sets** | small, per intent, language, tenant or document type | with the full set | each carries its own floor because the aggregate hides a collapsed slice |
+| **Slice sets** | small, per intent, language, tenant, document type or tool | with the full set | each carries its own floor because the aggregate hides a collapsed slice |
 | **Regression** | one item per fixed production incident, never pruned | every run | expected at 100% pass; "every bug becomes a test" is the cheapest coverage you will ever buy |
-| **Adversarial and safety** | prompt injection, jailbreak attempts, PII extraction | release and nightly | gated by absolute floors, not relative to the champion |
+| **Adversarial and safety** | prompt injection (including instructions planted in tool results and retrieved pages), jailbreak attempts, PII extraction | release and nightly | gated by absolute floors, not relative to the champion |
 | **Sealed holdout** | a subset prompt authors never see, never in few-shot or training data | release only | detects overfitting to the development set |
 
 - **The overfitting signal** is the gap between full-set and holdout scores.
@@ -74,7 +97,7 @@ standard error of one pass-rate run = √(p(1−p)/n)
 | 1,000 | ±2.5 |
 
 - **So a smoke set can only detect large breaks,** and anyone claiming a two-point improvement on a hundred
-  items is reading noise.
+  items is reading noise. Agent task success is a pass rate, so the same table applies.
 - **Pairing tightens this considerably.** When candidate and champion run on the *identical* items, item
   difficulty cancels in the per-item difference, which is why both must run on the same dataset version
   (the `evaluation-gates-for-production-releases` lesson does the arithmetic).
@@ -91,18 +114,20 @@ paired:    n ≈ 1.96² · f / h²      (f = fraction of items whose verdict dif
 - **At p = 0.8 and h = 2 points:** unpaired needs about 3,070 items; paired with f = 10% needs about 960.
 - **Detecting, not just bounding, costs more:** roughly double the items for 80% power.
 - **f is unknown** until you have run the champion against a few candidates, so measure it and resize.
+  Sampled agents often have a higher f than single-call apps, because one different early tool choice
+  changes the whole run.
 
 ### The sourcing pipeline
 | Source | How | Because |
 |---|---|---|
-| **Production traces** | sampled with per-slice quotas, stratified by outcome (thumbs-down, escalation, abandoned session), not uniformly | uniform sampling drowns rare intents in the head of the distribution |
-| **Failure mining** | error analysis of incidents | real failures are the highest-value items |
+| **Production traces** | sampled with per-slice quotas, stratified by outcome (thumbs-down, escalation, abandoned session, step budget exhausted), not uniformly | uniform sampling drowns rare intents in the head of the distribution |
+| **Failure mining** | error analysis of incidents and failed agent runs | real failures are the highest-value items |
 | **Synthetic generation** | for slices with too little real traffic, admitted only after a human labels and filters them | a generator shares the model's blind spots and writes easier cases than users do |
 | **Expert-written** | for policy-critical behaviour | traffic rarely exercises it |
 
 - **What "expected" stores depends on the task:** a label for classification, executable tests for code,
-  and for free text usually a short list of must-include facts and must-not behaviours rather than one
-  reference phrasing.
+  a final environment state for agents, and for free text usually a short list of must-include facts and
+  must-not behaviours rather than one reference phrasing.
 - **Criteria beat one reference phrasing** *because* a judge grading against criteria penalises legitimate
   rewording less, and a policy change then edits a named criterion instead of a paragraph nobody can diff.
 
@@ -114,7 +139,7 @@ paired:    n ≈ 1.96² · f / h²      (f = fraction of items whose verdict dif
 4. **Merged into the *next* version,** never the current one.
 
 - **PII is scrubbed or replaced** with synthetic values before storage, *because* a golden set lives for
-  years and gets copied to laptops.
+  years and gets copied to laptops. Tool fixtures recorded from production need the same scrub.
 
 ### Versioning and ownership
 - **A version is immutable,** identified by a content hash, with a changelog of items added, removed or
@@ -130,6 +155,7 @@ paired:    n ≈ 1.96² · f / h²      (f = fraction of items whose verdict dif
 - **Refresh is triggered, not calendar-driven:**
   - when production slice mix shifts (monitoring tells you);
   - when a policy changes an expected answer;
+  - when a tool is added, removed or changes its schema;
   - when a slice has sat at 100% for every candidate for months (move those items to smoke or regression;
     they no longer discriminate);
   - after every incident.
@@ -139,12 +165,12 @@ paired:    n ≈ 1.96² · f / h²      (f = fraction of items whose verdict dif
 
 ## Diagram
 Items flow from four sources through admission into the next immutable version; tiers are cut from it,
-and incidents feed back as regression items.
+and failed agent runs feed back as regression items.
 
 ```mermaid
 flowchart TD
-    PT["Production traces, quota sampled"] --> AD["Admission: label, second review"]
-    FM["Failure mining"] --> AD
+    PT["Agent traces, quota sampled"] --> AD["Admission: label, second review"]
+    FM["Failed runs, mined"] --> AD
     SY["Synthetic, human filtered"] --> AD
     EX["Expert-written"] --> AD
     AD -->|"PII scrubbed"| CC["Contamination check"]
@@ -157,6 +183,36 @@ flowchart TD
 ```
 
 ## Examples
+### Turning a failed agent run into a regression item
+A production run refunded the wrong order. The trace already holds the task, the tool results and the
+state; the conversion keeps those as fixtures and replaces the agent's wrong outcome with the reviewed
+correct one. `scrub` is your PII scrubber.
+
+```python
+import json
+
+def trace_to_item(trace, correct_state, forbidden, item_id, reviewer):
+    fixtures = [{"tool": c["tool"], "args": c["args"], "result": scrub(c["result"])}
+                for c in trace["tool_calls"]]                    # recorded world, not the live one
+    return {
+        "id": item_id,
+        "slice": trace["intent"],                                # e.g. "refunds"
+        "tier": "regression",                                    # never pruned, must pass 100%
+        "input": {"task": scrub(trace["user_message"])},
+        "fixtures": fixtures,
+        "expected": {"state": correct_state},                    # outcome, not the exact tool sequence
+        "forbidden": forbidden,                                  # path constraints scored as floors
+        "source": {"trace_id": trace["id"], "reviewed_by": reviewer},
+    }
+
+item = trace_to_item(
+    trace=json.load(open("incidents/INC-2291.json")),
+    correct_state={"order_1182": "refunded", "order_1183": "unchanged"},
+    forbidden=[{"tool": "issue_refund", "args": {"order_id": "1183"}}],
+    item_id="reg-2291", reviewer="domain:refunds-lead")
+# Merge into the NEXT version with a changelog line: "reg-2291: refund on wrong order (INC-2291)"
+```
+
 ### Sizing, quota sampling and cutting a version
 A support assistant with six intents whose production traffic splits roughly 60/20/10/5/3/2 percent.
 
@@ -202,6 +258,19 @@ def cut_version(items, parent, changelog, tier="full", sealed=False):
             "changelog": changelog}                            # e.g. "relabeled 15 refund items after policy change 2025-06"
 ```
 
+### Worked scenario: sizing an agent's task set by tool
+An agent with four tools; per-tool slices at p = 0.8 using the half-width table above. Illustrative.
+
+| Slice (by main tool) | Share of traffic | Items | 95% half-width | Can it catch a 10-point drop? |
+|---|---|---|---|---|
+| `search_orders` | 55% | 200 | ±5.5 | yes |
+| `issue_refund` | 20% | 50 | about ±11 | barely; raise to 200 before gating on it |
+| `update_address` | 15% | 50 | about ±11 | barely |
+| `escalate_to_human` | 10% | 50 | about ±11 | barely, but it carries a safety floor anyway |
+
+The refund slice is the one with money at stake, so it gets the larger quota first even though it is not
+the largest share of traffic.
+
 ### A mechanical contamination check
 Pure Python, runnable. Before a version is cut, compare golden inputs against prompt templates, few-shot
 banks and fine-tuning corpora: exact match after normalisation, then word 8-gram overlap for near
@@ -244,9 +313,12 @@ print(contamination(golden, few_shot_bank))   # [('g17', 'near-duplicate 89%')]
 - **Regression item in every incident fix** — for any team with on-call. Make "added regression item" a
   required checkbox in the bug-fix PR template, and fail the eval if the regression tier drops below 100%.
   Monitor the fraction of incidents with a matching regression item.
+- **Trace-to-task conversion with fixtures** — for agents. Turn a failed production run into an item that
+  keeps its tool results as scrubbed fixtures and stores a reviewed expected final state, so the regression
+  replays without live systems. Monitor items whose fixtures no longer match the current tool schemas.
 - **Outcome-stratified trace sampling** — when refreshing the full set. Pull a fixed quota per slice,
-  weighted toward thumbs-down, escalated and abandoned sessions, through a PII scrubber before labeling.
-  Monitor items per slice against the quota and the coverage gaps logged by the sampler.
+  weighted toward thumbs-down, escalated, abandoned and budget-exhausted runs, through a PII scrubber before
+  labeling. Monitor items per slice against the quota and the coverage gaps logged by the sampler.
 - **Contamination check as a CI step** — whenever prompts, few-shot banks or training corpora change. Run the
   hash and n-gram check above against the current golden versions and block the merge on a hit. Monitor
   hits per month and the gap between full-set and holdout scores.
@@ -270,6 +342,8 @@ print(contamination(golden, few_shot_bank))   # [('g17', 'near-duplicate 89%')]
 - **Cheap synthetic coverage vs realism.** Synthetic items cover rare slices cheaply but share the
   generator's blind spots and run easier than real users. The trade flips in their favour only once humans
   have labeled and filtered them.
+- **Recorded fixtures vs a living world.** Fixtures make agent items repeatable and safe, but they freeze
+  tool outputs; when a tool's real responses change shape, items go stale until fixtures are re-recorded.
 - **Tight intervals vs cost per run.** Larger sets tighten confidence intervals and raise cost per run;
   tiering and content-addressed caching reconcile the two, and without caching a large full set gets
   skipped.
@@ -287,6 +361,8 @@ print(contamination(golden, few_shot_bank))   # [('g17', 'near-duplicate 89%')]
   inter-annotator agreement that has never been measured.
 - **Items stale after a policy change.** Symptom: the gate blocks a legitimately correct new behaviour,
   engineers start overriding it, and it stops meaning anything.
+- **Expecting one exact tool sequence.** Symptom: a better agent that takes a shorter valid path "fails"
+  dozens of items. Fix: store expected final state plus forbidden actions instead.
 
 ## When to use
 - **Use when** an eval gates anything or more than one person edits the set.
@@ -326,18 +402,25 @@ for the champion on that version, and put slice floors into the gate.
   and the sealed holdout exists only to detect overfitting.
 - **Slices carry their own floors** because an aggregate hides a collapsed slice.
 
+### What does a golden item for a tool-calling agent contain, and why not an expected tool sequence?
+- **Contents:** the task, starting state or recorded tool fixtures, an expected final state or answer
+  criteria, and forbidden actions as constraints.
+- **Not a sequence** because agents reach the same correct state by different valid paths; exact-sequence
+  items fail better agents and flake on sampling.
+- **Fixtures** keep the run repeatable and free of side effects; re-record them when tool schemas change.
+
 ### How many items do you need to detect a two-point regression at an 80% pass rate?
 - **Unpaired:** about 1.96² × 2 × 0.8 × 0.2 / 0.02², roughly 3,070 items just to bound the difference to ±2
   points.
 - **Paired on identical items:** about 1.96² × f / 0.02²; with 10% of verdicts flipping, about 960.
 - **Reliable detection** at 80% power needs roughly double; measure the flip rate and resize per slice.
 
-### Your golden-set score rose to 98% but production CSAT is flat. How do you investigate?
+### Your agent's golden-set score rose to 98% but production CSAT is flat. How do you investigate?
 - **Suspect leakage first:** run a contamination check of golden inputs against prompts, few-shot banks and
   fine-tuning corpora.
 - **Compare with the sealed holdout:** a large full-versus-holdout gap means overfitting to the development
   set.
-- **Check staleness:** compare slice mix with current traffic; new flows may have no items.
+- **Check staleness:** compare slice mix with current traffic; new flows or new tools may have no items.
 
 ### When would you not keep a sealed holdout?
 - **When the team cannot afford two curated sets;** you cannot error-analyse what nobody may read.
@@ -377,3 +460,24 @@ for the champion on that version, and put slice floors into the gate.
 > Baselines are recorded against a dataset version; editing in place silently invalidates every earlier
 > comparison. A new content-hashed version with a changelog keeps history comparable, and re-running the
 > champion gives the gate a valid reference.
+
+## Use cases & projects
+### Use cases
+- **Launching a support agent.** The first golden set is built from real tickets with domain experts
+  labeling expected outcomes per intent.
+- **Adding a new tool.** A new slice with its own quota and floor is cut before the tool ships, so the
+  gate can see it.
+- **Incident follow-up.** Every failed agent run that caused an incident becomes a regression item with
+  fixtures and forbidden actions.
+- **Prompt-injection defence.** An adversarial tier plants instructions in tool results and retrieved
+  pages, gated by absolute floors.
+
+### Mini project
+**Build a versioned task set for a small agent (2-3 hours).**
+- **Goal:** a tiered, content-hashed golden set for a tool-calling agent, sized from the half-width table.
+- **Steps:** define 3 slices by tool; write or mine 20 tasks per slice with starting state, expected final
+  state and one forbidden action each; convert one failed run into a regression item with fixtures; run
+  the contamination check against your few-shot bank; cut smoke, full and regression versions with
+  `cut_version`.
+- **Done when:** each version has a content hash, per-slice counts and a changelog, the contamination check
+  reports zero hits, and you can state each slice's 95% half-width.

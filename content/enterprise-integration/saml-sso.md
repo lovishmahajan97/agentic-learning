@@ -5,7 +5,8 @@ name: SAML SSO
 kind: concept
 difficulty: advanced
 est_minutes: 17
-status: crisp
+status: agentic
+agent_relevance: background
 related:
   - enterprise-integration/sso-iam-integration
   - enterprise-integration/scim-provisioning
@@ -20,9 +21,20 @@ sources:
 ---
 
 ## TL;DR
-SAML 2.0 lets a customer's IdP vouch for a user with a signed XML assertion sent through the browser,
-and many enterprises still mandate it. XML signatures are subtle: use a maintained library and still
-check audience, recipient, time, correlation and replay.
+Many enterprises sign users into your agent product with SAML 2.0: their IdP vouches for the user with a
+signed XML assertion sent through the browser. Use a maintained library, check audience, recipient, time,
+correlation and replay, then derive the agent's user identity.
+
+## For agent builders
+- **Why it matters for agents.** The SAML login is where your agent learns who it is working for. The
+  NameID and attributes become the user key and roles that decide which tools the agent may call and which
+  documents retrieval may return, so a forged assertion is a forged agent principal.
+- **Where it shows up in your stack.** The ACS endpoint of the web app that hosts your agent, the SAML
+  library's per-tenant configuration, and the session your agent runtime reads identity from.
+- **What you control.** Which NameID format you key users on, how attributes map to agent roles, whether
+  IdP-initiated login is allowed, and the rule that API and tool calls use OAuth tokens, not SAML.
+- **What you can skip.** XML canonicalization details and hand-rolled signature code. Know the flow, the
+  validation checklist and the famous attacks well enough to configure and test a library.
 
 ## Why it exists
 - **Every app kept its own passwords.** Cross-domain single sign-on meant cookies that browsers would not
@@ -39,6 +51,14 @@ check audience, recipient, time, correlation and replay.
   protocol plus a checklist of validations that must be exactly right.
 
 ## How it works
+### Background
+- **SAML is interactive web login only.** It produces a browser session for your app. Your agent's calls to
+  downstream APIs still need OAuth access tokens, obtained by delegation from the user's session.
+- **What the agent builder keeps from it:** a stable user key (persistent NameID scoped to the tenant's
+  IdP), role or group attributes for the authorization layer, and the authentication time for step-up
+  decisions before risky agent actions.
+- **The rest below is the mechanism** your SAML library implements and you must be able to verify.
+
 ### Setup: metadata exchange
 Exchanged once per customer:
 
@@ -56,7 +76,7 @@ Exchanged once per customer:
 3. **The IdP authenticates** the user (password, MFA, conditional access).
 4. **The IdP posts back.** It returns an HTML form that auto-POSTs a base64 `SAMLResponse` to your ACS URL
    (HTTP-POST binding, *because* assertions are too large for a URL).
-5. **You validate and create a session.**
+5. **You validate and create a session**, which the agent runtime then reads the user from.
 
 ### What the assertion contains
 | Element | Holds |
@@ -80,7 +100,9 @@ Each check exists *because* skipping it enables a known attack:
 | `InResponseTo` matches a request ID that *this browser session* started; assertion IDs recorded until expiry | Replay, and login CSRF |
 
 - **Why bind to the session, not a global set of pending IDs:** otherwise an attacker can start a login,
-  feed their own valid response into a victim's browser, and sign the victim in as the attacker.
+  feed their own valid response into a victim's browser, and sign the victim in as the attacker. For an
+  agent product that is worse than usual: the victim's agent would then write memories and files into the
+  attacker's account.
 - **IdP-initiated SSO** (no `AuthnRequest`, so no `InResponseTo`) loses request correlation; many teams
   disable it or accept it only with strict replay caching.
 
@@ -101,19 +123,29 @@ Each check exists *because* skipping it enables a known attack:
   to. Treat it as untrusted and accept only relative paths or an allow-list, *because* redirecting to
   whatever it contains turns your login into an open redirect.
 - **Logout.** SAML Single Logout depends on every party's front-channel redirects succeeding and is
-  unreliable in practice. Do not rely on it for revocation; use short sessions and SCIM deactivation.
+  unreliable in practice. Do not rely on it for revocation, least of all for background agent tasks; use
+  short sessions and SCIM deactivation.
 
 ### Certificates
 - **Support two active certificates per tenant during rotation**, *because* IdP signing certificates expire
   and rotate, and a single hard-coded certificate turns a routine rotation into an outage for that customer.
 
+### From assertion to agent principal
+1. **User key** = (tenant, IdP entity ID, persistent NameID), never the email attribute.
+2. **Roles** = attribute values mapped through the tenant's reviewed mapping table to agent capabilities.
+3. **Auth time** = the assertion's authentication instant, so the agent runtime can demand a fresh login
+   before a consequential action.
+4. **Downstream tokens** come from a separate OAuth delegation step, because the SAML assertion is not an
+   API credential.
+
 ## Diagram
-SP-initiated login: the request ID you save in step 2 is what `InResponseTo` must match at the end.
+SP-initiated login: the request ID you save in step 2 is what `InResponseTo` must match at the end, and
+only the validated assertion becomes the agent session.
 
 ```mermaid
 sequenceDiagram
     participant U as Browser
-    participant S as Your app (SP)
+    participant S as Agent app (SP)
     participant I as Customer IdP
     U->>S: Open app
     Note over S: Home realm discovery, save request ID in session
@@ -124,7 +156,7 @@ sequenceDiagram
     U->>S: POST SAMLResponse to ACS URL
     Note over S: Verify signature, read only signed element
     Note over S: Issuer, Audience, Recipient, time, InResponseTo, replay
-    S->>U: Session cookie and safe RelayState redirect
+    S->>U: Session cookie, agent principal bound
 ```
 
 ## Examples
@@ -174,6 +206,33 @@ def consume(xml: bytes, tenant: dict, pending_ids: set, seen_ids: set) -> dict:
 - **In production, prefer a full SAML library per framework.** It also handles encrypted assertions and
   metadata, but this checklist is what you should be able to point to in its configuration.
 
+### Turning the validated assertion into an agent principal
+Runnable standard-library code: the agent runtime gets a principal with a stable key and an explicit tool
+allow-list; unknown role values grant nothing.
+
+```python
+from dataclasses import dataclass
+
+ROLE_MAP = {  # per tenant, reviewed: IdP attribute value -> agent capabilities
+    "acme": {"grp-support-agents": {"search_kb", "read_ticket", "draft_reply"},
+             "grp-support-leads":  {"search_kb", "read_ticket", "draft_reply", "refund_under_100"}},
+}
+
+@dataclass(frozen=True)
+class AgentPrincipal:
+    user_key: tuple          # (tenant, idp_entity_id, persistent NameID)
+    tools: frozenset
+
+def principal_from_assertion(tenant: str, idp_entity_id: str, validated: dict) -> AgentPrincipal:
+    groups = validated["attrs"].get("groups", [])
+    tools = set().union(*(ROLE_MAP[tenant].get(g, set()) for g in groups)) if groups else set()
+    return AgentPrincipal((tenant, idp_entity_id, validated["name_id"]), frozenset(tools))
+
+p = principal_from_assertion("acme", "http://www.okta.com/exk1",
+                             {"name_id": "00u8a1b2", "attrs": {"groups": ["grp-support-agents", "everyone"]}})
+print(p.tools)               # search_kb, read_ticket, draft_reply: no refund tool, 'everyone' grants nothing
+```
+
 ### RelayState allow-list and an expiring replay cache
 Pure standard library, runnable on Python 3.10+. Both are small, and both are commonly missing.
 
@@ -207,18 +266,19 @@ print(cache.first_use("_a1", not_on_or_after=1300, now=1200))   # False: replay 
 ```
 
 ### Worked scenario: the negative test matrix
-Every row is a tampered response your ACS endpoint must reject; run them in CI per library upgrade.
+Every row is a tampered response your ACS endpoint must reject; run them in CI per library upgrade. The
+last column is what a miss would mean for the agent.
 
-| Tampered response | Expected rejection |
-|---|---|
-| Genuine signed assertion plus a forged unsigned one | Only the signed element is read; exactly one assertion allowed |
-| Valid assertion for another SP | Wrong audience |
-| Valid assertion from another tenant's IdP | Wrong issuer or signature (different stored certificate) |
-| `NotOnOrAfter` 10 minutes in the past, skew 2 minutes | Outside validity window |
-| `InResponseTo` started in a different browser session | Unsolicited response |
-| Same assertion posted twice | Replayed assertion |
-| Comment injected into NameID | Library reads full canonicalized text, user unchanged |
-| DOCTYPE with an external entity | Parser refuses DTDs |
+| Tampered response | Expected rejection | Agent impact if accepted |
+|---|---|---|
+| Genuine signed assertion plus a forged unsigned one | Only the signed element is read; exactly one assertion allowed | Agent runs as any user |
+| Valid assertion for another SP | Wrong audience | Agent runs for a user of another app |
+| Valid assertion from another tenant's IdP | Wrong issuer or signature (different stored certificate) | Cross-tenant agent memory and tools |
+| `NotOnOrAfter` 10 minutes in the past, skew 2 minutes | Outside validity window | Stale session revived |
+| `InResponseTo` started in a different browser session | Unsolicited response | Victim's agent writes into attacker's account |
+| Same assertion posted twice | Replayed assertion | Second agent session from a captured response |
+| Comment injected into NameID | Library reads full canonicalized text, user unchanged | Agent bound to another user's key |
+| DOCTYPE with an external entity | Parser refuses DTDs | Server-side file read |
 
 ## Production patterns
 - **Two-certificate rotation with expiry alerts.** Store up to two IdP certificates per tenant, accept
@@ -232,6 +292,9 @@ Every row is a tampered response your ACS endpoint must reject; run them in CI p
 - **Hardened parser configuration.** Parse with DTDs and external entities disabled (for `lxml`, a parser
   created with entity resolution and network access turned off), before any signature work. Monitor parse
   failures as a security signal.
+- **One principal object for the agent runtime.** Convert the validated assertion once into a principal
+  (stable key, tenant, mapped tools, auth time) and pass only that to the agent loop and tools. Monitor
+  sessions with an empty tool set, which usually means a renamed attribute.
 - **Login failures by reason, per tenant.** Emit a reason code (audience, signature, expiry, recipient,
   unsolicited, replay) for each rejection so FDEs can tell a customer metadata mistake from an attack.
 
@@ -245,7 +308,8 @@ Every row is a tampered response your ACS endpoint must reject; run them in CI p
   `InResponseTo` correlation and widens replay and login-CSRF risk. Enable it only with strict replay caching
   and short validity.
 - **Persistent vs email NameIDs.** Persistent opaque NameIDs survive email changes; email NameIDs are easy to
-  map but change. The choice flips if the customer cannot emit a persistent identifier.
+  map but change, and agent memory keyed on them follows the mailbox. The choice flips if the customer cannot
+  emit a persistent identifier.
 
 ## Pitfalls
 - **Reading the user from the raw document** after checking that some signature verifies. Symptom: a pen
@@ -261,12 +325,15 @@ Every row is a tampered response your ACS endpoint must reject; run them in CI p
 - **Following `RelayState` to any URL.** Symptom: phishing links pass through your genuine login page and
   land on an attacker's site.
 - **Server clock drift.** Symptom: intermittent "assertion not yet valid" errors on only some application nodes.
+- **Using the SAML session as the agent's API credential.** Symptom: a tool forwards the session cookie or
+  assertion to a downstream API and fails, or a service token is quietly substituted. Fix: OAuth delegation.
 
 ## When to use
 - **Use when** customers require it, which in practice means most larger enterprise deals; offer OIDC
   alongside for those who can use it.
 - **Never hand-roll** XML signature verification; use a maintained library and verify its configuration
   against the checklist above.
+- **Agent scope:** SAML signs the user in; tools get OAuth tokens through delegation.
 - **Measure:** login failures by reason (audience, signature, expiry) per tenant, and alert ahead of IdP
   certificate expiry dates captured from metadata.
 - **Interviews:** walk the SP-initiated flow and explain signature wrapping and audience checks; that is the
@@ -312,15 +379,24 @@ Then still check issuer, audience, recipient, time window and InResponseTo.
 - **If enabled:** strict shared replay cache, short validity, and a fixed landing page instead of an
   arbitrary RelayState.
 
-### Why does encryption of the assertion not replace signature checks?
-- **Encryption hides attributes from the browser**, but anyone with the SP's public key can encrypt, so it
-  proves nothing about who produced the assertion.
-- **So decrypt, then verify the signature** on the decrypted assertion, and run every other check as normal.
-
 ### How do you make replay protection work behind a load balancer with many app nodes?
 - **Use a shared store**, because a per-node in-memory set lets a replay succeed on a different node.
 - **Key by assertion ID with a TTL** until its `NotOnOrAfter`, using an atomic set-if-absent so two nodes
   cannot both accept it.
+
+### Users sign in to your agent product with SAML. How does the agent get credentials to call Salesforce as them?
+- **Not from the assertion:** it is a one-time login statement for your SP, not a credential Salesforce accepts.
+- **Run an OAuth flow** for the downstream system (user consent or an IdP-supported delegation or token
+  exchange), store the resulting tokens server-side per user key, and inject them into tool calls.
+- **Keep identity consistent:** the stable key from the SAML NameID links the agent session, the stored
+  tokens and the audit log.
+
+### After an IdP change, every user at one tenant can sign in but their agent has no tools. What happened?
+- **Likely a renamed or removed attribute:** the groups attribute name or values changed, so the role
+  mapping matched nothing and the principal's tool set is empty.
+- **Diagnose** with a SAML tracer and the per-tenant count of empty-tool sessions.
+- **Fix** by updating the reviewed mapping, and fail visibly (an admin alert) rather than letting agents run
+  with silently reduced capabilities.
 
 ## Quiz
 ### Q: Why does the SAML HTTP-POST binding deliver the response through the user's browser?
@@ -346,3 +422,23 @@ Then still check issuer, audience, recipient, time window and InResponseTo.
 - [ ] It disables attribute statements
 > Unsolicited responses lose request correlation, which helps replay and login-CSRF attacks; mitigate with
 > strict replay caching and short validity windows, or disable the flow.
+
+## Use cases & projects
+### Use cases
+- **Enterprise deals that mandate SAML.** The customer's Okta or Entra app signs employees into your agent
+  workspace with their corporate MFA.
+- **Role-gated agent tools.** SAML group attributes map to which tools a support or finance agent may call.
+- **Security reviews of agent products.** The negative test matrix is the evidence a customer's security
+  team asks for before go-live.
+- **Multi-tenant agent hosting.** Per-tenant certificates, issuers and audiences keep one customer's
+  assertions out of another's workspace.
+
+### Mini project
+**SAML login that yields an agent principal (2-3 hours).**
+- **Goal:** sign test users into a tiny agent app with SAML and give each a tool allow-list from their groups.
+- **Steps:** create a SAML app in a free developer IdP tenant (or use a local test IdP); configure a
+  maintained SAML library; convert the validated assertion into a principal (stable key, tools); run one
+  agent prompt as two users in different groups; add CI tests for wrong audience, replay and an expired
+  assertion.
+- **Done when:** the two users see different tools offered to the model, all three negative tests reject,
+  and logs show a reason code for each rejection.

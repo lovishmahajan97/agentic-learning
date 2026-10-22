@@ -5,7 +5,8 @@ name: Handoff to customer teams
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - delivery-ownership/operational-ownership-and-support-boundaries
   - deployment/runbooks
@@ -18,9 +19,21 @@ related:
 ---
 
 ## TL;DR
-Handoff transfers *ownership* of a deployed AI system from the vendor or FDE team to the customer's
-engineers: running it, changing it safely, judging its quality. It works in stages, with exit criteria
-the customer has demonstrated, not a calendar date.
+Handoff transfers *ownership* of a deployed agent from the vendor or FDE team to the customer's
+engineers: running it, changing its prompts and tools safely, judging its quality. It works in stages,
+with exit criteria the customer has demonstrated, not a calendar date.
+
+## For agent builders
+- **Why it matters for agents.** An agent carries more moving parts than a chat feature: tool
+  credentials, approval gates, step budgets, a trajectory eval suite. Each one decays silently if nobody
+  on the customer side has operated it, and agents act on real systems when they decay.
+- **Where it shows up in your stack.** Tool credentials in the customer's identity provider, the agent's
+  prompts and tool schemas in their repositories, the eval gate in their CI, and agent alerts (tool error
+  rate, step-budget hits, cost per run) in their on-call tooling.
+- **What you control.** Building on customer-owned service identities from day one, a tool inventory with
+  scopes and expiry, runbooks keyed to agent alerts, and exit criteria that include an agent game day.
+- **What you can skip.** Contract and commercial mechanics of the support boundary; leave those to the
+  account team, but make sure the RACI names who owns each tool.
 
 ## Why it exists
 - **Forward-deployed work ends.** The FDE moves to the next account, and the system has to keep working
@@ -53,6 +66,16 @@ Split ownership into explicit areas, because each needs different skills and oft
 - **Accounts are dependencies.** A vendor-billed API account outlives the engagement unless it is moved.
 - **Write it as a responsibility matrix (RACI) that both sides sign.** An unclear boundary turns into
   support tickets the vendor bounces back and forth with the customer.
+
+### Agent-specific items to hand over
+- **Tool inventory:** every tool the agent can call, the service identity it uses, its scopes, expiry
+  date and owner, because an agent's blast radius is the union of its tools' permissions.
+- **Control settings:** step budgets, approval gates for consequential actions, rate and cost limits, and
+  how to switch the agent off or to read-only mode during an incident.
+- **Eval suite with trajectory checks:** required and forbidden tool calls per case, so the customer can
+  gate prompt, tool-schema and model changes.
+- **Known agent failure modes:** the current buckets (loops, bad arguments, premature stops) with their
+  rates and the fixes already tried.
 
 ### 2. Check the receiving team is real
 - **Confirm named people, allocated time and the needed skills** before planning the transfer. A handoff
@@ -110,7 +133,7 @@ flowchart TD
     S1 --> S2["Pair"]
     S2 --> S3["Reverse shadow: customer does"]
     S3 --> S4["Customer alone, FDE backup"]
-    S4 --> GD["Game day"]
+    S4 --> GD["Agent game day: tool outage, loop"]
     GD --> X{"Every criterion evidenced by 2+ people?"}
     X -->|"no"| S4
     X -->|"yes"| H["Hypercare taper"]
@@ -119,6 +142,42 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: audit the tool inventory before exit
+A support agent calls three tools. Before exit, every tool credential must belong to a customer service
+identity, have enough life left, carry least-privilege scopes and have a runbook. Names are illustrative.
+
+```python
+FDE = {"fde-anna", "fde-raj"}
+
+# Agent tool inventory: (tool, credential owner, scopes, days to expiry, runbook linked)
+tools = [
+    ("search_orders", "svc-support-agent", ["orders:read"], 180, True),
+    ("issue_refund",  "fde-raj",           ["refunds:write"], 12, True),
+    ("send_email",    "svc-support-agent", ["mail:send", "admin"], 365, False),
+]
+
+def tool_gaps(tools, min_days=30):
+    for name, owner, scopes, days, runbook in tools:
+        if owner in FDE:
+            yield f"{name}: credential owned by {owner}, re-issue to a customer service identity"
+        if days < min_days:
+            yield f"{name}: credential expires in {days} days"
+        if "admin" in scopes:
+            yield f"{name}: admin scope, narrow to least privilege"
+        if not runbook:
+            yield f"{name}: no runbook for tool failures"
+
+for gap in tool_gaps(tools):
+    print("GAP", gap)
+# GAP issue_refund: credential owned by fde-raj, re-issue to a customer service identity
+# GAP issue_refund: credential expires in 12 days
+# GAP send_email: admin scope, narrow to least privilege
+# GAP send_email: no runbook for tool failures
+```
+
+- **The refund tool is the outage waiting to happen:** it runs on the FDE's personal credential, which
+  expires 12 days after a typical exit date.
+
 ### Worked scenario: six-week handoff of a contract-review assistant
 A two-person FDE team hands the assistant to the customer's platform team (three engineers and one
 operations analyst) over six weeks. The timeline is illustrative.
@@ -174,7 +233,8 @@ for g in readiness(done, required):
 
 ## Production patterns
 - **Customer-owned identities from day one** — when the build starts, create service accounts in the
-  customer's identity provider and cloud, and never use personal API keys even temporarily. Keep a
+  customer's identity provider and cloud, one per agent or per tool group with least-privilege scopes,
+  and never use personal API keys even temporarily. Keep a
   credential inventory with owner and expiry date; alert well before expiry and after any personal key is
   found in use.
 - **Eval gate as a required CI check** — once prompts and configs live in the customer's repositories, make
@@ -183,7 +243,8 @@ for g in readiness(done, required):
 - **Alert-keyed runbooks** — every alert links to its runbook section, written for the customer's on-call
   engineer. Monitor alerts fired without a runbook link and time to acknowledge on the customer's rota.
 - **Game day before exit** — inject a realistic failure (empty retrieval, revoked permission, provider
-  outage) in a production-like environment with the FDE only observing. Measure time to resolve and fold
+  outage, a tool returning errors that sends the agent into a loop) in a production-like environment with
+  the FDE only observing. Include switching the agent to read-only or off. Measure time to resolve and fold
   every runbook correction back in.
 - **Skills matrix with two names per cell** — track who has *performed* each exit task, with links to the
   evidence. Monitor cells with fewer than two customer names; they are single points of failure.
@@ -203,6 +264,9 @@ for g in readiness(done, required):
 - **Exhaustive documentation vs maintained documentation.** Exhaustive docs feel safe but go stale
   quickly; short runbooks keyed to alerts plus decision records for non-obvious choices are maintained
   more often.
+- **Handing over full agent autonomy vs keeping gates.** Removing approval gates at handoff cuts the
+  customer's review load, but a new team learns the agent's failure modes slowly; keep gates on
+  consequential tools until the customer has run a few improvement cycles.
 
 ## Pitfalls
 - **Credentials tied to the FDE's personal accounts.** Symptom: an outage weeks after departure, when the
@@ -219,6 +283,9 @@ for g in readiness(done, required):
   on holiday, then the next incident takes days.
 - **A vague support boundary.** Tickets bounce between vendor support and the customer team, and
   resolution times climb.
+- **Nobody knows how to stop the agent.** During the first post-exit incident the agent keeps taking a
+  bad action while the team searches for the setting. Fix: a documented kill switch or read-only mode,
+  exercised in the game day.
 
 ## When to use
 - **Plan it at the start of the engagement,** not the end. Who will own the system should shape early
@@ -257,12 +324,22 @@ written down.
 - **Tacit knowledge** (why a prompt is phrased a certain way, which slices are noisy) needs decision records
   and paired work, not a final-week walkthrough.
 
-### Design the exit criteria for handing off a RAG assistant.
+### Design the exit criteria for handing off a RAG agent with tools.
 - **Tasks with checkable evidence:** a prompt change shipped through the gate, a regression correctly read,
   a game-day incident resolved from the runbook, a secret rotated, a re-index or model upgrade run with the
   suite, a weekly triage run unaided.
 - **Evidence a third party can verify:** merged pull requests, gate reports, incident tickets.
 - **Two people per area,** so the single point of failure does not move from vendor to customer.
+- **Agent-specific tasks:** a tool-schema change shipped through the trajectory gate, a tool credential
+  rotated, and the agent switched to read-only during a drill.
+
+### What agent-specific risks do you check before handing an agent to a customer team?
+- **Tool permissions:** every tool on a customer service identity with least-privilege scopes, an owner
+  and an expiry date, because the agent can do anything its tools allow.
+- **Controls they can operate:** step budgets, approval gates, cost limits and a kill switch, each with a
+  runbook and exercised once by the customer.
+- **Quality ownership:** a trajectory eval suite that runs in their CI, and the current failure buckets
+  with rates, so their first model upgrade is gated.
 
 ### When would you not do a full handoff?
 - **When the receiving team has no allocated capacity or AI skills,** because a handoff to nobody decays.
@@ -307,3 +384,24 @@ written down.
 - [ ] When the documentation is complete
 > Full ownership needs a capable, staffed receiving team. Without one, or while the system is still
 > changing quickly, the vendor operating it avoids handing responsibility to nobody.
+
+## Use cases & projects
+### Use cases
+- **FDE exit from an agent deployment.** Staged transfer plus an agent game day proves the customer can
+  run, change and stop the agent without the builder.
+- **Internal platform team adopting an agent.** The same RACI, tool inventory and exit evidence apply when
+  a product team hands its agent to a central platform team.
+- **Credential and permission hygiene.** A tool inventory audit before exit catches personal keys, near
+  expiries and over-broad scopes.
+- **Choosing managed service instead.** When the receiving team cannot yet own tools and evals, the
+  readiness check makes that case with evidence.
+
+### Mini project
+**Write and test a handoff pack for a toy agent (2-3 hours).**
+- **Goal:** make a small tool-calling agent operable by someone who did not build it.
+- **Steps:** list the agent's tools with owner, scopes and expiry; write two runbook sections keyed to
+  alerts (tool error rate, step-budget hits); add a switch that puts the agent in read-only mode; make the
+  eval suite runnable with one command; ask a colleague to resolve an injected tool outage using only the
+  pack.
+- **Done when:** the colleague restores service and flips read-only mode without help, the tool audit
+  prints no gaps, and you have folded their runbook corrections back in.

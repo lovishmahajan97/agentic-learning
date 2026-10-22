@@ -5,7 +5,7 @@ name: OpenTelemetry instrumentation
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - fastapi-for-ai/structured-logging
@@ -456,8 +456,9 @@ streams, part of that time is token streaming that a manual span closed early.
   shows which step made a 40-second run slow.
 - **Following runs across services.** Context propagation links the agent API, a retrieval service and
   tool or MCP servers into one trace.
-- **Token and model accounting.** GenAI attributes such as `gen_ai.request.model` and
-  `gen_ai.usage.input_tokens` let a backend aggregate usage by model and step.
+- **Per-step token and model breakdown.** GenAI attributes such as `gen_ai.request.model` and
+  `gen_ai.usage.input_tokens` show which step of a run burned the tokens; totals still come from metrics,
+  because traces are sampled.
 - **Switching backends without re-instrumenting.** OTLP lets the same spans go to a general tracing tool
   or an LLM observability tool such as Langfuse.
 

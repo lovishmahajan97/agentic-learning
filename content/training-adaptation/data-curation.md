@@ -5,7 +5,7 @@ name: Data curation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - training-adaptation/data-labeling
@@ -182,15 +182,15 @@ Agent logs need checks that chat data does not:
 
 ## Diagram
 The same pipeline applies to web data and agent logs: cheap, high-precision filters run first and costly
-judgement last; every stage logs its rejects with a reason, and agent eval error analysis feeds the next
-dataset version.
+judgement last, and for agent logs stage 3 adds the outcome, loop and schema rules. Every stage logs its
+rejects with a reason, and agent eval error analysis feeds the next dataset version.
 
 ```mermaid
 flowchart TD
     R[("Agent logs, crawls or exports")] --> P["1. Provenance, licence, hash, PII scrub"]
     P --> X["2. Extract, language ID, one template"]
-    X --> H["3. Heuristic filters"]
-    H --> D["4. Dedup: exact hash, then MinHash and LSH"]
+    X --> H["3. Heuristic and trajectory filters"]
+    H --> D["4. Dedup: exact, then MinHash LSH"]
     D --> C["5. Decontaminate vs every eval set"]
     C --> M["6. Model-based quality scoring"]
     M --> MX["7. Mix and balance per source"]
@@ -508,6 +508,7 @@ model, which decides whether the data is ready.
 - **Goal:** turn a raw export of agent runs into a versioned, deduplicated, PII-scrubbed JSONL set.
 - **Steps:** generate or export a few hundred agent traces with outcome labels; drop failed, looping and
   unrecovered-error runs into a reject store with reasons; scrub emails and phone numbers from tool
-  results; deduplicate with MinHash; split by conversation group; record stage counts and a content hash.
+  results; deduplicate user requests with MinHash; split by task cluster or tenant, not by run; record
+  stage counts and a content hash.
 - **Done when:** you have train and eval JSONL files, a per-stage drop table, a sample of rejects with
   reasons, and a check showing no near-duplicate crosses the split.

@@ -5,7 +5,7 @@ name: Retrieval granularity
 kind: decision
 difficulty: core
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - rag-retrieval/chunking-strategies
@@ -379,8 +379,8 @@ explanatory queries regress, I would add sum-based parent scoring or a reranker 
 ### Your agent quotes the right number but misses an exception stated in the next sentence. What is wrong?
 - **The return unit is too small:** the tool is sending the matched sentence alone, or the agent did not
   call the read tool before answering.
-- **Fix:** return a sentence window or the parent clause, or make the tool description require reading
-  the section before quoting figures.
+- **Fix:** return a sentence window or the parent clause, so the qualifier travels with the fact, or make
+  the tool description require reading the section before quoting figures.
 - **Verify** with faithfulness checks on a golden set of questions whose answers carry exceptions.
 
 ## Quiz

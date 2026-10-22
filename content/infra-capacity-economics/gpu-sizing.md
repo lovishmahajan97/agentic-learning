@@ -5,7 +5,7 @@ name: GPU sizing (VRAM math)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - model-internals/kv-cache
@@ -23,8 +23,8 @@ sources:
 
 ## TL;DR
 Serving an agent's model needs weights + KV cache + activations + overhead, and agent contexts are long,
-so the cache decides how many agents run at once. Fine-tuning on agent traces adds about 16 bytes per
-parameter with mixed-precision Adam.
+so the cache decides how many agents run at once. A full fine-tune on agent traces needs about 16 bytes
+per parameter with mixed-precision Adam.
 
 ## For agent builders
 - **Why it matters for agents.** An agent's context grows every step (system prompt, tool schemas, tool
@@ -217,14 +217,15 @@ plan("70B int4 / 1xH100",      70.6, 80, 8, 128, 80, bytes_w=0.55)            # 
 
 ### Worked scenario: how many coding agents fit on one H100?
 Llama-3-8B in bf16 on an 80 GB H100 leaves ≈ 55 GB of KV room, ≈ 420k tokens at 128 KB per token. Each
-agent run starts with a 6k-token prefix (system prompt plus tool schemas) and peaks at 32k tokens.
+agent run starts with a 6k-token prefix (system prompt plus tool schemas) and peaks at 32k tokens. Here
+k = 1,024 tokens; with prefix sharing, agents = (420k − 6k) ÷ unique tokens per agent, rounded down.
 
 | Plan | Tokens held per agent | Concurrent agents (≈ 420k ÷ per-agent) |
 |---|---|---|
 | Sized as 4k chats (the mistake) | 4k | ≈ 100, never reached in practice |
 | Agents at peak, no prefix sharing | 32k | ≈ 12 |
 | Prefix caching shares the 6k prefix once | 26k unique + 6k shared | ≈ 15 |
-| Plus compaction capping each run at 16k | 10k unique + 6k shared | ≈ 41 |
+| Plus compaction capping each run at 16k | 10k unique + 6k shared | ≈ 40 |
 
 - **The first row is how teams get preemption storms:** concurrency set from chat math, then agents grow
   past the KV room mid-run and the engine evicts or re-prefills them.
@@ -270,17 +271,17 @@ def peak_step_gb(model, batch, optimizer):
 - **Read the capacity line from the engine log.** Use on every deployment change. vLLM logs the KV-cache
   size it allocated (in tokens or blocks) at start-up; compare it with the planner's estimate. Monitor
   the gap: a large shortfall means an overhead term (CUDA graphs, a co-located process) you missed.
-- **Cap the worst case explicitly.** Use whenever traffic mixes short chats, long documents and long agent runs. Set
-  `--max-model-len` to the longest request you will accept and `--max-num-seqs` to the concurrency the
-  KV room supports. Monitor KV-cache usage and preemption counts in the engine's metrics.
+- **Cap the worst case explicitly.** Use whenever traffic mixes short chats, long documents and long
+  agent runs. Set `--max-model-len` to the longest request you will accept and `--max-num-seqs` to the
+  concurrency the KV room supports. Monitor KV-cache usage and preemption counts in the engine's metrics.
 - **Quantise before adding cards.** Use when weights leave too little KV room, as in the 70B bf16 on two
   cards case. Try fp8 weights (vLLM `--quantization fp8`) and an fp8 KV cache (`--kv-cache-dtype fp8`),
   then rerun your eval set. Monitor task quality alongside the gain in resident tokens.
 - **Leave headroom on shared cards.** Use when anything else runs on the GPU (a sidecar, a second model,
   a profiler). Lower `gpu_memory_utilization` below the 0.9 default rather than raising it. Monitor
   device memory used per process and OOM restarts.
-- **Measure one training step before a long run.** Use before any fine-tune longer than an hour, including LoRA runs on agent traces. Run a
-  single forward, backward and optimizer step at the real batch and sequence length and record
+- **Measure one training step before a long run.** Use before any fine-tune longer than an hour,
+  including LoRA runs on agent traces. Run a single forward, backward and optimizer step at the real batch and sequence length and record
   `torch.cuda.max_memory_allocated()`. Monitor that peak against card memory, keeping headroom.
 
 ## Trade-offs
@@ -437,7 +438,7 @@ contexts will be bandwidth-bound on one card, so latency targets need checking t
   against a real engine.
 - **Steps:** write a Python function that takes parameter count, precision, layers, KV heads, head dim,
   card memory and a per-session token profile (prefix plus tokens per step times steps); compute weights,
-  KV per token and sessions that fit with headroom; compare the result with the KV capacity line vLLM
+  KV per token and sessions that fit with headroom, with and without a shared prefix; compare the result with the KV capacity line vLLM
   prints at start-up for the same model and settings, if you have a GPU.
 - **Done when:** the calculator prints sessions-per-card for at least three agent profiles, and you can
   explain any gap between its estimate and the engine's reported capacity.

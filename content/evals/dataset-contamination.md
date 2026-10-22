@@ -5,7 +5,7 @@ name: Dataset contamination
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - evals/benchmarking
@@ -23,9 +23,9 @@ sources:
 ---
 
 ## TL;DR
-Dataset contamination means eval items or their answers reach the model through training data, prompts
-or, for agents, tools and memory, so scores measure memorization or lookup, not capability. Inflation is
-uneven across models, and your own golden set leaks just as easily.
+Dataset contamination means eval items or answers reach the model through training data, prompts or,
+for agents, tools and memory, so scores measure memorization or lookup, not capability. Web-scale
+training makes it unavoidable, inflation is uneven, and your golden set leaks too.
 
 ## For agent builders
 - **Why it matters for agents.** Agents add leak routes plain models lack: a web-search tool can fetch
@@ -271,16 +271,18 @@ agent may have found the answer rather than worked it out. Reuses `shingles` fro
 with a shorter n, because answers are short.
 
 ```python
+SEARCH_TOOLS = {"web_search", "fetch_url"}            # the tools that can bring outside text in
+
 def lookup_flags(runs, items, n=6):
     """runs: id -> {"pass": bool, "trace": [{"tool": str, "result": str}, ...]}"""
     flags = {}
     for it in items:
         ans = set(shingles(it["answer"], n))
+        pages = [str(t["result"]) for t in runs[it["id"]]["trace"] if t["tool"] in SEARCH_TOOLS]
         if not ans:                                   # answer shorter than n words: exact substring check
-            hit = any(it["answer"].lower() in str(t["result"]).lower() for t in runs[it["id"]]["trace"])
+            hit = any(it["answer"].lower() in p.lower() for p in pages)
         else:
-            hit = any(ans & set(shingles(str(t["result"]), n)) for t in runs[it["id"]]["trace"]
-                      if t["tool"] in {"web_search", "fetch_url"})
+            hit = any(ans & set(shingles(p, n)) for p in pages)
         flags[it["id"]] = hit
     return flags
 

@@ -5,7 +5,7 @@ name: ANN indexes (HNSW, IVF)
 kind: concept
 difficulty: core
 est_minutes: 19
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - rag-retrieval/similarity-search
@@ -195,13 +195,13 @@ An assistant agent stores memories in one pgvector table shared by 20,000 users 
 | Rows in the table | 10 million memories |
 | Rows for a typical user | ~500, so the filter keeps 0.005% |
 | HNSW candidate list | `hnsw.ef_search` default 40 |
-| Allowed rows among the 40 nearest overall | usually 0 |
+| Allowed rows among the 40 nearest overall | often none, at best a few |
 | Agent sees | 0-2 memories, then "I don't have that information" |
 
 - **Diagnosis.** The walk collects the 40 globally nearest memories, the filter discards nearly all of
   them, and the agent concludes it never knew the fact.
 - **Fixes.** For a user with ~500 rows, an exact scan on a B-tree `user_id` index is cheap and loses no
-  recall. Otherwise use iterative index scans (pgvector 0.8), a partial index per large tenant, or an
+  recall; confirm with `EXPLAIN` that the planner picks it over the HNSW index. Otherwise use iterative index scans (pgvector 0.8), a partial index per large tenant, or an
   engine with filtered traversal.
 - **Measure.** Count tool calls where returned rows are fewer than `LIMIT`, per user bucket.
 
@@ -368,17 +368,19 @@ configuration, not on a full-precision prototype.
 
 ### Your agent says it has no memory of facts users clearly told it. The memory table uses HNSW. How do you debug it?
 - **Suspect the filter first:** recall filtered by `user_id` keeps a tiny fraction of rows, so the
-  greedy walk's candidate list fills with other users' memories and the filter discards them.
+  greedy walk's candidate list fills with other users' memories and the filter discards them; allowed
+  nodes are only reachable through disallowed ones and the `ef`-sized list runs dry.
 - **Also check `ef_search`:** in pgvector a plain HNSW scan returns at most `hnsw.ef_search` rows, so
   `LIMIT 100` with the default 40 yields 40.
 - **Fix:** exact scan for small per-user sets, iterative scans (pgvector 0.8), filtered traversal with a
   wider ef, or partitioning by the filter key; track tool calls returning fewer rows than requested.
 
-### A filtered HNSW query asks for 10 results and returns 3. How do you debug it?
-- **Suspect the filter first:** a selective filter starves the greedy walk, because allowed nodes are only
-  reachable through disallowed ones and the `ef`-sized candidate list runs dry.
-- **Fix:** filtered traversal with a wider ef, iterative scans, pre-filtering to an exact scan for small
-  id sets, or partitioning by the filter key.
+### Your agent rewrites and deletes memories all day. What happens to its HNSW index over time?
+- **Deletes are tombstones:** removing a node could disconnect the graph, so engines mark it deleted and
+  keep routing through it; memory never shrinks and the walk wastes steps on dead nodes.
+- **Symptom:** recall on recent memories drifts down and latency rises slowly at the same `efSearch`.
+- **Fix:** schedule rebuilds (`REINDEX INDEX CONCURRENTLY` in Postgres) and track the deleted-row
+  fraction and recall on new versus old memories separately.
 
 ### When would you choose IVF-PQ over HNSW, and what do you give up?
 - **Choose IVF-PQ** when vectors outgrow RAM or must run on GPU: at m = 96 a 768-dim fp32 vector shrinks

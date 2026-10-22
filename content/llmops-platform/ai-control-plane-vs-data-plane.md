@@ -5,7 +5,8 @@ name: AI control plane vs data plane
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - system-design/ai-gateway
   - llmops-platform/model-registry
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-The data plane is the fast per-request path (gateway, routing, model call, retrieval, guardrails); the
-control plane is the slow, audited system of record (registries, rollouts, policies, keys). The data plane
-serves versioned snapshots and keeps the last one if the control plane fails.
+The data plane is the fast path your agent runs on (gateway, model and tool calls); the control plane
+is the audited system of record (bundles, rollouts, tool policies, keys). The data plane serves
+versioned snapshots, keeping the last if the control plane fails.
+
+## For agent builders
+- **Why it matters for agents.** An agent makes many model and tool calls per task, so any per-call lookup
+  to a config service multiplies its latency and failure rate by the step count. Agent policy (allowed
+  tools, step budgets, approval rules) belongs in a snapshot the runtime checks locally.
+- **Where it shows up in your stack.** The AI gateway and agent runtime (data plane), the model and prompt
+  registries, rollout settings and tool permission policies (control plane), and the config version on
+  every trace.
+- **What you control.** Which agent settings live in the snapshot, how the runtime enforces tool
+  allow-lists and step caps per tenant, how fast revocations of a tool or key reach the runtime, and
+  which version a long run uses.
+- **What you can skip.** xDS and mesh internals; the pattern (snapshot, atomic swap, fail static) is what
+  you apply.
 
 ## Why it exists
 - **The two halves have opposite requirements.**
@@ -107,6 +121,22 @@ serves versioned snapshots and keeps the last one if the control plane fails.
   the rollout reverted.
 - **The loop is asynchronous by design.** Per-request decisions use local counters; precise global quotas
   use a shared fast store that is part of the data plane, not the control plane.
+
+### Agents on the data plane
+An agent runtime is data plane: it executes the loop and every tool call. The control plane decides what
+it may do:
+
+| Control plane publishes | Agent runtime enforces locally, per step |
+|---|---|
+| tool allow-list per tenant and use case | reject a tool call outside the list before executing it |
+| step and token budgets per run | stop the loop at the cap |
+| approval rules for consequential tools | pause for a human when a rule matches |
+| bundle and rollout for the agent | pin the snapshot version at run start |
+
+- **Pin the snapshot per run, not per step,** *because* a run that switches bundle or tool policy halfway
+  through is an agent nobody evaluated; revocations are the exception and apply immediately.
+- **Per-step policy checks must be local,** *because* a 20-step run with three tool calls per step would
+  otherwise make dozens of control-plane calls per task.
 
 ### Where the gateway fits
 - **The AI gateway is data plane;** its admin API, configuration database and UI are control plane.
@@ -215,6 +245,38 @@ for age in (60, 900, 8 * 3600):
 "Deny" here means: refuse requests whose authorisation depends on the stale entry (for example any key
 not re-confirmed by the fast revocation channel), not the whole service.
 
+### Agent tool policy enforced from the snapshot
+Pure Python: the runtime pins a snapshot at run start, checks each tool call against it locally, and
+still honours revocations that arrive mid-run. Names are illustrative.
+
+```python
+REVOKED_TOOLS: set[tuple[str, str]] = set()     # filled by the fast revocation channel
+
+def start_run(conf: dict, tenant: str, use_case: str) -> dict:
+    pol = conf["agent_policy"][use_case].get(tenant, conf["agent_policy"][use_case]["default"])
+    return {"config_version": conf["version"], "tenant": tenant, "tools": set(pol["tools"]),
+            "approval": set(pol["needs_approval"]), "max_steps": pol["max_steps"], "steps": 0}
+
+def check_tool(run: dict, tool: str) -> str:
+    if (run["tenant"], tool) in REVOKED_TOOLS:
+        return "deny: revoked"                   # revocations apply mid-run
+    if tool not in run["tools"]:
+        return "deny: not allowed"
+    if tool in run["approval"]:
+        return "pause: human approval"
+    return "allow"
+
+conf = {"version": 418, "agent_policy": {"support": {
+    "default": {"tools": ["search", "get_order"], "needs_approval": [], "max_steps": 10},
+    "acme": {"tools": ["search", "get_order", "refund"], "needs_approval": ["refund"], "max_steps": 15}}}}
+run = start_run(conf, "acme", "support")
+print([check_tool(run, t) for t in ("search", "refund", "delete_account")])
+REVOKED_TOOLS.add(("acme", "refund"))
+print(check_tool(run, "refund"), "| run pinned to config", run["config_version"])
+# ['allow', 'pause: human approval', 'deny: not allowed']
+# deny: revoked | run pinned to config 418
+```
+
 ### Worked outage: two hours without a control plane
 Illustrative midday outage of the control-plane database on a well-built platform.
 
@@ -250,6 +312,9 @@ Illustrative midday outage of the control-plane database on a well-built platfor
 - **Audited break-glass override.** A signed local override file with an expiry, accepted only from an
   allow-listed operator identity and logged centrally once connectivity returns. Monitor active overrides
   and their remaining lifetime.
+- **Agent policy in the snapshot.** Publish tool allow-lists, step budgets and approval rules per tenant as
+  part of the config snapshot, pin it at run start and enforce it in the runtime before each tool call.
+  Monitor denied tool calls per tenant and runs stopped at the step cap.
 
 ## Trade-offs
 - **Snapshots vs propagation delay.** No per-request dependency on the control plane, but changes land
@@ -286,6 +351,9 @@ Illustrative midday outage of the control-plane database on a well-built platfor
   it and nobody able to change the alias. Fix: an audited local override.
 - **Treating key revocation as ordinary snapshot config.** Symptom: a revoked key keeps working on some
   replicas for as long as they cannot fetch a fresh snapshot. Fix: fast channel and fail closed.
+- **Calling a policy service before every agent tool call.** Symptom: agent tasks slow down in proportion
+  to their step count and fail whenever the policy service blips. Fix: tool policy in the local snapshot,
+  with only revocations pushed.
 
 ## When to use
 - **Make the split explicit** once configuration changes more often than code deploys, or more than one
@@ -330,7 +398,7 @@ were not stamped with the version. The outage is a test of exactly those three p
 - **Why separate:** opposite requirements; per-request config lookups put the control plane's latency and
   availability on every request, while baked-in config makes every change a redeploy.
 
-### A prompt change caused a few seconds of bizarre answers on every deploy. What is the likely design flaw?
+### Every agent prompt change causes a few seconds of bizarre answers and failed tool calls. What is the likely design flaw?
 - **Key-by-key hot reload:** replicas applied the new prompt before the matching model or tool schema, so
   they briefly served an unevaluated combination.
 - **Fix:** publish whole, versioned snapshots and swap them atomically per replica.
@@ -354,6 +422,14 @@ were not stamped with the version. The outage is a test of exactly those three p
 - **One team, one application,** where config changes are rare and both planes can share an on-call.
 - **Condition:** it already loads config into memory rather than querying per request.
 - **Split** when a second team shares the gateway or config changes outpace code deploys.
+
+### Where do an agent's tool permissions live, and how are they enforced on each step?
+- **Defined in the control plane:** allow-lists, approval rules and step budgets per tenant and use case,
+  changed through an audited path.
+- **Enforced in the runtime:** checked locally against the snapshot pinned at run start, before every tool
+  call, so a long run makes no control-plane calls.
+- **Revocations bypass the pin:** a revoked tool or key arrives on the fast channel and denies the next
+  call, even mid-run.
 
 ## Quiz
 ### Q: Which of these belongs in the control plane rather than the data plane?
@@ -379,3 +455,24 @@ were not stamped with the version. The outage is a test of exactly those three p
 - [ ] Redeploy the data plane with configuration baked in
 > Fail static is the design goal: availability of serving outranks freshness of configuration. The
 > trade is that changes, including rollbacks, wait for the control plane or a break-glass override.
+
+## Use cases & projects
+### Use cases
+- **Per-tenant tool permissions.** One customer's agent may issue refunds with approval, another's may only
+  read orders; both are snapshot entries, not code branches.
+- **Canarying a new agent bundle.** Rollout percentage is control-plane state; the runtime pins the bundle
+  per run and stamps the version on traces.
+- **Emergency tool kill switch.** A misbehaving tool is revoked on the fast channel and denied mid-run on
+  every replica.
+- **Agents deployed in a customer's region.** Runtime replicas run near the data while the control plane
+  stays central.
+
+### Mini project
+**Snapshot-driven agent runtime (2-3 hours).**
+- **Goal:** run a tool-calling agent whose tool policy and bundle come from a versioned snapshot and keep
+  working when the control plane is down.
+- **Steps:** serve a JSON snapshot (version, bundle, per-tenant tool allow-list, step cap) from a tiny HTTP
+  server; have the agent runtime pull it every 10 seconds, swap atomically and persist it; pin the version
+  per run; add a revocation endpoint the runtime polls every second; stop the config server mid-test.
+- **Done when:** runs keep completing on the last snapshot with the server down, a revoked tool is denied
+  within two seconds even mid-run, and every trace carries the config version it ran under.

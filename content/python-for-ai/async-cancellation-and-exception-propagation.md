@@ -5,7 +5,7 @@ name: Async cancellation & exception propagation
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/asyncio
@@ -282,8 +282,9 @@ In both runs the `finally` releases the resource, but only the correct version r
 
 ## Pitfalls
 - **Swallowing cancellation in a tool wrapper.** A bare `except:` or `except BaseException:` without
-  re-raise (or `except Exception` on Python 3.7 and earlier). Symptom: turn timeouts that never fire and
-  shutdowns that hang. Fix: re-raise.
+  re-raise (or `except Exception` on Python 3.7 and earlier). Symptom: timeouts that never fire and
+  shutdowns that hang, when the swallow runs in the task that owns the deadline (an inline `await`, not a
+  separate child task). Fix: re-raise.
 - **Fire-and-forget `asyncio.create_task(...)`** without keeping a reference or awaiting it. Symptom:
   "Task exception was never retrieved" in logs and occasionally tasks garbage-collected mid-flight.
   Fix: keep tasks in a set with a done-callback that discards and logs them, or use a `TaskGroup`.
@@ -416,8 +417,9 @@ or a compensating action.
 - **Goal:** prove that cancelling a turn stops every tool, runs every cleanup and keeps deadlines
   working.
 - **Steps:** build a fake turn that streams "tokens" and runs three tools in a `TaskGroup`, each logging
-  in `finally`; cancel the turn after 1 second and check all cleanups ran; add one tool that swallows
-  `CancelledError` and show that `asyncio.timeout` no longer raises; fix it by re-raising; finally compare
-  a failing tool under `TaskGroup` with `gather(return_exceptions=True)`.
+  in `finally`; cancel the turn after 1 second and check all cleanups ran; give one tool its own
+  `asyncio.timeout` and make it swallow `CancelledError` inside that block, then show its `TimeoutError`
+  never fires; fix it by re-raising; finally compare a failing tool under `TaskGroup` with
+  `gather(return_exceptions=True)`.
 - **Done when:** a pytest file asserts cleanup on cancel, timeout firing, and the fail-fast versus
   best-effort behaviour, and the swallowing tool's test fails until you fix it.

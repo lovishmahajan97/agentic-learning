@@ -5,7 +5,7 @@ name: Synchronous vs asynchronous execution
 kind: decision
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - system-design/event-driven-architecture
@@ -293,8 +293,12 @@ def run_agent_job(run_id, store, llm_step, call_tool, max_steps=25):
 | Tool at step 12 had already created a ticket | restart creates a second ticket | same key, so the ticket API returns the first one |
 | User closes the tab at step 5 | run continues, and the UI loses it | run continues, and the reopened UI replays events after the last id |
 
-Step counts are illustrative; the caveat is that the tool APIs must honour the idempotency key for the
-second row to hold.
+Step counts are illustrative. Two caveats:
+- **Tools must honour the key.** The second row holds only if the tool APIs deduplicate on the idempotency
+  key.
+- **The lease must outlast one step.** The heartbeat runs only between steps, so a single model or tool
+  call longer than the 60-second lease lets another worker reclaim a live run; lengthen the lease or
+  heartbeat from a background task.
 
 ### Production snippet: claiming a job with a lease in Postgres
 ```sql

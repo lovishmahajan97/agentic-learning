@@ -5,7 +5,7 @@ name: Security scanning & dependency auditing (pip-audit, Bandit)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - python-for-ai/lockfiles-and-dependency-pinning

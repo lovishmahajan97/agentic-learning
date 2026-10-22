@@ -5,7 +5,8 @@ name: OWASP Top 10 for LLMs
 kind: concept
 difficulty: intro
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - safety-security/prompt-injection
   - safety-security/excessive-agency
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-The OWASP Top 10 for LLM Applications names the most consequential LLM risk classes in a shared
-vocabulary. Its core framing: the model is an untrusted component that follows instructions in data, so
-every classic boundary must be redrawn around the prompt.
+The OWASP Top 10 for LLM Applications is the shared checklist reviewers will use on your agent. Its core
+framing: the model is an untrusted component that follows instructions in data, so every boundary around
+prompts, tools and outputs must be redrawn.
+
+## For agent builders
+- **Why it matters for agents.** Agents hit almost every item at once: indirect injection through tool
+  results (LLM01), tools with too much authority (LLM06), retrieval leaking across users (LLM08), and
+  runaway loops that burn budget (LLM10). The 2025 edition was restructured largely around these failures.
+- **Where it shows up in your stack.** Your threat model, red-team suite, enterprise security
+  questionnaires, and the review a new tool or data source goes through before it ships.
+- **What you control.** A per-item control matrix kept as code next to the agent, with evidence links (a
+  test, a config, a log), red-team cases tagged by item, and boundary controls that do not depend on
+  detecting the attack.
+- **What you can skip.** Memorising the numbering as a priority order, and any "OWASP compliant" claim.
+  Rank items by your agent's exposure and blast radius instead.
 
 ## Why it exists
 - **Security reviews run on checklists, and before 2023 there was none for LLM features.** Each review
@@ -43,7 +56,8 @@ every classic boundary must be redrawn around the prompt.
 
 ## How it works
 ### The 2025 list, grouped by trust boundary
-The ten items are easier to remember as six trust boundaries than as a numbered list.
+The ten items are easier to remember as six trust boundaries than as a numbered list, and each boundary
+maps to a part of an agent: the context, the stores, the tools, the user, the loop and the build.
 
 | Boundary | Item | What goes wrong | Deep lesson |
 |---|---|---|---|
@@ -103,8 +117,8 @@ A typical chain, four rows and one attack:
 | NIST AI Risk Management Framework | the organisational process for governing AI risk |
 
 ## Diagram
-One injection chain crosses four rows; the cheapest reliable control (no remote image rendering) sits in a
-different row from the one the incident gets filed under.
+One injection chain through a RAG agent crosses four rows; the cheapest reliable control (no remote image
+rendering) sits in a different row from the one the incident gets filed under.
 
 ```mermaid
 flowchart TD
@@ -118,7 +132,7 @@ flowchart TD
 ```
 
 ## Examples
-### Threat-modelling a contract-review assistant
+### Threat-modelling a contract-review agent
 RAG over each customer's uploaded contracts, a tool that creates tickets in the customer's tracker, used by
 legal teams at 300 tenants. Walking the list produces concrete controls rather than abstractions.
 
@@ -144,8 +158,8 @@ A chatbot over public documentation, by contrast, would rank LLM09 and LLM10 nea
 the bottom.
 
 ### A control matrix that fails CI on gaps
-Keep the matrix in the repo next to the code and fail the build when a row is missing or lacks evidence.
-Pure Python, runnable; here it reports the rows still to write.
+Keep the matrix in the repo next to the agent code and fail the build when a row is missing or lacks
+evidence. Pure Python, runnable; here it reports the rows still to write.
 
 ```python
 ITEMS = [f"LLM{n:02d}" for n in range(1, 11)]
@@ -179,6 +193,21 @@ for g in gaps(MATRIX):
 
 - **Version the matrix** with the edition it maps to (2025, not v1.1), so questionnaire answers line up with
   the item numbers customers cite.
+- **Tie it to the tool registry:** a CI rule that a new entry in the agent's tool registry must touch the
+  LLM06 row keeps the matrix from going stale.
+
+### Worked scenario: LLM10 for a runaway agent loop
+A research agent with no step cap hits a tool that keeps returning "try again"; each step adds ~2k tokens
+of context. Rough numbers, illustrative:
+
+| Setting | Steps before stop | Context at stop | Input tokens billed |
+|---|---|---|---|
+| No step cap, no budget | ~60, until the context window fills | ~120k | several million per run |
+| Ten-step cap | 10 | ~20k | ~110k |
+| Ten-step cap plus per-tenant monthly token budget | 10, and the tenant is throttled at the budget | ~20k | bounded per month |
+
+- **The control is in code, not the prompt:** a loop counter and a budget check in the orchestrator, with
+  alerts on limit hits, are the LLM10 evidence a reviewer asks for.
 
 ## Production patterns
 - **Matrix-as-code in the repo.** Store the per-item matrix next to the service, require evidence links to
@@ -221,7 +250,7 @@ for g in gaps(MATRIX):
   through rendering into disclosure, because no single row owned the chain.
 
 ## When to use
-- **When designing a new LLM feature:** as the skeleton of the threat model.
+- **When designing a new agent or LLM feature:** as the skeleton of the threat model.
 - **Before an enterprise security review or questionnaire:** as the structure of your answers.
 - **After any incident:** to classify it and check which row's evidence was missing.
 - **Avoid:** using it as a scoring scheme or a certification.
@@ -273,6 +302,13 @@ what the list is meant to elicit.
   images) breaks it completely; if a tool fired, LLM06 scoping and gates contain it.
 - **So classify the incident across every row it crossed** and fix the cheapest reliable link.
 
+### Your team adds a new tool to a production agent. How does the Top 10 enter that change?
+- **The tool registry diff triggers a matrix diff:** the LLM06 row records its scope, credential source
+  and whether it needs an approval gate.
+- **Check the crossing rows:** does it return untrusted text (LLM01), can it send data out (LLM02), does
+  its output reach a renderer or interpreter (LLM05)?
+- **Add tagged red-team cases** for the new tool so its item pass rates appear in the next release report.
+
 ### When is covering all ten items more process than it is worth?
 - **For a low-risk internal tool** with no write tools and no sensitive data, deep work on every row is
   disproportionate.
@@ -312,3 +348,24 @@ what the list is meant to elicit.
 - [ ] The list was merged into the web application Top 10
 > The 2025 edition reflected real deployments: cost and extraction joined denial of service, and RAG and
 > agent failures earned their own items, while prompt injection stayed at number one.
+
+## Use cases & projects
+### Use cases
+- **Launch reviews for a new agent.** The per-item matrix is the threat model a security team signs off
+  before a tool-using agent goes live.
+- **Enterprise security questionnaires.** Item-numbered answers with evidence let FDEs reply quickly and
+  consistently across customers.
+- **Red-team reporting.** Tagging adversarial cases by item turns a vague safety score into "LLM06 pass rate
+  dropped after the new refund tool".
+- **Incident postmortems.** Classifying a chain across every row it crossed points at the cheapest
+  reliable fix.
+
+### Mini project
+**Write the control matrix for a small agent (1-2 hours).**
+- **Goal:** turn the Top 10 into a CI-checked artefact for an agent with RAG and one write tool.
+- **Steps:** pick or sketch an agent (for example a docs assistant that can open tickets); fill all ten
+  rows with manifests, control and evidence, or a one-line n/a reason; adapt the `gaps` script to fail CI;
+  write one tagged red-team test each for LLM01, LLM05 and LLM10 (an injected document, an HTML
+  completion, a loop that must stop at a step cap).
+- **Done when:** the gap check passes, the three tests run and are tagged by item, and you can rank the ten
+  items for this agent with a one-line reason each.

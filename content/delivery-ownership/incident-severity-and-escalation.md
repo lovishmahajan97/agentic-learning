@@ -5,7 +5,8 @@ name: Incident severity & escalation
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - delivery-ownership/production-debugging
   - delivery-ownership/root-cause-analysis-and-postmortems
@@ -20,9 +21,22 @@ sources:
 ---
 
 ## TL;DR
-A severity scale classifies incidents by impact, not cause, so response speed, paging and update cadence
-are decided in advance. Escalation rules add expertise or authority. AI systems need extra criteria for
-quality and safety incidents that throw no errors.
+A severity scale classifies incidents by impact, not cause, so paging and response speed are decided in
+advance. Escalation adds expertise or authority. Agents need extra criteria: wrong actions, unsafe
+outputs and leaks that throw no errors.
+
+## For agent builders
+- **Why it matters for agents.** An agent can do damage while every dashboard is green: it returns HTTP
+  200 while issuing a duplicate refund, emailing the wrong customer or leaking another tenant's document.
+  Severity criteria that only mention uptime will not page anyone for that.
+- **Where it shows up in your stack.** Alerts on tool-action rates, guardrail blocks and quality scores;
+  per-tool and per-tenant kill switches; the paging tool's escalation timers; and the request IDs you
+  send to your model provider.
+- **What you control.** Which agent behaviours count as SEV1 (irreversible or unauthorised actions, data
+  exposure), which mitigations exist without a deploy (disable a tool, read-only mode, pin a snapshot),
+  and who can flip them.
+- **What you can skip.** Designing an organisation-wide incident programme from scratch; adopt the
+  company's scale and add agent-specific criteria and switches to it.
 
 ## Why it exists
 - **Without levels, every incident starts with a negotiation.** One engineer thinks a 5% error rate is a
@@ -63,6 +77,19 @@ Add impact criteria about content, not uptime:
 - **A provider model change or outage** affecting all traffic.
 - **One case can be enough.** A single confirmed data-exposure case can justify the top severity even if
   it touched one user, because the harm is not proportional to volume.
+
+### Agent action criteria
+Agents act, so classify by what the action did and whether it can be undone:
+
+| Agent behaviour | Typical severity | First mitigation |
+|---|---|---|
+| Irreversible or unauthorised action (payment, deletion, external email) | SEV1 | Disable that tool or switch the agent to read-only |
+| Reversible wrong actions at scale (mis-filed tickets, wrong tags) | SEV2 | Require human approval for that tool |
+| Agent loops or step budget hit, cost spiking, no user harm | SEV3 | Lower the step cap or route to a fallback |
+| Odd tool choice with correct outcome | SEV4 | Backlog, add an eval case |
+
+- **Count actions, not just requests.** One run can call a side-effecting tool many times, so the share of
+  degraded requests understates impact.
 
 ### Declare early, adjust freely
 - **Declare at the higher plausible severity and downgrade as facts arrive**, *because* under-declaring
@@ -174,7 +201,24 @@ print(classify(Impact(0.0, False, True, cross_tenant_exposure=True)))  # SEV1 at
 print(needs_escalation("SEV2", 45), needs_escalation("SEV2", 60))      # False True
 ```
 
+### Worked scenario: duplicate refunds from a support agent
+A support agent can call `issue_refund`. A retry change makes it re-issue a refund when the tool times
+out but the payment actually went through (timeline illustrative).
+
+| Time | What happened | Severity |
+|---|---|---|
+| **14:05** | Cost alert: tool calls per run up from about 4 to about 7. No errors, no complaints. | SEV3 |
+| **14:20** | Trace sample: 9 of 40 runs called `issue_refund` twice for the same order. Money left the company and cannot be pulled back automatically. | SEV1 |
+| **14:23** | Mitigation: `issue_refund` disabled by flag, agent tells users a human will follow up. Finance and leadership informed. | SEV1 |
+| **15:10** | Duplicates listed from traces and handed to finance; idempotency key added to the tool before re-enabling. | SEV2 until reconciled |
+
+The step that moved it to SEV1 was not volume but the fact that the action was irreversible.
+
 ## Production patterns
+- **Per-tool kill switches for agents.** When: any agent with side-effecting tools. How: a flag per tool
+  that removes it from the agent's tool list or forces human approval, plus a read-only mode, all
+  switchable without a deploy. Monitor: side-effecting calls per run and time from declaration to tool
+  disabled.
 - **Severity matrix in the runbook header.** When: before the first incident. How: a one-screen table of
   observable criteria per level, with paging target, acknowledge and mitigate targets, update cadence and
   postmortem requirement. Monitor: how often severity was disputed or changed during incidents.
@@ -220,6 +264,9 @@ print(needs_escalation("SEV2", 45), needs_escalation("SEV2", 60))      # False T
 - **Severity inflation.** Everything urgent-sounding is declared SEV1 and never downgraded. Symptom: SEV1
   pages that no longer mobilise anyone and a postmortem backlog nobody can clear. Fix: downgrade as facts
   arrive.
+- **Shipping side-effecting agent tools with no off switch.** Symptom: the only mitigation for a
+  misbehaving tool is a full rollback or taking the whole agent down. Fix: per-tool flags and a read-only
+  mode, tested before launch.
 
 ## When to use
 - **Use when:** any team runs a production service. Write the scale and escalation policy before the
@@ -274,6 +321,16 @@ have access, we downgrade; declaring high and downgrading is cheaper than the re
   contractual commitment can justify SEV1 or SEV2 even for one user.
 - **Then check reach.** Search traces for the same pattern, because one report often means many unnoticed
   cases.
+- **If an agent acted on it**, classify the action: a hallucinated order ID used in a cancellation is an
+  irreversible-action incident, not a wording issue.
+
+### Your agent just sent 30 emails to the wrong customers and errors are at zero. What do you do in the first 15 minutes?
+- **Declare high.** An external, irreversible action with possible data exposure is SEV1 provisionally;
+  assign a commander and inform security and the account owner.
+- **Mitigate without a deploy:** disable the email tool by flag or switch the agent to read-only, then
+  snapshot the traces for the affected runs.
+- **Escalate hierarchically** for customer and possibly regulatory notification, and functionally to the
+  team that owns the recipient lookup the agent called.
 
 ### What numbers would you track to know your severity policy works?
 - **Time to declare, acknowledge and mitigate**, broken down by severity.
@@ -305,3 +362,24 @@ have access, we downgrade; declaring high and downgrading is cheaper than the re
 - [x] Under-declaring delays the response while over-declaring only costs attention, and severity can be lowered later
 > The costs are asymmetric: a late response to a real SEV1 compounds harm, whereas downgrading after facts
 > arrive is cheap, so the policy biases toward early, high declaration.
+
+## Use cases & projects
+### Use cases
+- **Agents with payment or account tools.** Irreversible actions get their own SEV1 criterion and a
+  per-tool kill switch before launch.
+- **Multi-tenant RAG agents.** A single cross-tenant document in an answer is a top-severity incident even
+  with normal error rates.
+- **Silent provider model updates.** A schema or tool-call regression for one key tenant escalates to SEV2
+  and is mitigated by pinning that tenant's snapshot.
+- **Enterprise agent contracts.** Customer P1 to P4 priorities are mapped to internal severities so the
+  SLA clock and the on-call rotation agree.
+
+### Mini project
+**Write and test a severity policy for a tool-calling agent (1-2 hours).**
+- **Goal:** turn agent-specific impact facts into a tested classifier plus the switches it relies on.
+- **Steps:** list your agent's tools and mark each reversible or irreversible; extend the `Impact`
+  dataclass from the example with fields such as irreversible action taken and tenant boundary crossed;
+  write `classify` and `needs_escalation`; add a flag that removes a named tool from the agent's tool list
+  at runtime; write tests for five scenarios, including duplicate refunds and a loop with no user harm.
+- **Done when:** all five scenarios classify as your policy says, the flag disables a tool without a
+  restart, and the one-screen severity matrix is written down next to the code.

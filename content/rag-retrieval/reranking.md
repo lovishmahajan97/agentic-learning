@@ -5,7 +5,7 @@ name: Reranking (cross-encoder)
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - rag-retrieval/hybrid-search
@@ -194,7 +194,7 @@ def search_tool(query, first_stage, n=50, k=3):
     fut = pool.submit(ce.predict, [(query, t) for _, t in cands], batch_size=64)
     try:
         scores = fut.result(timeout=BUDGET_S)
-    except Timeout:
+    except Timeout:                                     # the abandoned call still occupies a worker
         return {"results": [c for c, _ in cands[:k]], "reranked": False}   # fallback
     ranked = sorted(zip(cands, scores), key=lambda x: -x[1])
     keep = [(c[0], float(s)) for c, s in ranked[:k] if s >= THRESHOLD]

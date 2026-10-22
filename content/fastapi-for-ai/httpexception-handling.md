@@ -5,7 +5,7 @@ name: HTTPException handling
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - fastapi-for-ai/middleware-ordering
@@ -253,8 +253,10 @@ async def generate(client: httpx.AsyncClient, payload: dict) -> dict:
 | 400 (we sent a bad request) | unmapped `HTTPStatusError` | generic 500 with `request_id`, full detail in logs |
 
 ### Agent executor turning tool-server errors into observations
-The tool servers return the Problem Details envelope above; the executor decides what the model sees.
-`http` is your shared `httpx.AsyncClient`.
+The tool servers return the Problem Details envelope above, ideally with `code` and `retryable` added as
+extension members (RFC 9457 allows extra fields; the `problem()` helper above carries the code only in
+`title`, so the executor falls back to it). The executor decides what the model sees. `http` is your
+shared `httpx.AsyncClient`.
 
 ```python
 import asyncio, httpx
@@ -271,9 +273,11 @@ async def call_tool(http: httpx.AsyncClient, url: str, args: dict, budget_left: 
         retry_after = r.headers.get("retry-after", "")
         if r.status_code == 503 and attempt == 0 and retry_after.isdigit() \
                 and int(retry_after) < budget_left / 2:
-            await asyncio.sleep(int(retry_after)); continue    # one retry inside the run budget
+            await asyncio.sleep(int(retry_after))              # one retry inside the run budget
+            budget_left -= int(retry_after); continue
         if 400 <= r.status_code < 500:                          # model can fix its arguments
-            return {"error": p.get("detail", "invalid request"), "code": p.get("code", "invalid")}
+            return {"error": p.get("detail", "invalid request"),
+                    "code": p.get("code") or p.get("title", "invalid")}
         return {"error": "tool unavailable", "retryable": True}  # 5xx: no internals to the model
     return {"error": "tool busy", "retryable": True}
 ```

@@ -5,7 +5,8 @@ name: Sandbox vs production environments
 kind: practice
 difficulty: core
 est_minutes: 13
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - enterprise-integration/enterprise-connectors
   - enterprise-integration/tenant-specific-configuration-and-feature-flags
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-Customer systems come in pairs: production with real data and side effects, and sandboxes that differ in
-data, configuration and limits. Build and verify against the sandbox, promote deliberately, and use hard
-guards so the two never mix.
+An agent's tools hit customer systems that come in pairs: production with real side effects, and
+sandboxes with different data and limits. Develop and evaluate agents against the sandbox, prove quality
+in shadow mode, and hard-guard tools so the two never mix.
+
+## For agent builders
+- **Why it matters for agents.** Every tool call an agent makes in a test run is a real call somewhere. An
+  agent pointed at production during development creates cases and sends emails; one evaluated only on a
+  masked sandbox ships prompts tuned on the wrong text.
+- **Where it shows up in your stack.** The tool adapter's base URL and secret reference, the vector-store
+  namespace the agent retrieves from, the eval harness that replays tasks, and the webhook receiver feeding
+  the agent's index.
+- **What you control.** One binding per environment resolved with no default, a host allow-list inside
+  every tool's HTTP client, a writes flag per binding, and shadow mode where the agent proposes actions
+  but its write tools are disabled.
+- **What you can skip.** The details of each vendor's sandbox types and refresh rules beyond what your
+  customer uses; learn the matrix, the guards and the promotion path, and look up the platform specifics.
 
 ## Why it exists
 - **The customer has its own environments.** Software teams separate development, staging and
@@ -126,9 +140,25 @@ production-safe tools:
 
 The sandbox proves the integration is *correct*; these prove it is *right for this customer*.
 
+### Environments for an agent
+An agent adds three things the binding must cover, because the model decides at runtime which tools to
+call and with what.
+- **The tool registry is per binding.** Each tool's adapter resolves its host and secret from the binding,
+  so no prompt or tool argument can redirect a call to another environment. Never let the model supply a
+  base URL or instance name.
+- **Shadow mode means write tools return a dry-run result.** The agent runs on live production inputs, read
+  tools work normally, and write tools record the proposed call (tool, arguments, target record) and
+  return "recorded, not executed". You compare proposed actions with what humans did.
+- **Evals run against the sandbox, quality evals against real data.** Functional agent evals (does the
+  agent call `update_case` with valid fields, does it respect permissions) run in the sandbox; task-quality
+  evals need real text, gathered under the data agreement or from shadow logs.
+- **Memory and retrieval are namespaced too.** An agent's long-term memory or retrieval index written in
+  staging must never be readable by the production agent, for the same reason as the index namespace.
+
 ## Diagram
-Each of your environments binds to exactly one customer environment, and the guard refuses any request
-whose host does not match its binding; production behaviour is proven only through shadow and canary.
+Each of your environments binds to exactly one customer environment, and the guard inside every agent
+tool refuses any request whose host does not match its binding; production agent behaviour is proven only
+through shadow and canary.
 
 ```mermaid
 flowchart TD
@@ -217,6 +247,28 @@ def receive(env: str, raw_body: bytes, signature_hex: str, payload: dict) -> boo
     return True                                  # safe to queue for ingestion
 ```
 
+### Agent shadow mode: write tools that record instead of acting
+The same tool registry serves both modes; in shadow, write tools log the proposal and tell the model it
+was not executed, so the run continues without side effects. `request` is the guarded client above.
+
+```python
+SHADOW = os.environ.get("AGENT_MODE") == "shadow"
+proposals = []   # compared later with what human agents actually did
+
+def tool_update_case(case_id: str, category: str) -> dict:
+    """Write tool exposed to the model. Host and secret come from the binding, never from arguments."""
+    if SHADOW:
+        proposals.append({"tool": "update_case", "case_id": case_id, "category": category})
+        return {"status": "recorded_not_executed", "case_id": case_id}
+    return request("PATCH", f"/cases/{case_id}", body={"category": category})
+
+def tool_get_case(case_id: str) -> dict:
+    """Read tool: runs normally in shadow mode."""
+    return request("GET", f"/cases/{case_id}")
+
+TOOLS = {"update_case": tool_update_case, "get_case": tool_get_case}
+```
+
 ### Worked scenario: what the sandbox proved and what it missed
 A ticket-triage feature (illustrative numbers) passed UAT on a partial-copy sandbox.
 
@@ -246,6 +298,10 @@ found them before the canary.
 - **Shadow before canary.** Use for any AI behaviour whose quality depends on real text. Run on live
   inputs without writing, compare with human decisions, then canary one queue with an agreed rollback
   threshold. Monitor agreement rate and canary error rate.
+- **Binding-scoped tool registry.** Use for every agent with write tools. Build the agent's tools from
+  the resolved binding at startup, keep base URLs and instance names out of tool schemas, and tag every
+  tool-call trace with the binding pair. Monitor traces whose host does not match the binding; the count
+  must be zero.
 
 ## Trade-offs
 - **Full-copy realism vs cost and exposure.** It gives the most realistic testing but costs the customer
@@ -273,6 +329,9 @@ found them before the canary.
 - **Sharing one webhook receiver and signing secret across the customer's environments.** Symptom: after
   a sandbox refresh, records with test names or obviously fake values appear in the production index, and
   their source instance id is the sandbox's. Fix: per-environment secrets and instance checks.
+- **Letting the model choose the environment.** Symptom: a tool schema exposes an `instance` or `url`
+  argument and a prompt-injected document steers the agent to another host. Fix: resolve hosts only from
+  the binding, never from tool arguments.
 - **Treating "works in sandbox" as the release gate.** Symptom: the first production run hits a
   validation rule, an email trigger or an API limit that the sandbox did not have. Fix: shadow and canary.
 
@@ -332,6 +391,12 @@ ensuring the development binding can never reach the production host.
   with rejected events counted by reason.
 - **Clean-up:** use the binding tag on ingested records to find and delete what came from the sandbox.
 
+### How would you run an agent with write tools in shadow mode against production?
+- **Same agent, same read tools, dry-run write tools.** Write tools record the proposed call and return a
+  "recorded, not executed" result, so the loop continues without side effects.
+- **Compare proposals with human actions** per task over a fixed period, and gate the canary on an agreed
+  agreement rate. Keep hosts bound by configuration so shadow cannot become live by a prompt.
+
 ### When is a lighter environment setup acceptable?
 - **Read-only pilots over an exported snapshot** have no side effects and no live credentials, so a full
   binding matrix adds cost without removing risk.
@@ -371,3 +436,25 @@ ensuring the development binding can never reach the production host.
 > Sandboxes commonly disable or redirect outbound integrations. A side effect that silently does nothing
 > in the sandbox must be listed explicitly per binding and verified in shadow or canary mode, not inferred
 > from a green UAT run.
+
+## Use cases & projects
+### Use cases
+- **Developing a CRM or ticketing agent.** Every tool call during development and evals goes to the
+  customer's developer sandbox through a binding that cannot reach production.
+- **Proving agent quality before go-live.** Shadow mode runs the agent on live production inputs with
+  write tools recording proposals, so you measure agreement with humans without side effects.
+- **Canary release of an agent's write tools.** One queue gets live writes with a rollback threshold
+  agreed in advance, while other queues stay in shadow.
+- **Keeping agent memory and retrieval clean.** Namespaces per binding stop sandbox fixtures from
+  appearing in a production agent's answers.
+
+### Mini project
+**Build a binding-guarded agent with a shadow mode (1-2 hours).**
+- **Goal:** one agent codebase that runs against a fake sandbox, a fake production API and in shadow mode,
+  with cross-wiring impossible.
+- **Steps:** create two fake HTTP APIs on different local ports standing in for sandbox and production;
+  define bindings resolved from `APP_ENV` with no default; build a read tool and a write tool through the
+  guarded client; add an `AGENT_MODE=shadow` path where writes are recorded; run a 5-task agent loop in
+  each mode.
+- **Done when:** a deliberately mis-set binding fails at startup, shadow runs leave the production API
+  untouched while producing a proposals log, and every trace line shows its binding pair.

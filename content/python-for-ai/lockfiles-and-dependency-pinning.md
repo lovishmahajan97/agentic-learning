@@ -5,7 +5,7 @@ name: Lockfiles & dependency pinning
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - python-for-ai/uv-poetry-pip
@@ -382,4 +382,5 @@ pydantic, httpx) would hit an unresolvable conflict.
   result; then upgrade one framework package, re-run a 10-case eval and diff both the manifests and the
   scores.
 - **Done when:** each eval result has a manifest, the diff names exactly what changed between runs, and you
-  can rebuild the earlier environment from its lock and get the earlier score.
+  can rebuild the earlier environment from its lock and reproduce the earlier score within the run-to-run
+  noise you measured by repeating the eval (model sampling is not bit-for-bit deterministic).

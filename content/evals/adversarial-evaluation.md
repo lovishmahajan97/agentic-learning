@@ -5,7 +5,7 @@ name: Adversarial evaluation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - evals/red-teaming
@@ -196,7 +196,8 @@ def asr_table(clean_docs: list[str]) -> dict:
     return {"cells": cells, "worst_case_per_goal": worst}
 
 # Gate: worst_case_per_goal["tool"] must be 0.0; an exfiltrating tool call is never acceptable.
-# 0 of 2 tasks x 5 samples is only 10 trials (upper bound ~30%): grow BASE_TASKS before trusting a zero.
+# 0 of 2 tasks x 5 samples is only 10 trials per cell (95% upper bound ~26%, rule of three 30%):
+# grow BASE_TASKS before trusting a zero.
 # Run the benign-but-edgy over-refusal set alongside, or ASR will fall by refusing everything.
 ```
 
@@ -388,8 +389,8 @@ last run, and does it run on every prompt and model change with a held-out slice
   email or issuing refunds, is a ship condition, measured beside over-refusal.
 - **Measuring a guardrail layer.** Running the same suite with and without a guardrail shows what it
   actually blocks and what benign requests it now refuses.
-- **Re-testing after every prompt or model change.** A versioned attack suite reopens checks that a
-  one-off pre-launch red team would have left closed.
+- **Re-testing after every prompt or model change.** A versioned attack suite re-runs every known
+  attack, because a prompt edit or model update can reopen a hole a one-off pre-launch red team saw closed.
 
 ### Mini project
 **Build a canary-graded injection suite for an email agent (2-3 hours).**

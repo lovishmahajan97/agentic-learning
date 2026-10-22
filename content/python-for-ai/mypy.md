@@ -5,7 +5,7 @@ name: mypy
 kind: tool
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - python-for-ai/type-hints
@@ -147,20 +147,21 @@ ignore_missing_imports = true
 
 ## Diagram
 What mypy consumes and where checking silently stops: annotated code is checked end to end, while `Any`
-and unannotated bodies bypass the checks unless strict flags close them.
+and unannotated bodies bypass the checks unless strict flags close them. Types come from `py.typed`
+packages, typeshed and `types-*` stubs; narrowing works on `None`, `isinstance` and `Literal` checks.
 
 ```mermaid
 flowchart TD
     SRC["Your modules and annotations"] --> P["Parse and build types"]
-    PKG[("Installed packages: py.typed hints, typeshed, types-* stubs")] --> P
-    CFG["pyproject.toml: strict, overrides, plugins"] --> P
-    P --> I["Infer unannotated locals, e.g. list of int"]
+    PKG[("Installed packages and stubs")] --> P
+    CFG["pyproject.toml: strict, overrides"] --> P
+    P --> I["Infer unannotated locals"]
     I --> Q{"Function annotated?"}
     Q -->|"no, default"| SK["Body skipped"]
-    Q -->|"yes"| C["Check each expression, narrow on None, isinstance, Literal"]
+    Q -->|"yes"| C["Check expressions, narrow types"]
     C --> A{"Value typed Any?"}
     A -->|"yes"| SL["Checks switched off downstream"]
-    A -->|"no"| E["Errors with codes: arg-type, union-attr, return-value"]
+    A -->|"no"| E["Errors with codes, e.g. union-attr"]
     SK -.->|"check_untyped_defs or strict"| C
     E --> CA[(".mypy_cache for incremental reruns")]
 ```
@@ -263,7 +264,8 @@ def helper(resp):                  # unannotated: mypy skips this body by defaul
 ```
 
 - **The fixes are one line each:** `os.environ["MODEL"]` or a default, an `is None` branch, the correct
-  key. mypy 1.19 also adds a `Did you mean "arguments"?` note to the TypedDict error.
+  key. mypy 1.19 also attaches a `Did you mean "arguments"?` note to the TypedDict error; under
+  `--strict` the same line additionally reports `[no-any-return]`, because the bad key's value is `Any`.
 - **Why `strict` matters:** unannotated bodies are skipped by default, and even `check_untyped_defs` cannot
   see through parameters that are implicitly `Any`. Strict mode's `disallow_untyped_defs` forces the
   annotation that makes the checker useful there.
@@ -310,7 +312,7 @@ async def main() -> None:
     reveal_type(scores)                         # note: Revealed type is "builtins.list[builtins.int]"
 ```
 
-The sync fake would have failed at runtime with "object str can't be used in 'await' expression", but
+mypy 2.x prints the same errors but shorter revealed types (`list[int]`). The sync fake would have failed at runtime with "object str can't be used in 'await' expression", but
 only on the path that awaits it; mypy reports it before any test runs.
 
 ### Worked scenario: adopting mypy on a legacy service
@@ -479,7 +481,7 @@ documents as present arriving as null, which only runtime validation catches.
 - **Optional model content.** mypy forces a check before `.strip()` on a reply whose content may be
   `None`, the classic crash after a tool-call-only response.
 - **Typed tool arguments.** `TypedDict` or Pydantic models for tool arguments turn a misspelled key into
-  a type error instead of a silent `KeyError` at runtime.
+  a type error instead of a `KeyError` in the middle of an agent run.
 - **Exhaustive step handling.** A union of step types with `assert_never` makes adding a new step type
   fail type checking until the agent loop handles it.
 - **Swappable model clients.** A `Protocol` for the model client lets the fake used in tests and the

@@ -5,7 +5,8 @@ name: Labeling sessions
 kind: practice
 difficulty: intro
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - customer-data-evaluation/golden-dataset-creation-with-client-smes
   - customer-data-evaluation/sme-review-and-annotation-guidelines
@@ -16,9 +17,21 @@ related:
 ---
 
 ## TL;DR
-A scheduled, facilitated block where customer SMEs calibrate, label independently, then resolve
-disagreements into written guideline rules. Async requests to busy experts stall, and tacit rules surface
-only live. The facilitator drives throughput and decisions while protecting label independence.
+A scheduled, facilitated block where customer SMEs calibrate, label agent outputs and traces
+independently, then resolve disagreements into written guideline rules. Async requests to busy experts
+stall, and tacit rules surface only live. The facilitator drives throughput while protecting independence.
+
+## For agent builders
+- **Why it matters for agents.** The labels from these sessions are your agent's golden set, your judge's
+  calibration data and the source of new prompt rules. If sessions stall, every agent change ships on
+  vibes.
+- **Where it shows up in your stack.** The labelling tool loaded with rendered agent traces, the batch
+  export from your eval harness, the decision log that feeds the agent's system prompt and guideline,
+  and the agreement report after each session.
+- **What you control.** Batch size from measured minutes per trace, which traces are doubled, gold checks,
+  how traces are rendered, and having an engineer in the room who can explain what the agent saw.
+- **What you can skip.** Building bespoke tooling; a self-hosted labelling tool or a controlled spreadsheet
+  works if it opens on the item and captures label, rationale and reviewer.
 
 ## Why it exists
 - **SMEs are the bottleneck of every customer evaluation.** They are senior, booked, and labelling is not
@@ -46,15 +59,18 @@ only live. The facilitator drives throughput and decisions while protecting labe
    ```
 
    So `items ≈ (capacity − reviewers × gold_checks) / (1 + d)`.
-   - **Measure minutes per label in the first session** rather than guessing.
+   - **Measure minutes per label in the first session** rather than guessing. Multi-step agent traces take
+     several times longer than single answers, so measure them separately.
    - **Shuffle strata through the batch,** so fatigue late in the session does not fall on one segment.
    - **Include a few previously adjudicated "gold check" items** to detect drift in individual reviewers.
 2. **Pre-load the tool.** Whatever it is (Label Studio, Argilla, the customer's own platform or a
    controlled spreadsheet), it must open on the item, show the guideline beside it, and capture label,
    rationale and reviewer. Fiddling with access during the session wastes the scarcest time.
-3. **Clear access.** Confirm every SME can open the data in the environment governance allows, the day
+3. **Render agent traces for humans.** Show the user request, each tool call with arguments and result, and
+   the final answer, without internal ids or model names, so SMEs judge what the agent saw.
+4. **Clear access.** Confirm every SME can open the data in the environment governance allows, the day
    before, not at minute one.
-4. **Share the current guideline** and a one-page decision card.
+5. **Share the current guideline** and a one-page decision card.
 
 ### During the session
 1. **Warm-up calibration (10–15 minutes).** Everyone labels the same handful of items silently, then
@@ -68,7 +84,7 @@ only live. The facilitator drives throughput and decisions while protecting labe
    - an escalation to the policy owner;
    - "genuinely ambiguous" (flagged and excluded from scoring).
 4. **Decision log.** Each outcome goes into the guideline changelog on the spot, with the item IDs it
-   affects, so relabelling can be targeted later.
+   affects, so relabelling can be targeted later and the agent prompt can be updated from the same entry.
 
 ### After the session
 - **Close the loop:** adjudicate remaining splits, relabel items affected by guideline changes, recompute
@@ -84,17 +100,18 @@ only live. The facilitator drives throughput and decisions while protecting labe
 
 ### Facilitation choices
 - **Keep sessions to about 60–90 minutes,** because label quality decays with fatigue.
-- **Have an engineer present** to answer "what is the system actually seeing?" questions.
+- **Have an engineer present** to answer "what is the system actually seeing?" questions, such as which
+  document the retrieval tool returned or why a tool call failed.
 - **No model pre-labels in calibration batches,** because pre-labels anchor reviewers; if you use them later
   to save time, measure how often reviewers change them.
 
 ## Diagram
 One session in order: the silent calibration and independent labelling protect independence, and only
-afterwards do splits become logged decisions that feed the next session.
+afterwards do splits become logged decisions that feed the guideline and the agent prompt.
 
 ```mermaid
 flowchart TD
-    P["Prep: batch, gold checks, access tested"] --> C["Silent calibration, then reveal"]
+    P["Prep: trace batch, gold checks, access"] --> C["Silent calibration, then reveal"]
     C --> I["Independent labelling, some doubled"]
     I --> D{"Doubles that split"}
     D -->|"guideline unclear"| G["Clarify guideline"]
@@ -103,12 +120,12 @@ flowchart TD
     G --> L["Decision log with item IDs"]
     E --> L
     X --> L
-    L --> N["Sponsor note and relabel queue"]
+    L --> N["Sponsor note, relabel queue, prompt update"]
     N -.->|"next week"| P
 ```
 
 ## Examples
-### Batch sizing and how much one session's agreement tells you
+### Batch sizing for answers vs agent traces
 Plug in last session's measured minutes per label; the interval shows why single-session agreement is noisy.
 
 ```python
@@ -127,10 +144,16 @@ print(items, round(items * 0.25))                 # 120 items, 30 of them double
 print(round(agreement_halfwidth(0.8, 30), 3))     # 0.143: one session, about +/-14 points
 print(round(agreement_halfwidth(0.8, 120), 3))    # 0.072: four sessions pooled, about +/-7
 print(round(1 - 0.9 ** 3, 2))                     # 0.27: a 90%-accurate reviewer misses >=1 of 3 gold checks
+
+# Same slot, but reviewing 6-step agent traces at an assumed 3 minutes each
+print(batch_size(reviewers=3, minutes=50, min_per_label=3, gold_checks=3, d=0.25))  # 32 traces
 ```
 
+- **The agent line is the planning point:** a session that labels 120 short answers labels only about 32
+  traces, so a 400-item agent golden set needs many more sessions than the sponsor expects.
+
 ### Worked session: contract-review pilot (timings and rates illustrative)
-A 90-minute weekly session with three in-house lawyers.
+A 90-minute weekly session with three in-house lawyers reviewing a clause-extraction agent.
 
 **Prep:** 120 clause-extraction outputs loaded, 30 of them assigned to two lawyers each, plus 3 gold check
 items from last week's adjudication. Access was tested the previous afternoon; one lawyer's account lacked
@@ -138,7 +161,7 @@ permission and was fixed then.
 
 | Slot | What happens | Outcome |
 |---|---|---|
-| 0–15 min, calibration | All three label 5 clauses silently. On a limitation-of-liability clause with a carve-out for confidentiality breaches, two mark "cap correctly extracted", one marks "fail, carve-out omitted" | The guideline was silent on carve-outs; the general counsel (present for this slot) rules they must be extracted; rule L4 and an example added |
+| 0–15 min, calibration | All three label 5 clauses silently. On a limitation-of-liability clause with a carve-out for confidentiality breaches, two mark "cap correctly extracted", one marks "fail, carve-out omitted" | The guideline was silent on carve-outs; the general counsel (present for this slot) rules they must be extracted; rule L4 and an example added, and L4 goes into the agent's prompt |
 | 15–65 min, independent labelling | Last week measured a little under a minute per label: 3 lawyers × 50 minutes ≈ 159 labels; minus 3 gold checks per lawyer leaves 150; at a 25% double-label fraction, 150 / 1.25 = 120 items | 90 labelled once, 30 twice; each lawyer completes about 53 labels with no slack, which is why the batch was not padded |
 | 65–85 min, disagreement review | 6 of the 30 doubles split | Four trace to "auto-renewal" when notice periods differ: escalated to the general counsel, due before next week. Two are slips by one lawyer, who also missed one of the three gold checks |
 | 85–90 min, wrap | Facilitator reads back two decisions and one open question | Follow-up note sent |
@@ -160,19 +183,22 @@ permission and was fixed then.
   nobody sees the same check twice in a row. Track per-reviewer gold accuracy over a rolling window, and
   act on repeated misses rather than single ones.
 - **Decision log that generates relabel work.** Each changelog entry records the rule id, date, deciding
-  person and affected item IDs, and the tool or a script turns it into a relabel queue. Monitor open
-  relabel items and decisions that are still waiting on an escalation.
+  person and affected item IDs, and the tool or a script turns it into a relabel queue and a pending
+  agent-prompt change. Monitor open relabel items and decisions still waiting on an escalation.
 - **Pooled agreement report.** After each session, publish agreement for that session and pooled over the
   last four, per reviewer pair, and for the first versus second half of the session. Shorten sessions when
   the second half is consistently worse.
+- **Batch export straight from agent traces.** Have the eval harness export the sampled runs, already
+  rendered and stripped of version tells, into the labelling tool. Monitor minutes per trace by step count
+  so the next batch is sized from real numbers.
 
 ## Trade-offs
 - **Live sessions vs calendars.** They get decisions and throughput but demand synchronous time; when SMEs
   are across time zones, run async labelling with a short live disagreement review instead.
 - **Policy owner in the room vs deference.** Splits resolve immediately, but reviewers may defer to them;
   have them join only for the disagreement segment.
-- **Pre-labelling vs anchoring.** Model outputs as pre-labels can raise throughput substantially, but anchor
-  reviewers toward the model; use them only after calibration, and track the change rate to detect
+- **Pre-labelling vs anchoring.** Agent outputs as pre-labels can raise throughput substantially, but anchor
+  reviewers toward the agent; use them only after calibration, and track the change rate to detect
   rubber-stamping.
 - **Longer sessions vs fatigue.** More labels per calendar booking, but quality drops; when gold-check
   accuracy falls in the second half, shorten the session.
@@ -187,10 +213,12 @@ permission and was fixed then.
 - **Not sending a summary to the sponsor.** Symptom: SMEs get pulled into other work and sessions are
   quietly cancelled.
 - **Ignoring gold-check items.** Symptom: one reviewer's labels drift for weeks unnoticed and drag down agreement.
+- **Sizing trace batches from answer-labelling speed.** Symptom: half the agent traces are unlabelled at
+  the end and the hardest, longest ones are the ones skipped.
 
 ## When to use
-- **Use when** SME labels are on the critical path of a pilot: building the golden set, calibrating an LLM
-  judge, or reviewing a new failure category.
+- **Use when** SME labels are on the critical path of an agent pilot: building the golden set, calibrating
+  an LLM judge, or reviewing a new failure category.
 - **Prefer a weekly recurring slot** over an occasional workshop, because it allows guideline fixes
   between rounds.
 - **Pure async labelling is fine** for stable, well-calibrated tasks with high agreement.
@@ -231,6 +259,14 @@ sections plus examples for the new case types, and shorter sessions if quality d
 - **Subtract gold checks and divide by 1 + d:** with three reviewers, 3 gold checks each and d = 0.25,
   about 159 labels become 120 items.
 - **Do not pad:** an overfilled batch leaves the hardest items unlabelled at the end.
+
+### How would you run a labelling session on multi-step agent traces rather than single answers?
+- **Re-measure speed:** traces take several minutes each, so the same slot labels a fraction of the items;
+  size the batch and the session count from that.
+- **Render traces for humans:** request, tool calls with results, final answer, no version tells, and an
+  engineer present to explain what each tool returned.
+- **Label action and answer separately,** so a split tells you whether the guideline gap is about what the
+  agent did or what it said.
 
 ### One reviewer missed one of three gold checks this week. What do you do?
 - **Treat it as weak evidence:** even a 90%-accurate reviewer misses at least one of three about 27% of the time.
@@ -275,3 +311,23 @@ sections plus examples for the new case types, and shorter sessions if quality d
 - [x] Record a guideline decision or escalation with affected item IDs so labels can be updated
 > The value of the session is turning splits into written rules. Logging the decision with item IDs
 > lets the team relabel precisely and stops the same debate recurring.
+
+## Use cases & projects
+### Use cases
+- **Building an agent golden set with scarce experts.** Weekly sessions turn a few SME hours into labelled
+  traces plus written rules.
+- **Calibrating an LLM judge for agent runs.** Session labels on doubled traces give the human agreement bar
+  the judge is measured against.
+- **Triage of a new agent failure category.** A focused session on fresh failing traces surfaces the missing
+  rule fast, with the policy owner present.
+- **Customer onboarding of reviewers.** Silent calibration plus gold checks bring new SMEs onto the shared
+  standard.
+
+### Mini project
+**Plan and dry-run one trace-labelling session (1-2 hours).**
+- **Goal:** prepare a realistic session for labelling agent traces and measure what it would actually yield.
+- **Steps:** export 40 traces from a toy agent and render them as request, tool calls, answer; time yourself
+  labelling 5 to get minutes per trace; size the batch with `batch_size`; pick doubles and gold checks;
+  write the agenda, decision-log template and sponsor note template.
+- **Done when:** you have a session pack (batch file, agenda, card, log template) and a one-line estimate of
+  sessions needed to label a 400-trace golden set.

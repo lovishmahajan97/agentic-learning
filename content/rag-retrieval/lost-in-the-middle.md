@@ -5,7 +5,7 @@ name: Lost-in-the-middle
 kind: concept
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - model-internals/context-window
@@ -137,12 +137,12 @@ with the goal and question, with error triage deciding whether layout or retriev
 flowchart TD
     Q["Agent step needs evidence"] --> W["Search tool: retrieve wide, top-50"]
     W --> RR["Cross-encoder rerank"]
-    RR --> C["Cut to small k, 5 to 8 or a token budget"]
+    RR --> C["Cut to small k, 5 to 8"]
     C --> E["Edge reorder: rank 1 first, rank 2 last"]
-    E --> P["Context: tagged docs, then goal and question last"]
+    E --> P["Docs first, goal and question last"]
     P --> G["Model quotes evidence, then acts"]
-    G --> T{"Wrong step: was gold chunk in context?"}
-    T -->|"yes, present but unused"| L["Fix layout: smaller k, compact, sub-agent"]
+    G --> T{"Gold chunk in context?"}
+    T -->|"yes, present but unused"| L["Fix layout: smaller k, compaction"]
     T -->|"no, missing"| R["Fix retrieval: decomposition, recall"]
 ```
 

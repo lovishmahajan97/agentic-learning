@@ -5,7 +5,7 @@ name: Hallucination evaluation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - evals/faithfulness-groundedness
@@ -279,7 +279,7 @@ for n in (50, 100, 400):
     print(n, f"±{100 * half_width(0.10, n):.1f} points")
 # 50 ±8.3 points   -> "12% -> 8%" is noise
 # 100 ±5.9 points
-# 400 ±2.9 points  -> per run; comparing two runs widens it by about 1.4x (±4.1)
+# 400 ±2.9 points  -> per run; comparing two runs widens it by about 1.4x (±4.2)
 ```
 
 - **Comparing two versions is noisier than one run.** The difference of two independent rates has a

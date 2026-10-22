@@ -6,7 +6,7 @@ kind: concept
 difficulty: intro
 est_minutes: 12
 status: agentic
-agent_relevance: core
+agent_relevance: useful
 related:
   - model-internals/softmax
   - model-internals/sampling-strategies
@@ -31,7 +31,8 @@ are read from them.
   why structured output and strict tool calling can be guaranteed rather than merely requested.
 - **Where it shows up in your stack.** Structured-output and JSON-schema options on hosted APIs, guided or
   structured decoding in vLLM, the `logit_bias` and `logprobs` request parameters, and a `LogitsProcessor`
-  in Hugging Face Transformers when self-hosting.
+  in Hugging Face Transformers when self-hosting. Not every hosted API exposes `logprobs` or
+  `logit_bias` (Anthropic's Messages API offers neither), so check before designing a gate around them.
 - **What you control.** Whether tool calls are schema-enforced or validated after the fact, whether
   routing and classification steps are restricted to a fixed label set, and whether you read logprobs
   to gate low-confidence steps.

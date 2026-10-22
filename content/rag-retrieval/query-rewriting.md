@@ -5,7 +5,7 @@ name: Query rewriting
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - rag-retrieval/query-decomposition
@@ -29,7 +29,7 @@ that rewrite and guard it.
 ## For agent builders
 - **Why it matters for agents.** Every search tool call is a rewrite: the agent condenses the
   conversation into a query string. Bad queries (dropped references, "fixed" error codes, invented
-  entities) are the most common reason an agent's retrieval step fails.
+  entities) are a common reason an agent's retrieval step fails, and they are visible in every trace.
 - **Where it shows up in your stack.** The tool's `description` and parameter descriptions (your rewriter
   prompt), LangChain's `create_history_aware_retriever` and `MultiQueryRetriever` in pipeline-style RAG,
   LlamaIndex query transforms, and the traces (LangSmith or similar) where you read the queries agents wrote.
@@ -241,7 +241,7 @@ ALLOWED_PRODUCTS = {"web", "ios", "android"}                         # never tru
 
 def run_search_docs(tool_input, user_message, k=8):
     q = str(tool_input.get("query", ""))[:300]                       # validate type and length
-    lost = [m for m in LITERAL.findall(user_message) if m not in q]
+    lost = [m for m in LITERAL.findall(user_message) if m.strip('"') not in q]   # quotes optional
     queries, weights = [q], [1.0]
     if lost:                                                          # literal guard: search raw text too
         queries.append(user_message); weights.append(1.0)

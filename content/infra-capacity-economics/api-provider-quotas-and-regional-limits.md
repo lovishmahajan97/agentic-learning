@@ -182,7 +182,7 @@ sequenceDiagram
     Note over G: wait Retry-After plus jitter, cap attempts
     G->>D1: retry
     D1-->>G: 529 overloaded
-    Note over G: open circuit on A for 30 s
+    Note over G: open circuit on Deployment A for 30 s
     G->>D2: send to next deployment
     D2-->>G: 200 plus remaining-budget headers
     G-->>A: response

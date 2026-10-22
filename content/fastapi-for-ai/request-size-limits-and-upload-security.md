@@ -5,7 +5,7 @@ name: Request-size limits & upload security
 kind: practice
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - fastapi-for-ai/uploadfile
@@ -137,8 +137,8 @@ so the same layers apply on the way in:
   internal addresses; allowlist schemes and hosts and block private address ranges.
 
 ## Diagram
-A document upload for a RAG agent, through the five layers: each one rejects what only it can see, and the risky parsing
-happens in an isolated worker after the API has already answered 202.
+A document upload for a RAG agent, through the five layers: each one rejects what only it can see, and
+the risky parsing happens in an isolated worker after the API has already answered 202.
 
 ```mermaid
 flowchart TD

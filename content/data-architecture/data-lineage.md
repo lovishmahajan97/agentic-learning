@@ -24,7 +24,7 @@ sources:
 ## TL;DR
 Data lineage is the recorded graph of where every chunk, memory, dataset and model behind your agent came
 from: inputs, job, code version, run. "Why did the agent say that" and "delete this user everywhere" are
-graph traversals, so lineage makes debugging, deletion and reproducibility possible.
+graph traversals, so lineage makes debugging and deletion possible.
 
 ## For agent builders
 - **Why it matters for agents.** An agent answer is built from retrieved chunks, long-term memories,

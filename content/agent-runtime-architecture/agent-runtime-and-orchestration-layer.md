@@ -5,7 +5,8 @@ name: Agent runtime & orchestration layer
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - agents/agent-loop
   - agents/state-machines
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-The runtime owns the agent loop (call model, run tool, feed back) as a crash-safe, policy-checked unit of
+The runtime owns your agent's loop (call model, run tool, feed back) as a crash-safe, policy-checked unit of
 work; orchestration coordinates many runs. Both exist because loop state outlives processes, tools have side
 effects, and rules need one enforcement point.
+
+## For agent builders
+- **Why it matters for agents.** The `while` loop you prototype with is the part that breaks first in
+  production: restarts lose the transcript, re-run side effects and cannot pause for a human. The runtime
+  is what turns a demo agent into one you can deploy, resume and audit.
+- **Where it shows up in your stack.** LangGraph checkpointers and `interrupt()`, Temporal workflows and
+  activities, hosted vendor agent APIs, or your own run table, step log and worker pool behind a queue.
+- **What you control.** The step log schema, write-ahead ordering, idempotency keys of the form
+  `run_id:call_id`, lease length, the single gated dispatch path, and how sub-agent scopes and budgets are
+  derived from the parent run.
+- **What you can skip.** Building your own workflow engine or scheduler from scratch. Assemble from an
+  engine or framework, but know the layers so you can see what each one leaves to you.
 
 ## Why it exists
 - **The first agent is a `while` loop in a request handler.** Call the model, run any tool call, append the
@@ -390,3 +403,25 @@ steps before the process exits.
 > Making "waiting_for_approval" an explicit, persisted state means the loop holds no process resources while
 > parked; the approval becomes an event that re-queues the run. Sleeping threads exhaust pools, and silently
 > re-planning around the approval defeats the control.
+
+## Use cases & projects
+### Use cases
+- **Support agents that issue refunds or credits.** The run parks in `waiting_for_approval`, survives a
+  day-long wait and dispatches exactly once with an idempotency key.
+- **Long-running coding and research agents.** Dozens of steps over minutes to hours outlive any request
+  timeout, so the step log and resume path carry the task across restarts and deploys.
+- **Supervisor agents that fan out to sub-agents.** Child runs carry a `parent_run_id`, attenuated scopes
+  and a share of the root budget, so ten children cannot spend ten times the limit.
+- **Agent platforms serving many teams.** One gated dispatch path gives every agent the same policy, audit
+  and budget rules instead of each loop reimplementing them.
+
+### Mini project
+**Kill-test a minimal agent runtime (2-3 hours).**
+- **Goal:** prove that a tool-calling agent resumes after a crash without repeating a side effect.
+- **Steps:** store runs and steps in SQLite; implement `tick()` with write-ahead ordering (decision before
+  dispatch, result before the next model call); add a fake email tool that deduplicates on
+  `run_id:call_id`; add a policy stub that returns `needs_approval` for one tool; kill the process
+  between the side effect and the result append, then restart and resume.
+- **Done when:** a test kills the worker at each of the three crash points in the recovery table, every
+  run completes after restart, the email tool's sent list has exactly one entry per call, and an
+  approval-gated run resumes from storage with no thread waiting.

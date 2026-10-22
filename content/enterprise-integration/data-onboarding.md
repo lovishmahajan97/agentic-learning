@@ -5,7 +5,8 @@ name: Data onboarding
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - scoping/data-access-and-permissions-discovery
   - enterprise-integration/data-ingestion-from-client-systems
@@ -18,9 +19,21 @@ related:
 ---
 
 ## TL;DR
-Data onboarding takes a new customer from "access granted" to "data loaded, validated and syncing" in
-gated stages: inventory, sample, profile, map, SME-checked pilot, backfill and sync. The customer's data,
-not the model, is usually the slowest and riskiest part.
+Before an agent can answer from a customer's data, onboarding takes it from "access granted" to "loaded,
+validated and syncing" in gated stages: inventory, sample, profile, map, SME-checked pilot, backfill and
+sync. The data, not the model, is usually the riskiest part.
+
+## For agent builders
+- **Why it matters for agents.** A RAG agent or a tool-calling agent that reads records is only as right
+  as the index and tables behind its tools. Most "the agent is wrong" reports in a new deployment trace to
+  onboarding: unmapped codes, missing permissions, scanned files with no text, stale snapshots.
+- **Where it shows up in your stack.** The ingestion jobs that fill the agent's vector store and record
+  tables, the ACL metadata the retrieval tool filters on, the golden set the agent is evaluated against,
+  and the change feed that keeps tool results fresh.
+- **What you control.** The pilot slice, the stratified sample, quarantine rules, the seeded-role checks
+  run through the agent itself, and the acceptance criteria that include agent eval scores.
+- **What you can skip.** Building a general data platform first; onboard the slice the pilot agent needs
+  and turn each stage into a reusable job as you go.
 
 ## Why it exists
 - **The data is the per-customer cost.** An AI product is only as good as the data it retrieves or learns
@@ -106,6 +119,18 @@ The safe sequence:
 4. **Keep periodic reconciliation running,** because the backfill is a snapshot and the change feed can
    still miss deletes and lost events.
 
+### What changes when the consumer is an agent
+- **Validate through the agent, not only the tables.** In the pilot, SMEs ask the agent real questions and
+  check both the answer and the tool calls behind it (which records it fetched, which chunks it cited),
+  because a correct table can still be retrieved wrongly.
+- **Permissions are a tool-level filter.** Every retrieval or record tool call carries the end user's
+  identity and filters on the ACL metadata ingested with each item, so the seeded-role check runs through
+  the agent's own tools.
+- **The golden set becomes the agent's regression suite.** The SME questions written in stage 5 are
+  replayed against the agent after every mapping change, backfill and prompt change.
+- **Freshness is part of acceptance.** A tool that returns a stale claim status is a wrong answer, so sync
+  lag is an acceptance metric, not an ops detail.
+
 ### 7. Sign-off and handover
 - **Exit with an agreed acceptance record:** coverage (records and documents loaded versus in scope),
   reject and quarantine counts with reasons, quality findings and their owners, sync freshness, and the
@@ -115,7 +140,8 @@ The safe sequence:
 
 ## Diagram
 Each stage gates the next, and problems found at a gate loop back to mapping or the data owner instead
-of flowing into production; the change-feed position is recorded before the backfill starts.
+of flowing into the agent's index; the pilot is reviewed through the agent, and the change-feed position
+is recorded before the backfill starts.
 
 ```mermaid
 flowchart TD
@@ -149,6 +175,20 @@ Figures are illustrative.
 The sign-off record lists coverage of 99.1% of in-scope claim records, the password-protected files
 (counted on the full library, not extrapolated from the sample's 6%) as excluded with a named owner, and
 a nightly reconciliation job.
+
+### Agent scenario: the pilot review that caught the join bug
+In the insurer pilot above, the claims agent has two tools, `search_claim_docs` and `get_claim`. The 40
+SME questions were scored by how the agent answered and which tool results it used (illustrative split).
+
+| Finding in review | Questions | Root cause | Fixed in stage |
+|---|---|---|---|
+| Correct answer, correct citations | 29 | none | none |
+| Cited an adjuster note from another claim | 6 | join on a non-unique key | 4, mapping |
+| "No information found" | 3 | answer sat in a scanned PDF before OCR | 3, routing |
+| Showed a document a handler should not see | 2 | folder ACL not ingested | 1, permission model |
+
+Re-run after fixes: 38 of 40 pass and zero permission leaks; the 40 questions stay as the agent's
+regression suite for every later backfill.
 
 ### Stratified sampling and the watermark-first hand-over
 A runnable sketch of two stage rules: sample across strata instead of taking the first rows, and replay
@@ -206,6 +246,9 @@ feed after the backfill would have left record 42 at version 1.
 - **Seeded-role permission checks.** Use in every pilot. Two or three seeded users with different roles
   run the same queries and the results are compared with what the source shows them. Monitor any result a
   user should not see as a release blocker.
+- **Golden set from the pilot, replayed on every change.** Use for any agent over onboarded data. Store
+  the SME questions with expected answers and expected source records, and run the agent against them
+  after each mapping update or backfill. Monitor pass rate and citation accuracy per source.
 
 ## Trade-offs
 - **Staged vs fast.** Staged onboarding finds problems on a sample when they are cheap but takes more
@@ -235,6 +278,8 @@ feed after the backfill would have left record 42 at version 1.
   version is older than the source's, all with source edit times inside the backfill window.
 - **Ingesting content without its permissions.** Symptom: a pilot user sees a document or record in an
   answer that the source system would not have shown them.
+- **Validating tables but not the agent's tool results.** Symptom: every count reconciles, yet the agent
+  cites the wrong claim's notes. Fix: review answers and the tool calls behind them in the pilot.
 - **Treating onboarding as finished at backfill.** Symptom: a slowly diverging index because deletes and
   late updates after the snapshot were never reconciled.
 
@@ -295,6 +340,13 @@ running, or every change made in between is silently missing and the system drif
 - **Never skip profiling,** because two customers on the same software use its fields differently, and
   never skip permission checks.
 
+### Pilot users say the agent is wrong on a third of questions. How do you tell a data problem from an agent problem?
+- **Inspect the traces per failed question:** did the right record or chunk come back from the tool, and
+  did the model use it? Wrong or missing tool results point to onboarding; right results misused point
+  to the prompt or model.
+- **Group data failures by cause** (mapping, parsing, permissions, freshness) and fix them at their stage,
+  then replay the same questions.
+
 ### What goes in the sign-off record, and how would you set the numbers?
 - **Coverage** of records and documents loaded versus in scope (for example 99.1% of claim records in the
   worked scenario), with exclusions named and owned.
@@ -325,3 +377,25 @@ running, or every change made in between is silently missing and the system drif
 - [ ] Customers require a second full import before sign-off
 > The source keeps changing after the snapshot. Without incremental sync and periodic reconciliation, the
 > system drifts from the source and serves deleted or outdated content.
+
+## Use cases & projects
+### Use cases
+- **Standing up a RAG agent for a new enterprise customer.** The staged process turns their document
+  library and records into an index the agent can cite, with permissions attached.
+- **Adding a new source to an existing agent.** A new system goes through sample, profile, map and pilot
+  before its tool is registered with the agent.
+- **Agent acceptance with the customer.** The sign-off record pairs data coverage with the agent's pass
+  rate on the SME golden set.
+- **Re-onboarding after a customer migration.** Versioned mappings and checks make the second load a
+  rerun, not a new project.
+
+### Mini project
+**Onboard a messy dataset for a small retrieval agent (2-3 hours).**
+- **Goal:** take a deliberately messy CSV plus a folder of documents to a validated agent with a golden
+  set.
+- **Steps:** draw a stratified sample; profile nulls and value sets; map one status field and quarantine
+  unknown codes; load the sample into a vector store with an ACL field per document; build an agent with a
+  search tool that filters by user role; write 15 questions with expected sources and run them as two
+  different roles.
+- **Done when:** a profile report, a quarantine list and a per-question table show pass or fail with the
+  cause, and neither role ever sees a document outside its ACL.

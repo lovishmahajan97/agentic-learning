@@ -5,7 +5,8 @@ name: Model monitoring
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - llmops-platform/drift
   - llmops-platform/observability-stack
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-A model can return fast 200s while answers get worse. Model monitoring layers operational signals,
-label-free behavioural proxies and late, sparse quality signals over live traffic, sliced by version and
-tenant, so silent regressions become alerts with examples attached.
+An agent can return fast 200s while it loops, skips tools or errs. Monitoring layers
+operational signals, label-free behavioural proxies (steps, tool mix, refusals) and late quality signals
+over live traffic, sliced by version and tenant, so silent regressions become alerts with traces attached.
+
+## For agent builders
+- **Why it matters for agents.** Agent failures are quiet: the run "succeeds" after twelve steps instead
+  of four, stops calling the search tool, or picks a write tool when it should ask. Only per-step and
+  per-task signals on live traffic catch that before users do.
+- **Where it shows up in your stack.** Trace spans for every LLM and tool call (OpenTelemetry GenAI
+  attributes or your tracing vendor), a metrics store for proxies, an online judge on sampled runs, and a
+  review queue that feeds your eval set.
+- **What you control.** Which proxies you compute (steps per task, tool-call mix, tool error rate,
+  refusal rate, finish reason), sampling rates per slice, alert thresholds with sample floors, and the
+  tags on every span.
+- **What you can skip.** Classic ML label-drift dashboards for tabular models; for agents, task-level
+  proxies and sampled judging do most of the work.
 
 ## Why it exists
 - **Correctness is not a status code.** The model confidently cites the wrong refund policy; the retriever
@@ -64,6 +78,10 @@ Cheap functions of the output, computed on 100% of traffic:
 - **Language mismatch** between input and output.
 - **Tool-call rate and which tools.**
 - **RAG signals:** citation presence and retrieval score distribution.
+
+- **Agent signals, per run:** steps (LLM calls) per task, tool-call error and retry rate per tool, the
+  share of runs hitting the step budget, repeated identical tool calls (a loop signature), and runs
+  ending without a final answer.
 
 - **None of these is quality; their *shift* is informative.** If refusal rate doubles after a model
   update, something changed, and you know within minutes, not after the weekly feedback review.
@@ -227,6 +245,44 @@ print(f"same, two consecutive windows: {slices * false_rate ** 2:.1f}")   # if w
 | 200 slices, single-window threshold | ~10 false alerts per run | too noisy to page on |
 | Same, persistence over 2 windows | ~0.5 per run (independence assumed) | ticket-worthy |
 
+### Agent run proxies from traces
+Per-run proxies computed from the spans of one agent run; feed the output into the windowed monitor
+above as extra metrics.
+
+```python
+from collections import Counter
+
+STEP_BUDGET = 15
+
+def run_proxies(spans: list[dict]) -> dict:
+    llm = [s for s in spans if s["kind"] == "llm"]
+    tools = [s for s in spans if s["kind"] == "tool"]
+    calls = Counter((s["tool"], s["args_hash"]) for s in tools)
+    return {
+        "steps": len(llm),
+        "hit_budget": len(llm) >= STEP_BUDGET,
+        "tool_error_rate": sum(s["error"] for s in tools) / len(tools) if tools else 0.0,
+        "repeat_calls": sum(n - 1 for n in calls.values() if n > 1),   # loop signature
+        "no_final_answer": not llm or llm[-1].get("finish_reason") != "stop",
+        "tools_used": sorted({s["tool"] for s in tools}),
+    }
+# Alert examples: p95 steps per task up 50% vs last week on n >= 200 runs, or the
+# share of runs that never call "search" doubling after a model alias change.
+```
+
+### Worked scenario: an alias update changes tool use
+Illustrative numbers for a RAG support agent after its provider alias moved overnight.
+
+| Proxy (per 1,000 runs) | Last week | Today | Read |
+|---|---|---|---|
+| Runs calling the search tool | 920 | 610 | the model now answers from memory |
+| Mean steps per task | 3.8 | 2.9 | fewer steps looks "cheaper" |
+| Citation presence | 88% | 57% | answers lost grounding |
+| Judged groundedness (sampled) | 4.3 | 3.6 | confirms the quality drop |
+
+- **The proxies moved within the first hour; the judge confirmed by mid-morning; feedback would have
+  taken days.** The fix was pinning the snapshot and canarying the new one.
+
 ## Production patterns
 - **Version and model tags from the OpenTelemetry GenAI conventions.** Record `gen_ai.request.model` and
   `gen_ai.response.model` on each LLM span, plus token usage attributes; the response model shows the
@@ -247,6 +303,9 @@ print(f"same, two consecutive windows: {slices * false_rate ** 2:.1f}")   # if w
   a step change in every quality series on one day usually means the judge moved.
 - **Alert-to-eval loop.** Every confirmed quality ticket exports its traces as new golden-set cases
   before closing. Monitor the share of incidents that produced at least one new eval case.
+- **Run-level rollups for agents.** Aggregate spans by run id into one row per task (steps, tools used,
+  tool errors, cost, outcome) and alert on those rows, because per-call dashboards hide loops. Monitor
+  p95 steps per task and the share of runs hitting the step budget.
 
 ## Trade-offs
 - **1% judge sampling: cheap vs coverage.** A small tenant may get five scored requests a day;
@@ -275,6 +334,8 @@ print(f"same, two consecutive windows: {slices * false_rate ** 2:.1f}")   # if w
   vendor shipped, with no change in your system. Fix: pin the judge.
 - **Fixed thresholds across hundreds of slices.** Symptom: a daily stream of one-window alerts on small
   tenants that never reproduce, until the channel is muted. Fix: per-slice standard errors and persistence.
+- **Monitoring agent calls but not agent runs.** Symptom: per-call latency and errors are flat while cost
+  per task doubles because the agent loops. Fix: roll spans up by run id and alert on steps per task.
 
 ## When to use
 - **From the first production deployment:** operational metrics and the cheapest proxies (schema
@@ -337,11 +398,18 @@ treat any model change, alias update included, as a release that goes through sh
 - **Cost of under-sampling:** with sd ≈ 0.8 and 50 judged per side, only drops above about 0.32 are
   detectable.
 
-### How would you turn "schema validity" into an alert that neither stays silent nor floods?
+### How would you turn "schema validity" of agent tool calls and outputs into an alert that neither stays silent nor floods?
 - **Define an SLO:** for example 99% of extraction responses pass schema validation over 28 days, giving
   a 1% error budget.
 - **Alert on burn rate:** page on a fast burn in a short and long window, ticket on a slow burn.
 - **Attach examples:** every alert links to the failing traces, and fixed failures become eval cases.
+
+### What would you monitor on a production tool-calling agent that a chat app does not need?
+- **Run-level proxies:** steps per task, share of runs hitting the step budget, repeated identical tool
+  calls and runs ending without a final answer, because loops are invisible per call.
+- **Tool behaviour:** call mix per tool and error and retry rate per tool, so a model that stops using
+  search or sends bad arguments shows up within the hour.
+- **Outcomes:** task completion, escalations and rejected approvals, sampled with a judge on full traces.
 
 ## Quiz
 ### Q: Why are behavioural proxies such as refusal rate and schema-failure rate monitored on every request while judge scores are sampled?
@@ -364,3 +432,23 @@ treat any model change, alias update included, as a release that goes through sh
 - [x] Require a minimum sample per window and compare against a time-matched baseline before alerting
 - [ ] Replace the judge with a keyword match
 > Judged metrics vary widely on small samples and with time of day. A sample floor and a time-matched baseline separate real shifts from noise and from weekly seasonality.
+
+## Use cases & projects
+### Use cases
+- **Catching silent provider updates.** Tool-call mix and citation rate move within an hour when an alias
+  changes the model under your agent.
+- **Detecting looping agents.** Steps per task and repeated identical tool calls flag runaway loops
+  before the cost report does.
+- **Per-tenant quality for B2B agents.** Stratified judging shows one customer's agent answers degrading
+  while the aggregate stays flat.
+- **Growing the eval set from production.** Low-scoring traces go to review and come back as golden-set
+  cases for the next release gate.
+
+### Mini project
+**A run-level monitor for a tool-calling agent (2-3 hours).**
+- **Goal:** compute agent proxies from traces and alert on a regression you inject.
+- **Steps:** log spans (LLM and tool calls with run id, bundle id, tool name, error, finish reason) from a
+  small agent over 300 tasks; roll them up per run; compute steps per task, tool error rate and repeat
+  calls by bundle; then switch to a prompt that discourages tool use and run 300 more tasks.
+- **Done when:** an alert with a minimum-sample guard fires on the second bundle, links to the five worst
+  runs, and does not fire when you rerun the first bundle.

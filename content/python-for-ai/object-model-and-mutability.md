@@ -5,7 +5,7 @@ name: Object model and mutability
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/dataclasses
@@ -138,7 +138,7 @@ Which one runs is a property of the type, not the syntax; the next section is th
 ## Diagram
 Names point at objects; a shallow copy of a plain-dict `DEFAULTS` makes a new outer dict whose entries
 still point at the same inner objects. Follow both requests' edges to the one shared `headers` dict:
-that is the tenant leak, and the bottom box is the fix used in the second example.
+that is the tenant leak, and the bottom box is the fix used in the third example.
 
 ```mermaid
 flowchart TD
@@ -427,8 +427,8 @@ small structure that actually changes and makes the sharing impossible rather th
 
 ## Use cases & projects
 ### Use cases
-- **Forking agent runs.** Branching a run to try two plans needs its own message list, or one branch's
-  tool results leak into the other.
+- **Forking agent runs.** Branching a run to try two plans needs its own message list and must never
+  edit the shared message dicts in place, or one branch's compaction or tool results leak into the other.
 - **Multi-tenant prompt templates.** A shared system prompt and tool list must stay immutable, or one
   tenant's edit changes every other tenant's agent.
 - **History compaction.** Summarising old turns should build a new list, so traces and checkpoints keep

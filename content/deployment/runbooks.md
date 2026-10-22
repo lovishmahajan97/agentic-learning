@@ -5,7 +5,8 @@ name: Runbooks
 kind: practice
 difficulty: core
 est_minutes: 13
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - deployment/health-checks
   - deployment/hypercare
@@ -19,16 +20,27 @@ sources:
 ---
 
 ## TL;DR
-A runbook is a written, tested procedure for one operational situation: trigger, impact check, exact
-mitigation steps, recovery check and escalation. It exists because the incident handler rarely built
-the system, so good runbooks are alert-linked, mitigation-first and rehearsed.
+A runbook is a tested procedure for one operational situation of your agent: trigger, impact check,
+exact mitigation, recovery check and escalation. The on-call rarely built the agent, so good runbooks are
+alert-linked, mitigation-first and rehearsed.
+
+## For agent builders
+- **Why it matters for agents.** Agents fail in ways a generic service runbook never covers: a loop that
+  burns budget, a tool returning garbage the agent trusts, a prompt injection arriving through a retrieved
+  document, a write tool updating the wrong records. Each needs a lever and a written step to pull it.
+- **Where it shows up in your stack.** A `runbook_url` on every paging alert, flags for fallback model,
+  per-tool disable and per-tenant limits, and trace queries that find the failing run by ID.
+- **What you control.** Which levers the agent exposes (kill switch per tool, max-step override, read-only
+  mode), which actions the on-call may take without approval, and the trace fields responders need.
+- **What you can skip.** Writing a runbook per code path. Write one per alert or symptom, starting with
+  provider outage, rate limits, cost runaway and unsafe actions.
 
 ## Why it exists
 - **Fix-it knowledge lives in a few heads.** Which dashboard shows the real problem, which flag switches
   to the fallback model, which log query finds the failing tenant. That works until those engineers are
   asleep, on holiday, or on another project.
 - **Forward-deployed work fails structurally.** After handoff the customer's operations team is on call
-  for a system they did not build, often in an environment the vendor cannot access. At 3 a.m. under
+  for an agent they did not build, often in an environment the vendor cannot access. At 3 a.m. under
   pressure nobody reasons well from first principles.
 - **"The on-call will figure it out" fails.** Every incident becomes an investigation, stretching time to
   mitigation from minutes to hours while users are affected.
@@ -69,6 +81,14 @@ the system, so good runbooks are alert-linked, mitigation-first and rehearsed.
   tools, block a tenant, shed load.
 - **Why:** waiting for a manager's approval at night extends the incident.
 
+### Agent-specific runbooks to write first
+| Situation | Typical trigger | First mitigation |
+|---|---|---|
+| **Cost runaway or loop** | Cost per task or step-budget hits above threshold | Lower the max-step limit, disable the looping tool, cap the tenant |
+| **Tool misbehaving** | Tool-call error rate up, or a tool returning malformed data | Disable that tool; the agent answers without it or hands off to a human |
+| **Unsafe or wrong write actions** | User report, audit alert on unusual writes | Switch write tools to approval-only or read-only mode, export affected run IDs |
+| **Prompt injection reported** | Report, guardrail alert on tool results | Disable the source tool or connector, preserve the traces, notify security |
+
 ### Automation is the next step, not a replacement
 - **Promote repeated steps:** a step run identically every time becomes a script, then automatic
   remediation.
@@ -105,9 +125,11 @@ flowchart TD
     C -->|"yes"| B{"Which branch matches?"}
     B -->|"provider outage"| M1["Fail over to fallback"]
     B -->|"rate limit"| M2["Cut own concurrency"]
+    B -->|"agent looping"| M3["Lower step limit, disable tool"]
     B -->|"no match"| E["Escalate to named rota"]
     M1 --> V{"Recovered for watch period?"}
     M2 --> V
+    M3 --> V
     V -->|"no"| E
     V -->|"yes"| R["Revert one change at a time"]
     R --> P["Record timeline for postmortem"]
@@ -115,8 +137,8 @@ flowchart TD
 
 ## Examples
 ### An LLM provider-degraded runbook
-An abridged runbook for an LLM-backed assistant, written for a customer operations team after handoff.
-Flag names, dashboards and thresholds are illustrative stand-ins for the team's own.
+An abridged runbook for an LLM-backed agent, written for a customer operations team after handoff. Flag
+names, dashboards and thresholds are illustrative stand-ins for the team's own.
 
 ```markdown
 ### RB-07 LLM provider degraded (429s / 5xx / timeouts)
@@ -154,6 +176,39 @@ What it encodes:
 - **A deliberate revert order:** one change at a time with a watch period, so if errors return you know
   which reverted change they depended on. The most load-generating change (batch jobs) comes back last,
   when the system has proven it is stable.
+
+### An agent cost-runaway runbook
+The agent-specific counterpart: a loop or a misbehaving tool drives cost per task up. Again, flag names
+and thresholds are illustrative stand-ins for the levers your own agent exposes.
+
+```markdown
+### RB-12 Agent cost runaway / looping
+Trigger: alert `agent_cost_per_task > 2x 7-day median for 15 min`, or step-budget hits > 2% of tasks
+Impact: spend climbs, tasks time out at the step limit. SEV2; SEV1 if daily budget will be hit today.
+
+Confirm
+1. Dashboard "Agent tasks" -> "steps per task" and "tool calls by tool": did one tool's call count jump?
+2. Open three runs at the step limit (trace search: status=step_limit, last 1 h).
+   Same tool called repeatedly with similar arguments = loop. Go to step 3.
+
+Mitigate (pre-authorised)
+3. Disable the looping tool: set `tools.<name>.enabled=false`. The agent answers without it or hands off.
+4. If no single tool: lower `agent.max_steps` from 15 to 8 for all tenants.
+5. One tenant driving the spend: set `tenant.<id>.daily_task_cap` to its 7-day average.
+
+Verify
+6. Cost per task back within 1.2x median and step-budget hits < 0.5% for 30 min.
+   Re-enable the tool on the internal tenant first, watch 30 min, then everyone.
+
+Escalate
+7. Not recovered 30 min after step 3 or 4: page vendor on-call (rota "assistant-l3") with trace IDs.
+Afterwards: attach three looping traces and the tool's recent changes to the postmortem.
+```
+
+- **The confirm step reads traces, not logs**, because a loop is visible as a repeated tool call in one
+  run, not as an error line.
+- **Disabling one tool is the smallest lever**, which is why the agent must be built to degrade (answer
+  without it or hand off) rather than crash when a tool is missing.
 
 ### Linking alerts to runbooks, and linting the link
 Prometheus alerting rules conventionally carry a `runbook_url` annotation, so the page that wakes the
@@ -206,9 +261,12 @@ print(lint(alerts, runbooks, date(2026, 10, 20)))
 - **Alert-embedded runbook links.** Put the runbook URL in every paging alert (for example the
   `runbook_url` annotation in Prometheus rules) so it travels into the pager notification. Monitor the
   share of paging alerts without a link; target zero.
+- **Levers built into the agent.** For every runbook step, the agent exposes a flag: per-tool disable,
+  max-step override, read-only mode for write tools, fallback model, per-tenant caps. Monitor runbooks
+  that reference a lever that does not exist (they should fail review).
 - **Game days before handoff.** Inject the failure in staging (block the provider endpoint, throttle a
-  connector, corrupt an index alias) and have the customer's on-call run the runbook unaided. Monitor time
-  to mitigate and every step where they hesitated.
+  connector, corrupt an index alias, make a tool return malformed data) and have the customer's on-call
+  run the runbook unaided. Monitor time to mitigate and every step where they hesitated.
 - **Runbook review in the postmortem template.** Each postmortem asks "was the runbook right, missing or
   wrong?" and opens an update task. Monitor incidents where the runbook was wrong.
 - **Mirrored copy outside the blast radius.** Export runbooks to a location that does not depend on the
@@ -219,7 +277,7 @@ print(lint(alerts, runbooks, date(2026, 10, 20)))
 
 ## Trade-offs
 - **Speed for strangers vs staleness.** Detailed, command-level runbooks make incidents fast for
-  unfamiliar operators but go stale quickly as the system changes; the cost flips when nobody owns
+  unfamiliar operators but go stale quickly as the agent changes; the cost flips when nobody owns
   updates, and a wrong runbook is worse than none.
 - **Fast mitigation vs over-reaction.** Pre-authorising disruptive actions shortens incidents but risks
   over-reaction on false alarms; keep the confirm step strict so disruptive mitigation follows evidence.
@@ -236,8 +294,11 @@ print(lint(alerts, runbooks, date(2026, 10, 20)))
   discovered mid-incident. Fix: game days and a last-tested date.
 - **Alerts with no linked runbook.** Symptom: repeated pages that each get the same ad-hoc response and no
   consistent mitigation time. Fix: lint for the link in CI.
-- **Leaving out AI-specific situations** such as cost spikes, guardrail-block surges or prompt-injection
-  reports. Symptom: a generic "service degraded" response to a problem that needed a kill switch.
+- **Leaving out AI-specific situations** such as cost spikes, agent loops, guardrail-block surges or
+  prompt-injection reports. Symptom: a generic "service degraded" response to a problem that needed a kill
+  switch.
+- **A runbook step with no lever behind it.** Symptom: "disable the CRM tool" is written down, but the
+  agent has no per-tool flag, so the only option is a full redeploy. Fix: build the lever with the tool.
 - **Keeping runbooks only behind the system's own login** or on infrastructure that fails with it.
   Symptom: in an identity or network outage the on-call cannot open the page that tells them what to do.
 - **Writing them only for the vendor team.** Symptom: a customer operations team that escalates every page
@@ -247,7 +308,8 @@ print(lint(alerts, runbooks, date(2026, 10, 20)))
 - **Use for:** every alert that pages a human, and every known failure mode a different team will
   handle, before go-live and as a readiness-review item.
 - **Start with the likeliest and most harmful situations:** provider outage, rate limits, cost runaway,
-  index staleness, unsafe output reports, authentication failures to customer systems.
+  agent loops, index staleness, unsafe output or action reports, authentication failures to customer
+  systems.
 - **Measure:** time to mitigate, how often responders escalate despite the runbook, and how often an
   incident finds a runbook wrong.
 - **Interviews:** alert-linked runbooks with pre-authorised mitigations and rehearsal show operational
@@ -285,23 +347,30 @@ under realistic conditions.
 - **Failing over can backfire:** the same load can exhaust the fallback's quota too. Failover fits 5xx and
   timeouts, which signal a provider outage.
 
+### Your agent's cost per task doubled overnight. Walk me through the runbook.
+- **Confirm from traces:** open runs that hit the step limit and look for one tool called repeatedly with
+  similar arguments, and check per-tool call counts on the dashboard.
+- **Mitigate with the smallest lever:** disable that tool or lower the max-step limit, cap a hot tenant,
+  then verify cost and step-budget hits return to baseline before re-enabling on one tenant first.
+
 ### Which actions would you pre-authorise for the on-call, and which not?
 - **Pre-authorise reversible, harm-stopping actions:** switch to a fallback model, disable an agent's write
   tools, block or rate-limit a tenant, shed load.
 - **Keep approval for irreversible or customer-contract changes**, and keep the confirm step strict so
   disruptive steps follow evidence rather than false alarms.
 
+### What must you build into an agent so its runbooks can actually be executed?
+- **Levers per risk:** a disable flag per tool, a read-only mode for write tools, a max-step override, a
+  fallback model route and per-tenant caps, all changeable without a redeploy.
+- **Graceful degradation and traceability:** the agent must keep working (or hand off) with a tool
+  disabled, and every run needs a searchable trace ID so the confirm step can find it.
+
 ### How do you know a runbook still works six months after handoff?
 - **Last-tested date and owner on each one**, with a CI check that flags stale runbooks and alerts missing
   a link.
 - **Game days and postmortem reviews:** rehearse in staging and update the runbook after every incident
-  where it was wrong or missing.
-
-### Where should runbooks live, and why does it matter?
-- **Outside the system's blast radius:** not only behind the same single sign-on or in a cloud account the
-  customer cannot access.
-- **With a mirrored or offline copy**, so an identity outage or network partition does not hide the page
-  that tells the on-call what to do.
+  where it was wrong or missing. Store runbooks outside the system's blast radius, with a mirrored or
+  offline copy, so an identity outage does not hide them.
 
 ## Quiz
 ### Q: Why do runbooks put mitigation steps before diagnosis?
@@ -327,3 +396,24 @@ under realistic conditions.
 - [ ] Convert it into a postmortem template
 > Automation fails in unusual conditions, which is when operators most need context. The runbook becomes
 > the fallback for the automation and explains its behaviour so responders do not fight it.
+
+## Use cases & projects
+### Use cases
+- **Handing an agent to a customer's on-call team.** Runbooks in their tools and access model let them
+  mitigate provider outages and agent loops without escalating.
+- **Cost runaway on a tool-calling agent.** A runbook with a per-tool disable and a max-step override
+  stops spend within minutes instead of hours.
+- **Prompt injection through a connector.** A pre-authorised "disable the connector, preserve traces,
+  notify security" procedure removes the need for a 3 a.m. approval call.
+- **Readiness reviews.** "Every paging alert links to a tested runbook" is a blocking checklist item.
+
+### Mini project
+**Write and rehearse two agent runbooks (2 hours).**
+- **Goal:** prove a stranger can stop an agent loop and a provider outage using only your runbooks.
+- **Steps:** add three flags to a toy agent (per-tool disable, `max_steps`, fallback model); write RB-07
+  style runbooks for "provider degraded" and "agent looping"; inject each failure (a stub tool that always
+  asks to be called again, a stub provider returning 429s); ask a colleague, or yourself a day later, to
+  follow the runbook without reading the code.
+- **Done when:** both failures are mitigated within 10 minutes using only the runbook, every step that
+  caused hesitation is rewritten, and a lint script confirms each alert links to a runbook tested in the
+  last 180 days.

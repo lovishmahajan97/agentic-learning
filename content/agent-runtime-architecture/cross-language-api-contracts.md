@@ -5,7 +5,8 @@ name: Cross-language API contracts
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - agents/typed-tool-contracts
   - agents/tool-schemas-and-argument-validation
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Agent systems are polyglot, and the model itself consumes JSON Schema. A contract is one machine-readable
-schema every side generates types and runtime validators from, with explicit rules for JSON's ambiguities
-(int64, dates, null vs absent, enums) and for safe evolution.
+Agent systems are polyglot, and the model itself reads your tool schemas. A contract is one
+machine-readable schema every side generates types and runtime validators from, with explicit rules for
+JSON's ambiguities (int64, dates, null vs absent, enums) and for safe evolution.
+
+## For agent builders
+- **Why it matters for agents.** Your tool definition is a contract the model reads, the executor validates
+  and the tool server compiles against. When they drift, tool-call success drops with "invalid arguments"
+  errors on calls that look correct, and no single code change is to blame.
+- **Where it shows up in your stack.** Tool `input_schema` sent to the provider, Pydantic or Zod models,
+  MCP server schemas, the step event stream to your UI, run checkpoints, and gRPC between executor and
+  tool workers.
+- **What you control.** One `contracts/` source of truth, `extra="forbid"` on model-supplied arguments and
+  tolerant readers on events, a per-provider strict-mode projection, `schema_version` on events and
+  checkpoints, and a generate-and-diff CI step.
+- **What you can skip.** Choosing a neutral IDL on day one. Start with JSON Schema emitted from your primary
+  language's models and promote when a third consumer appears.
 
 ## Why it exists
 - **Every arrow is a contract, written down or not.** Python sends the model a tool definition as JSON
@@ -370,3 +384,26 @@ drift is caught in minutes.
 > Only additive, optional changes leave old consumers working. Renames and type changes alter fields they
 > already read, and a new required field fails validation on every message they had no part in changing;
 > those need a new version.
+
+## Use cases & projects
+### Use cases
+- **Python agents calling TypeScript tool servers.** One schema generates the model's tool definition, the
+  Pydantic validator and the TypeScript types, so a rename cannot silently break dispatch.
+- **Agents that switch or fall back between model providers.** Per-provider projections of the same
+  contract keep strict tool calling working without changing what the executor enforces.
+- **Live agent UIs over server-sent events.** A versioned, discriminated event union with tolerant readers
+  lets the runtime add event types without crashing old clients.
+- **Long-running agents resumed after deploys.** Versioned checkpoints with migrations written up front keep
+  last week's parked runs loadable.
+
+### Mini project
+**One contract for a polyglot tool call (2-3 hours).**
+- **Goal:** drive a Python agent loop and a TypeScript tool server from a single schema and prove drift is
+  caught in CI.
+- **Steps:** define `CreateTicketArgs` and the event union in Pydantic; emit
+  `contracts/agent.schema.json`; generate TypeScript types and an ajv validator from it; send the
+  tool definition to a model and validate its arguments in Python and again in the tool server; add golden
+  fixtures for an id above 2^53, a naive `due_at`, an extra `assignee` field and an unknown event type;
+  add a `git diff --exit-code` regeneration check.
+- **Done when:** both pipelines accept and reject the same fixtures, renaming a field without regenerating
+  fails CI, and the agent's tool-call argument rejection rate is logged per tool and schema version.

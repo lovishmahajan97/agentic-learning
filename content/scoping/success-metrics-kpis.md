@@ -312,13 +312,13 @@ baseline window first, and agree in writing what result triggers expansion or a 
 - **Set per-field targets by consequence,** for example 99% on policy number but 90% on loss-type
   category, and tie the decision rule to the outcome KPI, not to accuracy alone.
 
-### How do you stop a support agent's deflection or containment metric from being gamed?
-- **Name the cheapest cheat:** making handoff harder, or a prompt that nudges the agent to end chats
-  early, raises containment.
-- **Pair it with guardrails** that catch exactly that: reopen rate, repeat contacts and escalations within
-  24 hours, shown on the same dashboard panel.
-- **Define the driver strictly,** as no human contact and no repeat contact on the same issue within a
-  window, so contained-but-unresolved chats do not count.
+### Your agent reports "task completed" at the end of each run. Can you use that as the level-3 quality metric?
+- **Not on its own.** The agent's final message is a self-report, and optimisation pressure on prompts
+  pushes it towards claiming success. Treat it as a candidate label, not ground truth.
+- **Verify against the business record:** join the run's task ID to the ticket or claim and count only
+  runs with no human touch and no reopen within 7 days, the same strict definition the driver uses.
+- **Audit a weekly sample** of "completed" runs by hand and report the audited pass rate beside the
+  self-reported one; a widening gap after a prompt or model change is the signal to roll back.
 
 ## Quiz
 ### Q: Why does a metric tree separate operational drivers from the outcome KPI?

@@ -5,7 +5,7 @@ name: Contract testing
 kind: practice
 difficulty: advanced
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - python-for-ai/test-doubles-mocks-fixtures
@@ -22,8 +22,9 @@ sources:
 ---
 
 ## TL;DR
-An agent sits on many interfaces: tool services, retrieval, MCP servers, tool schemas. A contract test checks that two sides agree on one (shapes, fields, status codes, errors)
-without running both: the consumer records what it relies on, the provider verifies it.
+An agent sits on many interfaces: tool services, retrieval, MCP servers, tool schemas. A contract test
+checks that two sides agree on one (shapes, fields, status codes, errors) without running both: the
+consumer records what it relies on, the provider verifies it.
 
 ## For agent builders
 - **Why it matters for agents.** When a tool or retrieval service renames a field, an agent rarely

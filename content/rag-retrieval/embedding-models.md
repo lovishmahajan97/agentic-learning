@@ -5,7 +5,7 @@ name: Embedding models
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - model-internals/embeddings
@@ -85,12 +85,13 @@ L = −log( exp(s(q, p⁺)/τ) / Σ_j exp(s(q, p_j)/τ) )      s = cosine simila
 - **The temperature `τ` is small** (a few hundredths is common), because cosine lives in [−1, 1].
   Dividing by a small number sharpens the softmax so the gradient concentrates on negatives scoring
   closest to the positive.
-- **Worked case:** one positive at cosine 0.80, one hard negative at 0.75 and two easy negatives.
+- **Worked case:** one positive at cosine 0.80, one hard negative at 0.75 and two easy negatives at
+  0.30 and 0.20.
 
-| τ | What the softmax sees | Where the gradient goes |
-|---|---|---|
-| 1.0 | near-uniform; cosine gaps are tiny | spread over all negatives, including easy ones |
-| 0.05 | easy negatives vanish | almost entirely on the hard negative at 0.75 |
+| τ | Loss | p(positive) | p(hard) | p(easy, 0.30) | Where the gradient goes |
+|---|---|---|---|---|---|
+| 1.0 | 1.134 | 0.322 | 0.306 | 0.195 | near-uniform softmax, spread over all negatives, easy ones included |
+| 0.05 | 0.313 | 0.731 | 0.269 | about 0 | easy negatives vanish; almost entirely on the hard negative at 0.75 |
 
 - **In-batch negatives are free.** With a batch of B pairs, every query gets B − 1 negatives. More
   negatives make the task harder and the space finer, which is why models train with very large batches.
@@ -210,7 +211,8 @@ def select_tools(user_msg: str, k: int = 2) -> list[str]:
     return [names[i] for i in order]
 
 print(select_tools("I want my money back for order 1182"))
-# Expect issue_refund and lookup_order: only their schemas go into this step's tool list.
+# Likely issue_refund first, with lookup_order a close second: only the selected schemas go
+# into this step's tool list. Check the ranking on logged requests rather than trusting a toy.
 ```
 
 | Setup (illustrative) | Schema tokens per step |

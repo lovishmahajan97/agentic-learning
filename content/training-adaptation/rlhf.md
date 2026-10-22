@@ -5,7 +5,7 @@ name: RLHF
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: background
 related:
   - training-adaptation/dpo
@@ -243,10 +243,10 @@ The inference-time cousin of rejection sampling: draft n final answers, score th
 judge, return the best. The score function here is a stand-in for your reward model or judge call.
 
 ```python
-def best_of_n(candidates, score, length_penalty=0.002, max_chars=1200):
-    """Pick the highest-scoring draft, penalising length so verbosity cannot win by itself."""
+def best_of_n(candidates, score, length_penalty=0.002, free_chars=600):
+    """Pick the highest-scoring draft, penalising length past free_chars so verbosity cannot win."""
     def guarded(c):
-        return score(c) - length_penalty * max(0, len(c) - max_chars // 2)
+        return score(c) - length_penalty * max(0, len(c) - free_chars)
     ranked = sorted(candidates, key=guarded, reverse=True)
     return ranked[0], [round(guarded(c), 3) for c in ranked]
 
@@ -258,12 +258,15 @@ drafts = ["Refund issued to card ending 4242; allow 5-7 business days.",
           "Thanks so much for reaching out! " * 25 + "We are looking into it.",
           "I checked order A-1042: refund issued, confirmation sent by email."]
 best, scores = best_of_n(drafts, toy_judge)
-print(best, scores)   # the short, correct drafts beat the padded one once length is guarded
+print(best, scores)   # guarded scores [0.833, 0.83, 0.528]: the A-1042 draft wins
 ```
+
+- **Without the guard the padded draft wins:** the toy judge gives it 1.024 against 0.833, purely for its
+  848 characters. That is the length bias reward models and LLM judges show, in miniature.
 
 ### Worked scenario: an agent eval that got overoptimised
 Illustrative numbers. A team tuned a support agent's prompt and best-of-n settings against one LLM judge
-for six weeks, checking a human-audited sample only at the end.
+for six weeks, and only in week 6 human-audited a sample from each week's configuration.
 
 | Week | Judge score (proxy) | Mean answer length | Human-audited task success |
 |---|---|---|---|
@@ -440,7 +443,7 @@ own score.
   pick DPO over a full PPO loop.
 
 ### Mini project
-**Catch reward hacking in a best-of-n agent reranker (1-2 hours).**
+**Catch reward hacking in a best-of-n agent reranker (2-3 hours).**
 - **Goal:** see overoptimisation happen on a small scale with an LLM judge as the reward.
 - **Steps:** generate 8 candidate answers per question for 30 agent questions; score each with an LLM
   judge; pick the top answer at n = 1, 2, 4 and 8; have a human (you) blind-rate the picked answers and

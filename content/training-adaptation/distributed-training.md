@@ -5,7 +5,7 @@ name: Distributed training (data / tensor / pipeline parallelism, FSDP, DeepSpee
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: background
 related:
   - training-adaptation/pre-training
@@ -25,8 +25,8 @@ sources:
 
 ## TL;DR
 Caveat: agent builders rarely run this; they need the vocabulary and arithmetic, not the practice. When
-an agent model's fine-tune outgrows one GPU, FSDP/ZeRO and data, tensor and pipeline parallelism split
-the work, and the cheapest option is usually not needing them.
+a fine-tune outgrows one GPU, FSDP/ZeRO and data, tensor and pipeline parallelism split the work,
+interconnect decides the mix, and the cheapest option is not needing them.
 
 ## For agent builders
 - **Why it matters for agents.** It decides what a fine-tune of your agent's model costs. LoRA or QLoRA
@@ -228,7 +228,9 @@ hardware is one node of eight 80 GB GPUs. State per GPU before activations, from
 - **The decision:** run LoRA on 7B first and compare it with the 70B base on the held-out agent eval;
   move to 70B LoRA with FSDP only if the gap is real.
 - **Time is not the constraint:** 5,000 trajectories is a tiny token budget next to the 6 × params × tokens
-  of pretraining, so the run takes hours, not years.
+  of pretraining, so the run takes hours, not years. At ~8k tokens each that is ~40M tokens, and
+  6 × 7B × 40M ≈ 1.7 × 10¹⁸ FLOPs, about 70 GPU-minutes per epoch at 400 TFLOP/s (illustrative; LoRA
+  needs less, since frozen weights get no gradient).
 
 ### FSDP full fine-tune of a 7B model on eight GPUs
 A minimal full-parameter fine-tune with FSDP in `FULL_SHARD` mode (the ZeRO-3 equivalent), wrapping per
@@ -507,9 +509,12 @@ optimizer state) or QLoRA. The arithmetic decides, not the framework.
 **Size three fine-tune options for one agent (1-2 hours).**
 - **Goal:** produce a one-page sizing note that recommends how to fine-tune a tool-calling agent's model on
   your hardware, with the arithmetic shown.
-- **Steps:** count tokens in a sample of agent trajectories; extend the planning calculator with LoRA and
-  QLoRA rows (base weights in bf16 or 4-bit plus a small adapter); compute per-GPU state for 7B and 70B
-  under DDP, ZeRO-3 and LoRA on your GPU count; if you have two GPUs, launch a tiny LoRA run with `torchrun`
-  and compare measured peak memory with the estimate.
+- **Steps:**
+  1. Count tokens in a sample of agent trajectories rendered with the target chat template.
+  2. Extend the planning calculator with LoRA and QLoRA rows (base weights in bf16 or 4-bit plus a small
+     adapter) and a run-time estimate from `6 × params × tokens`.
+  3. Compute per-GPU state for 7B and 70B under DDP, ZeRO-3 and LoRA on your GPU count.
+  4. Optional, with two GPUs: launch a tiny LoRA run with `torchrun` and compare measured peak memory
+     with the estimate.
 - **Done when:** the note has a table of options with fits or does not fit, an estimated run time from the
   token count, and a recommendation tied to an agent eval you would run to justify any step up.

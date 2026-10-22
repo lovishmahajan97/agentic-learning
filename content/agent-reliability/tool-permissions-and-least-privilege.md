@@ -5,7 +5,7 @@ name: Tool permissions & least privilege
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agent-reliability/idempotent-tool-execution

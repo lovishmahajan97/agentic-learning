@@ -5,7 +5,8 @@ name: Tenant-specific configuration & feature flags
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - system-design/tenant-isolation
   - enterprise-integration/sandbox-vs-production-environments
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-Tenant configuration expresses each customer's differences (model, guardrails, connectors, enabled
-features) as typed, versioned data resolved at runtime, and feature flags decide who gets which code
-path, so one codebase serves every customer instead of a fork per customer.
+One agent serves many customers: tenant configuration holds each one's model, prompt version, tool list
+and guardrails as typed, versioned data, and feature flags decide who gets which agent behaviour, so you
+never fork the agent per customer.
+
+## For agent builders
+- **Why it matters for agents.** An agent's behaviour is mostly data: system prompt version, model, which
+  tools are registered, retrieval sources, guardrail thresholds and step budgets. Each customer needs a
+  different mix, and each of those changes more often than the agent's code.
+- **Where it shows up in your stack.** The step where the agent is assembled for a run (prompt, model,
+  tool registry), the trace attributes of each run, the eval gate in front of prompt changes, and the kill
+  switch on-call uses to disable an external tool.
+- **What you control.** The typed schema of what may vary, the layering order, pinning the resolved config
+  at run start, and conservative defaults so a config outage removes tools rather than guardrails.
+- **What you can skip.** Comparing flag vendors in depth; a vendor-neutral interface and a typed table you
+  own cover most agent teams until flags multiply.
 
 ## Why it exists
 - **Every customer wants something different.** The first gets the product as built. The second needs
@@ -110,6 +123,19 @@ entitlements implemented as ad hoc flags get lost when someone cleans up "old fl
   apply changes at the next unit.
 - **Key the cache by tenant,** *because* a cache keyed by flag name alone is a cross-tenant leak: the
   first tenant to resolve a key sets it for everyone.
+
+### Assembling an agent from tenant config
+At the start of each run the resolved, pinned config builds the agent, so the model never sees a tool or
+prompt the tenant is not entitled to.
+1. **Pick the prompt** by `prompt_version`, never by editing prompt text in place, so every run names the
+   exact prompt it used.
+2. **Filter the tool registry** to the tenant's enabled tools, then remove any tool whose kill switch is
+   on. A tool that is not registered cannot be called, which is stronger than telling the model not to.
+3. **Apply limits** from config: step budget, token budget per run, allowed models and providers.
+4. **Stamp the trace** with config version, prompt version, tool list and flag decisions, so an eval or
+   incident can replay the run under the same settings.
+- **Experiment flags for agents** split runs, not requests: bucket by conversation or run id so one run
+  never mixes two prompts or two tool sets.
 
 ### Keeping the matrix testable
 Each independent boolean doubles the possible combinations, so you cannot test them all:
@@ -217,6 +243,27 @@ print(run_conversation("acme", 4, pin=False, admin_edit_at=2))  # [41, 41, 42, 4
 print(run_conversation("acme", 4, pin=True, admin_edit_at=2))   # [41, 41, 41, 41] reproducible
 ```
 
+### Building a tenant's agent with a kill switch
+A sketch that turns the pinned config into the tool list the model sees. Tool names and the `KILL`
+set are illustrative; in production the kill switches come from the flag service.
+
+```python
+ALL_TOOLS = {"search_kb": ..., "create_ticket": ..., "web_search": ..., "refund_order": ...}
+TENANT_TOOLS = {"acme": ["search_kb", "create_ticket"], "globex": ["search_kb", "web_search", "refund_order"]}
+KILL = {"web_search"}            # ops flag flipped by on-call: external tool misbehaving
+
+def build_agent(tenant: str, plan: str, run_id: str) -> dict:
+    cfg = resolve(tenant, plan)                     # typed, validated, pinned for this run
+    tools = [t for t in TENANT_TOOLS.get(tenant, []) if t not in KILL]   # unknown tenant: no tools
+    return {"run_id": run_id, "prompt_version": cfg.prompt_version, "model": cfg.model,
+            "tools": tools, "trace_attrs": {"tenant": tenant, "tools": ",".join(tools)}}
+
+print(build_agent("globex", "enterprise", "run-77")["tools"])   # ['search_kb', 'refund_order']
+```
+
+The model cannot call `web_search` while the switch is on, because the tool is absent from the request,
+not merely discouraged in the prompt.
+
 ### Worked scenario: rolling a new model to fifty tenants
 Illustrative plan using tenant config plus a release flag.
 
@@ -246,6 +293,10 @@ switch target.
 - **Config version in every trace.** Use always. Stamp the pinned config version and flag decisions on
   each request, job or conversation span. Monitor quality metrics broken down by config version so a
   regression is attributable to a save, not just a deploy.
+- **Tool lists as entitlements, tool kill switches as ops flags.** Use for every agent with external or
+  side-effecting tools. Store which tools a tenant may use in typed config, and give each external tool a
+  long-lived kill switch that removes it from the registry. Monitor tool-call error rate per tool and how
+  often each switch flips.
 
 ## Trade-offs
 - **No-deploy changes vs config-caused breakage.** Runtime configuration changes tenant behaviour without
@@ -280,6 +331,9 @@ switch target.
 - **Re-reading configuration at every step of a long agent run or conversation.** Symptom: a trace in which
   the prompt version or model changes mid-run, and a bug report nobody can reproduce because no single
   config version produced it.
+- **Disabling a tool by prompt instead of by registry.** Symptom: on-call adds "do not use web search" to
+  the prompt during an incident and the agent still calls it on some runs. Fix: remove the tool from the
+  request through a kill switch.
 - **Unvalidated free-form JSON config.** Symptom: a typoed key is silently ignored, so the tenant runs the
   default and nobody notices until the customer does.
 
@@ -342,6 +396,12 @@ eligible tenant is migrated.
 - **The service earns its place** when you run many short-lived release and experiment flags that need
   targeting, percentage rollouts, audit and a UI for non-engineers.
 
+### An external tool your agent uses starts returning garbage. How do you contain it across all tenants?
+- **Flip the tool's kill switch,** which removes it from every tenant's tool registry at the next run
+  without a deploy; runs already in progress keep their pinned config until they end.
+- **Confirm from traces** that tool-call counts for it drop to zero, then check task success per tenant
+  to see which agents depended on it and need a fallback.
+
 ### How do you keep the flag and config matrix testable as tenants grow?
 - **Test the combinations tenants actually run** by pulling live resolved configs into CI, since each
   independent boolean doubles the theoretical matrix.
@@ -372,3 +432,24 @@ eligible tenant is migrated.
 - [ ] A flag hiding a half-built admin page
 > Kill switches exist for incidents that can happen at any time, so they stay. Release and experiment
 > flags should be removed once the rollout or experiment ends, or they become permanent branching.
+
+## Use cases & projects
+### Use cases
+- **Multi-tenant support agents.** Each customer gets its own prompt version, language, retrieval sources
+  and tool list from one codebase.
+- **Rolling a new model or prompt to an agent fleet.** A release flag targeted by tenant, gated by each
+  tenant's regression suite, moves agents over in waves.
+- **Incident response on agent tools.** A kill switch removes a failing external tool from every agent's
+  registry in seconds.
+- **Prompt A/B tests on agents.** Experiment flags bucketed by run id compare two prompts without mixing
+  them inside one run.
+
+### Mini project
+**Config-driven agent assembly with pinning (2 hours).**
+- **Goal:** one agent factory that builds a different agent per tenant from layered config and keeps each
+  run on one config version.
+- **Steps:** define a typed config with prompt version, model, tool list and step budget; add global, plan
+  and tenant layers; build the agent from the resolved config; add a kill switch for one tool; change the
+  tenant's prompt version halfway through a 6-step run and log the version at every step.
+- **Done when:** two tenants get different tools and prompts from the same code, the kill switch removes a
+  tool on the next run, and every step of the edited run logs the same config version.

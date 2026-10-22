@@ -5,7 +5,7 @@ name: Parallel tool calls
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/tool-calling

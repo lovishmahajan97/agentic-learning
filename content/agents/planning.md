@@ -5,7 +5,7 @@ name: Planning
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/agent-loop
@@ -29,9 +29,10 @@ the loop a target to check progress against and a hook to replan; where planning
 robustness on long tasks.
 
 ## For agent builders
-- **Why it matters for agents.** Past roughly five tool calls, a greedy loop drifts: it repeats work,
-  forgets the goal and stops when the last output looks fine. A plan with step statuses is the cheapest
-  fix, and it is also what lets a human approve the approach before side effects.
+- **Why it matters for agents.** On tasks past roughly five tool calls (a rule of thumb, not a
+  threshold), a greedy loop tends to drift: it repeats work, forgets the goal and stops when the last
+  output looks fine. A plan with step statuses is a cheap fix, and it is also what lets a human approve
+  the approach before side effects.
 - **Where it shows up in your stack.** LangGraph, where plan-then-execute and ReWOO are graphs of planner,
   executor and replanner nodes with the plan held in graph state; todo-list tools in coding agents (Claude
   Code's todo tool, LangChain's deep agents planning tool); and step caps such as LangGraph's
@@ -421,5 +422,5 @@ batch. Better still, "matched" should be a deterministic check on stored records
 
 ### Major project
 This lesson feeds the module Capstone (see the module guide): the billing-dispute agent's investigation
-island runs under a step and token budget, and its proposal state is effectively a plan a support lead
-approves before execution.
+island runs under a step and token budget, and its proposal state plays the role of plan approval: a
+support lead reviews the proposed refund or credit before any side effect runs.

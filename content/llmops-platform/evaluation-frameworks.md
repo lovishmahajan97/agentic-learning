@@ -5,7 +5,8 @@ name: Evaluation frameworks
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - evals/eval-harness
   - evals/tooling
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-An evaluation framework turns one engineer's eval script into a shared service with five fixed
-interfaces (datasets, target, scorers, runner, results), so an eval score becomes a currency every team
+An evaluation framework turns ad-hoc agent eval scripts into a shared service with five fixed interfaces
+(datasets, target, scorers, runner, results), so "did this agent change help" has an answer every team
 can compare and accept.
+
+## For agent builders
+- **Why it matters for agents.** Agents fail in ways a single score hides: a wrong tool, invalid
+  arguments, a loop that hits the step budget, a right answer reached by an unsafe action. A framework
+  stores the whole trajectory and runs several scorers over it, so you can see which of those happened.
+- **Where it shows up in your stack.** Application frameworks (Promptfoo, DeepEval, RAGAS for the
+  retrieval step) and platform tools (Braintrust, LangSmith, Langfuse) wired into CI; a thin custom layer
+  when your agent has tool side effects the framework cannot model.
+- **What you control.** The target adapter (your real agent loop with sandboxed or recorded tools), the
+  scorers (final-state checks, tool-call validity, steps, judges), and the dataset of tasks.
+- **What you can skip.** Capability benchmark harnesses, unless you are choosing a base model for the
+  agent. They say nothing about your prompts, tools and retrieval.
 
 ## Why it exists
 - **A second team builds a second engine.** The `evals/eval-harness` lesson explains one engine. Team A
@@ -48,14 +61,18 @@ can compare and accept.
 ## How it works
 ### The five interfaces
 1. **Dataset.** Items of `{id, input, expected or reference, slice metadata}`, stored as immutable,
-   content-hashed versions.
+   content-hashed versions. For an agent, an item is a task plus what "done" means (an expected final
+   state, answer or set of allowed actions).
    - Immutable *because* a score only means something relative to a dataset version; an item relabeled in
      place silently moves every baseline.
    - Which datasets exist and how items get in: the `golden-dataset-strategy` lesson.
 2. **Target.** An adapter that calls the production code path with a pinned bundle (model snapshot, prompt
    version, decoding parameters, index snapshot).
    - It calls the real application *because* evaluating a copy of the prompt evaluates the copy: template
-     rendering, post-processing and retrieval are part of what ships.
+     rendering, post-processing and retrieval are part of what ships. For an agent, the real loop, step
+     budget and tool dispatch are part of what ships too.
+   - **Agent targets return a trajectory,** not just text: the final answer plus every tool call, its
+     arguments and result, so trajectory scorers have something to read.
 3. **Scorers.** Three families, each with a name and a version (see the table below). Every score is stored
    as `{item_id, scorer, scorer_version, value, rationale}`, the version *because* a judge upgrade changes
    scores without any change to the application.
@@ -63,6 +80,7 @@ can compare and accept.
    - Caches model calls keyed by the exact request sent (model id, decoding params, rendered messages).
    - Writes raw outputs *before* scoring and records a manifest of every pin. Raw outputs first *because*
      scorers change: re-scoring with a new judge should cost judge calls only, never a target re-run.
+     For agents this matters more, since one target run is many model and tool calls.
    - Records timeouts as errors, not zero scores, so a provider incident does not masquerade as a
      regression.
 5. **Results store and comparison.** Per-run aggregates per slice with confidence intervals, and a
@@ -72,8 +90,8 @@ can compare and accept.
 ### Scorer families
 | Family | Examples | Strength | Cost and caveat |
 |---|---|---|---|
-| **Deterministic** | exact match, regex, JSON-schema validity, unit tests that execute generated code | cheap, unambiguous | only applies to structured outputs |
-| **Model-graded** | LLM judge against a rubric, against a reference answer, or pairwise between two outputs | covers free text | a model call per item; the judge is itself a model that drifts, so calibrate against human labels and pin its snapshot |
+| **Deterministic** | exact match, regex, JSON-schema validity, unit tests that execute generated code; for agents, final-state checks, tool-argument schema validity, step count | cheap, unambiguous | only applies to structured outputs |
+| **Model-graded** | LLM judge against a rubric, against a reference answer, or pairwise between two outputs; for agents, a judge reading the trajectory | covers free text | a model call per item; the judge is itself a model that drifts, so calibrate against human labels and pin its snapshot |
 | **Human** | expert review | ground truth | used to calibrate judges and to sign off high-risk changes |
 
 ### Three categories of framework, chosen by the question
@@ -93,7 +111,7 @@ can compare and accept.
 - **CI.** CI calls the framework through a CLI or SDK and applies the gate policy (the
   `evaluation-gates-for-production-releases` lesson). The framework reports; the pipeline decides.
 - **Observability.** The stack runs the *same* scorers on sampled production traces, so offline and online
-  numbers share a definition.
+  numbers share a definition. Agent traces from production can be scored with the same trajectory scorers.
 - **Dataset pipeline (the reverse flow).** Failures mined from traces and error analysis become candidate
   items.
 
@@ -108,15 +126,15 @@ can compare and accept.
   format.
 
 ## Diagram
-Raw outputs are stored before scoring, so a scorer change re-scores stored outputs instead of re-running
-the target; the same scorers also run on production traces.
+Raw agent trajectories are stored before scoring, so a scorer change re-scores stored outputs instead of
+re-running the agent; the same scorers also run on production traces.
 
 ```mermaid
 flowchart TD
-    D[("Dataset version, hashed")] --> RN["Runner: pins, cache, retries"]
-    B["Pinned bundle"] --> TG["Target: production entrypoint"]
+    D[("Task dataset version, hashed")] --> RN["Runner: pins, cache, retries"]
+    B["Pinned agent bundle"] --> TG["Target: real agent loop"]
     RN --> TG
-    TG --> RO[("Raw outputs, keyed by generation id")]
+    TG --> RO[("Raw trajectories, by generation id")]
     RO --> SC["Versioned scorers"]
     SC --> RS[("Results store: per-item scores")]
     RS --> CMP["Item diff and slice CIs"]
@@ -187,6 +205,43 @@ def run(dataset_version: str, items: list[Item], target: Target, scorers: list[S
     return {"run_id": run_id, "gen_id": gen_id, "started": time.time(), "rows": rows}
 ```
 
+### Plugging an agent into the same skeleton
+Continues the skeleton above. The target runs the real agent loop and returns its trajectory as JSON; three
+deterministic trajectory scorers read it. `run_agent` and `TOOL_SCHEMAS` are your loop and your tools'
+argument schemas; `validate` is any JSON-schema check.
+
+```python
+def agent_target(inp):                              # the production loop, tools sandboxed or recorded
+    trace = run_agent(inp["task"], max_steps=10)
+    return json.dumps({"final": trace.final_answer, "state": trace.final_state,
+                       "calls": [{"tool": c.name, "args": c.args} for c in trace.tool_calls]})
+
+def final_state_matches() -> Scorer:                # did the task get done?
+    def fn(item, out):
+        t = json.loads(out)
+        ok = all(t["state"].get(k) == v for k, v in item.expected["state"].items())
+        return float(ok), "" if ok else f"state {t['state']}"
+    return Scorer("final_state", "1", fn)
+
+def tool_args_valid() -> Scorer:                    # were the calls well-formed?
+    def fn(item, out):
+        calls = json.loads(out)["calls"]
+        bad = [c["tool"] for c in calls if not validate(c["args"], TOOL_SCHEMAS[c["tool"]])]
+        return float(not bad), f"invalid args for {bad}" if bad else ""
+    return Scorer("tool_args_valid", "1", fn)
+
+def within_steps(limit: int) -> Scorer:             # did it get there efficiently?
+    def fn(item, out):
+        n = len(json.loads(out)["calls"])
+        return float(n <= limit), f"{n} tool calls"
+    return Scorer("within_steps", str(limit), fn)
+
+items = [Item("r1", {"task": "Refund order 1182"}, {"state": {"order_1182": "refunded"}}, "refunds")]
+bundle = {"model": "vendor-model-2025-04-14", "prompt": "support_agent@v14", "tools": "tools@3f9a"}
+report = run("agent-golden-v3@71ab02", items, agent_target,
+             [final_state_matches(), tool_args_valid(), within_steps(6)], bundle)
+```
+
 ### Using it: a judge upgrade re-scores without re-running the app
 Continues the skeleton above with stand-in target and judge functions that count their calls. Swapping the
 rubric version produces a new run id over the same stored outputs.
@@ -213,7 +268,8 @@ print(calls)                                                         # {'target'
 ```
 
 ### Worked scenario: what each change costs on a 1,000-item set
-Call counts follow from the generation id and run id above; they are not a benchmark.
+Call counts follow from the generation id and run id above; they are not a benchmark. For an agent target
+each "target call" is a whole run of several model and tool calls, so the zeros matter even more.
 
 | Change | Generation id | Target calls | Judge calls | Comparable with the old champion run? |
 |---|---|---|---|---|
@@ -226,6 +282,9 @@ Call counts follow from the generation id and run id above; they are not a bench
 - **One scorer library, versioned like code** — when several teams evaluate. Publish scorers as a package
   with explicit versions and record `scorer@version` on every score. Monitor how many teams' runs use an
   out-of-date scorer version.
+- **Trajectory scorers next to outcome scorers** — for every agent. Score final state or answer, tool-call
+  validity, step count and forbidden actions as separate versioned scorers, so a release that "succeeds"
+  through an unsafe tool call still fails a floor. Monitor each scorer's pass rate per slice.
 - **Judge calibration set** — whenever a model-graded scorer gates anything. Keep a few hundred
   human-labeled items, measure judge-to-human agreement on every judge or rubric change, and refuse to
   promote a judge that falls below the agreed level. Monitor agreement over time.
@@ -245,13 +304,16 @@ Call counts follow from the generation id and run id above; they are not a bench
   they fork.
 - **Coverage vs cost and drift.** Model-graded scorers cover free text that deterministic checks cannot, at
   the price of a judge call per item and a second model's drift. Prefer deterministic scorers whenever the
-  output is structured.
+  output is structured, which agent final states and tool calls usually are.
 - **SaaS convenience vs data boundary.** SaaS platforms give datasets, traces and experiments in one place
   with no operations burden, but production traces (customer data) leave your boundary. Self-host or build
   when residency or PII rules apply.
 - **Per-PR feedback vs cache effectiveness.** Running the eval on every PR gives fast feedback, and the
   cache keeps it cheap only while most items are unaffected. A prompt touched by every item invalidates the
   cache, which is why tiered datasets exist.
+- **Outcome scoring vs path scoring.** Scoring only the final state accepts any valid route but misses
+  wasteful or unsafe paths; scoring an exact tool sequence catches them but fails valid alternatives. Most
+  agent teams score outcome plus a few path constraints.
 
 ## Pitfalls
 - **Evaluating a copy of the prompt inside the framework.** Instead of the production code path. Symptom: a
@@ -264,6 +326,8 @@ Call counts follow from the generation id and run id above; they are not a bench
   with different item counts, which the comparison tool should refuse to compare.
 - **Reading a capability benchmark as application quality.** Symptom: the model with the higher public
   score loses on your golden set because your task depends on retrieval and formatting, not trivia.
+- **Storing only the agent's final answer.** Symptom: a failed task where nobody can tell whether the wrong
+  tool, bad arguments or a bad tool result caused it. Fix: the target returns the full trajectory.
 
 ## When to use
 - **Use when** a second person needs to run or read an eval, or the moment an eval gates anything.
@@ -301,6 +365,14 @@ aggregate numbers computed by four different rubrics, or from runs whose judge v
   swappable, caching becomes possible, and every score links back to its trace.
 - **The differentiating assets** are your dataset and scorers, not the runner.
 
+### How would you evaluate a tool-calling agent inside this framework?
+- **Target:** the real agent loop with the production step budget, tools sandboxed or replayed from
+  recordings, returning the full trajectory rather than just the answer.
+- **Scorers:** final-state or answer correctness, tool-argument validity, steps within budget and
+  forbidden-action checks, each versioned; a calibrated judge only where the answer is free text.
+- **Gate** on outcome plus floors for the safety-relevant path checks, and diff trajectories item by item
+  against the champion.
+
 ### Your eval says a change helped, but production complaints rose. How do you debug the framework?
 - **Check the target first:** does the adapter call the production entrypoint, or a copy of the prompt that
   skips retrieval and post-processing?
@@ -308,7 +380,7 @@ aggregate numbers computed by four different rubrics, or from runs whose judge v
 - **Check coverage:** run the same scorers on sampled production traces and compare slices; the failing
   cases may not exist in the dataset.
 
-### When would you not adopt an off-the-shelf eval framework?
+### When would you not adopt an off-the-shelf eval framework for an agent?
 - **When the target does not fit its data model,** such as long multi-turn agents with tool side effects or
   simulated users.
 - **When residency forbids a SaaS store** or scorers must run inside your network.
@@ -355,3 +427,23 @@ aggregate numbers computed by four different rubrics, or from runs whose judge v
 > A model-graded scorer is itself a model; if its snapshot or rubric moves, every candidate and champion
 > shifts together. Pinning the judge version and re-baselining the champion under the same scorer is the
 > defence; a cache would reproduce old scores, not new ones, and an unchanged dataset version rules out new items.
+
+## Use cases & projects
+### Use cases
+- **Comparing agent prompt versions.** The same task set and trajectory scorers run against both versions,
+  and reviewers read the per-task diff.
+- **Model migration for an agent fleet.** Several teams run their agents' golden sets through one
+  framework, so the migration decision rests on comparable numbers.
+- **Scoring production agent traces.** The offline scorers run on sampled live trajectories, so offline and
+  online success share one definition.
+- **Turning incidents into tests.** A bad production trajectory becomes a reviewed dataset item with one
+  action.
+
+### Mini project
+**Trajectory scorers for a small agent (2-3 hours).**
+- **Goal:** evaluate a tool-calling agent on outcome and path, with re-scoring that never re-runs the agent.
+- **Steps:** build the skeleton above; write an agent target that returns its trajectory; create 15 tasks
+  with expected final states; add final-state, tool-args-valid and within-steps scorers; run twice, then
+  change the step limit in `within_steps` and re-run.
+- **Done when:** the report shows per-task scores for all three scorers, the second run with a new scorer
+  version makes zero agent calls, and you can point to one task that succeeded but failed a path check.

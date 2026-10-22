@@ -5,7 +5,7 @@ name: Task completion rate
 kind: metric
 difficulty: core
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agent-reliability/agent-trajectory-evaluation

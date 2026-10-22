@@ -5,7 +5,8 @@ name: VPN
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - deployment/private-endpoints
   - deployment/customer-vpc-on-prem-air-gapped
@@ -21,14 +22,28 @@ sources:
 ---
 
 ## TL;DR
-A VPN joins two private networks, or a device to a network, through an encrypted tunnel over the
-internet, so AI workloads reach on-prem data privately. It is quick and cheap, but it joins
-address spaces, so scope, routing and MTU need design.
+A VPN joins your cloud network to a customer's on-prem network through an encrypted tunnel, so agent
+tools and RAG ingestion reach private systems. It is quick and cheap, but it joins address spaces, so
+scope, routing and MTU need design.
+
+## For agent builders
+- **Why it matters for agents.** A cloud-hosted agent whose tools query a customer's on-prem database,
+  file share or legacy API makes those calls over the tunnel, live, inside the agent loop. Tunnel
+  failover, MTU stalls and slow links become tool timeouts the model sees.
+- **Where it shows up in your stack.** Tool adapter base URLs using internal DNS names, per-tool
+  timeouts and retry policy, RAG ingestion workers doing bulk syncs, and the integration VPC your agent
+  workers run in.
+- **What you control.** Which on-prem hosts and ports the agent's tools may reach (scope the routes to
+  those), timeouts that survive a BGP failover, resumable ingestion, and error messages that tell the
+  model a tool is unavailable rather than inviting a retry loop.
+- **What you can skip.** IKE cryptographic details and BGP path selection. Know the ports, the two
+  tunnels, the MSS clamp and how overlap is solved; network teams do the rest.
 
 ## Why it exists
 - **The data has no public IP.** Your RAG product runs in the cloud; the customer's contracts live in an
   on-prem document store and their ticket history in a database in the same data center. Neither has,
-  nor will ever have, a public IP, yet ingestion workers must reach them on private addresses.
+  nor will ever have, a public IP, yet ingestion workers and agent tools must reach them on private
+  addresses.
 - **Exposing them publicly is rejected.** A database or file share on the internet behind a firewall rule
   fails the first security meeting, rightly: credentials become the only barrier.
 - **Disks or nightly SFTP exports go stale.** They work once, but give you stale data, a manual process
@@ -75,6 +90,8 @@ negotiated by IKEv2. Two phases:
   a tunnel fails, so failover between redundant tunnels is automatic.
 - **Configure both tunnels.** Cloud VPN gateways typically give you two tunnels per connection,
   terminating on different endpoints, precisely so the provider can maintain one without an outage.
+- **What failover means for an agent.** In-flight TCP connections may reset while routes move, so a tool
+  call in progress fails; the adapter must retry safe reads once, and never blindly retry writes.
 
 ### What the packet pays
 - **Overhead.** Each packet gains ESP headers, padding and an authentication tag plus an outer IP header,
@@ -108,19 +125,20 @@ first thing to check, not the last. Three ways out, in rough order of preference
 3. **Re-address one side**, which is correct and almost never quick inside an enterprise.
 
 ### Narrowing the blast radius
-Because a tunnel joins networks, scope it:
+Because a tunnel joins networks, scope it. This matters more for agents, because a model choosing tool
+arguments should never be able to reach a host nobody intended:
 - **Advertise only the specific subnets needed.**
 - **Filter on both ends:** firewall rules or security groups allowing only the required ports to the
   required hosts.
 - **Terminate in a dedicated integration VPC**, not your core production network.
 
 ## Diagram
-Traffic from cloud workers to two on-prem hosts: scoped routes, a clamped MSS and two BGP tunnels are
-the three design points.
+Traffic from cloud agent workers to two on-prem tool backends: scoped routes, a clamped MSS and two BGP
+tunnels are the three design points.
 
 ```mermaid
 flowchart TD
-    W["Ingestion workers"] --> IV["Integration VPC, non-overlapping range"]
+    W["Agent and ingestion workers"] --> IV["Integration VPC, non-overlapping range"]
     IV --> G["Cloud VPN gateway, MSS clamp"]
     G -->|"tunnel 1, BGP"| CG["Customer VPN gateway"]
     G -.->|"tunnel 2, standby"| CG
@@ -131,10 +149,12 @@ flowchart TD
 ```
 
 ## Examples
-### Worked scenario: a legal-tech pilot over site-to-site VPN
-A vendor pilots contract search for a firm whose 2 TB document archive sits on an on-prem file server,
-with case metadata in a SQL Server instance. Plan: a site-to-site VPN from the firm's data center to a
-dedicated "customer-integration" VPC in the vendor's cloud account.
+### Worked scenario: a legal-tech agent pilot over site-to-site VPN
+A vendor pilots a contract-search agent for a firm whose 2 TB document archive sits on an on-prem file
+server, with case metadata in a SQL Server instance. Plan: a site-to-site VPN from the firm's data
+center to a dedicated "customer-integration" VPC in the vendor's cloud account.
+
+Ingestion builds the RAG index over the archive; a `lookup_case` tool queries the database live.
 
 1. **Addressing.** The firm uses 10.0.0.0/8 broadly and the vendor's VPC is 10.20.0.0/16, which overlaps.
    Rather than re-IP anything, the vendor confirms the firm uses nothing in 172.16.0.0/12 and creates the
@@ -146,7 +166,8 @@ dedicated "customer-integration" VPC in the vendor's cloud account.
    measure, not a promise). See the table below.
 4. **The classic failure.** Small metadata queries work, but large file reads stall after a few
    kilobytes. Packet captures show oversized packets dropped with ICMP blocked; enabling MSS clamping on
-   the gateway fixes it.
+   the gateway fixes it. In the agent, this looked like `lookup_case` succeeding and the document tool
+   timing out.
 5. **Redundancy.** Both tunnels are configured, and the vendor tests failover by disabling one during a
    sync and confirming BGP shifts traffic without dropping the job.
 
@@ -181,6 +202,40 @@ for mtu in (1500, 1400):
 - **MSS is the MTU minus 40 bytes** of IPv4 and TCP headers (without options), so a 1,400-byte tunnel
   MTU means clamping MSS to 1,360.
 
+### An on-prem agent tool that survives tunnel failover
+The agent's `lookup_case` tool calls an internal API over the tunnel. It uses the internal hostname, a
+hard deadline, one retry for a read on connection errors (a failover reset), and a clear message to the
+model when the backend is unreachable.
+
+```python
+import time, requests
+
+BASE = "https://cases.firm.internal"       # resolved by the customer's DNS over the tunnel
+TIMEOUT = (3, 10)                          # connect, read seconds; tune from measured RTT
+
+def lookup_case(case_id: str) -> dict:
+    """Read-only tool exposed to the agent. Safe to retry because it has no side effects."""
+    for attempt in (1, 2):
+        try:
+            r = requests.get(f"{BASE}/cases/{case_id}", timeout=TIMEOUT)
+            r.raise_for_status()
+            return {"ok": True, "case": r.json()}
+        except (requests.ConnectionError, requests.Timeout) as e:
+            if attempt == 2:
+                return {"ok": False, "retryable": False,
+                        "error": "case system unreachable over the customer link; "
+                                 "tell the user and do not call this tool again this turn",
+                        "detail": type(e).__name__}
+            time.sleep(2)                  # give BGP time to move routes to the second tunnel
+        except requests.HTTPError as e:
+            return {"ok": False, "retryable": False, "error": f"HTTP {e.response.status_code}"}
+```
+
+- **Why the message is written for the model.** Without it, the agent often re-issues the same call every
+  step until its budget is gone; an explicit "do not call again" ends the loop.
+- **Writes are different.** A tool that updates the case system needs an idempotency key before it may
+  retry, because a reset can arrive after the server committed the write.
+
 ### Remote access with WireGuard
 A minimal client config for an engineer's laptop that routes only the integration range through the
 tunnel. Keys are placeholders; each side holds its own private key.
@@ -199,8 +254,8 @@ PersistentKeepalive = 25
 
 ## Production patterns
 - **Two tunnels, BGP, tested failover.** Configure both provider tunnels with BGP and, before go-live,
-  disable one during a sync to confirm traffic shifts. Monitor tunnel state and BGP session flaps
-  (on AWS Site-to-Site VPN, the CloudWatch `TunnelState` metric per tunnel).
+  disable one during a sync and during a scripted agent run to confirm traffic shifts. Monitor tunnel
+  state and BGP session flaps (on AWS Site-to-Site VPN, the CloudWatch `TunnelState` metric per tunnel).
 - **Clamp MSS on self-managed gateways.** On a Linux gateway, the iptables `TCPMSS` target rewrites
   MSS in SYN packets (rule below). Verify with `ping -M do -s <size> <host>` and watch for
   retransmissions of large segments.
@@ -209,18 +264,21 @@ PersistentKeepalive = 25
   iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
   ```
 - **Host routes and port filters only.** Ask the customer to advertise /32 routes for the hosts you need
-  and allow only those ports from your worker subnet. Review the advertised prefix list in every change.
+  and allow only those ports from your worker subnet. Keep that list equal to the agent's tool backends.
+  Review the advertised prefix list in every change.
 - **Integration VPC per customer.** Terminate each customer tunnel in its own small VPC with a range
-  chosen to avoid theirs, so overlaps never touch production. Keep an address-allocation register.
+  chosen to avoid theirs, so overlaps never touch production, and run that customer's agent workers
+  there. Keep an address-allocation register.
 - **Rate-limited bulk sync.** Schedule large initial syncs off-hours with a bandwidth cap, then switch to
-  incremental deltas. Monitor throughput against plan and the customer's uplink utilisation.
+  incremental deltas, so ingestion does not starve live agent tool calls. Monitor throughput against plan
+  and the customer's uplink utilisation.
 - **DNS across the tunnel.** Forward the customer's internal domain to their resolvers over the tunnel
-  so workers use hostnames, not IPs. Alert when a configured hostname stops resolving.
+  so workers and tools use hostnames, not IPs. Alert when a configured hostname stops resolving.
 
 ## Trade-offs
 - **Quick and cheap vs predictable.** A VPN stands up quickly over existing internet links, but
-  throughput and latency vary with the internet path. Once traffic is large and permanent, a dedicated
-  circuit pays for itself.
+  throughput and latency vary with the internet path, which shows up as variable tool latency in each
+  agent step. Once traffic is large and permanent, a dedicated circuit pays for itself.
 - **Any protocol vs attack surface.** Joining networks enables any protocol in either direction, which
   helps legacy integrations, but widens the attack surface compared with a one-way private endpoint to a
   single service.
@@ -238,24 +296,29 @@ PersistentKeepalive = 25
 - **Overlapping CIDR ranges discovered after the tunnel is up.** Symptom: a healthy tunnel status with
   traffic that never arrives, because each side routes the other's addresses locally.
 - **No MSS clamping or path MTU discovery when ICMP is filtered.** Symptom: small requests succeed while
-  large uploads, file reads or long model responses hang mid-transfer.
+  large uploads, file reads or long model responses hang mid-transfer. In an agent, small tools work and
+  document tools time out.
 - **Configuring only one of the two provided tunnels.** Symptom: an outage during the provider's routine
   maintenance window, often in the middle of the night.
 - **Advertising whole corporate supernets "to keep it simple".** Symptom: the security review finds the
-  vendor network can reach thousands of customer hosts it never needed.
+  vendor network can reach thousands of customer hosts it never needed, and an agent's tool could be
+  steered toward any of them.
 - **Leaving DNS out of the design.** Symptom: IP addresses hard-coded in config because internal
   hostnames do not resolve across the tunnel, which then break when the customer re-IPs a server.
+- **Tool timeouts that are shorter than failover or longer than the agent's patience.** Symptom: every
+  failover fails the task, or one hung call blocks a step for minutes. Fix: a deadline per tool and one
+  retry for idempotent reads.
 
 ## When to use
 - **Use a site-to-site VPN when** cloud workloads need private, bidirectional or multi-protocol access to
   a customer's on-prem systems: databases, file shares, legacy APIs, internal identity providers. It is
-  the default for pilots and moderate steady-state traffic.
+  the default for pilots and moderate steady-state traffic, including agents whose tools live on-prem.
 - **Prefer a private endpoint** when the flow is one-way to a single cloud service, and a dedicated
   circuit when sustained volume or latency guarantees matter.
 - **For people rather than systems**, prefer per-application zero-trust access over a full-network
   client VPN.
-- **Measure:** tunnel uptime, BGP state changes, throughput against the plan, and dropped or fragmented
-  packets.
+- **Measure:** tunnel uptime, BGP state changes, throughput against the plan, dropped or fragmented
+  packets, and tool-call error rate per on-prem backend.
 - **Interviews and design reviews:** mentioning address planning, scope and MTU unprompted signals that
   you have actually operated one.
 
@@ -293,6 +356,14 @@ discovery works. Then retest with a large result set.
   ends and that your subnet route tables point at the gateway.
 - **Then filters:** security groups and the customer's firewall must allow your worker subnet to the
   specific host and port; a capture on each gateway shows where packets stop.
+
+### Your cloud agent's tools call a customer's on-prem systems over a VPN. How do you design the tools so the agent behaves well when the link misbehaves?
+- **Deadlines per tool:** connect and read timeouts sized from measured round trips, so one hung call
+  cannot stall a step.
+- **Retry only what is safe:** one retry for reads after a connection reset (a failover), and idempotency
+  keys before any write is retried.
+- **Talk to the model:** return a structured, non-retryable error that says the system is unreachable, so
+  the agent tells the user instead of looping on the same call.
 
 ### When would you not use a VPN for a customer integration?
 - **One-way calls to one cloud service:** a private endpoint is narrower and does not join address spaces.
@@ -340,3 +411,26 @@ discovery works. Then retest with a large result set.
 > Dedicated circuits trade long lead times and higher fixed cost for consistent bandwidth and latency.
 > VPNs are encrypted, and a circuit does nothing to fix overlapping address ranges, which still require
 > re-addressing or NAT.
+
+## Use cases & projects
+### Use cases
+- **Agents with on-prem tools.** A cloud-hosted support agent queries a customer's ticket database and
+  legacy order API over a scoped site-to-site tunnel during each conversation.
+- **RAG ingestion from private file shares.** Ingestion workers sync a document archive over the tunnel
+  into the vector index, with a rate-limited initial sync and daily deltas.
+- **Agent pilots before a dedicated circuit.** A VPN is up in days, so a pilot can prove value before the
+  customer orders Direct Connect or ExpressRoute.
+- **FDE access for debugging.** An engineer reaches the integration VPC over WireGuard or a client VPN
+  scoped to that range only.
+
+### Mini project
+**Make an agent tool resilient to a flaky link (1-2 hours).**
+- **Goal:** show that an agent with a remote read-only tool ends a turn cleanly when the backend becomes
+  unreachable, instead of looping.
+- **Steps:** run a tiny HTTP service as the "on-prem" backend in a container; wrap it as the
+  `lookup_case` tool above inside a minimal tool-calling loop with a 10-step budget; add `tc netem`
+  delay or stop the container mid-run to simulate failover and outage; log each tool call and the
+  model's next action.
+- **Done when:** a brief outage is absorbed by the single retry, a full outage produces one structured
+  error and a user-facing answer within two steps, and your log table shows no repeated calls to the dead
+  tool.

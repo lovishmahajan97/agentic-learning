@@ -5,7 +5,7 @@ name: TTFT (time to first token)
 kind: metric
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - serving-inference/prefill-vs-decode
@@ -28,7 +28,8 @@ every step, over a transcript that keeps growing, so it dominates how fast a mul
 
 ## For agent builders
 - **Why it matters for agents.** A 10-step agent makes 10 model calls, and each one waits TTFT before
-  emitting a tool call. Tool-call outputs are short, so per-step latency is mostly TTFT, not decode.
+  emitting a tool call. Tool-call outputs are short, so on long transcripts TTFT is often the largest
+  share of per-step model time (less so when the step reasons at length first).
 - **Where it shows up in your stack.** Provider prompt caching and the cached-token fields in usage
   responses, vLLM `--enable-prefix-caching` and `vllm:num_requests_waiting` when self-hosting, and the
   first-content-delta timestamp in your agent traces.
@@ -246,7 +247,7 @@ Queueing adds to every step on top of this, so under load the gap between the tw
   and return a fast 429 with `Retry-After` beyond it. Monitor the engine's waiting-queue length, which
   vLLM exports as `vllm:num_requests_waiting`.
 - **Chunked prefill for mixed traffic.** When long prompts share a replica with live streams, enable
-  chunked prefill (vLLM `--enable-chunked-prefill`, always on in V1) and tune the per-step token
+  chunked prefill (vLLM `--enable-chunked-prefill`, on by default in the V1 engine) and tune the per-step token
   budget (`--max-num-batched-tokens`): smaller protects streams, larger favours TTFT. Monitor p99
   inter-token latency for running streams and TTFT for the longest prompt bucket.
 - **Bucketed TTFT SLOs.** Alert on TTFT p95 per prompt-length bucket (for example under 1k, 1k-8k,
@@ -408,7 +409,8 @@ depth rather than GPU utilisation; and move long-context or batch traffic to a s
 - **Goal:** show how TTFT changes step by step in a 10-step tool-calling loop, with and without a stable
   prefix and trimmed tool results.
 - **Steps:** build a small agent with two fake tools that return large outputs; stream every call and log
-  the time to the first content delta, input tokens and cached input tokens; run it once appending raw
-  tool output and once trimming it before appending.
-- **Done when:** you have a per-step table and chart of TTFT and prompt size for both runs, plus a short
-  note on which change saved the most time.
+  the time to the first content delta, input tokens and cached input tokens; run it three ways: raw tool
+  output appended, tool output trimmed before appending, and trimmed but with a timestamp at the top of
+  the system prompt (which breaks prefix reuse).
+- **Done when:** you have a per-step table and chart of TTFT, prompt size and cached tokens for all three
+  runs, plus a short note on which change saved the most time.

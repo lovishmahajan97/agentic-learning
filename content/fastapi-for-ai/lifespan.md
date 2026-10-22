@@ -5,7 +5,7 @@ name: Lifespan (load model / client once)
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - fastapi-for-ai/asgi-lifecycle

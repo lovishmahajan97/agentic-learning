@@ -5,7 +5,7 @@ name: Parent-document retrieval
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - rag-retrieval/chunking-strategies
@@ -29,7 +29,7 @@ second tool to read the section.
 ## For agent builders
 - **Why it matters for agents.** "Right passage, wrong details" is a common agent failure: the tool
   returned the sentence but not the table header, plan name or caveat. Parents fix that, but every
-  parent costs ~1,200 tokens that stay in the transcript for the rest of the run.
+  parent (~1,200 tokens in the manual below) stays in the transcript for the rest of the run.
 - **Where it shows up in your stack.** LangChain's `ParentDocumentRetriever`, LlamaIndex's sentence-window
   and auto-merging retrievers, a vector store for children plus a key-value or document store for
   parents, and the tool schemas your agent sees.
@@ -218,7 +218,8 @@ Illustrative, using the manual above with a 6,000-token evidence budget:
 | Whole document as parent | ~25k-token manual | 0 | overflow |
 
 ### Agent scenario: snippets first, sections on demand
-Two tools over the same two stores; `index`, `embed` and `parents` are as in the ingestion example.
+Two tools over the same two stores; `index`, `embed` and `parents` are as in the ingestion example, with
+one addition: `ingest` also stores `"heading": heading` in each child's `meta`, so snippets can show it.
 
 ```python
 TOOLS = [

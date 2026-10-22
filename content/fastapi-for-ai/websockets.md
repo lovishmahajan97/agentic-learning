@@ -5,7 +5,7 @@ name: WebSockets
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - fastapi-for-ai/server-sent-events
@@ -190,9 +190,15 @@ async def run_agent(ws: WebSocket, prompt: str, stop: asyncio.Event, approvals: 
     fut = asyncio.get_running_loop().create_future()
     approvals["refund-1"] = fut
     await ws.send_json({"type": "approval_needed", "id": "refund-1", "tool": "issue_refund"})
-    if not await asyncio.wait_for(fut, timeout=120):  # denied: tell the model, do not run the tool
-        await ws.send_json({"type": "done", "note": "refund denied"}); return
-    # 2) tool ran; stream the answer, checking stop between tokens
+    try:
+        approved = await asyncio.wait_for(fut, timeout=120)
+    except asyncio.TimeoutError:
+        approved = False                              # no answer in time counts as a deny
+    finally:
+        approvals.pop("refund-1", None)               # a late approve must not hit a dead future
+    if not approved or stop.is_set():                 # denied or stopped: do not run the tool
+        await ws.send_json({"type": "done", "note": "refund not issued"}); return
+    # 2) run the tool here (idempotency key = run id), then stream, checking stop between tokens
     async for piece in model_stream(prompt):
         if stop.is_set():
             await ws.send_json({"type": "stopped"}); return
@@ -210,7 +216,8 @@ async def agent(ws: WebSocket, token: str):          # ?token=... (short-lived);
             msg = await ws.receive_json()
             if msg["type"] == "prompt":
                 if task and not task.done():
-                    stop.set(); await task             # finish the old run cleanly first
+                    stop.set(); task.cancel()          # end the old run, even mid-approval
+                    await asyncio.gather(task, return_exceptions=True)
                 stop = asyncio.Event()
                 task = asyncio.create_task(run_agent(ws, msg["text"], stop, approvals))
             elif msg["type"] in ("approve", "deny") and msg["id"] in approvals:

@@ -5,7 +5,7 @@ name: Pairwise comparison
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - evals/llm-as-a-judge
@@ -251,8 +251,11 @@ the pairwise judge sees only tasks both versions solved. Numbers are illustrativ
 | Preference on the 210 both-succeeded | new 98, production 82, ties 30 → (98 + 15) / 210 ≈ 0.54 | SE ≈ √(0.54 × 0.46 / 210) ≈ 0.034, so roughly 47–61%: no clear reply-quality win |
 | Mean tool calls per solved task | new 6.1 vs production 4.3 | check whether the judge's wins sit in the longer runs |
 
-- **Decision:** the outcome gain is the real signal; the reply preference is a tie. Confirm the 18
-  production-only tasks are not a safety-relevant category before shipping.
+- **The outcome gain is suggestive, not yet decisive.** A paired (McNemar) test on the 30 vs 18
+  discordant tasks gives z = 12 / √48 ≈ 1.7, p ≈ 0.08, so add tasks or re-run before calling it.
+- **The reply preference is a tie.** Its interval includes 50%, so it neither helps nor blocks.
+- **Before shipping,** read the 48 discordant traces and confirm the 18 production-only tasks are not
+  a safety-relevant category.
 
 ## Production patterns
 - **Anchor every candidate to the production agent.** Keep a frozen task set with production runs, and
@@ -309,9 +312,8 @@ the pairwise judge sees only tasks both versions solved. Numbers are illustrativ
 
 ## When to use
 - **Use when** comparing variants of one agent or system (prompt A vs B, a model upgrade, a new tool
-  set, a fine-tune), collecting
-  preference data for training, or whenever humans judge subjective quality where an absolute scale would
-  not hold.
+  set, a fine-tune), collecting preference data for training, or whenever humans judge subjective
+  quality where an absolute scale would not hold.
 - **Avoid** using it alone for release gating, or for tasks with an executable check.
 - **Measure** win rate with a bootstrap interval, position-consistency rate, per-category win rates and
   the length difference between arms.
@@ -423,8 +425,9 @@ checked. If intervals overlap, buy more comparisons or move to an online A/B tes
 ### Mini project
 **Pairwise eval of two planner prompts (1-3 hours).**
 - **Goal:** decide whether a new planner prompt beats the current one on a small tool-calling agent.
-- **Steps:** run both agent versions on the same 50-100 tasks; apply outcome checks first and count a
-  run that fails them as a loss; judge the remaining pairs in both orders with ties allowed; compute the
-  win rate and a bootstrap interval; record how often the two orders disagreed.
-- **Done when:** you have a win rate with its interval, the order-disagreement rate, a ship or no-ship
-  call, and three example pairs explaining the verdict.
+- **Steps:** run both agent versions on the same 50-100 tasks from a fresh state; check task success
+  in code and count the discordant tasks (only one version succeeded); judge the both-succeeded pairs
+  in both orders with ties allowed; compute the win rate and a bootstrap interval; record how often the
+  two orders disagreed.
+- **Done when:** you have the paired success difference, a win rate with its interval, the
+  order-disagreement rate, a ship or no-ship call, and three example pairs explaining the verdict.

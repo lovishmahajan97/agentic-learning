@@ -5,7 +5,7 @@ name: PEFT (LoRA, QLoRA)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - training-adaptation/supervised-fine-tuning
@@ -334,7 +334,8 @@ deployment. Rollback for a tenant is swapping an ~85 MB directory.
   silently updated base produces a quietly different model.
 - **Forgetting `prepare_model_for_kbit_training` or input-gradient hooks with gradient checkpointing on
   a frozen base.** Symptom: "element 0 of tensors does not require grad", or an adapter whose loss never
-  changes.
+  changes. Fix: call `prepare_model_for_kbit_training` (or `model.enable_input_require_grads()` for a
+  bf16 base) before `get_peft_model`.
 
 ## When to use
 - **Try prompting first:** a frontier model with good tool descriptions and few-shot examples usually
@@ -458,8 +459,9 @@ trained against the quantized base.
 ### Mini project
 **LoRA a small model to call your tools (2-3 hours).**
 - **Goal:** raise schema-valid tool-call rate of a small open instruct model on a fixed agent task set.
-- **Steps:** write 3 tool schemas and 50 held-out tasks; collect or write a few hundred successful
-  trajectories rendered with the model's chat template; train a QLoRA adapter with assistant-only loss;
-  score base and adapter on tool-name accuracy, schema-valid arguments and task success.
+- **Steps:** write 3 tool schemas and 50 held-out tasks; generate a few hundred trajectories with a
+  stronger model and keep only the schema-valid, successful ones; render them with the small model's chat
+  template; train a QLoRA adapter (a 0.5B-1.5B model trains in minutes) with assistant-only loss; score
+  base and adapter on tool-name accuracy, schema-valid arguments and task success.
 - **Done when:** you have a before/after table for the 50 tasks, the adapter directory with the pinned
   base revision recorded next to it, and a note on the rank and learning rate you chose and why.

@@ -5,7 +5,8 @@ name: Hypercare
 kind: practice
 difficulty: core
 est_minutes: 13
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - deployment/runbooks
   - deployment/deployment-readiness-reviews
@@ -18,9 +19,21 @@ related:
 ---
 
 ## TL;DR
-Hypercare is a time-boxed period after go-live where the delivery team gives elevated support: closer
-monitoring, daily triage, faster fixes and named contacts. Real users always find what UAT missed, and it
-ends on written exit criteria and a handoff, not reassignment.
+Hypercare is a time-boxed period after your agent goes live where the delivery team gives elevated
+support: closer monitoring, daily trace review and triage, faster fixes, named contacts. Real users find
+what UAT missed; it ends on written exit criteria.
+
+## For agent builders
+- **Why it matters for agents.** Production is the first time your agent meets the full spread of user
+  phrasing, documents and tool responses. Its failures (wrong tool, a loop, a confident answer from
+  missing content) are found fastest by reading real runs in the first weeks.
+- **Where it shows up in your stack.** A daily sample of agent traces, dashboards for task completion,
+  steps per task, tool errors, approval rejections and handoffs to humans, one intake queue with a cause
+  field, and a regression suite that every fix must pass.
+- **What you control.** Which signals you watch, how traces are sampled, how fixes are batched and gated,
+  the change freeze, and the exit criteria that end your team's involvement.
+- **What you can skip.** Building new features. Hypercare is for fixing what real traffic exposes, and
+  anything else waits until it ends.
 
 ## Why it exists
 - **Production is the full distribution; UAT only sampled it.** Every user, document type, odd workflow
@@ -33,7 +46,7 @@ ends on written exit criteria and a handoff, not reassignment.
   usage never recovers even after the bugs are fixed.
 - **"Go-live is the finish line" fails.** Standard support is tuned for a stable system with known issues:
   it cannot tell a prompt regression from a user-training gap and has no route to change the prompt,
-  retrieval or model.
+  retrieval, tools or model.
 - **Open-ended hypercare fails the other way:** the delivery team quietly becomes the customer's permanent
   operations team. Hypercare bridges the two: concentrated expertise for a bounded time, with a defined
   exit.
@@ -54,8 +67,12 @@ ends on written exit criteria and a handoff, not reassignment.
   pages.
 - **Watch AI signals that rarely page anyone:** user feedback rates, escalation-to-human rate, guardrail
   blocks, retrieval misses ("no relevant documents found"), cost per task.
-- **Read a daily sample of real conversations.** It is the fastest way to learn where the system fails,
-  because metrics show that something changed while transcripts show why.
+- **Add agent signals:** task completion rate, steps per task, step-budget hits, tool-call error rate, and
+  how often humans reject an action the agent asked approval for. A rising rejection rate is an early sign
+  the agent proposes wrong actions.
+- **Read a daily sample of real conversations and traces.** It is the fastest way to learn where the agent
+  fails, because metrics show that something changed while traces show why: which tool, which argument,
+  which retrieved document.
 
 ### A daily triage loop
 Every issue, ticket and piece of negative feedback is classified by cause, which decides the owner and the
@@ -63,10 +80,10 @@ fix. A short daily review with the customer keeps both sides on the same list.
 
 | Cause | Meaning | Owner and fix |
 |---|---|---|
-| **Defect** | System bug, integration failure | Engineers |
-| **Quality** | Retrieval or model produced a poor answer | Prompt or retrieval tuning |
+| **Defect** | System bug, integration or tool failure | Engineers |
+| **Quality** | Retrieval, tool choice or model produced a poor result | Prompt, tool-description or retrieval tuning |
 | **Knowledge gap** | The answer is not in the indexed content | Customer's content owners |
-| **Training** | User misunderstood what the system does | Enablement |
+| **Training** | User misunderstood what the agent does | Enablement |
 | **Change request** | New scope | Sponsor |
 
 ### Fast but safe fixes
@@ -74,9 +91,9 @@ fix. A short daily review with the customer keeps both sides on the same list.
   failure becomes a new regression case, because a prompt change fixing today's complaint can quietly
   break a case UAT already accepted.
 - **Same rollout criteria, shorter stages**, not around them.
-- **Freeze everything else.** A model upgrade, a new feature, or an index rebuild for another team waits
-  until hypercare ends, because feedback signals are already noisy and two changes in one week make it
-  impossible to say which moved the thumbs-down rate.
+- **Freeze everything else.** A model upgrade, a new feature or tool, or an index rebuild for another team
+  waits until hypercare ends, because feedback signals are already noisy and two changes in one week make
+  it impossible to say which moved the thumbs-down rate.
 - **Batch fixes into one or two predictable releases a week**, each with a written note of what changed,
   so every movement in the metrics stays attributable.
 
@@ -97,7 +114,7 @@ focus rather than letting it drift.
 
 ```mermaid
 flowchart TD
-    G["Go-live"] --> M["Monitor metrics and read transcripts"]
+    G["Agent go-live"] --> M["Monitor metrics and read traces"]
     M --> T{"Daily triage by cause"}
     T -->|"defect or quality"| F["Fix, pass regression suite"]
     T -->|"knowledge gap"| K["Customer content owner"]
@@ -113,8 +130,9 @@ flowchart TD
 ```
 
 ## Examples
-### Worked scenario: an HR policy assistant
-An HR policy assistant for a 4,000-employee company, three weeks of planned hypercare.
+### Worked scenario: an HR policy agent
+An HR policy agent for a 4,000-employee company, with retrieval over policy documents and a tool to open
+HR cases. Three weeks of planned hypercare.
 
 Exit criteria agreed at the readiness review: zero open sev-1/sev-2, weekly actionable issues below 10
 for two consecutive weeks, thumbs-down rate at or below the 6% observed in UAT, and the customer's
@@ -170,14 +188,43 @@ print(exit_check(weeks))
 # ['issues below 10 for two consecutive weeks', 'desk resolution below 80%']
 ```
 
+### Daily trace sample, biased toward failures
+A uniform sample of agent runs is mostly successes. This picks the morning's reading list by
+over-sampling runs that already look wrong, while keeping some normal runs to catch silent failures.
+
+```python
+import random
+
+def daily_sample(runs, n=40, seed=None):
+    rng = random.Random(seed)
+    flagged = [r for r in runs if r["thumbs_down"] or r["hit_step_limit"]
+               or r["tool_errors"] > 0 or r["approval_rejected"]]
+    normal = [r for r in runs if r not in flagged]
+    k_flag = min(len(flagged), n // 2)                 # up to half the sample from flagged runs
+    picked = rng.sample(flagged, k_flag) + rng.sample(normal, min(len(normal), n - k_flag))
+    return [r["trace_id"] for r in picked]
+```
+
+| Agent signal, week 1 | Value | What the trace reading found |
+|---|---|---|
+| Step-budget hits | 3% of runs | The agent re-searched with near-identical queries when no policy matched (often a knowledge gap) |
+| Approval rejections on `open_hr_case` | 18% of proposals | Cases opened for questions the policy already answered; fixed in the tool description |
+| Tool-call errors | 1% | SSO timeouts in one region (the defect above) |
+
+These week-1 agent signal values are illustrative; the point is that each number led to a trace, and each
+trace to a cause and an owner.
+
 ## Production patterns
 - **Single intake channel with a cause field.** Route every report (tickets, chat, feedback buttons) into
   one tracker queue whose required fields include cause and severity. Monitor issues per 100 active users
   by cause each day.
-- **Daily transcript sampling.** Pull a fixed random sample of real conversations each morning, under the
-  data-access rules agreed in the readiness review, and have one person read them before triage. Monitor
-  new failure patterns found per day; when it reaches zero for several days, sampling can drop in
-  frequency.
+- **Daily trace sampling.** Pull a fixed sample of real agent runs each morning, over-weighting flagged
+  runs, under the data-access rules agreed in the readiness review, and have one person read them before
+  triage. Monitor new failure patterns found per day; when it reaches zero for several days, sampling can
+  drop in frequency.
+- **Agent signal board.** Track task completion, steps per task, step-budget hits, tool errors, approval
+  rejections and human handoffs daily, each linked to example traces. Monitor day-over-day change after
+  each fix release.
 - **Change freeze with a fix train.** Only hypercare fixes ship, batched into one or two scheduled releases
   a week, each passing the regression suite and a shortened rollout with a written change note. Monitor
   metric shifts against release notes so every movement is attributable.
@@ -197,8 +244,8 @@ print(exit_check(weeks))
   staff on request.
 - **Cadence vs regression risk.** A faster release cadence fixes real pain quickly but raises regression
   risk; it is safe only when every change passes the regression suite and a shortened rollout.
-- **Insight vs privacy cost.** Reading many real transcripts finds failure patterns early, but costs time
-  and needs privacy approval; agree data-access rules during the readiness review, not during an incident.
+- **Insight vs privacy cost.** Reading many real traces finds failure patterns early, but costs time and
+  needs privacy approval; agree data-access rules during the readiness review, not during an incident.
 
 ## Pitfalls
 - **No exit criteria.** Symptom: the delivery team still answers the customer's tickets months after
@@ -210,16 +257,19 @@ print(exit_check(weeks))
 - **Measuring only incidents and uptime.** Symptom: a quiet incident queue alongside falling usage,
   because unhappy users silently returned to the old process. Fix: normalise by active users and track
   retention.
+- **Reading only final answers.** Symptom: "the answer looks fine" while the agent took 14 steps, called a
+  write tool it did not need, or had its proposals rejected by approvers. Fix: read traces and watch agent
+  signals.
 - **Doing the support work instead of transferring it.** Symptom: a customer service desk that escalates
   every ticket on the first day after handoff. Fix: the desk leads tickets before exit.
 
 ## When to use
-- **Use when:** real users meet a new AI system, the customer's own team will eventually operate it, or
+- **Use when:** real users meet a new agent, the customer's own team will eventually operate it, or
   adoption matters commercially.
 - **Size by risk and scale:** a small internal pilot may need a few days of close attention; an enterprise
-  rollout to thousands of users needs weeks with dedicated staff.
+  rollout to thousands of users, or an agent with write tools, needs weeks with dedicated staff.
 - **Track:** issue volume by cause, user feedback, usage and retention, quality on real traffic versus the
-  UAT baseline, and the share of tickets the customer resolves alone.
+  UAT baseline, agent signals, and the share of tickets the customer resolves alone.
 - **Interviews:** strong answers describe hypercare as bounded, criteria-driven and aimed at transferring
   ownership, with AI-specific feedback classification.
 
@@ -247,13 +297,19 @@ incident counts alone would hide the real failure.
 - **Definition:** a bounded period of elevated support after go-live, with closer monitoring, daily triage,
   faster fixes and named contacts, ending on written exit criteria.
 - **Why not standard support:** it is tuned for stable systems, cannot tell a prompt regression from a
-  training gap, and cannot change the prompt, retrieval or model.
+  training gap, and cannot change the prompt, retrieval, tools or model.
 
-### Issue volume halved in week two. How do you know the system actually improved?
+### Issue volume halved in week two. How do you know the agent actually improved?
 - **Normalise by active users:** volume also falls when people stop using the system, so compute issues
   per 100 active users and read it next to usage retention.
 - **Example:** 41 issues for 1,900 users (about 2.2 per 100) falling to 9 for 2,900 users (about 0.3) while
   usage grows is real improvement.
+
+### What would you watch during hypercare for an agent that can take actions?
+- **Agent signals beyond feedback:** task completion, steps per task, step-budget hits, tool-call errors,
+  approval rejection rate and handoffs to humans, each linked to example traces.
+- **A daily trace sample biased to flagged runs:** rejected proposals and step-limit runs show wrong
+  actions and loops before users complain about them.
 
 ### A customer complaint arrives daily about answers on a topic. How do you triage it?
 - **Classify by cause first:** is the content indexed (knowledge gap), retrieved but answered badly
@@ -298,3 +354,24 @@ incident counts alone would hide the real failure.
 - [ ] Because hypercare fixes are deployed to all users at once
 > AI behaviour changes are global: a prompt edit affects every query. The regression suite, extended with
 > each real failure, is what keeps a fast fix cadence from trading one problem for another.
+
+## Use cases & projects
+### Use cases
+- **First weeks of a customer-facing support or HR agent.** Daily trace review and cause triage turn real
+  failures into fixes and regression cases while adoption is still forming.
+- **Agents with approval-gated write tools.** Approval rejection rate during hypercare shows whether the
+  agent proposes the right actions before approvals are relaxed.
+- **Handing an agent to a customer's service desk.** Shadow-then-lead transfer and an unaided-resolution
+  threshold decide when the vendor steps back.
+- **Model or prompt fixes under a freeze.** A weekly fix train keeps every change attributable while
+  signals are noisy.
+
+### Mini project
+**Run a simulated hypercare week for an agent (2-3 hours).**
+- **Goal:** turn a day's worth of agent runs into a triage list, fixes and an exit decision.
+- **Steps:** generate or log 300 runs from a toy RAG agent with a write tool, including thumbs-down,
+  step-limit hits and rejected approvals; build the biased daily sample of 40; read and label each by
+  cause; add every quality failure to a regression file; compute issues per 100 users and the exit check
+  for three simulated weeks.
+- **Done when:** you have a cause breakdown with an owner per cause, at least five new regression cases,
+  and an exit check that names exactly which criteria are unmet and the single focus for an extension.

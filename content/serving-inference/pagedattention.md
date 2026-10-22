@@ -5,7 +5,7 @@ name: PagedAttention
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - model-internals/kv-cache
@@ -22,8 +22,8 @@ sources:
 
 ## TL;DR
 Agent transcripts grow unpredictably, step by step. PagedAttention stores each request's KV cache in
-fixed-size blocks (usually 16 tokens), allocated on demand and shareable, so a self-hosted engine runs
-many more concurrent agents per GPU.
+fixed-size blocks (usually 16 tokens), allocated on demand and shareable. Decode is memory-bound, so
+the recovered memory becomes more concurrent agents per GPU.
 
 ## For agent builders
 - **Why it matters for agents.** You never know how long an agent run will get: a 3-step lookup and a
@@ -55,7 +55,7 @@ many more concurrent agents per GPU.
 
 ## How it works
 ### Why agent traffic is the worst case for contiguous allocation
-- **Length variance is extreme.** One agent answers in 2 steps at 7k tokens; another loops 20 times to
+- **Length variance is extreme.** One agent answers in 2 steps at 7.5k tokens; another loops 20 times to
   34.5k tokens. A contiguous allocator must reserve the route's maximum for both.
 - **Growth happens between calls.** Each step appends a tool call and its result, then the engine
   decodes again, so the cache grows in bursts the engine cannot predict at admission.
@@ -132,7 +132,7 @@ many more concurrent agents per GPU.
 | Larger | fewer table entries, better coalescing | more waste in the last block, coarser prefix sharing (only complete blocks are shared) |
 | Smaller | less tail waste, finer sharing | more table entries, worse coalescing |
 
-Sixteen tokens is the common compromise.
+Sixteen tokens is the common compromise; deviate only after measuring with your own length distribution.
 
 ## Diagram
 Each agent step is a request whose logical blocks map through its block table to scattered physical
@@ -246,8 +246,7 @@ print(a.table, b.table, "free:", len(pool.free))   # [7, 6, 4] [7, 6, 5] free: 4
 ### Worked scenario: how many research agents fit on one GPU
 Same 8B GQA model and pool as above (27,648 blocks ≈ 442,000 tokens).
 
-Each agent starts with a 6k-token
-prefix (system prompt plus tool schemas) and appends ~1.5k tokens per step, up to 20 steps (34.5k
+Each agent starts with a 6k-token prefix (system prompt plus tool schemas) and appends ~1.5k tokens per step after the first, up to 20 steps (34.5k
 tokens, about 4.2 GB of KV). Agents are spread evenly across steps 1 to 20, so the average context is
 about 20,250 tokens.
 

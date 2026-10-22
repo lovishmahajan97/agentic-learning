@@ -5,7 +5,7 @@ name: StreamingResponse
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - fastapi-for-ai/server-sent-events

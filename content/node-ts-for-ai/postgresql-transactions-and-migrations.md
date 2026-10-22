@@ -91,9 +91,10 @@ most inserts, not for read-modify-write on a shared row such as a budget counter
 | REPEATABLE READ | one snapshot per transaction; updating a row changed after the snapshot aborts with `40001` | preventing lost updates (not write skew) |
 | SERIALIZABLE | database detects anomalies and aborts one transaction with SQLSTATE `40001` | invariants spanning several rows |
 
-- **Why the predicate update is safe at READ COMMITTED.** `UPDATE budgets SET remaining = remaining - $1 WHERE tenant = $2 AND
-  remaining >= $1`: when two hit the same row, the second blocks on the row lock until the first
-  commits, then re-evaluates its `WHERE` against the newly committed row version.
+- **Why the predicate update is safe at READ COMMITTED.**
+  `UPDATE budgets SET remaining = remaining - $1 WHERE tenant = $2 AND remaining >= $1`: when two hit
+  the same row, the second blocks on the row lock until the first commits, then re-evaluates its `WHERE`
+  against the newly committed row version.
 - **Worked through.** With 1,200 remaining and two charges of 1,000, the first leaves 200; the second
   re-checks `200 >= 1000`, matches zero rows, and the caller sees "exhausted".
 - **The buggy version has no re-check.** A `SELECT`, a JavaScript check and an
@@ -248,7 +249,7 @@ call returned but before its transaction committed; the queue redelivers the job
 | Crash during step 4 writes | tool result saved, budget not charged, next step not enqueued | step 4 transaction rolls back as a whole |
 | Redelivered job starts | replays from step 1, re-runs tools 1-3 | reads the last committed step (3) and resumes at 4 |
 | Steps 1-3 written again | duplicate rows, budget charged twice for them | `ON CONFLICT DO NOTHING` returns "duplicate", no charge |
-| Final state | 9 step rows, budget wrong, run stuck | 6 step rows, budget charged once per step |
+| Final state | 10 step rows (steps 1-4 twice), budget wrong | 6 step rows, budget charged once per step |
 
 - **The cost of resume.** Step 4's model call is paid twice (once before the crash, once after), because
   the transaction deliberately excludes the model call; that is the price of not holding a connection

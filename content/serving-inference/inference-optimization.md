@@ -5,7 +5,7 @@ name: Inference optimization
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - serving-inference/prefill-vs-decode
@@ -23,17 +23,18 @@ sources:
 ---
 
 ## TL;DR
-Levers that make each agent step cheaper or faster on a fixed model. Decode is bandwidth bound, prefill
-compute bound, and agent traffic (long transcripts, short tool calls) leans on prefill: the bound you hit
-decides which lever helps.
+Levers that make each agent step cheaper or faster on a fixed model. Decode is bandwidth bound (each
+token re-reads weights and cache), prefill compute bound, and agent traffic leans on prefill: the bound
+you hit decides which lever helps.
 
 ## For agent builders
 - **Why it matters for agents.** An agent multiplies every per-call cost by its step count. A 10-step
-  task with long prompts and 150-token tool calls spends most of its GPU time on prefill, so prefix
-  caching and prompt discipline usually beat any decode trick.
+  task with long transcripts and 150-token tool calls can spend over half its GPU time re-prefilling the
+  same history (worked example below), so prefix caching and prompt discipline come before decode tricks.
 - **Where it shows up in your stack.** Provider prompt caching and smaller-model tiers for hosted APIs;
-  vLLM or SGLang flags (`--enable-chunked-prefill`, `--kv-cache-dtype fp8`, `--quantization`) and
-  speculative decoding for self-hosted models; structured-output or tool-call constraints in both.
+  vLLM flags (`--enable-chunked-prefill`, `--kv-cache-dtype fp8`, `--quantization`) or their SGLang
+  equivalents, plus speculative decoding, for self-hosted models; structured-output or tool-call
+  constraints in both.
 - **What you control.** Fewer steps per task, shorter and stable prompts, per-step `max_tokens`, routing
   easy steps (classify, summarize a tool result) to a small model, and one-flag-at-a-time changes gated
   by your agent eval.

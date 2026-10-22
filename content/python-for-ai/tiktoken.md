@@ -5,7 +5,7 @@ name: tiktoken
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - model-internals/tokenization

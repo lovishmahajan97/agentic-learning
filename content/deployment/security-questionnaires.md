@@ -5,7 +5,8 @@ name: Security questionnaires
 kind: practice
 difficulty: intro
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: background
 related:
   - deployment/security-and-architecture-reviews
   - deployment/compliance-constraints
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-A security questionnaire is the buyer's written audit of a vendor: hundreds of questions on encryption,
-access, incidents, subprocessors and AI data use. Answers become contract commitments, so answer from
-one maintained source of truth, precisely and never aspirationally.
+A security questionnaire is the buyer's written audit before they let your agent near their data: what
+it retains, which model providers see prompts, what its tools can do. Answers become contract
+commitments, so they must match how the agent really works.
+
+## For agent builders
+- **Why it matters for agents.** Agent deals stall on questions only the builder can answer: does the
+  agent retain prompts in traces, which model subprocessors see data, can it take actions, what stops
+  prompt injection from exfiltrating data. Your design choices become those answers.
+- **Where it shows up in your stack.** Trace and log retention settings, the model routing and fallback
+  config, each tool's permission scope, the approval gate on consequential actions, and how embeddings,
+  caches and memory are deleted on request.
+- **What you control.** Building the agent so the answers are good ones (a no-retention model path,
+  region-pinned routing, least-privilege tools), and flagging every change that alters a published
+  answer.
+- **What you can skip.** Scoring methodology and SIG versus CAIQ details. Know that answers are scored,
+  become findings, and are often incorporated into the contract.
 
 ## Why it exists
 - **Buyers cannot inspect every vendor.** A large company may have thousands of vendors, each a possible
@@ -44,7 +58,7 @@ one maintained source of truth, precisely and never aspirationally.
   buyer's risk model, and should be maintained like one.
 
 ## How it works
-### What arrives
+### Background: what arrives and how the buyer reviews it
 - **Format.** Typically a spreadsheet or a portal from a third-party risk platform, with
   yes/no/not-applicable columns, a free-text comment and an evidence-upload field per question.
 - **Domains:** governance and policies, access control and identity, encryption in transit and at rest,
@@ -52,8 +66,7 @@ one maintained source of truth, precisely and never aspirationally.
   monitoring, incident response and notification, business continuity, data retention and deletion,
   privacy, subprocessors, secure development, and increasingly an AI section.
 
-### What happens on the buyer's side
-Understanding the reviewer's workflow explains what they reward:
+The buyer's workflow explains what they reward:
 1. **Inherent-risk tiering.** Before sending anything, the risk team classifies the engagement by what
    you will touch: data sensitivity, volume, network or system access, and how critical you are to
    operations.
@@ -87,6 +100,22 @@ Buyers accept independent assurance in place of many answers:
 
 Sending the report early, under NDA, often removes a large share of the questionnaire.
 
+### The AI and agent section
+- **Expect questions on:** training use of customer data (yours and every model provider's), prompt and
+  output retention by each subprocessor, region of processing, model provenance and evaluation, human
+  oversight, guardrails against prompt injection and data leakage, tool permissions for agents, and how
+  customers can delete their data including embeddings and caches.
+- **Answer per data flow**, because the honest answer often differs between the hosted-API path and a
+  self-hosted model path.
+
+| Agent question | Where the true answer lives |
+|---|---|
+| Can the agent take actions in our systems? | the tool registry: which tools write, and their scopes |
+| Is there human approval before consequential actions? | the approval-gate config per tool |
+| Where are prompts and tool results stored, and for how long? | trace exporter, log retention, memory store TTLs |
+| How do you prevent prompt-injected exfiltration? | egress limits, tool allowlists, output filters, eval results |
+| Can we delete our data, including embeddings and memory? | the deletion job across vector store, caches, checkpoints |
+
 ### The answer library
 - **One library of approved answers**, each tied to the underlying control, an owner (security,
   infrastructure, legal, ML), the evidence that proves it and a review date.
@@ -103,17 +132,9 @@ Sending the report early, under NDA, often removes a large share of the question
   dated roadmap item; reviewers deal with gaps constantly, but discovered misstatements destroy trust.
 - **"Not applicable" only with a one-line reason.**
 
-### The AI section
-- **Expect questions on:** training use of customer data (yours and every model provider's), prompt and
-  output retention by each subprocessor, region of processing, model provenance and evaluation, human
-  oversight, guardrails against prompt injection and data leakage, tool permissions for agents, and how
-  customers can delete their data including embeddings and caches.
-- **Answer per data flow**, because the honest answer often differs between the hosted-API path and a
-  self-hosted model path.
-
 ## Diagram
-A questionnaire flows from the buyer's tiering through your answer library, where every draft passes
-an accountable owner before it becomes a commitment.
+A questionnaire flows from the buyer's tiering through your answer library, where every draft (often
+from a RAG drafting agent) passes an accountable owner before it becomes a commitment.
 
 ```mermaid
 flowchart TD
@@ -140,7 +161,8 @@ flowchart TD
 | "Do you retain prompts and responses?" | "No." | "Yes, for 30 days for debugging, access-restricted, deletable on request." | engineers found traces with full prompts kept for 30 days in the observability tool, which nobody had listed |
 
 - **The third answer surfaced a real gap** before an audit did; the observability vendor was added to
-  the subprocessor list.
+  the subprocessor list. Agent traces are the usual culprit, because they capture every prompt, tool
+  argument and tool result.
 - **Overall**, the SOC 2 report removed about a third of the questions as covered (an illustrative
   proportion), and the remaining answers were drafted from the library and approved by owners within the
   week.
@@ -180,13 +202,40 @@ print("needs review before reuse:", stale())
 # needs review before reuse: ['ENC-03']
 ```
 
+### A drafting agent that knows when not to answer
+Wrap the library in an agent step that drafts only from approved, fresh entries above a match threshold,
+and otherwise hands the question to the owner with no draft. It reuses `best_match` and `stale` above.
+
+```python
+MIN_SCORE = 0.3          # illustrative; tune on past questionnaires
+
+def draft(question, llm):
+    entry, score = best_match(question)
+    if score < MIN_SCORE:
+        return {"status": "needs_owner", "reason": "no library match", "draft": None}
+    if entry["id"] in stale():
+        return {"status": "needs_owner", "owner": entry["owner"],
+                "reason": f"{entry['id']} past review date", "draft": None}
+    text = llm(f"Rewrite this approved answer to fit the question. Do not add claims.\n"
+               f"Question: {question}\nApproved answer id: {entry['id']}\n"
+               f"Evidence: {entry['evidence']}")
+    return {"status": "awaiting_approval", "owner": entry["owner"],
+            "source": entry["id"], "draft": text}   # never sent until the owner approves
+```
+
+- **Why refuse instead of guess.** A fluent answer with no approved source is the misrepresentation the
+  library exists to prevent; an empty draft routed to an owner is the safe failure.
+- **Measure it like any agent.** Track the share of drafts the owner edits before sending; a high edit
+  rate means the library or the prompt is wrong.
+
 ## Production patterns
 - **Answer library with owners and review dates.** Store each answer with its control, owner, evidence
   link and last-reviewed date; block reuse of entries past their review window (for example six months)
   until the owner re-approves. Track the share of stale entries.
 - **Architecture-change trigger.** Add a pull-request template question such as "does this change a
-  data flow, region, retention or subprocessor?" that pings the library owner. Monitor answers changed
-  after engineering review; a high count means the library lags the system.
+  data flow, region, retention or subprocessor?" that pings the library owner. Agent changes that add a
+  tool, a model fallback or a trace exporter should always trip it. Monitor answers changed after
+  engineering review; a high count means the library lags the system.
 - **Trust center plus NDA-gated reports.** Publish the subprocessor list, data-flow summary and AI
   data-use statement; share the SOC 2 report and full pen-test results only under NDA. Measure
   questions answered by reference to it.
@@ -195,8 +244,9 @@ print("needs review before reuse:", stale())
   the classic miss. Alert on any new external domain in production egress.
 - **Per-flow AI answers.** Keep separate entries for the hosted-API path and the self-hosted path for
   training use, retention and region, and quote the one matching the customer's tier.
-- **Measure the process.** Turnaround time, follow-up rounds per questionnaire and findings per review,
-  tracked per buyer tier.
+- **Generate the agent section from config.** Export the tool registry (tool, read or write, scope,
+  approval required) and retention settings into the library entry, so "what can the agent do" is
+  never answered from memory. Track turnaround time, follow-up rounds and findings per buyer tier.
 
 ## Trade-offs
 - **Templates vs custom forms.** Industry templates such as SIG or CAIQ let you answer once and reuse
@@ -206,7 +256,7 @@ print("needs review before reuse:", stale())
   library may suffice first.
 - **Specific answers vs commitments.** Detailed answers build trust and reduce follow-ups, but each
   detail is a commitment. Where the system changes often, describe the control and its guarantee rather
-  than its exact implementation.
+  than its exact implementation. Agent tool lists change often, so describe the permission model.
 - **AI drafting vs accuracy.** Drafts from the library save hours per questionnaire, but only work when
   every generated answer is reviewed by the owner of the underlying control.
 
@@ -219,6 +269,8 @@ print("needs review before reuse:", stale())
   question is answered differently in a renewal, prompting a full re-review.
 - **Never revisiting answers after architecture changes.** Symptom: stale claims, for example "data
   never leaves the EU" after someone added a US-hosted model fallback route.
+- **Saying "the agent is read-only" after adding a write tool.** Symptom: a buyer's pilot logs show the
+  agent creating tickets or sending email. Fix: derive the answer from the tool registry.
 - **Attaching sensitive evidence without controls.** A full penetration-test report with unfixed
   findings or a detailed network diagram, on a portal outside an NDA. Symptom: your internal security
   detail circulates among people you have never met. Share summaries and attestation letters by
@@ -231,7 +283,8 @@ print("needs review before reuse:", stale())
   write the answer library, the subprocessor list, a data-flow diagram and the AI data-use statement
   while the architecture is fresh.
 - **Pursue SOC 2 or ISO 27001** when the volume of questionnaires and deal size justify the audit cost.
-- **Route through control owners**, not the account team alone.
+- **Route through control owners**, not the account team alone. For the agent section, the owner is the
+  team that owns the tool registry and traces.
 - **Measure:** turnaround time, follow-up rounds and the number of answers changed after engineering review.
 - **Interviews (FDE and architect):** expect "how do you answer a question where the honest answer is
   no?" The answer: honestly, with compensating controls and a dated plan.
@@ -270,19 +323,28 @@ next questionnaire is correct, and tell engineering the routing change has compl
   for debugging, access-restricted, deletable on request".
 - **Fix the record:** add any newly found vendor to the subprocessor list and update the library entry.
 
-### When is pursuing SOC 2 not yet worth it?
-- **Low deal volume:** an early-stage vendor with few enterprise deals may get further with a strong
-  answer library, a clear data-flow diagram and a pen-test summary.
-- **Cost:** a Type II audit costs significant time and money every year and covers a period, so it pays
-  off once questionnaire volume and deal size justify it.
-- **Signal to watch:** repeated deals stalling on "do you have a SOC 2 report?"
+### A buyer asks "Can your agent take actions in our systems, and how do you prevent misuse?" How do you answer, and what must be true in the agent?
+- **Answer from the tool registry:** list which tools read and which write, the scope of each credential,
+  and which actions need human approval before they run.
+- **Describe the guardrails:** least-privilege tool roles, egress limits, tool allowlists, and prompt
+  injection evals with results you can share.
+- **Make it stay true:** generate this entry from config and trip the change trigger whenever a tool or
+  scope is added.
 
 ### How would you use an LLM to speed up questionnaire responses safely?
 - **RAG over the approved library**, not over raw documents, so drafts reuse wording an owner already
   signed off.
 - **Owner approval on every answer**, because a fluent wrong answer is a misrepresentation; track which
   answers were edited before sending.
-- **Freshness gate:** refuse to draft from entries past their review date.
+- **Freshness gate:** refuse to draft from entries past their review date, and route low-match questions
+  to an owner with no draft.
+
+### When is pursuing SOC 2 not yet worth it?
+- **Low deal volume:** an early-stage vendor with few enterprise deals may get further with a strong
+  answer library, a clear data-flow diagram and a pen-test summary.
+- **Cost:** a Type II audit costs significant time and money every year and covers a period, so it pays
+  off once questionnaire volume and deal size justify it.
+- **Signal to watch:** repeated deals stalling on "do you have a SOC 2 report?"
 
 ### What does a strong answer to an AI training-use question contain?
 - **The direct answer** for your own models, then the same for every model subprocessor and their
@@ -315,3 +377,23 @@ next questionnaire is correct, and tell engineering the routing change has compl
 - [x] Requiring the owner of each underlying control to approve the drafted answer before it is sent
 > Retrieval speeds drafting, but answers are commitments, and a fluent wrong answer is a misrepresentation.
 > Model size and agreement between drafts do not establish truth; an accountable owner's review does.
+
+## Use cases & projects
+### Use cases
+- **Unblocking an enterprise agent deal.** The AI section asks about retention, model subprocessors and
+  tool permissions; answers generated from the agent's own config close it in one round.
+- **Designing for good answers.** Teams pick a no-retention model path and region-pinned routing early
+  because they know the questionnaire will ask.
+- **RAG drafting agents for security teams.** An internal agent drafts responses from the approved library
+  and routes every draft to its owner.
+- **Catching hidden subprocessors.** Reconciling egress logs with the subprocessor list finds the trace
+  vendor that stores every prompt.
+
+### Mini project
+**Build a questionnaire-drafting agent with refusal (1-2 hours).**
+- **Goal:** draft answers to 20 sample questions from a small approved library, without inventing claims.
+- **Steps:** write 10 library entries (include two stale ones and an agent-tools entry generated from a
+  toy tool registry); implement `best_match`, `stale` and the `draft` step with any LLM; run 20 questions,
+  including five with no good match; record the status of each.
+- **Done when:** every no-match and stale question returns `needs_owner` with no draft, every draft cites
+  a library id, and a table shows match scores against your own judgement of the right entry.

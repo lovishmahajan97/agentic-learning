@@ -5,7 +5,7 @@ name: Audit logs / execution traces
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agent-reliability/structured-event-streams
@@ -273,8 +273,9 @@ Each standard question is answered by a specific field, and the shared `run_id` 
   `authorized` write must succeed before the tool runs; read-only tools buffer and retry instead. Monitor:
   audit write p95 latency on the critical path and the count of tool runs refused for audit unavailability.
 - **One identifier everywhere.** When: always. How: put `run_id` (and `step_id`) on every span as an
-  attribute and in every audit row, so a single query jumps between sinks. Monitor: audit rows whose
-  `run_id` has no trace, which reveal effects that bypassed the runtime.
+  attribute and in every audit row, so a single query jumps between sinks. Monitor: audit rows of failed,
+  denied or escalated runs whose `run_id` has no trace (those are never sampled out, so a miss means broken
+  propagation), and target-system records with no audit row, which reveal effects that bypassed the runtime.
 - **Blob retention from investigation windows.** When: payloads are stored by reference. How: lifecycle
   rules on the blob store set from the longest investigation you must support, with per-record delete for
   data-protection requests. Monitor: references in audit rows that no longer resolve.
@@ -411,8 +412,8 @@ head hashes. The identifiers are shared, so a row leads to the trace while it ex
   every authority-bearing action, kept far longer than traces.
 - **Debugging cost and latency.** Span attributes for tokens, cache hits and latency show which step or
   tool drives a slow or expensive run.
-- **Detecting bypasses.** Audit rows whose `run_id` has no trace reveal effects that did not go through
-  the agent runtime.
+- **Detecting bypasses.** Reconciling the payment or ticketing system's records against audit rows by
+  target id reveals effects that never went through the agent runtime, which neither sink can show.
 
 ### Mini project
 **Trace and audit a refund agent (2-3 hours).**

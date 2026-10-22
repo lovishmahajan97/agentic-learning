@@ -172,7 +172,7 @@ print(per_tool, per_run, sep="\n")
 |---|---|---|
 | `lookup_order` error rate | 3 of 4 calls = 0.75 | Read those tool results; likely a bad argument schema |
 | Run `r3` | 4 steps, 16,000 input tokens | Two retries of the same failing tool added two steps of re-sent context |
-| Input tokens per step | grows ~600 per step | The transcript grows each step; see prompt caching |
+| Input tokens per step | grows ~500-600 per step | The transcript grows each step; see prompt caching |
 
 ### Eval summary per model and category
 Summarising an agent eval run: pass rate, tail latency and cost per model and category.
@@ -220,9 +220,24 @@ category to the large one.
 
 ### Worked scenario: loading a large usage log without exhausting memory
 A token-usage export from a busy agent fleet is too big to load with default dtypes. Read only needed
-columns (`ts`, `model`, `route`, `out_tokens`, `latency_ms`), pin compact dtypes (`category`, `int32`,
-`float32`), use `parse_dates=["ts"]`, and aggregate with `chunksize=1_000_000`, combining partial sums
-with `groupby(level=["model", "route"], observed=True).sum()`.
+columns, pin compact dtypes, and aggregate chunk by chunk.
+
+```python
+import pandas as pd
+
+cols = ["ts", "model", "route", "out_tokens", "latency_ms"]
+dtypes = {"model": "category", "route": "category",
+          "out_tokens": "int32", "latency_ms": "float32"}
+
+parts = []
+for chunk in pd.read_csv("usage.csv", usecols=cols, dtype=dtypes,
+                         parse_dates=["ts"], chunksize=1_000_000):
+    parts.append(chunk.groupby(["model", "route"], observed=True)
+                      .agg(calls=("latency_ms", "size"), out_tokens=("out_tokens", "sum")))
+
+usage = pd.concat(parts).groupby(level=["model", "route"], observed=True).sum()  # combine partial sums
+print(usage.sort_values("out_tokens", ascending=False).head())
+```
 
 Why the dtypes matter, per 10 million rows (bytes are exact for fixed-width types):
 

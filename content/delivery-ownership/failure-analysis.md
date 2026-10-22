@@ -5,7 +5,8 @@ name: Failure analysis
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - delivery-ownership/production-debugging
   - delivery-ownership/root-cause-analysis-and-postmortems
@@ -17,9 +18,20 @@ related:
 ---
 
 ## TL;DR
-Failure analysis finds the few failure modes causing most harm across many failures. Sample without
-bias, label each by error and stage, count, weight by severity, and fix the top of the list. LLM
-failures are diverse and quiet, so this matters.
+Failure analysis finds the few failure modes causing most harm across many agent runs. Sample without
+bias, label each run by its first error and stage, count, weight by severity, and fix the top of the list
+instead of swapping models on instinct.
+
+## For agent builders
+- **Why it matters for agents.** Agents fail in more places than chatbots: wrong tool chosen, malformed
+  arguments, a tool error ignored, a loop, a missed hand-off to a human. Reading a sample of trajectories
+  tells you which of these actually dominates, so the next week of work goes there.
+- **Where it shows up in your stack.** Trace viewers or an annotation queue for coding runs, a shared
+  taxonomy of failure categories, and the eval suite where top categories become regression cases.
+- **What you control.** Which signals mark a run as failed, how you sample, the taxonomy and severity
+  scale, and whether each trace records per-step outputs so the originating stage can be named.
+- **What you can skip.** Heavy statistics. Proportions with a standard error and a frequency × severity
+  score are enough to rank fixes.
 
 ## Why it exists
 - **Debugging explains one failure; products fail in hundreds of ways a day.** An answer misses a detail,
@@ -70,6 +82,21 @@ failures are diverse and quiet, so this matters.
    counts that follow are noise.
 
 This is the discipline the evals module calls error analysis, applied here to live production traffic.
+
+### Coding agent trajectories
+For a multi-step agent, the "first error" is the first bad **step**. Stages worth tagging:
+
+| Stage | Typical first error |
+|---|---|
+| Planning or tool choice | Picked the wrong tool, or skipped a required lookup |
+| Tool arguments | Wrong format, invented ID, missing field |
+| Tool result handling | Ignored an error string, trusted a truncated result |
+| Retrieval or memory | Missing or stale context, forgot an earlier fact |
+| Control flow | Looped, hit the step budget, stopped too early |
+| Policy | Acted when it should have asked or escalated |
+
+- **Record the step number too**, because failures clustered at step 1 point at prompts and tool
+  descriptions, while failures late in long runs point at context growth or memory.
 
 ### 4. Count and weight
 - **Share with uncertainty.** A proportion *p* from *n* samples has standard error √(p(1−p)/n).
@@ -194,7 +221,28 @@ print(f"freshness fix: {expected_reduction(0.38, 0.8):.1%} points")   # 2.4%
 print(f"bigger model:  {expected_reduction(0.12, 0.5):.1%} points")   # 0.5%
 ```
 
+### Worked scenario: a ticket-triage agent's failed runs
+An agent that reads a ticket, looks up the account and files it to a queue fails on about 9% of runs
+(illustrative). The team codes 150 random failed trajectories by first bad step.
+
+| First error (stage) | Count | Share | Typical step |
+|---|---:|---:|---|
+| Account ID invented instead of looked up (tool arguments) | 51 | 34% | 1-2 |
+| Tool error ignored, filed anyway (tool result handling) | 33 | 22% | 3 |
+| Wrong queue, correct context (model) | 27 | 18% | 4 |
+| Should have asked the user (policy) | 21 | 14% | 2 |
+| Step budget hit while retrying (control flow) | 18 | 12% | 6+ |
+
+- **Fixes by stage:** a validator that rejects account IDs not returned by a prior lookup attacks 34%;
+  returning structured errors and blocking `file_ticket` after a failed lookup attacks another 22%.
+- **The model is again a small target:** only 18% are wrong decisions with correct context.
+- **Uncertainty:** the top share has standard error √(0.34 × 0.66 / 150) ≈ 0.039, so roughly 26%-42%.
+
 ## Production patterns
+- **Annotation queue for failed runs.** When: any agent in production. How: route a random sample of
+  runs with a failure signal (tool error, step budget hit, thumbs-down, human takeover) plus a slice of
+  normal runs into a queue where reviewers tag first bad step and stage. Monitor: share per category and
+  median step of first error.
 - **Weekly failure review.** When: any system in production. How: a fixed slot where an engineer and a
   domain expert code a fresh random sample of flagged traces plus a slice of unflagged traffic into the
   shared taxonomy. Monitor: category shares week over week and the size of "other".
@@ -236,6 +284,9 @@ print(f"bigger model:  {expected_reduction(0.12, 0.5):.1%} points")   # 0.5%
 - **Sampling only flagged conversations.** Symptom: a reported failure rate that looks stable while
   customers, on manual review, turn out to be receiving confidently wrong answers nobody flagged. Fix:
   label a random slice of all traffic.
+- **Labelling the visible bad action instead of the first bad step.** Symptom: an agent taxonomy dominated
+  by "wrong action" with no stage-specific fix. Fix: walk the trajectory back to the first step whose
+  output was wrong, often a tool argument or ignored tool error.
 
 ## When to use
 - **Use when:** an aggregate quality metric moves, before choosing between expensive interventions (model
@@ -300,6 +351,14 @@ estimate the ceiling each intervention could reach before committing.
 - **Trade-off:** you can miss a second, independent defect, so record secondary errors in a separate field
   when you suspect one.
 
+### Your agent's task success rate dropped from 91% to 84%. How do you decide what to fix?
+- **Sample trajectories, not answers.** Pull a random set of failed runs plus some successes and read each
+  run step by step to find the first bad step and its stage.
+- **Tag agent-specific stages:** tool choice, tool arguments, tool result handling, retrieval or memory,
+  control flow and policy, plus the step number.
+- **Rank and fix at the stage:** for example a validator for invented IDs or structured tool errors, then
+  confirm with the next sample before considering a model swap.
+
 ## Quiz
 ### Q: Why should failure coding anchor on the first thing that went wrong in a trace?
 - [ ] The first error is always the most severe one
@@ -325,3 +384,24 @@ estimate the ceiling each intervention could reach before committing.
 > A stronger model improves generation, not stale indexes or provider timeouts; its main lever is the share
 > of failures that originate in the model (plus some spillover into tool arguments and instruction following),
 > so larger categories elsewhere usually deserve priority.
+
+## Use cases & projects
+### Use cases
+- **Deciding between a model upgrade and stage fixes.** A coded sample shows what share of agent failures
+  a stronger model could even reach.
+- **Prioritising a tool-calling agent's backlog.** Invented arguments, ignored tool errors and loops are
+  counted and ranked rather than argued about.
+- **End-of-pilot reviews with a customer.** Their experts code failures with you, so severity reflects
+  their business, not your assumptions.
+- **Building the agent's regression eval.** Each top category becomes a detector or a set of eval cases
+  tracked on every change.
+
+### Mini project
+**Run a failure analysis on 50 agent trajectories (2-3 hours).**
+- **Goal:** produce a ranked, stage-tagged list of what breaks a small tool-calling agent.
+- **Steps:** run a simple agent (2-3 tools) on 100+ varied tasks and log every step; pick 50 failed runs
+  at random plus 10 successes; for each, note the first bad step, its stage and a severity from 1 to 4;
+  cluster into categories; compute shares with 95% intervals and a severity-weighted score; implement the
+  cheapest fix for the top category and rerun.
+- **Done when:** you have a table of categories with shares and intervals, one fix shipped at its
+  originating stage, and a rerun showing whether that category's share fell.

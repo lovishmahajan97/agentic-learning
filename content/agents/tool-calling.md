@@ -5,7 +5,7 @@ name: Tool calling
 kind: concept
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/agent-loop
@@ -386,8 +386,9 @@ logging the ratio of calls to answerable queries.
   can validate and gate each one before it happens.
 - **Agentic RAG.** Retrieval becomes a search tool the model calls when it needs evidence, rather than a
   fixed step before every answer.
-- **Structured extraction.** A single forced tool call returns typed fields, a common way to get
-  reliable JSON out of a model.
+- **Typed hand-offs inside an agent.** A forced `submit_result` tool at the end of a sub-agent or
+  classification step returns typed fields the harness can route on; for plain extraction with no
+  acting, prefer native structured outputs (see When to use).
 
 ### Mini project
 **Build a tool dispatcher with gating (1-2 hours).**

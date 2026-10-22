@@ -5,7 +5,7 @@ name: Backpressure
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - fastapi-for-ai/concurrency-limits

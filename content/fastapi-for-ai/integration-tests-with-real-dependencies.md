@@ -5,7 +5,7 @@ name: Integration tests with real dependencies
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - fastapi-for-ai/testclient-plus-pytest-asyncio

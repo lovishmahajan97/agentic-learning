@@ -5,7 +5,7 @@ name: Docker
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - backend-fundamentals/kubernetes
@@ -258,6 +258,8 @@ diagnosis.
 ### Agent code-execution tool in a locked-down container
 The agent's `run_python` tool runs model-written code in a throwaway container. All flags are standard
 `docker run` options; the sandbox image is a slim Python image with only the libraries you allow.
+- **Where this runs:** on the host or in a dedicated sandbox-runner service, never inside the agent's own
+  container with the Docker socket mounted (see Pitfalls), because that hands the agent root on the host.
 
 ```python
 import subprocess, uuid
@@ -277,7 +279,7 @@ def run_python(code: str, timeout_s: int = 20) -> dict:
         subprocess.run(["docker", "kill", name], capture_output=True)
         return {"error": "timeout", "limit_s": timeout_s}
     if p.returncode == 137:
-        return {"error": "killed: memory limit or timeout", "exit": 137}
+        return {"error": "killed (SIGKILL): likely the memory limit", "exit": 137}
     return {"exit": p.returncode, "stdout": p.stdout[-4000:], "stderr": p.stderr[-2000:]}
 
 print(run_python("import os; print(sorted(os.environ))"))   # no provider keys visible
@@ -480,7 +482,8 @@ measurements, because the second needs a startup probe and a weight cache rather
   a locked-down sandbox container.
 - **Steps:** write a multi-stage Dockerfile for a small agent API with a `run_python` tool; add a
   `compose.yaml` with the API and Redis for session memory; implement the sandbox with the flags from the
-  example; add a SIGTERM handler that finishes in-flight runs; try three hostile snippets (print the
+  example in a small runner process on the host that the API calls over HTTP (no Docker socket in the API
+  container); add a SIGTERM handler that finishes in-flight runs; try three hostile snippets (print the
   environment, call the internet, allocate 2 GB).
 - **Done when:** all three hostile snippets fail safely with clear tool results, `docker stop` on the API
   exits 0 in under ten seconds during a run, and the API image has no weights or secrets in

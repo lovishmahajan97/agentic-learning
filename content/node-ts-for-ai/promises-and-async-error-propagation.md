@@ -255,7 +255,11 @@ async function runToolBatch(
     if (e instanceof ProviderError && !e.retryable) {    // permanent: tell the model, let it adapt
       return { toolCallId: id, content: `error ${e.status}: ${e.message}`, isError: true };
     }
-    return { toolCallId: id, content: "temporary failure after retries", isError: true };
+    if (e instanceof ProviderError) {                    // retryable, but exec's retries ran out
+      return { toolCallId: id, content: "temporary failure after retries", isError: true };
+    }
+    console.error("tool bug", calls[i]!.name, e);        // not classified: likely our own code
+    return { toolCallId: id, content: "internal tool error", isError: true };
   });
 }
 ```

@@ -5,7 +5,7 @@ name: Synthetic data generation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - training-adaptation/data-curation
@@ -148,17 +148,18 @@ compound, and each generation is a blurrier copy. The defences follow from the m
   and some open-weight licences attach conditions to derived models.
 
 ## Diagram
-The generate-verify loop, as used for agent tool-call data and eval tasks: verification (ideally an
-executed end state) decides what survives, real held-out agent traffic decides whether it worked, and
+The generate-verify loop, as used for agent tool-call data and eval tasks: verification (strongest
+first: execution or an executed end state, construction with a round trip, consistency, a calibrated
+judge, humans) decides what survives, real held-out agent traffic decides whether it worked, and
 failures flow back into the specification rather than into more generation.
 
 ```mermaid
 flowchart TD
-    S["Seeds, personas, real artefacts"] --> SP["Specify: task, schema, diversity axes"]
+    S["Seeds: tool schemas, personas, artefacts"] --> SP["Specify: task, schema, diversity axes"]
     SP --> G["Generate several samples per prompt"]
-    G --> V["Verify: execution, construction, consistency, judge, humans"]
+    G --> V["Verify: end state, round trip, judge"]
     V -->|"fails"| RJ[("Rejects, read by hand")]
-    V -->|"passes"| DD["Deduplicate and balance, check distinct-n"]
+    V -->|"passes"| DD["Dedup, balance, distinct-n gate"]
     DD --> MX["Mix with accumulated real data"]
     MX --> T["Train"]
     T --> E["Evaluate on REAL held-out data"]
@@ -447,9 +448,7 @@ pipeline's error bar, not noise.
 - **Verify:** an independent checker must recover the exact call from the request, and rejects are read
   by hand, because some are hard-but-valid cases that belong in the eval suite.
 - **Gate batches:** distinct-n, per-tool balance and round-trip pass rate per tool, then evaluate the
-  trained model on real held-out requests, not synthetic ones. For generated code, the same idea is
-  execution: unit tests in a separate process with a timeout, and `subprocess` is not a security
-  sandbox.
+  trained model on real held-out requests, not synthetic ones.
 
 ## Quiz
 ### Q: What most determines the quality of a synthetic training set?
@@ -492,8 +491,9 @@ pipeline's error bar, not noise.
 - **Goal:** build 50 verified tasks for a small tool-using agent and use them to compare two agent
   versions.
 - **Steps:** write a mock backend with 3 tools and seeded state; have a model propose tasks with the
-  expected end state; run each task once with a reference agent and keep only those whose end state
-  matches; deduplicate and record generator, prompt version and seed per row; replay the set against two
-  prompt versions of your agent.
+  expected end state and a reference solution (the tool calls that achieve it); execute each reference
+  and keep tasks whose end state matches; read the failures by hand, since some are valid tasks with a
+  wrong reference; deduplicate and record generator, prompt version and seed per row; replay the set
+  against two prompt versions of your agent.
 - **Done when:** you have the task file with provenance, the share of generated tasks that survived
   verification, and a per-version pass-rate table.

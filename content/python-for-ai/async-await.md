@@ -5,7 +5,7 @@ name: async / await
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/asyncio
@@ -489,7 +489,8 @@ fix the unrelated endpoint's latency should no longer move.
 **Run parallel tool calls with limits and timeouts (1-2 hours).**
 - **Goal:** an async agent step that executes a turn's tool calls concurrently and safely.
 - **Steps:** write three fake async tools that sleep for different times, one of which sometimes hangs;
-  run them sequentially, then concurrently with `asyncio.gather` or a `TaskGroup` under a semaphore of 2; wrap
-  each in a per-tool timeout and return a timeout as an error tool result; time each variant.
-- **Done when:** the concurrent step takes about the slowest call instead of the sum, the hung tool is
-  cut off at its timeout without stalling the others, and a table shows wall time per variant.
+  run them sequentially, then concurrently with `asyncio.gather` under a semaphore of 3; wrap each in a
+  per-tool timeout and return a timeout as an error tool result; time each variant, then rerun with a
+  semaphore of 2 and explain why the third call now waits for a free slot.
+- **Done when:** the concurrent step takes about the slowest bounded call instead of the sum, the hung
+  tool is cut off at its timeout without stalling the others, and a table shows wall time per variant.

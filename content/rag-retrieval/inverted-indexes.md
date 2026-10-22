@@ -5,7 +5,7 @@ name: Inverted indexes
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: background
 related:
   - rag-retrieval/bm25-internals
@@ -159,7 +159,7 @@ Timings are illustrative.
 | 0 ms | `create_ticket` indexes INC-20931 into the buffer | no |
 | ~400 ms | next LLM step decides to search | no |
 | ~600 ms | `search_tickets("INC-20931")` runs | no: refresh not yet run, zero hits |
-| 1,000 ms | refresh at `refresh_interval` `1s` flushes a segment | yes, too late |
+| up to 1,000 ms | next periodic refresh (`refresh_interval` `1s`) flushes a segment | yes, too late |
 
 - **What the agent does.** It concludes the ticket failed to save and creates a duplicate.
 - **Fixes.** Index agent-written documents with `refresh=wait_for`, return the new id from the write tool
@@ -168,7 +168,8 @@ Timings are illustrative.
 
 ### Agent write tool that is searchable on return
 The write tool blocks until the document is visible to search and returns the id, so the next step's
-search sees it. Use the Elasticsearch Python client; the index mapping matches the production snippet.
+search sees it. It uses the Elasticsearch Python client (8.x); map `tenant_id` as a `keyword` field, as
+in the mapping snippet below, so the filter is one exact term.
 
 ```python
 from elasticsearch import Elasticsearch
@@ -281,8 +282,10 @@ PUT /products
   afterwards, which avoids many tiny segments. Monitor segment count and merge time after the load.
 - **Watch deleted-document bloat.** On high-churn indexes (agent memory, ticket state) track the
   deleted-docs count (the `_cat/indices` API shows it) and run a force merge with `only_expunge_deletes`
-  in a quiet window if merges lag. Keep top-k cheap: leave `track_total_hits` at its bounded default.
-  Monitor index size and p99 latency over weeks.
+  in a quiet window if merges lag. Monitor index size and p99 latency over weeks.
+- **Keep the agent's search tool top-k only.** Leave `track_total_hits` at its bounded default rather
+  than demanding exact counts, and do not let the tool emit leading wildcards on large dictionaries.
+  Monitor p99 tool-call latency against posting-list length of the query terms.
 
 ## Trade-offs
 - **Postings make queries cost matching documents, not corpus size,** but indexing becomes the expensive,
@@ -373,7 +376,8 @@ bounds still prune most of the common list for a top-10 result.
   threshold θ exceeds the common term's bound, documents containing only that term cannot qualify.
 - **MaxScore or WAND** then iterate the rare list and probe the common list through skip data, and
   block-max impacts skip low-scoring blocks; the result is exact, not approximate.
-- **Exact total hit counts defeat this,** so an agent tool should not ask for them.
+- **Exact total hit counts defeat this,** because every match must be counted, so an agent's search tool
+  should not ask for them.
 
 ### When would you turn off positions on a field, and what do you lose?
 - **Turn them off** on fields only ever filtered or scored as a bag of words, because positions

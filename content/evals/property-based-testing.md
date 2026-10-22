@@ -5,7 +5,7 @@ name: Property-based testing
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - python-for-ai/property-based-testing
@@ -316,6 +316,7 @@ kind of input a Unicode-aware generator eventually produces.
   retry limit per tool) as a stateful test whose rules are "model calls tool", "tool errors", "tool
   times out", with invariants that the loop always terminates within the step limit and spend never goes
   negative or past the cap. Monitor production runs that hit the step limit.
+
 ## Trade-offs
 - **Coverage vs determinism.** Hundreds of inputs per property give coverage no example suite reaches,
   but runs are slower and vary in what they explore, so CI relies on the example database and pinned

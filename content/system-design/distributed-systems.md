@@ -5,7 +5,7 @@ name: Distributed systems
 kind: concept
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - system-design/data-consistency
@@ -25,9 +25,9 @@ sources:
 ---
 
 ## TL;DR
-Every agent is a distributed system: model API, vector store, tools and workers on separate machines,
-defined by **partial failure**, where "slow" looks like "dead". The discipline: deadlines, idempotent
-retries, quorums, fenced leases, consensus, tracing.
+Machines cooperating over a network, defined by **partial failure**: any node or link can stall while the
+rest continue, and "slow" looks like "dead"; every agent (model API, vector store, tools, workers) is one.
+The discipline: deadlines, idempotent retries, quorums, fenced leases, consensus, tracing.
 
 ## For agent builders
 - **Why it matters for agents.** One agent run crosses the network dozens of times: model calls, retrieval,

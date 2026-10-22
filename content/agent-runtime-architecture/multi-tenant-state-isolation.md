@@ -5,7 +5,8 @@ name: Multi-tenant state isolation
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - system-design/multi-tenancy
   - system-design/tenant-isolation
@@ -24,6 +25,18 @@ sources:
 Agent runtimes spread tenant data across step logs, memory, indexes, files, sandboxes, caches, traces and
 queues, and leaks happen wherever a filter was forgotten. Take tenant identity from authentication, never
 the model, and enforce it at each store's storage layer.
+
+## For agent builders
+- **Why it matters for agents.** Your agent writes tenant data into far more places than a CRUD app: step
+  logs, memory, RAG indexes, semantic caches, sandboxes and traces. One forgotten filter in any of them
+  means one customer's agent recalls another customer's data, and you hear about it from the customer.
+- **Where it shows up in your stack.** Postgres RLS on the step store, the tenant filter in your Qdrant or
+  pgvector recall helper, cache key builders, object-store credentials for uploads, sandbox pools, and the
+  observability tool that stores full prompts.
+- **What you control.** Tool schemas with no `tenant_id` or `user_id` arguments, one context object threaded
+  through every adapter, filter-inside-search helpers, per-run sandboxes, and a canary test in CI.
+- **What you can skip.** Building per-tenant cells for every customer. Shared stores with storage-level
+  scoping are the default; reserve dedicated stores for regulated or residency-bound tenants.
 
 ## Why it exists
 - **A CRUD app has one place to forget the `WHERE`.** Multi-tenancy there is mostly one `tenant_id` column.
@@ -363,3 +376,25 @@ is caught before a customer reports it, and run the offboarding deletion drill a
 > A session-level setting persists after the transaction and can be inherited by the next request that
 > borrows the same pooled connection. A transaction-local setting is discarded at commit or rollback, so
 > every request must set it explicitly. `BYPASSRLS` disables the control entirely.
+
+## Use cases & projects
+### Use cases
+- **B2B agent platforms with shared memory.** One vector collection holds every customer's memory, and the
+  tenant filter inside the search keeps recall correct and private, even for the smallest tenants.
+- **RAG assistants over customer documents.** Object prefixes, prefix-scoped credentials and filtered
+  indexes stop one company's uploaded contracts from answering another's questions.
+- **Code-execution agents.** Per-run sandboxes, or tenant-affine warm pools, keep generated files from
+  leaking between customers.
+- **Customer offboarding and deletion requests.** The surface inventory drives deletion across rows,
+  vectors, cache keys, traces and eval sets, then the canary search verifies it.
+
+### Mini project
+**Build and break a two-tenant memory agent (2-3 hours).**
+- **Goal:** show that tenant scoping is enforced by the stores, not by the model or by care.
+- **Steps:** build an agent with a `remember` and a `recall` tool backed by Postgres with RLS (or pgvector)
+  and a semantic cache; take tenant only from a context object; first ship a deliberately broken version
+  that post-filters top-k and keys the cache on the prompt only; write the canary test from the examples
+  and watch it fail; then fix filter placement and the cache key.
+- **Done when:** the canary test fails on the broken build and passes on the fixed one, a small tenant
+  owning 0.2% of vectors gets 8 recall hits, and a tool call that tries to pass `tenant_id` is rejected by
+  the schema.

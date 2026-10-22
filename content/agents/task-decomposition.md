@@ -5,7 +5,7 @@ name: Task decomposition
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/planning
@@ -30,8 +30,8 @@ buys parallelism and isolated failures; done badly, coordination overhead.
 ## For agent builders
 - **Why it matters for agents.** It is the design step behind every research, migration or extraction
   agent: which pieces run as their own model call or sub-agent, what each returns, and where a verifier
-  sits. Chains of unverified steps are the most common reason an agent's end-to-end success is far below
-  its per-step success.
+  sits. Long chains of unverified steps are why an agent's end-to-end success can sit far below its
+  per-step success, because per-step failures multiply.
 - **Where it shows up in your stack.** LangGraph graphs (nodes, edges, subgraphs, and the `Send` API for
   map-reduce fan-out), sub-agents in coding agents, agents-as-tools in the OpenAI Agents SDK, CrewAI
   tasks that declare other tasks as context, and typed subtask contracts with Pydantic or structured

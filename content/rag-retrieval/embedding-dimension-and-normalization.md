@@ -5,7 +5,7 @@ name: Embedding dimension & normalization
 kind: concept
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - rag-retrieval/embedding-models

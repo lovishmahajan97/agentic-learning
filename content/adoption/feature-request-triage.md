@@ -5,7 +5,8 @@ name: Feature-request triage
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - customer-data-evaluation/feedback-loops-to-product
   - delivery-ownership/productizing-repeated-customer-solutions
@@ -17,9 +18,21 @@ related:
 ---
 
 ## TL;DR
-Feature-request triage turns customer asks into routed decisions: capture the problem, classify what it
-really is (often a quality failure, training gap or model limit), cluster across customers, score,
-route, and tell the requester.
+Feature-request triage turns asks about your agent into routed decisions: capture the problem, classify
+what it really is (often a quality failure, a setting or an autonomy limit), cluster across customers,
+score, route, and tell the requester.
+
+## For agent builders
+- **Why it matters for agents.** Agent asks hide their type: "it keeps searching forever" is a loop bug,
+  "stop asking me to approve" is a risk setting, "connect it to our CRM" is a new tool, and "let it do
+  the whole claim alone" is a reliability limit. Each goes to a different queue.
+- **Where it shows up in your stack.** The first classifying step reads the agent's traces for the
+  requester's example; configuration means prompts, tool lists, approval gates and step budgets; new
+  tools land on your supported tool interface instead of a fork.
+- **What you control.** The intake fields, the fixed order of classifying questions, a small reliability
+  trial before calling anything a product gap, and keeping ARR out of the score.
+- **What you can skip.** Roadmap-planning frameworks beyond RICE; the scoring is a ranking aid, and the
+  routing is where agent teams win or lose time.
 
 ## Why it exists
 - **Asks arrive constantly.** In workshops, in Slack, from the sponsor, and from end users during
@@ -76,6 +89,14 @@ Ask the classifying questions in a fixed order, cheapest and most urgent first:
 - **Split compound asks.** "Make pricing answers right and never wrong" is one quality failure plus one
   capability limit, and each half has a different route.
 
+### What the types look like for an agent
+| Agent ask | Usual type |
+|---|---|
+| "It keeps calling search and never answers" | Quality failure: a loop bucket for the improvement loop |
+| "Stop asking me to approve small refunds" | Configuration, but only with a risk owner signing off on the approval threshold |
+| "Connect it to our in-house CRM" | Customer-specific extension: a new tool on the supported tool interface |
+| "Let it file claims end to end with no human" | Often a capability limit on reliability: narrower scope or human review |
+
 ### 3. Deduplicate and cluster across customers
 - **Group by underlying problem, not wording.** One cluster with five accounts and concrete examples is far
   stronger evidence than five separate tickets.
@@ -120,8 +141,8 @@ flowchart TD
     Q1 -->|"yes, fails"| QF["Quality failure: triage and regression case"]
     Q1 -->|"yes, works"| UG["Usage gap: enablement"]
     Q1 -->|"no"| Q2{"Can configuration do it?"}
-    Q2 -->|"yes"| CF["Field team configures"]
-    Q2 -->|"no"| Q3{"Models reliable on real examples?"}
+    Q2 -->|"yes"| CF["Field team configures prompts, tools, gates"]
+    Q2 -->|"no"| Q3{"Agent reliable on a real trial?"}
     Q3 -->|"no"| CL["Capability limit: reset, mitigate"]
     Q3 -->|"yes"| Q4{"Unique to this customer?"}
     Q4 -->|"yes"| EX["Extension point build"]
@@ -129,6 +150,20 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: triaging four asks about a claims agent
+One week of asks from a claims-handling agent's users, classified with the fixed questions. Numbers are
+illustrative.
+
+| Ask | What the traces or a trial showed | Type | Route |
+|---|---|---|---|
+| "It keeps searching and never answers" | 9% of runs hit the step budget with repeated policy-search calls | Quality failure | Loop bucket, regression cases, fix in the search tool's empty result |
+| "Stop asking me to approve small payouts" | Approval gate is a per-tool setting; 98% of payouts under the threshold were approved unchanged last month | Configuration | Raise the threshold only after the risk owner signs off |
+| "Connect it to our in-house fraud system" | No such tool; no other customer uses this system | Customer-specific extension | Build a tool on the supported tool interface, register it, add it to the extension register |
+| "Let it settle claims end to end" | Trial on 24 real claims: 14 settled correctly with no human | Capability limit | Narrow scope to simple claim types and keep human review for the rest |
+
+- **Only the trial makes the last row honest:** 14 of 24 is about 58%, far from "end to end", so the
+  answer is a scoped plan, not a roadmap promise.
+
 ### Weekly triage pass: cluster, route and score
 Seven captured requests from five accounts. Requests are clustered by underlying problem and type, each
 cluster is routed, and only product gaps get a RICE score. ARR is shown next to the score but kept out of
@@ -225,13 +260,14 @@ for ask, answers in asks.items():
   one list; triage merges duplicates weekly before scoring. Monitor how many tickets each cluster absorbs
   and how often new tags are created.
 - **Auto-route quality failures out of the backlog** — a request classified as a quality failure opens a
-  failure-triage item with its example as a regression case. Monitor time from report to regression case
+  failure-triage item with its example, and the agent run ID behind it, as a regression case. Monitor time from report to regression case
   and to a gated fix.
 - **ARR as its own column** — the backlog view shows RICE and commercial weight side by side, so the
   product owner sees when a large account would reorder the list. Monitor how often a decision overrode
   the RICE order, with the reason written down.
-- **Recurrence rule for field extensions** — keep a register of customer-specific builds by pattern; when a
-  pattern repeats across several customers, raise a productization proposal. Monitor extensions per
+- **Recurrence rule for field extensions** — keep a register of customer-specific builds by pattern,
+  including custom agent tools; when a pattern repeats across several customers (three CRM tools that do
+  the same lookup), raise a productization proposal. Monitor extensions per
   pattern and how many were later productized.
 - **Decision and closure log** — every request records a decision, a reason and the date the requester was
   told. Monitor time from request to decision and the share of requesters notified.
@@ -246,6 +282,9 @@ for ask, answers in asks.items():
   anecdotes into evidence; for a single small pilot with one stakeholder, a lightweight list may be enough.
 - **Roadmap transparency vs implied commitments.** Sharing roadmap intent builds trust but creates implied
   commitments; share problem clusters and status, not delivery dates, unless product has committed.
+- **Saying yes to more autonomy vs risk.** Relaxing approval gates or step budgets on request removes
+  friction users feel daily, but moves error cost onto the customer; treat it as a risk decision with an
+  owner, backed by approval data.
 
 ## Pitfalls
 - **Logging the proposed solution instead of the problem.** The backlog fills with near-duplicate items,
@@ -260,6 +299,9 @@ for ask, answers in asks.items():
   designing human review and scope limits.
 - **No closure to requesters.** The same asks reappear louder through other channels, and feedback from end
   users dries up.
+- **Granting "more autonomy" as a feature.** A field team removes an approval gate to please a user, and
+  the first bad payout shows nobody owned the risk. Fix: route autonomy asks to a named risk owner with
+  approval-rate evidence.
 
 ## When to use
 - **Use when** a deployed system has users who can ask for things, which is from the first pilot week
@@ -320,9 +362,16 @@ matches, or human review for quotes. Then I tell the VP the plan and timeline.
   swap the order.
 - **Then add the non-score inputs:** strategic fit, risk and commercial weight, kept visible.
 
-### When is a field-built, customer-specific feature acceptable?
-- **When the need is genuinely unique** and it can be built on a supported extension point, never as a fork,
-  because forks tax every later upgrade.
+### Users ask the agent to "stop asking for approval". How do you triage it?
+- **Classify with data first:** pull approval-gate decisions per tool; if almost every proposal below some
+  amount was approved unchanged, a higher threshold is a configuration change.
+- **But treat it as risk, not convenience:** a named risk owner signs off on the threshold, and the
+  change ships through the gate with monitoring of reversals or complaints.
+- **Keep gates where rejections are frequent,** because those are the actions the agent still gets wrong.
+
+### When is a field-built, customer-specific feature or agent tool acceptable?
+- **When the need is genuinely unique** and it can be built on a supported extension point, such as the
+  agent's tool interface, never as a fork, because forks tax every later upgrade.
 - **Track it in a register,** and apply the recurrence rule: once several customers need the same
   extension, propose productizing it.
 
@@ -350,3 +399,24 @@ matches, or human review for quotes. Then I tell the VP the plan and timeline.
 - [ ] RICE scores are only defined for non-financial inputs
 > Revenue matters, but hidden inside a score it silently outweighs reach and impact. Showing it
 > separately lets product leaders decide openly when to favour a big account.
+
+## Use cases & projects
+### Use cases
+- **Weekly triage for a deployed agent.** Asks are checked against traces first, so loop and wrong-tool
+  complaints reach the improvement loop within days.
+- **New tool requests.** "Connect it to our system" becomes a tool on the supported interface, tracked in
+  the extension register until a pattern justifies productizing it.
+- **Autonomy requests.** Asks to drop approvals or raise step budgets go to a risk owner with
+  approval-gate data instead of being granted in the field.
+- **Cross-customer roadmap input.** Clusters with RICE and a separate ARR column show product which agent
+  capabilities several accounts need.
+
+### Mini project
+**Build a triage helper for agent asks (1-2 hours).**
+- **Goal:** route a batch of agent feature requests correctly using traces and a small trial.
+- **Steps:** collect or write 15 realistic asks about a tool-calling agent; for each, record the
+  requester's example and look up (or simulate) the matching run; answer the four classifying questions
+  in order with a small function like the one above; run a 20-case trial for any "can it do X" ask; score
+  the product gaps with RICE and show ARR separately.
+- **Done when:** every ask has a type, a route and a written reply to the requester, and at least one ask
+  is reclassified from "feature" to quality failure or configuration with trace evidence.

@@ -5,7 +5,8 @@ name: Observability stack
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - observability/tracing
   - observability/opentelemetry
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-An AI observability stack turns every request into queryable data: LLM-aware traces, a collector that
-redacts and samples, separate stores for traces, metrics and payloads, analysis tools where scores attach
-to traces, and alerting. Each layer has its own owner, retention and cost.
+An observability stack turns every agent run into queryable data: one trace per run with a span per LLM
+and tool call, a collector that redacts and samples, separate stores for traces, metrics and payloads,
+scores attached to traces, and alerting.
+
+## For agent builders
+- **Why it matters for agents.** An agent run is a tree: plan, call a model, call tools, call the model
+  again, maybe hand off to a sub-agent. Without one trace per run you cannot answer "why did it take 14
+  steps", "which tool failed" or "what did this task cost".
+- **Where it shows up in your stack.** The OpenTelemetry SDK or your framework's tracing hooks, GenAI
+  semantic-convention attributes on model spans, a collector, and an LLM trace viewer such as Langfuse,
+  LangSmith or Arize Phoenix.
+- **What you control.** The span tree shape (run, step, model call, tool call), mandatory attributes
+  (tenant, bundle, run id), what payloads you capture and where, sampling policies that keep failed runs,
+  and scores written back by trace id.
+- **What you can skip.** Running the collector fleet yourself if a platform team does; you still own
+  instrumentation and attributes.
 
 ## Why it exists
 - **One team, one vendor SDK works; many teams break it in four places at once.**
@@ -71,6 +85,23 @@ to traces, and alerting. Each layer has its own owner, retention and cost.
   attribute names have changed between versions.
 - **Mandatory platform keys on every span:** tenant, user (pseudonymous), bundle and prompt version, config
   version, request id. Mandatory *because* every later question is a group-by on them.
+
+### The agent span tree
+An agent run should be one trace with a predictable shape:
+
+| Span | Children | Key attributes |
+|---|---|---|
+| Agent run (root) | steps | run id, task type, bundle, final status, step count |
+| Step | one model call, zero or more tool calls | step index |
+| Model call | none | requested and response model, input and output tokens, finish reason |
+| Tool call | downstream HTTP or DB spans | tool name, argument hash, error, duration |
+| Sub-agent or handoff | its own steps | parent run id |
+
+- **Recent GenAI convention versions also name agent and tool operations** (for example invoking an agent
+  and executing a tool); use them when your pinned version has them, and your own `app.` attributes
+  otherwise.
+- **Long agent sessions break tail sampling's "complete" window**, so make the sampling unit the run (or
+  a step) and record the run's final status on the root span.
 
 ### Layer 2: collection
 Services send to an OpenTelemetry Collector, not straight to a backend. Platform policy runs there:
@@ -206,6 +237,48 @@ The collector pipeline for this stream, in prose:
 4. **A spanmetrics connector** producing per-model, per-bundle rate, error and latency series.
 5. **Exporters** to the trace store, the metrics database and the LLM analysis tool.
 
+### Tracing a tool-calling agent loop
+One trace per run: a root span, a span per step, and child spans for the model call and each tool call.
+`call_model` and `TOOLS` are the agent's own functions; `keys` reuses the mandatory platform keys.
+
+```python
+import hashlib, json
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
+
+tracer = trace.get_tracer("ticket-agent")
+MAX_STEPS = 12
+
+def run_agent(task, keys, run_id):
+    with tracer.start_as_current_span("agent.run", attributes={**keys, "app.run_id": run_id}) as root:
+        messages = [{"role": "user", "content": task}]
+        for step in range(MAX_STEPS):
+            with tracer.start_as_current_span("agent.step", attributes={**keys, "app.step": step}):
+                with tracer.start_as_current_span(f"chat {MODEL}", attributes=keys) as s:
+                    resp = call_model(MODEL, messages)
+                    s.set_attributes({"gen_ai.request.model": MODEL,
+                                      "gen_ai.response.model": resp.model,
+                                      "gen_ai.usage.input_tokens": resp.usage.input_tokens,
+                                      "gen_ai.usage.output_tokens": resp.usage.output_tokens})
+                if not resp.tool_calls:
+                    root.set_attributes({"app.steps": step + 1, "app.status": "answered"})
+                    return resp.text
+                for tc in resp.tool_calls:
+                    arg_hash = hashlib.sha256(json.dumps(tc.args, sort_keys=True).encode()).hexdigest()[:8]
+                    with tracer.start_as_current_span(f"tool {tc.name}", attributes={
+                            **keys, "app.tool": tc.name, "app.tool.args_hash": arg_hash}) as t:
+                        try:
+                            result = TOOLS[tc.name](**tc.args)
+                        except Exception as e:
+                            t.set_status(Status(StatusCode.ERROR, str(e))); result = f"error: {e}"
+                    messages += [resp.as_message(), {"role": "tool", "name": tc.name, "content": str(result)}]
+        root.set_attributes({"app.steps": MAX_STEPS, "app.status": "step_budget_exhausted"})
+        root.set_status(Status(StatusCode.ERROR, "step budget exhausted"))   # tail sampler keeps it
+```
+
+- **The argument hash** lets a query find repeated identical tool calls, the usual loop signature.
+- **Marking budget exhaustion as an error** means the `errors` tail-sampling policy keeps every runaway run.
+
 ### The same pipeline as Collector configuration
 A sketch using components from the OpenTelemetry Collector contrib distribution; check field names against
 the collector version you run. Two trace pipelines read the same receiver: one feeds spanmetrics from the
@@ -274,6 +347,10 @@ Illustrative platform: 1,000,000 requests a day, 30 KB average payload, 2% of tr
 | Cost job run on the trace store | sees ~6.9% of calls, skewed to slow, expensive ones | attributed spend far below the invoice and shifts whenever sampling changes |
 | Cost from a token-usage metric on the full stream | every call counted before sampling | matches the invoice within pricing error |
 
+- **Agents multiply it:** a 10-step run re-sends its growing transcript every step, so payload per run is
+  far larger than per chat request. Store each tool result once and reference it, rather than copying the
+  whole transcript onto every model span.
+
 ## Production patterns
 - **Trace-aware load balancing in front of tail samplers.** Run a first collector tier with the
   `loadbalancing` exporter routing by trace id, so every span of a trace reaches the same sampling
@@ -293,6 +370,9 @@ Illustrative platform: 1,000,000 requests a day, 30 KB average payload, 2% of tr
 - **Mandatory-attribute contract test.** A CI test runs the service against a stub model and asserts every
   model span carries tenant, bundle and config version; dashboards track the share of production model
   spans missing them. Monitor that share; above zero means attribution is leaking.
+- **Run-level root spans for agents.** Record run id, step count, final status and total tokens on the
+  agent's root span, and mark step-budget exhaustion as an error so tail sampling keeps it. Monitor p95
+  steps per run and the share of runs ending in a non-answered status.
 
 ## Trade-offs
 - **OpenTelemetry vs vendor SDKs.** OTel keeps instrumentation neutral and composable; vendor SDKs capture
@@ -323,6 +403,9 @@ Illustrative platform: 1,000,000 requests a day, 30 KB average payload, 2% of tr
   to a bundle or prompt version, so rollback becomes guesswork. Fix: contract tests.
 - **Judge scores stored without the trace id.** Symptom: a quality dashboard that cannot be joined to the
   requests it describes. Fix: write scores keyed by trace id.
+- **One trace per model call instead of per agent run.** Symptom: a slow or failed task shows up as a dozen
+  unrelated traces, so nobody can see the loop. Fix: a root span for the run with steps and tool calls as
+  children, and context propagated into tool services.
 - **Computing cost or volume from the sampled trace store.** Symptom: attributed spend that is a small,
   unstable fraction of the invoice and moves whenever someone changes the sampling rate. Fix: an
   unsampled token-usage metric.
@@ -380,7 +463,7 @@ reliable answer, which is the failure the stack exists to prevent.
 - **Fix:** tail sampling with error and latency policies behind a trace-id-aware load balancer, and link
   each alert to a trace query.
 
-### How do you design payload storage for prompts and completions?
+### How do you design payload storage for agent prompts, completions and tool results?
 - **Separate store, referenced from spans by id**, because payloads are bulky and sensitive.
 - **Retention and access per data classification:** for example short TTL and redaction for confidential
   tenants; spans keep only the pointer.
@@ -397,6 +480,14 @@ reliable answer, which is the failure the stack exists to prevent.
 - **Keep an exit:** use OpenTelemetry underneath where possible, so moving to the full stack later is a
   configuration change rather than re-instrumentation.
 - **Switch** when a second team, a second provider or a compliance requirement appears.
+
+### How would you instrument a tool-calling agent so a slow, looping run can be debugged?
+- **One trace per run:** a root span with run id, final status and step count; a span per step; children
+  for each model call and tool call, with context propagated into tool services.
+- **Attributes that answer agent questions:** tokens per model call, tool name, argument hash and error per
+  tool call, so repeated identical calls and failing tools are one query away.
+- **Keep the bad runs:** mark step-budget exhaustion and failed runs as errors so tail sampling retains
+  them, and write judge scores back by trace id.
 
 ## Quiz
 ### Q: Why does a platform route telemetry through an OpenTelemetry Collector instead of exporting directly from each service to the backend?
@@ -423,3 +514,23 @@ reliable answer, which is the failure the stack exists to prevent.
 - [ ] Analysis tools require a dedicated payload API
 > Payloads dominate volume and carry customer data; keeping them in a dedicated store lets the
 > platform apply per-tenant retention and access rules without touching the trace or metrics stores.
+
+## Use cases & projects
+### Use cases
+- **Debugging a looping agent.** The run's span tree shows twelve steps with the same tool and argument
+  hash, pointing at the prompt or tool description.
+- **Cost per task across teams.** Token-usage metrics labelled by bundle and tenant answer what each agent
+  feature costs, matching the invoice.
+- **Turning bad runs into evals.** Low-scored agent traces are filtered in the trace viewer and exported to
+  a dataset for the next release gate.
+- **Compliance for agents that read customer data.** Collector redaction and a payload store with
+  per-tenant TTL answer what was stored and for how long.
+
+### Mini project
+**Trace an agent end to end (2-3 hours).**
+- **Goal:** see every agent run as one trace and find a deliberately injected loop from the data alone.
+- **Steps:** instrument a two-tool agent with the OpenTelemetry SDK (run, step, model and tool spans with
+  run id, bundle and argument hash); export to a local collector or an LLM trace viewer that accepts OTLP;
+  run 50 tasks, including some where one tool always returns an error so the agent retries.
+- **Done when:** one query lists runs with repeated identical tool calls, every model span carries the
+  mandatory attributes, and total tokens per run add up to the sum over its model spans.

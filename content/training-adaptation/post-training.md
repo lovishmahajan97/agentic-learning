@@ -5,7 +5,7 @@ name: Post-training
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - training-adaptation/pre-training
@@ -143,7 +143,8 @@ evaluation sets that tell you whether a round helped.
 ## Diagram
 Read it top to bottom: each stage consumes a different signal, and each round ends at an eval gate
 (tool-call format, win rate, refusals on harmful and benign sets, length, capability delta). A failed or
-unfinished round samples the new model and feeds fresh on-policy comparisons back into stage 2.
+unfinished round samples the new model and feeds fresh on-policy comparisons back into stage 2, with a
+KL leash to the reference model.
 
 ```mermaid
 flowchart TD
@@ -408,9 +409,10 @@ the DPO stage stable, so the saving is not worth it.
 ### Mini project
 **Map agent failures to post-training stages (1-2 hours).**
 - **Goal:** turn a pile of failed agent runs into a concrete post-training plan.
-- **Steps:** run a small tool-calling agent on 40 tasks and save every transcript; label each failure as
-  format (bad JSON, wrong tool name), quality (correct but worse choice) or skill (checkable task
-  failed); for each bucket write which stage you would use (SFT, DPO or GRPO), the data you would need
-  and the eval that gates the change.
+- **Steps:** run a small tool-calling agent on 40 tasks and save every transcript; write a script that
+  auto-flags format failures (JSON that does not parse, unknown tool name, arguments that fail the
+  schema); hand-label the rest as quality (correct but worse choice) or skill (checkable task failed);
+  for each bucket write which stage you would use (SFT, DPO or GRPO), the data you would need and the
+  eval that gates the change.
 - **Done when:** you have a failure table with counts per bucket and a one-page plan naming the first
   stage to run and the metric that proves it worked.

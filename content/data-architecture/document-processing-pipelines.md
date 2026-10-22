@@ -5,7 +5,8 @@ name: Document processing pipelines
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - rag-retrieval/document-parsing
   - multimodal/ocr
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-A document processing pipeline turns mixed files into one canonical block structure. It is a tiered
-router: detect what each page really is, use the cheapest extractor that preserves structure, score the
-output, and escalate (native text, OCR, layout model, vision LLM) only on failure.
+Agents read documents through retrieval tools and file uploads, so their answers are only as good as
+parsing. Route each page to the cheapest extractor that preserves structure, score it, and escalate
+(native, OCR, layout model, vision LLM) only on failure.
+
+## For agent builders
+- **Why it matters for agents.** A scanned annex parsed as empty or a table flattened to loose numbers never
+  errors; the agent just retrieves nothing or the wrong cell and answers confidently. Most "the agent
+  hallucinated a figure" incidents on enterprise documents start here.
+- **Where it shows up in your stack.** The parse stage behind your knowledge-base tools, and a `read_document`
+  tool for files users attach mid-conversation: PyMuPDF, Tesseract or a cloud OCR service, Docling or
+  Unstructured, and a vision model as the last tier.
+- **What you control.** The tier ladder and thresholds, the canonical block schema (page and `bbox` for
+  citations), what the tool returns for pages that failed, and the per-session latency and cost budget.
+- **What you can skip.** OCR and layout-model internals. Treat extractors as tiers with a cost, a latency and a
+  quality score.
 
 ## Why it exists
 - **The single library call breaks on the real corpus.** Scanned PDFs have no text layer, so it returns empty
@@ -108,9 +121,22 @@ Order extractors by cost and by what they preserve; route each page to the first
 - **Run a gold evaluation set** (gold text and gold tables, measured by character error rate and table cell
   accuracy) on every parser change.
 
+### 7. Parsing inside an agent loop
+Files a user attaches mid-conversation need the same ladder under a tighter budget, because the agent is
+waiting:
+- **Run the cheap tiers inline.** Native extraction answers in milliseconds of CPU; OCR on a few pages is
+  usually acceptable inside one tool call.
+- **Escalate asynchronously.** Pages needing a layout model or vision LLM go to a background job, and the tool
+  result says which pages are pending instead of returning silence.
+- **Return structure the model can use.** Blocks with type, page and a table serialized as Markdown let the
+  agent cite "page 14, table 2" and answer column-aware questions.
+- **Say what failed.** A `needs_review` page in the tool result lets the agent tell the user, rather than
+  answering as if the annex were blank.
+
 ## Diagram
 Each page starts at the cheapest tier that can work for it and climbs only when its quality score fails;
-document-level cleaning runs after all pages are assembled.
+document-level cleaning runs after all pages are assembled, and the stored blocks are what the agent's
+retrieval and `read_document` tools return.
 
 ```mermaid
 flowchart TD
@@ -230,6 +256,32 @@ print(sorted(repeated))   # ['acme corp - master agreement', 'confidential - pag
 print(cleaned[2])         # ['Revenue grew 12% in Q3.']
 ```
 
+### Agent scenario: a `read_document` tool with an inline budget
+The tool reuses `process` from the router above, but only with the inline tiers, and queues the rest. The
+agent gets typed blocks with page numbers, plus an explicit list of pages it must not pretend to have read.
+
+```python
+INLINE_TIERS = ["native", "ocr"]          # fast enough for one tool call
+def read_document(path, tiers, queue, max_pages=40):
+    inline = [(n, f) for n, f in tiers if n in INLINE_TIERS]
+    result = process(path, inline)        # per-page routing, quality gate, errors recorded
+    pending = [p["page"] for p in result["pages"] if p["tier"] == "needs_review"]
+    if pending:
+        queue.put({"path": path, "pages": pending, "tiers": ["layout", "vlm"]})   # background escalation
+    blocks = [{"page": p["page"] + 1, "type": b["type"], "text": b["text"]}
+              for p in result["pages"][:max_pages] for b in p["blocks"]
+              if b["type"] not in ("header", "footer")]
+    return {"blocks": blocks,
+            "pending_pages": [n + 1 for n in pending],     # tell the agent, and through it the user
+            "note": "Pages in pending_pages are still being processed; do not answer from them."}
+```
+
+| User uploads the 60-page contract above | Inline (native + OCR) | Background (layout, vision) |
+|---|---|---|
+| Pages handled | 58 (52 native, 6 OCR) | 2 handwritten annex pages |
+| Tool result | blocks for 58 pages, `pending_pages` lists 2 | results cached by page hash for the next call |
+| Agent behaviour | answers from 58 pages, says 2 annex pages are still processing | re-reads the 2 pages on the next turn |
+
 ## Production patterns
 - **Detect type from content.** At intake, sniff the MIME type from the first bytes (for example
   `magic.from_buffer(data, mime=True)` with python-magic) and route by that, not the extension. Monitor the
@@ -244,6 +296,10 @@ print(cleaned[2])         # ['Revenue grew 12% in Q3.']
   parser change if character error rate or table cell accuracy regresses. Track both per class.
 - **Escalation-rate alarm.** Chart the share of pages reaching each tier per source per day; a climbing
   escalation rate is the earliest sign of a new document type entering the corpus.
+- **Explicit gaps in agent tool results.** Agent teams return pending or failed pages as a field in the
+  document tool's output and instruct the agent to mention them, instead of returning partial text silently.
+  Monitor the share of agent answers given while pages were pending and the p95 latency of the inline tiers
+  per tool call.
 
 ## Trade-offs
 - **Tiered routing vs extra passes.** Average cost stays near the cheapest extractor, but there is a scoring
@@ -277,6 +333,8 @@ print(cleaned[2])         # ['Revenue grew 12% in Q3.']
 - **Use** a tiered pipeline as soon as a corpus mixes formats or includes scans, tables or multi-column
   layouts, which describes nearly every enterprise document set.
 - **A homogeneous Markdown or HTML corpus** needs only the cleaning and canonical-model steps.
+- **Use the inline variant when** an agent accepts user uploads: cheap tiers inside the tool call, expensive
+  tiers in the background, with pending pages reported to the agent.
 - **Measure** text-layer ratio, per-tier volume and cost, quality-score distribution, escalation rate,
   review-queue size, and extraction accuracy on the gold set.
 - **Day to day,** this is where retrieval incidents are traced to and fixed.
@@ -318,7 +376,7 @@ retrieve the correct table chunk.
   embeddings churn.
 - **So** use it as the last tier, gated by a quality score and cached by page hash.
 
-### Users say a contract "should be there" but retrieval never finds its annex. How do you debug it?
+### Users say your contracts agent claims an annex "has no signatures", but it does. How do you debug it?
 - **Check the per-page record:** which tier processed each annex page and what quality it scored.
 - **Likely cause:** whole-document routing sent a mostly born-digital file to native extraction, and the
   scanned annex yielded empty text that was indexed as nothing.
@@ -329,6 +387,14 @@ retrieve the correct table chunk.
   grids plus a Markdown or HTML serialization.
 - **Why:** chunking, metadata extraction and citations depend on one schema, so swapping or escalating an
   extractor changes nothing downstream.
+
+### Design a document tool for an agent that accepts uploads mid-conversation. What does it return?
+- **Typed blocks with page numbers,** tables serialized as Markdown, headers and footers removed, so the agent
+  can cite and answer column-aware questions.
+- **A latency split:** native and OCR inline within the tool call, layout and vision tiers queued in the
+  background and cached by page hash.
+- **Explicit gaps:** `pending_pages` and `needs_review` pages in the result, with an instruction not to answer
+  from them, so silence is never mistaken for "not in the document".
 
 ### When would you skip the tier ladder?
 - **A corpus that is almost entirely scans:** start at OCR, since tier one would fail nearly every page.
@@ -369,3 +435,25 @@ retrieve the correct table chunk.
 > Native extraction reads the PDF's text layer; scans have none, so the output is empty even though the
 > pages are full of content. The gate exists precisely to catch this and route the documents to OCR
 > instead of indexing them as empty.
+
+## Use cases & projects
+### Use cases
+- **Contract and claims agents.** Mixed born-digital and scanned files need per-page routing so the agent sees
+  the signed annex, not an empty page.
+- **Financial-report question answering.** Tables kept as cell grids and Markdown let an agent answer "Q3
+  revenue" from the right column and cite the page.
+- **Chat with your uploaded file.** A `read_document` tool runs cheap tiers inline and escalates the rest in
+  the background, reporting pending pages to the agent.
+- **Knowledge-base hygiene.** Header and footer removal plus a quality gate stop boilerplate chunks from
+  crowding the agent's top-k.
+
+### Mini project
+**Build a tiered `read_document` tool for an agent (2-3 hours).**
+- **Goal:** an agent tool that parses a mixed PDF, reports what it could not read, and lets the agent cite
+  pages.
+- **Steps:** collect five PDFs (one born-digital, one scanned, one two-column, one table-heavy, one mixed);
+  implement native and OCR tiers with PyMuPDF and Tesseract plus the quality score; add `strip_repeating`;
+  return typed blocks and `pending_pages`; wire it into a small tool-calling agent and ask 10 questions,
+  including two whose answers sit on scanned pages.
+- **Done when:** a table shows tier per page and quality scores for each file, the agent cites page numbers in
+  its answers, and for pending pages it says they are still processing instead of answering.

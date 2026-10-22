@@ -5,7 +5,7 @@ name: Self-host vs API
 kind: decision
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - system-design/build-vs-buy
@@ -72,13 +72,15 @@ effective_$ per 1M tokens = gpu_hourly_cost × 1e6 / (tokens_per_second × 3600 
 
 ### Agent workloads change the inputs
 - **Tokens per task, not per request.** Context at step *k* is prefix + all earlier tool calls and results,
-  so input grows roughly quadratically with step count while output stays small.
-- **Prefill-heavy mix.** A 37:1 input-to-output ratio is ordinary for agents, so a cost model sized on
-  decode throughput alone underestimates GPUs; prefix caching (provider prompt caching, or
-  `enable_prefix_caching` in vLLM) is the biggest lever on both sides.
+  so a task's total input grows roughly quadratically with step count while output stays small.
+- **Prefill-heavy mix.** Input-to-output ratios like the 37:1 in the example below are ordinary for
+  agents, so a cost model sized on decode throughput alone underestimates GPUs. Prefix caching (provider
+  prompt caching, or `enable_prefix_caching` in vLLM, on by default in recent releases) is the biggest
+  lever on both sides.
 - **Tool calling is a capability gate.** The hosted model must emit valid tool calls in the format your
-  framework parses. vLLM's OpenAI-compatible server can return tool calls, but only with a model and parser
-  configured for it; test it on your tool schemas before costing the move.
+  framework parses. vLLM's OpenAI-compatible server returns tool calls only when started with
+  `--enable-auto-tool-choice` and a `--tool-call-parser` that matches the model; test it on your tool
+  schemas before costing the move.
 - **Per-step placement.** A planner that needs frontier reasoning and a high-volume classifier or
   extractor step are different decisions; most savings come from moving the narrow step.
 
@@ -136,15 +138,15 @@ utilisation with people included; most paths end in the API or a hybrid split.
 
 ```mermaid
 flowchart TD
-    S["New agent step or quarterly review"] --> C{"Hard constraint? air gap, adapters, version pin"}
+    S["New agent step or quarterly review"] --> C{"Air gap, adapters or version pin?"}
     C -->|"yes"| H["Self-host this step"]
-    C -->|"no"| T{"Do zero-retention terms or an in-cloud platform satisfy legal?"}
+    C -->|"no"| T{"Zero-retention or in-cloud terms satisfy legal?"}
     T -->|"no"| H
-    T -->|"yes"| E{"Open model passes golden set and tool-call eval?"}
+    T -->|"yes"| E{"Open model passes golden and tool evals?"}
     E -->|"no"| A["Stay on the API"]
     E -->|"yes"| U{"Cheaper at real peak, people included?"}
     U -->|"no"| A
-    U -->|"yes"| HY["Hybrid: move this step, keep the rest on the API"]
+    U -->|"yes"| HY["Hybrid: move only this step"]
     A -.->|"revisit as volume and prices move"| S
     HY -.->|"revisit quarterly"| S
 ```
@@ -199,6 +201,16 @@ flatten the peak ratio to 1.5.
 | Base inputs above | about $10,800 | $24,775 | 7 | 29% | API |
 | 5× traffic, $1.50/h reserved, peak ratio 1.5 | $54,000 | about $29,520 | 16 | 64% | Self-host |
 
+- **Sweep the volume and the crossover is set by utilisation, not GPU price.** Same inputs, 5 prompt
+  tokens per output token (API $1.35 per 1M output tokens):
+
+| Output tokens / month | API | On-demand, peak ratio 3 | Reserved $1.50/h, peak ratio 1.5 |
+|---|---|---|---|
+| 8B | $10,800 | $24,775 (7 GPUs) | $16,380 (4 GPUs) |
+| 20B | $27,000 | $41,200 (16 GPUs) | $20,760 (8 GPUs): self-host wins |
+
+- **On-demand at peak ratio 3 never catches up in this model:** each extra 1B output tokens a month adds
+  about $1,400 of GPUs against $1,350 of API, so higher volume alone does not flip it.
 - **Caveat:** the model ignores prefill compute, which matters when prompts are five times longer than
   outputs, and matters far more for agents at 37:1. Benchmark aggregate throughput on your real traffic
   before trusting it.
@@ -208,6 +220,7 @@ The agent code never names a vendor; a step's entry in config decides where it r
 OpenAI-compatible API, so the hosted step is a `base_url` and model-name change.
 
 ```python
+import os
 from openai import OpenAI
 
 STEPS = {   # per-step placement; edit config, not agent code, to move a step
@@ -219,8 +232,9 @@ _clients = {}
 def call(step, messages, tools=None):
     cfg = STEPS[step]
     key = cfg["base_url"] or "default"
-    if key not in _clients:
-        _clients[key] = OpenAI(base_url=cfg["base_url"]) if cfg["base_url"] else OpenAI()
+    if key not in _clients:   # own key for vLLM (its --api-key), so the provider key never leaves for it
+        _clients[key] = (OpenAI(base_url=cfg["base_url"], api_key=os.environ.get("VLLM_API_KEY", "none"))
+                         if cfg["base_url"] else OpenAI())
     resp = _clients[key].chat.completions.create(model=cfg["model"], messages=messages,
                                                   **({"tools": tools} if tools else {}))
     u = resp.usage   # log per step: this feeds the break-even model

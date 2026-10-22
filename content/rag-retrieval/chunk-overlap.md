@@ -5,7 +5,7 @@ name: Chunk overlap
 kind: concept
 difficulty: intro
 est_minutes: 10
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - rag-retrieval/chunking-strategies

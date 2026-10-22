@@ -5,7 +5,8 @@ name: Production debugging
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - delivery-ownership/failure-analysis
   - delivery-ownership/incident-severity-and-escalation
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-Production debugging finds why a live system misbehaved when you cannot pause it or rely on a repeat.
-For LLM systems: stop the bleeding, rebuild the *exact* input from traces, bisect the pipeline, and
-replay with one variable changed at a time.
+Production debugging finds why a live agent misbehaved when you cannot pause it or rely on a repeat:
+stop the bleeding, rebuild the *exact* run from its trace, find the first step that went wrong, and
+replay it with one variable changed at a time.
+
+## For agent builders
+- **Why it matters for agents.** An agent run is many model calls, tool calls and retrievals chained
+  together, so "it gave a wrong answer" can start at any step. Without a trace you cannot tell a bad tool
+  result at step 3 from a bad decision at step 7.
+- **Where it shows up in your stack.** Tracing spans per model call and tool call (OpenTelemetry or your
+  framework's tracer), the run or conversation ID, recorded tool results, the resolved model snapshot,
+  and a replay harness that can restart a run from any step.
+- **What you control.** What every step logs (rendered messages, tool arguments, raw tool results),
+  whether side-effecting tools can be stubbed in replay, and whether one ID joins every span of a run.
+- **What you can skip.** Classic debugger tooling and profilers for the model itself; the leverage for
+  agents is in traces, replay and bisecting the steps of a run.
 
 ## Why it exists
 - **You cannot attach a debugger to yesterday.** In development you control the input, code version and
@@ -89,6 +102,22 @@ tool execution → post-processing. Check the intermediate output at each bounda
 
 Bisecting is logarithmic in the number of stages, which is why it beats reading the whole trace linearly.
 
+### 5b. Bisect an agent run by step
+An agent repeats that chain once per step, so a run is a sequence of (model decision, tool call, tool
+result) triples. Find the **first divergent step**, because every later step inherits its error.
+
+| What step k shows | Where the bug is |
+|---|---|
+| Tool result wrong or truncated, decision reasonable | The tool or its integration |
+| Tool result fine, model picked the wrong tool or arguments | Tool descriptions, prompt or model |
+| Loop never stops, same call repeated | Stop condition, step budget or error handling |
+| Early steps fine, later steps forget facts | Memory or context compaction |
+
+- **Compare against a good run** of the same task: the step where the two transcripts first differ is
+  where to look.
+- **Replay from step k**, not from step 1, by feeding recorded tool results for steps before k, so the
+  earlier, already-correct steps cannot drift and hide the bug.
+
 ### 6. Replay with one variable changed, many times
 1. **Measure the baseline.** Replay the reconstructed input N times at the logged parameters to get a
    failure rate.
@@ -127,7 +156,8 @@ The same scope-trace-bisect loop applies, but the evidence is the span waterfall
 - **Close the logging gaps found in step 4** in the same change.
 
 ## Diagram
-Mitigation comes before diagnosis; the replay loop changes one factor at a time until the stage is found.
+Mitigation comes before diagnosis; the replay loop changes one factor at a time until the stage, or
+the first bad agent step, is found.
 
 ```mermaid
 flowchart TD
@@ -138,7 +168,7 @@ flowchart TD
     M --> S
     S --> T["Pull failing and good traces"]
     T --> X["Reconstruct exact input"]
-    X --> B["Bisect pipeline stages"]
+    X --> B["Bisect stages and agent steps"]
     B --> P["Replay N times, change one factor"]
     P -->|"rate unchanged"| B
     P -->|"rate drops"| F["Fix plus regression case"]
@@ -208,6 +238,54 @@ for n in (20, 100, 300):
 print(replays_needed(0.10), replays_needed(0.01))   # 29 299
 ```
 
+### Agent replay from the first bad step, with tools stubbed
+Replays step `k` of a recorded agent run. Earlier steps and every tool call are served from the trace,
+so nothing live is executed and only the decision at step `k` is sampled again. `complete` is your
+provider call; it returns the model's next tool call (or final answer) as a dict.
+
+```python
+import json
+from collections import Counter
+
+def complete(messages, model, tools, **params) -> dict:
+    raise NotImplementedError("call your provider SDK here")
+
+def messages_before(run, k):
+    """Rebuild the exact transcript the model saw before step k from recorded steps."""
+    msgs = list(run["initial_messages"])
+    for step in run["steps"][:k]:
+        msgs.append(step["assistant_message"])           # recorded tool call
+        msgs.append({"role": "tool", "tool_call_id": step["call_id"],
+                     "content": step["raw_tool_result"]})  # recorded result, never re-executed
+    return msgs
+
+def replay_step(run, k, n=20, **overrides):
+    t = {**run, **overrides}                              # one factor at a time
+    msgs = messages_before(t, k)
+    picks = [complete(msgs, t["model"], t["tools"], **t["params"]) for _ in range(n)]
+    return Counter(p.get("tool_name", "final_answer") for p in picks)
+
+run = json.load(open("run_4c19.json"))   # rendered messages, model snapshot, params, steps
+print(replay_step(run, k=3))             # e.g. Counter({'cancel_order': 9, 'lookup_order': 11})
+```
+
+- **Reading the result:** if step 3 picks `cancel_order` 9 times in 20 at the logged inputs, the bad
+  decision reproduces at that step; now change only the tool descriptions, or only the model, and count
+  again.
+
+### Worked scenario: an agent loop that ran 41 steps
+A support agent normally finishes in about 6 steps. After a release, cost per conversation tripled
+(numbers illustrative).
+
+| Step | Evidence | Conclusion |
+|---|---|---|
+| Scope | p50 steps 6, p99 steps 41 since Tuesday's deploy | A minority path, an event |
+| Trace diff | Long runs call `search_orders` again and again | Loop at the tool step |
+| First divergent step | Step 4: the tool returns an error string, the model retries with the same arguments | Error handling |
+| Change log | The deploy renamed a field the tool expects | Candidate cause |
+| Replay step 4, n=20, tools stubbed | Same retry chosen 20 of 20 | Reproduced, deterministic |
+| Fix | Restore the field, return a structured error, cap identical calls per run, add the run as a regression case | Closed |
+
 ### Worked incident: wrong refund window
 | Step | Evidence | Conclusion |
 |---|---|---|
@@ -231,6 +309,9 @@ print(replays_needed(0.10), replays_needed(0.01))   # 29 299
 - **Sampled full-payload capture with redaction.** When: volume or PII makes logging everything costly.
   How: keep full rendered prompts for a fixed sample plus every errored or flagged request, redact before
   storage, and set a retention window. Monitor: time-to-reproduce and storage per day.
+- **One span per agent step.** When: any tool-calling loop. How: emit a child span for each model call
+  and each tool call under the run's root span, with the step number, tool name, arguments and a hash or
+  copy of the raw result. Monitor: steps per run (p50 and p99) and identical repeated tool calls per run.
 - **Change log joined to dashboards.** When: always. How: emit an annotation event for every deploy,
   prompt edit, flag flip and index rebuild onto the same time axis as error and quality metrics. Monitor:
   fraction of incidents whose onset lines up with a logged change.
@@ -261,10 +342,13 @@ print(replays_needed(0.10), replays_needed(0.01))   # 29 299
 - **Replaying with live tools.** Symptom: duplicate side effects (a second email or refund) or replays
   whose tool outputs differ from the trace, so the "reproduction" is not one. Fix: stub to recorded
   results.
+- **Replaying an agent from step 1 to debug step 7.** Symptom: earlier steps take a different path each
+  replay, so the failure seems to vanish. Fix: replay from the first divergent step with earlier tool
+  results served from the trace.
 
 ## When to use
-- **Use when:** a live system produces wrong, slow or failed results and the cause is not obvious from one
-  error message.
+- **Use when:** a live agent or LLM system produces wrong, slow, looping or failed results and the cause
+  is not obvious from one error message.
 - **Invest upfront:** trace IDs threaded through every stage, rendered prompts and retrieval results
   captured (or sampled), a change log, and a replay harness. This is the investment that pays for itself.
 - **Measure:** time-to-reproduce. If most investigations stall at "cannot reproduce", the problem is
@@ -319,11 +403,21 @@ then swap only the retrieved context to confirm the cause, and add the case to t
 - **Size the replay to the original rate.** A 1% failure needs roughly 300 clean replays before "0%"
   means fixed.
 
-### What must a trace contain for an LLM request to be debuggable later?
+### An agent took a wrong action at step 7 of 12. How do you find out why?
+- **Find the first divergent step.** Compare the run's transcript with a good run of the same task; the
+  error often starts earlier than the visible action, for example a truncated tool result at step 5.
+- **Replay from that step with tools stubbed.** Rebuild the transcript from recorded steps, sample the
+  decision 20 or more times, then change one factor: tool description, model, or the tool result itself.
+- **Close it** with the run added to the agent's regression suite.
+
+### What must a trace contain for an agent run to be debuggable later?
 - **Rendered messages** and the resolved model snapshot, not the template or alias.
 - **Sampling and format parameters**, tool schemas, retrieved chunk IDs with their text at the time, and
   every raw tool result including errors.
-- **A trace ID shared across stages**, so retrieval, model and tool spans can be joined.
+- **One run ID shared across stages and one span per step**, so retrieval, model and tool spans can be
+  joined in order.
+- **Record-and-stub replay** so any run can be restarted from any step without side effects, plus a
+  change log on the same time axis as steps-per-run, tool error rate and cost per run.
 
 ## Quiz
 ### Q: Why should you replay a reconstructed LLM request many times rather than once?
@@ -349,3 +443,24 @@ then swap only the retrieved context to confirm the cause, and add the case to t
 - [x] Capture sample trace IDs and config, then roll back the prompt change
 > Mitigation precedes diagnosis when users are being harmed, but grabbing evidence first keeps the
 > investigation possible after the rollback erases the live state.
+
+## Use cases & projects
+### Use cases
+- **Support agents giving wrong policy answers.** Trace the run, check whether retrieval returned the
+  current page, and replay with the historical context to confirm.
+- **Coding and ops agents that loop.** Steps-per-run p99 spikes; the first divergent step usually shows a
+  tool error the model keeps retrying.
+- **Agents that took a harmful action.** Replay the decision step with tools stubbed so the investigation
+  never re-issues the refund, email or deletion.
+- **Silent provider model updates.** The resolved snapshot in the trace changes with no deploy on your
+  side, and replays at old and new snapshots isolate the cause.
+
+### Mini project
+**Build a step-level replay harness for a small agent (2-3 hours).**
+- **Goal:** turn any recorded agent run into a reproducible test that restarts from a chosen step.
+- **Steps:** build a 3-tool agent (one tool side-effecting, such as a fake `send_email`); log every step
+  as a JSON record with rendered messages, tool name, arguments and raw result; write `replay_step(run, k,
+  n)` that serves recorded results for earlier steps and stubs every tool; inject a bug (a tool that
+  returns a truncated result) and use the harness to locate it.
+- **Done when:** the harness reports the first divergent step and a failure rate over 20 replays, never
+  calls a live tool, and the failing run is saved as a regression case that passes after the fix.

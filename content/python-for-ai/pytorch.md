@@ -5,7 +5,7 @@ name: PyTorch (tensors, autograd, nn.Module, DataLoader, device)
 kind: tool
 difficulty: core
 est_minutes: 20
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - python-for-ai/numpy
@@ -306,7 +306,7 @@ Plain fp32 training with AdamW, before activations, for example a 1B model tuned
 ## Trade-offs
 - **In-process tool model vs separate model server.** Loading the embedder or router inside the agent
   process is simplest and has no network hop, but it ties GPU memory to agent replicas and blocks the
-  event loop. A dedicated server batches across agents and scales separately; it wins once several agent
+  event loop unless offloaded to a worker thread. A dedicated server batches across agents and scales separately; it wins once several agent
   replicas or teams share the model.
 - **Eager debuggability vs per-op overhead.** Define-by-run makes debugging trivial, but per-op Python
   overhead hurts small models. `torch.compile` recovers speed by tracing to fused kernels, at the cost of

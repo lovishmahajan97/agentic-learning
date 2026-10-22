@@ -31,7 +31,8 @@ agent completes tasks.
   example on agent traces), perplexity on a fixed text is the fastest regression check, and token
   log-probabilities on a tool call are a cheap confidence signal for escalation.
 - **Where it shows up in your stack.** Fine-tuning loss curves (log-perplexity), `llama-perplexity` in
-  llama.cpp, the logprobs option many model APIs and engines expose, and contamination checks in evals.
+  llama.cpp, the logprobs option of self-hosted engines such as vLLM and of some hosted APIs, and
+  contamination checks in evals.
 - **What you control.** The fixed eval text, window and stride you check into the repo, the threshold
   that blocks a quantised build, and whether low-logprob tool calls are retried or escalated.
 - **What you can skip.** Compression theory and the history of the metric. Know why it is not comparable
@@ -166,8 +167,10 @@ flowchart TD
 
 ## Examples
 ### Agent scenario: gate a tool call on its own perplexity
-Many APIs and serving engines can return per-token log-probabilities. Perplexity over just the generated
-tool call, plus its least confident token, is a cheap signal for "execute" versus "escalate".
+Self-hosted engines and some hosted APIs can return per-token log-probabilities. Perplexity over just the
+generated tool call, plus its least confident token, is a cheap signal for "execute" versus "escalate".
+Check that your provider returns logprobs for tool-call output, not only for text content; if it does not,
+generate the call as JSON text on a self-hosted engine.
 
 ```python
 import math

@@ -5,7 +5,8 @@ name: Technical documentation
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - system-design/adrs
   - deployment/runbooks
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-Technical documentation keeps a system working when its builders are gone. It works when each document
-has one reader and one job, lives next to the code, has an owner and is checked for staleness. AI systems
-add model, prompt, eval and failure-mode pages.
+Documentation keeps an agent working when its builders are gone. Each document needs one reader, one
+job, an owner and a staleness check. Agents add model, prompt, tool, eval and failure-mode pages, and
+tool descriptions are docs the model itself reads.
+
+## For agent builders
+- **Why it matters for agents.** An agent's behaviour lives in artefacts that are not obviously code:
+  model snapshot, system prompt, tool schemas, retrieval index, eval set. When a run goes wrong, the first
+  question is which of those changed, and only versioned docs and registries answer it.
+- **Where it shows up in your stack.** Tool names, descriptions and parameter docs in your tool schemas
+  (the model reads them on every call), an agent system card, runbooks for agent alerts, decision records
+  for loop design, and repository instruction files that coding agents read.
+- **What you control.** One reader per document (human operator or model), docs changed in the same pull
+  request as the prompt or tool, versions pulled from the manifest, and drills that test runbooks.
+- **What you can skip.** Documentation-tool debates and style guides beyond the four Diátaxis types. The
+  mechanism that forces updates at the moment of change is what matters.
 
 ## Why it exists
 - **Systems outlive their builders' attention.** The forward-deployed engineer rotates to the next
@@ -80,6 +93,22 @@ For a system handed to a customer or another team, the minimum set usually maps 
   This borrows the model-card idea and extends it to the whole system.
 - **Operations and support guide**: who owns what, escalation paths, SLAs, how to roll back.
 
+### What agents add to the set
+- **Tool reference doubles as model context.** Each tool's name, description and parameter docs are sent
+  to the model and decide when and how it calls the tool, *because* the model has nothing else to go on.
+  Write them like a how-to for a competent reader: what it does, when to use it, what not to pass.
+- **Agent system card.** Extend the AI system card with the tool list and each tool's permissions (read
+  or write, which systems), step and token caps, human-approval points and the handoff path, *because*
+  security reviewers ask "what can this agent do on its own?" first.
+- **Agent runbooks.** Write one per agent alert: runaway loops hitting the step cap, a tool error spike,
+  completion-rate drop, duplicated writes. The first safe action is usually a prompt or model rollback or
+  disabling one tool behind a flag.
+- **Decision records for loop design.** Record why a step cap is 12, why a tool needs approval or why a
+  retry exists, so a new owner does not "simplify" a guard that prevents a known failure.
+- **Instruction files for coding agents.** If agents work in the repository, a short instruction file at
+  its root (build, test and convention commands) is reference written for an agent reader; keep it under
+  the same freshness checks.
+
 ### Docs as code
 1. **Keep documents in the repository,** change them in the same pull request as the code, and review
    them with it.
@@ -114,12 +143,12 @@ same reason: an unexercised path should be presumed broken.
   history.
 
 ## Diagram
-The loop that keeps docs true: every change passes the invalidation question and the freshness check,
-and every stall found by a drill goes back in as a doc fix.
+The loop that keeps an agent's docs true: every prompt, tool or config change passes the invalidation
+question and the freshness check, and every stall found by a drill goes back in as a doc fix.
 
 ```mermaid
 flowchart TD
-    C["Code, prompt or config change"] --> PR["Pull request"]
+    C["Prompt, tool or config change"] --> PR["Pull request"]
     PR --> Q{"Which docs does this invalidate?"}
     Q --> CI["CI: links, samples, freshness"]
     CI -->|"stale doc"| U["Update doc in same PR"]
@@ -192,6 +221,39 @@ Stop and escalate if: queue age still rises 15 minutes after rollback,
 or any job shows a partial ERP write. Call the platform on-call (see ops guide).
 ```
 
+### Agent system card generated from the tool registry
+The tool list in the card is rendered from the same definitions the agent sends to the model, so the
+card cannot drift from what the agent can actually do. The registry shape and names are illustrative.
+
+```python
+TOOLS = [  # the same list the agent loop passes to the model
+    {"name": "search_invoices", "description": "Find invoices by vendor or number. Read-only.",
+     "access": "read", "system": "ERP", "approval": False},
+    {"name": "post_invoice", "description": "Post one validated invoice to the ERP ledger.",
+     "access": "write", "system": "ERP", "approval": True},
+]
+MANIFEST = {"model": "provider-model-2025-01-15", "prompt": "invoice-agent@v14",
+            "index": "vendors-2025-02", "max_steps": 12, "eval_pass_rate": 0.94}
+
+def render_card(tools, manifest):
+    lines = ["# Agent system card: invoice agent", ""]
+    lines += [f"- {k}: {v}" for k, v in manifest.items()]   # pulled, never typed
+    lines += ["", "| Tool | Access | System | Human approval |", "|---|---|---|---|"]
+    lines += [f'| {t["name"]} | {t["access"]} | {t["system"]} | {"yes" if t["approval"] else "no"} |'
+              for t in tools]
+    writes = [t["name"] for t in tools if t["access"] == "write" and not t["approval"]]
+    if writes:
+        lines.append(f"\nWARNING: unapproved write tools: {', '.join(writes)}")
+    return "\n".join(lines)
+
+print(render_card(TOOLS, MANIFEST))
+```
+
+- **Why generate it:** a reviewer asking "can this agent write to the ERP without a human?" gets an answer
+  that matches production, *because* the card and the agent read the same list.
+- **Run it in CI:** publish the card per release tag, and fail the build if a write tool lacks an
+  approval decision recorded in an ADR.
+
 ## Production patterns
 - **Full-history checkout for doc checks** — when a CI job compares commit times, fetch full history;
   with GitHub Actions that is `actions/checkout` with `fetch-depth: 0`, since its default fetches only
@@ -208,6 +270,10 @@ or any job shows a partial ERP write. Call the platform on-call (see ops guide).
 - **Doc drills before handoff** — schedule a tabletop incident and a customer-operator rollback using
   only the docs, and file each stall as a doc bug with an owner. Monitor stalls per drill and time to
   find the first safe action.
+- **Tool descriptions reviewed like prompts** — treat changes to a tool's name, description or parameter
+  docs as behaviour changes: version them with the prompt, run the agent eval set before merging, and
+  regenerate the system card. Monitor tool-selection errors and invalid-argument rates per tool after each
+  change.
 
 ## Trade-offs
 - **Docs as code vs editor reach.** It keeps documentation current with changes, but non-engineers find
@@ -221,6 +287,9 @@ or any job shows a partial ERP write. Call the platform on-call (see ops guide).
 - **Detailed runbooks vs judgement.** They shorten recovery for known failures, but encourage blind
   command-following; they need a "stop and escalate if" line for situations outside what the author
   anticipated.
+- **Rich tool descriptions vs context budget.** Detailed descriptions cut wrong tool calls, but every
+  word is sent on every model call and costs tokens; it flips toward terse descriptions plus a reference
+  page when the agent has dozens of tools and the descriptions dominate the prompt.
 
 ## Pitfalls
 - **Mixing tutorial, reference and rationale in one page.** Symptom: readers asking questions in chat
@@ -235,10 +304,16 @@ or any job shows a partial ERP write. Call the platform on-call (see ops guide).
   assumes access, tools or tribal context the customer's operator does not have.
 - **Leaving documents without owners.** Symptom: a wiki where every page has a "this may be out of date"
   banner and nobody trusts any of it.
+- **Hand-maintaining the agent's tool list in the docs.** Symptom: a security review approves an agent
+  whose card omits a write tool added last sprint. Fix: render the tool table from the registry.
+- **Vague tool descriptions.** Symptom: the agent calls the wrong tool or passes malformed arguments, and
+  the team tunes the system prompt instead. Fix: rewrite the description and parameter docs, then re-run
+  evals.
 
 ## When to use
 - **Use when:** someone other than the current author must operate, review, extend or approve the
-  system, which for delivered work is always.
+  agent, which for delivered work is always; tool descriptions are needed from the first prototype,
+  because the model reads them.
 - **Start early** with the architecture overview and decision records, *because* security reviews and
   design debates need them; write runbooks with the alerts they serve; write the handoff and system
   card before the people who know the answers leave.
@@ -275,7 +350,7 @@ invalidates, and CI checks links and freshness. I would run one tabletop inciden
   template question about invalidated docs, and CI freshness checks.
 - **Plus ownership:** every document has a named owner and a review date.
 
-### Output quality changed last week and nobody knows why. What documentation would have answered it in minutes?
+### Your agent's output quality changed last week and nobody knows why. What documentation would have answered it in minutes?
 - **An AI system card** listing the deployed model, prompt and index versions, pulled from the registry
   or manifest rather than typed.
 - **Per-release tagging** of docs and versions, so you can diff what ran last week against what runs now.
@@ -299,6 +374,13 @@ invalidates, and CI checks links and freshness. I would run one tabletop inciden
 - **Fix it** by fetching full history or the merge base in that job, then confirm the check fails on a
   test change to a covered path.
 - **Also check coverage:** docs without a `covers:` line are skipped silently.
+
+### A security reviewer asks what your agent can do without a human. Which documents answer that, and how do you keep them true?
+- **The agent system card:** tools with read or write access, target systems, approval points, step and
+  token caps, and the handoff path.
+- **Decision records** for each write tool explaining why it needs approval or why it does not.
+- **Keep it true by generation:** render the tool table from the same registry the agent loop sends to
+  the model, publish it per release, and fail CI on an unapproved write tool.
 
 ## Quiz
 ### Q: Why separate how-to guides from tutorials instead of writing one combined guide?
@@ -324,3 +406,23 @@ invalidates, and CI checks links and freshness. I would run one tabletop inciden
 - [ ] It makes the documentation publicly visible
 > Staleness is cheapest to catch at the moment of change. Co-locating docs lets review and CI tie them to
 > the code change; ownership is still needed, and visibility depends on repository settings.
+
+## Use cases & projects
+### Use cases
+- **Handing an agent to a customer's operations team.** Runbooks for agent alerts, the operations guide
+  and the agent system card let their on-call roll back a prompt or disable a tool without you.
+- **Security and compliance review of an agent.** The data-flow overview and a generated tool and
+  permission table answer "what can it touch, and who approves writes?"
+- **Debugging a behaviour change.** Per-release cards with pulled model, prompt, tool and index versions
+  let you diff what ran last week against what runs now.
+- **Improving tool-call accuracy.** Rewriting tool descriptions and parameter docs, then re-running evals,
+  is often cheaper than more prompt engineering.
+
+### Mini project
+**Generated agent system card with a freshness gate (1-2 hours).**
+- **Goal:** produce documentation for a small tool-calling agent that cannot drift from what it runs.
+- **Steps:** take an agent with three or four tools (at least one write tool); render a system card from
+  its tool registry and a version manifest, as in the example; write one runbook for "step cap hit rate
+  rising" with a `covers:` line; add the freshness check to CI with full-history checkout.
+- **Done when:** adding a tool changes the card automatically, editing the prompt without touching the
+  runbook fails CI, and a teammate can disable a tool using only the runbook.

@@ -5,7 +5,7 @@ name: Multi-tenancy
 kind: concept
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - system-design/tenant-isolation
@@ -235,6 +235,7 @@ async def run_agent_job(msg: dict):
         await meter.record(tenant_id, run_id=run_id, model=cfg.model,
                            input_tokens=reply.usage.input_tokens,
                            output_tokens=reply.usage.output_tokens)
+        messages.append(reply.message)                         # assistant turn incl. tool calls
         if not reply.tool_calls:
             await mem.save(msg["task"], reply.text)
             return reply.text

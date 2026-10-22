@@ -5,7 +5,8 @@ name: Llama Guard
 kind: tool
 difficulty: core
 est_minutes: 13
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - safety-security/content-moderation
   - safety-security/input-output-guardrails
@@ -19,9 +20,22 @@ sources:
 ---
 
 ## TL;DR
-Llama Guard is Meta's open-weight content-safety classifier: a fine-tuned Llama that reads a policy and a
-conversation and generates `safe` or `unsafe` plus category codes. The policy is editable prompt text;
-it does not detect injection, PII or hallucination.
+Llama Guard is Meta's open-weight content-safety classifier for an agent's input and output rails: a
+fine-tuned Llama that reads an editable policy and a conversation and generates `safe` or `unsafe` plus
+category codes. It misses injection, PII and hallucination.
+
+## For agent builders
+- **Why it matters for agents.** A user-facing agent needs a content-safety check on what users ask and
+  what the agent says, and the main model is the wrong judge because it is the one under attack. Llama
+  Guard gives a separate, self-hostable verdict with a score you can threshold per rail.
+- **Where it shows up in your stack.** A guard endpoint (often vLLM) called from your agent's chat path,
+  or a rail inside NeMo Guardrails; Llama Guard 3's S14 code-interpreter abuse category can screen code an
+  agent is about to run.
+- **What you control.** Which categories are enforced, their wording, the threshold per rail, whether the
+  input check runs in parallel with generation, and the 1B-versus-8B choice.
+- **What you can skip.** Using it as your prompt-injection or tool-authorization defence: injected
+  instructions in tool results look benign to a hazard taxonomy. Typed tools, scopes and taint rules do
+  that job.
 
 ## Why it exists
 - **Existing moderation fits chat badly.** Hosted endpoints mean sending every prompt and reply to a third
@@ -50,6 +64,8 @@ Each request is a prompt with three parts:
   and an output rail (last message is the assistant's, judged with the user's prompt in view).
 - **The Hugging Face chat template assembles all of this,** so in code you pass a list of role/content
   messages.
+- **For agents,** the "assistant message" you check can be the final reply or the text of a proposed
+  action, such as code the agent wants to run, rendered as content.
 
 ### The output is generated, not predicted by a head
 - **Format:** `safe`, or `unsafe` on the first line and a comma-separated list such as `S2,S9` on the second.
@@ -85,11 +101,13 @@ p_unsafe = exp(z_unsafe) / (exp(z_unsafe) + exp(z_safe))
 - **Zero-shot categories work to a degree;** the paper shows accuracy on novel categories improves when you
   fine-tune on a few hundred examples.
 
-### Deployment shape
+### Deployment shape in an agent
 1. **Input check** runs in parallel with main-model generation and cancels or replaces the answer if the
    prompt is unsafe.
 2. **Output check** runs on the finished reply, or on chunks if you stream, at the cost of possibly
    retracting text already shown.
+3. **Optional action check:** before a code-execution tool runs, the proposed code can be checked against
+   the code-interpreter abuse category, as one signal next to the sandbox.
 
 - **Cheap prefill:** the policy block is identical across requests, so prefix caching in the serving engine
   removes most of its cost, and generation is only a handful of tokens.
@@ -105,8 +123,8 @@ p_unsafe = exp(z_unsafe) / (exp(z_unsafe) + exp(z_safe))
 | NeMo Guardrails | orchestration layer | calls Llama Guard as one rail among several |
 
 ## Diagram
-One model, two rails: the input rail judges the user's message, the output rail judges the reply with the
-question in view, and each thresholds `p_unsafe` separately.
+One model, two rails around the agent's turn: the input rail judges the user's message, the output rail
+judges the reply with the question in view, and each thresholds `p_unsafe` separately.
 
 ```mermaid
 sequenceDiagram
@@ -171,6 +189,35 @@ print(moderate([user, reply]))                   # output rail: the reply is jud
 - **Expected:** the input call comes back `unsafe` with a non-violent-crimes code (S2); the output call
   comes back `safe`, because the refusal is judged in context.
 
+### Guard rails around one agent turn
+Wraps the agent's turn with the `moderate` function above: an input rail, an optional check on code the
+agent proposes to execute, and an output rail, each with its own threshold from config. `agent_step`,
+`run_in_sandbox` and the thresholds are the application's own.
+
+```python
+THRESHOLDS = {"input": 0.5, "action": 0.3, "output": 0.4}   # chosen from labelled sweeps per rail
+REFUSAL = "Sorry, I can't help with that."
+
+def guarded_turn(history: list[dict], user_msg: str) -> str:
+    user = {"role": "user", "content": user_msg}
+    _, p_in = moderate([user])
+    if p_in > THRESHOLDS["input"]:
+        return REFUSAL                                   # in production: run in parallel, cancel the agent
+    step = agent_step(history + [user])                  # model proposes a reply or a tool call
+    if step.tool == "run_python":
+        proposed = {"role": "assistant", "content": step.args["code"]}
+        verdict, p_act = moderate([user, proposed])      # S14 code-interpreter abuse is in the policy
+        if p_act > THRESHOLDS["action"]:
+            return REFUSAL                               # a signal only; the sandbox is the real control
+        step = agent_step(history + [user], tool_result=run_in_sandbox(step.args["code"]))
+    reply = {"role": "assistant", "content": step.text}
+    _, p_out = moderate([user, reply])
+    return step.text if p_out <= THRESHOLDS["output"] else REFUSAL
+```
+
+- **What it does not cover:** a fetched page telling the agent to email data out passes all three rails,
+  because the text is not hazardous content; that is a tool-layer problem.
+
 ### Choosing a threshold per rail
 Thresholding `p_unsafe` rather than parsing the text lets the rails run at different strictness. Suppose a
 labelled sample of 500 of your own prompts (50 truly unsafe, 450 benign; illustrative numbers):
@@ -208,9 +255,12 @@ sweep(sample)
   an engine with prefix caching (vLLM's `--enable-prefix-caching`, for example), so the identical policy
   block is prefilled once. Request token log-probabilities to compute `p_unsafe` server-side. Monitor guard
   p95 latency and prefix-cache hit rate.
-- **Parallel input rail with cancellation.** Start main-model generation and the input check together;
-  if the check crosses its threshold, cancel the generation and return a fixed refusal. Monitor added
-  latency per turn (target: near zero for the input rail) and cancellation counts.
+- **Parallel input rail with cancellation.** Start the agent's first model call and the input check
+  together; if the check crosses its threshold, cancel the generation and return a fixed refusal. Monitor
+  added latency per turn (target: near zero for the input rail) and cancellation counts.
+- **Check final replies, not every intermediate step.** In a multi-step agent, run the output rail on what
+  the user sees and on consequential action text, rather than every internal thought, to keep guard calls
+  per turn bounded. Monitor guard calls per turn and cost per conversation.
 - **Per-rail, per-surface thresholds in config.** Keep thresholds and enforced categories in versioned
   config per product surface, chosen from a labelled sweep. Monitor block rate per category; a sudden shift
   usually means a traffic change or a model upgrade.
@@ -231,10 +281,13 @@ sweep(sample)
   threshold sensibly.
 - **1B speed vs recall.** The 1B model cuts latency and cost several-fold, yet recall on subtle cases is
   lower. It suits a pre-filter before the 8B model, not a replacement, when false negatives are costly.
+- **More rails per agent step vs latency.** Checking every tool call adds a guard round-trip per step; for
+  long agent loops, reserve it for code execution and user-visible output.
 
 ## Pitfalls
 - **Using Llama Guard as the prompt-injection defence.** Symptom: injected instructions in retrieved
-  documents pass straight through, because they contain nothing the hazard taxonomy recognises.
+  documents or tool results pass straight through, because they contain nothing the hazard taxonomy
+  recognises.
 - **Checking only the input.** Symptom: a benign question produces a harmful answer that nothing inspected.
 - **Taking the argmax verdict and ignoring the probability.** Symptom: a product that is too strict or too
   lax with no knob to adjust.
@@ -291,6 +344,13 @@ phrased outside its training distribution; those need domain-specific classifier
 - **Edit the policy text:** drop or reword that category for this surface, since categories are prompt text.
 - **Re-tune the threshold** on a labelled sample from this product, and run the change in shadow mode first.
 
+### Where would you place Llama Guard in a tool-using agent, and what would you not rely on it for?
+- **Place it** on the user input (in parallel with the first model call), on user-visible output, and
+  optionally on code the agent is about to execute via the code-interpreter abuse category.
+- **Do not rely on it** for injection in tool results, tool authorization or data exfiltration; those need
+  typed tools, scopes, taint rules and egress limits.
+- **Measure** block rates and latency per rail, so the guard does not quietly dominate step latency.
+
 ### How do you get a confidence score out of a model that generates text?
 - **Locate the verdict token,** skipping any leading whitespace or newline tokens.
 - **Renormalise** its logits over `safe` and `unsafe` to get `p_unsafe`, then threshold per rail from a
@@ -334,3 +394,25 @@ phrased outside its training distribution; those need domain-specific classifier
 > The verdict token carries the decision, so its probability (renormalised against `safe`) is a natural
 > confidence score; the paper evaluates this way and it lets input and output rails run at different
 > strictness, whereas sampled or self-reported numbers are not calibrated.
+
+## Use cases & projects
+### Use cases
+- **Consumer-facing chat agents.** Input and output rails with per-surface thresholds keep harmful requests
+  and replies out without blocking the product's core topics.
+- **Code-executing agents.** The code-interpreter abuse category adds a signal before the sandbox runs
+  agent-written code.
+- **Regulated or on-prem deployments.** Self-hosting keeps prompts inside the customer's boundary when a
+  hosted moderation API is ruled out.
+- **Per-customer acceptable-use policies.** Rewording or dropping categories lets one agent platform serve a
+  medical customer and a children's product with different lines.
+
+### Mini project
+**Threshold a guard for a chat agent (2-3 hours).**
+- **Goal:** pick input and output thresholds for a small agent from your own labelled data, not defaults.
+- **Steps:** label about 100 prompts and 100 agent replies as safe or unsafe for a chosen product; score
+  them with Llama Guard 3 (the 1B model is enough on a laptop GPU) using the `moderate` function; run the
+  `sweep` at several thresholds per rail; wire the chosen values into `guarded_turn` and replay ten
+  conversations, including one injected tool result.
+- **Done when:** you have a precision and recall table per rail, a written threshold choice with its
+  reason, and a note showing the injected tool result passed every rail, explaining which control should
+  catch it instead.

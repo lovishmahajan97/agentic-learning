@@ -5,7 +5,7 @@ name: Message queues (Kafka, SQS, RabbitMQ)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - backend-fundamentals/background-jobs-durable-workers
@@ -294,8 +294,8 @@ def handle_tool_call(msg):
 
 | Setting | Value | Why |
 |---|---|---|
-| p99 tool duration | ~6 min | sets the timeout floor |
-| Visibility timeout | 60 s, heartbeat every 30 s | short enough to recover a crashed worker fast |
+| p99 tool duration | ~6 min | a fixed visibility timeout would have to exceed this |
+| Visibility timeout | 60 s, heartbeat every 30 s | the heartbeat covers the 6 minutes, while a crashed worker's message reappears within a minute |
 | `maxReceiveCount` | 5 | a video that always crashes the transcriber goes to the DLQ, and the run is marked failed |
 
 The result event carries a reference, not the transcript, because a long transcript is a claim-check
@@ -510,7 +510,7 @@ older than the current state. Add a DLQ so poison messages do not block either p
   without slowing the agent loop.
 
 ### Mini project
-**Run an agent tool through a queue with exactly-once effects (2-3 hours).**
+**Run an agent tool through a queue with effectively-once side effects (2-3 hours).**
 - **Goal:** an agent whose slow tool executes on a separate worker via a queue, with no duplicate side
   effects under crashes.
 - **Steps:** use SQS (or LocalStack, or RabbitMQ in Docker); give a small agent a slow fake tool that

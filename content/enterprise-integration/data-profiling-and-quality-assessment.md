@@ -5,7 +5,8 @@ name: Data profiling & quality assessment
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - enterprise-integration/data-onboarding
   - enterprise-integration/data-mapping-and-canonical-schemas
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-Profiling measures what a client's data actually contains (nulls, value sets, formats, duplicates,
-freshness); assessment judges that against the use case as usable, fixable or blocking. Findings become
-automated checks on every load, because AI systems degrade quietly on bad data.
+Agents fail quietly on bad data. Profiling measures what a client's data contains (nulls, value sets,
+formats, duplicates, freshness); assessment judges it against what the agent reads as usable, fixable or
+blocking, and findings become checks on every load.
+
+## For agent builders
+- **Why it matters for agents.** A retrieval tool that returns "see email" or five drafts of one policy
+  makes the agent hallucinate or cite the wrong version, and it looks like a model problem. Profiling
+  the fields and documents behind each tool is how you tell a data failure from an agent failure.
+- **Where it shows up in your stack.** The ingestion pipeline feeding the agent's index, metadata filters
+  the retrieval tool applies, redaction before content reaches the model, and the eval set whose slices
+  should mirror the profile's slices.
+- **What you control.** Which fields each tool reads, placeholder registries that turn disguised nulls into
+  real missing values, near-duplicate collapse before indexing, and load-time expectations that stop a bad
+  batch reaching the agent.
+- **What you can skip.** Full data-quality frameworks for fields no tool, filter or prompt ever reads.
 
 ## Why it exists
 - **Schemas and documentation hide the quirks.** A column called `resolution_notes` is a text field; the
@@ -123,6 +136,18 @@ Classify each finding:
 
 The assessment names an owner for each and is shared with the client, because many fixes are theirs.
 
+### Profile from the agent's point of view
+Start from the agent, not the schema, because the use case defines fitness.
+1. **List what each tool reads:** the fields a record tool returns, the metadata a retrieval tool filters
+   on, the text that gets chunked and embedded.
+2. **Profile exactly those, per slice the agent serves** (tenant, region, department).
+3. **Translate findings into agent symptoms:** disguised nulls become invented answers, near duplicates
+   become crowded-out retrieval results, a 37% null slice becomes "no information found" for one region.
+4. **Mirror the slices in the agent's eval set,** so a weak slice in the profile shows up as a weak slice
+   in the scores.
+- **Tell the model what is missing.** Return placeholder values as explicit nulls in tool results, so the
+  agent says "no resolution recorded" instead of reading "see email" as content.
+
 ### From one-off profile to continuous checks
 - **Thresholds become expectations on every load:** null rate of `loss_date` below 2%, `status` within the
   agreed set, row count within a band of yesterday's.
@@ -132,7 +157,8 @@ The assessment names an owner for each and is shared with the client, because ma
 
 ## Diagram
 Profiling runs per slice on the full table for cheap metrics and on a sample for expensive ones; each
-finding gets a decision and an owner, and accepted thresholds become load-time checks.
+finding gets a decision and an owner, and accepted thresholds become load-time checks in front of the
+agent's index.
 
 ```mermaid
 flowchart TD
@@ -219,6 +245,19 @@ print(f"null rate {notes.count(None) / len(notes):.0%}, "
 print(Counter(notes).most_common(1))      # [('see email', 40)] is the tell
 ```
 
+### Agent scenario: linking eval failures to profile findings
+A resolution-suggestion agent scores 81% on its 200-question eval overall. Splitting the failures by the
+profile's slices (illustrative numbers):
+
+| Slice | Eval pass rate | Profile finding behind it | Action |
+|---|---|---|---|
+| EMEA | 90% | none material | none |
+| APAC | 52% | `resolution_notes` 37% null | source question: notes kept elsewhere? |
+| Pre-2021 tickets | 64% | notes truncated at 255 characters | exclude from retrieval or mark truncated |
+| All regions | (citations) | 212 duplicate `ticket_id` values | dedupe before indexing |
+
+No prompt change would have fixed APAC; the profile shows the agent had nothing to retrieve.
+
 ## Production patterns
 - **Baseline profile per tenant and source.** Use from onboarding on. Store the onboarding profile (per
   slice) as a versioned artifact and diff each new profile against it. Monitor per-slice null rate,
@@ -235,6 +274,9 @@ print(Counter(notes).most_common(1))      # [('see email', 40)] is the tell
 - **SME accuracy review on a schedule.** Use where answers drive decisions. A small, structured sample per
   quarter or per source change, checked against ground truth by the client's experts. Monitor the share
   of sampled values rejected.
+- **Eval slices aligned to profile slices.** Use for any agent over client data. Tag every eval question
+  with the same slice keys the profile uses, and report pass rate per slice next to the slice's profile
+  metrics. Monitor slices where a profile shift and an eval drop coincide.
 
 ## Trade-offs
 - **Sample vs full scan.** Profiling a stratified sample is fast and cheap but can miss rare problems;
@@ -263,6 +305,9 @@ print(Counter(notes).most_common(1))      # [('see email', 40)] is the tell
   versions of the same policy and answers citing an outdated draft.
 - **A profile report with no decisions or owners.** Symptom: the same findings rediscovered in the pilot,
   after users have already seen the consequences.
+- **Tuning the agent's prompt for what is a data gap.** Symptom: weeks of prompt iterations that lift one
+  slice and hurt another, while the failing slice simply has no content to retrieve. Fix: split eval
+  failures by profile slice before touching the prompt.
 - **Copying production data to a laptop to profile it.** Symptom: a security finding, because profiling
   exposes the most sensitive columns first. Fix: profile inside the approved environment.
 
@@ -318,6 +363,12 @@ reaching users.
   still allow 0.06%, and a 200-row slice allows 1.5%.
 - **So** cheap metrics run on the full table and samples are reserved for expensive checks.
 
+### Your agent fails 48% of eval questions for one region. How do you decide whether to fix the prompt or the data?
+- **Split failures by slice and read the traces:** if the retrieval tool returned empty, placeholder or
+  truncated content, it is a data problem, and the profile for that slice should show it.
+- **Fix data at its stage** (source question, pipeline fix, exclusion), re-run the eval slice, and only
+  then tune the prompt on what remains.
+
 ### When would you fix quality at the source rather than in your pipeline?
 - **When the error originates at data entry** and will keep recurring, such as a form that lets users skip
   a required field; a pipeline patch must then be maintained forever and hides the problem from the client.
@@ -355,3 +406,25 @@ reaching users.
 - [ ] Whether the nulls are stored as empty strings or as NULL
 > Quality is fitness for purpose. A sparse field the product never uses is irrelevant; the same rate on
 > a field used for filtering or answering can block the use case.
+
+## Use cases & projects
+### Use cases
+- **Pre-launch checks for a RAG agent.** Profiling the fields and documents behind each tool finds
+  disguised nulls, duplicates and scanned files before users see invented answers.
+- **Debugging an agent quality drop.** Diffing the current profile against the baseline separates a
+  source-side change from a model or prompt regression.
+- **Designing the eval set.** Profile slices tell you which regions, years and document types the agent's
+  eval questions must cover.
+- **Guarding the index.** Load-time expectations quarantine bad batches before the agent can retrieve
+  them.
+
+### Mini project
+**Profile, then explain an agent's failures (2 hours).**
+- **Goal:** show that a retrieval agent's weak slice is caused by the data, using a profile and a sliced
+  eval.
+- **Steps:** generate a ticket dataset with a region slice that has many placeholder notes and duplicates;
+  run the sliced profiler and the disguised-null check; index the notes and build a small agent that
+  suggests resolutions; write 30 eval questions tagged by region; fix the data (placeholders to nulls,
+  dedupe) and re-run.
+- **Done when:** a table pairs per-slice pass rate with per-slice profile metrics before and after the
+  data fix, with no prompt change in between.

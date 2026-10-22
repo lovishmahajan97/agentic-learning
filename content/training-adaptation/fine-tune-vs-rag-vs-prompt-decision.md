@@ -5,7 +5,7 @@ name: Fine-tune vs RAG vs prompt decision
 kind: decision
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - training-adaptation/supervised-fine-tuning
@@ -38,7 +38,7 @@ not facts. Climb only when evals prove the cheaper rung insufficient.
 - **What you control.** The failure labels, the golden set built from real agent runs, the order you
   climb, and the break-even arithmetic, which multiplies per call by steps per task.
 - **What you can skip.** Fine-tuning mechanics until the prompt rung has plateaued on a measured eval;
-  most agent teams never need to leave the first two rungs.
+  many agent teams never need to leave the first two rungs.
 
 ## Why it exists
 - **The same requests arrive every week.** "Make the agent know our stuff", "make it sound like us",
@@ -84,7 +84,8 @@ not facts. Climb only when evals prove the cheaper rung insufficient.
    target, or the prompt needed to reach it dominates per-request cost, move to a LoRA SFT on the same
    reviewed examples. Use DPO when failures are preference-shaped (two answers, one better) rather than
    right/wrong.
-4. **Economics gap → fine-tune.** Distil the big model's outputs into a smaller model, or train the
+4. **Economics gap → cache, then fine-tune.** Turn on prompt caching for the stable prefix first, since
+   it costs one deploy. If that is not enough, distil the big model's outputs into a smaller model, or train the
    few-shot block into the weights so the prompt shrinks; verify on the same eval set that quality held.
    In agents, a common first target is the high-volume, narrow step (routing or argument extraction).
 5. **Combine.** The usual production end state is RAG for facts, a fine-tuned or well-prompted model for
@@ -409,8 +410,8 @@ Propose the measurement plan up front so each step is justified by a number, not
 
 ## Use cases & projects
 ### Use cases
-- **Triage after an agent eval regresses.** Label each failed trace as a behaviour, knowledge or
-  capability gap, then pick prompt, retrieval or fine-tune per label instead of one fix for everything.
+- **Triage after an agent eval regresses.** Label each failed trace as a knowledge, behaviour or
+  economics gap, then pick retrieval, prompt or fine-tune per label instead of one fix for everything.
 - **"Make the agent know our docs" requests.** Route them to a search tool with citations and per-tenant
   filters, because fine-tuning facts is weak, frozen and impossible to delete.
 - **Cutting cost on a high-volume agent step.** A router or extraction step with a long few-shot prompt is
@@ -421,9 +422,11 @@ Propose the measurement plan up front so each step is justified by a number, not
 ### Mini project
 **Build a failure-to-lever triage report for one agent (1-3 hours).**
 - **Goal:** turn a pile of failed agent runs into a ranked list of fixes, each tied to the right rung.
-- **Steps:** collect 30-50 failed traces from a small agent you own (or a sample tool-calling agent);
-  label each as wrong tool, missing knowledge, ignored context, format or cost; route labels with the
-  triage script from Examples; apply the cheapest fix for the top label (a tool-description edit or a
-  search tool) and re-run the same traces as an eval.
+- **Steps:**
+  1. Collect 30-50 failed traces from a small agent you own (or a sample tool-calling agent).
+  2. Label each with one of the triage script's gaps: `knowledge`, `wrong_tool`, `bad_args`,
+     `ignores_context` or `economics`, and run the script from Examples.
+  3. Apply the cheapest fix for the top label (a tool-description edit, a strict schema or a search
+     tool) and re-run the same traces as an eval.
 - **Done when:** you have a table of failure counts per label and per lever, a before/after pass rate for
   the fix you applied, and a written break-even estimate for the one case where fine-tuning might win.

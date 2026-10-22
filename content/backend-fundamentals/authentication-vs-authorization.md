@@ -5,7 +5,7 @@ name: Authentication vs authorization
 kind: concept
 difficulty: intro
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - backend-fundamentals/oauth-2-0-oidc

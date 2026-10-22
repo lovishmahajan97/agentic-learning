@@ -5,7 +5,8 @@ name: Acceptance testing against customer KPIs
 kind: practice
 difficulty: advanced
 est_minutes: 18
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - scoping/success-metrics-kpis
   - scoping/baseline-measurement-before-deployment
@@ -18,9 +19,22 @@ related:
 ---
 
 ## TL;DR
-The pre-agreed test that decides acceptance: business KPIs become proxies, thresholds and sample sizes,
-signed before results are seen, then measured offline and in a pilot against a baseline. "Scores 91%"
-does not answer "did invoice cost fall without more errors?"
+The pre-agreed test that decides whether a customer accepts your agent: business KPIs become proxies,
+thresholds and sample sizes, signed before results, then measured offline and in a pilot against a
+baseline. "Scores 91%" does not answer "did invoice cost fall without more errors?"
+
+## For agent builders
+- **Why it matters for agents.** Your agent ships only when the sponsor signs off, and they sign off on
+  business outcomes. Task success on your eval is one proxy among several; the contract decides what
+  "done" means for the whole build.
+- **Where it shows up in your stack.** An acceptance config read by your eval harness, a shadow or pilot
+  mode where the agent proposes and humans decide, per-segment reports with intervals, and production
+  guardrail alerts with a rollback trigger after launch.
+- **What you control.** Which agent metrics map to which KPI (straight-through rate, escalation rate,
+  critical-error rate, cost and latency per task), the feasibility check before signature, and routing
+  untestable segments to humans.
+- **What you can skip.** Deriving the interval formulas; use Wilson intervals and the power formula here,
+  and know that halving the gap quadruples the sample.
 
 ## Why it exists
 - **A customer buys an outcome, not an accuracy number.** The sponsor's success statement is in business
@@ -37,7 +51,7 @@ does not answer "did invoice cost fall without more errors?"
 - **Naive alternatives prove nothing or the wrong thing:** accepting on a demo, or on a single overall
   accuracy number.
 - **What it buys:** an explicit deal. These metrics, measured this way, on this data, with these thresholds
-  and this much confidence, mean the system is accepted.
+  and this much confidence, mean the agent is accepted.
 
 ## How it works
 ### 1. Start from the KPI tree
@@ -46,11 +60,11 @@ does not answer "did invoice cost fall without more errors?"
    reaching payment.
 3. **Measurable proxies:** map each driver to something measurable offline or in a pilot. Offline evals
    can measure accuracy and straight-through eligibility; only a pilot can measure time and behaviour change.
-- **Why explicit:** the tree shows which model metric moves which business number.
+- **Why explicit:** the tree shows which agent metric moves which business number.
 
 ### 2. Measure the baseline
 - **Measure the current process on the same kind of sample:** human error rate, handle time, throughput.
-- **Without it,** thresholds are guesses and the system is held to a standard of perfection the humans never met.
+- **Without it,** thresholds are guesses and the agent is held to a standard of perfection the humans never met.
 
 ### 3. Define criteria of three types
 | Type | Examples | Why |
@@ -59,6 +73,10 @@ does not answer "did invoice cost fall without more errors?"
 | **Guardrails** | must not get worse: critical-field error rate, compliance violations, escalation rate | optimising one KPI often degrades another |
 | **Segment floors** | minimum performance on high-stakes strata (high-value invoices, regulated products) | an overall average can pass while the segment that matters fails |
 
+- **Agent-specific guardrails** worth considering: unauthorised or unsafe actions (often zero tolerance, so
+  size it with the rule of three), cost per task, and p95 time per task, because an agent that loops can
+  pass on quality and still break the budget.
+
 ### 4. Fix the statistics in advance
 - **Point estimate or confidence bound?** State which for each criterion, and size the sample accordingly,
   because some criteria are unprovable at small n.
@@ -66,7 +84,7 @@ does not answer "did invoice cost fall without more errors?"
   can produce bounds below zero.
 
 Three decisions hide inside "no worse than today":
-- **Non-inferiority margin.** Requiring the system's upper bound to sit at or below the baseline's point
+- **Non-inferiority margin.** Requiring the agent's upper bound to sit at or below the baseline's point
   estimate demands near-proof that it is *better*. The usual form is non-inferiority: upper bound ≤
   baseline + δ, where δ is the largest degradation the sponsor would accept. Choosing δ is a business
   decision, not a statistical one, so it is the sponsor's to sign.
@@ -88,11 +106,12 @@ n ≈ [z_α·√(t(1−t)) + z_β·√(p(1−p))]² / (t − p)²
 ### 5. Sign before measuring
 - **Put metrics, data, thresholds, sample sizes and the decision rule** in the statement of work or an
   acceptance annex, signed by the sponsor.
-- **Freeze** the acceptance dataset version and the holdout.
+- **Freeze** the acceptance dataset version, the holdout and the agent version under test.
 
 ### 6. Run in stages
 1. **Offline** on the frozen golden holdout.
-2. **Shadow mode or a limited pilot** on live traffic, with humans still in control.
+2. **Shadow mode or a limited pilot** on live traffic, with humans still in control: the agent proposes
+   actions, humans approve or override, and the override rate is logged.
 3. **A pilot that measures time and throughput** against the baseline or a concurrent control group.
 - **Each stage has its own pass criteria;** failure sends you back to the review loop.
 
@@ -106,15 +125,15 @@ renegotiated then, not discovered at the go/no-go meeting.
 
 ```mermaid
 flowchart TD
-    K["Sponsor KPI"] --> D["Drivers and measurable proxies"]
+    K["Sponsor KPI"] --> D["Drivers and agent proxies"]
     B["Measured human baseline"] --> C
     D --> C["Primary, guardrail, segment criteria"]
     C --> F{"Provable at agreed sample size?"}
     F -->|"no"| R["Renegotiate: margin, n, or human route"]
     R --> C
-    F -->|"yes"| S["Sign annex, freeze dataset"]
+    F -->|"yes"| S["Sign annex, freeze dataset and agent"]
     S --> O["Offline on golden holdout"]
-    O --> P["Shadow or limited pilot"]
+    O --> P["Shadow: agent proposes, humans decide"]
     P --> T["Pilot vs baseline or control"]
     T --> E["Report each criterion with interval"]
     O -.->|"fail"| L["Back to review loop"]
@@ -122,10 +141,11 @@ flowchart TD
 ```
 
 ## Examples
-### Scoring signed criteria with Wilson intervals
-Invoice extraction for an accounts-payable team. Baseline, measured on 500 invoices: 2.0% critical-field
-error rate (amount, supplier bank details, due date), and every invoice is touched by a human. The KPI is
-cost per invoice; the agreed proxies are below, all illustrative.
+### Scoring signed criteria for an invoice agent with Wilson intervals
+An invoice-processing agent for an accounts-payable team reads invoices, looks up the supplier and posts
+to the ERP or escalates. Baseline, measured on 500 invoices: 2.0% critical-field error rate (amount,
+supplier bank details, due date), and every invoice is touched by a human. The KPI is cost per invoice;
+the agreed proxies are below, all illustrative.
 
 ```python
 import math
@@ -164,10 +184,12 @@ What the result means, and what should have been caught when the annex was writt
 
 - **The fix is a renegotiation *before* testing:** either larger samples (pilot traffic can supply them),
   or a point-estimate rule backed by a downstream control such as human review of all high-value invoices.
+- **For the agent, that control is routing:** high-value invoices always go to the `escalate` path, so the
+  agent never posts them and the segment leaves automated scope.
 
 ### Feasibility check before anyone signs
 Run the power formula for each criterion while drafting the annex. This normal-approximation version
-reproduces the orders of magnitude above.
+reproduces the orders of magnitude above, and the last line sizes a zero-tolerance agent guardrail.
 
 ```python
 import math
@@ -181,6 +203,9 @@ print(n_for_upper_bound(0.02, 0.015, z_b=0))   # 3012: passes only about half th
 print(n_for_upper_bound(0.02, 0.015))          # 7403: about a 90% chance of passing
 print(n_for_upper_bound(0.025, 0.015))         # 2133: non-inferiority with a 0.5-point margin
 print(round(0.9 ** 3, 2))                      # 0.73: three such criteria all passing
+
+# "Unauthorised ERP postings under 1%" with none observed: rule of three, n >= 3 / 0.01
+print(math.ceil(3 / 0.01))                     # 300 clean tasks needed in the pilot
 ```
 
 ## Production patterns
@@ -193,12 +218,15 @@ print(round(0.9 ** 3, 2))                      # 0.73: three such criteria all p
 - **Fixed stopping point for the pilot.** Write the pilot volume or end date into the annex and evaluate
   then, because stopping the first time an interval crosses the threshold inflates the chance of a false
   pass. Track running intervals on a dashboard for visibility, not for the decision.
+- **Shadow mode before write access.** Run the agent with its write tools disabled or routed to a proposal
+  queue, and score proposals against what humans actually did. Monitor override rate per segment; grant
+  write access segment by segment as each passes its signed criterion.
 - **Concurrent control when mix shifts.** Where volume and mix are unstable, route a random share of
   traffic to the current process during the pilot and compare handle time and errors between arms. Monitor
   that the arms stay balanced by segment.
 - **Guardrails become production alerts.** After acceptance, keep the same guardrail metrics running on
-  sampled production traffic with a rollback trigger agreed in the annex. Monitor the guardrail interval
-  weekly, not just its point estimate.
+  sampled production traffic with a rollback trigger agreed in the annex, for an agent typically a flag
+  that turns off write tools. Monitor the guardrail interval weekly, not just its point estimate.
 
 ## Trade-offs
 - **Confidence-bound thresholds vs data.** They protect the customer from lucky small samples but demand
@@ -225,6 +253,8 @@ print(round(0.9 ** 3, 2))                      # 0.73: three such criteria all p
   performance beats the threshold.
 - **Accepting on offline evals alone.** Symptom: good golden-set numbers and no change in handle time,
   because users do not trust the output and re-check everything.
+- **Changing the agent during the acceptance run.** Symptom: results that mix two prompt or model versions
+  and cannot be attributed. Fix: freeze the agent version in the annex and restart the count after any change.
 
 ## When to use
 - **Define acceptance tests at scoping,** as soon as the KPIs and baseline are known and certainly before
@@ -260,6 +290,12 @@ and size the sample so it is provable. Then everything goes into a signed annex 
 - **It has no reference:** without a measured human baseline, nobody knows whether 91% is better than today.
 - **It has no confidence or segments:** a single average hides high-stakes strata and sampling noise.
 
+### Which acceptance criteria would you add for an agent that can write to the customer's ERP?
+- **Primary:** straight-through rate and handle time against the measured baseline.
+- **Guardrails:** critical-field error rate as non-inferiority, unauthorised or unsafe postings at
+  near-zero (sized with the rule of three, about 300 clean tasks for under 1%), and cost and p95 time per task.
+- **Staging:** shadow mode with write tools off first, then write access per segment as each passes.
+
 ### Explain non-inferiority and who should choose the margin.
 - **Definition:** pass when the system's upper bound ≤ baseline + δ, instead of demanding proof it beats
   the baseline, which needs far larger samples.
@@ -278,8 +314,9 @@ and size the sample so it is provable. Then everything goes into a signed annex 
 - **Shorten the signed list** to a handful of primary metrics and guardrails, and report the rest as diagnostics.
 - **Power each remaining criterion generously,** so a system that meets them passes with high probability.
 
-### Offline acceptance passed, but handle time did not change in the pilot. How do you debug it?
-- **Check behaviour first:** users may not trust the output and re-check everything, which offline evals cannot see.
+### Offline acceptance passed, but handle time did not change in the agent pilot. How do you debug it?
+- **Check behaviour first:** users may not trust the agent's output and re-check everything, which offline
+  evals cannot see.
 - **Measure where time goes:** compare touched versus straight-through items and review time per touched
   item against the baseline.
 - **Fix the right lever:** confidence display, routing of low-confidence items, or training, then re-run the
@@ -309,3 +346,22 @@ and size the sample so it is provable. Then everything goes into a signed annex 
 - [ ] They measure the model's latency and nothing else
 > Pushing straight-through rate or speed can increase downstream errors or compliance breaches.
 > Guardrails make "no worse than baseline" on those dimensions an explicit condition of acceptance.
+
+## Use cases & projects
+### Use cases
+- **Go-live sign-off for a back-office agent.** Invoice, claims or ticket agents accepted on straight-through
+  rate and handle time with error guardrails.
+- **Granting write access in stages.** Shadow-mode override rates per segment decide where the agent may act
+  on its own.
+- **Contract negotiation.** A feasibility check turns "99% accurate" into criteria the agent can fairly pass or fail.
+- **Post-launch rollback triggers.** The signed guardrails become alerts that switch the agent back to
+  propose-only mode.
+
+### Mini project
+**Write and score an acceptance annex for a toy agent (2-3 hours).**
+- **Goal:** draft signed-style criteria for an agent, check feasibility, then score a simulated pilot.
+- **Steps:** pick an invoice or refund agent; write a KPI tree; define one primary, two guardrails (one
+  zero-tolerance action guardrail) and one segment floor in a config file; run `n_for_upper_bound` and the
+  rule of three on each; simulate pilot outcomes; score them with `wilson`.
+- **Done when:** you have the config, a feasibility table flagging any unpassable criterion with its fix,
+  and a pass or fail report with intervals for every criterion.

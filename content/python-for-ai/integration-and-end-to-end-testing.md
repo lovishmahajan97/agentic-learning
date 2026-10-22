@@ -5,7 +5,7 @@ name: Integration and end-to-end testing
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/pytest
@@ -130,17 +130,19 @@ Most e2e flakiness is self-inflicted, and each cause has a mechanical fix:
   change and e2e on merge or deploy.
 
 ## Diagram
-Which lane catches what: each step up uses more real systems, runs less often and costs more per test.
+Which lane catches what: each step down uses more real systems, runs less often and costs more per test.
+Unit tests use doubles on every save, integration runs real containers per PR, and e2e drives the
+deployed API on merge or deploy, polling readiness instead of sleeping.
 
 ```mermaid
-flowchart LR
-    C["Code change"] --> U["Unit lane: doubles, ms per test, every save"]
-    U --> I["Integration lane: real DB and HTTP in containers, every PR"]
-    I --> E["E2E lane: deployed stack via public API, on merge or deploy"]
-    I --> PG[("Postgres plus pgvector, pinned image")]
-    I --> FM["Fake model server speaking the provider API"]
+flowchart TD
+    C["Code change"] --> U["Unit lane: doubles"]
+    U --> I["Integration lane: every PR"]
+    I --> PG[("Postgres plus pgvector, pinned")]
+    I --> FM["Fake model server"]
+    I --> E["E2E lane: merge or deploy"]
     E --> FM
-    E --> RD["Poll readiness and job status with a deadline"]
+    E --> RD["Poll status with a deadline"]
     S["Scheduled live-model check"] -.->|"structure and invariants only"| E
     E -.->|"answer quality"| EV["Eval suite, not tests"]
 ```
@@ -256,8 +258,8 @@ def test_filtered_search_returns_all_matches(retriever, tenant):
   tenant filter, a naive query can return fewer than *k* rows, which is a property of the real engine and
   its settings, not of your Python.
 - **Why it happens.** pgvector's HNSW scan gathers a bounded candidate list (`hnsw.ef_search`, 40 by
-  default) and the `WHERE` filter is applied afterwards; version 0.8.0 added iterative index scans to keep
-  searching when too few rows survive.
+  default) and the `WHERE` filter is applied afterwards; version 0.8.0 added iterative index scans that keep
+  searching when too few rows survive, but they are off until you set `hnsw.iterative_scan`.
 - **Make the test meaningful.** Seed enough rows for other tenants that the planner actually uses the
   index; on a near-empty table Postgres may choose an exact sequential scan and the test passes for the
   wrong reason.

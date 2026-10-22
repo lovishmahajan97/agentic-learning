@@ -5,7 +5,7 @@ name: Train / validation / test split
 kind: practice
 difficulty: intro
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - ml-fundamentals/train-test-leakage
@@ -222,9 +222,13 @@ print(f"McNemar exact p = {mcnemar_exact(40, 25):.3f}")          # 0.082 for 40 
   but pairing uses only the 45 discordant tasks, and 15 vs 30 gives p ≈ 0.04.
 - **Caveat.** That holds only if this was the one planned comparison on a set nobody tuned against, and
   each task ran once; with stochastic runs, repeat each task and compare per-task pass rates.
-- **Contrast.** Two models at 91.0% and 89.5% on 1,000 items (870 both right, 40 only A, 25 only B, 65
-  both wrong; single-model SE 0.0095) give p ≈ 0.08 for the 1.5-point win from the 65 discordant items: suggestive, not
+- **Contrast.** Two models at 91.0% and 89.5% on 1,000 items (870 both right, 40 only A, 25 only B,
+  65 both wrong; single-model SE 0.0095) give p ≈ 0.08 for the 1.5-point win from the 65 discordant
+  items: suggestive, not
   conclusive at the usual 0.05 bar.
+- **Decision rule.** When the paired test is inconclusive, do not ship on it alone; grow the test set
+  with fresh items, keeping it paired, rather than re-reading the same set until something looks
+  significant.
 
 ## Production patterns
 - **Hash-keyed split in the data pipeline.** Assign split by hashing the group key (session, customer,
@@ -268,7 +272,9 @@ print(f"McNemar exact p = {mcnemar_exact(40, 25):.3f}")          # 0.082 for 40 
 - **Splitting by row when rows share a source.** Symptom: validation accuracy far above production and a
   sharp drop the first time a new customer, document or user arrives. Fix: grouped split.
 - **Iterating prompts on the test set.** Symptom: the eval score climbs every week while production
-  success and user feedback stay flat. Fix: iterate on dev, sign off on a frozen test set read once.
+  success and user feedback stay flat, because the test set has quietly become a validation set. Fix:
+  iterate on dev, sign off on a frozen test set read once, and carve a fresh one from newly arrived
+  traces once it has been reused.
 - **Fitting preprocessing before splitting** (scalers, tokenizers, vocabularies, filters). Symptom: a
   small, persistent optimistic bias that vanishes when the pipeline is rebuilt on train only. Fix: split
   first, fit every preprocessing step on train only.
@@ -348,7 +354,7 @@ comparison paired on the same customers so the error bar on the difference is as
 - **Check run-to-run noise:** agents are stochastic, so rerun each task a few times per config and compare
   per-task pass rates, still paired.
 - **Check selection:** if B was the best of many variants tried on this set, confirm on a fresh test set
-  before shipping.
+  before shipping; if the result is inconclusive, add fresh tasks rather than re-reading the same set.
 
 ### When is k-fold cross-validation not worth it?
 - **When one training run is expensive,** as with LLM fine-tunes: *k* folds cost *k* times the training
@@ -407,9 +413,10 @@ comparison paired on the same customers so the error bar on the difference is as
 ### Mini project
 **Build a leak-free eval split for an agent (1-2 hours).**
 - **Goal:** split a trace dataset so held-out scores reflect new users and new tasks, not memorised ones.
-- **Steps:** take 500+ agent tasks or traces with session and customer ids; split once by row and once by
-  customer into dev and test; fine-tune or prompt-tune against dev only; score both test sets; compute the
-  standard error of each test score.
-- **Done when:** you have a table showing the row-split versus customer-split test scores with their error
-  bars, the split script is deterministic (seeded, keyed on the id), and the test set is documented as
-  read once per release.
+- **Steps:** take 500+ labeled agent tasks or traces with session and customer ids (a public support or
+  QA dataset works); split once by row and once by hashed customer id into train, dev and test; give the
+  agent a few-shot or retrieved-examples pool drawn from train only; tune its prompt on dev; score both
+  test sets; compute the standard error of each score.
+- **Done when:** you have a table of row-split versus customer-split test scores with error bars, a
+  leakage assertion that passes for the customer split, a deterministic hash-keyed split script, and the
+  test set documented as read once per release.

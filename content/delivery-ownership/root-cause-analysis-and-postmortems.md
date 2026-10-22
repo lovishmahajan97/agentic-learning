@@ -5,7 +5,8 @@ name: Root-cause analysis & postmortems
 kind: practice
 difficulty: core
 est_minutes: 17
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - delivery-ownership/production-debugging
   - delivery-ownership/failure-analysis
@@ -21,9 +22,20 @@ sources:
 ---
 
 ## TL;DR
-Root-cause analysis asks why an incident was possible; a postmortem turns the answer into owned, tracked
-work. Complex systems rarely have one root cause, so map contributing factors across prevention,
-detection and mitigation, blamelessly. "The model hallucinated" is a symptom, never a cause.
+Root-cause analysis asks why an agent incident was possible; a postmortem turns the answer into owned,
+tracked work. Map contributing factors across prevention, detection and mitigation, blamelessly. "The
+model hallucinated" is a symptom, never a cause.
+
+## For agent builders
+- **Why it matters for agents.** Agents will make wrong calls; the postmortem question is why the
+  harness around the model (tool permissions, validators, approval gates, step caps, evals) let a wrong
+  call become harm. That is where the fixes live.
+- **Where it shows up in your stack.** Run traces and deploy logs for the timeline, the agent's eval suite
+  for new regression cases, tool wrappers for validators and idempotency, and flags for kill switches.
+- **What you control.** Which defences sit between a model decision and a side effect, how fast a bad
+  pattern is detected, and whether every postmortem action lands as a test, gate or alert with an owner.
+- **What you can skip.** Formal reliability engineering methods beyond five whys, a fishbone and a simple
+  fault tree; they are enough for agent incidents.
 
 ## Why it exists
 - **Mitigation ends the incident, not the next one.** Roll back, close the ticket and move on, and the
@@ -72,6 +84,20 @@ Run the whys along several axes:
   smaller? If not, it is background, not a factor.
 - **Evidence test:** is the causal link shown by logs, traces or a reproduction, or only plausible? A
   plausible story that nobody checked is how postmortems confidently fix the wrong thing.
+
+### The defence layers in an agent
+When an agent incident happens, walk each layer and ask why it did not catch the bad step:
+
+| Layer | Question for the postmortem |
+|---|---|
+| Tool design | Could the tool do this at all? Was it scoped to the task (read-only, one tenant, capped amount)? |
+| Argument validation | Did anything check the arguments against a prior lookup or a schema? |
+| Approval gate | Should this action have needed a human confirmation? |
+| Control flow | Was there a step cap, a retry limit, an idempotency key? |
+| Evals | Did the regression suite contain a trajectory like this one? |
+| Online detection | Which metric or alert should have fired, and why did it not? |
+
+Each "no" is a contributing factor and a candidate action.
 
 ### When to stop asking why
 - **Stop at a changeable, ownable condition:** one a team can change with a system control and own as an
@@ -161,6 +187,28 @@ config; eval suite with no freshness cases; detection reliant on users.
 
 Note what is absent: "the model hallucinated" and "the admin should have checked the folder."
 
+### Worked agent postmortem: the cancelled orders
+**Incident (illustrative):** over 50 minutes an order-support agent cancelled 23 orders whose customers
+had only asked about delivery dates. **Proximate trigger:** a tool-description edit made `cancel_order`
+read as the general "order changes" tool.
+
+| Layer | What the trace showed | Contributing factor |
+|---|---|---|
+| Tool design | One tool both modified and cancelled orders | Over-broad tool |
+| Approval gate | Cancellation needed no confirmation from the user | Missing gate for an irreversible action |
+| Evals | No trajectory case where the user asks a question and no action should be taken | Eval gap |
+| Change process | Tool descriptions were edited outside code review | Unreviewed prompt surface |
+| Detection | Found by a customer call; cancellations per hour had no alert | User-detected |
+
+| Category | Action | Owner | Due |
+|---|---|---|---|
+| Prevent | Split `cancel_order` from order edits and require explicit user confirmation | agent team | 2 weeks |
+| Prevent | Tool descriptions in version control with review and an eval run | platform | 3 weeks |
+| Detect | 40 "question only, no action" trajectories in the regression suite, plus an alert on cancellations per hour | AI engineer | 2 weeks |
+| Mitigate | Per-tool kill switch for `cancel_order` | platform | 1 week |
+
+Absent again: "the model misunderstood" and "the engineer should have tested the description."
+
 ### Linting action items and spotting recurring factors (runnable)
 A small check you can run in CI over postmortem action items exported from your tracker. Pure Python.
 
@@ -211,6 +259,10 @@ print(Counter(f for pm in factors for f in pm).most_common(2))
 - **Every detection gap becomes an eval or alert.** When: an AI incident was found by a user. How: add the
   failing inputs as regression eval cases and an online check (for example a scheduled "current value"
   question set). Monitor: time from impact start to detection on the next incident.
+- **Every agent incident becomes a trajectory eval.** When: an agent took a wrong action or loop. How: save
+  the run's inputs and recorded tool results as a regression case that asserts the correct tool sequence
+  (or no action), and run it on every prompt, tool-description or model change. Monitor: incidents whose
+  trajectory pattern was already in the suite (should trend to zero).
 - **Internal and external versions.** When: customers were affected. How: keep the internal postmortem
   fully candid and derive a customer version with impact, timeline summary and corrective actions.
   Monitor: customer follow-up questions the external version failed to answer.
@@ -242,6 +294,9 @@ print(Counter(f for pm in factors for f in pm).most_common(2))
 - **Hindsight bias**, judging decisions by an outcome nobody could see at the time. Symptom: "should have"
   and "failed to" language in the timeline, and no explanation of why the action looked reasonable to the
   person who took it. Fix: record what each person knew when they acted.
+- **Treating the agent's decision as the root cause.** Symptom: actions like "improve the system prompt"
+  and the same kind of wrong action recurring with different wording. Fix: walk the defence layers and add
+  a gate, validator or eval at each one that failed.
 
 ## When to use
 - **Use when:** an incident is above a severity threshold defined in your incident policy, for any data
@@ -277,9 +332,9 @@ and date. "Improve the prompt" may stay, but only as one item among them.
 - **Why:** blame makes people hide mistakes and sanitise timelines, so the organisation loses the evidence
   it needs to fix the system.
 
-### An incident was detected 40 minutes after impact began. How do you analyse that gap?
-- **Treat detection as its own chain.** Ask why no alert fired, which signal would have caught it, and
-  who noticed first.
+### An agent incident was detected 40 minutes after impact began. How do you analyse that gap?
+- **Treat detection as its own chain.** Ask why no alert fired, which signal would have caught it (for an
+  agent: side-effecting calls per hour, steps per run, tool error rate), and who noticed first.
 - **Check the evidence:** did monitoring look at the right property (source freshness, not just
   groundedness)?
 - **Output a detect action:** an alert or eval with an owner, date and ticket, measured by time to detect
@@ -302,6 +357,13 @@ and date. "Improve the prompt" may stay, but only as one item among them.
 - **A fault tree** works back through AND/OR gates and is the better tool when you must show several
   conditions were jointly necessary.
 - **In practice** run whys along several axes and use a fishbone or fault tree when the chains branch.
+
+### An agent issued a wrong refund. The draft postmortem blames the model. How do you run the analysis?
+- **Start from the trace:** which step produced the amount, what the tool returned, and what the model saw.
+- **Walk the defence layers:** why the amount was not fetched by a tool, why no validator compared it with
+  the order record, why no approval gate applied, why no eval covered refunds.
+- **Actions per layer** (prevent, detect, mitigate), each with an owner and date; a prompt change may be
+  one of them, never the only one.
 
 ## Quiz
 ### Q: What is the main limitation of the five-whys technique in complex systems?
@@ -327,3 +389,24 @@ and date. "Improve the prompt" may stay, but only as one item among them.
 - [x] Add an automated eval or online check for the failure type, with an owner and due date
 > A detection action should catch the failure automatically before users do; reminders and disclaimers do
 > not detect anything, and a model swap is a prevention guess rather than a detection control.
+
+## Use cases & projects
+### Use cases
+- **An agent took an irreversible action it should not have.** The postmortem walks tool design,
+  validation, approval gates and evals rather than stopping at the model's choice.
+- **A RAG agent served stale facts.** Freshness and detection chains produce index filters and scheduled
+  "current value" checks.
+- **Recurring agent incidents across teams.** Tagged contributing factors (eval gap, unreviewed tool
+  description, provider change) show where platform investment pays.
+- **Customer-facing agent outages.** An external version of the postmortem explains impact and fixes to
+  the customer while the internal one stays candid.
+
+### Mini project
+**Write a postmortem for a staged agent incident (2-3 hours).**
+- **Goal:** practise turning one agent failure into prevent, detect and mitigate actions that are code.
+- **Steps:** give a small agent a side-effecting fake tool and a description that invites misuse; run 20
+  tasks and capture the traces where it misfires; write the timeline and walk the six defence layers; ship
+  at least one action per category (a validator or confirmation gate, a trajectory eval case, a kill
+  switch); run the action-item linter from the example over your list.
+- **Done when:** the postmortem has every section of the template, the linter reports no wishes, and the
+  same 20 tasks rerun with zero misfires and the new eval case passing.

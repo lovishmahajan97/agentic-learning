@@ -5,7 +5,8 @@ name: Data ingestion from client systems
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - data-architecture/ingestion-pipelines
   - enterprise-integration/incremental-synchronization-and-cdc
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-Client ingestion pulls data you do not own through channels the client approves. Pick the least invasive
-channel, land an immutable raw copy, advance the checkpoint only after a durable write, throttle to
-protect the source, and reconcile for deletes the channel cannot see.
+An agent's retrieval index is fed from client systems you do not own. Pick the least invasive channel,
+land an immutable raw copy, advance the checkpoint only after a durable write, throttle to protect the
+source, and reconcile for deletes.
+
+## For agent builders
+- **Why it matters for agents.** Ingestion decides what the agent can know and how stale it is. A missed
+  update means the agent confidently cites an old ticket status; a missed delete means it cites a document
+  the customer removed; missing ACLs mean it shows users what the source would hide.
+- **Where it shows up in your stack.** The sync jobs behind the agent's vector store and record tables,
+  the raw zone you re-chunk from when you change embedding models, and the choice between pre-ingesting
+  data and letting the agent call the live API as a tool.
+- **What you control.** Channel per source, watermark overlap, what goes into the content hash, which
+  permission fields are landed, and a freshness target the agent's answers depend on.
+- **What you can skip.** Building a general streaming platform. A watermark poll with overlap, a raw zone
+  and an ID reconciliation cover most agent knowledge bases.
 
 ## Why it exists
 - **Ingestion at a client is a negotiation.** The data sits in their CRM, ERP, ticketing system or file
@@ -103,9 +116,25 @@ and long transactions commit with earlier timestamps. So:
 - **Fill the gap** with the source's deleted-items endpoint or tombstones where it has one, CDC where
   available, and otherwise a periodic ID reconciliation comparing source and target key sets.
 
+### 8. Ingest ahead, or let the agent call live
+An agent can reach client data two ways, and most deployments use both.
+
+| Approach | Good for | Cost |
+|---|---|---|
+| **Ingest into an index** (this lesson) | semantic search over documents, large history, cross-record questions | freshness lag, a second copy, permissions to mirror |
+| **Live tool call** to the client API at question time | current status of one record, actions | rate limits shared with the client's users, latency per step, no semantic search |
+
+- **Rule of thumb:** ingest what the agent searches, call live for what must be current, such as a ticket's
+  status before the agent writes to it.
+- **Live tools share the ingestion quota.** Agent tool calls and sync jobs hit the same rate limit, so
+  budget them together and give the agent's calls priority during business hours.
+- **Re-embedding comes from raw.** Changing chunking or the embedding model re-runs from the raw zone,
+  never from the client API.
+
 ## Diagram
 An incremental run reads from the watermark minus an overlap, lands raw records keyed by content hash,
-and moves the watermark only after every write succeeds; reconciliation covers deletes separately.
+and moves the watermark only after every write succeeds before chunks reach the agent's index;
+reconciliation covers deletes separately.
 
 ```mermaid
 flowchart TD
@@ -196,6 +225,18 @@ print([i for i in overlap if i not in already])  # ['T4', 'T5'] overlap catches 
 
 The overlap also re-reads T1 to T3; in the real pipeline the content-hash key turns those into no-ops.
 
+### Agent scenario: a stale answer traced to the sync
+A support agent tells a user that ticket INC-2207 is "awaiting customer" though it closed two hours ago.
+Trace of the investigation (illustrative numbers).
+
+| Question | Finding |
+|---|---|
+| What did the agent retrieve? | the chunk for INC-2207 indexed at 06:00, status "awaiting customer" |
+| When did the source change? | closed at 09:12 by an automation rule |
+| Did the 10:00 sync see it? | no: the rule bumped `SystemModstamp`, the sync polls `LastModifiedDate` |
+| Fix for freshness | poll the system field, and add a live `get_ticket_status` tool the agent calls before stating a status |
+| Fix for trust | show the chunk's indexed-at time in the tool result so the model can say how current it is |
+
 ### Worked scenario: choosing channels for one client
 A client with three sources and different constraints (illustrative).
 
@@ -222,6 +263,9 @@ A client with three sources and different constraints (illustrative).
 - **ID-set reconciliation for deletes.** Use whenever the channel cannot report deletes. Periodically list
   source IDs, diff with target IDs and tombstone the difference through to the index. Monitor tombstones
   per run and raw-versus-target counts.
+- **Freshness metadata in every retrieval result.** Use for agents that state facts from indexed records.
+  Store the source's `updated_at` and your indexed-at time on each chunk and return both in the tool
+  result, so the agent can prefer a live tool call when data is old. Monitor index lag p95 per source.
 
 ## Trade-offs
 - **API pull vs replica.** API pull respects the vendor's permission model and is supported, but rate
@@ -253,6 +297,9 @@ A client with three sources and different constraints (illustrative).
   although nobody edited those records.
 - **Writing straight to the index with no raw copy.** Symptom: a parser or mapping fix requires a full
   re-pull, which can take days against a rate-limited API.
+- **Giving agent tool calls and sync jobs separate, uncoordinated rate budgets.** Symptom: during a
+  backfill the agent's live lookups start failing with 429s and users see "tool unavailable". Fix: one
+  quota budget per client instance with priority for interactive calls.
 - **Assuming polling sees deletes.** Symptom: answers citing documents or records the customer deleted
   weeks ago, often found by the customer.
 
@@ -311,6 +358,12 @@ and tombstones the difference through to the index.
 - **The trade-off** is operating software you cannot log into freely, so build heartbeat, version reporting
   and remote diagnostics in from the start.
 
+### Should your agent read ticket data from an index or call the ticketing API live?
+- **Index what the agent searches:** semantic search over descriptions and comments needs ingested,
+  chunked and embedded data with permissions attached.
+- **Call live for what must be current,** such as status before the agent updates a ticket, because the
+  index lags by up to one sync interval. Budget live calls inside the same API quota as the sync.
+
 ### How large should the watermark overlap be?
 - **Larger than the worst clock skew plus the longest source transaction,** because late-committing
   transactions are stamped with earlier times.
@@ -341,3 +394,25 @@ and tombstones the difference through to the index.
 - [x] Records that were hard-deleted in the source
 > A query for recently modified records can only return records that still exist. Hard deletes need a
 > deleted-items endpoint, CDC, or a key-set reconciliation between source and target.
+
+## Use cases & projects
+### Use cases
+- **Knowledge bases for support and IT agents.** Ticketing and wiki content is synced incrementally into
+  the agent's vector store with ACLs attached.
+- **Re-embedding without re-pulling.** Changing the chunker or embedding model re-runs from the raw zone in
+  hours instead of weeks of rate-limited API calls.
+- **Agents over on-premises systems.** An outbound-only connector inside the client network feeds an agent
+  hosted in your cloud.
+- **Hybrid agents.** Indexed history for search plus live tools for current status, sharing one quota
+  budget.
+
+### Mini project
+**Incremental sync feeding a retrieval agent (2-3 hours).**
+- **Goal:** a fake ticket API synced into a small vector index that a question-answering agent searches,
+  with freshness and deletes handled.
+- **Steps:** build a fake paginated API with `updated_at` and random 429s; write the overlap-watermark sync
+  with a content-hash raw zone; chunk and index into any local vector store; add a reconciliation that
+  tombstones deleted ids; build an agent with `search_tickets` and a live `get_ticket_status` tool; edit
+  and delete tickets between runs.
+- **Done when:** after edits and deletes the agent never cites a deleted ticket, states current status via
+  the live tool, and the sync survives a mid-run crash without losing or duplicating records.

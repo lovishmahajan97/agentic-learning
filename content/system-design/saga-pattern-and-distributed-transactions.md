@@ -5,7 +5,7 @@ name: Saga pattern & distributed transactions
 kind: pattern
 difficulty: advanced
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - system-design/outbox-inbox-patterns
@@ -324,6 +324,10 @@ def execute(run, call, impl, approve):
 | Model calls `book_hotel` before the fraud check | not possible, order is in code | refused, the model gets the error and calls the check first |
 | Worker crashes after `started book_hotel` | resume from log | resume, query partner by key, replay the logged arguments |
 | Reviewer rejects at the gate | n/a | void the authorisation, close the ticket, end `compensated` |
+
+- **Simplification.** The "retriable only after the pivot" rule assumes every run of this agent reaches a
+  pivot. An agent whose runs may have no irreversible step needs a per-workflow policy for which tools must
+  precede which, or it would never be allowed to send the email.
 
 ### Worked scenario: where the failure lands decides the outcome
 The travel saga above, failing at each step in turn.

@@ -219,7 +219,8 @@ print(t1.num_rows)                                                    # 3333
   against `table.nbytes`.
 - **Zstandard for archives, Feather for local caches.** Write long-lived Parquet with
   `compression="zstd"`; for scratch data reread many times on one machine, write Arrow IPC with
-  `pyarrow.feather.write_feather` and memory-map it on read. Compare file size and read time per format.
+  `pyarrow.feather.write_feather` (pass `compression="uncompressed"`, since its default LZ4 must be
+  decoded on read) and memory-map it on read. Compare file size and read time per format.
 
 ## Trade-offs
 - **Cheap selective reads vs immutability.** Parquet's compression and column pruning make selective

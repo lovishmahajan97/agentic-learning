@@ -5,7 +5,8 @@ name: Compliance constraints
 kind: concept
 difficulty: core
 est_minutes: 18
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - security-governance-compliance/compliance-architecture
   - security-governance-compliance/data-residency
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-Compliance constraints are the rules laws, contracts and audit frameworks impose on where data is
-processed, who sees it, how long it is kept and what is proven. For AI they decide region, model
-provider and logging design; deep treatment lives in security-governance-compliance.
+Compliance constraints are rules from law, contracts and audit frameworks on where data is processed,
+who sees it, how long it is kept and what is proven. For agents they decide model provider, region,
+memory, traces and oversight; deep treatment lives in security-governance-compliance.
+
+## For agent builders
+- **Why it matters for agents.** Every agent step sends context, often including tool results full of
+  personal data, to a model; traces capture it; memory and checkpoints keep it. Each of those is a
+  processing location, a retention period and an erasure target that compliance rules govern.
+- **Where it shows up in your stack.** The model gateway's per-tenant provider and region allowlist,
+  trace and log redaction, memory and checkpoint TTLs, the erasure job across vector store, memory and
+  caches, and human-approval steps for consequential actions.
+- **What you control.** Routing every model call through one policy chokepoint, keeping customer data in
+  deletable retrieval indexes rather than fine-tuned weights, logging metadata instead of content, and
+  making oversight an auditable event.
+- **What you can skip.** Interpreting the law and classifying an AI Act risk tier; counsel does that.
+  Know the regimes well enough to translate them into constraints and evidence.
 
 ## Why it exists
 - **Finished is not deployable.** A hospital cannot send patient notes to a model provider that has not
@@ -47,6 +61,7 @@ provider and logging design; deep treatment lives in security-governance-complia
 | Erasure | whether you may fine-tune on customer data, since deleting a record from model weights is not practical |
 | Audit | what your logs must contain |
 | Minimization | what your logs may contain |
+| Agent memory and checkpoints | how long conversation state may persist, and how it is erased |
 
 ## How it works
 ### From obligation to evidence
@@ -71,7 +86,7 @@ configuration in code, logs, test results.
   impose EU residency contractually because it is the simplest way to stay safe.
 - **Controller and processor.** The customer is usually the **controller** and you the **processor**, so
   you act only on their documented instructions, and your subprocessors (model, cloud, tracing) need
-  their approval.
+  their approval. A tool that calls an outside API with customer data adds a subprocessor too.
 - **Remote access counts.** European regulators generally treat *remote access* from outside the EEA,
   such as a US support engineer opening an EU tenant's traces, as a transfer. Residency is about who can
   read the data, not only where disks sit.
@@ -100,15 +115,15 @@ have their own duties. Which tier a use case falls into is a legal determination
 ### The constraint categories
 Translate any regime into these questions:
 
-| Category | Question |
-|---|---|
-| **Where** | where may data be processed and stored? |
-| **Who** | who may access it, including vendors and personnel? |
-| **What** | what data may enter prompts, logs and indexes? |
-| **How long** | how long must or may it be kept? |
-| **How** | how must it be protected (encryption, customer-managed keys)? |
-| **What proof** | which audit trails and change records must exist? |
-| **AI-specific** | no training use, human oversight, disclosure that users are talking to AI |
+| Category | Question | Agent example |
+|---|---|---|
+| **Where** | where may data be processed and stored? | model region, tool backends, trace store |
+| **Who** | who may access it, including vendors and personnel? | support engineers reading traces |
+| **What** | what data may enter prompts, logs and indexes? | card numbers in tool results |
+| **How long** | how long must or may it be kept? | memory and checkpoint TTLs |
+| **How** | how must it be protected (encryption, customer-managed keys)? | encrypted memory store |
+| **What proof** | which audit trails and change records must exist? | who approved which agent action |
+| **AI-specific** | no training use, human oversight, disclosure that users are talking to AI | approval gate before writes |
 
 ### Enforce at a chokepoint, check in the pipeline
 A constraint written only in a policy document is broken by the first engineer who adds a fallback
@@ -116,14 +131,15 @@ region. So enforce each constraint where every request must pass, and check it w
 1. **Runtime chokepoint.** Route all model calls through one gateway holding a per-tenant policy (allowed
    providers, allowed regions, whether content may be logged) that refuses anything else. It is a
    chokepoint *because* a single enforcement point cannot be bypassed by a new code path the way
-   scattered checks can, and its configuration plus its refusal logs are the evidence.
+   scattered checks can, and its configuration plus its refusal logs are the evidence. For agents, every
+   step of every loop passes it, including sub-agents and retries.
 2. **Change-time check.** Run policy checks on infrastructure plans (for example, fail any Terraform plan
    that creates storage outside approved regions or a log sink without a retention setting), and require
    review when a new subprocessor appears in the dependency or egress list. This catches the violation
    before production, which is when it is cheapest.
 3. **Periodic proof.** Access reviews; deletion tests that confirm an erased record is gone from the
-   database, the vector index and the caches; and a reconciliation of actual egress against the declared
-   subprocessor list.
+   database, the vector index and the caches (and agent memory and checkpoints); and a reconciliation of
+   actual egress against the declared subprocessor list.
 
 ### Constraints conflict
 | Conflict | Explicit resolution |
@@ -132,10 +148,11 @@ region. So enforce each constraint where every request must pass, and check it w
 | Debug logging vs minimization | log metadata and hashes rather than content |
 | Cross-region fallback vs residency | in-region fallback or a degraded mode |
 | Fine-tuning on customer data vs deletion | keep customer data in retrieval indexes (which can be deleted) instead of in fine-tuned weights |
+| Long-term agent memory vs retention limits | TTL on memory entries, and erasure that reaches memory |
 
 ## Diagram
 Each obligation becomes a constraint, then a control at runtime or change time, and the controls emit
-the evidence auditors check.
+the evidence auditors check. Every agent step crosses the runtime gateway.
 
 ```mermaid
 flowchart TD
@@ -181,7 +198,8 @@ The result changed two design decisions (model provider selection and log conten
 
 ### A per-tenant policy at the model gateway
 The runtime chokepoint in miniature: deny by default, allow only listed provider and region pairs, and
-log a hash instead of content unless the tenant's policy allows content.
+log a hash instead of content unless the tenant's policy allows content. An agent framework calls
+`route` once per step.
 
 ```python
 """Per-tenant compliance policy enforced at the model gateway (the chokepoint)."""
@@ -223,21 +241,51 @@ for args in (("eu-insurer", "provider-a", "us-east-1"), ("unknown", "provider-a"
 - **Hash caveat.** A plain hash of a short, guessable input can be reversed by guessing; in production
   use a keyed hash (HMAC with a secret) so the trace still correlates requests without exposing content.
 
+### Erasure that reaches every agent store
+An agent leaves copies of a person's data in more places than a CRUD app. The erasure job deletes from
+each store and then verifies, and the verification output is the evidence.
+
+```python
+"""Erase one data subject from every store an agent writes to, then prove it."""
+class Store:
+    def __init__(self, name): self.name, self.rows = name, []
+    def delete_subject(self, sid): self.rows = [r for r in self.rows if r["subject"] != sid]
+    def contains(self, sid): return any(r["subject"] == sid for r in self.rows)
+
+STORES = [Store(n) for n in ("crm_db", "vector_index", "agent_memory",
+                             "checkpoints", "response_cache", "eval_dataset", "debug_traces")]
+
+def erase(subject_id):
+    for s in STORES:
+        s.delete_subject(subject_id)
+    report = {s.name: ("FAIL" if s.contains(subject_id) else "ok") for s in STORES}
+    return all(v == "ok" for v in report.values()), report
+
+for s in STORES:                                   # seed: the subject appears everywhere
+    s.rows.append({"subject": "cust-118", "text": "..."})
+ok, report = erase("cust-118")
+print(ok, report)
+# True {'crm_db': 'ok', 'vector_index': 'ok', 'agent_memory': 'ok', 'checkpoints': 'ok', ...}
+```
+
+- **The list is the point.** Agent memory, checkpoints and response caches are the stores teams forget;
+  a real job would call each store's delete API and query it by the subject's identifiers.
+
 ## Production patterns
-- **Gateway policy, deny by default.** Every model call goes through one gateway with per-tenant
-  allowlists of providers and regions and a content-logging flag, as in the sketch above. Monitor refusal
-  counts per tenant; a spike after a release means a code path tried a disallowed route.
+- **Gateway policy, deny by default.** Every model call, from every agent step, goes through one gateway
+  with per-tenant allowlists of providers and regions and a content-logging flag, as in the sketch above.
+  Monitor refusal counts per tenant; a spike after a release means a code path tried a disallowed route.
 - **Policy as code on IaC plans.** Convert plans with `terraform show -json` and evaluate them with a
   policy engine such as Open Policy Agent (via Conftest) to reject storage outside approved regions or
   log sinks without retention. Track failed policy checks per pull request.
-- **Split audit and debug stores.** Audit records go to a write-once, long-retention store (for example S3
-  with Object Lock); debug traces get a short lifecycle expiry such as 30 days. Alert if any trace store
-  lacks an expiry.
-- **Erasure that reaches derived data.** An erasure job deletes from the database, the vector index, caches
-  and eval datasets, then a test queries each for the subject's identifiers. Monitor time to complete
-  erasure requests and failed verification checks.
+- **Split audit and debug stores.** Audit records (including human approvals of agent actions) go to a
+  write-once, long-retention store (for example S3 with Object Lock); debug traces get a short lifecycle
+  expiry such as 30 days. Alert if any trace store lacks an expiry.
+- **Erasure that reaches derived data.** An erasure job deletes from the database, the vector index, caches,
+  agent memory, checkpoints and eval datasets, then a test queries each for the subject's identifiers.
+  Monitor time to complete erasure requests and failed verification checks.
 - **Egress reconciliation.** Compare actual egress destinations and vendor invoices against the declared
-  subprocessor list each month, because new SDKs and fallbacks arrive silently. Alert on any new
+  subprocessor list each month, because new SDKs, tools and fallbacks arrive silently. Alert on any new
   external domain.
 - **Compliance as non-functional requirements.** Capture each regime as where/who/what/how-long/how/proof
   constraints in discovery, with an owner and the evidence each must produce.
@@ -247,11 +295,14 @@ for args in (("eu-insurer", "provider-a", "us-east-1"), ("unknown", "provider-a"
   but remove cross-region failover. If availability targets are strict, you need multiple in-region
   providers or accept degraded modes.
 - **Self-hosting vs cost and quality.** Self-hosting a model in the customer's environment satisfies the
-  strictest data-custody constraints, but costs GPU capacity, operations and often model quality; API
-  providers with suitable terms win when available.
+  strictest data-custody constraints, but costs GPU capacity, operations and often model quality
+  (tool-calling accuracy in particular); API providers with suitable terms win when available.
 - **Minimal logging vs debuggability.** It lowers compliance exposure but makes production debugging
-  harder; structured metadata, hashes and on-demand, access-logged content capture recover most of the
-  debugging value.
+  harder, and agent failures are hard to debug without the trace; structured metadata, hashes and
+  on-demand, access-logged content capture recover most of the debugging value.
+- **Long agent memory vs erasure cost.** Persistent memory makes agents more useful across sessions, but
+  every remembered fact is another erasure target and retention question. Short TTLs flip the balance
+  when the data is regulated.
 - **One compliant tier vs many.** A single compliant tier for every customer simplifies operations but
   over-serves smaller customers; separate tiers cost more to run and must be described precisely in
   questionnaires.
@@ -259,12 +310,14 @@ for args in (("eu-insurer", "provider-a", "us-east-1"), ("unknown", "provider-a"
 ## Pitfalls
 - **Treating "compliant" as a vendor property rather than a configuration.** Symptom: using a provider's
   HIPAA-eligible service without a signed BAA or with ineligible features enabled.
-- **Forgetting derived data.** Embeddings, caches, eval datasets and traces contain the same personal
-  data. Symptom: an erasure request completed in the database while vectors and logs still hold it.
+- **Forgetting derived data.** Embeddings, caches, eval datasets, traces, agent memory and checkpoints
+  contain the same personal data. Symptom: an erasure request completed in the database while vectors
+  and logs still hold it.
 - **Fine-tuning on customer personal data without a deletion story.** Symptom: an erasure request that
   can only be honored by retraining or discarding the model.
-- **Engineering changes that silently violate a constraint**, such as a new fallback region or a new
-  analytics SDK. Symptom: an audit finding against a previously compliant system.
+- **Engineering changes that silently violate a constraint**, such as a new fallback region, a new
+  analytics SDK or a new tool that calls an outside API. Symptom: an audit finding against a previously
+  compliant system.
 - **Deciding the EU AI Act risk tier or other legal classifications in engineering alone.** Symptom: a
   design built for the wrong obligations, discovered when counsel finally reviews it.
 
@@ -273,7 +326,7 @@ for args in (("eu-insurer", "provider-a", "us-east-1"), ("unknown", "provider-a"
   customer policies go beyond them, and what evidence their reviewers will want.
 - **Translate and record** each into where/who/what/how-long/how/proof constraints as non-functional
   requirements, and enforce them in code and configuration so evidence comes for free.
-- **Revisit** whenever data sources, regions, providers or features change.
+- **Revisit** whenever data sources, regions, providers, tools or features change.
 - **Do not interpret law yourself:** bring counsel in for classification and contract terms.
 - **Go deeper** in the security-governance-compliance module for the full design of controls, audit
   trails and residency.
@@ -314,6 +367,13 @@ Ensure deletion reaches embeddings and caches. Document it all in the DPA and da
 - **Data handling:** no training and bounded retention on the model path, minimum-necessary logging, and
   access-logged storage for content.
 - **Evidence:** BAA list, data-flow diagram, retention config in IaC and access review records.
+
+### Your agent has long-term memory and runs for EU customers. A user exercises their right to erasure. What has to happen?
+- **Find every copy:** the source record, chunks and embeddings in the vector index, agent memory
+  entries, conversation checkpoints, response caches, eval datasets built from traces, and debug traces.
+- **Delete and verify:** an erasure job per store, then queries by the subject's identifiers that must
+  return nothing; the verification output is the evidence.
+- **Design so it stays possible:** TTLs on memory and traces, and no fine-tuning on that personal data.
 
 ### How do you stop an engineer from silently breaking residency with a new fallback?
 - **Runtime chokepoint:** all model calls go through a gateway with per-tenant allowed providers and
@@ -361,3 +421,25 @@ Ensure deletion reaches embeddings and caches. Document it all in the DPA and da
 > Separating audit records from debug telemetry satisfies each requirement on its own terms. Keeping all
 > content for seven years violates minimization, encryption does not remove retention duties, and
 > disabling logs fails the audit obligation.
+
+## Use cases & projects
+### Use cases
+- **Healthcare agents under HIPAA.** A note-summarizing agent uses only BAA-covered model providers,
+  hashes content in traces and records each clinician approval in the audit store.
+- **EU agents with residency contracts.** The model gateway pins each tenant to EU regions and refuses the
+  US fallback, with refusal logs as evidence.
+- **Erasure for agents with memory.** A deletion job reaches the vector index, memory, checkpoints and
+  caches, and a verification report closes each request.
+- **Keeping agents out of PCI scope.** Card numbers are stripped from tool results before they reach the
+  prompt or the trace.
+
+### Mini project
+**Put a compliance chokepoint in front of an agent (2-3 hours).**
+- **Goal:** make every model call from a small tool-calling agent pass a per-tenant policy, and prove
+  erasure across its stores.
+- **Steps:** wrap the agent's model client with the `route` gateway for two tenants; add a fallback that
+  tries a disallowed region and confirm it is refused; give the agent a simple memory store and a trace
+  store with a 30-day TTL field; implement the erasure job across memory, traces, a vector index and a
+  cache, then run it for one subject.
+- **Done when:** a run for each tenant shows only allowed provider and region pairs, the fallback appears
+  as a logged refusal, no trace holds raw prompt text, and the erasure report shows every store `ok`.

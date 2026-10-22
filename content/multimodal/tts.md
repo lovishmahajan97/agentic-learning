@@ -5,7 +5,8 @@ name: TTS (text-to-speech)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - multimodal/speech-to-text
   - serving-inference/streaming
@@ -21,9 +22,20 @@ sources:
 ---
 
 ## TL;DR
-Text-to-speech turns a string into a waveform: normalise the text, predict a compact acoustic
-representation (mel-spectrogram or codec tokens) with prosody, then decode it to audio, fast enough that
-a voice agent feels conversational.
+Text-to-speech is the voice agent's mouth: normalise the LLM's text, predict mel-spectrogram or codec
+tokens, decode to audio. Streaming by clause and cancelling on barge-in decide whether the agent feels
+conversational.
+
+## For agent builders
+- **Why it matters for agents.** Users judge a voice agent by the silence before it speaks and by whether
+  it says names and numbers right. Both are set by the pipeline around TTS (splitting, normalisation,
+  cancellation), not by the LLM.
+- **Where it shows up in your stack.** A managed or self-hosted TTS behind a WebSocket or telephony
+  bridge, a splitter on the LLM token stream, SSML or a lexicon for names, and the barge-in handler.
+- **What you control.** When the first chunk is released, text normalisation of LLM output, a reply style
+  written for the ear, per-tenant pronunciation, phrase caching, and TTFA as the headline metric.
+- **What you can skip.** Vocoder and flow-model internals. Know the three stages, why codec models
+  generate few tokens autoregressively, and the latency budget.
 
 ## Why it exists
 - **A voice agent that cannot speak is a chatbot.** Agents, accessibility, IVR and narration all need
@@ -137,6 +149,14 @@ A worked budget (illustrative numbers) shows why sentence streaming is non-negot
 - **Control** comes from SSML-style markup (breaks, emphasis, say-as for digits and dates, explicit
   phonemes) or from style prompts in newer models.
 
+### What the agent's LLM should hand to TTS
+- **Write for the ear.** Instruct the agent to answer in short spoken sentences with no markdown, tables,
+  URLs or JSON, because anything visual either gets read aloud or stripped.
+- **Speak tool results, do not read them.** A tool returns structured data; the agent summarises it ("your
+  order ships Tuesday") rather than voicing every field.
+- **Fill tool-call gaps.** When a tool call will take a second or more, a short spoken filler or cached
+  phrase keeps the line from going silent while the tool runs.
+
 ## Diagram
 Text flows down through normalisation, an acoustic model and a decoder; in a voice agent this runs per
 clause so the first chunk plays while later ones are still being made, and barge-in cancels it.
@@ -213,6 +233,41 @@ print(ttfa_ms(tts_first=75))                  # 1315.0: halving TTS first chunk 
 print(codec_tokens(10), 75 * 8 * 10 / 1000)   # 6000 tokens, 6.0 kbps with 1,024-entry codebooks
 ```
 
+### Agent turn with barge-in: cancel speech and generation together
+A sketch of one voice-agent turn in `asyncio`. `llm_stream`, `synthesize` and `play` stand for your
+LLM client, TTS backend and audio sink; the point is the shape: speak clause by clause, and on a VAD
+speech-start event cancel both the speaking task and the LLM stream.
+
+```python
+import asyncio, re
+
+CLAUSE_END = re.compile(r"[.!?,;:]\s")
+
+async def speak_reply(llm_stream, synthesize, play, min_chars=25):
+    buf = ""
+    async for token in llm_stream:                 # cancelling this task also stops generation
+        buf += token
+        m = CLAUSE_END.search(buf, min_chars)      # release the first clause early
+        if m:
+            clause, buf = buf[:m.end()], buf[m.end():]
+            await play(await synthesize(normalize(clause)))   # normalize() from the example above
+    if buf.strip():
+        await play(await synthesize(normalize(buf)))
+
+async def agent_turn(llm_stream, synthesize, play, user_started_speaking: asyncio.Event):
+    speaking = asyncio.create_task(speak_reply(llm_stream, synthesize, play))
+    barge_in = asyncio.create_task(user_started_speaking.wait())
+    done, _ = await asyncio.wait({speaking, barge_in}, return_when=asyncio.FIRST_COMPLETED)
+    if barge_in in done:
+        speaking.cancel()                          # stop TTS, playback and the LLM stream
+        return "interrupted"                       # log what was spoken so history stays truthful
+    barge_in.cancel()
+    return "completed"
+```
+
+- **Keep history honest.** After an interruption, store only the text actually spoken in the agent's
+  transcript, otherwise the next turn assumes the user heard things they did not.
+
 ## Production patterns
 - **Clause-level splitter on the LLM stream.** When: any conversational agent. How: release the first
   chunk at the first clause or sentence boundary past a minimum length, then sentence by sentence.
@@ -229,6 +284,9 @@ print(codec_tokens(10), 75 * 8 * 10 / 1000)   # 6000 tokens, 6.0 kbps with 1,024
 - **Cache fixed phrases.** When: greetings, disclaimers and menu prompts repeat. How: key cached audio by
   normalised text, voice and model version; synthesise only dynamic parts. Monitor: cache hit rate and
   synthesis cost per call.
+- **A spoken-style system prompt.** When: the same agent serves chat and voice. How: a voice-specific
+  instruction block (short sentences, no markdown, numbers in words for amounts, summarise tool results)
+  plus the normaliser as a safety net. Monitor: share of chunks the normaliser had to rewrite.
 
 ## Trade-offs
 - **Non-autoregressive speed vs codec-LM richness.** Non-autoregressive acoustic models give fast,
@@ -256,6 +314,8 @@ print(codec_tokens(10), 75 * 8 * 10 / 1000)   # 6000 tokens, 6.0 kbps with 1,024
   being interrupted.
 - **Evaluating only by listening to a few demos.** Symptom: mispronounced customer names and product
   terms in production that an ASR round-trip WER test on your own vocabulary would have caught.
+- **Recording unspoken text in agent history after barge-in.** Symptom: the agent later refers to details
+  the user never heard. Fix: truncate the stored reply to what was played before cancellation.
 
 ## When to use
 - **Use neural TTS** whenever text must become speech for dynamic content: voice agents, IVR replacing
@@ -322,6 +382,12 @@ metric that matches what users feel.
 - **The workaround.** Predict the coarse first codebook autoregressively and the rest in parallel, or use
   interleaving and delay patterns across codebooks.
 
+### Your voice agent goes silent for two seconds whenever it calls a tool. What do you change?
+- **Measure the gap.** Trace TTFA per turn and split it into LLM, tool and TTS time; tool latency often
+  dominates turns that call an API.
+- **Hide or cut it.** Speak a short cached filler before the tool call, start the tool on partial ASR
+  where safe, and stream the answer clause by clause as soon as the tool returns.
+
 ## Quiz
 ### Q: Why do most TTS pipelines predict a mel-spectrogram first and then run a vocoder, instead of generating waveform samples directly from text?
 - [ ] Waveforms cannot be produced by neural networks
@@ -346,3 +412,23 @@ metric that matches what users feel.
 - [ ] Total synthesis time for the full reply
 > Users judge the gap before the agent starts speaking. RTF and MOS matter for throughput and quality,
 > but a low RTF with whole-reply synthesis still produces a long silent gap.
+
+## Use cases & projects
+### Use cases
+- **Phone support and booking agents.** Streaming TTS with barge-in replaces IVR menus with an agent that
+  answers and acts in one conversation.
+- **In-car and hands-free assistants.** Short spoken replies and summarised tool results matter more than
+  voice quality.
+- **Outbound notification agents.** Cached fixed phrases plus synthesised dynamic parts (names, dates,
+  amounts) keep cost and pronunciation risk low.
+- **Accessibility read-aloud.** An agent turns documents or dashboards into spoken summaries rather than
+  reading raw tables.
+
+### Mini project
+**Measure and cut time-to-first-audio (2-3 hours).**
+- **Goal:** build a text-in, speech-out agent reply path and bring TTFA down with streaming and barge-in.
+- **Steps:** stream an LLM reply into any TTS backend twice, once synthesising the whole reply and once
+  clause by clause; add the normaliser; simulate barge-in with a timer that cancels the turn; log TTFA,
+  RTF and the text actually spoken.
+- **Done when:** you have TTFA for both runs, a barge-in that stops audio and generation within a few
+  hundred milliseconds, and an agent history that stores only spoken text.

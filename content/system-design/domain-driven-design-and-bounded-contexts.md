@@ -5,7 +5,7 @@ name: Domain-driven design & bounded contexts
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - system-design/modular-monolith-vs-microservices
@@ -293,9 +293,9 @@ except CreditLimitExceeded as e:
   published language and owners, and run per-context evals written by its experts. Monitor tool-selection
   errors and eval scores by context, so a regression points at one owner.
 - **Tool results in the agent's language, checked by schema.** Validate every tool result against the
-  published schema (the `SupportCustomer` shape, as a Pydantic model or JSON Schema) before it reaches the model,
-  and reject results that carry upstream field names. Monitor schema-validation failures per tool, since
-  each one is an adapter that drifted.
+  published schema (the `SupportCustomer` shape, as a Pydantic model or JSON Schema) before it reaches
+  the model, and reject results that carry upstream field names. Monitor schema-validation failures per
+  tool, since each one is an adapter that drifted.
 - **Coupling metrics on change.** Tag pull requests and releases by the contexts they touch, and track how
   many contexts a typical change spans and how often releases must be coordinated. A rising number means a
   seam is in the wrong place.

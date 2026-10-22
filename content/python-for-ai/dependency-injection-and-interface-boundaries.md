@@ -5,7 +5,7 @@ name: Dependency injection & interface boundaries
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/protocols-generics-structural-typing
@@ -31,8 +31,8 @@ milliseconds and swap providers in one file.
   deterministic dependency you have: the model. Without injection, every test of planning, tool routing
   or stop conditions needs an API key, costs money and returns different text each run.
 - **Where it shows up in your stack.** LangChain's chat-model interface and LangGraph nodes are already
-  ports you call through; FastAPI `Depends` and a lifespan wire agent services; LangSmith or
-  OpenTelemetry tracing is just another injected collaborator. Your own `Completer`, `Tool` and
+  ports you call through; FastAPI `Depends` and a lifespan wire agent services; an OpenTelemetry
+  tracer or a LangSmith client can be injected like any other collaborator. Your own `Completer`, `Tool` and
   `MemoryStore` protocols sit on top so business logic does not import any of them.
 - **What you control.** Which ports exist (model, tools, retriever, memory, clock), what types cross
   them (your `Completion` and tool-call dataclasses, not vendor objects), and the one composition root
@@ -106,7 +106,7 @@ milliseconds and swap providers in one file.
 | Mismatch | What happens |
 |---|---|
 | Async service calls a sync adapter | event loop blocks on every network call |
-| Sync service handed an async adapter | gets an un-awaited coroutine; mypy flags it, the runtime does not |
+| Sync service handed an async adapter | gets an un-awaited coroutine; mypy flags it, the runtime only fails later (an `AttributeError` reading `.text` off the coroutine, plus a "never awaited" warning) |
 
 - `def complete(...)` returns a `Completion`; `async def complete(...)` returns a coroutine. They are
   different interfaces, so decide at the port.

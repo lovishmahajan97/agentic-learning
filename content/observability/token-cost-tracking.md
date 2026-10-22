@@ -5,7 +5,8 @@ name: Token / cost tracking
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - observability/monitoring
   - observability/spans
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-LLM spend is metered per token and priced by token class and model, so record provider usage on every
-call, cost it at the price then in force, and roll up by decision dimensions. Retries, agent loops and
-history make averages mislead.
+An agent run's cost is the sum of every step's tokens, priced by token class and model. Record provider
+usage on every call, cost it at the price then in force, roll up per run and task, and enforce budgets
+inside the loop.
+
+## For agent builders
+- **Why it matters for agents.** Each step resends the growing transcript, so a 20-step run sends far
+  more input than 20 single calls, and one looping run can cost more than a thousand normal ones. Cost
+  is a property of the loop, not of a request.
+- **Where it shows up in your stack.** The `usage` object on every provider response (including cached and
+  reasoning token fields), `tiktoken` or a provider's token-counting endpoint for pre-call estimates,
+  span attributes in your tracing tool, and the gateway or agent state that holds budgets.
+- **What you control.** A per-run token and dollar budget checked before each step, a stable cacheable
+  prefix (system prompt and tool schemas), history compaction, the dated price table, and attribution
+  by feature, tenant, prompt version and run id.
+- **What you can skip.** Provider billing internals. Know the usage fields per provider, the
+  history-growth arithmetic and cost per successful task.
 
 ## Why it exists
 - **The invoice is one number per model per month.** It cannot tell you that summarisation costs three
@@ -100,6 +114,20 @@ total output over 20 turns = 20 × 400 = 8,000
   much.
 - **So** prompt caching (the repeated prefix billed at a discount) and history compaction exist, and cost
   per conversation must be tracked separately from cost per turn.
+
+### Why agent runs are expensive: the same arithmetic per step
+An agent loop is a conversation the model has with its tools: every step resends the system prompt, tool
+schemas and every earlier tool call and result.
+
+```
+input(step n) = prefix + per_step × (n − 1)
+total input over N steps = N × prefix + per_step × N(N − 1) / 2
+```
+
+- **With a 6,000-token prefix and 1,500 tokens appended per step,** 20 steps send 405,000 input tokens,
+  and a run that loops to 100 steps sends 8,025,000: 5× the steps, about 20× the input.
+- **So the levers are agent design choices:** a step budget, a cacheable byte-identical prefix,
+  compaction of old tool results, and short tool outputs (return ids and summaries, not whole documents).
 
 ### Beyond text tokens
 - **Images and audio** become tokens by provider-specific rules (image cost typically depends on
@@ -212,6 +240,51 @@ for turns in (5, 10, 20, 40):
 | 20 | 169,000 | $0.418 |
 | 40 | 618,000 | $1.396 |
 
+### Worked scenario: one agent run with and without caching, and a runaway loop
+Same 6,000-token prefix, 1,500 tokens appended per step, 300 output tokens per step, illustrative
+prices of 2 (input), 10 (output), 2.5 (cache write) and 0.2 (cache read) dollars per million tokens.
+
+| Run | Input tokens | Input cost | Output cost | Total |
+|---|---|---|---|---|
+| 20 steps, no caching | 405,000 uncached | $0.81 | $0.06 | ~$0.87 |
+| 20 steps, append-only prefix cached | 34,500 written, 370,500 read | ~$0.16 | $0.06 | ~$0.22 |
+| 100-step loop, no caching | 8,025,000 uncached | ~$16.05 | $0.30 | ~$16.35 |
+
+- **Reading:** caching cuts this run about 4×; one runaway run costs as much as roughly 19 normal
+  uncached runs, which is why the budget check lives inside the loop, not in a monthly report.
+
+### Per-run budget guard in the agent loop
+Uses `cost_usd` and the neutral usage dict from above. The running total lives in the run's state, so
+the check is synchronous and happens before the next step spends anything.
+
+```python
+class BudgetExceeded(Exception):
+    pass
+
+class RunBudget:
+    def __init__(self, max_usd=0.50, max_steps=20):
+        self.max_usd, self.max_steps = max_usd, max_steps
+        self.spent, self.steps, self.calls = 0.0, 0, []
+
+    def charge(self, model, usage, is_retry=False):
+        c = cost_usd(model, usage)
+        self.spent += c
+        self.calls.append({"model": model, "cost": c, "retry": is_retry, **usage})
+        return c
+
+    def check_before_step(self):
+        self.steps += 1
+        if self.steps > self.max_steps:
+            raise BudgetExceeded(f"step budget {self.max_steps} reached")
+        if self.spent >= self.max_usd:
+            raise BudgetExceeded(f"cost budget ${self.max_usd:.2f} reached (${self.spent:.3f})")
+
+# in the loop:
+#   budget.check_before_step()
+#   reply = call_model(messages); budget.charge(model, from_anthropic(reply.usage))
+# on BudgetExceeded: stop, tell the user, record stop_reason and budget.spent on the run span
+```
+
 ### Production snippet: provider adapters into the neutral schema
 Two providers report cache usage differently, which is exactly why the adapter exists. Field names are
 from the providers' documented usage objects at the time of writing; verify against current docs.
@@ -246,6 +319,9 @@ def from_anthropic(u):     # messages usage: input_tokens EXCLUDES cache reads a
 - **Cache effectiveness tracking.** Record cache-read and cache-write tokens separately and chart their
   ratio per prompt version. Monitor a falling read-to-write ratio after a deploy; it usually means the
   prefix stopped being byte-identical.
+- **Tool output size limits.** Cap or summarise tool results before appending them to the transcript,
+  because every token a tool returns is resent on every later step. Monitor tool-result tokens per step
+  and per tool; a tool returning whole documents shows up as the largest per-step growth.
 - **Cost per successful task as the headline.** Divide feature cost by completed tasks (not requests) on
   the weekly dashboard, and use it when comparing models. Monitor it for a week after any model switch.
 
@@ -262,6 +338,9 @@ def from_anthropic(u):     # messages usage: input_tokens EXCLUDES cache reads a
 - **Cheaper model vs tokens per task.** It cuts cost per token immediately, but can raise tokens per task
   (more retries, longer outputs, more agent steps); cost per successful task is the only comparison that
   settles it.
+- **Tight run budgets vs task completion.** A low per-run cap stops runaway loops early, but also cuts off
+  legitimately long tasks and lowers success. It flips toward a higher cap per task type once you know the
+  step-count distribution of successful runs; set the cap above their p99.
 - **Prompt caching vs write premium.** Caching lowers input cost sharply for stable prefixes, but on some
   providers adds a write premium and only pays off when the prefix is reused within the cache window.
   Tracking cache-read against cache-write tokens tells you whether it is paying.
@@ -276,6 +355,9 @@ def from_anthropic(u):     # messages usage: input_tokens EXCLUDES cache reads a
 - **Ignoring reasoning tokens.** Reasoning models bill hidden reasoning as output tokens. Symptom: output
   counts and cost far above what the visible answer's length suggests, unexplained unless reasoning tokens
   are recorded as their own field.
+- **Large tool results appended raw.** Symptom: input tokens per step jump after a new tool ships, and run
+  cost grows much faster than step count. Fix: truncate, paginate or summarise tool outputs, and compact
+  old tool results once they have been used.
 - **Recomputing historical cost with current prices.** Symptom: last month's cost "changing" in reports.
 - **Average cost per request for agent features.** Symptom: a budget blown by a handful of runs that
   looped, invisible in the mean.
@@ -353,6 +435,13 @@ argument for recording them from the start.
 - **Caching discounts the repeated prefix** only while it is byte-identical and reused within the cache
   window; some providers charge a write premium, so track cache reads against writes to confirm it pays.
 
+### One agent run cost $16 while the median is under a dollar. How do you find out why and prevent it?
+- **Read the run's per-call records:** steps, input tokens per step and repeated tool calls usually show
+  a loop, or a tool returning a huge result that every later step resent.
+- **Prevent it in the loop:** a per-run step and dollar budget checked before each step, loop detection on
+  repeated identical tool calls, and size limits on tool results.
+- **Watch the tail:** alert on p99 cost per run per feature, because the mean hides these runs.
+
 ## Quiz
 ### Q: Why should cost be computed and stored at ingest time rather than recomputed from token counts when a report is run?
 - [ ] Token counts are too large to store
@@ -379,3 +468,23 @@ argument for recording them from the start.
 - [ ] Cost per request ignores output tokens
 > Agent cost is the sum over a variable number of calls, and abandoned or retried runs are real spend.
 > Dividing total cost by completed tasks charges those failures to the model that caused them.
+
+## Use cases & projects
+### Use cases
+- **Per-run budgets for autonomous agents.** A running cost total in the loop stops runaway runs before
+  they spend dollars instead of cents.
+- **Choosing a model for an agent.** Cost per successful task on an eval set settles whether a cheaper
+  model is actually cheaper once extra steps and retries count.
+- **Chargeback on a multi-tenant agent platform.** Per-call records with tenant and run ids attribute the
+  bill to the tenants and workflows that caused it.
+- **Prompt and tool changes.** Tokens per step and cache read-to-write ratio per prompt version show when a
+  change broke caching or a tool started returning too much.
+
+### Mini project
+**Cost-instrument an agent and enforce a run budget (2-3 hours).**
+- **Goal:** know the cost of every agent run and stop expensive runs automatically.
+- **Steps:** wrap a small tool-calling agent's model calls with a provider adapter into the neutral usage
+  schema; cost each call from a dated price table; add `RunBudget` with step and dollar caps; run 30
+  tasks with caching off and on, plus one task designed to loop.
+- **Done when:** you have a per-run table of steps, input, cached and output tokens and cost; the cached
+  runs are measurably cheaper; and the looping task stops at the budget with its stop reason recorded.

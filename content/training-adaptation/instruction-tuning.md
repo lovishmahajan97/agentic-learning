@@ -5,7 +5,7 @@ name: Instruction tuning
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - training-adaptation/supervised-fine-tuning
@@ -121,15 +121,15 @@ single format, for the same reason as templates: learn the intent, not one surfa
 ## Diagram
 Follow how many narrow sources, including tool-calling tasks, become one wide, balanced mixture: formats
 are mixed, large tasks are capped before proportional mixing, and the SFT loss masks the instruction.
-Evaluation holds out whole task families and unseen tools, not rows.
+Evaluation holds out whole task families and unseen tools, not rows; only a model that passes moves on to
+preference and safety training.
 
 ```mermaid
 flowchart TD
     BM["Public benchmarks"] -->|"several templates and inversions"| P["Instruction pool"]
     HW["Human-written requests"] --> P
     TC["Tool-calling tasks, varied schemas"] --> P
-    SD["Seed tasks"] --> SI["Self-Instruct: teacher generates"]
-    SI -->|"filter quality and diversity"| P
+    SI["Self-Instruct from seed tasks"] -->|"filter quality and diversity"| P
     P --> MX["Mix prompt formats"]
     MX --> CAP["Proportional mixing, per-task cap"]
     CAP --> SFT["SFT, instruction masked"]
@@ -137,12 +137,13 @@ flowchart TD
     HO["Held-out tasks and tools"] --> EV{"Works on unseen tasks?"}
     IT --> EV
     EV -->|"no: add tasks and phrasings"| P
+    EV -->|"yes"| NX["Preference and safety training"]
 ```
 
 ## Examples
 ### A miniature mixture with a tool-calling task family
 Two task families, several templates each, balanced with a per-task cap. The tool family varies the
-tool's name and wording so the model learns "read the schema, call it", not one tool. FLAN-style
+tool's name, wording and argument order so the model learns "read the schema, call it", not one tool. FLAN-style
 pipelines do this at a scale of hundreds of tasks.
 
 ```python
@@ -153,7 +154,7 @@ sentiment = [("The battery lasts two days, love it.", "positive"),
              ("Screen cracked in a week.", "negative")]
 tool_rows = [("What's the weather in Pune tomorrow?", {"city": "Pune", "day": "tomorrow"}),
              ("Will it rain in Oslo today?", {"city": "Oslo", "day": "today"})]
-tool_variants = [("get_weather", "Get the forecast for a city and day."),   # same task, varied schema
+tool_variants = [("get_weather", "Get the forecast for a city and day."),   # same task, varied name and wording
                  ("weather_lookup", "Look up weather. Args: city, day."),
                  ("forecast", "Returns a forecast for the given city on the given day.")]
 
@@ -172,7 +173,8 @@ def build(cap=1000):
             out.append({"instruction": t.format(x=x), "output": y, "task": "sentiment"})
     for x, args in tool_rows[:cap]:
         name, desc = random.choice(tool_variants)
-        tools = json.dumps([{"name": name, "description": desc}])
+        params = random.sample(list(args), k=len(args))   # vary argument order too
+        tools = json.dumps([{"name": name, "description": desc, "parameters": params}])
         for t in templates["tool_call"]:
             out.append({"instruction": t.format(tools=tools, x=x),
                         "output": json.dumps({"name": name, "arguments": args}), "task": "tool_call"})
@@ -191,7 +193,7 @@ for ex in build()[:3]:
 
 ### Worked numbers: why the cap matters
 Suppose the real mixture has three tasks with 500,000, 20,000 and 2,000 examples: say general QA,
-extraction, and your agent's tool-calling traces.
+extraction, and a small task such as your agent's tool-calling traces (`rewrite` in the code below).
 
 | Mixing rule | Task A (500,000) | Task B (20,000) | Task C (2,000) | Effect |
 |---|---|---|---|---|
@@ -311,12 +313,13 @@ tend to overfit seen tasks.
   many different schemas, and keep a general instruction slice.
 - **Fix the eval:** hold out whole tools and score valid-call rate on them before every release.
 
-### You have one 500,000-example task and two small ones. How do you build the mixture?
-- **Proportional mixing** gives the big task about 96% of samples, so the result is effectively
-  single-task.
-- **Cap each task** (for example at 10,000) before proportional mixing; the small tasks then become
+### You add 2,000 agent tool-calling traces to a mix with a 500,000-example task and a 20,000-example one. How do you build the mixture?
+- **Proportional mixing** gives the big task about 96% of samples and the traces about 0.4%, so the
+  result is effectively single-task and tool calling is barely trained.
+- **Cap each task** (for example at 10,000) before proportional mixing; the smaller tasks then become
   visible at about 45% and 9%.
-- **Tune the cap** by watching per-task held-out scores, because it is a knob, not a constant.
+- **Tune the cap** by watching per-task held-out scores, including valid-call rate on held-out tools,
+  because it is a knob, not a constant.
 
 ### When would you not instruction-tune, and do a narrow fine-tune instead?
 - **When the product has one fixed task**, because a narrow SFT on that task is simpler and wins on it.

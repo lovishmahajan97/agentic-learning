@@ -5,7 +5,8 @@ name: Feature stores (hybrid ML only)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: background
 related:
   - ml-fundamentals/train-test-leakage
   - data-architecture/training-data-pipelines
@@ -20,9 +21,23 @@ sources:
 ---
 
 ## TL;DR
-Caveat first: this matters only for hybrid systems serving classical ML models beside LLMs. A feature store
-computes features once, serves them point-in-time correct to training and fresh to inference, and versions
-definitions, preventing training/serving skew and time leakage.
+Caveat first: this matters only when your agent relies on classical ML models (risk scores, routers,
+rankers). A feature store computes features once, serves them point-in-time correct to training and fresh
+to inference, preventing training/serving skew and time leakage.
+
+## For agent builders
+- **Why it matters for agents.** Many production agents sit beside classical models: a fraud or risk score
+  decides whether the agent's refund action executes, a routing classifier picks the model or sub-agent, a
+  ranker orders documents. If those scores are skewed or leaky, the agent acts on wrong numbers with full
+  confidence.
+- **Where it shows up in your stack.** A tool or guardrail that calls `get_online_features` and a scoring
+  model before a consequential action, the feature views the ML team owns (often in Feast or a managed
+  store), and served-feature logs you join with agent traces.
+- **What you control.** Usually little of the store itself. You control which score gates which tool, what
+  the agent does when a feature is null or stale, and that the score and feature version land in the
+  trace.
+- **What you can skip.** All of it, if your agent uses only LLMs over retrieved text. Then ingestion
+  contracts and embedding versioning cover the analogous concerns.
 
 ## Why it exists
 - **Caveat: hybrid systems only.** Feature stores matter in systems that train and serve classical ML models
@@ -45,20 +60,24 @@ definitions, preventing training/serving skew and time leakage.
   both problems.
 
 ## How it works
-### Entities, features and feature views
+### Background: the moving parts
 - **A feature** is a named, typed value attached to an **entity** (a customer id, a card id, a merchant id)
   with an **event timestamp** saying when the value became true.
 - **A feature view** (Feast's term; other systems say feature groups or tables) is a set of features for one
   entity, computed by one transformation from one source, with a TTL saying how long a value stays valid.
-- **The definition lives in code under version control,** *because* it must be the single source of truth
-  for both the batch and the serving path.
+  The definition lives in code under version control, *because* it must be the single source of truth for
+  both the batch and the serving path.
+- **The offline store** holds historical feature values, keyed by entity and event timestamp, in the
+  warehouse or lakehouse. It is append-only by design: a new value is a new row with a later timestamp, not
+  an overwrite, *because* training needs every past value to reconstruct what was known at any given moment.
+- **The online store** is a low-latency key-value store (Redis, DynamoDB, Bigtable and similar) holding only
+  the latest value per entity per feature view; serving reads it with a single lookup per entity. A
+  scheduled materialization job copies the latest values from the offline store into it, so both paths see
+  the same computed numbers.
+- **A streaming path** writes to both stores from the event stream for features that must be fresher than the
+  materialization cadence (counts in the last minute).
 
-### The offline store
-- **Historical feature values,** keyed by entity and event timestamp, in the warehouse or lakehouse.
-- **Append-only by design:** a new value is a new row with a later timestamp, not an overwrite, *because*
-  training needs every past value to reconstruct what was known at any given moment.
-
-### The point-in-time join
+### Background: the point-in-time join
 Given a label table with `(entity_id, label_timestamp, label)`, for each row and each feature view:
 1. Select the latest value with `event_timestamp <= label_timestamp`.
 2. Require `label_timestamp - event_timestamp <= ttl`.
@@ -90,14 +109,6 @@ The `<=` in the join is a decision, not a detail.
   set where the feature is null before its launch date.
 - **So feature sources should be append-only events** wherever possible.
 
-### The online store
-- **A low-latency key-value store** (Redis, DynamoDB, Bigtable and similar) holding only the latest value per
-  entity per feature view. Serving reads it with a single lookup per entity.
-- **Populated by materialization:** a scheduled job copies the latest values from the offline store into the
-  online store, so both paths see the same computed numbers.
-- **A streaming path** writes to both stores from the event stream for features that must be fresher than the
-  materialization cadence (counts in the last minute).
-
 ### Why one definition serves both paths
 - **Written once, executed twice:** in the batch engine for history, and in the materializer or stream
   processor for serving. Skew is prevented structurally rather than by code review, *because* there is no
@@ -114,11 +125,13 @@ The `<=` in the join is a decision, not a detail.
 - **Statistics computed at materialization** (null rates, distributions) are what drift monitoring compares
   against.
 
-### Where it sits in a hybrid AI system
+### Where it sits in an agent system
 - **Typical shapes:** a ranking or routing model decides which documents or which LLM an agent should use; a
   fraud or risk score gates whether an LLM-generated action executes; a churn model decides which users get
   an LLM-drafted outreach.
-- **The LLM gets the score or the decision,** not the features, which come from the feature store.
+- **The LLM gets the score or the decision,** not the features, which come from the feature store. Keep the
+  gate in code, not in the prompt, *because* a model asked to "refuse risky refunds" can be talked out of it
+  and a threshold check cannot.
 - **Embeddings as features:** a user or item embedding fed to a ranker makes the embedding model's version
   part of the feature view's definition. Changing it is a new feature version and a retrain, for the same
   reason it forces a re-index in retrieval.
@@ -135,7 +148,8 @@ The `<=` in the join is a decision, not a detail.
   concepts above are shared.
 
 ## Diagram
-One definition feeds both paths: history for point-in-time training joins, latest values for serving.
+One definition feeds both paths: history for point-in-time training joins, latest values for the score
+that gates the agent's action.
 
 ```mermaid
 flowchart TD
@@ -148,11 +162,45 @@ flowchart TD
     LBL["Labels with timestamps"] --> PIT["Point-in-time join"]
     OFF --> PIT
     PIT --> TRAIN["Training set"]
-    ON -->|"one lookup per entity"| SERVE["Model scoring"]
+    ON -->|"one lookup per entity"| SERVE["Risk score gates agent tool"]
     SERVE -.->|"log served values"| OFF
 ```
 
 ## Examples
+### A risk score gating an agent's refund tool
+The agent proposes a refund; code, not the model, reads online features, scores them and decides. Stale or
+missing features fail closed to human review. The feature lookup and model are stand-ins for
+`get_online_features` and a trained classifier.
+
+```python
+from datetime import datetime, timedelta, timezone
+
+ONLINE = {"card:4242": {"txn_count_1h": 7, "avg_order_value_90d": 55.0,
+                        "event_timestamp": datetime.now(timezone.utc) - timedelta(minutes=3)}}
+MAX_STALENESS = timedelta(minutes=15)    # illustrative: the freshness the model was trained to expect
+THRESHOLD = 0.7                          # illustrative: set from the model's precision/recall curve
+
+def risk_model(f: dict) -> float:        # stand-in for the classical model
+    return min(1.0, 0.08 * f["txn_count_1h"] + 0.001 * f["avg_order_value_90d"])
+
+def refund_tool(card_id: str, amount_usd: float, trace: dict) -> dict:
+    f = ONLINE.get(f"card:{card_id}")
+    if f is None or datetime.now(timezone.utc) - f["event_timestamp"] > MAX_STALENESS:
+        trace["gate"] = "features_missing_or_stale"
+        return {"status": "needs_human_review", "reason": "risk features unavailable"}
+    score = risk_model(f)
+    trace.update(gate="risk_score", score=round(score, 3), feature_view="card_activity:v3")
+    if score >= THRESHOLD:
+        return {"status": "needs_human_review", "reason": "risk score above threshold"}
+    return {"status": "refunded", "amount_usd": amount_usd}
+
+trace = {}
+print(refund_tool("4242", 30.0, trace), trace)   # score 0.615 -> refunded, score logged in the trace
+```
+
+Logging the score and feature view version in the agent trace is what lets you later join served values
+with batch values to check for skew.
+
 ### Point-in-time join versus the leaky latest-value join
 Pure Python, contrasted with the "join to the latest value" that hand-rolled pipelines usually do. Feature
 rows are `(entity, event_time, value)`; labels are `(entity, label_time)`.
@@ -224,9 +272,10 @@ online = store.get_online_features(features=["customer_orders:avg_order_value_90
                                    entity_rows=[{"customer_id": 1001}]).to_dict()
 ```
 
-### Worked scenario: the 0.95-offline, 0.80-production fraud model
-Logging served features and comparing them with batch values for the same entities and timestamps
-(illustrative findings):
+### Worked scenario: the 0.95-offline, 0.80-production fraud model behind an agent
+A support agent's refund tool is gated by a fraud model that scored 0.95 offline and behaves like 0.80 in
+production, so the agent approves refunds it should escalate. Logging served features and comparing them
+with batch values for the same entities and timestamps (illustrative findings):
 
 | Check | Finding | Class of bug | Fix |
 |---|---|---|---|
@@ -236,22 +285,24 @@ Logging served features and comparing them with batch values for the same entiti
 | Last-hour count at the label event | logged serving values sit one below training values | inclusive-join leakage | strict comparison at the boundary |
 
 - **After the rebuild the offline score drops** toward production, which is the point: the evaluation now
-  measures the model production actually runs.
+  measures the model production actually runs. The agent's prompt never needed changing.
 
 ## Production patterns
+- **Gate consequential agent tools on scores in code.** Use when a classical model decides whether an agent
+  action runs (refunds, account changes, outreach). The tool reads online features, scores, and returns
+  "needs review" above the threshold or when features are null or stale. Monitor gate outcomes per tool and
+  the share of decisions made on stale features.
 - **Feature definitions as reviewed code.** Use from the first shared feature. Keep feature views in a repo,
   run `feast apply` (or the managed store's equivalent) from CI, and require a new version for any semantic
   change. Monitor the fraction of model features with a single definition.
-- **Scheduled incremental materialization.** Use for every online feature view. Run
-  `materialize_incremental` on a cadence shorter than the feature's freshness requirement. Monitor feature
-  freshness at serve time (now minus the served value's event timestamp) and materialization job failures.
-- **Streaming push for second-level freshness.** Use only for features like last-minute counts. Write from the
-  stream processor into both stores (Feast offers a push source for this). Monitor stream lag, because it
-  becomes the feature's staleness.
+- **Scheduled incremental materialization and streaming push.** Run `materialize_incremental` on a cadence
+  shorter than the feature's freshness requirement; only features like last-minute counts get a stream
+  processor writing into both stores (Feast offers a push source for this). Monitor serve-time freshness
+  (now minus the served value's event timestamp), materialization failures and stream lag.
 - **Served-feature logging and skew checks.** Use for every model in production. Log the feature vector with
-  each prediction asynchronously (sample at high traffic), then join to batch-recomputed values for the same
-  entity and timestamp. Monitor per-feature mismatch rate; a constant offset of one points at the join
-  boundary.
+  each prediction asynchronously (sample at high traffic), alongside the agent trace id, then join to
+  batch-recomputed values for the same entity and timestamp. Monitor per-feature mismatch rate; a constant
+  offset of one points at the join boundary.
 - **TTL on every feature view.** Use always. Set `ttl` to the longest staleness the model can tolerate, so
   dormant entities get nulls instead of year-old values. Monitor null rate per feature at training and serve
   time; a jump means a source stopped producing.
@@ -273,6 +324,8 @@ Logging served features and comparing them with batch values for the same entiti
 - **Closed loop vs write per prediction.** Logging served features closes the loop on online-only
   transformations, but adds a write per prediction to a read-only path; make it asynchronous and sample when
   traffic is high.
+- **Fail closed vs agent throughput.** Routing every stale-feature case to human review keeps actions safe
+  but queues work when the online store lags; size the staleness limit to what the model was trained on.
 
 ## Pitfalls
 - **Joining labels to current feature values.** Symptom: offline evaluation far better than production, with
@@ -283,6 +336,8 @@ Logging served features and comparing them with batch values for the same entiti
   dormant entity as if it were current.
 - **Mixing event time and ingestion time.** Symptom: subtle leakage when late-arriving events get stamped with
   when they were loaded rather than when they happened.
+- **Putting the risk gate in the prompt.** Symptom: the agent approves a flagged action after a persuasive
+  user message. Fix: the threshold check lives in the tool's code.
 - **Adopting a feature store for an LLM-only application.** Symptom: an expensive platform holding document
   metadata that the ingestion pipeline already handled.
 - **Not recording feature view versions in the model's provenance.** Symptom: being unable to tell why model
@@ -331,6 +386,14 @@ after the inputs are right.
 - **Prevention is structural:** one feature view definition executes in the batch engine and in the
   materializer or stream processor, so there is no second implementation to drift.
 
+### Your agent's refund tool is gated by a fraud score. How do you design the gate?
+- **In code, not the prompt:** the tool reads online features, scores them and enforces the threshold, so no
+  user message can talk the agent past it.
+- **Fail closed:** null or stale features (older than the freshness the model was trained on) route to human
+  review instead of defaulting to "low risk".
+- **Observable:** log the score, threshold and feature view version on the agent trace so skew checks and
+  incident reviews can join them later.
+
 ### Walk me through building a leakage-free training set for a churn model.
 - **Start from labels** with entity id and label timestamp.
 - **As-of join each feature view:** latest value with event time at or before the label time, within the TTL,
@@ -338,7 +401,7 @@ after the inputs are right.
 - **Check the boundary:** decide strict or inclusive comparison to match what serving can know at decision
   time, and use event time, not ingestion time.
 
-### Would you add a feature store to a pure RAG assistant?
+### Would you add a feature store to a pure RAG assistant or agent?
 - **No:** with no classical model to train and serve, there is no skew or point-in-time problem to solve.
 - **Use instead** an ingestion contract for metadata consistency and embedding versioning for transformation
   versions; a feature store would hold document metadata the ingestion pipeline already handles.
@@ -381,3 +444,25 @@ after the inputs are right.
 > Feature stores solve training/serving skew and time leakage for models trained on tabular features.
 > A RAG assistant has no such model; consistency between ingestion and query metadata is an ingestion
 > contract concern, and transformation versioning is handled by the embedding recipe.
+
+## Use cases & projects
+### Use cases
+- **Risk-gated agent actions.** A fraud or abuse score from online features decides whether a refund,
+  account change or payout tool runs or goes to review.
+- **Routing in multi-model agent systems.** A classical classifier trained on request features picks the
+  model or sub-agent, and must be point-in-time correct to evaluate honestly.
+- **Ranking for retrieval or recommendations.** A ranker with user and item features (embeddings included)
+  orders what the agent sees.
+- **Proactive outreach agents.** A churn model decides which users get an LLM-drafted message; leakage there
+  means messaging the wrong people.
+
+### Mini project
+**A leakage-free risk gate for an agent tool (2-3 hours).**
+- **Goal:** gate a toy refund tool with a small classifier and show how leakage changes the gate's
+  decisions.
+- **Steps:** generate synthetic transaction events with timestamps and fraud labels; build features once with
+  a leaky latest-value join and once with a point-in-time join; train a logistic regression on each and
+  compare offline AUC; put the point-in-time model behind a `refund_tool` that reads the latest features,
+  fails closed on stale ones, and logs the score on the trace; replay 200 later events through it.
+- **Done when:** a table shows the leaky model's offline AUC beating the honest one but losing on the
+  replayed events, and every replayed tool call has a score and feature version in its trace.

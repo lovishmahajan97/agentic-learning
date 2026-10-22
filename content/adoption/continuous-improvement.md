@@ -5,7 +5,8 @@ name: Continuous improvement
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - evals/error-analysis
   - evals/regression-tests
@@ -18,9 +19,21 @@ related:
 ---
 
 ## TL;DR
-Continuous improvement is the operating loop that turns production evidence into measured fixes:
-classify failures, prioritise them, fix at the cheapest layer, encode cases in a regression suite, gate
+Continuous improvement is the loop that turns production agent runs into measured fixes: classify
+trajectory failures, prioritise them, fix at the cheapest layer, encode cases in a regression suite, gate
 the release and confirm online that the bucket shrank.
+
+## For agent builders
+- **Why it matters for agents.** Agent failures are coupled and multi-step: a prompt edit that stops one
+  loop can make the agent skip a required lookup elsewhere. Without a frozen suite and a paired gate,
+  every fix is a guess about the other trajectories.
+- **Where it shows up in your stack.** Traces with tool-call spans feed the failure taxonomy; an eval
+  harness runs the regression suite in CI; canary or shadow routing and version stamps (prompt, tool
+  schemas, model, index) make production changes attributable.
+- **What you control.** The bucket taxonomy (wrong tool, bad arguments, loops, premature stop), the
+  layer you fix at, the gate's noise rules, and when vendor model or data changes count as releases.
+- **What you can skip.** Statistics beyond McNemar's paired test and a rate per 1,000 runs; that pair
+  covers most agent release decisions.
 
 ## Why it exists
 - **Quality does not stay where acceptance left it.** New users phrase things differently, the knowledge
@@ -49,6 +62,9 @@ Pull signals from several sources, because each sees different failures:
 ### 2. Classify
 - **Build a stable taxonomy through error analysis:** read real traces and name the failure modes ("cited
   superseded policy", "wrong language", "tool called with wrong account ID").
+- **For agents, classify the trajectory, not just the final answer:** wrong tool chosen, right tool with
+  bad arguments, a loop that hits the step budget, a required lookup skipped, or a stop before the task
+  was done. A correct final answer reached through a risky action is still a failure.
 - **Scale with an LLM classifier** once the categories are stable, and spot-check it.
 - **Counts per bucket per week** are the input to everything that follows.
 
@@ -73,6 +89,10 @@ Diagnose which layer owns the failure before touching anything. In rough order o
 
 - **Many "model failures" are retrieval or data failures,** and a prompt cannot fix a document that is not
   in the index.
+- **Agents add a layer: the loop itself.** Loops and premature stops are often fixed in orchestration
+  (stopping conditions, step budgets, loop detection, a clearer tool error message the model can act on),
+  not in the system prompt. Tool descriptions and argument schemas sit in layer 4 and are a cheap,
+  frequent fix for wrong-tool and bad-argument buckets.
 
 ### 5. Encode before you fix
 - **Add the failing production cases,** de-identified as needed, to the regression suite *before* changing
@@ -111,7 +131,7 @@ back to the fix step, not to production.
 
 ```mermaid
 flowchart TD
-    O["Observe: feedback, traces, random sample"] --> C["Classify into failure buckets"]
+    O["Observe: takeovers, agent traces, random sample"] --> C["Classify trajectories into buckets"]
     C --> P["Prioritise: count x severity / effort"]
     P --> L["Pick cheapest layer that owns it"]
     L --> E["Encode cases in regression suite"]
@@ -126,6 +146,52 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: seeding trajectory buckets from traces
+Before an LLM classifier is worth it, simple rules over tool-call spans seed the agent's failure buckets,
+and every failing run becomes a regression case. Run summaries are illustrative.
+
+```python
+from collections import Counter
+
+# Minimal run summaries from the tracing store: tool calls in order, plus the run outcome.
+runs = [
+    {"id": "r1", "calls": [("search_orders", "ok"), ("issue_refund", "ok")], "outcome": "done"},
+    {"id": "r2", "calls": [("search_orders", "ok")] * 6, "outcome": "max_steps"},
+    {"id": "r3", "calls": [("issue_refund", "error:bad_account_id")], "outcome": "taken_over"},
+    {"id": "r4", "calls": [], "outcome": "answered_without_tools"},
+    {"id": "r5", "calls": [("search_orders", "ok")] * 3, "outcome": "max_steps"},
+]
+
+def bucket(run):
+    names = [name for name, _ in run["calls"]]
+    if any(status.startswith("error") for _, status in run["calls"]):
+        return "tool called with bad arguments"
+    if run["outcome"] == "max_steps" and len(names) >= 3 and len(set(names[-3:])) == 1:
+        return "loop: same tool repeated"
+    if run["outcome"] == "answered_without_tools":
+        return "skipped required lookup"
+    return "ok"
+
+counts = Counter(bucket(r) for r in runs)
+for name, n in counts.most_common():
+    print(f"{name:32} {n}")
+regression_cases = [r["id"] for r in runs if bucket(r) != "ok"]
+print(regression_cases)
+# loop: same tool repeated         2
+# ok                               1
+# tool called with bad arguments   1
+# skipped required lookup          1
+# ['r2', 'r3', 'r4', 'r5']
+```
+
+| Week | Loop bucket per 1,000 runs | What happened |
+|---|---|---|
+| Before fix | 18 | the order-search tool returned an empty list with no message, so the agent retried |
+| Fix (layer 4) | n/a | the tool now returns "no orders found for this email", and a loop detector stops after 3 identical calls |
+| Canary, 2 weeks | 6 | the bucket rate fell against its own pre-release weeks, so the fix is kept |
+
+The rates are illustrative; the point is the unit, failures per 1,000 runs, not raw counts.
+
 ### Weekly triage and release gate in Python
 Bucket counts come from classified production feedback. The ranking applies the severity override, and
 the gate compares per-slice pass rates on the same frozen regression suite.
@@ -208,18 +274,19 @@ print(slice_gate(4, 0))     # ('pass', 4.0, 0.125)    chi-square says block, exa
 ```
 
 ## Production patterns
-- **Paired gate on a frozen suite** — for every candidate prompt, retrieval or model change, run baseline
-  and candidate on the same cases in CI and gate on per-slice flips (exact test when flips are few), not
-  on the average. Monitor flips per slice and regression escapes per release.
+- **Paired gate on a frozen suite** — for every candidate prompt, tool-schema, retrieval or model change,
+  run baseline and candidate agents on the same cases in CI and gate on per-slice flips (exact test when
+  flips are few), not on the average. Score trajectories as well as final answers, for example "called
+  the lookup tool before refunding". Monitor flips per slice and regression escapes per release.
 - **Repeat flaky cases and score the majority** — when a case passes and fails across identical runs, mark
   it flaky, run it an odd number of times and take the majority. Monitor the share of flaky cases; a
   rising share means the judge or the prompt is unstable.
 - **Canary with a bucket-rate check** — route a small share of traffic to the candidate, then compare the
   targeted bucket's failures per 1,000 conversations with its own pre-release weeks. Monitor that rate and
   roll back if it does not fall.
-- **Version stamps on every trace** — record prompt version, retrieval or index version and model
-  identifier on each request, so a production shift can be attributed to a release. Monitor metrics
-  grouped by release, not by calendar week.
+- **Version stamps on every trace** — record prompt version, tool-schema version, retrieval or index
+  version and model identifier on each agent run, so a production shift can be attributed to a release.
+  Monitor metrics grouped by release, not by calendar week.
 - **Treat vendor and data changes as releases** — where the provider offers dated model snapshots, pin one
   instead of a floating alias, and run the full suite before moving; do the same before swapping a
   re-indexed knowledge base. Monitor suite results per snapshot.
@@ -237,6 +304,9 @@ print(slice_gate(4, 0))     # ('pass', 4.0, 0.125)    chi-square says block, exa
 - **Shared fix vs isolation.** Fixing one customer's failure in shared prompts helps everyone but risks
   others' behaviour; when the failure is truly customer-specific, put the fix in that customer's
   configuration and suite.
+- **Final-answer scoring vs trajectory scoring.** Checking only the answer is cheap and stable, but misses
+  risky or wasteful paths; trajectory checks catch them at the cost of brittle expectations, so assert on
+  required and forbidden tool calls rather than an exact sequence.
 
 ## Pitfalls
 - **Whack-a-mole prompt edits without a suite.** Symptom: complaints you already fixed reappear a few
@@ -253,6 +323,9 @@ print(slice_gate(4, 0))     # ('pass', 4.0, 0.125)    chi-square says block, exa
   re-index or the vendor's model update caused it.
 - **Feedback that disappears into a backlog.** Feedback volume drops because users learn that reporting
   changes nothing.
+- **Fixing agent loops in the system prompt.** "Do not call the same tool repeatedly" is added, loops drop
+  for a week, then return in another tool. Fix: repair the tool's empty or error result and add a loop
+  detector or step budget in the orchestration layer.
 
 ## When to use
 - **Use when** an AI system is in production with real users, starting in hypercare and continuing for
@@ -313,11 +386,20 @@ shrank, not only by offline pass rate.
 - **Block anyway if** a flipped case is a severity-5 failure, because the severity override applies to
   gates too.
 
-### The vendor updated the model behind the alias you call. What should your process do?
-- **Treat it as a release:** run the full frozen suite and compare per slice against the previous model.
+### The vendor updated the model behind the alias your agent calls. What should your process do?
+- **Treat it as a release:** run the full frozen suite and compare per slice against the previous model,
+  including trajectory checks, because tool-choice and stopping behaviour can shift even when answers look
+  similar.
 - **Prefer pinned snapshots** where the provider offers them, so the update happens when you choose.
 - **Watch online bucket rates** after the switch, because vendor changes are one of the main sources of
   silent drift.
+
+### After a tool-schema change, your agent hits the step budget far more often. Walk through the loop.
+- **Classify first:** pull max-step runs by version stamp and read trajectories; repeated identical calls
+  point to a loop, alternating tools to a planning failure.
+- **Fix at the cheapest layer:** often the tool description or its empty and error results, then a loop
+  detector in orchestration; encode the failing runs as regression cases before changing anything.
+- **Gate and verify:** paired gate on the suite, canary, then confirm the loop bucket per 1,000 runs fell.
 
 ## Quiz
 ### Q: Why add the failing production cases to the regression suite before implementing the fix?
@@ -343,3 +425,23 @@ shrank, not only by offline pass rate.
 - [ ] Widen the tolerance so the release passes
 > Averages hide regressions for specific user groups. The per-slice no-regression rule exists to catch
 > exactly this kind of coupled side effect before it reaches production.
+
+## Use cases & projects
+### Use cases
+- **Hypercare for a newly launched agent.** Weekly trajectory triage turns takeovers and max-step runs
+  into ranked buckets with owners.
+- **Shipping prompt or tool-schema changes safely.** A paired gate on a frozen suite blocks the fix that
+  repairs refunds but breaks the French slice.
+- **Absorbing vendor model updates.** Pinned snapshots plus a full suite run make a model change a
+  release, not a surprise.
+- **Killing agent loops for good.** Loop and premature-stop buckets are fixed in tools and orchestration,
+  then verified as a rate per 1,000 runs.
+
+### Mini project
+**Run one full improvement cycle on a toy agent (2-3 hours).**
+- **Goal:** take one failure bucket from production-style traces to a gated, verified fix.
+- **Steps:** build a small agent with two tools, one of which returns an empty result without a message;
+  generate 50+ runs and bucket them with rules like the example; add the failing runs to a regression
+  suite; fix at the cheapest layer; run baseline and candidate on the suite and apply the McNemar gate.
+- **Done when:** the suite shows the loop bucket fixed with no slice regressing beyond noise, and a
+  before/after table reports the bucket as failures per 1,000 runs.

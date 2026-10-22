@@ -5,7 +5,7 @@ name: Computer use
 kind: concept
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/sandboxing
@@ -415,7 +415,9 @@ text as untrusted. Report measured completion rate and cost per invoice before p
 **A gated computer-use loop in a VM (2-3 hours).**
 - **Goal:** run a small computer-use agent on a local web form and measure completion, cost and gating.
 - **Steps:** start a VM or container with Xvfb and a browser on a local form with a Send button; adapt
-  the minimal loop from the examples with `keep_shots=3` and a 40-step budget; plug in the hit-test gate
-  so Send needs approval; run 10 attempts and log steps, image tokens per call and gated actions.
-- **Done when:** a table shows completion rate, steps per task and tokens per step staying flat, and every
-  run that reached Send stopped for approval instead of clicking it.
+  the minimal loop from the examples with `keep_shots=3` and a 40-step budget; plug in the hit-test gate,
+  building its element tree from the page's element bounding boxes scaled into the model's screenshot
+  coordinates, so Send needs approval; run 10 attempts and log steps, image tokens per call and gated
+  actions.
+- **Done when:** a table shows completion rate, steps per task and image tokens per call staying flat
+  after the third step, and every run that reached Send stopped for approval instead of clicking it.

@@ -5,7 +5,7 @@ name: Ray / KubeRay
 kind: tool
 difficulty: advanced
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - infra-capacity-economics/keda-autoscaling
@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-Ray turns Python functions and classes into distributed tasks and stateful GPU actors; KubeRay runs them
-on Kubernetes. Agent teams use it to embed RAG corpora, fan out eval runs over thousands of agent
-episodes, and serve self-hosted models and rerankers behind agent tools.
+Ray turns Python functions and classes into tasks and stateful GPU actors scheduled by declared
+resources; KubeRay runs them as Kubernetes custom resources. Agent teams use it to embed RAG corpora, fan
+out agent evals, and serve models and rerankers behind tools.
 
 ## For agent builders
 - **Why it matters for agents.** The agent loop itself is light; the heavy jobs around it are not.
@@ -223,24 +223,31 @@ pull, model load) is a fixed cost per run, shown here as an assumed 5 minutes.
 Each eval case is one agent episode (a multi-step tool-calling loop), so it maps to one stateless Ray
 task. `my_agent` stands in for your own agent code; tools that touch real systems are mocked so a retry
 cannot repeat a real action.
+- **Concurrency is capped in code,** because episodes are I/O-bound model and tool calls: one CPU each
+  would let a large cluster run hundreds at once and flood the model endpoint.
+- **`max_retries` covers worker and node failures only.** An exception raised inside the episode is not
+  retried unless you also pass `retry_exceptions=True`.
 
 ```python
 import ray
 
 ray.init()
+MAX_IN_FLIGHT = 50                               # what the model endpoint sustains, not the CPU count
 
-@ray.remote(num_cpus=1, max_retries=2)          # episodes are I/O-bound model and tool calls
+@ray.remote(num_cpus=1, max_retries=2)          # re-run if the worker or node dies mid-episode
 def run_episode(case: dict) -> dict:
     from my_agent import run_agent, grade       # your agent loop and grader (placeholders)
     result = run_agent(case["prompt"], tools="mocked", max_steps=20)
     return {"id": case["id"], "passed": grade(case, result), "steps": result.steps}
 
 cases = [{"id": i, "prompt": f"task {i}"} for i in range(500)]
-pending = [run_episode.remote(c) for c in cases]
-results = []
-while pending:                                   # collect as episodes finish, not in order
-    done, pending = ray.wait(pending, num_returns=1)
-    results.append(ray.get(done[0]))
+pending, results = [], []
+for case in cases:
+    if len(pending) >= MAX_IN_FLIGHT:            # back-pressure: wait for one episode to finish
+        done, pending = ray.wait(pending, num_returns=1)
+        results.extend(ray.get(done))
+    pending.append(run_episode.remote(case))
+results.extend(ray.get(pending))                 # drain the last wave
 print(sum(r["passed"] for r in results) / len(results))
 ```
 
@@ -303,12 +310,12 @@ app = Reranker.bind()       # deploy with `serve run module:app`, or from a RayS
 - **GCS fault tolerance for RayService.** Use for any production Serve application behind agent tools.
   Enable KubeRay's GCS fault tolerance backed by an external Redis so a head-pod restart does not take
   every Serve replica with it. Monitor head-pod restarts and Serve availability during them.
-- **Keep the dashboard and job API internal.** Use always. Expose the dashboard and job-submission service as
-  cluster-internal only, behind a network policy, and reach it through port-forwarding or an authenticated
-  proxy. Monitor for unknown job submissions.
-- **Declare GPUs to match what code uses.** Use for every actor and task. Set `num_gpus` from what the code
-  actually loads, and use fractional values only for models whose summed memory fits the card. Monitor
-  actor busy time and GPU memory per process in the dashboard.
+- **Keep the dashboard and job API internal.** Use always. Expose the dashboard and job-submission
+  service as cluster-internal only, behind a network policy, and reach it through port-forwarding or an
+  authenticated proxy. Monitor for unknown job submissions.
+- **Declare GPUs to match what code uses.** Use for every actor and task. Set `num_gpus` from what the
+  code actually loads, and use fractional values only for models whose summed memory fits the card.
+  Monitor actor busy time and GPU memory per process in the dashboard.
 - **Separate worker groups per GPU tier.** Use when jobs need different cards, such as a small embedder
   and a large model. Define one worker group per card type with a node selector, plus custom resources so
   actors target the right group. Monitor pending demand per group to see which tier is the bottleneck.
@@ -468,10 +475,14 @@ object-store spilling, and per-GPU throughput before scaling out.
 **Parallel agent eval on a local Ray cluster (2-3 hours).**
 - **Goal:** run a 100-case agent eval suite in parallel with Ray tasks and show what concurrency and
   retries do to wall-clock and correctness.
-- **Steps:** `pip install ray` and start it locally with `ray.init()`; write a toy agent with two tools,
-  one read-only and one that "writes" to a local file, with a fake model call that sleeps 1-3 seconds; run
-  the 100 cases serially, then as `@ray.remote` tasks with `max_retries=2`; randomly raise an exception
-  mid-episode in 10% of runs and count duplicate writes; then add an idempotency key per case and rerun.
+- **Steps:**
+  1. `pip install ray` and start it locally with `ray.init()`.
+  2. Write a toy agent with two tools, one read-only and one that "writes" to a local file, and a fake
+     model call that sleeps 1-3 seconds.
+  3. Run the 100 cases serially, then as `@ray.remote` tasks with `max_retries=2` and
+     `retry_exceptions=True` (without it, Ray does not retry Python exceptions).
+  4. Raise an exception after the write in a random 10% of runs and count duplicate writes; then add an
+     idempotency key per case and rerun.
 - **Done when:** you have a table of serial versus parallel wall-clock, duplicate-write counts before and
   after the idempotency key, and a short note on how you would cap concurrency against a real model's rate
   limit.

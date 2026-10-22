@@ -5,7 +5,7 @@ name: Serverless GPUs
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - infra-capacity-economics/keda-autoscaling
@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-Serverless GPUs bill per second and scale to zero, so bursty agent workloads (nightly agents, eval
-suites, low-traffic tools) pay only for busy seconds. The cost: cold starts of tens of seconds to minutes
-and a rate above on-demand.
+Serverless GPUs bill per second and scale to zero, so bursty agent work (nightly agents, eval suites)
+pays only for busy seconds. The cost: cold starts of seconds to minutes and a rate above on-demand.
+Decide on utilisation break-even, gated by your latency SLO.
 
 ## For agent builders
 - **Why it matters for agents.** Much agent GPU work is bursty: an eval suite that runs on every prompt
@@ -179,11 +179,13 @@ twice a day. Each task averages 20 model calls at ~3 GPU-seconds each, at the sa
 |---|---|---|
 | GPU-seconds per suite | 500 × 20 × 3 = 30,000 s ≈ 8.3 hours | |
 | Busy hours | 2 suites a day × 30 days × 8.3 h ≈ 500 hours | about $800 at $1.60/h |
-| With 8 concurrent inputs batched per container | GPU time shrinks by several times when the engine batches the suite's calls | well under $800 |
+| With 8 concurrent inputs batched per container | A batch-8 decode step is only ~1.25× slower than batch 1 (bandwidth lesson), so container time falls ~6×: ≈ 80 hours | ≈ $130 (upper-bound estimate) |
 | Dedicated L4 kept for evals | 730 hours at $0.80 | $584, but every suite queues on one card instead of fanning out |
 
-- **The unbatched line loses to dedicated**, because 500 busy hours is above the 50% break-even; the
-  batched line wins and also finishes each suite faster by fanning out across containers.
+- **The unbatched line loses to dedicated**, because 500 busy hours (68% of the month) is above the 50%
+  break-even; the batched line wins and also finishes each suite faster by fanning out across containers.
+- **The batched figure is a ceiling on savings,** not a measurement: prefill, uneven task lengths and the
+  idle tail of each container eat into it, so measure GPU-seconds per task on one real suite.
 - **Cold starts barely matter here:** one per container per suite, with no user waiting on step one.
 - **Interactive agents are the opposite case:** use the hybrid base-plus-burst layout below.
 
@@ -214,30 +216,33 @@ print(f"break-even utilisation (no cold starts): {breakeven:.0%}")     # 50%
 ```
 
 ### Production snippet: load once, cached weights, batched concurrency (Modal)
-The structure that keeps cold starts short on any platform: weights on a volume, load in a start-up hook,
-several requests per container. Shown with Modal's Python SDK (1.x parameter names); check the current
-docs, since these names have changed between versions.
+The structure that keeps cold starts short on any platform: weights on a volume, load once per
+container, several requests per container.
+- **Shown with Modal's Python SDK** (1.x parameter names) running vLLM's OpenAI-compatible server, so the
+  agent calls it with its usual tool-calling client. Check the current docs, since these names have
+  changed between versions.
+- **Why a server process:** vLLM's offline `LLM` class does not batch calls that arrive on separate
+  threads, so a server that schedules them itself is what makes `max_inputs=8` pay off.
 
 ```python
+import subprocess
 import modal
 
-app = modal.App("doc-tool")
+app = modal.App("agent-model")
 weights = modal.Volume.from_name("model-weights", create_if_missing=True)
 image = modal.Image.debian_slim().pip_install("vllm")       # weights stay out of the image
 
-@app.cls(gpu="L4", volumes={"/models": weights},
-         scaledown_window=300,      # 5-minute idle window: the cost knob from the calculator
-         min_containers=0)          # scale to zero; raise only if the SLO demands it
-@modal.concurrent(max_inputs=8)     # let the engine batch, never 1
-class Model:
-    @modal.enter()
-    def load(self):                 # runs once per container, not per request
-        from vllm import LLM
-        self.llm = LLM(model="/models/llama-3-8b-instruct")
-
-    @modal.method()
-    def generate(self, prompt: str) -> str:
-        return self.llm.generate([prompt])[0].outputs[0].text
+@app.function(image=image, gpu="L4", volumes={"/models": weights},
+              scaledown_window=300,     # 5-minute idle window: the cost knob from the calculator
+              min_containers=0)         # scale to zero; raise only if the SLO demands it
+@modal.concurrent(max_inputs=8)         # up to 8 in-flight requests per container, never 1
+@modal.web_server(port=8000, startup_timeout=600)   # Modal routes traffic once the port answers
+def serve():
+    # Runs once per container: vLLM loads weights from the volume, then batches concurrent
+    # agent calls itself. Tool-call parsing is on so agents get structured tool calls back.
+    subprocess.Popen(["vllm", "serve", "/models/llama-3.1-8b-instruct",
+                      "--host", "0.0.0.0", "--port", "8000", "--max-num-seqs", "8",
+                      "--enable-auto-tool-choice", "--tool-call-parser", "llama3_json"])
 ```
 
 ## Production patterns
@@ -252,15 +257,16 @@ class Model:
   concurrency to what the batching lesson and KV room allow (for example eight concurrent inputs), not 1.
   Monitor GPU-seconds per request and per-container queue time.
 - **Hybrid base plus burst.** Use when there is a latency SLO and a steady floor of traffic, as with
-  interactive agents. Serve the base
-  load on a dedicated card or Kubernetes replica and route only overflow to serverless. Monitor the
-  fraction of requests that hit a cold start and p95/p99 with cold starts included.
-- **Snapshot after imports.** Use where the platform offers memory snapshots and imports dominate start-up.
-  Enable the snapshot after imports and weight loading to CPU, then move to the GPU at restore. Monitor
-  cold-start p50 before and after.
+  interactive agents. Serve the base load on a dedicated card or Kubernetes replica and route only
+  overflow to serverless. Monitor the fraction of requests that hit a cold start and p95/p99 with cold
+  starts included.
+- **Snapshot after imports.** Use where the platform offers memory snapshots and imports dominate
+  start-up. Enable the snapshot after imports and weight loading to CPU, then move to the GPU at restore.
+  Monitor cold-start p50 before and after.
 - **Capacity fallback for bursts.** Use for any customer-facing endpoint, and for agent loops, which
   should retry a capacity error on the fallback rather than fail the run. Configure a second GPU type or
-  region, or a per-token API, for capacity errors. Monitor capacity or quota errors per GPU type and region.
+  region, or a per-token API, for capacity errors. Monitor capacity or quota errors per GPU type and
+  region.
 
 ## Trade-offs
 - **Per-second billing vs rate premium.** It makes low and bursty utilisation cheap, but the premium makes
@@ -298,8 +304,8 @@ class Model:
 
 ## When to use
 - **Use when:** utilisation would be low or bursty (internal tools, nightly batch and eval-suite agents,
-  prototypes, long-tail models that are rarely hit), latency can absorb a cold start or the warm pool makes it rare, and you
-  want no node operations.
+  prototypes, long-tail models that are rarely hit), latency can absorb a cold start or the warm pool
+  makes it rare, and you want no node operations.
 - **Prefer dedicated capacity or Kubernetes when:** sustained utilisation exceeds the price ratio, tail
   latency is contractual, or the model spans multiple GPUs.
 - **Measure:** cold start by stage, busy seconds per day, and p95 with cold starts included; those three
@@ -416,7 +422,8 @@ the base load to dedicated capacity if the utilisation arithmetic says so.
 - **Goal:** measure when a serverless GPU endpoint goes cold during an agent run and fix it.
 - **Steps:** deploy a small model or embedder on a serverless GPU platform you can access; build an agent
   loop that calls it, with a fake tool that sleeps for a configurable gap between calls; record per-call
-  latency while raising the gap past the platform's idle window; then move weights to a cached volume or
-  baked image and repeat; finally compute the break-even busy fraction against a dedicated card.
+  latency while raising the gap past the platform's idle window; then move weights from a remote bucket
+  to the platform's cached volume and repeat; finally compute the break-even busy fraction against a
+  dedicated card.
 - **Done when:** a table shows per-call latency by tool-call gap, before and after the weight-loading
   change, plus your break-even calculation for your expected agent traffic.
