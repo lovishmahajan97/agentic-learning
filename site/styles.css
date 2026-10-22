@@ -601,3 +601,16 @@ body { background:
 .proj-major { display: grid; gap: 4px; margin-top: 14px; max-width: 72ch; padding: 16px 20px; border-radius: 14px; color: #fff; background: var(--grad); box-shadow: var(--glow); }
 .proj-major .proj-head { color: rgba(255,255,255,.85); margin: 0; }
 .proj-major:hover { text-decoration: none; filter: brightness(1.06); }
+
+/* diagrams: crisp panel, bold strokes, fit + expand */
+.diagram { position: relative; background: var(--surface) !important; border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--line)); border-radius: 14px; padding: 28px 18px 22px; box-shadow: 0 1px 0 var(--line), 0 12px 30px -22px rgba(76, 29, 149, .45); }
+.diagram svg .flowchart-link, .diagram svg .messageLine0, .diagram svg .messageLine1, .diagram svg .transition { stroke-width: 2px !important; }
+.diagram svg .node rect, .diagram svg .node polygon, .diagram svg .node circle, .diagram svg .node path, .diagram svg rect.actor { stroke-width: 1.8px !important; }
+.diagram svg .nodeLabel, .diagram svg .edgeLabel, .diagram svg .messageText, .diagram svg .actor tspan { font-weight: 500; }
+.diagram svg .edgeLabel, .diagram svg .edgeLabel rect, .diagram svg .labelBkg { background: var(--surface) !important; }
+.diagram.scrolls::after { content: "Scroll sideways or expand"; position: absolute; left: 18px; bottom: 6px; font-size: 11px; color: var(--ink-3); }
+.diagram-zoom { position: absolute; top: 8px; right: 8px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink-2); font-size: 12px; font-weight: 600; cursor: pointer; }
+.diagram-zoom:hover { background: var(--accent-soft); color: var(--accent-soft-ink); }
+.diagram-overlay { position: fixed; inset: 0; z-index: 60; background: rgba(20, 14, 40, .55); backdrop-filter: blur(3px); display: grid; place-items: center; padding: max(16px, env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px)) max(16px, env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px)); }
+.diagram-overlay-box { background: var(--surface); border-radius: 16px; padding: 28px; max-width: 100%; max-height: 100%; overflow: auto; box-shadow: 0 30px 80px -30px rgba(0,0,0,.5); }
+.diagram-close { position: fixed; top: calc(16px + env(safe-area-inset-top, 0px)); right: calc(16px + env(safe-area-inset-right, 0px)); z-index: 61; padding: 8px 14px; border-radius: 999px; border: 0; background: var(--grad); color: #fff; font-weight: 600; cursor: pointer; }

@@ -26,12 +26,60 @@
     });
     if (!window.mermaid) { nodes.forEach(n => n.closest('.diagram').classList.add('diagram-src')); return; }
     try {
-      mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: isDark() ? 'dark' : 'neutral',
-        fontFamily: getComputedStyle(document.body).fontFamily, flowchart: { htmlLabels: true, curve: 'basis', useMaxWidth: false, nodeSpacing: 36, rankSpacing: 44 }, sequence: { useMaxWidth: false }, state: { useMaxWidth: false } });
+      const dark = isDark();
+      const tv = dark ? {
+        background: '#15122a', primaryColor: '#2a2160', primaryBorderColor: '#a78bfa', primaryTextColor: '#f1eeff',
+        secondaryColor: '#3a1f4a', secondaryBorderColor: '#e879f9', secondaryTextColor: '#f1eeff',
+        tertiaryColor: '#3a2a12', tertiaryBorderColor: '#fb923c', tertiaryTextColor: '#f1eeff',
+        lineColor: '#c4b5fd', textColor: '#f1eeff', edgeLabelBackground: '#15122a', clusterBkg: '#1d1938', clusterBorder: '#6d5bd0',
+        actorBkg: '#2a2160', actorBorder: '#a78bfa', actorTextColor: '#f1eeff', actorLineColor: '#8b85ad', signalColor: '#c4b5fd', signalTextColor: '#f1eeff',
+        labelBoxBkgColor: '#2a2160', labelBoxBorderColor: '#a78bfa', labelTextColor: '#f1eeff', noteBkgColor: '#3a2a12', noteBorderColor: '#fb923c', noteTextColor: '#fde7d2',
+        activationBkgColor: '#3a1f4a', activationBorderColor: '#e879f9', sequenceNumberColor: '#12082e',
+        fontSize: '17px'
+      } : {
+        background: '#ffffff', primaryColor: '#efe9ff', primaryBorderColor: '#7c3aed', primaryTextColor: '#1e1347',
+        secondaryColor: '#fde7f6', secondaryBorderColor: '#c026d3', secondaryTextColor: '#1e1347',
+        tertiaryColor: '#ffefe0', tertiaryBorderColor: '#ea580c', tertiaryTextColor: '#1e1347',
+        lineColor: '#6d28d9', textColor: '#1e1347', edgeLabelBackground: '#ffffff', clusterBkg: '#f7f5ff', clusterBorder: '#a78bfa',
+        actorBkg: '#efe9ff', actorBorder: '#7c3aed', actorTextColor: '#1e1347', actorLineColor: '#a39dc4', signalColor: '#6d28d9', signalTextColor: '#1e1347',
+        labelBoxBkgColor: '#efe9ff', labelBoxBorderColor: '#7c3aed', labelTextColor: '#1e1347', noteBkgColor: '#fff4e0', noteBorderColor: '#ea580c', noteTextColor: '#4a2a08',
+        activationBkgColor: '#fde7f6', activationBorderColor: '#c026d3', sequenceNumberColor: '#ffffff',
+        fontSize: '17px'
+      };
+      mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: 'base', themeVariables: tv,
+        fontFamily: getComputedStyle(document.body).fontFamily,
+        flowchart: { htmlLabels: true, curve: 'basis', useMaxWidth: false, nodeSpacing: 40, rankSpacing: 48, padding: 14 },
+        sequence: { useMaxWidth: false, actorMargin: 40, boxMargin: 8, messageFontSize: 15, noteFontSize: 14, actorFontSize: 15, mirrorActors: false },
+        state: { useMaxWidth: false } });
       mermaid.run({ nodes, suppressErrors: true }).finally(() => nodes.forEach(n => {
-        if (!n.querySelector('svg')) { const w = n.closest('.diagram'); if (w) { w.classList.add('diagram-src'); n.textContent = w.dataset.src; } }
+        const w = n.closest('.diagram'); if (!w) return;
+        const svg = n.querySelector('svg');
+        if (!svg) { w.classList.add('diagram-src'); n.textContent = w.dataset.src; return; }
+        fitDiagram(w, svg);
       }));
     } catch (e) { nodes.forEach(n => n.closest('.diagram').classList.add('diagram-src')); }
+  }
+  function fitDiagram(w, svg) {
+    const vb = svg.viewBox && svg.viewBox.baseVal; const natural = vb && vb.width ? vb.width : svg.getBoundingClientRect().width;
+    const avail = w.clientWidth - 36;
+    svg.style.maxWidth = 'none';
+    if (natural > avail && avail / natural >= 0.72) { svg.style.width = avail + 'px'; svg.style.height = 'auto'; w.classList.add('fitted'); }
+    else if (natural > avail) { svg.style.width = natural + 'px'; w.classList.add('scrolls'); }
+    else { svg.style.width = natural + 'px'; }
+    if (!w.querySelector('.diagram-zoom')) {
+      const b = document.createElement('button'); b.className = 'diagram-zoom'; b.type = 'button'; b.textContent = 'Expand';
+      b.onclick = () => openDiagram(svg, natural); w.appendChild(b);
+    }
+  }
+  function openDiagram(svg, natural) {
+    const ov = document.createElement('div'); ov.className = 'diagram-overlay'; ov.setAttribute('role', 'dialog'); ov.setAttribute('aria-label', 'Diagram');
+    const box = document.createElement('div'); box.className = 'diagram-overlay-box';
+    const close = document.createElement('button'); close.className = 'diagram-close'; close.type = 'button'; close.textContent = 'Close';
+    const clone = svg.cloneNode(true); clone.style.maxWidth = 'none'; clone.style.width = Math.min(natural * 1.2, window.innerWidth - 96) + 'px'; clone.style.height = 'auto';
+    box.appendChild(clone); ov.appendChild(close); ov.appendChild(box); document.body.appendChild(ov);
+    const done = () => { ov.remove(); document.removeEventListener('keydown', onKey); };
+    const onKey = e => { if (e.key === 'Escape') done(); };
+    close.onclick = done; ov.onclick = e => { if (e.target === ov) done(); }; document.addEventListener('keydown', onKey); close.focus();
   }
   function highlight(root) {
     renderDiagrams(root);
