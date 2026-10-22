@@ -5,8 +5,13 @@ name: Retrieval evaluation (recall@k, MRR, NDCG)
 kind: metric
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - rag-retrieval/recall-vs-precision-trade-off
+  - evals/golden-dataset
 related:
   - rag-retrieval/recall-vs-precision-trade-off
   - rag-retrieval/reranking
@@ -307,20 +312,22 @@ print(f"run-level recall = {recall(seen, relevant):.2f}, "
 
 ## Pitfalls
 - **Incomplete qrels, with unjudged chunks counted as irrelevant.** Symptom: a new retriever that finds
-  different but valid passages scoring *lower*. Fix: pooling and re-judging its top results.
+  different but valid passages scoring *lower*. Diagnose: measure the share of its top-k that is
+  unjudged. Fix: pooling and re-judging its top results.
 - **Eval queries written by reading the chunks.** Symptom: near-perfect offline recall and poor results
-  on real user phrasing. Fix: queries from logs and tickets.
+  on real user phrasing. Diagnose: compare recall on logged queries with recall on the written set.
+  Fix: queries from logs and tickets.
 - **Document-level labels with chunk-level retrieval.** Symptom: "relevant document retrieved" while the
-  chunk that reached the generator lacks the answer. Fix: judge chunks or spans.
-- **Reporting only the mean.** Symptom: average recall of 0.85 with short or ambiguous queries at 0.3.
-  Fix: segment by query type.
+  chunk that reached the generator lacks the answer. Diagnose: read the retrieved chunk text for a sample
+  of hits. Fix: judge chunks or spans.
 - **Changing chunk size and comparing recall@k against the old qrels.** Symptom: numbers that are not
-  comparable because the unit of relevance changed. Fix: re-map or re-judge.
+  comparable because the unit of relevance changed. Diagnose: count qrels that map to no chunk after the
+  re-index. Fix: re-map or re-judge.
 - **Evaluating only on user questions when the agent writes its own queries.** Symptom: good offline
-  recall, yet traces show the search tool returning little of use. Fix: add the logged search-tool
-  arguments as an eval query set.
+  recall, yet traces show the search tool returning little of use. Diagnose: score the logged
+  search-tool arguments. Fix: add them as an eval query set.
 - **Near-duplicate chunks in the index.** Symptom: a top-k full of copies, recall of distinct relevant
-  items stalling while precision looks fine. Fix: deduplicate.
+  items stalling while precision looks fine. Diagnose: count distinct sources per top-k. Fix: deduplicate.
 
 ## When to use
 - **Run it on every change** to the embedding model, chunking, index, hybrid weights, reranker or
@@ -331,8 +338,17 @@ print(f"run-level recall = {recall(seen, relevant):.2f}, "
   per-category breakdown.
 - **Build the query set from real traffic,** on the order of a few hundred queries (illustrative),
   stratified by type.
-- **Interviews:** define the three metrics, say which one you would make primary and why, and explain how
-  you would construct the judgments.
+
+## Exercise
+**Goal:** build a retrieval eval for the search tool of a RAG agent you have, or a small one over 50-200
+documents you choose, and use it to decide one change. No solution is given.
+- **Inputs:** 40-80 queries from the agent's logged tool calls, plus 20 user questions.
+- **Constraints:** chunk- or span-level qrels; pool the top results of at least two retrievers before
+  judging; one change only (k, chunking, hybrid or a reranker).
+- **Deliver:** recall@k at the first-stage and final k, MRR and NDCG@k per query set and per category,
+  run-level recall on 10 traces, and a paired-bootstrap interval for the change.
+- **Acceptance:** your NDCG matches `sklearn.metrics.ndcg_score` on three queries; the unjudged share of
+  the new system's top-k is under 10%; the ship call cites the interval.
 
 ## Role lens
 - **Engineer:** Keeps the qrels file and the metrics script in CI so an embedding-model swap that drops
@@ -376,13 +392,6 @@ queries with a paired bootstrap.
 - **Track the cost side:** search calls per run and duplicate results, so a gain in run-level recall
   bought with twice the calls is visible.
 
-### How would you pick k for a RAG agent's search tool?
-- **Start from the context budget:** k is the number of passages the generator actually receives after
-  reranking.
-- **Sweep it:** measure answer quality at several k; recall keeps rising but answer quality flattens or
-  drops as distractors and tokens grow.
-- **Pick the knee** and record the eval that justified it, so the choice is revisited when models change.
-
 ### You have no labeled data for a new customer. How do you build qrels in a week?
 - **Take a few hundred real queries** from logs or tickets, stratified by type.
 - **Pool candidates** from two or three retrievers (lexical, dense, hybrid) and judge the union, so no
@@ -423,6 +432,20 @@ queries with a paired bootstrap.
 > Judgments made from the old system's results cannot credit passages only the new system finds. Pooling
 > the top results of both systems and judging the union is the standard remedy.
 
+## Mastery test
+**Problem:** a coding agent's `search_code` tool returns the top 8 snippets. After switching to a code
+embedding model, NDCG@8 on the team's 150 qrels rose from 0.61 to 0.70, but the agent's task success
+fell 6 points.
+
+The qrels were written from developer questions. What are the likely causes and what settles it?
+
+**A strong answer:**
+- suspects a query mismatch: the agent searches with identifiers and error strings, not developer
+  questions, so it scores the logged tool arguments as a second set;
+- checks run-level recall and searches per run, since worse first calls can trigger extra searches;
+- pools the old and new top-8 and re-judges, and checks the 8 snippets for near-duplicates crowding out
+  distinct files, comparing everything with a paired bootstrap per category.
+
 ## Use cases & projects
 ### Use cases
 - **Changing chunking or embeddings.** recall@k on a versioned qrels file shows in seconds whether a new
@@ -431,8 +454,6 @@ queries with a paired bootstrap.
   splits retrieval failures from generation failures.
 - **Tuning the agent's search tool.** k per call, a reranker and hybrid search are compared with paired
   intervals on the agent's own logged queries.
-- **Memory lookup in long-running agents.** The same metrics score whether a memory tool returns the
-  facts the agent stored earlier.
 
 ### Mini project
 **Evaluate a RAG agent's search tool from its own queries (2-3 hours).**

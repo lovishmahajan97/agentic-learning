@@ -5,8 +5,13 @@ name: Document parsing (OCR, layout, tables)
 kind: concept
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: implement
+code_tested: partial
+prerequisites:
+  - rag-retrieval/chunking-strategies
+  - multimodal/ocr
 related:
   - multimodal/ocr
   - multimodal/document-understanding
@@ -212,6 +217,8 @@ def read_document(path: str, pages: list[int] | None = None, min_conf: float = 8
 | Citation | "the lease says" | "page 3 (scanned, unclear)" |
 
 The threshold `min_conf=80.0` and the page cap are illustrative; tune them on pages you have labelled.
+Checked with pdfplumber 0.11 and pytesseract 0.3.13 on a generated PDF; the OCR branch needs the
+Tesseract binary installed and was exercised with a stub.
 
 ### Per-page parser with OCR fallback and row-wise tables
 Use the text layer when present, fall back to OCR, and serialise tables row by row with their headers.
@@ -336,15 +343,18 @@ have labelled by eye.
 
 ## Pitfalls
 - **Using one `extract_text()` call for everything.** Symptom: scanned documents produce empty chunks, so
-  whole contracts are missing from search with no error raised.
+  whole contracts are missing from search with no error raised. Diagnose: log characters per page and
+  list pages under the threshold by file. Fix: per-page OCR routing.
 - **Ignoring reading order.** Symptom: retrieved chunks whose sentences jump between two columns and that
-  match queries poorly despite containing the right words.
+  match queries poorly despite containing the right words. Diagnose: read the parsed text of a
+  two-column page beside its rendering.
 - **Leaving running headers and footers in.** Symptom: many unrelated chunks score high for the company
-  name or "Confidential" and crowd out real results.
+  name or "Confidential" and crowd out real results. Diagnose: count chunks containing that string.
 - **Flattening tables to a stream of values.** Symptom: the model cites the right chunk but reads the wrong
-  cell, such as quoting the Basic plan's price for the Enterprise plan.
+  cell, such as quoting the Basic plan's price for the Enterprise plan. Diagnose: check whether the cited
+  chunk keeps row and column labels. Fix: header-tagged rows.
 - **Trusting a text layer because it is non-empty.** Symptom: chunks full of `(cid:NN)` placeholders or
-  mojibake that embed to near-identical vectors and never match any query.
+  mojibake that embed to near-identical vectors and never match any query. Fix: the quality gate.
 - **Not stitching tables that span pages.** Symptom: correct answers for rows on a table's first page and
   wrong or missing answers for rows that fall on its continuation.
 - **Never evaluating the parser.** Problems surface only as downstream wrong answers, whereas a sample of
@@ -365,8 +375,18 @@ have labelled by eye.
   VLMs only where the sample shows failures.
 - **For agents that take uploads:** add a runtime read tool with page ranges and parse-quality flags, and
   include scanned and table-heavy uploads in the agent eval set.
-- **Interviews:** "I would look at the parsed text first" often separates experienced RAG builders from
-  tutorial-level ones.
+
+## Exercise
+**Goal:** build a parser golden set and a page-triaging parser that beats naive `extract_text()` on it.
+No solution is given.
+- **Inputs:** 15 hard pages from real documents: two scans, a two-column page, a borderless table, a
+  table spanning two pages, a page with a broken font map, and pages with a running header.
+- **Deliver:** hand transcriptions with expected table rows, a parser that routes per page, strips
+  repeated headers and emits header-tagged rows, and a scoring script printing CER, digit CER and table
+  cell accuracy per page for both parsers.
+- **Acceptance:** the score runs in CI and fails on a regression; every scanned page has `source: ocr`;
+  the continued table's rows on page two carry their column labels; no chunk contains the running
+  header; at least one value naive extraction got wrong is now right.
 
 ## Role lens
 - **Engineer:** Builds the per-page triage, OCR fallback, header stripping and table serialisation, and keeps
@@ -388,14 +408,6 @@ lookups. I would build a small eval of numeric questions with known answers to c
 VLM transcription for numbers unless outputs are cross-checked.
 
 ## Interview questions
-### Why is document parsing a retrieval problem and not just a preprocessing detail?
-- **A PDF is drawing instructions, not text:** glyphs at coordinates, with no paragraphs, columns or table
-  cells, and a scanned page has no text layer at all.
-- **Every later stage sees only the parser's output:** the embedding model embeds garbage, the vector store
-  indexes it, and the symptom looks like a retrieval or model problem.
-- **So fix it at the source:** parsing errors are among the most common root causes in RAG failure analysis
-  and cheapest to fix where they happen.
-
 ### Your agent says a contract "does not mention" a clause that is in it, and ingestion logged no errors. How do you debug it?
 - **Check the trace first:** did the search tool return chunks from that contract at all? If none exist,
   the loss is at parsing, not in the agent's query.
@@ -413,14 +425,6 @@ VLM transcription for numbers unless outputs are cross-checked.
   silently normalise a value or fill a smudged digit, and it costs per-page inference and latency.
 - **If you use it,** validate numbers against the text layer or OCR output and mark generated figure
   descriptions as generated.
-
-### OCR on a sample page scores a CER of 0.016. Is that good enough?
-- **Not on its own:** in the sample sentence that is one wrong character out of 64, but the wrong character
-  is the "0" in "30 days", so digit CER is 0.50 and the answer is wrong.
-- **Measure numbers separately** and keep per-word confidence, because low-confidence regions are where "0"
-  becomes "O" and "1" becomes "l".
-- **Inputs matter:** render around 300 DPI for Tesseract, deskew and set the correct language before
-  blaming the engine.
 
 ### How would you choose between an open-source stack and a managed document service?
 - **Benchmark on your own ugliest pages:** tools such as pdfplumber plus Tesseract, Docling or Unstructured,
@@ -462,6 +466,20 @@ VLM transcription for numbers unless outputs are cross-checked.
 - [ ] It always requires a text layer to be present
 > VLMs often handle complex layouts better than rule-based tools, but they generate rather than copy, so a
 > smudged or unusual value can be silently changed. Cross-checking against OCR or the text layer catches this.
+
+## Mastery test
+**Problem:** an insurance claims agent reads uploaded claim forms. Since a new branch office started
+sending files, 12% of its payout amounts are wrong, yet ingestion logs show no errors and the OCR share
+per document type is unchanged. The files are born-digital PDFs from a form tool. Find the likely cause
+and the fix.
+
+**A strong answer:**
+- rules out scans (OCR share flat, born-digital) and suspects the text layer itself: a broken font map,
+  form fields whose values are not in the page text, or a table layout read in the wrong order;
+- diagnoses by diffing the parsed text of a few failing forms against their rendering and checking
+  `(cid:` counts and dictionary-word share;
+- fixes with the quality gate routing bad layers to OCR, extracting form-field values directly, and a
+  golden set of that office's forms, scored on digit accuracy for the amount fields.
 
 ## Use cases & projects
 ### Use cases

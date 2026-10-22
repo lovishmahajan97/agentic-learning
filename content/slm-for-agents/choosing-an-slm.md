@@ -5,8 +5,13 @@ name: Choosing an SLM (Llama, Qwen, Phi, Gemma, Mistral small models)
 kind: decision
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: partial
+prerequisites:
+  - slm-for-agents/when-an-slm-is-enough
+  - serving-inference/kv-cache-memory-estimation
 related:
   - model-internals/small-language-models
   - system-design/model-selection
@@ -35,8 +40,8 @@ agent eval pick the winner.
   repo id in `vllm serve`, and the chat template that formats tools for that model.
 - **What you control.** The shortlist, the size and quantization that fit your hardware, the license review,
   and the eval that decides.
-- **What you can skip.** Exact benchmark numbers in blog posts. Families release new versions every few
-  months, so learn the selection criteria and re-run them on the current model cards.
+- **What you can skip.** Blog benchmark numbers: families ship new versions every few months, so learn the
+  criteria and re-run them on current cards.
 
 ## Why it exists
 - **There are hundreds of candidates.** Each family ships several sizes, base and instruct variants, and
@@ -45,8 +50,6 @@ agent eval pick the winner.
   in 8 GB, or a chat template without tool support removes a model regardless of its quality.
 - **Benchmarks measure someone else's task.** General averages say little about selecting one of your 6
   tools with the right arguments, or extracting your schema from your documents.
-- **The choice is reversible only if you planned it.** An OpenAI-compatible endpoint and a golden set let you
-  swap models in an afternoon; hard-coding one model's prompt quirks does not.
 
 ## How it works
 ### Step 1: hard filters (pass or fail)
@@ -100,6 +103,7 @@ Pull the candidates with `ollama pull`, then score each on correct tool, valid a
 Ollama's Python client. The model tags are examples; use the current tags from the Ollama library.
 
 ```python
+# Checked with the ollama Python client 0.6 (attribute access on responses needs 0.4+).
 import json, time
 import ollama
 
@@ -147,10 +151,11 @@ The 3B baseline failed German extraction, which no general benchmark had flagged
 
 ## Production patterns
 - **Keep a model registry entry per choice.** Record repo id, exact revision or file hash, quantization,
-  license, chat template and eval scores. Re-run the golden set before any upgrade, because a new release of
-  the same family can change tool-call formats.
+  license and legal sign-off, chat template, eval scores with run date, and the fallback model, so an
+  upgrade can be re-tested against the same evidence.
 - **Abstract the endpoint.** Serve every candidate behind an OpenAI-compatible API (Ollama, llama.cpp
-  server, vLLM) and call it through one client or LiteLLM, so swapping models is a config change.
+  server, vLLM) and call it through one client or LiteLLM. With a golden set, a swap is then a config change
+  and an afternoon; hard-coding one model's prompt quirks makes it costly.
 - **Re-screen on a schedule.** Re-run the shortlist each quarter or when a family ships a new generation, since
   a newer small model often matches an older larger one and frees hardware.
 - **Pin the chat template.** Use the template from the model's own repo; community GGUF files sometimes ship
@@ -159,8 +164,8 @@ The 3B baseline failed German extraction, which no general benchmark had flagged
   regression can be traced to a model change.
 
 ## Trade-offs
-- **Bigger model vs headroom.** A 14B model may pass more cases, but on fixed hardware it leaves less memory
-  for context and concurrent agents. The smallest model that passes usually serves more users.
+- **Bigger model vs headroom.** A 14B model may pass more cases, but on fixed hardware leaves less memory
+  for context and concurrent agents.
 - **Permissive license vs best quality.** An Apache 2.0 or MIT model is easy to ship; a custom license may
   have the best scores but adds legal review and conditions. This flips when legal has already approved one.
 - **One family vs several.** Standardising on one family simplifies templates and tooling, but ties you to
@@ -169,13 +174,16 @@ The 3B baseline failed German extraction, which no general benchmark had flagged
   general instruction following and tool use.
 
 ## Pitfalls
-- **Choosing from a leaderboard.** Symptom: a top-ranked model fails your tool calls. Fix: shortlist with
-  hard filters, then decide on your own golden set.
-- **Testing a different build than you deploy.** Symptom: production quality is lower than the eval. Fix:
-  evaluate the exact quantization, engine and template you will ship.
-- **Using a base model.** Symptom: rambling text and no tool calls. Fix: use the instruct or chat variant.
-- **Skipping the license.** Symptom: a late legal block before launch. Fix: put license review first in the
-  checklist and record the outcome in the registry.
+- **Choosing from a leaderboard.** Symptom: a top-ranked model fails your tool calls. Diagnose: split its
+  golden-set failures into no call, wrong tool and wrong arguments. Fix: shortlist with hard filters, then
+  decide on your own golden set.
+- **Testing a different build than you deploy.** Symptom: production quality is lower than the eval.
+  Diagnose: diff tag or file hash, quantization, engine version and template between eval and production
+  traces. Fix: evaluate the exact build you will ship.
+- **Using a base model.** Symptom: rambling text and no tool calls. Diagnose: the output continues your
+  prompt instead of answering, and the card or tag lacks "instruct". Fix: use the instruct or chat variant.
+- **Skipping the license.** Symptom: a late legal block before launch. Diagnose: registry entries with no
+  license sign-off. Fix: put license review first in the checklist and record the outcome.
 
 ## When to use
 - **Use when** you have decided a step can run small and need a specific model for it, or when a family
@@ -183,8 +191,17 @@ The 3B baseline failed German extraction, which no general benchmark had flagged
 - **Avoid when** the step has not been shown to suit an SLM at all; settle that first.
 - **Measure** pass rate, valid-JSON and correct-tool rates, p95 latency and peak memory, per candidate, on
   the deployed build.
-- **Interviews:** expect "walk me through how you would pick a small model for this agent" and a follow-up
-  on license and hardware.
+
+## Exercise
+**Goal:** turn the hard filters into a screener that rejects models with a stated reason before any quality
+test. No solution is given.
+- **Inputs:** 5-8 candidate models from current cards, each card's `config.json`, and your constraints:
+  memory budget, context, concurrency, languages, allowed licenses.
+- **Deliver:** a script computing weights plus KV cache plus 10% headroom per candidate and quantization,
+  checking license and tool template, and printing pass or fail with the reason; then screen the survivors
+  with the harness above.
+- **Acceptance:** every rejected model names the filter it failed; for one model you can run, your memory
+  estimate lands within about 15% of what `ollama ps` or `nvidia-smi` reports at your context.
 
 ## Role lens
 - **Engineer:** Runs the screening harness across candidates, records scores per agent step, and pins the
@@ -227,14 +244,9 @@ and template.
   model revision.
 
 ### How would you choose between a 3B and an 8B model for an agent's argument-filling step?
-- **Measure both** on the same golden set with validation; record pass rate, invalid-JSON rate and latency.
+- **Measure both** on one golden set with validation: pass rate, invalid-JSON rate, latency.
 - **Price the difference:** the 8B needs more memory per replica and serves fewer concurrent agents.
-- **Decide by the bar:** take the 3B if it passes with escalation to a larger model on failure, otherwise the 8B.
-
-### What would you record about a model choice so the decision is auditable later?
-- **Identity:** repo id, revision or file hash, quantization, chat template source.
-- **Evidence:** golden-set scores per step, latency and memory on the target hardware, date of the run.
-- **Constraints:** license and legal sign-off, data-handling notes, and the fallback model.
+- **Decide by the bar:** the 3B if it passes with escalation on failure, otherwise the 8B.
 
 ## Quiz
 ### Q: Which check should eliminate a candidate SLM before any quality testing?
@@ -261,16 +273,25 @@ and template.
 > When both meet the bar on your tasks, the smaller model serves more agents per GPU at lower latency. Keep
 > an escalation path for cases it fails.
 
+## Mastery test
+**Problem:** a support agent must run on 8 GB edge GPUs, in Spanish and Portuguese, with 32k-token
+transcripts; procurement allows only Apache 2.0 or MIT. The top leaderboard SLM is an 8B under a custom
+license. What do you do?
+
+**A strong answer:**
+- drops the 8B at the license filter whatever its score, and checks licenses per size within a family;
+- computes KV cache at 32k from each config, since it can rival 4-bit weights on 8 GB, and proposes
+  summarising transcripts, an 8-bit KV cache or fewer sessions;
+- tests Portuguese tool arguments for two permissive families on the deployed build.
+
 ## Use cases & projects
 ### Use cases
 - **On-premises agents.** Teams pick the best model that fits the customer's single GPU and license policy,
   then lock its revision in a registry.
 - **Multilingual assistants.** Screening reveals which family keeps tool calling accurate in the customer's
   languages, which general benchmarks rarely show.
-- **Cost reviews.** A quarterly re-screen often finds a newer, smaller model that matches the current one and
-  frees hardware.
-- **Vendor-exit planning.** A shortlist of open models from different families gives a tested fallback if a
-  hosted provider changes terms.
+- **Vendor-exit planning.** Open models from different families give a tested fallback if a hosted
+  provider changes terms.
 
 ### Mini project
 **Build a model-selection scorecard (2-3 hours).**

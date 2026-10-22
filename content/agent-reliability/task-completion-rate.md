@@ -5,8 +5,13 @@ name: Task completion rate
 kind: metric
 difficulty: core
 est_minutes: 12
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - evals/task-specific-acceptance-criteria
+  - evals/pass-k
 related:
   - agent-reliability/agent-trajectory-evaluation
   - agent-reliability/tool-call-success-rate
@@ -48,8 +53,7 @@ segmented by task type, beside pass^k for unattended use.
   they half-did, misread or abandoned, and the gap between claimed and verified completion is routinely
   large enough to change a launch decision.
 - **Careless denominators produce two truths.** Abandoned sessions, out-of-scope requests and clarifying
-  questions end up counted as failures or quietly excluded depending on who ran the query, so two
-  dashboards show two different rates for the same week.
+  questions get counted as failures or excluded depending on who ran the query: two rates for one week.
 - **So treat it like a service-level indicator:** a precise definition of unit, success predicate,
   denominator and measurement method, plus statistics that respect how few tasks you actually have.
 
@@ -257,19 +261,23 @@ print(f"scope {b['declined'] / len(runs):.1%}  abandonment {b['abandoned'] / len
   condition that justifies reporting pass@k instead is a real verifier or human choosing among attempts.
 
 ## Pitfalls
-- **Counting "the model said done" as completion.** Symptom: a dashboard at 90% and a support queue full of
-  half-finished tasks.
-- **Changing the task grain between releases.** Symptom: a rate that jumps or drops with no change in agent
-  behaviour.
-- **One rate across a shifting task mix.** Symptom: a "regression" that turns out to be a week with more
-  hard tasks.
-- **Quoting 85% from 50 tasks without an interval.** Symptom: launch decisions reversed by the next run of
-  the same suite.
-- **Mixing assisted and unassisted completions.** Symptom: an autonomy number that looks fine until the
-  humans who were quietly fixing tasks go on holiday.
+- **Counting "the model said done" as completion.** Symptom: a dashboard at 90% and a support queue of
+  half-finished tasks. Diagnose: verify a random sample of "done" runs against the system of record and
+  report the claimed-versus-verified gap. Fix: a success predicate.
+- **Changing the task grain between releases.** Symptom: the rate jumps or drops with no change in
+  behaviour. Fix: version the task definition and never compare across versions.
+- **One rate across a shifting task mix.** Symptom: a "regression" that is a week of harder tasks.
+  Diagnose: segment by task type and compare each segment's interval with last week's. Fix: report
+  segments.
+- **Quoting 85% from 50 tasks without an interval.** Symptom: decisions reversed by the next run of the
+  same suite. Diagnose: compute the Wilson interval (about ten points either side). Fix: gate on the lower
+  bound.
+- **Mixing assisted and unassisted completions.** Symptom: autonomy looks fine until the humans quietly
+  fixing tasks go on holiday. Fix: the `human_fixed` bucket.
 - **An offline suite never compared to online outcomes.** Symptom: a suite at 95% and customers at 70%.
-- **Treating "no complaint" as success online.** Symptom: a high proxy completion rate that drops sharply
-  the first time someone hand-reviews a random sample of sessions.
+  Diagnose: track the offline-online gap per segment. Fix: mine failed online runs into the suite.
+- **"No complaint" counted as success online.** Symptom: the proxy rate drops sharply at the first
+  hand-review of random sessions. Fix: verified end state, or sampled review.
 
 ## When to use
 - **Make it the headline metric** of any agent from the first prototype, and define its unit, success
@@ -278,9 +286,17 @@ print(f"scope {b['declined'] / len(runs):.1%}  abandonment {b['abandoned'] / len
   signal, and the gap between them as the signal to refresh the suite.
 - **Pair it** with cost per successful task and with tool-call success rate, which explains most movements
   in it.
-- **Interviews:** "how would you measure whether the agent works" should produce the definitions, the
-  denominator policy, the Wilson interval, segmentation, and the pass^k argument for unattended agents,
-  not a single percentage.
+
+## Exercise
+**Goal:** produce an honest completion report and a release verdict from it. No solution given.
+- **Inputs:** 50 or more runs of your own agent, or of a trajectory suite, across at least two task
+  types; 3 or more repeated trials for at least 20 tasks.
+- **Constraints:** success comes from a verified end state, never the agent's message; one shared
+  bucketing function computes every number.
+- **Deliver:** a written denominator policy, a per-segment table with Wilson intervals, scope,
+  abandonment and assisted rates, per-task pass^3, and a one-paragraph verdict.
+- **Acceptance:** recomputing from raw runs reproduces every number; the claimed-versus-verified gap is
+  quantified; the verdict uses the lower bound per segment, not the pooled rate.
 
 ## Role lens
 - **Engineer:** Implements the success predicates and the verification step in the harness, and makes sure
@@ -305,14 +321,6 @@ them which task types work every time and can be automated without review. The a
 a secondary line for their support organisation.
 
 ## Interview questions
-### Why can't you measure task completion by counting runs where the agent said it was done?
-- **Self-report is the least reliable signal:** agents declare completion on tasks they half-did, misread or
-  abandoned.
-- **The gap is large enough to matter:** claimed versus verified completion routinely differs by enough to
-  change a launch decision.
-- **Use a success predicate instead,** ideally a verified end state, with human acceptance or a calibrated
-  judge where the state cannot be inspected.
-
 ### Completion dropped from 84% to 78% this week with no deploy. How do you investigate?
 - **Check the task mix first:** segment by task type and difficulty; a week with more hard tasks moves the
   overall rate without any change in the agent.
@@ -365,6 +373,18 @@ a secondary line for their support organisation.
 > Removing declined and abandoned tasks keeps the rate about agent execution, and reporting those rates
 > separately stops an agent from looking better by declining more.
 
+## Mastery test
+**Problem:** a vendor claims "92% task completion" for its coding agent: 300 tasks, completion means the
+final message says the PR is ready, tasks where it asked a question are excluded, one run per task.
+Should you pilot it for unattended dependency upgrades? What do you ask for and test?
+
+**A strong answer:**
+- rejects self-report: asks for a verified predicate such as tests passing in CI and the PR merged;
+- asks how many tasks were excluded as questions, since that inflates the rate;
+- wants the rate for dependency upgrades only, with an interval, not the pooled 92%;
+- needs repeated trials per task for pass^k, because unattended use needs consistency;
+- runs a pilot suite of real upgrades.
+
 ## Use cases & projects
 ### Use cases
 - **Release gates.** The Wilson lower bound per segment, plus pass^k for unattended segments, decides
@@ -379,9 +399,7 @@ a secondary line for their support organisation.
 ### Mini project
 **A completion-rate report for an agent (1-2 hours).**
 - **Goal:** compute an honest completion rate from a set of agent runs.
-- **Steps:** take 50 or more recorded runs (from your own agent or a trajectory suite); label each with a
-  verified end-state outcome and a case (completed, failed, declined, abandoned, assisted); write one
-  shared bucketing function; compute the unassisted rate with a Wilson interval per task type, plus scope,
-  abandonment and assisted rates; compare with the self-reported rate.
-- **Done when:** one table shows each segment's rate and interval, the claimed-versus-verified gap is
-  quantified, and every number comes from the same function.
+- **Steps:** label 50 or more recorded runs with a verified outcome and a case (completed, failed,
+  declined, abandoned, assisted); compute the Exercise table without the repeated trials.
+- **Done when:** one table shows each segment's rate and interval, and every number comes from the same
+  function.

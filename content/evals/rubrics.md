@@ -5,8 +5,13 @@ name: Rubrics
 kind: practice
 difficulty: intro
 est_minutes: 13
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: partial
+prerequisites:
+  - evals/llm-as-a-judge
+  - evals/error-analysis
 related:
   - evals/llm-as-a-judge
   - evals/judge-calibration-and-bias
@@ -348,21 +353,26 @@ Illustrative release comparison over 200 eval runs:
   score lumpy; report gate failure rate and the non-gated score separately so trends stay readable.
 
 ## Pitfalls
-- **Double-barreled criteria** such as "accurate and complete". Symptom: annotators split on items that
-  are accurate but incomplete, and agreement on that criterion collapses. Fix: split it.
+- **Double-barreled criteria** such as "accurate and complete". Symptom: agreement on that criterion
+  collapses. Diagnose: read the disagreed items side by side; they are accurate but incomplete. Fix:
+  split it.
 - **Anchors that describe grader feelings** ("excellent", "adequate") instead of output features.
-  Symptom: scores drift between annotators and across weeks for the same outputs. Fix: rewrite each
-  anchor as an observable property of the output.
+  Symptom: scores drift between annotators and across weeks for the same outputs. Diagnose: regrade a
+  fixed set a week apart and compare. Fix: rewrite each anchor as an observable property of the output.
 - **Averaging over a gate.** Symptom: an answer with a fabricated citation scores 0.8 and passes the
-  release threshold. Fix: gates override the average.
+  release threshold. Diagnose: list passing items with any failed gate. Fix: gates override the average.
 - **Editing the rubric mid-experiment.** Symptom: an "improvement" that disappears when both arms are
-  regraded with the same version. Fix: freeze a version per experiment.
+  regraded with the same version. Diagnose: group results by the stamped rubric version. Fix: freeze a
+  version per experiment.
 - **Scoring inapplicable criteria as passes.** Symptom: "escalates when out of scope" reports a 97% pass
-  rate although the system mishandles most of the few out-of-scope items. Fix: explicit N/A.
-- **Twelve criteria in one judge call.** Symptom: later criteria agree with humans far less than the same
-  criteria graded in isolation. Fix: split high-stakes criteria into their own calls.
+  rate although the system mishandles most of the few out-of-scope items. Diagnose: log the applicable
+  count per criterion. Fix: explicit N/A.
+- **Twelve criteria in one judge call.** Symptom: later criteria agree with humans less than the same
+  criteria graded alone. Diagnose: plot judge–human agreement by criterion position in the prompt. Fix:
+  split high-stakes criteria into their own calls.
 - **Treating the rubric as finished.** Symptom: a green eval dashboard while production complaints
-  describe a failure mode no criterion covers. Fix: periodic error analysis.
+  describe a failure mode no criterion covers. Diagnose: track the share of complaints that map to no
+  criterion. Fix: periodic error analysis.
 - **Scripting the agent's exact tool sequence as a criterion.** Symptom: a new model that solves tasks
   in fewer steps fails "process" checks while the outcome rate rises. Fix: check outcome and forbidden
   or wasteful steps, not one expected path.
@@ -374,10 +384,18 @@ Illustrative release comparison over 200 eval runs:
 - **Start with** three to six criteria drawn from error analysis, binary where possible, with a gating
   subset.
 - **Measure** per-criterion inter-annotator agreement and judge–human agreement before relying on it.
-- **Day to day,** the rubric lives in the judge prompt and the annotation guidelines and changes under
-  version control.
-- **Interviews:** "how would you evaluate a summarisation feature?" is a rubric question: criteria,
-  observable anchors, gates, pilot, agreement, versioning.
+
+## Exercise
+**Goal:** write, pilot and freeze a rubric for an agent you have, or a small tool-calling agent you
+build (support, booking or file management). No solution is given.
+- **Inputs:** 50 traces with tool calls and results; a second grader (colleague or other-family judge).
+- **Constraints:** 3-6 binary criteria from your own error analysis, at least one gate, at least one
+  criterion with an N/A trigger, and code checks wherever the trace allows.
+- **Deliver:** the rubric file with a version, per-criterion pass rates with applicable counts, the gate
+  rate shown separately, and per-criterion agreement on a 30-item pilot.
+- **Acceptance:** every criterion's anchor can be applied by someone who has not seen your notes; the
+  lowest-agreement criterion is rewritten and its agreement re-measured; a run that fails a gate scores a
+  fail whatever its other criteria.
 
 ## Role lens
 - **Engineer:** Encodes the rubric as data, grades one criterion per judge call, and logs per-criterion
@@ -438,14 +456,6 @@ version so future scores are comparable.
 - **Validate per criterion against SME labels** and automate only criteria where judge agreement is close
   to SME–SME agreement; keep humans on the rest.
 
-### What does N/A handling change in the reported numbers?
-- **Scoring N/A as pass inflates scores:** 2 of 3 real checks plus 3 inapplicable ones reports 5/6
-  instead of 2/3.
-- **It also hides rare-case failures:** an escalation criterion that applies to few items can show 97%
-  while most of those few items fail.
-- **So compute each criterion's pass rate only over items where it applied,** and decide applicability
-  before grading.
-
 ## Quiz
 ### Q: Why prefer several binary criteria over a single 1–10 "quality" score?
 - [ ] LLM judges cannot output numeric scores reliably
@@ -471,14 +481,24 @@ version so future scores are comparable.
 > Low agreement isolated to one criterion points at that criterion's definition. Annotators agree fine
 > elsewhere, so replacing them or widening the scale would not fix the ambiguity.
 
+## Mastery test
+**Problem:** a coding agent opens pull requests. Its rubric is "correct, clean and well explained,
+scored 1–5" by one judge call, and the mean rose from 3.9 to 4.1 after a model swap while reviewers
+report more broken builds. Redesign the rubric and say what the new numbers would reveal.
+
+**A strong answer:**
+- splits outcome (tests and build pass, run in code), process (no edits outside the task's files, no
+  disabled tests: code over the diff) and reply (the description matches the diff: judge);
+- makes "build breaks" and "tests deleted or skipped" gates, with N/A where no tests exist;
+- expects per-criterion rates to show the build gate failing more often while explanation criteria
+  rise, which the blended 1–5 mean hid.
+
 ## Use cases & projects
 ### Use cases
 - **Acceptance criteria for a customer agent.** A versioned rubric turns a statement of work ("refunds
   only with confirmation, cites the order") into checks both sides can audit.
 - **Debugging a regression to one component.** Separate outcome, trajectory and reply criteria show
   whether a drop came from the planner, a tool or the final message.
-- **Safety gates on destructive tools.** Gating criteria such as "no delete without confirmation" fail
-  a run outright, whatever its other scores.
 - **Annotation queues for trace review.** Reviewers label against the same binary criteria the judge
   uses, so human and judge pass rates are comparable per criterion.
 

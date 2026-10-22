@@ -5,8 +5,13 @@ name: Parent-document retrieval
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - rag-retrieval/chunking-strategies
+  - rag-retrieval/retrieval-granularity
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/retrieval-granularity
@@ -294,23 +299,27 @@ The snippet design uses less than half the context but adds 2 sequential steps.
   small at the cost of extra sequential calls, and flip to worse when nearly every hit needs its section.
 
 ## Pitfalls
-- **The whole document as parent for long documents.** The symptom is context overflow, lost-in-the-middle
-  effects and a cost spike, with no recall gain over stuffing.
-- **Skipping deduplication.** The symptom is the same parent repeated in the prompt and fewer unique
-  sources than the budget allowed.
-- **Citing the parent instead of the matched child span.** The symptom is citations pointing at a
-  2k-token section users cannot verify, and reviewers calling the citations wrong.
-- **Reranking children, then emitting parents in child order without regrouping.** The symptom is parent
-  order that does not reflect the strongest evidence.
-- **Parent store and child index out of sync** after re-indexing or deletion. The symptom is `parent_id`
-  lookups that miss and silently produce an empty context.
-- **Children so small they are generic** ("See below.", "Note:"). The symptom is high similarity scores on
-  sentences that carry no information.
-- **Assuming parents fix matching.** The symptom is queries naming the product or plan still missing a
-  section whose children never mention it, until heading paths or contexts are prepended to children.
-- **Agent answers from the snippet without reading the section.** The symptom is the old "right passage,
-  wrong details" failure coming back after switching to snippets. Say in the tool description when to
-  call `read_section`, and score answers that cite unread sections in the agent eval.
+- **The whole document as parent for long documents.** Symptom: context overflow, lost-in-the-middle
+  effects and a cost spike, with no recall gain over stuffing. Diagnose: log parent tokens per request
+  against the budget. Fix: section-level parents with a size cap.
+- **Skipping deduplication.** Symptom: the same parent repeated and fewer unique sources than the budget
+  allowed. Diagnose: unique `parent_id`s per request.
+- **Citing the parent instead of the matched child span.** Symptom: citations pointing at a 2k-token
+  section users cannot verify, and reviewers calling them wrong. Fix: cite matched spans with offsets.
+- **Reranking children, then emitting parents in child order without regrouping.** Symptom: parent order
+  that does not reflect the strongest evidence. Fix: regroup after reranking.
+- **Parent store and child index out of sync** after re-indexing or deletion. Symptom: `parent_id` lookups
+  that miss and silently produce an empty context. Diagnose: a nightly job that resolves every child's
+  `parent_id`, plus lookup-miss counts. Fix: re-index per document.
+- **Children so small they are generic** ("See below.", "Note:"). Symptom: high similarity scores on
+  sentences that carry no information. Diagnose: list top-scoring children under ~10 tokens. Fix: a
+  minimum child size.
+- **Assuming parents fix matching.** Symptom: queries naming the product or plan still miss a section whose
+  children never mention it. Diagnose: child recall@k on the product-or-plan slice. Fix: prepend heading
+  paths or contexts to children.
+- **Agent answers from the snippet without reading the section.** Symptom: "right passage, wrong details"
+  returns after switching to snippets. Diagnose: in traces, count answers citing a section with no
+  `read_section` call. Fix: say in the tool description when to call it.
 
 ## When to use
 - **Use for** long, structured documents where answers depend on surrounding context: manuals, contracts,
@@ -322,8 +331,16 @@ The snippet design uses less than half the context but adds 2 sequential steps.
 - **Measure:** child-level recall@k against a single-chunk-size baseline, then answer faithfulness and
   tokens per request (tool-result tokens per run, for agents), since the gain in context is paid for in
   budget.
-- **Interviews:** appears as "small-to-big" retrieval; the strong answer covers the join, the score
-  aggregation and the citation granularity.
+
+## Exercise
+**Goal:** build the two-store join and decide between parents up front and snippets plus `read_section`.
+No solution is given.
+- **Inputs:** 3-5 long structured documents (manuals or runbooks), 25 golden questions whose answers need
+  a table header, plan name or caveat near the matching sentence, with the answer section labelled.
+- **Deliver:** children with heading paths, a parent store, max-child grouping with dedup and a token
+  budget, and both tool designs; a table of section recall@4, accuracy, tool calls and tokens per task.
+- **Acceptance:** every child's `parent_id` resolves; accuracy beats a single-chunk-size baseline on the
+  same questions; citations point at child spans; you can say which design wins on your mix and why.
 
 ## Role lens
 - **Engineer:** Builds the two-store pipeline, the parent grouping and deduplication, and keeps child
@@ -362,13 +379,6 @@ single-size baseline.
   deletion.
 - **Fix the sync:** re-index per document (delete all children for the `doc_id`, replace its parents in one
   job) and alert on lookup misses.
-
-### Max-child, count or fraction: how do you choose the parent scoring rule?
-- **Max child** suits pinpoint questions, because the parent with the single best passage wins.
-- **Count of hits** favours broad overview sections but has a size bias: a 30-child parent has more chances
-  to land hits than a 4-child one.
-- **Fraction** removes the size bias but over-rewards a tiny parent with one lucky hit; pick by question
-  type and measure on the golden set.
 
 ### Your agent searches four times per task and its context fills with manual sections. What do you change?
 - **Measure first:** at 4 parents of ~1,200 tokens per search, four searches add 19,200 tokens of tool
@@ -417,6 +427,17 @@ single-size baseline.
 - [ ] Faster retrieval, because parent lookups replace vector search
 > The parent must fit the context budget alongside other parents; a whole long manual per hit defeats the
 > purpose, which is sharp matching with just enough surrounding context.
+
+## Mastery test
+**Problem:** a legal agent over 300-page contracts finds the right clause but misses definitions ("as
+defined in Section 1.4") and exceptions two pages later. Sections vary from 200 to 9,000 tokens, and the
+agent searches 5 times per task. Parent-document retrieval is proposed. Is it enough?
+
+**A strong answer:**
+- caps parent size (split the 9,000-token sections) and keeps children with heading paths;
+- sees that a cross-referenced definition is not in the same parent: that is a second hop or a
+  definitions lookup, not a bigger parent;
+- prefers snippets plus `read_section` at 5 searches per task, and measures tokens per run and accuracy.
 
 ## Use cases & projects
 ### Use cases

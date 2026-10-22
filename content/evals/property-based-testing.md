@@ -5,8 +5,13 @@ name: Property-based testing
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: implement
+code_tested: yes
+prerequisites:
+  - python-for-ai/pytest
+  - prompting/structured-outputs-json-mode
 related:
   - python-for-ai/property-based-testing
   - evals/metamorphic-testing
@@ -33,9 +38,8 @@ chunkers and prompt renderers; model-output properties cost one call per example
 - **Where it shows up in your stack.** Hypothesis with pytest for Python agents, typically on Pydantic
   or dataclass tool-argument models, memory and scratchpad managers, RAG chunkers and prompt templates,
   with stateful tests for anything that changes across turns.
-- **What you control.** The strategies (shaped like real model JSON and real user text), the properties
-  (round trip, typed errors only, budget invariants), the CI and nightly profiles and the pinned
-  counterexamples.
+- **What you control.** Strategies shaped like real model JSON and user text, the properties (round
+  trip, typed errors only, budget invariants), CI and nightly profiles, pinned counterexamples.
 - **What you can skip.** QuickCheck history and advanced shrinking internals; generators, properties,
   shrinking and `RuleBasedStateMachine` cover agent plumbing.
 
@@ -52,9 +56,7 @@ chunkers and prompt renderers; model-output properties cost one call per example
   without shrinking a failure is a 4 KB blob nobody can read.
 - **Property-based testing changes the division of labour.** Begun as QuickCheck: the engineer states
   what must be true for *all* inputs, the framework explores, and a counterexample is minimised into
-  something a human understands in five seconds.
-- **It is the cheapest edge-case finder for plain code.** Those edge cases otherwise surface as a 3 a.m.
-  production exception inside a retrieval pipeline.
+  something a human understands in five seconds. For plain code it is the cheapest edge-case finder.
 
 ## How it works
 ### Three parts
@@ -105,7 +107,7 @@ The property must not re-implement the function, or a bug in the logic appears i
 - **Invariants run after every step:** the system prompt is still first, the total stays under the token
   budget, the latest user turn is never dropped, a cache hit returns what was stored under that exact key.
 - **Shrinking works on the sequence too.** A failure found after 40 random operations is reported as the
-  shortest breaking sequence, often three or four steps, which reads like a bug report.
+  shortest breaking sequence, often four or five steps, which reads like a bug report.
 
 ### Properties on model outputs
 Generate inputs, call the model, assert a property: schema valid, no echo of a planted secret, reply
@@ -205,7 +207,7 @@ class HistoryMachine(RuleBasedStateMachine):
     def user_turn(self, tokens):
         self.h.add("user", tokens); self.saw_user = True
 
-    @rule(tokens=st.integers(1, 3_000))
+    @rule(tokens=st.integers(1_000, 3_000))         # (1, 3_000) missed the bug in ~1 of 5 runs
     def tool_result(self, tokens):
         self.h.add("tool", tokens)
 
@@ -222,10 +224,12 @@ class HistoryMachine(RuleBasedStateMachine):
         assert not self.saw_user or any(role == "user" for role, _ in self.h.turns)
 
 TestHistory = HistoryMachine.TestCase
-# Fails latest_user_turn_kept, shrunk to a short sequence (typically four steps), e.g. user_turn(tokens=1),
-# tool_result(tokens=1500), tool_result(tokens=3000), tool_result(tokens=3000):
-# 500 + 1 + 1500 + 3000 + 3000 = 8001 > 8000, so the trimmer drops the only user turn.
+# Fails latest_user_turn_kept on every run (Hypothesis 6.170), shrunk to about five steps, e.g.
+# user_turn(tokens=1), tool_result(1000), tool_result(1000), tool_result(2500), tool_result(3000):
+# 500 + 1 + 1000 + 1000 + 2500 + 3000 = 8001 > 8000, so the trimmer drops the only user turn.
 ```
+
+A four-step sequence breaks it the same way:
 
 | Step | History (tokens) | Total |
 |---|---|---|
@@ -333,15 +337,21 @@ kind of input a Unicode-aware generator eventually produces.
 
 ## Pitfalls
 - **The property copies the implementation.** Symptom: a test that passes forever and a bug that ships
-  in both. Fix: state independent facts (coverage, bounds, round trip).
+  in both. Diagnose: plant a bug and see whether the property fails. Fix: state independent facts
+  (coverage, bounds, round trip).
 - **Over-filtering with `assume`.** Symptom: a `FailedHealthCheck` error (`filter_too_much`), or, if
-  someone suppresses it, a test that effectively ran ten examples. Fix: build valid inputs directly.
+  someone suppresses it, a test that effectively ran ten examples. Diagnose: run pytest with
+  `--hypothesis-show-statistics` and read the invalid-example count. Fix: build valid inputs directly.
 - **Model-calling property on default deadline and example count.** Symptom: a flaky, slow test marked
-  skip within a week. Fix: low count, no deadline, caching, a rate.
+  skip within a week. Diagnose: `DeadlineExceeded` or `Flaky` errors in CI logs. Fix: low count, no
+  deadline, caching, a rate.
+- **A strategy too broad to reach the bug.** Symptom: a stateful test that fails only on some runs.
+  Diagnose: clear the database, rerun 10 times, count failures. Fix: shape the strategy toward
+  realistic sizes, as the trimmer example does.
 - **Patching for the original 2 KB input, ignoring the shrunk one.** Symptom: the same bug reappears
   with a different long input. Fix: debug the minimal case and pin it.
 - **ASCII-only alphabets for the chunker.** Symptom: production failures on emoji, CJK text or combining
-  marks the generator would have found in seconds. Fix: use the default `st.text()` alphabet.
+  marks. Fix: use the default `st.text()` alphabet.
 
 ## When to use
 - **Use when:** a pure function sits between the user and the model or between the model and a tool:
@@ -352,8 +362,17 @@ kind of input a Unicode-aware generator eventually produces.
 - **Avoid when:** only a label can judge the behaviour; that is the golden set's job.
 - **Measure:** how many distinct bugs the properties found and how often a shrunk counterexample became
   a pinned case.
-- **Interviews:** name a non-trivial property for a chunker or parser, explain shrinking, and say why
-  model-output properties need different settings.
+
+## Exercise
+**Goal:** property-test two pieces of plumbing from an agent you have (or write small ones): a
+prompt renderer and a tool-call budget tracker. No solution is given.
+- **Inputs:** a renderer that puts user text between delimiters and caps tokens; a tracker with a step
+  limit, a cost cap and a retry limit per tool.
+- **Deliver:** a renderer property whose strategy includes delimiter strings, backticks, braces and
+  `### ` lines, and a `RuleBasedStateMachine` with rules for tool call, tool error and timeout.
+- **Acceptance:** each test fails on a planted bug you introduce (delimiter not escaped, retry counter
+  not reset), shrinks to five steps or fewer, and the shrunk case is pinned; clearing `.hypothesis/` and
+  rerunning 10 times finds the planted bug every time.
 
 ## Role lens
 - **Engineer:** Writes strategies that resemble real user and model output, states round-trip and
@@ -385,12 +404,6 @@ and keep any model-calling property out of the PR gate with caching and a low ex
 - **Why it matters for AI:** inputs are whatever users send plus whatever models produce, and nobody
   writes the example that breaks a chunker or parser.
 
-### Which properties would you write for a RAG chunker?
-- **Coverage:** concatenating chunks minus overlap reconstructs the text exactly.
-- **Bounds:** every chunk is non-empty and at most `size` characters.
-- **Overlap:** each chunk starts with the previous chunk's overlap region; plus Unicode safety, with the
-  default text alphabet rather than ASCII.
-
 ### Your agent crashes a few times a day inside a tool with a KeyError on model-produced arguments. How do you make that class of bug impossible?
 - **Typed boundary:** parse every tool's arguments into a typed object that either validates or raises
   one typed error the loop returns to the model as a tool error, so it can retry.
@@ -405,12 +418,6 @@ and keep any model-calling property out of the PR gate with caching and a low ex
 - **Invariants:** system prompt first, total under budget, latest user turn kept.
 - **Payoff:** a failure after dozens of operations shrinks to a short sequence, like the four-step
   8,001-token case in the example.
-
-### When would you not gate PRs on a property test?
-- **When it calls a model:** each example is a slow, paid, nondeterministic call, so cap examples, set no
-  deadline, cache responses and report a nightly rate.
-- **When the property is weak:** "does not crash" alone gives false confidence about correctness.
-- **When only a label can judge the output:** use a golden set instead.
 
 ### Your property test passes locally but fails in CI with a different input each time. What is going on?
 - **Exploration differs between runs:** generation is random, so CI found new cases; that is a real bug,
@@ -447,6 +454,19 @@ and keep any model-calling property out of the PR gate with caching and a low ex
 > Comparing against a copy of the implementation reproduces its bugs on both sides. Coverage, size bound
 > and overlap are independent statements about what a correct chunker must do, so they can fail when the
 > code is wrong.
+
+## Mastery test
+**Problem:** your agent streams tool-call arguments as JSON fragments and a helper reassembles them,
+returning the arguments once complete. Production shows rare tool calls with truncated strings and
+occasional double-applied refunds after retries. Which properties and strategies would you write?
+
+**A strong answer:**
+- states a round trip: any valid arguments object, split into arbitrary fragments, reassembles to the
+  same object, with a strategy that splits inside escapes and multibyte characters;
+- asserts incomplete input never returns arguments, only "need more" or a typed error;
+- models retries as a `RuleBasedStateMachine` (fragment, retry, complete) with an invariant that each
+  call ID is applied at most once;
+- pins shrunk cases and keeps any model-calling property out of the PR gate.
 
 ## Use cases & projects
 ### Use cases

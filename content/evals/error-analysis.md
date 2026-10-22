@@ -5,8 +5,14 @@ name: Error analysis
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - evals/golden-dataset
+  - evals/eval-harness
+  - observability/tracing
 related:
   - evals/golden-dataset
   - evals/eval-harness
@@ -57,7 +63,7 @@ and which fix buys most.
 - **The naive alternatives all skip the reading.** "Trust the judge score" fails because a judge grades
   only the criteria you gave it and cannot see a failure mode you did not name; Shankar et al. found
   people's criteria drift as they read outputs. "Fix what you notice" is whack-a-mole with regressions
-  elsewhere. "Collect thumbs-down" is biased toward failures users notice and bother to report.
+  elsewhere. "Collect thumbs-down" sees only failures users report.
 
 ## How it works
 ### 1. Sample traces, not just outputs
@@ -217,10 +223,8 @@ Illustrative: one hundred random production traces are read; 36 are judged failu
 - **Second fix: "guesses account data",** only 6 cases but highest severity, fixed with a handoff rule
   and a deterministic grader.
 - **Ceiling analysis predicted the shape:** the two categories touched held 18 of 100 traces, so +18
-  points was the most the fix could buy, and it bought +12.
-- **Next round's agenda:** the remaining 24 failures are led by "contradicts context" (7) and "guessed
-  account data" (6). A confirm run on a fresh 100 traces checks the gain was not specific to the traces
-  the fix was tuned on.
+  points was the most the fix could buy, and it bought +12. A confirm run on a fresh 100 traces comes
+  next.
 
 ### Annotation schema for agent traces
 The schema and the counting are a few lines; the stage prefix rolls counts up to the component owner.
@@ -298,10 +302,8 @@ for k in (7, 9):
   Monitor the failure rate per stratum against the random sample.
 - **Promote with a calibration set.** When a category is stable for two rounds, write its grader and keep
   the human-labelled traces as the grader's test set. Monitor the grader's agreement with human labels
-  (true-positive and true-negative rates) before trusting it in CI.
-- **Category trend table.** Keep one row per round with counts per category and the share of failures
-  covered by the top three. Monitor whether a fix reduced its target category on a fresh sample, and
-  retire categories at zero for several rounds.
+  (true-positive and true-negative rates) before trusting it in CI. Keep one row per round of counts per
+  category to see trends.
 
 ## Trade-offs
 - **Discovery vs expert hours.** Reading traces by hand costs expert hours and cannot cover every trace,
@@ -321,29 +323,46 @@ for k in (7, 9):
   which matters most after you add a new tool.
 
 ## Pitfalls
-- **Fixing while reading.** A failure gets patched before the counting is done. Symptom: the prompt grows
-  with special cases and the aggregate barely moves, because the patched category was 3% of failures.
-- **Sampling only thumbs-down conversations or escalations.** Symptom: the taxonomy is dominated by tone
-  and formatting complaints while silent wrong answers, which users rarely flag, go uncounted.
-- **Letting an LLM judge do the open coding.** Symptom: categories sound generic ("inaccurate",
-  "unhelpful"), match the judge's prior rather than your data, and suggest no concrete fix.
+- **Fixing while reading.** Symptom: the prompt grows with special cases and the aggregate barely moves,
+  because the patched category was 3% of failures. Diagnose: map each recent prompt change to a counted
+  category and its share. Fix: finish notes and counts before changing anything.
+- **Sampling only thumbs-down conversations or escalations.** Symptom: tone and formatting complaints
+  dominate while silent wrong answers, which users rarely flag, go uncounted. Diagnose: compare category
+  shares against a random sample from the same week. Fix: random sample for prevalence, flagged traces
+  for discovery only.
+- **Letting an LLM judge do the open coding.** Symptom: generic categories ("inaccurate", "unhelpful")
+  that match the judge's prior, not your data. Diagnose: ask what change each category implies; if none,
+  it is the judge's vocabulary. Fix: humans write notes; an LLM may only propose clusters of them.
 - **Grading the final answer without the trace.** Symptom: "hallucination" is the biggest category, yet
-  every prompt fix fails, because the real cause was retrieval or a tool returning stale data.
-- **Categories defined by unobservable cause** ("model got confused") instead of observable behaviour.
-  Symptom: annotators disagree and counts swing between rounds with no change to the system.
+  every prompt fix fails, because the real cause was retrieval or a tool returning stale data. Diagnose:
+  check whether the correct fact was in the retrieved chunks or tool results. Fix: annotate full traces
+  with the first wrong step.
+- **Categories defined by unobservable cause** ("model got confused"). Symptom: annotators disagree and
+  counts swing between rounds with no system change. Diagnose: have a second annotator label 20 traces
+  and measure agreement per category. Fix: redefine as observable behaviour with examples.
 - **Skipping the re-measure on the same sample after a fix.** Symptom: a change "felt better" in the
-  playground, and the next round shows the category unchanged or a neighbouring one larger.
+  playground, and the next round shows the category unchanged or a neighbour larger. Diagnose: re-run the
+  round's traces and diff counts per category. Fix: same sample first, then a fresh one.
 
 ## When to use
 - **Before writing any agent evals,** to learn which failure modes exist.
 - **When the aggregate plateaus** or a change has an effect you cannot explain.
-- **On a cadence against production traffic.** It is never a substitute for automated evals, because its
-  output *is* the next set of automated evals.
+- **On a cadence against production traffic,** with a weekly hour of reading. It is never a substitute
+  for automated evals, because its output *is* the next set of automated evals.
 - **Measure:** traces read per round, the categories and their counts, the share of failures covered by
   the top three categories, and whether a fix reduced its target category on a fresh sample.
-- **Day to day:** a shared sheet or trace viewer with a notes column and a weekly hour of reading.
-- **Interviews:** answer "the score dropped after your change, what do you do?" with "diff the runs, pull
-  the items that flipped, read their traces, count", not with "try a different prompt".
+
+## Exercise
+**Goal:** run one decision-grade round on traces you did not write the taxonomy for in advance, and
+decide what to fix with numbers. No solution is given.
+- **Inputs:** 60-100 full traces from an agent you run (or a public agent-trace dataset), each with tool
+  calls, tool results and the final answer.
+- **Deliver:** a sheet with `note` written before `first_failure`; a stage-prefixed taxonomy of 5-15
+  categories with definitions; counts with 95% intervals; the ceiling for the top two; a one-paragraph
+  decision naming the first fix and why severity or fixability did or did not reorder the list.
+- **Acceptance:** a second person labels 15 failing traces from your definitions alone and matches your
+  category on most of them; you can say which ranking differences are inside the noise; the fix, re-run
+  on the same traces, shrinks its target category without growing another.
 
 ## Role lens
 - **Engineer:** Builds the trace sampler and annotation sheet, reads the traces, and converts stable
@@ -397,13 +416,6 @@ and slices, not the aggregate, to the product owner.
 - **Trade-off:** the first-failure rule keeps counts attributable and fixes well-targeted, at the price
   of hiding compounding failures if you never look at the secondary field.
 
-### How many traces do you need to read per round, and why?
-- **Until saturation,** usually dozens to low hundreds of traces: stop when new traces stop producing new
-  categories.
-- **Numbers:** a mode with prevalence p appears in n random traces with probability 1 − (1 − p)ⁿ. At 100
-  traces a 2% mode shows up about 87% of the time, a 1% mode about 63%.
-- **So** rare, severe modes need a stratified sample, not a larger random one.
-
 ### How do you turn a failure category into an automated eval you can trust?
 - **Golden items:** the failing traces with corrected expected outputs or rubrics.
 - **Grader:** a deterministic assertion when the failure has an observable signature, otherwise a binary
@@ -438,6 +450,18 @@ and slices, not the aggregate, to the product owner.
 > The counts decide priority, and promoting each stable category into golden items and a grader is what
 > keeps the eval suite representative of real failures. A single overall score or a longer prompt would
 > throw away the attribution the round produced.
+
+## Mastery test
+**Problem:** a coding agent passes 150 of 200 tasks; the lead wants 90% next sprint. Your reading gives:
+"claimed done without running tests" 14, "edited the wrong file" 12, "looped on a failing command" 9,
+"deleted an untracked user file" 1, other 14. Which fixes do you plan, and is 90% reachable?
+
+**A strong answer:**
+- computes ceilings against all 200 traces: 7, 6 and 4.5 points, so the top three cap at about 17.5
+  points and +15 needs nearly all of them fixed perfectly;
+- notes 14 vs 12 is a tie (intervals roughly 3.5-10.5% and 2.7-9.3%), so fixability decides between them;
+- gates the single file deletion first, because severity outweighs count;
+- turns "tests not run" into a deterministic grader, re-measures on the same 200, then on fresh tasks.
 
 ## Use cases & projects
 ### Use cases

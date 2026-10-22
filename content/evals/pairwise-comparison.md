@@ -5,8 +5,13 @@ name: Pairwise comparison
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - evals/llm-as-a-judge
+  - math-for-ai/statistics-for-evaluation
 related:
   - evals/llm-as-a-judge
   - evals/judge-calibration-and-bias
@@ -294,21 +299,24 @@ the pairwise judge sees only tasks both versions solved. Numbers are illustrativ
 
 ## Pitfalls
 - **A high win rate against a weak baseline.** Symptom: 80% wins and a product nobody can use, because
-  the baseline was never a bar. Fix: a strong fixed baseline plus rubric gates.
+  the baseline was never a bar. Diagnose: run the rubric gates on the candidate alone. Fix: a strong
+  fixed baseline plus rubric gates.
 - **Dropping ties instead of splitting them.** Symptom: a win rate that swings several points depending
   on tie handling. Fix: count ties as 0.5.
 - **No confidence interval.** Symptom: leaderboard positions reshuffling between runs on the same data.
-  Fix: bootstrap every win rate and strength.
+  Diagnose: bootstrap and check whether neighbours' intervals overlap. Fix: bootstrap every win rate and
+  strength.
 - **One global win rate over mixed categories.** Symptom: a variant that wins overall but loses on the
-  category that matters most, such as safety-sensitive requests. Fix: per-category win rates.
+  category that matters most, such as safety-sensitive requests. Diagnose: break the win rate down by
+  category and compare BT predictions with observed head-to-heads. Fix: per-category win rates.
 - **Elo on a static dataset.** Symptom: ratings that change when the comparison order is shuffled. Fix:
   batch Bradley–Terry fit.
 - **Letting a nicer reply outvote a failed task.** Symptom: the new agent "wins" 60% of pairwise
-  comparisons while its task success rate fell. Fix: check outcome in code first and judge preference
-  only where both runs succeeded.
+  comparisons while its task success rate fell. Diagnose: count discordant outcomes per pair before any
+  preference. Fix: check outcome in code first and judge preference only where both runs succeeded.
 - **Reusing LLM-judged pairs as DPO data without debiasing.** Symptom: a model whose outputs get longer
-  every training round while human preference stays flat. Fix: keep only position-consistent verdicts
-  and check the chosen-vs-rejected length gap before training.
+  every training round while human preference stays flat. Diagnose: log the chosen-minus-rejected length
+  gap per round. Fix: keep only position-consistent verdicts and close that gap before training.
 
 ## When to use
 - **Use when** comparing variants of one agent or system (prompt A vs B, a model upgrade, a new tool
@@ -317,8 +325,17 @@ the pairwise judge sees only tasks both versions solved. Numbers are illustrativ
 - **Avoid** using it alone for release gating, or for tasks with an executable check.
 - **Measure** win rate with a bootstrap interval, position-consistency rate, per-category win rates and
   the length difference between arms.
-- **Interviews:** explain Bradley–Terry versus Elo, why a leaderboard uses the batch fit, and roughly how
-  many comparisons it takes to resolve a five-point difference.
+
+## Exercise
+**Goal:** decide with pairwise evidence whether version 2 of an agent (yours, or a small tool-calling
+agent with two planner prompts) should replace version 1. No solution is given.
+- **Inputs:** 60-120 tasks with a code-checkable outcome, run from fresh state; an other-family judge.
+- **Constraints:** outcome is scored in code before any preference; every pair is judged in both orders;
+  inconsistent pairs count as ties.
+- **Deliver:** discordant outcome counts with a McNemar z, the win rate on both-succeeded pairs with a
+  bootstrap interval, the position-flip rate, the tool-call-count difference, and a ship call.
+- **Acceptance:** shuffling the verdict order leaves every number unchanged; your interval agrees with
+  √(p(1−p)/n) within a point; the decision names the number that decided it.
 
 ## Role lens
 - **Engineer:** Builds the comparison harness: randomised order, both orders for an LLM judge, tie
@@ -378,14 +395,6 @@ checked. If intervals overlap, buy more comparisons or move to an online A/B tes
 - **Spend adaptively:** a cheap first round drops clear losers, and the remaining budget goes where
   intervals overlap.
 
-### Why use Bradley–Terry instead of Elo for a static leaderboard?
-- **Bradley–Terry is a joint maximum-likelihood fit** over all comparisons, so the ranking does not depend
-  on the order games were fed in, and missing pairs are handled naturally.
-- **Elo is sequential** with step size K, designed for live play, and gives different ratings when a
-  static dataset is shuffled.
-- **The likelihood supports bootstrap intervals,** which is what a leaderboard needs to say two systems
-  are tied.
-
 ## Quiz
 ### Q: Why did large preference leaderboards move from Elo-style updates to Bradley–Terry maximum likelihood?
 - [ ] Elo cannot handle more than two competitors
@@ -411,14 +420,24 @@ checked. If intervals overlap, buy more comparisons or move to an online A/B tes
 > logit(0.73) ≈ 0.99, so β_A − β_C ≈ 1.99 and sigmoid(1.99) ≈ 0.88. A large gap between that prediction
 > and the observed A-vs-C rate is the standard check for intransitive preferences.
 
+## Mastery test
+**Problem:** six agent configurations (two models × three tool sets) must be ranked for a customer by
+Friday. Your budget is 450 LLM-judge calls, each task has a code-checkable outcome, and one model is
+from the judge's family. Design the comparison and the decision rule.
+
+**A strong answer:**
+- scores outcome in code on every configuration first, so judge calls go only to both-succeeded pairs;
+- anchors to the current configuration instead of all 15 pairs, with both orders halving the budget to
+  about 225 verdicts, and spends a second round where intervals overlap;
+- fits Bradley–Terry with bootstrap intervals, checks per-category intransitivity and length or step
+  gaps, and swaps in a cross-family judge for the sibling model.
+
 ## Use cases & projects
 ### Use cases
 - **Shipping a new agent prompt or model.** The candidate is judged against the production agent on the
   same tasks, and a win rate with a bootstrap interval decides the launch.
 - **Choosing among several agent variants.** Bradley–Terry strengths rank many prompt, model and tool-set
   combinations from a sparse set of comparisons.
-- **SME review sessions.** Domain experts pick the better of two trajectories faster and more
-  consistently than they assign absolute scores.
 - **Preference data for tuning.** The (prompt, chosen, rejected) pairs collected during evals feed DPO or
   a reward model trained on agent traces.
 

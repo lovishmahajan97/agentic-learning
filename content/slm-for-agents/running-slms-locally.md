@@ -5,8 +5,13 @@ name: Running SLMs locally (Ollama, llama.cpp, vLLM)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: partial
+prerequisites:
+  - agents/tool-calling
+  - serving-inference/kv-cache-memory-estimation
 related:
   - serving-inference/engines
   - slm-for-agents/quantized-slms
@@ -34,18 +39,18 @@ GPU servers with many concurrent agents.
   LiteLLM or framework config.
 - **What you control.** The model and quantization, context length, how many requests run in parallel, and
   whether native tool-call parsing is turned on.
-- **What you can skip.** Engine internals such as kernels and schedulers; `serving-inference/engines` covers
-  them. Here you need the commands, the flags that matter to agents, and when to switch engines.
+- **What you can skip.** Kernels and schedulers (see `serving-inference/engines`); you need the commands,
+  agent-relevant flags, and when to switch.
 
 ## Why it exists
 - **Hosted APIs are not always allowed or affordable.** Regulated data, air-gapped sites and high call volume
   push SLM steps onto hardware you run.
 - **Raw model weights are not a service.** You need tokenisation, chat templates, batching, a KV cache and an
   HTTP API; these three engines package all of that.
-- **Agents need tool calls parsed, not just text.** Each engine can turn the model's tool-call tokens into
-  structured `tool_calls` in the response, if you enable the right template or parser.
+- **Agents need tool calls parsed, not just text.** Each engine can turn tool-call tokens into structured
+  `tool_calls`, if you enable the right template or parser.
 - **One size does not fit all.** A laptop, a CPU-only edge box and an 80 GB GPU serving 50 agents need
-  different engines, but the same OpenAI-style API keeps the agent code identical.
+  different engines; the shared API keeps agent code identical.
 
 ## How it works
 ### The three engines at a glance
@@ -110,6 +115,7 @@ The same loop works with Ollama, llama.cpp (`--jinja`) or vLLM (tool parser on);
 `MODEL` only.
 
 ```python
+# Checked with openai 3.36 (Python SDK) on Python 3.12.
 import json
 from openai import OpenAI
 
@@ -152,39 +158,38 @@ hardware and model.
 All three expose `/v1/chat/completions`, so the agent and its eval suite run unchanged in each place.
 
 ## Production patterns
-- **One client, many backends.** Route through LiteLLM or a thin gateway with entries for each local engine
-  and a hosted fallback. Monitor per-backend error rate and latency so a failing local server shifts traffic
-  instead of failing agent runs.
-- **Containerise with the model pinned.** Run the official Ollama or vLLM container images, or a llama.cpp
-  build, with the model file or revision baked in or mounted read-only. Pin versions, because engine upgrades
-  can change templates, parsers and defaults.
+- **One client, many backends.** Route through LiteLLM or a thin gateway with each local engine and a hosted
+  fallback. Monitor per-backend errors and latency so a failing server shifts traffic, not fails runs.
+- **Containerise with the model pinned.** Official Ollama or vLLM images, or a llama.cpp build, with engine
+  version pinned and the model file or revision baked in or mounted read-only.
 - **Health check with a real completion.** Probe with a short chat request, not just an open port, because a
   server can be up while the model is still loading. Alert on time to first token and on queue length.
-- **Size concurrency from memory.** Set `--max-num-seqs` or `--parallel` from KV-cache arithmetic for your
-  context length, then load-test at the concurrency your agents create. Watch preemptions in vLLM metrics.
+- **Size concurrency from memory.** Set `--max-num-seqs` or `--parallel` from KV-cache arithmetic, then
+  load-test at your agents' concurrency. Watch preemptions in vLLM metrics.
 - **Trace local calls like hosted ones.** Send spans with model, engine, quantization, tokens and latency to
   Langfuse or your tracing backend, so SLM steps are visible in the same agent trace.
 
 ## Trade-offs
-- **Ollama convenience vs control.** It is the fastest path to a working local agent, but exposes fewer
-  serving knobs and lower concurrency than vLLM. It flips once you serve many concurrent users.
+- **Ollama convenience vs control.** The fastest path to a working local agent, but fewer serving knobs and
+  lower concurrency than vLLM; it flips once you serve many concurrent users.
 - **llama.cpp portability vs throughput.** It runs on CPU, Apple silicon and modest GPUs from one GGUF file,
   but does not batch as aggressively as vLLM on a large GPU.
 - **vLLM throughput vs footprint.** Continuous batching and prefix caching give the most agents per GPU, but
   it targets GPU servers, pre-allocates most GPU memory, and has heavier dependencies.
-- **Local vs hosted.** Local keeps data in and per-token cost out, but you own uptime, upgrades and capacity.
+- **Local vs hosted.** Local keeps data in and per-token cost out; you own uptime, upgrades, capacity.
 
 ## Pitfalls
 - **Truncated context in Ollama.** Symptom: the agent ignores tools or the system prompt on longer runs.
-  Fix: raise `num_ctx` (Modelfile or `OLLAMA_CONTEXT_LENGTH` when you call the OpenAI-compatible
-  endpoint) and confirm prompt token counts in the response usage.
-- **Tool calls returned as plain text.** Symptom: JSON-looking text in `content` and no `tool_calls`. Fix:
-  start llama.cpp with `--jinja`, enable vLLM's auto tool choice with the right parser, or pick a model whose
-  Ollama template supports tools.
-- **Cold starts between steps.** Symptom: some agent steps take seconds longer. Fix: set keep-alive or keep
-  the model resident, and avoid loading several large models on one small GPU.
-- **Benchmarking at batch 1.** Symptom: fine in testing, slow under load. Fix: load-test with the real number
-  of concurrent agents and long prompts.
+  Diagnose: log `usage.prompt_tokens` per step; a flat ceiling while the transcript grows means truncation.
+  Fix: raise `num_ctx` (Modelfile, or `OLLAMA_CONTEXT_LENGTH` for the OpenAI-compatible endpoint).
+- **Tool calls returned as plain text.** Symptom: JSON-looking text in `content` and no `tool_calls`.
+  Diagnose: log both fields for one request and check the engine's start flags. Fix: llama.cpp `--jinja`,
+  vLLM auto tool choice with the right parser, or a model whose Ollama template supports tools.
+- **Cold starts between steps.** Symptom: some agent steps take seconds longer. Diagnose: `ollama ps` or the
+  server log shows a load before the slow step. Fix: set keep-alive, and avoid loading several large models
+  on one small GPU.
+- **Benchmarking at batch 1.** Symptom: fine in testing, slow under load. Diagnose: plot time to first token
+  against concurrency. Fix: load-test with the real number of concurrent agents and long prompts.
 
 ## When to use
 - **Use Ollama when** you want a local model for development, demos or a single user in minutes.
@@ -193,6 +198,16 @@ All three expose `/v1/chat/completions`, so the agent and its eval suite run unc
 - **Use vLLM when** a GPU server must serve many concurrent agent sessions with high throughput.
 - **Measure** time to first token, tokens per second, valid tool-call rate and memory at your real
   concurrency.
+
+## Exercise
+**Goal:** write a preflight check your agent runs against any local engine before its first step. No
+solution is given.
+- **Inputs:** one small instruct model with tool support, served by at least two of the three engines.
+- **Deliver:** a script taking `BASE_URL` and `MODEL` that checks a real completion, that tools come back as
+  `tool_calls`, that a long prompt is not truncated (`usage.prompt_tokens` against your count), and time to
+  first token at concurrency 1, 4 and 8.
+- **Acceptance:** it passes on a correct setup; it fails with a clear message for a model whose template
+  lacks tools and for a 6k-token prompt sent to an Ollama model at a 2048 context.
 
 ## Role lens
 - **Engineer:** Starts the right engine with the right flags, points the agent's client at its base URL,
@@ -221,17 +236,9 @@ the local model before trusting it.
 - **Cost:** it needs a GPU server and more operational work, so it pays off only at real traffic.
 
 ### Your local model returns tool calls as raw text. How do you debug it?
-- **Check the template:** the chat template must define tool calls; with llama.cpp start `llama-server` with
-  `--jinja`, with vLLM enable auto tool choice with the right parser.
-- **Check the model:** use an instruct model whose card documents tool support, at the deployed quantization.
-- **Add a fallback parser** only as a stopgap, and add the case to your eval set.
-
-### How do you keep one agent codebase working across laptop, edge and GPU-server deployments?
-- **Same API everywhere:** all three engines expose OpenAI-compatible chat completions, so only `base_url` and
-  model name change.
-- **Config, not code:** keep engine, model, context and fallback in configuration or a gateway such as
-  LiteLLM.
-- **Eval per environment:** run the same golden set on each deployed build, since quantization can differ.
+- **Template, parser, model:** `llama-server` with `--jinja`, vLLM auto tool choice with the right parser,
+  and an instruct model whose card documents tool support, at the deployed quantization.
+- **A fallback parser** is only a stopgap; add the case to your eval set.
 
 ### How would you size a vLLM server for 40 concurrent agent sessions with 8k-token contexts?
 - **Weights first:** model size at its precision, for example a 7B at 4-bit.
@@ -270,10 +277,21 @@ the local model before trusting it.
 > vLLM parses tool calls only when auto tool choice is on and a parser matching the model family is chosen.
 > Prefix caching, context length and memory utilisation are performance and capacity settings.
 
+## Mastery test
+**Problem:** an agent that works on Ollama laptops moves, same model, to a vLLM server for 30 concurrent
+users. Long runs now fail with a context-length error, tool calls arrive as text, and time to first token
+hits 6 seconds at peak. Explain each and fix it.
+
+**A strong answer:**
+- sees the laptops silently truncated, while vLLM rejects prompts over `--max-model-len`: set it from
+  measured prompt tokens and compact the transcript;
+- enables `--enable-auto-tool-choice` with that family's parser;
+- checks queue and preemptions against `--max-num-seqs` and KV-cache size, and enables prefix caching for
+  the shared system prompt and tool schemas.
+
 ## Use cases & projects
 ### Use cases
-- **Offline development.** Engineers build and debug agents on laptops against Ollama, with no API keys or
-  per-token cost.
+- **Offline development.** Agents built on laptops against Ollama, with no API keys or per-token cost.
 - **Air-gapped and on-premises agents.** llama.cpp or vLLM serve the agent's model inside the customer's
   network.
 - **High-volume SLM steps.** A vLLM server handles classification and extraction calls for many agents,

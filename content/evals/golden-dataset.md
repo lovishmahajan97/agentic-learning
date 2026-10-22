@@ -5,8 +5,13 @@ name: Golden dataset (eval dataset)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - evals/model-evaluation
+  - math-for-ai/statistics-for-evaluation
 related:
   - evals/model-evaluation
   - evals/task-specific-acceptance-criteria
@@ -53,8 +58,8 @@ agreed and authoritative, not perfect or large.
   right" is argued once, during labeling, not in every review. Versioning makes a score reproducible,
   so two prompts, two models or two weeks can be compared. Every production failure becomes an item, so
   the set grows toward failures that actually occur rather than ones imagined up front.
-- **Quality beats size.** A few hundred well-chosen, well-labeled items beat ten thousand scraped ones,
-  provided they are stratified across the cases that matter and kept out of prompts and training data.
+- **Quality beats size,** provided the few hundred items are stratified across the cases that matter
+  and kept out of prompts and training data.
 
 ## How it works
 ### What a record contains
@@ -218,6 +223,11 @@ def split(item: Item) -> str:                       # stable: the same id always
 def stderr(p: float, n: int) -> float:
     return math.sqrt(p * (1 - p) / n)
 
+def fetch_logs(days: int) -> list[dict]:           # stand-in for your trace store: skewed synthetic traffic
+    rng, mix = random.Random(1), ["billing"] * 50 + ["refund"] * 25 + ["shipping"] * 15 + ["cancel"] * 10
+    return [{"id": f"s{i}", "intent": rng.choice(mix), "message": f"msg {i}", "doc_ids": []}
+            for i in range(days * 40)]
+
 items = stratified(fetch_logs(days=30), {"billing": 60, "refund": 60, "shipping": 40, "cancel": 40})
 with open("golden_v3.jsonl", "w") as f:
     for it in items: f.write(json.dumps({**asdict(it), "split": split(it)}) + "\n")
@@ -292,17 +302,19 @@ for delta in (0.05, 0.10):
 
 ## Pitfalls
 - **Label errors in the reference.** Symptom: a pass-rate ceiling below 100% where the "failures" turn
-  out, on inspection, to be correct outputs disagreeing with a wrong label.
+  out, on inspection, to be correct outputs disagreeing with a wrong label. Diagnose: list items every
+  candidate fails and have an SME re-check them. Fix: relabel and bump the version.
 - **A set that is too easy** because it came from happy-path traffic. Symptom: 98% offline while
-  support tickets keep arriving about cases the set never contained.
+  support tickets keep arriving about cases the set never contained. Diagnose: tag recent tickets by
+  slice and compare with per-slice item counts. Fix: quota the missing slices.
 - **Golden items reused as few-shot or fine-tuning data.** Symptom: a jump in offline score with no
-  movement in production metrics.
+  movement in production metrics. Diagnose: grep prompts and training files for golden ids and inputs.
 - **One reference string for an open-ended task.** Symptom: correct, differently worded outputs fail
   exact or overlap matching, and the team "fixes" the prompt to mimic the reference wording.
 - **Never retiring stale items.** Symptom: a stable score that no longer tracks what the system is
   supposed to do, and arguments about whether old failures still count.
 - **No per-slice quotas.** Symptom: a rare but critical intent with three items, so its pass rate swings
-  between 33% and 100% run to run.
+  between 33% and 100% run to run. Diagnose: print per-slice *n* and standard error next to each rate.
 - **Comparing across dataset versions.** A new run on v4 against a baseline scored on v3. Symptom: a
   "regression" or "improvement" that vanishes when the baseline is re-run on the same version.
 - **Tasks without captured tool state.** Symptom: an agent task that passed last month fails today
@@ -317,8 +329,17 @@ for delta in (0.05, 0.10):
   are tight and where production failures appear.
 - **Avoid:** using it for training or few-shot prompting, or letting the people tuning prompts see the
   held-out split.
-- **Interviews:** how you would build one for a given product, how big it must be to detect a given
-  improvement, and how you keep it from leaking into the system under test.
+
+## Exercise
+**Goal:** build a versioned golden set for an agent you have, sized for one decision you actually need
+to make. No solution is given.
+- **Inputs:** 30 days of traces or tickets (or a synthetic stand-in), your intent or tool taxonomy, and
+  the smallest change you need to detect.
+- **Deliver:** `golden_v1.jsonl` with seeds, expected end state, grader spec, slice tags and provenance
+  per task; a hash-based dev/held-out split; a sizing note using a flip rate you measured from two runs.
+- **Acceptance:** a loader validates every record and seeds the sandbox; per-slice *n* meets your
+  sizing note; a second person labels 20 tasks and agrees on at least 18; a leak check finds no golden
+  id in prompts.
 
 ## Role lens
 - **Engineer:** Writes the sampling and split code, keeps the JSONL under version control, and turns
@@ -341,13 +362,6 @@ spec per item instead of exact-match on a reference, split into dev and held-out
 version the result. A few hundred such items will say more than two thousand synthetic ones.
 
 ## Interview questions
-### What makes a dataset "golden", and why not just use production logs?
-- **Golden means agreed and authoritative:** expected outputs signed off by the people who own the task,
-  versioned so a score is reproducible, not a claim that the set is perfect or large.
-- **Raw logs fail as a reference** because they have no labels, their composition shifts week to week,
-  and privacy constraints keep them out of CI.
-- **Logs are still the best source of inputs,** sampled with per-slice quotas and then labeled by SMEs.
-
 ### What goes into a golden item for a tool-calling agent, beyond input and expected answer?
 - **Replayable starting state:** a seed for every backend the tools touch, so the same task runs the
   same way next month.
@@ -417,6 +431,19 @@ version the result. A few hundred such items will say more than two thousand syn
 > Disagreement between qualified experts usually points at the task definition, not the people. A
 > grader cannot be more reliable than its labels, so the guideline must be sharpened, ambiguous items dropped or made multi-answer, and
 > agreement re-measured before the set is used.
+
+## Mastery test
+**Problem:** a legal-intake agent has a 150-task golden set: 120 "contract question" tasks and 30 split
+across "deadline", "conflict check" and "escalate to lawyer". Two runs of the same version flip 20% of
+tasks. Leadership asks whether a new retrieval setup improves the escalation slice by 10 points.
+Can the set answer that, and what do you change?
+
+**A strong answer:**
+- sees escalation has roughly 10 tasks, so its standard error at p = 0.8 is about 12.6 points and nothing under
+  that is detectable;
+- sizes paired runs with d = 0.2 and δ = 0.1: about 157 escalation tasks, not the whole set;
+- sources them from escalation tickets and SME edge cases with seeds, quota per slice, and re-baselines
+  on the new version.
 
 ## Use cases & projects
 ### Use cases

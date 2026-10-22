@@ -5,8 +5,13 @@ name: Tool-call success rate
 kind: metric
 difficulty: core
 est_minutes: 12
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - agents/tool-calling
+  - agent-reliability/tool-adapters-service-interfaces
 related:
   - agent-reliability/task-completion-rate
   - agent-reliability/tool-adapters-service-interfaces
@@ -250,21 +255,22 @@ print(f"need per step for 90% over 20 steps: {per_step_needed(0.90, 20):.4f}")  
   idempotency keys.
 
 ## Pitfalls
-- **Counting HTTP 200 as success.** Symptom: a tool at 99% while the trajectory evals show the model acting
-  on empty or wrong results.
-- **Aggregating across tools.** Symptom: a healthy-looking 96% overall while one critical tool sits at 70%
-  and caps every task that needs it.
-- **Not distinguishing schema-invalid from upstream failures.** Symptom: an infrastructure team paged for a
-  problem caused by a prompt change.
-- **Counting each retry as an independent failure without a per-step view.** Symptom: panic over a 429 storm
-  that the agent is actually surviving.
-- **Ignoring the compounding arithmetic.** Symptom: a team happy with 95% per tool and puzzled that
-  ten-step tasks complete 60% of the time.
-- **Treating denied calls as tool failures.** Symptom: loosening a permission policy to improve a metric
-  that was signalling a model probing beyond its scope.
-- **Returning opaque error strings, then wondering why recovery is low.** Symptom: a model that repeats the
-  identical failing call two or three times before giving up, visible as consecutive identical
-  `invalid_arguments` events within one step.
+- **Counting HTTP 200 as success.** Symptom: a tool at 99% while trajectory evals show the model acting on
+  empty or wrong results. Diagnose: sample 200 responses and check them against the request. Fix: the
+  effective layer (`empty_result`, `not_found`).
+- **Aggregating across tools.** Symptom: 96% overall while one critical tool sits at 70% and caps every
+  task that needs it. Diagnose: break the rate down per tool. Fix: per-tool alerts.
+- **Schema-invalid and upstream failures not separated.** Symptom: infrastructure paged for a problem a
+  prompt change caused. Diagnose: split failures by layer and owner. Fix: route alerts by error class.
+- **Each retry counted as an independent failure, no per-step view.** Symptom: panic over a 429 storm the
+  agent is surviving. Diagnose: compare per-attempt with per-step. Fix: alert on per-step, watch the gap.
+- **Ignoring the compounding arithmetic.** Symptom: 95% per tool and ten-step tasks completing 60% of
+  the time. Fix: derive per-step targets from task step counts.
+- **Denied calls treated as tool failures.** Symptom: a permission policy loosened to improve a metric
+  that was signalling a model probing beyond its scope. Fix: report `denied` separately.
+- **Opaque error strings, then low recovery.** Symptom: the model repeats the identical failing call two
+  or three times. Diagnose: count consecutive identical `invalid_arguments` events within one step. Fix:
+  structured errors naming the field.
 
 ## When to use
 - **Instrument it from the first tool,** because the adapter already sees every outcome and the cost is one
@@ -275,8 +281,18 @@ print(f"need per step for 90% over 20 steps: {per_step_needed(0.90, 20):.4f}")  
 - **Watch** per-attempt and per-step side by side so vendor degradation is visible before it reaches users,
   and add recovery rate after model-visible failures, which tells you whether your error results are good
   enough for the model to act on.
-- **Interviews:** "how do you know your tools work" is answered by the four layers, the taxonomy,
-  attribution to an owner, and the p^n argument that links tool reliability to task completion.
+
+## Exercise
+**Goal:** build a tool-health report for an agent and use it to name the tool that most limits
+completion. No solution is given.
+- **Inputs:** an agent with three or more tools whose adapters emit `tool.call.result` with `tool`,
+  `error_class`, `attempt` and `step_id`; fake tools you can inject faults into.
+- **Constraints:** one shared error taxonomy; retries only for retryable classes.
+- **Deliver:** per-tool, per-layer rates, per-attempt and per-step, recovery rate, and completion
+  conditional on each tool failing, over 30 or more tasks.
+- **Acceptance:** an injected 429 storm drops per-attempt while per-step holds; injected bad arguments
+  land in the well-formed layer; empty results land in the effective layer; your named tool matches the
+  completion drop.
 
 ## Role lens
 - **Engineer:** Emits a classified result event from every adapter, builds the per-tool breakdown, and
@@ -302,14 +318,6 @@ not. The fix follows the class: backoff and idempotent retries for infrastructur
 change for arguments, an index check for empties.
 
 ## Interview questions
-### Why is counting HTTP 200 responses a bad measure of tool success?
-- **It overstates:** a 200 with an empty list, a wrong record or a truncated payload counts as success while
-  the model acts on bad data.
-- **It understates:** a call that succeeded after a retry shows up as failures plus a success, hiding that
-  the step was fine.
-- **It is blind upstream:** schema-invalid and policy-denied calls never reach the service, so a 200-count
-  cannot see model or policy problems.
-
 ### A tool's `invalid_arguments` rate jumped from 1% to 12% right after a deploy. What happened and what do you do?
 - **Likely cause:** the deploy changed the tool's schema or description (a renamed argument, a narrowed
   enum), and the model still emits the shape it learned from prompts and examples.
@@ -363,6 +371,19 @@ change for arguments, an index check for empties.
 > Per-attempt measures tool health, per-step measures what the agent experiences; a widening gap is the
 > early warning that a tool is degrading.
 
+## Mastery test
+**Problem:** a research agent averages 12 steps; completion fell from 81% to 64% over two weeks. The
+dashboard shows overall tool success steady at about 97%. `web_search` is 40% of calls at 99%; `fetch_page`
+is 30% at 98%; `extract_table` is 8% of calls but its per-step rate fell from 97% to 80%. Explain.
+
+**A strong answer:**
+- sees the overall rate hide `extract_table` behind high-volume healthy tools;
+- checks layers: is the drop well-formed (a description change), executed (a vendor) or effective
+  (new page layouts returning empty tables)?
+- joins tool events to outcomes: completion conditional on an `extract_table` failure;
+- notes a tool used once per task caps completion at its own per-step rate (0.80 here);
+- adds a per-tool alert so the next drop is caught in days.
+
 ## Use cases & projects
 ### Use cases
 - **Catching a bad tool-description deploy.** A step change in `invalid_arguments` for one tool right
@@ -381,6 +402,4 @@ change for arguments, an index check for empties.
   `attempt` and `step_id`; inject faults (bad arguments, a 429 storm, empty results) into fake tools; run
   30 tasks; compute per-attempt and per-step success per tool and class, the recovery rate, and completion
   conditional on each tool failing.
-- **Done when:** a table or chart shows each tool's rates by class, the injected 429 storm appears as a
-  per-attempt drop with per-step success held up by retries, and you can name the tool whose failures most
-  reduce completion.
+- **Done when:** the Exercise acceptance checks pass.

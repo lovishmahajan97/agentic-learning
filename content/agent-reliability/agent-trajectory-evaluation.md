@@ -5,8 +5,14 @@ name: Agent trajectory evaluation
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - evals/eval-harness
+  - evals/pass-k
+  - agent-reliability/structured-event-streams
 related:
   - agent-reliability/task-completion-rate
   - agent-reliability/tool-call-success-rate
@@ -41,8 +47,7 @@ over many runs per task, so you learn where and why the agent fails.
 
 ## Why it exists
 - **An agent produces a trajectory, not an output.** Single-turn evaluation compares an output to a
-  reference. An agent produces a plan, a tool call, an observation, a revised plan, another call, and
-  eventually some end state in the world.
+  reference; an agent produces plans, tool calls and observations, then some end state in the world.
 - **The final output may be unobservable or trivial.** "Done, the ticket is created" is not the thing to
   check; the ticket in the ticketing system is.
 - **Same end state, very different paths.** Two trajectories can differ enormously in cost, latency, risk
@@ -281,18 +286,22 @@ failing step and class.
   calibrate on a labelled sample and never let a judge be the only gate on a side-effecting agent.
 
 ## Pitfalls
-- **Scoring the agent's own claim of success.** Symptom: a high eval score and users reporting that "done"
-  tasks were not done.
-- **Exact-matching trajectories against a golden path.** Symptom: a shorter, better trajectory fails the
-  eval and engineers tune prompts to imitate the reference.
-- **Running each task once.** Symptom: a "regression" or "improvement" that disappears on the next run of
-  the same suite.
-- **Ignoring policy violations when the outcome is correct.** Symptom: a release that passes the gate and an
-  incident caused by a forbidden action the eval counted as success.
-- **Evaluating only in simulation.** Symptom: a suite at 95% and a production completion rate of 70%,
-  because real tools time out, paginate and return mess.
-- **No failure taxonomy.** Symptom: a dashboard with a single number that goes down and a team with no idea
-  which prompt, tool or policy to change.
+- **Scoring the agent's own claim of success.** Symptom: a high score while users report "done" tasks
+  not done. Diagnose: sample passing runs and check end state in the system of record. Fix: end-state
+  predicates.
+- **Exact-matching trajectories against a golden path.** Symptom: a shorter, better trajectory fails and
+  engineers tune prompts to imitate the reference. Diagnose: read failing runs whose end state is
+  correct. Fix: ordered-subsequence checks.
+- **Running each task once.** Symptom: a "regression" or "improvement" vanishes on the next run of the
+  same suite. Diagnose: run the unchanged suite twice and compare the gap with your intervals. Fix: N
+  runs per task.
+- **Policy violations ignored when the outcome is correct.** Symptom: the release passes the gate, then
+  a forbidden action causes an incident. Fix: a violation zeroes the run.
+- **Evaluating only in simulation.** Symptom: a suite at 95% and production completion at 70%, because
+  real tools time out, paginate and return mess. Diagnose: compare failure classes between live and
+  simulated tiers. Fix: a live or recorded-production tier.
+- **No failure taxonomy.** Symptom: one number goes down and nobody knows which prompt, tool or policy to
+  change. Fix: label the first failing step and class.
 
 ## When to use
 - **Build the suite** as soon as the agent has more than one tool, and run it on every prompt, tool, model
@@ -302,8 +311,17 @@ failing step and class.
 - **Measure** pass rate with an interval, pass^k for unattended agents, violation count, mean steps and
   cost per successful run, and the failure-class histogram over time.
 - **Daily work:** "why did this get worse" is answered by diffing failure classes between two suite runs.
-- **Interviews:** the expected depth is the distinction between outcome, process and policy scores, and
-  why pass^k, not pass@k, is the number for an autonomous agent.
+
+## Exercise
+**Goal:** build a trajectory eval suite for a small tool-calling agent and use it to decide one change.
+No solution is given.
+- **Inputs:** an agent with three to five tools against fake tools with resettable state, and 10-20
+  tasks you write (initial state, goal, success predicate, required order, forbidden tools).
+- **Deliver:** outcome, process and policy scorers; 5 runs per task; a per-task table; a failure-class
+  histogram; one prompt or tool-description change judged by the suite.
+- **Acceptance:** a scripted forbidden-path run that reaches the right end state scores as failure; a
+  scripted shorter valid path passes; pass rate carries an interval; your verdict on the change cites
+  pass^3 and the class that moved.
 
 ## Role lens
 - **Engineer:** Builds the harness that records trajectories, writes scorers over the event stream, and
@@ -329,13 +347,6 @@ decision is about the specific failures, not a single number. Then ship against 
 figures.
 
 ## Interview questions
-### What does trajectory evaluation catch that final-answer evaluation misses?
-- **Unacceptable paths to a correct answer:** a forbidden `delete` followed by a recreate scores as success
-  on outcome alone.
-- **Cost and risk:** forty steps instead of four, redundant calls and budget violations are invisible in the
-  final text.
-- **Where it broke:** labelling the first failing step and its class turns a 0 into a fix.
-
 ### Design an eval for a refund agent that talks to users and calls an orders API.
 - **Environment:** simulated orders API with resettable state, and an LLM-simulated user with a scripted
   goal and persona.
@@ -391,6 +402,18 @@ figures.
 > Many trajectories are valid; the subsequence check encodes the constraints that matter (lookup before
 > refund) without penalizing a shorter or different path.
 
+## Mastery test
+**Problem:** a travel-booking agent moves to a new model. On 40 tasks × 5 runs, pass rate rises from
+78% to 83%, mean steps fall from 14 to 9, and policy violations go from 0 to 2 runs, both booking
+without the user's confirmation. The LLM judge rates the new transcripts "more helpful". Ship it?
+
+**A strong answer:**
+- blocks the release: a violation zeroes the run, so the 2 runs are failures and the gate requires zero;
+- notes a 5-point gain on 200 runs is inside the noise, so it needs per-task pass^k and an interval;
+- reads the fewer steps as possibly the skipped confirmation, not efficiency, and checks the order;
+- discounts the judge, which cannot see side effects and favours shorter transcripts;
+- fixes with a confirmation gate or required-order check, then reruns.
+
 ## Use cases & projects
 ### Use cases
 - **Release gates for agent changes.** Outcome and policy over N runs per task, with pass^3 and zero
@@ -405,10 +428,7 @@ figures.
 ### Mini project
 **Trajectory eval suite for a small refund agent (2-3 hours).**
 - **Goal:** score a tool-calling agent on outcome, process and policy, not on its final message.
-- **Steps:** write 10 tasks with initial state, goal, success predicate and required actions (for example
-  `lookup_order` before `refund`); run each task 5 times against fake tools; implement outcome,
-  ordered-subsequence, redundant-call and forbidden-tool scorers; compute per-run pass rate and pass^3
-  per task; label the first failing step of each failure; add one scripted trajectory that reaches the
-  right end state through a forbidden `delete_order` call.
-- **Done when:** you have a per-task table with pass rate and pass^3, a failure-class histogram, and the
-  scripted forbidden-path run passes a final-answer check but fails your policy check.
+- **Steps:** the Exercise with 10 tasks (for example `lookup_order` before `refund`), 5 runs each, and
+  the scripted forbidden path being a `delete_order` call; label each failure's first failing step.
+- **Done when:** the scripted forbidden-path run passes a final-answer check but fails your policy
+  check, and you have the per-task table and histogram.

@@ -5,8 +5,13 @@ name: Deterministic replay & reproducibility
 kind: concept
 difficulty: advanced
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - agent-reliability/structured-event-streams
+  - model-internals/sampling-strategies
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/structured-event-streams
@@ -42,8 +47,7 @@ replay always available.
 
 ## Why it exists
 - **The failure you cannot see.** A run fails at 03:00: the agent called the wrong tool at step 7 and
-  corrupted a record. The engineer reruns the task in the morning and it works. There is no bug to fix
-  because there is no failure to look at.
+  corrupted a record. The morning rerun works, so there is no failure to look at.
 - **Several links in the chain are not functions of their inputs:** the model's sampled output, the
   provider's silently updated weights or serving stack, a tool returning today's data instead of last
   night's, the clock, the random id generator. Each decision is conditioned on everything before it, so
@@ -290,22 +294,24 @@ print(runs_per_arm(0.10, 0.08))   # 3213
   the cost to the divergent tail.
 
 ## Pitfalls
-- **Believing temperature 0 means deterministic.** Symptom: a "reproduction" that diverges at step 3 with no
-  code change and a team debugging a phantom.
-- **Recording the prompt template name but not its exact text or hash.** Symptom: a replay that silently
-  uses today's template and produces a different trajectory from the incident's.
-- **Calling the model inside orchestration without the effect interface,** for example a helper that "just
-  summarizes" tool output. Symptom: a non-determinism error on replay pointing at a step that looks pure.
-- **Replaying an old recording on changed code without a version check.** Symptom: a mismatched response
-  served to a different request, producing a run that never happened.
-- **Treating a single successful rerun as proof a bug is fixed.** Symptom: the bug returns in production at
-  roughly its old rate.
-- **Tools with live side effects running during replay.** Symptom: the incident reproduction creates a
-  second real ticket.
-- **Replaying parallel tool calls by arrival position.** Symptom: non-determinism errors only on runs with
-  parallel calls, vanishing when the same task runs sequentially.
-- **Recordings under no retention policy.** Symptom: a data-protection deletion request that cannot be
-  honoured because customer content sits in years of replay logs.
+- **Believing temperature 0 means deterministic.** Symptom: a "reproduction" diverges at step 3 with no
+  code change. Diagnose: rerun the same request N times and diff outputs. Fix: replay the recording.
+- **The prompt template name recorded, not its text or hash.** Symptom: replay silently uses today's
+  template and a different trajectory. Diagnose: compare the recorded prompt hash with today's. Fix:
+  record the hash.
+- **The model called inside orchestration without the effect interface,** for example a helper that
+  "just summarizes" tool output. Symptom: a non-determinism error at a step that looks pure. Diagnose:
+  read the error's effect index against the recording. Fix: route it through `do`.
+- **Old recordings replayed on changed code without a version check.** Symptom: a mismatched response
+  served to a different request, a run that never happened. Fix: stamp and check the code version.
+- **One successful rerun treated as proof of a fix.** Symptom: the bug returns at roughly its old rate.
+  Diagnose: compute runs per arm for the claimed change. Fix: the statistical grade.
+- **Live side-effecting tools during replay.** Symptom: the reproduction creates a second real ticket.
+  Fix: fake or sandboxed tools in replay and forks.
+- **Parallel tool calls replayed by arrival position.** Symptom: non-determinism errors only on runs with
+  parallel calls. Fix: key by `(step, call_id)`.
+- **Recordings under no retention policy.** Symptom: a deletion request cannot be honoured because
+  customer content sits in years of replay logs. Fix: payloads by reference with retention.
 
 ## When to use
 - **Record every production run by default;** the event stream you already keep for resumption and audit
@@ -315,8 +321,17 @@ print(runs_per_arm(0.10, 0.08))   # 3213
 - **Measure** replay coverage (fraction of runs that replay without a non-determinism error), the
   divergence rate of best-effort re-execution, and the run count needed to detect the improvement you care
   about.
-- **Interviews:** the strong answer distinguishes the three grades and explains why orchestration must be
-  pure.
+
+## Exercise
+**Goal:** make one tool-calling agent fully replayable and use a fork to test a fix. No solution is
+given; the `Effects` class above is a sequential sketch, and your version must handle parallel calls.
+- **Inputs:** any agent loop with at least one parallel tool step; fake or sandboxed tools only.
+- **Constraints:** LLM, tools, clock and random go through one interface keyed by `(step, call_id)`;
+  each recording carries the code version.
+- **Deliver:** record, replay and fork modes, plus a CI test replaying ten recordings.
+- **Acceptance:** replay makes zero live calls and reproduces each trajectory; shuffling parallel
+  completion order still replays; changing prompt assembly raises a non-determinism error; a fork at
+  step *k* runs only steps after *k* live.
 
 ## Role lens
 - **Engineer:** Routes every LLM, tool, clock and random call through one effect interface and keeps
@@ -342,14 +357,6 @@ baseline with a confidence interval. Finally, record the code version with the f
 this recording warn that it predates the change.
 
 ## Interview questions
-### Why must orchestration code be deterministic for replay to work?
-- **Replay re-executes the orchestrator** and serves effects from the recording; it only reproduces the run
-  if the orchestrator issues exactly the same requests in the same order.
-- **Hidden non-determinism breaks that:** a direct `datetime.now()`, a `uuid4()` in an argument or an
-  unrecorded model call changes a request hash and the replay diverges.
-- **So the rule is:** orchestration is a pure function of recorded history, and every effect goes through
-  one interface.
-
 ### Replay works for sequential runs but fails with non-determinism errors on runs with parallel tool calls. Why?
 - **Position matching:** the replayer serves "the nth effect", but parallel results arrive in a different
   order each run, so the nth request no longer matches the nth recording.
@@ -400,6 +407,20 @@ this recording warn that it predates the change.
 > Replay reproduces the past and a single rerun is one sample from a stochastic process; only repeated
 > runs measure a change in rate.
 
+## Mastery test
+**Problem:** after a weekend deploy, 30% of in-flight runs fail on resume with non-determinism errors,
+all at the step after the last checkpoint. The diff changed a helper that builds a request id from
+`uuid4()` and reordered two tool calls. Replay of last week's recordings in CI passed. What happened,
+and what do you change?
+
+**A strong answer:**
+- explains that resume replays history through new code, so both the id and the reordering change
+  request hashes;
+- spots the CI gap: no recording exercised the changed path, so the replay sample needs coverage of
+  every step type;
+- routes `uuid4()` through the effect interface and versions the orchestrator;
+- lets old runs finish on the old version (or a version branch) instead of mixing code.
+
 ## Use cases & projects
 ### Use cases
 - **Debugging a production incident.** Replay the recorded run step by step and inspect the exact
@@ -418,6 +439,5 @@ this recording warn that it predates the change.
   interface keyed by `(step, call_id)`; record a run that makes a mistake; replay it offline; change how
   the prompt is assembled (so a request hash changes) and confirm replay refuses; fork at the step before
   the mistake with a fixed prompt and fake side-effecting tools.
-- **Done when:** replay reproduces the run with zero live calls, the prompt change raises a
-  non-determinism error, and 20 forks show how often the fixed decision now appears (a smoke check; proving
-  a rate change needs the N from the sample-size formula).
+- **Done when:** the Exercise acceptance checks pass, and 20 forks show how often the fixed decision now
+  appears (a smoke check; proving a rate change needs the N from the sample-size formula).

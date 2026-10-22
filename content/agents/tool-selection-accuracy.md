@@ -5,8 +5,14 @@ name: Tool selection accuracy
 kind: metric
 difficulty: core
 est_minutes: 12
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: partial
+prerequisites:
+  - agents/tool-calling
+  - evals/golden-dataset
+  - math-for-ai/statistics-for-evaluation
 related:
   - agents/tool-calling
   - agents/tool-schemas-and-argument-validation
@@ -48,8 +54,8 @@ because it isolates the decision made every step.
 - **Reading a few transcripts is not a substitute.** It is slow, biased toward the cases you happened to
   look at, and useless for catching a regression after a model upgrade or a description edit.
 - **The metric moves when the tool surface changes and stays still when it does not,** which is what safe
-  iteration needs. A wrong selection wastes a step at best and causes a wrong side effect at worst.
-- **It is cheap:** the decision is made in the model's first response, so no tool has to execute to score it.
+  iteration needs. A wrong selection wastes a step at best and causes a wrong side effect at worst. It is
+  scored on the first response, so no tool executes.
 
 ## How it works
 ### Decompose the decision
@@ -98,8 +104,9 @@ At each step the model makes three choices, each with its own metric:
 ### What moves the number
 - **Trigger conditions in descriptions.** "Call this when the user asks about an order's status; do not use
   it for returns" is usually the highest-leverage single edit for recall and confusion.
-- **Re-validate eagerness per model.** How eagerly a model reaches for tools differs between families and
-  versions (some under-call, some over-call), so "call when" language must be re-checked on every model change.
+- **Re-validate per model.** Selection is learned behaviour: eagerness differs between families and
+  versions (some under-call, some over-call), so re-run the eval on every model change and treat a
+  should-call shift as expected, not a bug in your code.
 - **Fewer, more distinct tools.** Merge overlapping tools behind an enum parameter, split a do-anything tool
   whose `mode` parameter is really five tools, and use names that read as verbs on nouns.
 - **Fewer tools in context.** Beyond a few dozen tools (the threshold is model-dependent and illustrative)
@@ -107,11 +114,6 @@ At each step the model makes three choices, each with its own metric:
   dynamic registration when the task calls for them.
 - **Better parameter descriptions and enums** move argument accuracy specifically.
 - **System prompt guidance** about when to act versus answer moves should-call precision and recall.
-
-### Model dependence
-- **Selection is learned behaviour,** so the same tool definitions score differently on different models and
-  versions.
-- **Re-run the eval on every model change** and treat a should-call shift as expected, not a bug in your code.
 
 ## Diagram
 Each labelled case is scored at the first decision it fails, which is what turns one headline number into
@@ -140,6 +142,7 @@ confusion map that also records missed and unnecessary calls.
 It uses the production `TOOLS` and `SYSTEM` and never executes a tool, so it is safe to run in CI.
 
 ```python
+# Needs an API key and your SYSTEM and TOOLS; scoring checked with anthropic 2.1.0 and scripted replies.
 import anthropic
 from collections import Counter
 
@@ -223,8 +226,8 @@ print(f"6 vs 3 flips:  p = {discordant_p(6, 3):.3f}")    # 0.508 -> noise
 - **Refresh the golden set from traffic.** Monthly or after a launch; sample new production turns, label
   expected tool and key arguments, and add them, keeping them out of description few-shot examples. Monitor
   the share of cases from the last quarter.
-- **One description edit per change.** When tuning; edit one description, rerun, compare the confusion matrix,
-  then move on. Monitor which pair each edit was aimed at and whether it moved.
+- **One description edit per change.** When tuning; edit, rerun, compare the confusion matrix. Monitor
+  whether the targeted pair moved.
 - **Cap tools per agent and defer the rest.** For large catalogues; set a maximum based on measured accuracy
   and expose the rest through tool search or dynamic registration. Monitor accuracy on deferred tools
   separately, since discovery adds a step.
@@ -242,19 +245,23 @@ print(f"6 vs 3 flips:  p = {discordant_p(6, 3):.3f}")    # 0.508 -> noise
   or normalized matching for ids, enums and dates and reserve the judge for queries.
 
 ## Pitfalls
-- **Measuring only task success.** Symptom: a selection regression stays invisible until many tasks fail and
-  the cause must be reconstructed from transcripts. Fix: score selection separately.
+- **Measuring only task success.** Symptom: a selection regression stays invisible until many tasks fail.
+  Diagnose: replay failed runs' first decision points as selection cases and see which component fails.
+  Fix: score selection separately.
 - **Writing eval cases from the examples in the descriptions.** Symptom: a perfect eval score and the old
-  failures in production. Fix: cases from real traffic, held out.
-- **Omitting `none` cases.** Symptom: an agent that calls tools for greetings and small talk, and a bill that
-  grows faster than usage. Fix: include them at their real proportion.
-- **Changing several descriptions in one commit.** Symptom: a moved number with no way to know which edit
-  moved it or whether another edit cancelled a gain. Fix: one edit per change.
-- **Skipping the eval on a model upgrade.** Symptom: a drop in should-call rate with no code change and a week
-  looking for the bug in the wrong place. Fix: model id changes trigger the eval.
+  failures in production. Diagnose: string-match cases against description text and few-shot examples.
+  Fix: cases from real traffic, held out.
+- **Omitting `none` cases.** Symptom: tool calls on greetings and small talk, and a bill growing faster
+  than usage. Diagnose: tool calls per turn on conversational turns in traces. Fix: include them at their
+  real proportion.
+- **Several description edits in one commit.** Symptom: a moved number nobody can attribute. Fix: one
+  edit per change.
+- **Skipping the eval on a model upgrade.** Symptom: a should-call drop with no code change and a week
+  hunting the bug in the wrong place. Diagnose: line the calls-per-turn dashboard up against model-id
+  changes. Fix: model id changes trigger the eval.
 
 ## When to use
-- **Instrument it** as soon as an agent has more than two or three tools, and run it on every change to
+- **Instrument it** once an agent has more than two or three tools, and run it on every change to
   descriptions, the tool list, the system prompt or the model.
 - **Use the decomposition to decide what to edit:** low recall means trigger conditions and system prompt;
   confusion between a pair means those two descriptions; low argument accuracy means parameter descriptions
@@ -262,8 +269,18 @@ print(f"6 vs 3 flips:  p = {discordant_p(6, 3):.3f}")    # 0.508 -> noise
 - **Avoid** chasing the last few points on a small eval; label more cases instead.
 - **Measure in production** the ratio of tool calls to turns and the schema-validation failure rate, cheap
   proxies that need no labels.
-- **Interviews:** "how do you know your tool descriptions are good" is common; the expected answer is a
-  labelled set, the three-way decomposition and a confusion matrix, not "we read transcripts".
+- **Interviews:** "how do you know your tool descriptions are good" wants a labelled set, the
+  decomposition and a confusion matrix, not "we read transcripts".
+
+## Exercise
+**Goal:** build the CI gate that decides whether a selection change ships. No solution is given.
+- **Inputs:** baseline and candidate JSONL files of per-case outcomes (case id, expected tool, chosen
+  tool, argument match), three repeats per case; generate synthetic ones first.
+- **Deliver:** a script printing the decomposed scores, the confusion-pair diff and the paired
+  discordant counts with a sign-test p-value, exiting non-zero on a significant regression.
+- **Acceptance:** a synthetic 14-to-3 regression fails the gate and a 6-to-3 one passes; the diff names
+  the pair you planted; a case that flips between repeats is reported as unstable, not counted as a
+  regression.
 
 ## Role lens
 - **Engineer:** Maintains the labelled case set, runs the selection eval in CI, and edits one
@@ -346,6 +363,17 @@ every message. In production, confirm by tracking the share of delivery-date ans
 - [ ] To test the fallback model
 > Without `none` cases an agent that calls a tool on every turn scores perfectly on recall while wasting
 > cost and latency; the `none` cases are what expose over-calling.
+
+## Mastery test
+**Problem:** on a model upgrade, 300 cases: should-call recall 91% to 84%, precision 88% to 96%, name
+accuracy flat. Paired: 25 cases went pass to fail, 6 fail to pass. Product says ship, precision rose.
+Your call?
+
+**A strong answer:**
+- the change is real (sign test on 25 vs 6 gives p below 0.001), and the new model under-calls;
+- reads the `(tool, None)` confusions: misses on must-look-up tools (balances, delivery dates) mean
+  invented facts, which precision cannot offset;
+- blocks, retunes trigger conditions for this model, reruns; lower recall is acceptable only on write tools.
 
 ## Use cases & projects
 ### Use cases

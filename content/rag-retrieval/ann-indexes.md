@@ -5,8 +5,12 @@ name: ANN indexes (HNSW, IVF)
 kind: concept
 difficulty: core
 est_minutes: 19
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: evaluate
+code_tested: partial
+prerequisites:
+  - rag-retrieval/similarity-search
 related:
   - rag-retrieval/similarity-search
   - rag-retrieval/vector-databases
@@ -308,15 +312,16 @@ the graph, is what makes the corpus fit.
 
 ## Pitfalls
 - **Trusting the vendor's benchmark recall.** Symptom: works in demos, misses obvious documents in
-  production, because your embeddings and filters are not theirs. Fix: measure against a brute-force scan
-  on your data.
+  production, because your embeddings and filters are not theirs. Diagnose: overlap of the ANN top 10
+  with a brute-force top 10 on sampled real queries. Fix: tune the knob on your data.
 - **Selective filter plus HNSW.** Symptom: fewer than k results, or results that ignore the filter, and an
-  agent that claims it has no memory of something the user told it. Fix is engine-specific (filtered
-  traversal, pre-filtering, partitioned indexes); check before shipping.
-- **Heavy churn without rebuilding.** Tombstones accumulate, recall drifts down and memory never shrinks,
-  visible as slowly rising latency for the same `efSearch`.
+  agent that claims it has no memory of something the user told it. Diagnose: log returned rows vs
+  `LIMIT` per filter value. Fix is engine-specific (filtered traversal, pre-filtering, partitioned indexes).
+- **Heavy churn without rebuilding.** Tombstones accumulate, recall drifts down and memory never shrinks.
+  Diagnose: slowly rising latency at the same `efSearch` and a growing deleted-row fraction. Fix: rebuild.
 - **Training IVF on a non-representative sample** (say, only English before a multilingual launch).
-  Symptom: good recall on old content, poor on new content at identical settings.
+  Symptom: good recall on old content, poor on new at identical settings. Diagnose: measure recall
+  separately by content cohort. Fix: re-train on a current sample.
 - **`efSearch` below k.** Some libraries silently clamp, others return fewer results than requested;
   either way recall numbers look wrong for no visible reason.
 
@@ -332,8 +337,16 @@ the graph, is what makes the corpus fit.
   mostly reflects the embedding model; 0.99 ANN recall cannot rescue a model that ranks the wrong chunk first.
 - **Configure, do not hard-code,** the search knob, because the right operating point changes with
   traffic and content.
-- **Interviews:** explain the greedy walk, why ef and nprobe exist, and what happens under a restrictive
-  filter.
+
+## Exercise
+**Goal:** choose and defend an index configuration for a filtered agent memory store, with measured
+evidence. No solution is given.
+- **Inputs:** 200k+ real or public embeddings (not random Gaussians), a synthetic `user_id` giving most
+  users 100-1,000 rows, and 200 held-out queries; FAISS, pgvector or Qdrant.
+- **Deliver:** recall@10 against brute force and p95 single-query latency for HNSW at three `efSearch`
+  values and IVF at three `nprobe` values, unfiltered and filtered to one user; RAM per index.
+- **Acceptance:** the chosen setting meets recall@10 of at least 0.95 filtered and unfiltered; no
+  filtered query returns fewer than 10 rows when the user has 10; latency is single-query, not batched.
 
 ## Role lens
 - **Engineer:** Picks index type and parameters, writes the recall-versus-latency sweep, and tunes
@@ -395,12 +408,6 @@ configuration, not on a full-precision prototype.
   invisible and costs roughly linear latency, paid on every one of the agent's searches.
 - **Keep it in config** and set it per query (`SET LOCAL hnsw.ef_search`), always at least k.
 
-### How much memory does HNSW need for 10 million 768-dimensional vectors?
-- **Vectors dominate:** 3,072 bytes each in fp32, about 30.7 GB in total.
-- **Graph links add little:** roughly 2M 4-byte ids at layer 0, about 128 bytes per node at M = 16, so
-  around 32 GB overall, and it must all be in RAM because traversal is random access.
-- **To fit a 16 GB node**, shrink the vectors (int8 or PQ), not the graph.
-
 ## Quiz
 ### Q: In HNSW, what does raising `efSearch` do, and why does it help recall?
 - [ ] It adds more links per node, so the graph becomes denser at query time
@@ -429,6 +436,18 @@ configuration, not on a full-precision prototype.
 > ones, and a fixed-size candidate list runs dry. Engines address this with filtered traversal,
 > pre-filtering to an id set with a brute-force fallback, or partitioned indexes; k-means is an IVF
 > concept, not HNSW.
+
+## Mastery test
+**Problem:** a legal-research agent searches 400 million 384-dim fp32 chunks on GPUs with 80 GB each.
+Matters are loaded nightly in bulk; each query filters to one client, and clients range from 2,000 to
+40 million chunks. Pick an index design and say what you would measure.
+
+**A strong answer:**
+- sizes the raw vectors at about 600 GB, so full-precision in-RAM HNSW needs many GPUs, while IVF-PQ at
+  tens of bytes per vector fits;
+- matches nightly bulk loads to IVF re-training and adds exact re-ranking of a few hundred PQ candidates;
+- handles the filter by size: exact scan for small clients, partitions for the largest;
+- sweeps `nprobe` on the final quantized setup and tracks result shortfall per client.
 
 ## Use cases & projects
 ### Use cases

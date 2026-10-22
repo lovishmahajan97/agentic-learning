@@ -5,8 +5,14 @@ name: Tool calling and structured output with SLMs
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: partial
+prerequisites:
+  - agents/tool-calling
+  - prompting/structured-outputs-json-mode
+  - slm-for-agents/running-slms-locally
 related:
   - agents/tool-calling
   - prompting/structured-outputs-json-mode
@@ -30,13 +36,13 @@ schemas, and escalation to a larger model when validation still fails.
 
 ## For agent builders
 - **Why it matters for agents.** Every tool call is structured output: a tool name plus arguments that must
-  parse and validate. A 3B-8B model that is 95% right per call fails roughly one task in four over six calls.
+  parse and validate, so per-call errors of a 3B-8B model compound across a task.
 - **Where it shows up in your stack.** Ollama's `tools` and `format`, llama.cpp's `--jinja` and JSON-schema
   grammars, vLLM's tool parsers and structured outputs, and Pydantic or Instructor on the client side.
 - **What you control.** How many tools the model sees, the schema shape, whether decoding is constrained,
   the validator, the retry budget and the fallback model.
-- **What you can skip.** How grammar engines compile schemas into token masks; that is in
-  `serving-inference/structured-constrained-generation`. Here you apply them to SLM agents.
+- **What you can skip.** How grammars compile into token masks
+  (`serving-inference/structured-constrained-generation`); here you apply them.
 
 ## Why it exists
 - **SLMs drift from formats.** Missing braces, extra prose around JSON, or tool calls written as text in
@@ -103,6 +109,7 @@ flowchart TD
 Ollama's `format` takes a JSON schema and constrains decoding to it; Pydantic then checks meaning.
 
 ```python
+# Checked with the ollama Python client 0.6 and Pydantic 2.14 on Python 3.12 (`X | None` needs 3.10+).
 from typing import Literal
 from pydantic import BaseModel, Field, ValidationError
 import ollama
@@ -134,14 +141,24 @@ JSON-schema `response_format` on an OpenAI-compatible server; support varies by 
 check its docs.
 
 ```python
-import json
+# Checked with openai 3.36 (Python SDK) on Python 3.12.
+import json, re
 from openai import OpenAI
 
 slm, big = OpenAI(base_url="http://localhost:8000/v1", api_key="x"), OpenAI()
-TOOLS = {"lookup_order": {...}, "cancel_order": {...}, "update_address": {...}}  # fill: name -> JSON schema
+ORDER = {"type": "string", "pattern": r"^ORD-\d{6}$"}
+TOOLS = {   # name -> flat JSON schema for its arguments
+    "lookup_order": {"type": "object", "required": ["order_id"], "properties": {"order_id": ORDER}},
+    "cancel_order": {"type": "object", "required": ["order_id", "reason"], "properties": {
+        "order_id": ORDER, "reason": {"type": "string", "enum": ["changed_mind", "late", "other"]}}},
+    "update_address": {"type": "object", "required": ["order_id", "postcode"], "properties": {
+        "order_id": ORDER, "postcode": {"type": "string"}}},
+}
+KNOWN_ORDERS = {"ORD-123456"}                        # stand-in for your order database
 
-def validate_against_backend(tool, args):            # stub: raise if IDs are unknown or not permitted
-    ...
+def validate_against_backend(tool, args):            # raise if IDs are unknown or not permitted
+    if not re.fullmatch(r"ORD-\d{6}", args.get("order_id", "")) or args["order_id"] not in KNOWN_ORDERS:
+        raise ValueError(f"unknown order for {tool}: {args.get('order_id')}")
 
 def ask(client, model, prompt, schema):
     r = client.chat.completions.create(model=model, temperature=0,
@@ -161,6 +178,8 @@ def plan_call(request, model="Qwen/Qwen2.5-7B-Instruct"):
         args = ask(big, "YOUR_LARGE_MODEL", prompt, TOOLS[tool])
         validate_against_backend(tool, args)         # escalated output is checked too
     return tool, args
+
+print(plan_call("Where is my order ORD-123456?"))
 ```
 
 ### Worked scenario: making a 3B agent reliable
@@ -177,36 +196,39 @@ Constrained decoding alone fixed syntax but barely moved task success; tool narr
 most of the work.
 
 ## Production patterns
-- **Constrain everything the code parses.** Turn on JSON-schema or grammar decoding for every SLM call whose
-  output is parsed, via Ollama `format`, llama.cpp JSON schema or vLLM structured outputs. Monitor
-  invalid-output rate; it should be near zero, so any rise means a config regression.
+- **Constrain everything the code parses.** Use Ollama `format`, llama.cpp JSON schema or vLLM structured
+  outputs on every parsed SLM call. Invalid-output rate should be near zero, so any rise means a config
+  regression.
 - **Validate against reality, not just the schema.** After Pydantic, check IDs exist, amounts are within
   limits and the user may act, before executing. Log rejected calls with the input for the eval set.
 - **Budget retries and escalate.** Allow one or two retries with the validation error, then call a larger
   model. Alert when the escalation rate per tool passes the level priced into the cost model.
-- **Narrow tools per step.** Use a router or embedding retrieval to show the SLM only the few tools relevant to
-  the current step. Track correct-tool rate per step in traces.
+- **Narrow tools per step.** A router or embedding retrieval shows the SLM only the relevant few; track
+  correct-tool rate per step in traces.
 - **Gate changes on a tool-call golden set.** Re-run valid-call, correct-tool and argument-accuracy metrics
   when changing model, quantization, template, engine version or tool schemas.
 
 ## Trade-offs
 - **Constrained decoding vs reasoning quality.** It guarantees syntax, but forcing JSON from the first token can
   reduce answer quality on harder steps. Add a short reasoning field first, or reason in a separate call.
-- **Retries vs latency.** Each retry adds a full SLM call; one retry usually fixes most errors, more rarely pay.
+- **Retries vs latency.** Each retry is a full SLM call; one usually fixes most errors, more rarely pay.
 - **Two-stage calling vs call count.** Splitting tool choice and arguments improves accuracy but doubles calls
   for that step; it pays off with many tools, not with two.
 - **Escalation vs privacy.** Falling back to a hosted large model rescues hard cases but sends that data out;
   for private data, escalate to a larger self-hosted model or to a human instead.
 
 ## Pitfalls
-- **Trusting syntax as correctness.** Symptom: perfectly formatted calls with invented order IDs. Fix:
-  business validation against real data before execution.
-- **Exposing every tool every step.** Symptom: the SLM calls plausible but wrong tools. Fix: route or
-  retrieve a small tool subset per step.
-- **Mismatched template or parser.** Symptom: tool calls arrive as text in `content`. Fix: correct chat
-  template (`--jinja` in llama.cpp), matching vLLM parser, or a model whose template supports tools.
-- **Deeply nested schemas.** Symptom: missing inner fields and wrong array shapes. Fix: flatten, split into
-  several calls, or let code assemble the nested structure from flat fields.
+- **Trusting syntax as correctness.** Symptom: perfectly formatted calls with invented order IDs. Diagnose:
+  check each argument of failed calls against the backend and count valid-but-wrong calls. Fix: business
+  validation against real data before execution.
+- **Exposing every tool every step.** Symptom: the SLM calls plausible but wrong tools. Diagnose: build an
+  expected-versus-chosen tool table on the golden set. Fix: route or retrieve a small tool subset per step.
+- **Mismatched template or parser.** Symptom: tool calls arrive as text in `content`. Diagnose: log raw
+  `content` and `tool_calls` with the engine flags. Fix: `--jinja` in llama.cpp, the matching vLLM parser, a
+  model whose template supports tools, or meanwhile constrained JSON with your own tool-call schema.
+- **Deeply nested schemas.** Symptom: missing inner fields and wrong array shapes. Diagnose: group
+  validation errors by field path. Fix: flatten, split into several calls, or let code assemble the nested
+  structure.
 
 ## When to use
 - **Use when** an SLM produces anything code consumes: tool calls, extraction results, routing labels,
@@ -214,8 +236,16 @@ most of the work.
 - **Avoid when** the output is free text for a human; constraining it adds nothing and may hurt quality.
 - **Measure** valid-output rate, correct-tool rate, argument accuracy, retry rate and escalation rate per
   step.
-- **Interviews:** expect "how would you make a small model call tools reliably?" and the distinction between
-  syntax guarantees and correctness.
+
+## Exercise
+**Goal:** build a validate, retry and escalate wrapper for one SLM tool step that never executes a bad
+call. No solution is given.
+- **Inputs:** a local 1B-4B instruct model, three tools with flat schemas, and 40 golden requests, 10 of
+  them adversarial: unknown IDs, missing values, requests no tool handles.
+- **Deliver:** a function returning the tool, its arguments and the path taken (first try, retry, escalated,
+  rejected), logging every validation error.
+- **Acceptance:** no unknown ID is ever executed; a request missing a required value ends in escalation or a
+  clarifying question, never an invented value; you report the rate of each path and the retry fix rate.
 
 ## Role lens
 - **Engineer:** Turns on constrained decoding, writes Pydantic models and business validators, and wires the
@@ -244,16 +274,9 @@ consider fine-tuning on logged tool calls if the gap persists.
   separate call.
 
 ### How would you design tools for an agent that runs on a 3B model?
-- **Few tools per step:** a router or retrieval shows 1-5 relevant tools, since selection accuracy falls as
-  the list grows.
-- **Simple schemas:** flat objects, enums, short descriptions, one or two examples in the prompt.
+- **Few tools, simple schemas:** a router shows 1-5 relevant tools; flat objects, enums, short
+  descriptions and one or two examples.
 - **Safety net:** constrained decoding, Pydantic and business checks, one retry, then escalation.
-
-### Your local model returns tool calls inside the text content instead of `tool_calls`. What is wrong?
-- **Template or parser:** the engine is not applying the model's tool template or not parsing its output.
-  Use `--jinja` in llama.cpp or the matching vLLM tool parser.
-- **Model support:** the model may not be trained for tools; check the model card or choose another.
-- **Interim fix:** constrained JSON output with your own tool-call schema, then validate.
 
 ### How do you decide between retrying the SLM and escalating to a large model?
 - **Retry when** the error is specific and fixable, such as a wrong enum or a missing field; one retry with
@@ -292,6 +315,17 @@ consider fine-tuning on logged tool calls if the gap persists.
 - [ ] Because constrained decoding lowers it further
 > Independent per-call success multiplies across the steps of a task, so 0.95 to the 6th power is about
 > 0.74. Validation, retries and escalation raise per-call reliability to make long tasks viable.
+
+## Mastery test
+**Problem:** an offline phone assistant uses a 1.5B model to fill `create_event` with nested attendees
+(name, email), start, end and a recurrence object. Constrained decoding gives 100% valid JSON, yet 20% of
+events have wrong times or missing attendees, and there is no network to escalate. What do you change?
+
+**A strong answer:**
+- names it as meaning, not syntax: add checks such as end after start, a timezone, attendees in contacts;
+- flattens: attendees chosen from an enum of contacts, times as separate fields, code builds the nested
+  object and resolves the timezone;
+- retries once with the error, then asks the user to confirm, and tracks per-field accuracy.
 
 ## Use cases & projects
 ### Use cases

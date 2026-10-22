@@ -5,8 +5,14 @@ name: State machines
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - agents/agent-loop
+  - agents/tool-calling
+  - agent-reliability/idempotent-tool-execution
 related:
   - agents/agent-loop
   - agents/workflows-vs-agents
@@ -45,14 +51,14 @@ tests pass" hold, and (state, data) can be checkpointed and resumed.
 - **Prompt rules are preferences, not rules.** "Always run tests before deploying" in the prompt is
   something the model weighs; nothing enforces it.
 - **Formlessness breaks recovery.** When the process dies at step 37, the transcript says what was said,
-  not where the run is: is the migration applied, is the fix half-written? Restarting from the top repeats
+  not where the run is: is the migration applied, the fix half-written? Restarting from the top repeats
   side effects; restarting from the last message assumes the model can infer its position from a log.
-- **It breaks observability too.** You cannot plot "time spent in verification" or "failure rate by
-  phase" if phases do not exist.
-- **The middle ground.** A hand-coded pipeline enforces everything but cannot branch on judgement, so it
-  only solves cases its author foresaw; a free loop branches on anything but enforces nothing. A state machine fixes the *set* of next steps in code
-  and lets the model make the *choice*, the move protocol and UI designers made long ago because states
-  can be checked, tested, drawn and resumed.
+- **And observability.** Without phases you cannot plot "time in verification" or "failure rate by
+  phase".
+- **The middle ground.** A hand-coded pipeline enforces everything but only handles cases its author
+  foresaw; a free loop branches on anything but enforces nothing. A state machine fixes the *set* of next
+  steps in code and lets the model make the *choice*, because states can be checked, tested, drawn and
+  resumed.
 
 ## How it works
 ### Anatomy
@@ -72,7 +78,7 @@ tests pass" hold, and (state, data) can be checkpointed and resumed.
 2. **Look up (state, event)** in the table.
 3. **Reject illegal events with a reason** ("finish is not allowed until tests pass") and re-prompt.
 4. **Count rejections toward a retry budget**, because a model that keeps proposing illegal transitions
-   is stuck, and the run should end in FAILED rather than loop.
+   is stuck and should end in FAILED.
 
 ### Guards hold the invariants
 - **A guard is a predicate over the data** that must be true for a transition to fire: "cannot enter DONE
@@ -109,8 +115,7 @@ State machine + checkpoint + idempotent tools is the recipe for durable executio
 - **LangGraph is exactly this:** nodes, conditional edges and shared typed state form a state machine
   whose data is the graph state, with checkpointers for persistence and interrupts for human input.
 - **Hand-rolled vs framework:** a hand-rolled machine is about fifty lines; frameworks add persistence,
-  streaming, visualization and time travel.
-- **Either way** choosing the states and guards is your design work.
+  streaming, visualization and time travel; choosing states and guards stays your work.
 
 ### Checking the machine
 Because the machine is data (an enum, a table, a tool map), its properties are testable without a model:
@@ -119,8 +124,7 @@ Because the machine is data (an enum, a table, a tool map), its properties are t
 - **No event leads into DEPLOY or DONE without a guard.**
 - **Consequential tools appear only** in the states meant to hold them.
 
-These are cheap unit tests, and the reason to prefer an explicit table over transitions scattered through
-`if` statements: a free loop has no structure you can check this way.
+These cheap unit tests are why an explicit table beats transitions scattered through `if` statements.
 
 ### Choosing the states
 - **A state is** a phase in which the allowed actions differ, or a point at which you would want to
@@ -150,22 +154,19 @@ stateDiagram-v2
 
 ## Examples
 ### A bug-fix agent as a small machine
-- **Per-state tools:** the model only sees the tools of its current state, and the table decides what
-  each call means.
-- **Guards:** no finishing without passing tests, and a bounded number of apply attempts.
+- **Per-state tools:** the model sees only its state's tools; the table decides what each call means.
 - **PROPOSE has no model tools.** Its event comes from outside (a reviewer approves or rejects), because
   a plan the model approves itself is not reviewed.
 - **Legality is checked *before* the tool executes**, so a rejected call has no side effect.
 - **An edit clears `tests_passed`**, so a stale pass cannot satisfy the guard.
-- **Bounded failure:** the third retry and repeated illegal calls both end in FAILED. The rejection count
-  is checkpointed with the state, so a crash cannot reset the budget.
-- **Simplification to know about:** the idempotency key is per step, but on resume the model is asked
-  again and may pick a different call under the same key. A production version checkpoints the pending
-  call before executing it and replays that exact call on resume.
+- **Bounded failure:** the third retry and repeated illegal calls end in FAILED; the rejection count is
+  checkpointed, so a crash cannot reset it.
+- **Simplification:** on resume the model is re-asked and may pick a different call under the same
+  per-step key; production checkpoints the pending call first and replays it.
 
 ```python
 from enum import Enum
-from pydantic import BaseModel
+from pydantic import BaseModel        # checked with pydantic 2.14 on Python 3.12 (needs 3.10+ for `str | None`)
 
 class S(str, Enum):
     INVESTIGATE = "investigate"; PROPOSE = "propose"; APPLY = "apply"
@@ -273,9 +274,9 @@ A guard that reads a fact nobody clears. Each row is one transition in the persi
 - **Transition-table tests in CI.** For every machine. Assert reachability to terminal states, guard
   coverage on DONE and DEPLOY, and tool placement, as in the unit-test example. Fail the build on any
   unguarded path.
-- **Per-state metrics and rejection rate.** Emit state, duration and the rejection reason on every
-  transition. A rising rejected-transition rate means a state is starved of tools; long time in one
-  state shows where runs stall.
+- **Per-state metrics and rejection rate.** Emit state, duration and rejection reason per transition.
+  A rising rejection rate means a state is starved of tools; long time in one state shows where runs
+  stall.
 - **Versioned data schema.** Store a `schema_version` with each checkpoint and migrate on load, because a
   run resumed next week carries last week's schema.
 
@@ -287,41 +288,48 @@ A guard that reads a fact nobody clears. Each row is one transition in the persi
   split, not a looser one.
 - **Recoverability vs write cost.** Per-transition checkpoints make crashes recoverable but add a write
   per step; for fast, cheap, side-effect-free runs that cost can exceed the value.
-- **Precise guards vs schema versioning.** A typed data record makes guards precise but must be
-  versioned: a resumed run from last week carries last week's schema.
 - **Framework vs hand-rolled.** Frameworks save the plumbing (persistence, streaming, interrupts) at the
   cost of learning their abstractions and inheriting their churn; a hand-rolled machine is smaller and
   fully understood.
 
 ## Pitfalls
 - **States designed around prompts** ("the summarizing state") instead of allowed actions and resume
-  points. Symptom: twenty states and no useful guards.
+  points. Symptom: twenty states and no useful guards. Diagnose: list each state's tools and guards;
+  states identical to a neighbour are prompts. Fix: merge them.
 - **State kept only in the transcript or a Python variable.** Symptom: a crash that cannot be resumed
-  and a run that re-applies side effects on restart.
+  and a run that re-applies side effects on restart. Diagnose: kill a test run mid-APPLY, restart with
+  the same run id and count side effects. Fix: per-transition checkpoints plus idempotency keys.
 - **Events inferred by string-matching prose** ("if 'done' in text"). Symptom: spurious transitions when
-  the model says "not done yet". Fix: phase-change tools.
+  the model says "not done yet". Diagnose: log each transition's event source. Fix: phase-change tools.
 - **No terminal failure state, or unbounded self-loops.** Symptom: APPLY → VERIFY → APPLY for hours,
-  stopping only at the global token budget.
-- **Guards in the prompt** ("only finish when tests pass") rather than in code. Symptom: a
-  successful-looking run whose tests never ran.
-- **A guard fact set once and never cleared.** Symptom: a run that passed tests, made one more edit, and
-  finished green with untested code.
+  stopping only at the global token budget. Diagnose: the reachability test and transitions per run by
+  state. Fix: bounded counters that end in FAILED.
+- **Guards in the prompt** ("only finish when tests pass"), **or a guard fact never cleared.** Symptom:
+  a green run whose tests never ran, or that passed, made one more edit and finished on untested code.
+  Diagnose: replay the transition log and check which step last set the fact. Fix: guards in code, and
+  edits clear `tests_passed`.
 - **The model firing someone else's transition** (`approve_plan` as a model tool). Symptom: a review
-  state every run passes through in one step.
+  state every run passes through in one step. Fix: external events never appear in a tool list.
 - **Schema changes without migrating persisted runs.** Symptom: validation errors on resume, a week after
-  the deploy.
+  the deploy. Fix: migrate on load by `schema_version`.
 
 ## When to use
 - **Use when:** an agent has distinct phases with different allowed actions, any consequential action,
   or a need to resume after interruption, which covers most production agents.
-- **Skip for:** short, read-only, single-phase loops (answer a question with two searches), where the
-  overhead buys nothing.
-- **Skip for open-ended exploration** where you cannot name the phases; use a step budget and stopping
-  conditions instead.
+- **Skip for:** short, read-only, single-phase loops (answer a question with two searches), and
+  open-ended exploration where you cannot name the phases; use a step budget and stopping conditions.
 - **Measure:** time and failure rate per state, the rate of rejected transitions (a design smell), and
   resume success after induced crashes.
-- **Interviews:** expect "how would you stop an agent deploying without tests?" The answer is a guard in
-  code; the follow-up is how you would resume it after a crash.
+
+## Exercise
+**Goal:** turn a refund-handling support agent into a guarded state machine. No solution is given.
+- **Constraints:** states for triage, verify customer, propose refund, approval, execute, done, failed
+  and needs-human; refunds over 200 need a human approval; the refund tool exists only in execute.
+- **Deliver:** the enum, transition table, per-state tool map and guards; a run loop with a fake model
+  and SQLite checkpoints; table tests in pytest.
+- **Acceptance:** tests prove every non-terminal state reaches a terminal one and no edge enters execute
+  unguarded; a scripted model that calls `refund` from triage is rejected before any side effect; killing
+  the process in execute and resuming issues the refund exactly once.
 
 ## Role lens
 - **Engineer:** Writes the state enum, the transition table and the guards, exposes per-state tool
@@ -407,6 +415,17 @@ NEEDS_HUMAN state for approvals.
 - [ ] Guards are unnecessary when there are many states
 > States earn their place by restricting tools or marking resume points. Thirty prompt-shaped states
 > with nothing enforced is a code-defined workflow in disguise and should be written as plain code.
+
+## Mastery test
+**Problem:** a database-migration agent has states PLAN, APPROVE, MIGRATE, VERIFY, DONE. Review found
+two runs where a human approved plan A, the model then revised it to plan B in MIGRATE, and B ran. Both
+runs show a green guard. Find the flaw and fix the machine.
+
+**A strong answer:**
+- names the cause: `approved_by` was never invalidated when the plan changed, so a stale fact passed;
+- binds the approval to a hash of the exact plan, and any plan change clears it and returns to APPROVE;
+- removes plan-editing tools from MIGRATE, since a phase that executes should not redesign;
+- adds a table test and a replay of the two runs that now fail at the guard.
 
 ## Use cases & projects
 ### Use cases

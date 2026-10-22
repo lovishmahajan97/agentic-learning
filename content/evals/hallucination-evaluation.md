@@ -5,8 +5,14 @@ name: Hallucination evaluation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: partial
+prerequisites:
+  - evals/golden-dataset
+  - evals/llm-as-a-judge
+  - evals/faithfulness-groundedness
 related:
   - evals/faithfulness-groundedness
   - model-internals/hallucination
@@ -37,8 +43,8 @@ evidence, and report claim precision, response rate and abstention per slice.
 - **What you control.** The reference (tool outputs, retrieved context, a versioned KB), the verifier
   model, the unanswerable and false-premise slices, and the gate pair: fabrication rate plus a ceiling
   on false abstention.
-- **What you can skip.** The taxonomy debates in the survey literature. Know intrinsic vs extrinsic,
-  the three reference regimes and the four numbers; that is enough to evaluate a production agent.
+- **What you can skip.** The survey's taxonomy debates; intrinsic vs extrinsic, the three reference
+  regimes and the four numbers are enough.
 
 ## Why it exists
 - **The failure is fluent and expensive.** Confident, well-structured text with one wrong number, a
@@ -51,14 +57,12 @@ evidence, and report claim precision, response rate and abstention per slice.
   guess. The reader only sees the error by checking every claim, the slow step the model was meant to save.
 - **Ordinary metrics miss it.** Exact match scores a response 0 or 1 and is undefined for open-ended
   text. A judge asked "is this a good answer" rewards fluency and accepts plausible claims it cannot
-  verify, the generator's own bias. String overlap cannot tell "revenue grew 12%" from "revenue grew
-  21%". Users rate confident answers highly and find the invented contract clause later.
+  verify. String overlap cannot tell "revenue grew 12%" from "revenue grew 21%".
 - **The naive fixes fail.** "Ask the model whether it hallucinated" reuses the knowledge that produced
   the error, so it defends a confident fabrication. Hand spot-checks do not scale and miss exactly the
   errors that look right.
 - **Cost is asymmetric.** One fabricated figure in a financial summary costs more than ten honest
-  abstentions, so one averaged score under-weights the only failures that matter. This practice makes
-  the fabrication rate a first-class number: precise, claim-level, broken out by the cases that trigger it.
+  abstentions, so one averaged score under-weights the only failures that matter.
 
 ## How it works
 ### Define what counts
@@ -123,8 +127,8 @@ A golden set of only answerable, well-covered questions underestimates the rate 
 - questions about entities that do not exist (an order ID the lookup tool cannot find);
 - questions about facts past the model's training cutoff.
 
-Fabrication concentrates in the last four, so that is where the metric moves when you change the prompt,
-the tool descriptions or the retrieval step.
+Fabrication concentrates in the last four, so the metric moves there when you change the prompt, tool
+descriptions or retrieval.
 
 ### Size the slices before trusting a difference
 - **Critical slices are small and noisy.** A 10% fabrication rate on 50 unanswerable items has a 95%
@@ -161,12 +165,17 @@ flowchart TD
 ## Examples
 ### Agent scenario: grounding a support agent's answer in its own trace
 The reference is the trace itself. Fact claims are verified against tool results; action claims must
-match a tool call that succeeded. `call_model` is a verifier from a different model family.
+match a tool call that succeeded. `call_model` is a verifier from a different model family; it is canned
+here so the script runs as is (tested on Python 3.12).
 
 ```python
 import json
 
-def call_model(prompt: str) -> str: ...      # verifier, different family from the agent
+def call_model(prompt: str) -> str:          # replace with a verifier from a different family
+    if prompt.startswith("Split"):
+        return json.dumps([{"claim": "Order 123 shipped on May 3", "action": None},
+                           {"claim": "I issued your refund", "action": "refund"}])
+    return "SUPPORTED"
 
 ACTIONS = {"refund": "issue_refund", "cancel": "cancel_order", "email": "send_email"}
 CLASSIFY = ("Split the agent's final message into atomic claims. For each, return "
@@ -181,7 +190,7 @@ def score_agent_answer(final_text: str, trace: list[dict]) -> dict:
     labels = []
     for c in claims:
         if c["action"]:                          # deterministic: did the call actually succeed?
-            labels.append("SUPPORTED" if ACTIONS[c["action"]] in ok_calls else "CONTRADICTED")
+            labels.append("SUPPORTED" if ACTIONS.get(c["action"]) in ok_calls else "CONTRADICTED")
         else:
             labels.append(call_model(VERIFY.format(evidence=evidence, claim=c["claim"])).strip(" .\n").upper())
     n = len(labels)
@@ -189,6 +198,12 @@ def score_agent_answer(final_text: str, trace: list[dict]) -> dict:
             "claim_precision": labels.count("SUPPORTED") / n if n else None,
             "hallucinated": "CONTRADICTED" in labels,
             "action_hallucination": any(c["action"] and l == "CONTRADICTED" for c, l in zip(claims, labels))}
+
+trace = [{"type": "tool_call", "tool": "lookup_order", "status": "ok"},
+         {"type": "tool_result", "output": {"order": 123, "shipped": "May 3"}},
+         {"type": "tool_call", "tool": "issue_refund", "status": "error"}]
+print(score_agent_answer("Order 123 shipped on May 3. I issued your refund.", trace))
+# {'n_claims': 2, 'claim_precision': 0.5, 'hallucinated': True, 'action_hallucination': True}
 ```
 
 Illustrative run on 300 support-agent traces (not a benchmark), before and after making the final-answer
@@ -323,20 +338,24 @@ for n in (50, 100, 400):
 
 ## Pitfalls
 - **Measuring only answerable questions.** Symptom: near-zero hallucination in the eval and a stream of
-  invented policies in production, because fabrication was never provoked. Fix: add the four risky slices.
+  invented policies in production, because fabrication was never provoked. Diagnose: count items per
+  slice; zero unanswerable or false-premise items is the tell. Fix: add the four risky slices.
 - **Grading the final message without the trace.** Symptom: "I've updated your address" passes the
-  judge although the update tool returned an error. Fix: give the verifier the tool results and check
-  action claims against the call log.
+  judge although the update tool returned an error. Diagnose: join claimed actions to tool statuses in
+  a sample of traces. Fix: give the verifier the tool results and check action claims against the call log.
 - **Using the generating model as verifier.** Symptom: high "supported" rates on claims a human later
-  finds false, since the verifier shares the generator's beliefs. Fix: a different model family.
+  finds false, since the verifier shares the generator's beliefs. Diagnose: kappa against 200 human
+  claim labels. Fix: a different model family.
 - **Claim precision without response-level rate.** Symptom: a 95% score while one in three answers
-  contains something wrong, which is what users experience. Fix: report both.
+  contains something wrong. Diagnose: compute both on the same run. Fix: report both.
 - **Driving fabrication down without watching false abstention.** Symptom: "I cannot determine that from
-  the provided information" to questions answered on page one. Fix: gate the pair.
-- **Counting a citation correct because the document exists.** Symptom: impeccable footnotes that say
-  something else when opened. Fix: verify each cited passage supports its sentence.
+  the provided information" to questions answered on page one. Diagnose: abstention rate on the
+  answerable slice, before and after. Fix: gate the pair.
+- **Counting a citation correct because the document exists.** Symptom: footnotes that say something
+  else when opened. Fix: verify each cited passage supports its sentence.
 - **Merging unverifiable and contradicted.** Symptom: a rate that jumps whenever the corpus is thin, not
-  whenever the model is wrong. Fix: keep three labels.
+  whenever the model is wrong. Diagnose: chart the two labels separately per corpus snapshot. Fix: keep
+  three labels.
 
 ## When to use
 - **Use when:** the agent asserts facts or actions a user might act on: contract or medical-record
@@ -347,8 +366,17 @@ for n in (50, 100, 400):
 - **Measure:** claim precision, response-level rate, fabrication on unanswerable items and false
   abstention together, per slice; gate releases on the pair that matters for the product.
 - **Avoid when:** creative or opinion tasks where "unsupported" is the point; skip the heavy pipeline.
-- **Interviews:** explain why claim-level verification beats a holistic judge, why unanswerable items
-  must be in the set, and why the verifier must be a different model.
+
+## Exercise
+**Goal:** measure fabrication and false abstention for an agent you can run (or a RAG chain over a
+small document set), and decide whether one prompt change is worth shipping. No solution is given.
+- **Inputs:** 40 answerable tasks and 40 risky ones (missing from context, false premise, unknown ID,
+  tool returns an error), plus the agent's traces for two prompt versions.
+- **Deliver:** a script that prints the four numbers per slice and per version, lists each contradicted
+  claim with its trace ID, and flags action claims with no successful tool call.
+- **Acceptance:** your verifier agrees with your own labels on 50 claims (report kappa); at least one
+  action hallucination is caught by the tool-log check alone; you state whether the difference between
+  versions exceeds the interval for your slice size.
 
 ## Role lens
 - **Engineer:** Builds the decompose-and-verify pipeline, adds unanswerable and false-premise slices to
@@ -372,13 +400,6 @@ as the generator and was never validated; measure its agreement with human claim
 different model. Finally gate on false abstention too, or the fix will be a model that refuses.
 
 ## Interview questions
-### What is the difference between claim precision and response hallucination rate, and why report both?
-- **Claim precision** is supported claims over all claims: how much of the text you can trust.
-- **Response rate** is the share of responses with at least one contradicted claim: how often a user
-  receives something wrong.
-- **They diverge sharply:** twelve claims with one false is 92% precision but a 100% hallucinated
-  response, so a 95% precision headline can hide one bad answer in three.
-
 ### Your support agent tells users "your refund has been issued" when the refund tool failed. How do you catch this systematically?
 - **Treat it as an action hallucination:** extract claimed actions from the final message and match
   each to a successful tool call in the same trace, deterministically rather than with a judge.
@@ -443,6 +464,20 @@ different model. Finally gate on false abstention too, or the fix will be a mode
 > Consistency checks rely on confabulated details varying between samples. A false belief the model holds
 > firmly is reproduced identically every time and looks exactly like real knowledge, so only a reference
 > corpus or human check can catch it.
+
+## Mastery test
+**Problem:** a travel-booking agent searches flights, holds seats and emails itineraries. After launch,
+users report itineraries with flight numbers that do not exist and "your seat is held" when the hold
+API timed out. The eval shows 98% claim precision on 300 tasks. Design the evaluation that would have
+caught both, and say what you gate on.
+
+**A strong answer:**
+- explains why 98% precision hides it: holistic or answerable-only items, and no response-level rate;
+- checks hold and email claims deterministically against successful calls, on all traffic;
+- verifies flight numbers against the search tool's results, with a cross-family verifier measured
+  against human labels;
+- adds slices for empty results, timeouts and nonexistent routes, large enough to see the change;
+- gates on fabrication there plus a false-abstention ceiling and zero action hallucinations.
 
 ## Use cases & projects
 ### Use cases

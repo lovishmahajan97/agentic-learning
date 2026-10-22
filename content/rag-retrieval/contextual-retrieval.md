@@ -5,8 +5,14 @@ name: Contextual retrieval
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: implement
+code_tested: yes
+prerequisites:
+  - rag-retrieval/hybrid-search
+  - rag-retrieval/chunking-strategies
+  - prompting/prompt-caching
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/parent-document-retrieval
@@ -266,7 +272,7 @@ Illustrative: 2,000 documents of 20,000 tokens with 50 chunks each, using the ra
 - **Cache the document block explicitly.** On Anthropic's Messages API, put the document in its own content
   block marked with `cache_control` of type `"ephemeral"` and the chunk plus instruction after it. Monitor
   the usage fields `cache_creation_input_tokens` and `cache_read_input_tokens`: reads should dominate after
-  the first call per document.
+  the first call per document (field names checked against the `anthropic` Python SDK 0.125.0).
 - **Warm, then fan out.** Send one chunk's call first so it writes the cache, then run the remaining chunks
   of that document concurrently, inside the cache lifetime. Monitor the cache-read share per document; a
   share near zero means the fan-out raced the write.
@@ -299,25 +305,28 @@ Illustrative: 2,000 documents of 20,000 tokens with 50 chunks each, using the ra
   side (vague or follow-up queries), which no index change repairs.
 
 ## Pitfalls
-- **Embedding only the context or only the chunk** instead of the concatenation. The symptom is no
-  measurable improvement after a costly ingestion run.
-- **Contexts in the dense index but not BM25.** The symptom is exact-term queries naming the entity still
-  missing, and part of the reported gain absent (a 35% versus 49% failure reduction in the post).
-- **Contexts that are too long.** The symptom is every chunk from one document looking alike, and retrieval
-  returning clusters of neighbours from the same document instead of the specific passage.
-- **Ingesting without prompt caching.** The symptom is a bill several times to an order of magnitude above
-  the cached estimate, growing with chunks × document length, which is roughly document length squared.
-- **Firing all chunk calls in parallel before the first has written the cache.** The symptom is cache-write
-  or cache-miss charges on every call and a bill close to the uncached estimate. Send one call first, then
-  fan out the rest.
-- **Silently truncating documents longer than the model's context.** The symptom is contexts for late
-  chunks that refer to the wrong section or entity.
-- **Displaying the contextualised text as a quotation.** The symptom is "cited" sentences that do not exist
-  in the source document.
-- **Shipping contexts and a reranker in one release without a golden set.** The symptom is not knowing
-  which change produced the gain or the regression.
-- **Saving agent memory notes bare.** The symptom is a later session that cannot find "the annual plan
-  note" because the note never named the account or the date; contextualise at write time.
+- **Embedding only the context or only the chunk** instead of the concatenation. Symptom: no measurable
+  improvement after a costly ingestion run. Diagnose: print the exact text sent to `embed` for a few chunks.
+- **Contexts in the dense index but not BM25.** Symptom: exact-term queries naming the entity still miss,
+  and part of the reported gain is absent (a 35% versus 49% failure reduction in the post). Diagnose: query
+  BM25 alone for the entity. Fix: index the concatenation in both legs.
+- **Contexts that are too long.** Symptom: every chunk of a document looks alike, and retrieval returns
+  clusters of same-document neighbours instead of the specific passage. Diagnose: context length
+  distribution and same-document share of the top-k. Fix: cap the context.
+- **Ingesting without prompt caching.** Symptom: a bill several times to an order of magnitude above the
+  cached estimate, growing with chunks × document length, roughly document length squared. Diagnose: the
+  usage fields per call.
+- **Firing all chunk calls in parallel before the first has written the cache.** Symptom: write or miss
+  charges on every call and a bill near the uncached estimate. Diagnose: a cache-read share near zero per
+  document. Fix: one call first, then fan out.
+- **Silently truncating documents longer than the model's context.** Symptom: late chunks' contexts name
+  the wrong section or entity. Fix: contextualise against the section.
+- **Displaying the contextualised text as a quotation.** Symptom: "cited" sentences absent from the source.
+  Fix: display the stored original chunk.
+- **Shipping contexts and a reranker in one release without a golden set.** Symptom: not knowing which
+  change produced the gain or the regression. Fix: one eval arm per layer.
+- **Saving agent memory notes bare.** Symptom: a later session cannot find "the annual plan note" because
+  it never named the account or the date. Fix: contextualise at write time.
 
 ## When to use
 - **Use when** failure analysis shows chunks that cannot be matched because they lost their subject: many
@@ -330,8 +339,17 @@ Illustrative: 2,000 documents of 20,000 tokens with 50 chunks each, using the ra
   re-contextualise, and collections of short self-contained records that never lost context.
 - **Measure:** retrieval failure rate or recall@20 on a golden set before and after, with and without
   contextual BM25, plus ingestion cost per million tokens.
-- **Interviews:** the answer to "the right chunk is in the index but never retrieved"; the strong candidate
-  explains both legs, the caching cost model and the re-indexing consequence.
+
+## Exercise
+**Goal:** measure what each contextualisation layer buys on a look-alike corpus, and what it costs. No
+solution is given.
+- **Inputs:** 10-20 similar long documents (filings, per-customer contracts or per-service runbooks), 30
+  golden questions naming an entity or period with labelled chunks, BM25, any embedder and an LLM with
+  prompt caching.
+- **Deliver:** arms for plain chunks, title-plus-heading prefixes, contextual embeddings, and contextual
+  embeddings plus BM25; recall@20 per arm; ingestion input tokens with the cache-read share.
+- **Acceptance:** cache reads dominate after the first call per document; your measured cost is within 20%
+  of `ingest_cost`; each layer's gain is attributable; 10 contexts checked by hand against the source.
 
 ## Role lens
 - **Engineer:** Adds the contextualisation step to the ingestion pipeline with prompt caching, indexes the
@@ -380,13 +398,6 @@ baseline.
 - **Scope and measure:** filter by the session's user id and track recall on a golden set of memory
   questions.
 
-### When would you not use contextual retrieval?
-- **Small corpora** that fit in the context window: put them in the prompt with caching and skip retrieval.
-- **High-churn corpora:** each context depends on the whole document, so any edit can re-contextualise every
-  chunk, and the recurring ingestion cost can outweigh the gain.
-- **Short self-contained records** that never lost their subject, or corpora where structural prefixes
-  already close the gap on the golden set.
-
 ### Estimate the ingestion cost for a 20,000-token document with 50 chunks, with and without caching.
 - **Uncached:** 50 × (20,000 + 500) ≈ 1,025,000 full-price input tokens.
 - **Cached, using the quoted ratios** (write about 1.25×, read about 0.1×): about 148,000 full-price
@@ -428,6 +439,19 @@ baseline.
 - [ ] Chunk overlap was set too high
 > The context is meant to add a few disambiguating facts, not to replace the chunk's own content; when it
 > dominates, all chunks of a document collapse toward one vector and intra-document discrimination is lost.
+
+## Mastery test
+**Problem:** a support agent searches 8,000 per-customer runbooks (about 30,000 tokens each, 5% edited
+daily). Queries like "Globex failover steps" miss because chunks say "the primary cluster". Heading
+prefixes did not help: runbooks share one template. Should you contextualise, and how do you keep it
+affordable?
+
+**A strong answer:**
+- confirms the failure is lost subject, so contextual embeddings plus contextual BM25 fit, query side
+  unchanged;
+- prices it with the cached cost model, splitting runbooks into sections to tame the squared term;
+- re-contextualises only edited documents by hash (about 400 a day), warming the cache before fan-out;
+- validates contexts against the source and measures recall@20 per arm.
 
 ## Use cases & projects
 ### Use cases

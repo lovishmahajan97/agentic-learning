@@ -5,8 +5,13 @@ name: When an SLM is enough (task fit, cost, latency, privacy)
 kind: decision
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: partial
+prerequisites:
+  - model-internals/small-language-models
+  - evals/golden-dataset
 related:
   - model-internals/small-language-models
   - system-design/slm-vs-llm-trade-offs
@@ -36,8 +41,7 @@ privacy, never per agent.
   steps large.
 - **What you control.** Which steps go small, the acceptance threshold per step, the fallback when the SLM
   fails validation, and the eval set that proves it.
-- **What you can skip.** Leaderboard debates. The decision rests on your traces and your golden set, not on
-  a public benchmark average.
+- **What you can skip.** Leaderboard debates; your traces and golden set decide.
 
 ## Why it exists
 - **Agents multiply calls.** A 10-step agent with a planner, tool calls and a summariser can make 15-30 model
@@ -47,8 +51,8 @@ privacy, never per agent.
   so a chain of five classification or extraction calls stops dominating time to answer.
 - **Some data cannot leave.** Health records, source code under contract, or on-premises customer data rule
   out a hosted API. A model you run yourself is the only option, and only small ones fit the hardware.
-- **"Always use the biggest model" fails quietly.** It works in the demo, then cost per task and p95
-  latency block the rollout; teams then downgrade blindly instead of per step with evidence.
+- **"Always use the biggest model" fails quietly.** It works in the demo; then cost per task and p95
+  latency block rollout, and teams downgrade blindly, not per step with evidence.
 
 ## How it works
 ### The four questions, per step
@@ -100,6 +104,7 @@ Both models sit behind OpenAI-compatible endpoints (here Ollama locally and any 
 harness compares them. Replace the model names with your candidates.
 
 ```python
+# Checked with openai 3.36 (Python SDK) on Python 3.12; any OpenAI-compatible server works.
 import json
 from openai import OpenAI
 
@@ -144,10 +149,11 @@ roughly 60%, while the two hardest calls keep frontier quality.
   SLM-friendly and SLM-hostile steps.
 - **Validate, then escalate.** Wrap SLM steps in a schema or enum check; on failure, retry once and then call
   the large model. Alert when the escalation rate for a step rises above the rate you priced in.
-- **Gate with a golden set in CI.** Re-run each step's golden set when you change the prompt, the model or the
-  quantization. Block the change if the pass rate drops more than your tolerance.
+- **Gate with a golden set in CI.** Re-run each step's golden set when the prompt, model or quantization
+  changes; block the change if the pass rate drops beyond tolerance.
 - **Price the server, not the token.** For self-hosting, compute cost per task from GPU hours at real
-  utilisation, not from free local tokens. Below a certain volume a hosted small or large model is cheaper.
+  utilisation. Below some volume, a dedicated GPU idling most of the day costs more per task than a hosted
+  small or large model.
 - **Keep private steps local by policy.** Mark steps that touch regulated fields and route them only to
   self-hosted models, enforced in the gateway rather than by convention.
 
@@ -163,13 +169,17 @@ roughly 60%, while the two hardest calls keep frontier quality.
 
 ## Pitfalls
 - **Deciding from a public benchmark.** Symptom: the SLM looks strong on paper and fails on your tickets.
-  Fix: decide only from a golden set built from your own traces.
-- **Asking the SLM to recall facts.** Symptom: confident wrong answers about policies or products. Fix: put
-  the facts in context through retrieval, or keep that step on the large model.
-- **Moving the planner first.** Symptom: loops, wrong tool order and giving up early. Fix: move leaf steps
-  (classify, extract, fill arguments) first; the planner is usually the last step to go small.
-- **Ignoring the fallback cost.** Symptom: savings vanish because 30% of calls escalate. Fix: include
-  escalation rate in the cost model and only route steps where it stays low.
+  Diagnose: run both models on a golden set from your traces and group failures by input type. Fix: decide
+  only from that set.
+- **Asking the SLM to recall facts.** Symptom: confident wrong answers about policies or products. Diagnose:
+  for each failure, check whether the fact was in the prompt. Fix: put facts in context through retrieval,
+  or keep that step large.
+- **Moving the planner first.** Symptom: loops, wrong tool order and giving up early. Diagnose: compare
+  steps per task, repeated tool calls and early stops before and after the swap. Fix: move leaf steps
+  (classify, extract, fill arguments) first; the planner goes small last.
+- **Ignoring the fallback cost.** Symptom: savings vanish because 30% of calls escalate. Diagnose: log
+  escalations per step and price each escalated call as small plus large. Fix: route only steps where the
+  rate stays low.
 
 ## When to use
 - **Use when** a step has a bounded, checkable output, high volume, a latency budget, or data that must stay
@@ -177,8 +187,16 @@ roughly 60%, while the two hardest calls keep frontier quality.
 - **Avoid when** the step needs open-ended planning, broad world knowledge, or long tool lists, or when volume
   is too low to justify any extra model.
 - **Measure** pass rate per step against the large model, escalation rate, cost per task and p95 latency.
-- **Interviews:** expect "which parts of this agent would you move to a small model, and how would you know
-  it is safe?"
+
+## Exercise
+**Goal:** estimate, before building anything, which steps of one agent should move to an SLM and what that
+saves. No solution is given.
+- **Inputs:** 100+ traced runs (yours or synthetic) with calls tagged by step and tokens; prices for a large
+  and a small model; an assumed escalation rate per step.
+- **Deliver:** a script printing cost per task for all-large and for your routing, counting escalated calls
+  twice, plus GPU cost at realistic utilisation and the break-even daily volume if you self-host.
+- **Acceptance:** one step's cost reproduced by hand; you can state the escalation rate at which each
+  step's saving reaches zero; break-even volume rises when GPU cost doubles.
 
 ## Role lens
 - **Engineer:** Tags model calls by step, builds the per-step golden sets, and wires the validator and
@@ -215,22 +233,15 @@ cost per task, because a high escalation rate erases the savings.
 - **Eval on their data on site** before promising quality, since the gap to a frontier model varies by task.
 
 ### When would you not use an SLM even though it is cheaper per token?
-- **Low volume.** A dedicated GPU idling most of the day can cost more per task than a hosted large model.
-- **High escalation.** If 30% or more of calls fail validation and retry on the large model, you pay twice.
-- **Hard steps.** Planning over many tools or long-horizon recovery is where quality loss causes failed tasks,
-  which cost more than tokens.
+- **Low volume or high escalation.** An idle GPU, or 30% of calls retried on the large model, erases the
+  saving.
+- **Hard steps.** Planning over many tools or long-horizon recovery fails tasks, costing more than tokens.
 
 ### Your SLM router passed the eval but production escalations doubled after a month. What happened?
 - **Likely drift:** new products, intents or phrasing absent from the golden set; check the escalated inputs.
 - **Fix the loop:** sample escalated and low-confidence cases into the golden set, relabel, re-evaluate, and
   either update the prompt or fine-tune.
 - **Guard it:** alert on escalation rate per step so the next drift is caught in days, not a month.
-
-### How would you estimate the savings of moving steps to an SLM before building anything?
-- **From traces:** count calls and tokens per step type, then price each step at the large and small rate.
-- **Add escalation:** multiply the expected escalation rate by the large-model cost for those calls.
-- **Add fixed cost:** for self-hosting, GPU hours at realistic utilisation plus operations time, compared
-  against the per-task saving at current and forecast volume.
 
 ## Quiz
 ### Q: Which agent step is the best first candidate for a small language model?
@@ -257,6 +268,18 @@ cost per task, because a high escalation rate erases the savings.
 - [ ] Self-hosted models cannot use prompt caching
 > Self-hosting has a fixed cost that only pays off at enough volume, and every call that fails validation
 > and escalates to the large model costs both the small and the large call.
+
+## Mastery test
+**Problem:** a law firm's contract-review agent may not send documents outside its network; volume is about
+300 contracts a day. Steps: a 12-label clause classifier, party and date extraction, case-law answers from
+model memory, and a summary for the partner. Which steps go small, and what do you change?
+
+**A strong answer:**
+- sees privacy forces every step onto self-hosted models, so low volume no longer decides it; the question
+  is size and design per step;
+- moves classifier and extraction small with validators, and replaces memory recall with retrieval over the
+  firm's sources, because SLMs hallucinate facts;
+- keeps escalation inside the boundary (larger self-hosted model or human) and evals on site.
 
 ## Use cases & projects
 ### Use cases

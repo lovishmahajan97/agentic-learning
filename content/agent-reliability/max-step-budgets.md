@@ -5,8 +5,13 @@ name: Max-step budgets
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - agents/agent-loop
+  - agent-reliability/stopping-conditions-termination
 related:
   - agent-reliability/stopping-conditions-termination
   - agent-reliability/loop-detection
@@ -48,8 +53,8 @@ every exhaustion as a stuck-agent signal.
   tokens, step forty may cost tens of thousands. Steps are a loose proxy for what you want to bound: cost
   and time.
 - **Raising on the limit loses the work.** The model never gets to say "here is what I have and what is
-  blocking me", often the most useful output of a failed run. So budgets need several dimensions, a soft
-  threshold before the hard one, and an exhaustion path that preserves state.
+  blocking me", often the most useful output of a failed run. Hence several dimensions, a soft threshold
+  and a state-preserving exhaustion path.
 
 ## How it works
 ### Dimensions
@@ -142,12 +147,9 @@ flowchart TD
 
 ## Examples
 ### A multi-dimension budget with projection and sub-budgets
-- **Three dimensions at once:** steps, tokens and seconds, with a single soft warning at 80% of whichever
-  is closest to its limit.
-- **Projection:** it refuses a call whose *projected* cost would breach the token limit, and returns a
-  labelled partial rather than raising.
-- **Delegation:** `child()` hands a sub-agent a slice of what remains and `absorb()` debits the parent
-  when the child returns, so delegation cannot spend more than the parent had.
+- **What it does:** caps steps, tokens and seconds with one soft warning at 80% of whichever is closest;
+  refuses a call whose *projected* cost breaches the token limit and returns a labelled partial; and
+  `child()` / `absorb()` fund a sub-agent from what remains, so delegation cannot overspend.
 
 Why the warning also fires on `last`, traced for a run whose context grows by about 15k tokens per step
 (step *n* sends roughly 15k × n; cumulative spend after *n* steps is 15k × n(n+1)/2):
@@ -157,9 +159,8 @@ Why the warning also fires on `last`, traced for a run whose context grows by ab
 | 5 | 225k (56%) | step six sends 90k: 225k + 90k + 4k ≤ 400k fits | but six and seven together would not, so warn with step six |
 | 6 | 315k (still under the 80% line) | step seven would project to 424k | stop with a partial |
 
-- **Lesson:** a purely fractional soft line would never have fired. With quadratic growth the jump from
-  "under 80%" to "cannot afford another call" happens in one step, so the warning must be driven by the
-  projection, not only by the fraction.
+- **Lesson:** a purely fractional soft line would never have fired. With quadratic growth, "under 80%"
+  becomes "cannot afford another call" in one step, so the projection must drive the warning.
 
 ```python
 import time
@@ -208,6 +209,22 @@ def run(state, model, budget: Budget, max_out=4_000):
         budget.charge(resp.usage)
         if state.handle(resp):                   # True once submit_result is accepted
             return {"status": "succeeded", "result": state.result}
+
+# --- runnable check (Python 3.10+): a stuck run whose context grows 15k per step ---
+from types import SimpleNamespace as NS
+
+class StuckState:                                # never submits, like a looping agent
+    def __init__(self): self.messages, self.n = [], 0
+    def context_tokens(self): return 15_000 * (self.n + 1)
+    def push_user(self, text): print(f"warning injected before step {self.n + 1}")
+    def handle(self, resp): self.n += 1; return False
+    def wrap_up(self): return f"summary after {self.n} steps"
+
+state = StuckState()
+model = lambda messages: NS(usage=NS(input_tokens=state.context_tokens(), output_tokens=0))
+b = Budget()
+print(run(state, model, b), b.tokens)            # warns before step 6; partial at 315000
+child = b.child(); print(child.max_steps, child.max_tokens)   # 1 21250: a slice of what is left
 ```
 
 ### Runnable: simulate quadratic token growth
@@ -272,19 +289,23 @@ for steps in (8, 10, 20):     # re-sent context units: 36, 55, 210
   lengths, or the projection becomes the binding constraint instead of real spend.
 
 ## Pitfalls
-- **Counting steps but not tokens.** The symptom is cost per run growing far faster than steps per run as
-  tasks lengthen, and a surprising bill. Fix: add a token or money budget.
-- **Raising an exception on exhaustion and discarding the transcript.** The symptom is support unable to
-  see what the agent did, and users receiving a bare "failed" with no partial output. Fix: checkpoint and
-  return `partial`.
-- **Resetting the budget to zero on resume.** The symptom is a stuck run that is retried automatically
-  consuming several budgets instead of one. Fix: persist counters in the checkpoint.
-- **One budget constant for every task type.** The symptom is trivial tasks with absurd headroom while
-  complex ones are cut off at a fixed step count regardless of progress. Fix: per-class budgets.
-- **Wall-clock budget without per-call timeouts.** The symptom is a run that "times out" long after its
-  budget because one tool call hung and nothing interrupted it. Fix: timeouts on every call.
-- **Checking the budget only after charging.** The symptom is runs ending 10–20% over their token limit,
-  because the final call's cost was unknown until it had been paid. Fix: project before the call.
+- **Counting steps but not tokens.** Symptom: cost per run growing far faster than steps per run as tasks
+  lengthen, and a surprising bill. Diagnose: plot input tokens per step against step index; a rising line
+  is re-sent context. Fix: add a token or money budget.
+- **Raising an exception on exhaustion and discarding the transcript.** Symptom: support cannot see what
+  the agent did, and users get a bare "failed" with no partial output. Diagnose: count exhausted runs
+  with no checkpoint or draft. Fix: checkpoint and return `partial`.
+- **Resetting the budget to zero on resume.** Symptom: a stuck run that is retried automatically consumes
+  several budgets instead of one. Diagnose: sum tokens across all attempts of one run id. Fix: persist
+  counters in the checkpoint.
+- **One budget constant for every task type.** Symptom: trivial tasks with absurd headroom while complex
+  ones are cut off at a fixed step count regardless of progress. Diagnose: exhaustion rate and step
+  percentiles split by task class. Fix: per-class budgets.
+- **Wall-clock budget without per-call timeouts.** Symptom: a run that "times out" long after its budget,
+  because one tool call hung and nothing interrupted it. Diagnose: compare the longest tool span with the
+  run's overshoot. Fix: timeouts on every call.
+- **Checking the budget only after charging.** Symptom: runs ending 10–20% over their token limit,
+  because the final call's cost was unknown until paid. Fix: project before the call.
 
 ## When to use
 - **Always on, from the first prototype:** the prototype without a cap is the one that runs overnight.
@@ -294,8 +315,18 @@ for steps in (8, 10, 20):     # re-sent context units: 36, 55, 210
   the quality of partial results produced after the soft warning.
 - **Day to day:** this is the parameter you revisit after every "why did this run cost that much"
   conversation.
-- **Interviews:** explain why steps are a proxy, how you would pick the number from data, and what happens
-  to the state when the limit fires.
+
+## Exercise
+**Goal:** budget a parent agent that delegates to two sub-agents, from real usage data. No solution is
+given.
+- **Inputs:** traces (or logged usage) of at least 20 successful runs of one task class, and a loop with a
+  scripted fake model for both levels.
+- **Constraints:** hard limits from the success percentiles, projection before every call, a reserved
+  no-tools wrap-up, children funded from what remains, counters persisted and restored on resume.
+- **Deliver:** the budget config with the data behind each number, and scripted runs: a stuck child, a
+  resume after a crash, and a hung tool under the wall-clock cap.
+- **Acceptance:** no run, including parent plus children, ever exceeds its token limit; resume continues
+  the counters; the hung tool is interrupted within its timeout; all 20 successful runs fit.
 
 ## Role lens
 - **Engineer:** Implements the Budget object, wires usage accounting from API responses, persists the
@@ -346,13 +377,6 @@ larger payloads. Report the exhaustion rate by task class rather than lowering t
 - **When warnings make the model rush.** An early soft line can make it skip verification, so keep it
   late (around 75–80%) and compare quality on warned versus unwarned runs.
 
-### How do you budget a parent agent that spawns sub-agents?
-- **Give each child a slice of what remains** so the sum of allowances never exceeds the parent's
-  remaining budget.
-- **Children report usage upward and the parent debits on return.**
-- **Add tenant and platform caps above the run,** because a thousand in-budget runs can still be an
-  incident.
-
 ## Quiz
 ### Q: Why is a token or cost budget a better primary guard than a step count?
 - [ ] Steps cannot be counted reliably when the model emits parallel tool calls
@@ -377,6 +401,19 @@ larger payloads. Report the exhaustion rate by task class rather than lowering t
 - [ ] Double the budget and continue
 > Exhaustion must be visible to callers and metrics, and the state must survive so a human or a retry
 > can resume. Returning the last message as success hides the failure; discarding loses the work.
+
+## Mastery test
+**Problem:** a support agent has a 20-step cap and no other budget. After a search tool starts returning
+full documents instead of snippets, cost per run triples while steps stay flat, and the fleet hits its
+provider rate limit at peak. What failed, and what do you add?
+
+**A strong answer:**
+- explains that each step now carries a larger tool result that is re-sent on every later call, so
+  tokens rise with flat steps;
+- adds a token or money budget with projection, and a cap or truncation on tool output size;
+- adds a tenant or platform token quota and a concurrency cap, because in-budget runs together hit
+  the rate limit;
+- names the signals: tokens per step, tool output size per tool, quota burn rate.
 
 ## Use cases & projects
 ### Use cases

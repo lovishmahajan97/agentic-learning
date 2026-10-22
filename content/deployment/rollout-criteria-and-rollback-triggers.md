@@ -5,8 +5,13 @@ name: Rollout criteria & rollback triggers
 kind: practice
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: implement
+code_tested: yes
+prerequisites:
+  - llmops-platform/canary-shadow-deployments
+  - math-for-ai/statistics-for-evaluation
 related:
   - llmops-platform/canary-shadow-deployments
   - llmops-platform/rollback
@@ -34,7 +39,7 @@ rationalise bad numbers mid-incident and agent quality signals are noisy and slo
   exhaustion, guardrail blocks), which are soft (judge score, task completion), minimum samples, and
   whether write tools are fenced in early stages.
 - **What you can skip.** Building your own traffic-shifting controller; use the flag service or an
-  existing canary tool and spend your effort on the agent-specific metrics.
+  existing canary tool.
 
 ## Why it exists
 - **A staged rollout only reduces risk if someone decides at each stage.** Without written criteria, that
@@ -48,8 +53,7 @@ rationalise bad numbers mid-incident and agent quality signals are noisy and slo
   hundreds of requests and hours or days before a difference beats noise. And some AI actions are
   irreversible: emails sent or records updated by an agent are not undone by redeploying.
 - **"Watch the dashboards and use judgement" fails** because judgement under pressure is biased toward
-  continuing. Writing criteria in advance moves the hard thinking to a calm moment and makes the live
-  decision mechanical.
+  continuing; criteria written in advance make the live decision mechanical.
 
 ## How it works
 ### 1. Define the stages and what each must prove
@@ -269,14 +273,17 @@ print(min_requests(0.01, 1.5))   # 10000 -> smaller regressions cost quadratical
 
 ## Pitfalls
 - **Writing criteria after the rollout starts.** Symptom: thresholds that conveniently sit just above
-  whatever the canary is currently showing. Fix: commit criteria with the release plan.
+  whatever the canary is currently showing. Diagnose: compare the commit time of the gate config with the
+  rollout start. Fix: commit criteria with the release plan.
 - **Judging a stage before its minimum sample.** Symptom: releases promoted on a quiet hour and incidents
-  that start when peak traffic arrives. Fix: enforce duration and sample floors in the gate.
-- **Monitoring only errors and latency for a prompt or model change.** Symptom: a green rollout followed by
-  a week of user complaints about worse answers, or a cost bill up by half. Fix: add sampled quality as a
-  soft trigger and cost and steps per task as hard ones.
+  that start when peak traffic arrives. Diagnose: log requests, tasks and judged count at each promotion.
+  Fix: enforce duration and sample floors in the gate.
+- **Monitoring only errors and latency for a prompt or model change.** Symptom: a green rollout, then a
+  week of complaints about worse answers, or a cost bill up by half. Diagnose: plot judge pass rate, cost
+  and steps per task per release version. Fix: sampled quality as a soft trigger, cost and steps as hard.
 - **Pointing at a floating model alias.** The provider changes the model underneath you; symptom: a
-  quality shift no release on your side explains and rollback does not fix. Fix: pin model versions.
+  quality shift no release on your side explains and rollback does not fix. Diagnose: log the
+  provider-returned model version per call. Fix: pin model versions.
 - **Assuming rollback undoes everything.** Symptom: a clean revert while records written or messages sent
   by the bad version remain in customer systems. Fix: fence write actions early.
 
@@ -287,8 +294,18 @@ print(min_requests(0.01, 1.5))   # 10000 -> smaller regressions cost quadratical
   swap for an agent with write tools needs staged tenants, a long bake and human-reviewed quality gates.
 - **Measure** what the customer feels (errors, latency, cost, task success) and what predicts it (judge
   score on sampled traffic, escalations, steps per task).
-- **Interviews:** strong answers name the three-state decision, minimum samples, relative-plus-absolute
-  thresholds, hard versus soft triggers, and the irreversibility of agent side effects.
+
+## Exercise
+**Goal:** write and test the rollout plan and gate for one real or simulated agent release (a model
+swap or prompt change). No solution is given.
+- **Inputs:** baseline rates from your traces or a simulator: error rate, cost and steps per task,
+  step-budget hits, judge pass rate.
+- **Constraints:** every minimum sample is derived from a baseline and the smallest regression you care
+  about, and every trigger is hard or soft, with relative limits plus absolute floors.
+- **Deliver:** a stage ladder with durations and floors, a gate returning promote, hold or roll back with
+  a reason, and a replay of simulated traffic through it.
+- **Acceptance:** a canary looping 50% more rolls back on a hard trigger; a 3-point judge drop holds once
+  the judged floor is met, not before; a clean canary promotes only after every floor.
 
 ## Role lens
 - **Engineer:** Implements the gate logic, version pinning and flags, and wires metrics so the canary
@@ -316,12 +333,6 @@ roll back; if they are spread and the gap closes with more data, continue.
 - **Soft signals need a human:** a judge-score drop may be a real regression or the judge misreading a new
   style, so hold and page a named owner rather than automating either way.
 
-### How would you pick the minimum request count for a canary stage?
-- **Start from the baseline rate and smallest regression you care about:** errors are roughly Poisson, so
-  the standard deviation of the count is about √(np).
-- **Worked numbers:** at a 1% baseline, 3,000 requests give about 30 ± 5.5 errors versus about 60 for a
-  doubled rate, more than five standard deviations apart; 100 requests cannot tell.
-
 ### A prompt change rolled out green on errors and latency, then complaints arrived. What was missing?
 - **Quality signals:** prompt and model changes can degrade answers with no error or latency change.
 - **Fix the gate:** add sampled LLM-judge scoring on canary and control as a soft trigger, with a judged
@@ -332,12 +343,6 @@ roll back; if they are spread and the gap closes with more data, continue.
   unambiguous, so compare them per arm and roll back automatically past a relative limit.
 - **Instrument at task level:** tag traces with the release version, because request-level metrics hide
   that one task now makes nine model calls instead of six.
-
-### When would you roll forward instead of rolling back?
-- **When rollback is impossible:** a schema migration already applied, or an external contract already
-  changed.
-- **When the old version is broken too:** for example a deprecated provider model; otherwise roll back,
-  because it restores a known state.
 
 ### What does rollback not undo for an agent, and how do you design around it?
 - **Side effects:** emails sent or records updated by the bad version stay in customer systems after a
@@ -369,6 +374,20 @@ roll back; if they are spread and the gap closes with more data, continue.
 - [x] Keeping the old index serving in parallel until the new one has passed its bake period
 > Re-embedding takes hours, so it is not a mid-incident rollback. Keeping the old index live lets
 > rollback be a configuration switch, while code-only rollback would query vectors from an incompatible model.
+
+## Mastery test
+**Problem:** a sales agent drafts and sends outreach emails. You are swapping its model; it gets about
+400 tasks a day across 6 tenants, one tenant is half the volume, and email-send errors run near 0.5%.
+
+Design the stages and triggers. What can the canary prove in a week, and what can it not?
+
+**A strong answer:**
+- computes that a doubled 0.5% error rate needs about 5,000 tasks (`min_requests(0.005, 2)`), over 12
+  days of total traffic, so error triggers alone cannot decide in a week;
+- leans on fast hard signals (cost and steps per task) and a judged sample, and admits small tenants
+  stay underpowered;
+- fences sends behind dry-run or approval in early stages, because a sent email cannot be rolled back;
+- pins the model and keeps the old version behind the flag.
 
 ## Use cases & projects
 ### Use cases

@@ -5,8 +5,13 @@ name: State persistence & conversation recovery
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - agents/tool-calling
+  - agent-reliability/durable-execution-and-checkpointing
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/state-and-checkpoint-stores
@@ -49,8 +54,8 @@ number and interrupted turns are repaired, never dangling or duplicated.
 - **The naive design only works in demos.** Keeping the message array in memory and re-sending it from the
   client loses history on restart, cannot resume streams, lets a retried POST append the user's message
   twice, and makes the model's context the storage format, so any compaction (summarizing old turns to fit
-  the window) permanently destroys the original record. Persistence needs an explicit model: canonical
-  record, derived views, and a turn state machine recovery can reason about.
+  the window) permanently destroys the original record. Hence a canonical record, derived views and a
+  turn state machine.
 
 ## How it works
 ### Two kinds of state
@@ -282,21 +287,25 @@ for e in s.since("c1", after_seq=3):                     # client reconnects
   linear log is simpler and the trade flips.
 
 ## Pitfalls
-- **Model context as the storage format.** Compaction erases history; the symptom is users asking "what
-  did I say earlier" and the assistant having no record. Fix: log is truth, context is a view.
-- **Retried POSTs without a client-generated turn id.** The symptom is duplicate user messages and two
-  concurrent runs in one conversation after a timeout. Fix: dedupe on turn id.
-- **A tool call left without a result after a crash.** The symptom is every later request on that
-  conversation failing with an API error about unmatched tool calls. Fix: the repair job.
-- **Replaying only completed events on reconnect.** The symptom is the client missing the first half of
-  the answer and showing a message that starts mid-sentence. Fix: replay buffered deltas.
-- **Turn state only in memory.** The symptom is spinners that never stop after a deploy, for turns no
-  worker is running. Fix: persist state and run id on the turn record.
-- **A plain "error" result for an interrupted side-effecting call.** The symptom is the model confidently
-  re-issuing the refund or email next turn, because history said the first attempt failed rather than
-  that its outcome is unknown. Fix: say "outcome unknown".
-- **Editing messages in place.** The symptom is reconnecting clients rendering a mix of old and new
-  content, and audits unable to show what the assistant actually saw. Fix: branches.
+- **Model context as the storage format.** Symptom: users ask "what did I say earlier" and the assistant
+  has no record, because compaction erased history. Fix: log is truth, context is a view.
+- **Retried POSTs without a client-generated turn id.** Symptom: duplicate user messages and two
+  concurrent runs in one conversation after a timeout. Diagnose: find identical user events seconds
+  apart with different turn ids. Fix: dedupe on turn id.
+- **A tool call left without a result after a crash.** Symptom: every later request on that conversation
+  fails with an API error about unmatched tool calls. Diagnose: diff tool_call ids against tool_result
+  ids per conversation. Fix: the repair job.
+- **Replaying only completed events on reconnect.** Symptom: the client shows a message starting
+  mid-sentence. Diagnose: compare the first replayed delta with the run's first delta. Fix: replay
+  buffered deltas.
+- **Turn state only in memory.** Symptom: spinners that never stop after a deploy, for turns no worker is
+  running. Diagnose: list `running` turns whose lease expired. Fix: persist state and run id on the turn
+  record.
+- **A plain "error" result for an interrupted side-effecting call.** Symptom: the model confidently
+  re-issues the refund or email next turn, because history said the first attempt failed, not that its
+  outcome is unknown. Fix: say "outcome unknown".
+- **Editing messages in place.** Symptom: reconnecting clients render a mix of old and new content, and
+  audits cannot show what the assistant saw. Fix: branches.
 
 ## When to use
 - **Conversation store:** any assistant used more than once by the same person.
@@ -306,8 +315,18 @@ for e in s.since("c1", after_seq=3):                     # client reconnects
 - **Decide early** whether a turn survives client disconnect, because it shapes the whole API.
 - **Measure:** reconnect success rate, share of turns ending interrupted, malformed-history errors from
   the model API (which should be zero), and duplicate-turn rate.
-- **Interviews:** explain why the transcript and the model context are different objects, and what you do
-  about a tool call whose result never arrived.
+
+## Exercise
+**Goal:** put a streaming chat agent of yours on an event log and prove it survives the three failures
+above. No solution is given.
+- **Inputs:** an agent endpoint that streams over SSE and calls at least one tool; SQLite or Postgres.
+- **Constraints:** unique turn id and unique `(conversation_id, seq)`, deltas buffered per run id, a repair
+  job on expired leases, edits stored as branches.
+- **Deliver:** fault scripts that drop the client mid-message, retry a POST after a timeout, kill the
+  worker between a tool call and its result, and edit an earlier message.
+- **Acceptance:** the reconnecting client renders the full answer from its last seq with no gap; one user
+  event per turn id; the next model call after the crash succeeds; the derived context never includes
+  the abandoned branch.
 
 ## Role lens
 - **Engineer:** Builds the event log, the catch-up-by-sequence endpoint, resumable token streams and
@@ -336,12 +355,6 @@ close any dangling tool call and mark the turn interrupted with a retry affordan
   the transcript with scratch data or loses run state when the conversation is compacted.
 - **Different owners and keys:** the conversation store is keyed by conversation id, the checkpoint store
   by run id, and only a completed turn's outputs cross from one to the other.
-
-### A user edits their second message in a long chat. How do you store that?
-- **As a branch, not an overwrite:** the edit is a new user turn whose parent is the turn before the
-  edited one, so existing events and client cursors stay valid.
-- **Derive the context by walking parents from the active leaf,** keeping abandoned branches for audit
-  and "previous response" navigation without leaking them into the model view.
 
 ### After a deploy, every request in some conversations fails with an unmatched tool call error. What happened and how do you fix it?
 - **Workers died between a tool call event and its result,** leaving dangling calls that model APIs reject.
@@ -383,6 +396,19 @@ close any dangling tool call and mark the turn interrupted with a retry affordan
 - [ ] The client waits for the run to finish before retrying
 > A client-generated id lets the server recognise the retry as the same turn regardless of timing or
 > text, which is the standard idempotency approach. Text comparison fails for legitimately repeated messages.
+
+## Mastery test
+**Problem:** a team keeps each conversation as the provider-formatted message array in one JSON column,
+rewritten after every turn and compacted in place when it nears the window. They now need multi-device
+sync, an audit of what the model saw, and erasure on request. What breaks, and what do you migrate to?
+
+**A strong answer:**
+- names the breaks: compaction destroyed the record, a whole-array rewrite gives no cursor and lets two
+  devices overwrite each other, and there is no record of the exact context;
+- migrates to a sequence-numbered event log with summary events and derived views, logging which summary
+  and documents each turn used;
+- adds one active turn and catch-up by seq;
+- handles erasure with deletion or per-conversation keys, including summaries.
 
 ## Use cases & projects
 ### Use cases

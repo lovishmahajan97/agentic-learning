@@ -5,8 +5,13 @@ name: Health checks
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: implement
+code_tested: yes
+prerequisites:
+  - backend-fundamentals/kubernetes
+  - fastapi-for-ai/lifespan
 related:
   - fastapi-for-ai/health-readiness-endpoints
   - backend-fundamentals/kubernetes
@@ -47,8 +52,8 @@ turns one slow LLM provider or tool into a total outage.
 - **A single deep check wired to restarts is dangerous.** Checking every dependency (database, vector
   store, LLM provider) in the restart probe means one provider blip fails every instance at once: a
   fleet-wide restart storm with cold model loads on top.
-- **"Healthy" is not one question.** Restart, route traffic, and "does the agent work end to end" have
-  different answers and consequences, so each gets its own check and scope.
+- **"Healthy" is not one question.** Restart, route traffic, and "does the agent work end to end" each
+  get their own check.
 
 ## How it works
 ### The four checks
@@ -141,7 +146,8 @@ stateDiagram-v2
 ## Examples
 ### FastAPI service with separate probes
 A FastAPI agent service that loads a model at startup, separates liveness from readiness and reports
-overload. The model loader is a stand-in for real initialisation.
+overload. The model loader is a stand-in for real initialisation (run with FastAPI 0.128 and uvicorn
+0.39: probes return 503 for about 5 seconds, then 200).
 
 It runs as a background task because an `await` inside the lifespan would delay the server from
 accepting connections until loading ends: probes would see connection refused rather than a 503 with a
@@ -255,8 +261,8 @@ def synthetic_check(base_url, token):
 
 - **Every probe can be green while this fails:** an expired credential to the policy system, a renamed tool
   parameter, or a stale index all break the golden task without touching any instance's local state.
-- **Keep it read-only and cheap:** one fixed task per critical path, so the check costs a handful of model
-  calls per run and can never change customer data.
+- **Keep it read-only and cheap:** one fixed task per critical path, costing a handful of model calls
+  and never changing customer data.
 
 ### Worked scenario: the 90-second provider blip
 | Design | What happens during a 90-second provider outage |
@@ -276,9 +282,6 @@ def synthetic_check(base_url, token):
 - **Pre-stop delay plus graceful timeout.** Add a short pre-stop sleep so endpoint removal propagates, and
   set `terminationGracePeriodSeconds` above the longest stream; the server should finish in-flight
   requests on SIGTERM. Monitor client-side disconnects and truncated streams during deploys.
-- **Checkpointed agent runs.** For runs longer than the grace period, persist state after each tool step
-  so a run interrupted by a deploy resumes on another replica instead of restarting. Monitor runs resumed
-  versus runs lost per deploy.
 - **Golden-task synthetic check.** Run a scheduled job (every few minutes) from outside the cluster that
   sends a fixed task through the public entry point and asserts on a cited document ID, the tools called
   and the step count. Alert on consecutive failures and track synthetic latency separately.
@@ -294,25 +297,26 @@ def synthetic_check(base_url, token):
   fast but cause flapping and needless restarts under load spikes; tolerate a few consecutive failures
   before acting.
 - **Graceful shedding vs empty endpoints.** Load-based readiness ("at capacity") sheds traffic gracefully,
-  but if every replica hits capacity at once the service has no endpoints; pair it with autoscaling and a
-  front-door rate limit.
+  but if every replica hits capacity at once the service has no endpoints.
 - **End-to-end proof vs cost and drift.** Synthetic checks prove end-to-end correctness, but each costs
   real model and tool calls and can drift from real usage; keep them few, cheap and representative of the
   critical path.
 
 ## Pitfalls
 - **Checking the LLM provider or database in liveness.** Symptom: every pod restarts at once during a short
-  upstream incident, followed by slow cold starts. Fix: liveness is local only.
+  upstream incident, followed by slow cold starts. Diagnose: line up container restart counts with the
+  provider's error-rate graph, and read the probe handler for outbound calls. Fix: liveness is local only.
 - **No startup probe for a service loading large weights.** Symptom: pods killed by liveness during model
-  loading and stuck in a restart loop. Fix: a startup probe sized to the worst case.
+  loading, stuck in a restart loop. Diagnose: compare measured cold-node load time with the window
+  `periodSeconds × failureThreshold`. Fix: a startup probe sized to the worst case.
 - **Exiting without draining**, so new requests still arrive during shutdown. Symptom: streamed responses
-  and agent runs cut off mid-answer on every deploy or scale-down. Fix: pre-stop delay, graceful timeout,
-  and checkpoints for long runs.
-- **Only shallow HTTP pings.** Symptom: instances that report healthy while every request fails because
-  the model never loaded or a GPU is in an error state. Fix: readiness checks model and GPU state.
+  and agent runs cut off mid-answer on every deploy or scale-down. Diagnose: count truncated streams and
+  lost runs per rollout. Fix: pre-stop delay, graceful timeout, and checkpoints for long runs.
+- **Only shallow HTTP pings.** Symptom: instances report healthy while every request fails because the
+  model never loaded or a GPU errored. Fix: readiness checks model and GPU state.
 - **Treating green probes as proof the agent works.** Symptom: all-green dashboards while users get wrong
-  answers from a stale index or a broken tool, which only a synthetic end-to-end check would have caught.
-  Fix: a scheduled golden task that asserts on the answer and the tool path.
+  answers from a stale index or a broken tool. Diagnose: compare synthetic pass rate and user-reported
+  failures with probe status. Fix: a golden task asserting on the answer and the tool path.
 
 ## When to use
 - **Every deployed agent service:** liveness and readiness.
@@ -322,8 +326,19 @@ def synthetic_check(base_url, token):
 - **Decide scope by the action triggered:** restart, route away, or alert.
 - **Measure:** probe failure counts, restart counts, ready replica count and synthetic pass rate, with each
   health alert linked to a runbook.
-- **Interviews:** explain why liveness must not include dependencies, how readiness interacts with draining
-  and rolling deploys, and why a probe cannot tell you answers are correct.
+
+## Exercise
+**Goal:** give a toy agent service probes that survive a provider outage, then prove it with failure
+injection. No solution is given.
+- **Inputs:** a FastAPI (or similar) agent with a stubbed LLM provider, one stubbed tool, and a model
+  load you can make slow.
+- **Constraints:** no probe makes an outbound call; probe timings are derived from load times you
+  measured, written next to the config.
+- **Deliver:** the endpoints, a probe config (Kubernetes or your platform's), a golden-task script, and a
+  short log of each injected failure and what every check reported.
+- **Acceptance:** with the provider stubbed down, readiness stays 200 and users get a degraded answer;
+  doubling load time still fits the startup window; a renamed tool parameter fails the golden task two
+  runs in a row while every probe stays green.
 
 ## Role lens
 - **Engineer:** Implements separate liveness, readiness and startup endpoints, keeps them fast and
@@ -347,13 +362,6 @@ check. The request path should degrade with a fallback model or clear error, and
 slow loads are not killed.
 
 ## Interview questions
-### What is the difference between liveness and readiness, and why does it matter?
-- **Liveness decides restarts:** it asks whether the process is irrecoverably stuck, so it checks only
-  what a restart fixes.
-- **Readiness decides routing:** a failing pod leaves the Service endpoints without restarting, so it
-  checks whether this instance can serve now.
-- **Mixing them** turns a shared-dependency blip into a restart storm or an empty endpoint list.
-
 ### Your model takes 90 seconds to load, sometimes 4 minutes. How do you configure the probes?
 - **Startup probe sized to the worst case:** reaction time is about `periodSeconds × failureThreshold`, so
   10 × 30 gives 300 seconds; a 60-second window would loop forever on cold nodes.
@@ -402,6 +410,21 @@ slow loads are not killed.
 - [ ] A pod that is shutting down
 > Probes check one instance's local condition. A stale index leaves every instance healthy while
 > answers are wrong, which only a check asserting on real end-to-end output can detect.
+
+## Mastery test
+**Problem:** a customer's load balancer supports one health URL per pool and checks it every 5 seconds,
+3 failures to eject. Your agent runs on their VMs, calls a hosted LLM through their proxy, and runs last
+up to 8 minutes.
+
+Which conditions go behind that URL, and how do you deploy without cutting runs?
+
+**A strong answer:**
+- puts only local conditions behind it (model or client initialised, in-flight budget, draining flag),
+  never the proxy or the LLM, so one proxy blip does not eject every VM;
+- notes ejection takes about 15 seconds, so draining fails the check first, waits that long, then
+  finishes runs;
+- checkpoints runs per tool step because 8 minutes exceeds any sane drain;
+- watches the proxy and provider through metrics and a golden task from inside their network.
 
 ## Use cases & projects
 ### Use cases

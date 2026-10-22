@@ -5,8 +5,13 @@ name: Runbooks
 kind: practice
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: implement
+code_tested: yes
+prerequisites:
+  - observability/monitoring
+  - delivery-ownership/incident-severity-and-escalation
 related:
   - deployment/health-checks
   - deployment/hypercare
@@ -100,8 +105,7 @@ alert-linked, mitigation-first and rehearsed.
   failing, and not only in a cloud account the customer's on-call cannot access.
 - **Keep an offline or mirrored copy** for scenarios (identity outage, network partition into an
   air-gapped site) where the primary location goes down too.
-- **The alert carries the link**, because searching for the right page costs minutes the incident does
-  not have.
+- **The alert carries the link**, because searching costs minutes.
 
 ### Runbook vs playbook
 - **Terminology varies:** some teams say *playbook* for the broader incident-handling process (roles,
@@ -289,11 +293,14 @@ print(lint(alerts, runbooks, date(2026, 10, 20)))
 
 ## Pitfalls
 - **Explaining the architecture instead of giving steps.** Symptom: an on-call who read the page and still
-  had to page the original engineer. Fix: imperative, exact steps.
+  had to page the original engineer. Diagnose: in the incident timeline, find the step where they stopped
+  and whether it named an exact flag or query. Fix: imperative, exact steps.
 - **Never testing them.** Symptom: a step references a flag, dashboard or command renamed months ago,
-  discovered mid-incident. Fix: game days and a last-tested date.
+  discovered mid-incident. Diagnose: check every flag and dashboard a runbook names against the live
+  config, plus its last-tested date. Fix: game days and a last-tested date.
 - **Alerts with no linked runbook.** Symptom: repeated pages that each get the same ad-hoc response and no
-  consistent mitigation time. Fix: lint for the link in CI.
+  consistent mitigation time. Diagnose: lint the alert rules for a missing `runbook_url`. Fix: fail CI on
+  it.
 - **Leaving out AI-specific situations** such as cost spikes, agent loops, guardrail-block surges or
   prompt-injection reports. Symptom: a generic "service degraded" response to a problem that needed a kill
   switch. Fix: write the four agent runbooks in the table above before go-live.
@@ -303,8 +310,9 @@ print(lint(alerts, runbooks, date(2026, 10, 20)))
   Symptom: in an identity or network outage the on-call cannot open the page that tells them what to do.
   Fix: a mirrored or offline copy outside the blast radius.
 - **Writing them only for the vendor team.** Symptom: a customer operations team that escalates every page
-  during hypercare because the runbooks assume access and context they do not have. Fix: rewrite them in
-  the customer's tools and access model, then rehearse them in a game day with their on-call.
+  during hypercare because the runbooks assume access and context they do not have. Diagnose: track
+  escalation rate per runbook. Fix: rewrite them in the customer's tools and access model, then rehearse
+  with their on-call.
 
 ## When to use
 - **Use for:** every alert that pages a human, and every known failure mode a different team will
@@ -314,8 +322,18 @@ print(lint(alerts, runbooks, date(2026, 10, 20)))
   systems.
 - **Measure:** time to mitigate, how often responders escalate despite the runbook, and how often an
   incident finds a runbook wrong.
-- **Interviews:** alert-linked runbooks with pre-authorised mitigations and rehearsal show operational
-  maturity beyond "we have monitoring".
+
+## Exercise
+**Goal:** write one agent runbook a stranger can execute, and prove it in a game day. No solution is
+given.
+- **Inputs:** an agent you have built, or a toy one with two tools; pick "tool misbehaving" or
+  "prompt injection reported" from the table above.
+- **Constraints:** every step names an exact flag, query or command that exists today; the confirm step
+  separates a real problem from a false alarm; pre-authorised actions are listed.
+- **Deliver:** the runbook, any levers you had to add to the agent, the alert rule carrying its
+  `runbook_url`, and a game-day log.
+- **Acceptance:** someone who did not build the agent mitigates the injected failure within 15 minutes
+  using only the runbook; the lint script passes; every hesitation in the log led to an edit.
 
 ## Role lens
 - **Engineer:** Writes runbooks for the failure modes they built in, with exact flags and queries, and
@@ -355,24 +373,11 @@ under realistic conditions.
 - **Mitigate with the smallest lever:** disable that tool or lower the max-step limit, cap a hot tenant,
   then verify cost and step-budget hits return to baseline before re-enabling on one tenant first.
 
-### Which actions would you pre-authorise for the on-call, and which not?
-- **Pre-authorise reversible, harm-stopping actions:** switch to a fallback model, disable an agent's write
-  tools, block or rate-limit a tenant, shed load.
-- **Keep approval for irreversible or customer-contract changes**, and keep the confirm step strict so
-  disruptive steps follow evidence rather than false alarms.
-
 ### What must you build into an agent so its runbooks can actually be executed?
 - **Levers per risk:** a disable flag per tool, a read-only mode for write tools, a max-step override, a
   fallback model route and per-tenant caps, all changeable without a redeploy.
 - **Graceful degradation and traceability:** the agent must keep working (or hand off) with a tool
   disabled, and every run needs a searchable trace ID so the confirm step can find it.
-
-### How do you know a runbook still works six months after handoff?
-- **Last-tested date and owner on each one**, with a CI check that flags stale runbooks and alerts missing
-  a link.
-- **Game days and postmortem reviews:** rehearse in staging and update the runbook after every incident
-  where it was wrong or missing. Store runbooks outside the system's blast radius, with a mirrored or
-  offline copy, so an identity outage does not hide them.
 
 ## Quiz
 ### Q: Why do runbooks put mitigation steps before diagnosis?
@@ -398,6 +403,21 @@ under realistic conditions.
 - [ ] Convert it into a postmortem template
 > Automation fails in unusual conditions, which is when operators most need context. The runbook becomes
 > the fallback for the automation and explains its behaviour so responders do not fight it.
+
+## Mastery test
+**Problem:** an IT-ops agent can restart services and close tickets. The alert "guardrail block rate
+above 3x baseline for 10 min" fires at 2 a.m.; the customer's on-call has a read-only console and no vendor
+access.
+
+Outline the runbook: which branches does confirm need, and which mitigations are pre-authorised?
+
+**A strong answer:**
+- confirm splits an attack (one tenant or source, injected text in tool results), a guardrail or model
+  change (blocks across all tenants just after a release), and a real shift in user requests;
+- pre-authorises reversible levers the on-call can reach: disable the source connector, switch restart
+  and close tools to approval-only, roll back the guardrail policy flag;
+- preserves traces and notifies security for a suspected injection;
+- names the escalation rota and the recovery metric.
 
 ## Use cases & projects
 ### Use cases

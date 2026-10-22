@@ -5,8 +5,13 @@ name: Similarity search (cosine, dot product)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: partial
+prerequisites:
+  - model-internals/embeddings
+  - math-for-ai/linear-algebra-intuition
 related:
   - rag-retrieval/embedding-models
   - rag-retrieval/embedding-dimension-and-normalization
@@ -300,18 +305,20 @@ Exact scan cost is bytes read per query, N × d × bytes per element (1M vectors
 
 ## Pitfalls
 - **Index and query operators disagree.** The index uses `vector_cosine_ops`, the query uses `<->`.
-  Symptom: query time grows linearly with corpus size and `EXPLAIN` shows a sequential scan. Fix: query
-  with the matching operator or build a matching index.
+  Symptom: query time grows linearly with corpus size. Diagnose: `EXPLAIN` the exact SQL the retriever
+  emits; it shows a sequential scan. Fix: query with the matching operator or build a matching index.
 - **L2 or dot product on raw outputs of a cosine-trained model.** Symptom: rankings disagree with the
-  vendor's playground for the same query, usually favoring long passages. Fix: normalize.
+  vendor's playground for the same query, usually favoring long passages. Diagnose: log stored norms for
+  a sample; a wide spread means unnormalized vectors. Fix: normalize.
 - **Copying a similarity threshold** (say 0.8) from a blog post or a previous model. Symptom: after an
-  embedding upgrade everything or nothing passes, because the score distribution shifted, and the agent
-  suddenly reports "nothing found" on every task. Fix: recalibrate.
+  embedding upgrade everything or nothing passes, so the agent reports "nothing found" on every task.
+  Diagnose: plot the score histogram of labeled relevant and irrelevant pairs for the new model; it has
+  shifted. Fix: recalibrate.
 - **Treating score as confidence across queries.** A 0.72 for one query and a 0.72 for another say
   nothing comparable, so "answer only if score > t" needs per-model calibration on labeled pairs.
 - **Mixing two embedding models or versions in one collection.** Symptom: documents indexed after the
-  switch are never retrieved (or only they are), since the two spaces are unrelated. Agent memories
-  written before an upgrade vanish the same way. Fix: re-embed.
+  switch are never retrieved (or only they are), since the two spaces are unrelated; old agent memories
+  vanish the same way. Diagnose: group rows by stored model version. Fix: re-embed.
 
 ## When to use
 Every dense retrieval step in an agent makes this choice, usually implicitly inside a framework default.
@@ -322,8 +329,17 @@ Every dense retrieval step in an agent makes this choice, usually implicitly ins
   raising an error.
 - **Use brute force when** the corpus is small (per-user memory, a single customer's documents) or you
   need an exact reference; move to an approximate index when latency or memory forces it.
-- **Interviews:** derive the relationship between the three scores and explain why a cosine-trained model
-  should not be queried with dot product on raw vectors.
+
+## Exercise
+**Goal:** audit the similarity setup of a retrieval tool end to end and prove it with numbers. No
+solution is given.
+- **Inputs:** any open embedding model you can run (read its card for the training similarity), 1,000+
+  chunks of your own documents, and 30 agent-style queries each labeled with one relevant chunk.
+- **Deliver:** recall@5 for cosine, raw dot product and L2, with and without normalization; a score
+  threshold picked at 90% precision on half the labels; and a `search_docs` tool that returns an
+  explicit "no relevant passages" note below it.
+- **Acceptance:** the settings you expect to tie do tie exactly; the threshold holds within 5 points of
+  precision on the held-out half; if you use pgvector, `EXPLAIN` shows an index scan.
 
 ## Role lens
 - **Engineer:** Chooses `normalize_embeddings=True` and the matching operator class, writes the
@@ -349,12 +365,6 @@ probably for the better if the model was cosine-trained. A strong answer also me
 brute-force recall check on a labeled sample before and after.
 
 ## Interview questions
-### Why do cosine, dot product and L2 give the same ranking on normalized vectors, and why does that matter?
-- **The algebra:** with unit norms, cosine equals the dot product, and ‖q − d‖² = 2 − 2·cos, a
-  monotone transform, so all three order candidates identically.
-- **Why it matters:** normalizing once at write time lets you use the cheapest score (dot product) and
-  any index built for inner product or L2 while still getting cosine results.
-
 ### Your RAG agent started giving wrong answers after a team swapped embedding models. How do you debug it?
 - **Check the contract first:** which similarity does the new model card name, are vectors normalized,
   and does the collection mix rows from the old and new model?
@@ -416,6 +426,20 @@ brute-force recall check on a labeled sample before and after.
 > Cosine is bounded by one regardless of dimension or normalization, so neither mechanical explanation
 > holds. Each model places query–document pairs in its own band of scores; a threshold calibrated on one
 > model is an arbitrary line for another and must be re-estimated on labeled pairs.
+
+## Mastery test
+**Problem:** an agent's memory lives in pgvector with an HNSW index on `vector_l2_ops`. The team swaps
+a dot-product-trained retriever for a cosine-trained model, writes new memories raw, and keeps the old
+rows and the 0.6 "relevant" cutoff.
+
+A week later the agent ignores old memories and often re-queries. What happened, and what is your plan?
+
+**A strong answer:**
+- names three faults: two unrelated spaces in one table, L2 on raw cosine-model vectors mixing in length,
+  and a cutoff calibrated on another model's score band;
+- explains why old rows vanish: query vectors from the new model have no meaningful geometry against them;
+- plans a new normalized collection per version, an inner-product index, a recalibrated cutoff, and a
+  recall@k check against brute force before switching the tool.
 
 ## Use cases & projects
 ### Use cases

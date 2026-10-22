@@ -5,8 +5,13 @@ name: Task-specific acceptance criteria
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - evals/model-evaluation
+  - evals/golden-dataset
 related:
   - evals/golden-dataset
   - evals/rubrics
@@ -190,6 +195,14 @@ def gate(results):                     # results: [(slice, [(name, passed, sever
             verdict["soft"][f"{name}/{slc}"] = (round(rate, 3), rate >= need)
     verdict["ship"] = not hard_fail and all(ok for _, ok in verdict["soft"].values())
     return verdict
+
+# demo: 49 clean tickets and one whose summary carries an email address
+lab = {"category": "billing", "priority": "P2"}
+ok = json.dumps({"category": "billing", "priority": "P2", "summary": "Customer was charged twice"})
+bad = json.dumps({"category": "billing", "priority": "P2", "summary": "Reply to ann@example.com"})
+t = {"text": "I was charged twice"}
+v = gate([("billing", list(checks(t, ok, lab)))] * 49 + [("billing", list(checks(t, bad, lab)))])
+print(v["blocking"], v["ship"])        # [('billing', 'no_pii_in_summary')] False
 ```
 
 - **Intended behaviour:** a single ticket whose summary contains an email address blocks the release
@@ -283,15 +296,18 @@ print(f"items for +/-5 points at 85%: {items_for(0.85, 0.05)}")
 
 ## Pitfalls
 - **Criteria that paraphrase the prompt** ("output should be accurate and helpful"). Symptom: a judge
-  that passes almost everything and a release meeting that still argues from anecdotes.
+  that passes almost everything and a release meeting that still argues from anecdotes. Diagnose: try
+  to write each criterion as a function; any you cannot is a paraphrase. Fix: derive from failure clusters.
 - **One aggregate quality score as the only gate.** Symptom: a rare catastrophic failure (PII, a
-  fabricated refund) ships inside a high overall score.
+  fabricated refund) ships inside a high overall score. Diagnose: count hard-criterion violations per
+  run separately from the score. Fix: hard criteria block on one occurrence.
 - **Round-number thresholds** instead of the downstream cost of errors. Symptom: a gate that blocks
-  harmless regressions and passes harmful ones.
+  harmless regressions and passes harmful ones. Diagnose: log each block and whether review later
+  judged it harmless.
 - **No operational criteria.** Symptom: a quality improvement that triples latency, discovered by users
   rather than by the eval.
 - **Criteria in a document while graders drift.** Symptom: a passing eval for a behaviour the document
-  says is forbidden.
+  says is forbidden. Diagnose: diff criterion names in the document against the grader registry.
 - **No per-slice floors.** Symptom: a merged change raised the average by regressing the one category
   the enterprise customer cares about.
 - **A clean offline run taken as proof a hard criterion holds.** Symptom: the first real violation
@@ -308,8 +324,16 @@ print(f"items for +/-5 points at 85%: {items_for(0.85, 0.05)}")
 - **Measure** them in the harness, enforce them in CI and, where cheap, monitor them online.
 - **Most valuable in forward-deployed work,** where the customer's sign-off on criteria makes "done"
   unambiguous.
-- **Interviews:** given a task, write its criteria. The strong answer separates hard from soft, names
-  slices, ties thresholds to downstream cost, and includes an operational limit.
+
+## Exercise
+**Goal:** write and enforce acceptance criteria for one agent you have (or a refund toy agent with
+three tools), derived from its real failures. No solution is given.
+- **Inputs:** 50 or more stored outputs or traces, read and clustered by hand; the agent's tools.
+- **Deliver:** a criteria registry (name, scope, check, threshold, severity, owner) with at least two
+  hard, three soft with slice floors sized to slice *n*, and one operational limit; a gate script; a
+  runtime guard in the tool handler for each hard write criterion.
+- **Acceptance:** every criterion traces to a failure cluster; the gate exits non-zero on a planted
+  violation; the guard refuses an out-of-order write in a unit test; each floor's interval is printed.
 
 ## Role lens
 - **Engineer:** Implements each criterion as a grader, keeps rubric text versioned with the judge, and
@@ -332,14 +356,6 @@ never below 90% for any language slice. Operational: p95 under a few seconds, bo
 I would get the support lead to sign the list, encode every check as a grader, and gate releases on it.
 
 ## Interview questions
-### What are task-specific acceptance criteria, and why not use one overall quality score?
-- **Definition:** checkable statements about one task's outputs, covering format, content, correctness,
-  edge cases, latency and cost, each with a threshold, a scope and a severity.
-- **Why not one score:** a single judge rating hides which property failed and averages catastrophic
-  with cosmetic, so a 1% PII leak inside an otherwise perfect system still scores 99%.
-- **They are a contract** between the builders and the people who live with the feature, so "done" is
-  defined before the demo.
-
 ### Write acceptance criteria for an invoice field extractor that feeds an accounting system.
 - **Hard, 100%:** output is valid JSON matching the schema, because a parse failure breaks the
   downstream import; amounts are numeric; currency is from an allowed set.
@@ -402,6 +418,20 @@ I would get the support lead to sign the list, encode every check as a grader, a
 - [ ] Re-run with more samples until the slice reaches 90%
 > Per-slice floors exist precisely so that an average cannot mask a failing segment. Re-running does not
 > fix a real 71%; the slice must be investigated and the fix measured.
+
+## Mastery test
+**Problem:** a calendar agent books meetings for executives via `find_slots`, `create_event` and
+`send_invite`. The product owner's spec reads "books the right meeting quickly and politely". The
+golden set has 120 tasks; 15 involve external attendees. Write the criteria and say what the eval
+can and cannot prove.
+
+**A strong answer:**
+- hard with runtime guards: no `send_invite` to external addresses without confirmation, no double
+  booking, `create_event` only on a slot `find_slots` returned;
+- soft: final calendar state correct with an intent floor, noting 15 external tasks give about ±25
+  points at p = 0.5;
+- operational: steps, p95 latency and cost per booking;
+- notes 0/120 violations only bounds the rate near 2.5%, so the guards are the real control.
 
 ## Use cases & projects
 ### Use cases

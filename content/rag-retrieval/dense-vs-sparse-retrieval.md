@@ -5,8 +5,13 @@ name: Dense vs sparse retrieval
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - rag-retrieval/embedding-models
+  - rag-retrieval/similarity-search
 related:
   - rag-retrieval/bm25-internals
   - rag-retrieval/inverted-indexes
@@ -317,15 +322,18 @@ arm is worth its cost here; if one set were a subset of the other, it would not 
 ## Pitfalls
 - **Shipping dense-only because the demo paraphrases worked.** Symptom: tickets like "I searched the
   exact ticket number and got unrelated results", or an agent that cannot find a record by the id another
-  tool just returned. Fix: add a sparse arm.
+  tool just returned. Diagnose: recall@k on the identifier slice of traced queries. Fix: add a sparse arm.
 - **Shipping sparse-only with the default analyzer.** Symptom: zero-result or wrong-result queries
-  whenever users use synonyms, plurals the stemmer misses, or another language.
+  whenever users use synonyms, plurals the stemmer misses, or another language. Diagnose: zero-result
+  rate by query class. Fix: add a dense arm.
 - **Evaluating a dense model on the vendor's benchmark, not your corpus.** Symptom: recall collapses on
-  internal jargon, acronyms and tables that look nothing like web text.
+  internal jargon, acronyms and tables that look nothing like web text. Diagnose: compare it with BM25 on
+  a labeled in-domain slice.
 - **Large chunks for dense retrieval.** Symptom: relevant passages rank below shorter, vaguely related
   chunks, because the long chunk's vector is an average of many topics.
 - **Refreshing sparse and dense indexes separately.** Symptom: a document appears in keyword results but
-  not semantic results (or vice versa) for hours after an update.
+  not semantic results (or vice versa) for hours after an update. Diagnose: log each index's latest
+  document version; alert on the gap. Fix: one change stream.
 
 ## When to use
 Start from the queries, including the ones the agent writes.
@@ -338,8 +346,16 @@ Start from the queries, including the ones the agent writes.
 - **Decide with data.** Build a labeled query set, measure recall@k for each retriever alone and combined,
   and look at which queries each loses. If BM25's wins are a subset of dense's, a second arm adds cost and
   nothing else; if each wins queries the other loses, the union bounds what hybrid can reach.
-- **Interviews:** name each family's structural failure modes, explain why BM25 remains a strong
-  baseline, and say what learned sparse models add.
+
+## Exercise
+**Goal:** decide, with evidence, whether your agent's search tool needs one arm or two. No solution is
+given.
+- **Inputs:** 2,000+ chunks of a technical corpus (product docs, a codebase's issues or runbooks) and
+  40 labeled queries: half identifier-style copied from tool output, half paraphrased questions.
+- **Deliver:** recall@5 for BM25, one open bi-encoder and their union per slice; the "only BM25" and
+  "only dense" query lists; one analyzer change that keeps codes whole, with its before and after.
+- **Acceptance:** numbers reproduce from a single script; each slice has a written verdict; your
+  recommendation follows from the union gain, not from the overall average.
 
 ## Role lens
 - **Engineer:** Builds both retrievers behind one interface, keeps tokenization consistent between index
@@ -364,12 +380,6 @@ would also check tokenization of identifiers in both systems, since hyphen handl
 those queries.
 
 ## Interview questions
-### What is the core difference between dense and sparse retrieval?
-- **Both score with an inner product;** what differs is who defines the dimensions. Sparse uses vocabulary
-  terms fixed by the analyzer with count-based weights; dense uses d latent features learned in training.
-- **So sparse is exact and interpretable** but blind to synonyms, while dense matches paraphrases but blurs
-  rare tokens and needs re-embedding on every model change.
-
 ### Would you give your agent one search tool or separate keyword and semantic tools?
 - **Default to one fused tool:** both arms run on every call and fusion handles the mix, so the model
   cannot misroute an identifier query to the dense arm.
@@ -429,6 +439,18 @@ those queries.
 > SPLADE keeps the sparse, vocabulary-dimensional representation and inverted-index serving, but learns
 > the weights and expands documents with related terms, which addresses vocabulary mismatch without a
 > vector database. The index structure is unchanged.
+
+## Mastery test
+**Problem:** a coding agent searches 30,000 internal GitHub issues. Its traces show three query kinds:
+stack-trace lines pasted from a test tool, symptom descriptions like "login hangs after SSO redirect",
+and function names. Issues are filed and closed all day, and there is no GPU. Design the retrieval.
+
+**A strong answer:**
+- keeps BM25 as backbone, with an analyzer that preserves dotted and snake_case names and error codes;
+- adds a dense arm through an embedding API or a small CPU model only if the symptom slice shows a
+  measured union gain;
+- runs both behind one fused tool so the agent cannot misroute, refreshed from one change stream;
+- evaluates per slice on traced queries and logs which arm supplied each hit.
 
 ## Use cases & projects
 ### Use cases

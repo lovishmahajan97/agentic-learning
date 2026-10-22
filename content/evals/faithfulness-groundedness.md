@@ -5,8 +5,13 @@ name: Faithfulness / groundedness
 kind: metric
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: partial
+prerequisites:
+  - evals/llm-as-a-judge
+  - rag-retrieval/citations-grounding
 related:
   - evals/hallucination-evaluation
   - evals/retrieval-evaluation
@@ -315,19 +320,22 @@ An eval run over 400 answers (illustrative numbers).
 
 ## Pitfalls
 - **Scoring at answer level instead of claim level.** Symptom: 95% "grounded" answers while a slice of
-  them carry wrong numbers or dates. Fix: atomic claims.
+  them carry wrong numbers or dates. Diagnose: run the number guard over the "grounded" answers. Fix:
+  atomic claims.
 - **Leaving tool results out of the context.** Symptom: correct agent replies about order status scored
-  NOT_FOUND because the verifier saw only retrieved chunks. Fix: build the context from every tool
-  result in the run.
+  NOT_FOUND. Diagnose: log the context the verifier saw; it held only retrieved chunks. Fix: build the
+  context from every tool result in the run.
 - **Optimising faithfulness in isolation.** Symptom: a rising abstention rate and falling answer relevance
-  as the assistant learns that silence is safe. Fix: report the triad.
+  as the assistant learns that silence is safe. Diagnose: plot abstention and claims per answer per
+  release. Fix: report the triad.
 - **Collapsing NOT_FOUND and CONTRADICTED into one "unsupported" bucket.** Symptom: an answer that
   directly contradicts policy shipping with a respectable 0.8. Fix: three-way verdicts and a gate.
 - **A judge that uses its own knowledge.** Symptom: faithfulness staying high when the context is
-  shuffled or emptied, which the sanity test catches. Fix: tighten the "context only" instruction,
-  require a quoted span, and recalibrate on the labeled claim set.
+  shuffled or emptied. Diagnose: the shuffled-context sanity test. Fix: tighten the "context only"
+  instruction, require a quoted span, and recalibrate on the labeled claim set.
 - **Decomposition that is too fine.** Symptom: scores inflating as answers get wordier because trivial
-  claims are all supported. Fix: a decomposition prompt with examples of the intended granularity.
+  claims are all supported. Diagnose: track claims per answer against answer length. Fix: a
+  decomposition prompt with examples of the intended granularity.
 - **Reporting faithfulness as if it were accuracy.** Symptom: a stakeholder reading 0.9 as "90% of
   answers are correct" when the context itself was never checked. Fix: label it "supported by context"
   and report correctness separately.
@@ -341,9 +349,19 @@ An eval run over 400 answers (illustrative numbers).
   claims.
 - **Avoid for tasks meant to draw on parametric knowledge,** such as open-domain creative writing, where
   it is not meaningful.
-- **Day to day,** it is the per-claim log attached to a trace.
-- **Interviews:** expect to lay out the correctness-versus-faithfulness 2×2, the claim-decomposition
-  pipeline and the abstention loophole.
+
+## Exercise
+**Goal:** build and calibrate a groundedness check for an agent you have, or a small tool-calling agent
+you build, so it can gate replies. No solution is given.
+- **Inputs:** 40 traces with tool calls and results, including at least 8 replies you edit to contain a
+  wrong figure, a contradicted policy or an action no tool performed.
+- **Constraints:** context is built only from the run's tool results; the verifier returns three
+  verdicts with a quoted span; action claims are checked against the tool-call record.
+- **Deliver:** per-trace faithfulness, contradiction and unsupported-action flags, verifier agreement
+  with your hand labels on 60 claims (15+ per verdict), and the shuffled-context score.
+- **Acceptance:** every edited reply is flagged by the number guard, the action check or the verifier;
+  the shuffled-context score falls well below the real one; you state which checks run inline and which
+  run async, with their cost per reply.
 
 ## Role lens
 - **Engineer:** Implements extract-then-verify with structured outputs, runs it on a sample of production
@@ -375,13 +393,6 @@ or to human review.
   built on a stale document is wrong.
 - **The distinction picks the fix:** faithful-but-wrong points at ingestion and freshness; unfaithful
   points at the generator or prompt.
-
-### How would you implement a faithfulness metric for a RAG agent from scratch?
-- **Decompose** each answer into atomic, self-contained claims with an LLM and structured output.
-- **Verify each claim against the context only,** meaning the retrieved chunks and tool results of that
-  run, with three verdicts and a quoted span, using NLI first and an LLM judge for uncertain claims.
-- **Aggregate** supported / total per answer, plus the share of answers with any contradiction, and
-  calibrate the verifier on a labeled claim set with a shuffled-context test.
 
 ### Your support agent tells users "your refund has been issued", but finance finds no refund. How do you catch this before users see it?
 - **Treat action statements as claims** whose only valid support is a successful matching tool call in
@@ -440,6 +451,21 @@ or to human review.
 > An answer with no claims is perfectly faithful, so the cheapest way to improve the metric is to say
 > less. Relevance and completeness are the counterweights that keep the gain honest.
 
+## Mastery test
+**Problem:** a finance research agent writes weekly market notes from three tools: a price API, a news
+search and an internal analyst-notes search. Mean faithfulness is 0.96.
+
+Yet a client found a note
+claiming "shares rose 4% after the earnings call" when the price tool showed a 4% fall. Explain why the
+metric missed it and redesign the check.
+
+**A strong answer:**
+- sees that the number guard passes (4 appears in the context) and a lenient verifier can miss a
+  flipped direction, so a contradiction hid inside a 0.96 mean;
+- adds structured checks of figure plus direction and date against the price tool, a contradiction gate
+  per note, and verifier calibration on sign-flip and wrong-entity claims;
+- reports the share of notes with any contradiction and runs the shuffled-context canary.
+
 ## Use cases & projects
 ### Use cases
 - **RAG agents over company documents.** Faithfulness on sampled traces shows whether answers come from
@@ -448,8 +474,6 @@ or to human review.
   replies that promise refunds, bookings or cancellations that never happened.
 - **Agents that summarise tool output.** Research and reporting agents are scored on whether every
   figure and finding in the report appears in what their tools returned.
-- **Release gates for prompt and model changes.** A contradiction gate and the triad dashboard keep a
-  "more faithful" release from simply saying less.
 
 ### Mini project
 **Groundedness checker for a tool-calling support agent (2-3 hours).**

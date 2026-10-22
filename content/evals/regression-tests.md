@@ -5,8 +5,14 @@ name: Regression tests
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: partial
+prerequisites:
+  - evals/golden-dataset
+  - evals/eval-harness
+  - evals/pass-k
 related:
   - evals/golden-dataset
   - evals/eval-harness
@@ -35,7 +41,7 @@ telling real regressions from noise with paired, per-item comparisons.
 - **What you control.** Case contents (input, stubbed tool responses, expected trajectory or end state),
   grader order, *k* samples per case, the critical tag, the same-job baseline and the gate policy.
 - **What you can skip.** Exotic statistics. Flip lists, pass^k and McNemar's 3.84 threshold cover nearly
-  every gate decision an agent team makes.
+  every gate decision.
 
 ## Why it exists
 - **A prompt is one shared artifact.** In ordinary code a change to function A does not alter B. A
@@ -178,6 +184,11 @@ def grade_trajectory(trace: list[dict], g: dict) -> bool:
     if g["type"] == "max_steps":
         return len(calls) <= g["value"]
     raise ValueError(g["type"])                  # judge graders run in the nightly tier
+
+trace = [{"type": "tool_call", "tool": "get_order", "args": {"order_id": "A-1009"}},
+         {"type": "tool_call", "tool": "issue_refund", "args": {"order_id": "A-1009"}}]
+print([grade_trajectory(trace, g) for g in CASE["graders"] if g["type"] != "judge_ref"])
+# [True, False, True]  -> the forbidden refund call fails the case
 ```
 
 Illustrative effect of one edit to the `issue_refund` tool description ("use whenever the customer asks
@@ -193,7 +204,7 @@ for a refund"), on a 120-case agent suite with *k* = 3:
 ### pytest suite over a JSONL case file
 Each case runs *k* times, critical cases must pass every time, other cases fail only if they clearly
 got worse than the recorded baseline, and the fixture writes candidate pass rates so a separate step can
-diff them against the baseline per slice.
+diff them per slice. Checked with pytest 9.1 against a stub `myapp`.
 
 ```python
 # tests/test_regression.py  ->  pytest -q tests/test_regression.py
@@ -304,18 +315,22 @@ Illustrative numbers. The provider's new snapshot is swapped in; the full tier h
 
 ## Pitfalls
 - **Comparing aggregate pass rates.** Symptom: "82% vs 81%, looks fine" while ten items flipped each
-  way and a customer-facing case is among the losses. Fix: review the flip lists.
+  way and a customer-facing case is among the losses. Diagnose: count discordant pairs per slice. Fix:
+  review the flip lists.
 - **Asserting exact output strings.** Symptom: failures on every harmless rephrasing until someone
-  disables the suite. Fix: behavioural assertions and narrow judges.
+  disables the suite. Diagnose: diff failing outputs against expectations; same meaning, new wording.
+  Fix: behavioural assertions and narrow judges.
 - **Asserting the exact tool sequence.** Symptom: an agent that adds a harmless lookup step fails half
-  the suite. Fix: assert required and forbidden calls, key arguments, a step budget and the end state,
-  not the full ordered list.
+  the suite. Diagnose: list the extra or reordered calls in failing traces. Fix: assert required and
+  forbidden calls, key arguments, a step budget and the end state, not the full ordered list.
 - **Running only on diffs.** Symptom: a regression on a day with no commits, traced weeks later to a
   provider model update. Fix: the scheduled no-diff run.
 - **Stale expectations after an intended change.** Symptom: a permanent red test everyone ignores, which
-  hides the next real failure. Fix: update expectations in the same commit.
+  hides the next real failure. Diagnose: list cases failing for more than a week. Fix: update
+  expectations in the same commit.
 - **Diffing against a weeks-old baseline.** Symptom: flips on cases the change could not plausibly
-  affect, because provider or index drift is attributed to the PR. Fix: same-job baseline.
+  affect. Diagnose: compare the model snapshot and index version logged with each run. Fix: same-job
+  baseline.
 - **Cases leaking into the prompt as few-shot examples.** Symptom: a perfect suite score and unchanged
   production quality. Fix: keep cases out of prompts.
 - **A judge tuned on the same cases.** Symptom: the suite passes outputs the customer rejects. Fix: tune
@@ -326,14 +341,21 @@ Illustrative numbers. The provider's new snapshot is swapped in; the full tier h
 - **Run:** the smoke tier on every change to a prompt, model setting, retriever or tool schema; the
   full tier before any release and on a schedule regardless of commits. For agents, include every
   tool name, description and argument schema in what counts as a change.
-- **Keep the suite out of the prompt and out of capability claims:** cases never double as few-shot
-  examples, and "is the new version better" belongs to a held-out golden set.
 - **Measure:** per-item flips, per-slice pass rates and the suite's own flakiness (items whose pass rate
   differs between two identical runs); if flakiness exceeds your tolerance, fix graders first.
-- **Avoid when:** measuring capability. The suite is a safety net of known behaviour; a golden set with
-  held-out items answers "is the new version better".
-- **Interviews:** explain why comparisons are paired and per item, how you handle nondeterminism, and how
-  the suite grows from incidents.
+- **Avoid when:** measuring capability, and never reuse cases as few-shot examples. The suite is a
+  safety net of known behaviour; a golden set with held-out items answers "is the new version better".
+
+## Exercise
+**Goal:** build a regression gate for a small tool-calling agent that blocks a real regression and
+passes harmless changes. No solution is given.
+- **Inputs:** an agent with 2-3 stubbed tools, 20 cases from imagined or real incidents (5 tagged
+  critical), and two candidate edits: a tool-description rewrite and a reworded final-answer style.
+- **Deliver:** trajectory and end-state graders, a CI command that runs baseline and candidate in the
+  same job with *k* = 3, and a report with both flip lists, McNemar statistic and exact p-value.
+- **Acceptance:** running the identical config twice shows a flakiness rate you report; the
+  tool-description edit that breaks tool choice blocks with the flipped case IDs named; the rewording
+  passes; one hand-computed McNemar value matches the script.
 
 ## Role lens
 - **Engineer:** Owns the case file and graders, wires the smoke tier into CI, pins model and index
@@ -384,13 +406,6 @@ whether any expectations were edited in the same change, which would be a prompt
 - **Bisect the environment,** not the code: re-run with yesterday's index or model snapshot to isolate
   which component moved.
 
-### Why not just block any PR whose aggregate pass rate drops?
-- **Aggregates hide flips:** 80% to 80% can contain several regressions, including critical ones.
-- **Aggregates also cry wolf:** a one-item drop is usually noise; with 34 discordant pairs you need a
-  net difference of 12 to clear McNemar's 3.84.
-- **Better gate:** block on smoke failures and critical flips, apply a per-slice tolerance, and only warn
-  on judge-graded single flips.
-
 ### How do you keep a regression suite from becoming flaky and ignored?
 - **Order graders by determinism**, using judges only with a reference and a narrow question.
 - **Pin and record:** model snapshot, prompt hash, index version, seeds where supported, recorded tool
@@ -425,6 +440,20 @@ whether any expectations were edited in the same change, which would be a prompt
 > Free-text outputs vary in wording even when the behaviour is identical, so snapshot equality flags
 > every run. The practical response is to replace it with behavioural assertions, schema checks and
 > narrow reference-based judges.
+
+## Mastery test
+**Problem:** a coding agent's suite has 150 cases, one sample each, and compares against a baseline
+stored three weeks ago. A change to the `run_tests` tool schema shows 7 pass→fail and 4 fail→pass flips,
+none critical. The author says "noise, merge it".
+
+What do you check, and what would you change about the suite?
+
+**A strong answer:**
+- computes McNemar ((7 − 4)² / 11 ≈ 0.82) and notes 11 pairs need the exact test: not significant,
+  but not proof of noise either;
+- checks whether the 7 regressions cluster in tasks that call `run_tests`, which would be signal;
+- reruns the baseline in the same job, since three weeks of drift contaminates the flips;
+- moves to *k* samples, tags incident cases critical, and measures flakiness on an identical rerun.
 
 ## Use cases & projects
 ### Use cases

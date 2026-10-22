@@ -5,8 +5,13 @@ name: Quantized SLMs (GGUF, AWQ, quality vs memory)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: evaluate
+code_tested: partial
+prerequisites:
+  - serving-inference/kv-cache-memory-estimation
+  - slm-for-agents/running-slms-locally
 related:
   - training-adaptation/quantization
   - serving-inference/quantization-quality-evaluation
@@ -32,8 +37,8 @@ laptop, edge box or smaller GPU. GGUF suits llama.cpp and Ollama, AWQ suits vLLM
   AWQ or GPTQ repos loaded by vLLM, and the memory line in your capacity plan.
 - **What you control.** The format for your engine, the bit width, whether to use an importance matrix, and
   the eval gate that accepts or rejects a quantized build.
-- **What you can skip.** The quantizer maths; `training-adaptation/quantization` covers GPTQ, AWQ and the
-  granularity ladder. Here you choose a file and prove it still works for your agent.
+- **What you can skip.** Quantizer maths (GPTQ, AWQ, the granularity ladder: see
+  `training-adaptation/quantization`); here you choose a file and prove it works.
 
 ## Why it exists
 - **Weights dominate small-model memory.** A 7B model in 16-bit is about 14 GB of weights before any KV
@@ -80,7 +85,9 @@ Effective bits include the per-block scales, so a "4-bit" file is really around 
 | 3-bit and below | about a quarter or less | Often breaks JSON, arguments and multi-step reasoning in small models |
 
 Small models tend to lose more from aggressive quantization than large ones, because each weight carries
-more of the model's capacity. That is why a 4-bit 7B is often a better buy than a 2-bit 14B of similar size.
+more of the model's capacity. So a 4-bit 7B is often a better buy than a 2-bit 14B of similar size.
+
+At a fixed budget a 4-bit larger model often wins; below about 3 bits a smaller 8-bit model is safer.
 
 ## Diagram
 Follow one model from full precision to a deployable file: the engine picks the format, and the agent eval,
@@ -126,6 +133,7 @@ Run the same tool-calling golden set on each build. Ollama publishes several qua
 separate tags; check the model's tag list for exact names.
 
 ```python
+# Checked with the ollama Python client 0.6 (attribute access on responses needs 0.4+).
 import json, ollama
 
 BUILDS = ["qwen2.5:7b-instruct-q8_0", "qwen2.5:7b-instruct-q4_K_M", "qwen2.5:7b-instruct-q3_K_M"]
@@ -165,11 +173,10 @@ became the only metric that mattered.
 
 ## Production patterns
 - **Default to 4-5 bit, prove it, then go lower only with evidence.** Start with `Q4_K_M` or `Q5_K_M` GGUF,
-  or AWQ on GPU, and run the agent golden set against an 8-bit or 16-bit reference. Accept within a stated
-  tolerance on task pass rate and valid-JSON rate.
+  or AWQ on GPU; accept it if golden-set pass and valid-JSON rates stay within tolerance of an 8-bit or
+  16-bit reference.
 - **Calibrate with your own prompts.** When producing GGUF yourself, build an importance matrix with
   `llama-imatrix` on text resembling your agent's inputs, then pass it to `llama-quantize --imatrix`.
-  Compare against the non-imatrix build on the golden set.
 - **Pin the exact file.** Record the repo, file name and hash of the GGUF or the revision of the AWQ repo,
   because community re-uploads with the same name can differ in template or quantization recipe.
 - **Spend saved memory on context and sessions.** After quantizing weights, re-run KV-cache sizing and raise
@@ -181,22 +188,24 @@ became the only metric that mattered.
 ## Trade-offs
 - **Memory and speed vs quality.** Fewer bits fit smaller hardware and decode faster, but each step down
   costs some accuracy, and structured output degrades first. The flip point is your eval tolerance.
-- **Bigger model at lower bits vs smaller model at higher bits.** At a fixed memory budget, compare both;
-  a 4-bit larger model often wins, but below about 3 bits a smaller 8-bit model is usually safer.
 - **GGUF portability vs GPU throughput.** GGUF runs everywhere from one file but serves fewer concurrent
   requests than AWQ or FP8 in vLLM on a big GPU.
 - **Using a community quant vs producing your own.** Downloads are instant, but you inherit someone else's
   calibration data and template; producing your own costs an hour and gives control.
 
 ## Pitfalls
-- **Judging a quant by perplexity alone.** Symptom: perplexity barely moves but tool arguments break. Fix:
-  gate on the agent's golden set, including JSON validity and argument accuracy.
+- **Judging a quant by perplexity alone.** Symptom: perplexity barely moves but tool arguments break.
+  Diagnose: put valid-JSON and argument accuracy per build next to perplexity, against an 8-bit reference.
+  Fix: gate on the agent's golden set.
 - **Comparing file sizes, not total memory.** Symptom: the model loads but crashes or swaps with long
-  context. Fix: add KV cache for your context and sessions to the estimate.
+  context. Diagnose: read peak memory (`ollama ps`, `nvidia-smi`) at full context and sessions against your
+  estimate. Fix: add KV cache for your context and sessions.
 - **Mismatched format and engine.** Symptom: vLLM cannot load a GGUF efficiently, or Ollama cannot use an AWQ
-  repo. Fix: GGUF for llama.cpp and Ollama, AWQ, GPTQ or FP8 for GPU engines.
-- **Going to 2-3 bits on a small model.** Symptom: loops, malformed JSON and wrong tools. Fix: step up to 4-5
-  bits or choose a smaller model at higher precision.
+  repo. Diagnose: check the repo's files and the engine's load log. Fix: GGUF for llama.cpp and Ollama;
+  AWQ, GPTQ or FP8 for GPU engines.
+- **Going to 2-3 bits on a small model.** Symptom: loops, malformed JSON and wrong tools. Diagnose: invalid
+  JSON and repeated-call rates per build jump at the low-bit step. Fix: step up to 4-5 bits or choose a
+  smaller model at higher precision.
 
 ## When to use
 - **Use when** the model does not fit the target hardware at 16-bit, when you need more concurrent agent
@@ -205,8 +214,16 @@ became the only metric that mattered.
   models without a strong eval result.
 - **Measure** task pass rate, valid-JSON rate, tool-argument accuracy, peak memory and tokens per second for
   each build.
-- **Interviews:** expect "which quantization would you ship for this hardware, and how would you know it is
-  safe?"
+
+## Exercise
+**Goal:** make your own GGUF quants of one small model and test whether an imatrix from your agent's
+prompts helps. No solution is given.
+- **Inputs:** a 0.5B-3B instruct model, llama.cpp (`convert_hf_to_gguf.py`, `llama-imatrix`,
+  `llama-quantize`), 200 prompts resembling your agent's inputs, and a 50-case JSON golden set.
+- **Deliver:** `Q4_K_M` with and without imatrix plus `Q3_K_M`, each with file size, valid-JSON rate, field
+  accuracy and tokens per second against a `Q8_0` reference.
+- **Acceptance:** you can explain each file size's gap from parameters × effective bits ÷ 8; one script
+  reproduces the table; you can say whether perplexity would have picked the same build.
 
 ## Role lens
 - **Engineer:** Picks the GGUF or AWQ build for the engine, produces imatrix quants when needed, and runs the
@@ -244,17 +261,12 @@ Pin the file hash once accepted.
 - **Measure:** compare invalid-JSON and wrong-argument rates against the previous build on the golden set.
 - **Mitigate:** add constrained decoding or schema validation with retry, try an imatrix or 5-bit build, or
   route failures to a larger model.
-- **Prevent:** make the golden set a required gate for any quantization change.
+- **Prevent:** gate every quantization change on the golden set.
 
 ### Why is a quantized model often faster as well as smaller?
 - **Decode reads all weights every token,** so it is limited by memory bandwidth, not arithmetic.
 - **Fewer bytes per weight** means fewer bytes moved per token, so tokens per second rise on bandwidth-bound
   hardware, up to the point where dequantization overhead dominates.
-
-### How would you size memory for four concurrent agent sessions on a quantized SLM?
-- **Weights:** parameters times effective bits per weight divided by 8, from the actual file size.
-- **KV cache:** bytes per token from the config times context times four sessions, plus about 10% overhead.
-- **Check** the total against device memory and leave room for the OS or other processes on shared devices.
 
 ## Quiz
 ### Q: Roughly how much memory do the weights of a 7B model need at `Q4_K_M` compared with 16-bit?
@@ -281,6 +293,17 @@ Pin the file hash once accepted.
 > GPU engines are built around formats such as AWQ, GPTQ and FP8 with fast kernels and continuous batching.
 > GGUF is designed for llama.cpp and Ollama, and 2-bit is too aggressive for agent reliability.
 
+## Mastery test
+**Problem:** an edge device has 6 GB usable and must hold two concurrent 16k-token agent sessions. Options:
+a 4B model at `Q8_0`, an 8B at `Q3_K_M` (about 4 GB of weights), or the 4B at `Q4_K_M`. Both models have
+36 layers, 8 KV heads and head dim 128. Which fits, and what do you test?
+
+**A strong answer:**
+- computes about 0.15 MB of fp16 KV per token, so about 4.8 GB for two 16k sessions: the cache, not the
+  weights, decides;
+- finds only the 4B at `Q4_K_M` (about 2.4 GB) with an 8-bit KV cache fits, near 5.3 GB with overhead;
+- re-runs the golden set after the KV change, and offers shorter context or one session as fallbacks.
+
 ## Use cases & projects
 ### Use cases
 - **Laptop and desktop agents.** A 4-bit GGUF lets a 7B-8B model run locally next to the user's files.
@@ -288,7 +311,6 @@ Pin the file hash once accepted.
 - **Denser GPU serving.** AWQ or FP8 weights free memory for KV cache. Where 16-bit weights filled most of the
   card (a 7B on a 24 GB GPU), that can roughly double the agent sessions it holds; on an 80 GB GPU the gain
   is much smaller.
-- **Cost reviews.** Teams re-test lower bit widths when hardware is the bottleneck, gated on the agent eval.
 
 ### Mini project
 **Find the smallest safe quantization for one agent step (1-2 hours).**

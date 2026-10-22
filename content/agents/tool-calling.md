@@ -5,8 +5,12 @@ name: Tool calling
 kind: concept
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: partial
+prerequisites:
+  - agents/agent-loop
 related:
   - agents/agent-loop
   - agents/tool-schemas-and-argument-validation
@@ -82,20 +86,20 @@ and parsing actions from free text is unreliable.
   only `auto` and `none`, so the instruction must go in the prompt. Treat forcing as model- and
   mode-dependent and always check a `tool_use` block came back.
 - **`strict: true` guarantees shape, not sense.** With it on the declaration (and
-  `additionalProperties: false` in the schema) the API guarantees arguments validate against the schema.
-  That removes a class of parsing failures but says nothing about whether the values make sense.
+  `additionalProperties: false` in the schema) arguments always validate against the schema, but nothing
+  says the values make sense.
 
 ### Under the hood
-- **It is still next-token prediction.** The provider serializes declarations into a prompt format the
-  model was fine-tuned on; the model emits the call as ordinary tokens wrapped in special delimiters; the
-  API recognises them, stops generation, parses the arguments and hands you a `tool_use` block.
-- **Without `strict`, validity is a trained tendency, not a guarantee.** The model usually produces
-  schema-shaped JSON *because* it was trained on millions of such calls, but it can omit a required field
-  or invent an enum value, so your handler must validate.
+- **It is still next-token prediction.** Declarations are serialized into a prompt format the model was
+  fine-tuned on; the model emits the call as ordinary tokens inside special delimiters; the API stops
+  generation, parses the arguments and hands you a `tool_use` block.
+- **Without `strict`, validity is a trained tendency.** The model usually produces schema-shaped JSON
+  *because* it was trained on millions of such calls, but it can omit a required field or invent an enum
+  value, so your handler must validate.
 - **`strict` works by constrained decoding.** The schema is compiled into a grammar and tokens that would
-  break it are masked before sampling. That is why it can *guarantee* shape, why it supports only a
-  subset of JSON Schema (the grammar must compile), and why it cannot help with meaning.
-- **A grammar can force `"date"` to be a pattern-matching string,** not to be the date the user meant.
+  break it are masked before sampling. Hence the guarantee, the JSON Schema subset (the grammar must
+  compile), and no help with meaning: `"date"` can be forced to match a pattern, not to be the date the
+  user meant.
 
 ### Your side
 1. **Execute** the matching function for each `tool_use` block, with `input` as its arguments.
@@ -119,11 +123,11 @@ and parsing actions from free text is unreliable.
 - **Both kinds can be declared in one request.**
 
 ### Token and latency accounting
-- **Every declared tool costs tokens on every call;** a catalogue of fifty tools can be several thousand
-  tokens of fixed overhead, and selection accuracy degrades as the catalogue grows.
-- **Each round trip is a full model call plus your tool's latency.**
-- **These two facts drive most tool engineering:** small focused tool sets, deferred loading or tool search
-  for large catalogues, parallel calls for independent reads, and compact results.
+- **Every declared tool costs tokens on every call** (fifty tools can be several thousand tokens), and
+  selection accuracy degrades as the catalogue grows. **Each round trip** is a full model call plus your
+  tool's latency.
+- **Hence most tool engineering:** small focused tool sets, deferred loading or tool search, parallel
+  calls for independent reads, and compact results.
 
 ## Diagram
 One tool call is two model requests: the first returns a `tool_use` request, your code runs it, and the
@@ -150,7 +154,7 @@ sequenceDiagram
 ### One tool, one call, one result, one answer
 The point is the exact shape of each message: the assistant turn carries the `tool_use` block, the next
 user turn carries the `tool_result` with the matching id, and only then does the model produce final
-text. The rate itself is stubbed.
+text. The rate is stubbed; checked against `anthropic` 2.1.0 with scripted responses.
 
 ```python
 import json, anthropic
@@ -262,30 +266,41 @@ Illustrative assumption: about 100 tokens per tool declaration. Measure your own
 
 ## Pitfalls
 - **Descriptions that say what, not when.** Symptom: the model answers from memory when it should have
-  called, or picks the wrong one of two similar tools. Fix: add trigger conditions and negative guidance.
-- **Returning raw API payloads of thousands of tokens.** Symptom: context exhaustion after a handful of
-  steps and answers that miss the one field buried in the dump. Fix: return only the fields that matter.
+  called, or picks the wrong one of two similar tools. Diagnose: a selection eval's should-call recall and
+  confusion pairs. Fix: add trigger conditions and negative guidance.
+- **Returning raw API payloads of thousands of tokens.** Symptom: context exhaustion after a few steps and
+  answers that miss the one field buried in the dump. Diagnose: log result tokens per tool. Fix: return
+  only the fields that matter.
 - **Raising on tool failure instead of returning `is_error: true`.** Symptom: a crashed loop where a retry
-  with corrected arguments would have succeeded. Fix: route through a dispatcher that catches.
-- **Matching on the serialized `input` string (in tests or caches) instead of the parsed object.** Symptom:
-  spurious mismatches when the model escapes Unicode or slashes differently between runs. Fix: compare
-  parsed, canonicalized objects.
+  with corrected arguments would have succeeded. Diagnose: count runs ending in an uncaught handler
+  exception. Fix: route through a dispatcher that catches.
+- **Matching on the serialized `input` string (in tests or caches).** Symptom: spurious mismatches when the
+  model escapes Unicode or slashes differently between runs. Fix: compare parsed, canonicalized objects.
 - **On the Claude API, separate user messages per result, or text before the `tool_result` blocks.**
-  Symptom: a validation error about unanswered `tool_use` ids, or a model that quietly stops batching
-  independent calls. Fix: one message, results first.
+  Symptom: an error about unanswered `tool_use` ids, or a model that quietly stops batching. Diagnose:
+  dump the request and check the message after each `tool_use` turn. Fix: one message, results first.
 
 ## When to use
 - **Use when** the answer depends on data the model lacks or an effect it cannot cause: lookups, exact
   calculations, writes to systems, anything time-sensitive.
 - **Avoid when** you only want structured output from a model that is not acting. A JSON schema on the
   response (structured outputs) is the right tool where supported; forcing a "function" to extract JSON is
-  a leftover habit from before that existed.
+  a leftover habit.
 - **Measure** how often the model calls when it should and refrains when it should not, how often
   arguments validate, and tokens per completed task.
-- **Day to day** the work is writing descriptions, keeping schemas small, shaping results and handling
-  `is_error`.
-- **Interviews:** draw the request and response shapes from memory and explain why the model never
-  executes anything itself.
+- **Day to day and in interviews:** descriptions, small schemas, shaped results, `is_error`; draw the
+  request and response shapes from memory and explain why the model never executes anything.
+
+## Exercise
+**Goal:** write one provider-neutral tool layer that speaks both the Claude and OpenAI Chat Completions
+shapes. No solution is given.
+- **Inputs:** two tool definitions in a neutral format; a recorded two-call response per provider
+  (hand-written from the docs if you have no key).
+- **Deliver:** `to_provider_tools(spec, provider)`, `extract_calls(response, provider)` and
+  `results_message(results, provider)`, plus tests.
+- **Acceptance:** Claude output is one user message with every `tool_result` first; OpenAI output is one
+  `role: "tool"` message per call keyed by `tool_call_id`; an unknown tool yields an error result, not an
+  exception; comparisons use parsed arguments.
 
 ## Role lens
 - **Engineer:** Declares tools with trigger-condition descriptions, dispatches `tool_use` blocks to
@@ -378,6 +393,17 @@ logging the ratio of calls to answerable queries.
 > Selection is driven by the description; the schema shapes the arguments once a tool is chosen. Array
 > position and name length matter far less than a description that states the trigger condition.
 
+## Mastery test
+**Problem:** to stop a support agent answering from memory, a team sets `tool_choice` to `any` on every
+turn. Runs now end only at the step budget, "thanks!" triggers a search, and with extended thinking on
+every request is rejected. Explain and redesign.
+
+**A strong answer:**
+- `any` forces a call every turn, so the model can never finish with text, and small talk gets calls;
+- with extended thinking the Claude API accepts only `auto` and `none`;
+- uses `auto` with trigger conditions, forces only specific steps, and proves it with should-call
+  recall and precision on a labelled set.
+
 ## Use cases & projects
 ### Use cases
 - **Live-data assistants.** Weather, stock levels, order status and calendars reach the agent only
@@ -393,9 +419,8 @@ logging the ratio of calls to answerable queries.
 ### Mini project
 **Build a tool dispatcher with gating (1-2 hours).**
 - **Goal:** give an agent four tools and a dispatcher that executes, gates and answers every call.
-- **Steps:** declare `search_orders`, `get_order`, `issue_refund` and `send_email` with clear trigger
-  conditions in each description; write one dispatch function that looks up the handler, catches
-  exceptions into error results and blocks `issue_refund` above a set amount until a human approves;
-  run ten prompts, including two that should use no tool.
+- **Steps:** declare `search_orders`, `get_order`, `issue_refund` and `send_email` with trigger
+  conditions; extend the dispatcher above to block `issue_refund` above a set amount until a human
+  approves; run ten prompts, including two that should use no tool.
 - **Done when:** every tool call in the log has a matching result, the blocked refund produced an
   approval request instead of a side effect, and the two no-tool prompts were answered directly.

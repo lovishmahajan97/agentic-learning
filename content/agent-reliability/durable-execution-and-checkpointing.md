@@ -5,8 +5,13 @@ name: Durable execution & checkpointing
 kind: concept
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - agents/agent-loop
+  - backend-fundamentals/background-jobs-durable-workers
 related:
   - agent-reliability/state-persistence-and-conversation-recovery
   - agent-reliability/state-and-checkpoint-stores
@@ -53,8 +58,6 @@ so checkpointing is inseparable from idempotent tools.
 - **The naive answers fail.** "Background job with retries" restarts from zero, with the problems above;
   "keep the state in memory and hope" is where most prototypes live. Neither answers: when the process
   comes back, how does it know what already happened?
-- **What it takes.** State written somewhere durable before the process can lose it, and a resume
-  procedure that reads it and continues without redoing side effects.
 
 ## How it works
 ### What a checkpoint contains
@@ -155,8 +158,7 @@ The sequence:
   changed". Less often widens the window of lost work.
 - **Inside a step, save each completed tool result,** so a step with several parallel calls does not
   re-run finished ones on resume.
-- **Anything finer buys little.** Saving partial model output is pointless because a model call can be
-  repeated safely: it costs tokens but has no side effects.
+- **Anything finer buys little,** since a model call can be repeated safely (see What you can skip).
 - **Latency matters.** The write sits on the critical path of every step; that is the topic of the state
   and checkpoint stores lesson.
 
@@ -312,23 +314,25 @@ for fresh in (False, True):
   honour them; tools that cannot must be gated behind approvals or an outbox instead.
 
 ## Pitfalls
-- **Checkpointing only after tool execution.** The symptom is duplicate tickets, emails or commits after
-  worker restarts, each a few seconds apart. Fix: save the intent first.
-- **Regenerating idempotency keys randomly on resume.** The symptom is a dedup layer that exists but
-  duplicates that still appear after crashes. Fix: derive keys from run id, step and call index.
-- **Resuming without a lease.** The symptom is two workers continuing the same run and a transcript with
-  interleaved, contradictory tool results. Fix: an expiring lease with fencing.
-- **Changing the prompt or tool schema without a version check.** The symptom is resumed runs failing
-  with malformed-history errors or behaving differently from fresh ones. Fix: versioned checkpoints.
-- **Storing the entire transcript in every snapshot.** The symptom is checkpoint storage growing
-  quadratically and store latency climbing as runs lengthen. Fix: append-only events plus a small
-  snapshot.
-- **Waiting for a human approval inside a live worker.** The symptom is runs lost whenever a deploy
-  happens during business hours, and worker pools sized for idle waiting rather than work. Fix: park
-  the run.
-- **Treating a crash-resume as a new attempt with a fresh run id.** The symptom is the same as random
-  keys: duplicates after restarts, because every derived idempotency key changed. Fix: keep the run id,
-  bump a resume counter.
+- **Checkpointing only after tool execution.** Symptom: duplicate tickets, emails or commits after worker
+  restarts, each a few seconds apart. Diagnose: line up duplicate timestamps with worker restart times.
+  Fix: save the intent first.
+- **Regenerating idempotency keys randomly on resume.** Symptom: a dedup layer exists but duplicates still
+  appear after crashes. Diagnose: compare the keys sent by both attempts. Fix: derive keys from run id,
+  step and call index.
+- **Resuming without a lease.** Symptom: two workers continue the same run, and the transcript has
+  interleaved, contradictory tool results. Diagnose: log worker id and lease epoch on every write. Fix:
+  an expiring lease with fencing.
+- **Changing the prompt or tool schema without a version check.** Symptom: resumed runs fail with
+  malformed-history errors or behave differently from fresh ones. Diagnose: resume failures grouped by
+  checkpoint version. Fix: versioned checkpoints.
+- **Storing the entire transcript in every snapshot.** Symptom: storage growing quadratically and store
+  latency climbing as runs lengthen. Fix: append-only events plus a small snapshot.
+- **Waiting for a human approval inside a live worker.** Symptom: runs lost whenever a deploy happens in
+  business hours, and worker pools sized for idle waiting. Fix: park the run.
+- **Treating a crash-resume as a new attempt with a fresh run id.** Symptom: as with random keys,
+  duplicates after restarts, because every derived key changed. Diagnose: count run ids per logical task.
+  Fix: keep the run id, bump a resume counter.
 
 ## When to use
 - **Use when:** a run can outlive a single request, touches external systems, or costs enough that
@@ -339,8 +343,18 @@ for fresh in (False, True):
   engine when runs are long, span human waits of hours or days, and you already run workflow
   infrastructure.
 - **Measure:** resume success rate, duplicate-side-effect incidents and checkpoint write latency.
-- **Interviews:** the question is usually "what happens if the worker dies between the API call and
-  recording its result"; have the three-phase answer ready.
+
+## Exercise
+**Goal:** prove a real agent loop of yours survives a crash at every boundary with no duplicate side
+effect. No solution is given.
+- **Inputs:** a loop with at least one side-effecting tool (a SQLite "tickets" table is enough) and two
+  parallel tool calls per step.
+- **Constraints:** checkpoints in a durable store, intent-execute-record with keys from run id, step and
+  call index, an expiring lease, and a `schema_version` field.
+- **Deliver:** a fault-injection test that crashes after each save and each tool execution in turn and
+  resumes under the same run id, plus one run parked for approval and woken by a signal.
+- **Acceptance:** every crash point yields exactly one effect per logical call; a second worker cannot
+  write while the lease is held; a checkpoint from the previous schema version still resumes.
 
 ## Role lens
 - **Engineer:** Writes the save-before-execute loop and the resume path with pending-intent
@@ -374,12 +388,6 @@ attempts and a second ticket appears.
 - **Then after each tool result,** so parallel calls that finished are not re-run.
 - **Not only after tools,** because a crash between the side effect and the save would duplicate it;
   losing an unsaved model response only costs tokens.
-
-### Snapshot checkpointing or a Temporal-style replay engine: how do you choose?
-- **Snapshot** for a simple loop you control with minimal dependencies; it is framework-agnostic but
-  needs care with growing transcripts.
-- **Replay** when runs are long, wait hours or days on humans, and workflow infrastructure already
-  exists; the price is deterministic orchestration code and versioning on every deploy.
 
 ### After a deploy, the team sees duplicate Jira tickets. How do you debug it?
 - **Check key derivation first:** if keys are random or the resume minted a new run id, nothing links the
@@ -419,6 +427,19 @@ attempts and a second ticket appears.
 - [ ] The model's temperature setting
 > Without recorded pending intents, a resume cannot tell whether an in-flight tool ran; it either
 > repeats the side effect or loses it. Prompt text and settings are reconstructable from a version id.
+
+## Mastery test
+**Problem:** a payments-ops agent issues refunds through a provider API that has no idempotency keys.
+Runs often wait a day for a manager's approval, and workers redeploy several times a day. Design
+checkpointing and resume so no refund is ever issued twice.
+
+**A strong answer:**
+- records the intent with a deterministic key before calling, and wraps the API in an adapter with its
+  own dedup table, writing the key into the refund's reference field;
+- on a pending intent without a result, reconciles first (look up by reference) instead of retrying
+  blindly, because the call is not idempotent;
+- parks the run during the approval wait and resumes under a lease with fencing;
+- marks the refund call non-retryable and tests a crash at every boundary.
 
 ## Use cases & projects
 ### Use cases

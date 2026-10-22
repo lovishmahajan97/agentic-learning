@@ -5,8 +5,13 @@ name: Reranking (cross-encoder)
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - rag-retrieval/hybrid-search
+  - model-internals/self-attention
 related:
   - rag-retrieval/hybrid-search
   - rag-retrieval/similarity-search
@@ -339,13 +344,16 @@ runs out.
 
 ## Pitfalls
 - **Reranking the top 5 and expecting better recall.** Symptom: "the reranker did nothing", because the
-  answer was never in the five. Rerankers reorder, they do not retrieve; widen n.
+  answer was never in the five. Diagnose: recall@n of the first stage on labeled queries. Rerankers
+  reorder, they do not retrieve; widen n.
 - **Chunks longer than the reranker's maximum length.** Symptom: long, relevant passages score low because
-  only their first few hundred tokens were read.
+  only their first few hundred tokens were read. Diagnose: count candidate tokens with the reranker's own
+  tokenizer and log the truncated share. Fix: window.
 - **A web-QA reranker in a domain with its own relevance** (legal, clinical, code). Symptom: confident
-  reordering that human reviewers disagree with. Validate with NDCG on your labels and fine-tune if needed.
+  reordering that human reviewers disagree with. Diagnose: NDCG before and after on your labels. Fix:
+  fine-tune or swap.
 - **Unbatched reranking on the critical path.** Symptom: p95 latency scales with n because candidates were
-  scored one at a time, multiplied by every search the agent makes.
+  scored one at a time, multiplied by every search the agent makes. Diagnose: count `predict` calls per search.
 - **Raw-logit thresholds copied from another model or dataset.** Symptom: a "no relevant context" path
   that fires on everything or never, since score scales differ between rerankers; the agent then either
   gives up on every task or never admits it found nothing.
@@ -361,8 +369,16 @@ runs out.
 - **Measure:** NDCG@k or MRR before and after, recall@n at the chosen depth, added p95 latency and
   per-query cost, plus agent task success and tool-result tokens per task.
 - **Day to day:** the n and k configuration, the batching code and the length check.
-- **Interviews:** explain why a bi-encoder cannot do what a cross-encoder does, and why that makes two
-  stages necessary.
+
+## Exercise
+**Goal:** add a cross-encoder to an existing search tool and justify n, k and the threshold with
+measurements. No solution is given.
+- **Inputs:** any first-stage retriever over 2,000+ chunks, 40 labeled queries (some with no answer in the
+  corpus), and an open cross-encoder you can run locally.
+- **Deliver:** recall@n for n = 10 to 200; NDCG@5 before and after reranking; p95 rerank latency per n,
+  batched; a threshold for "nothing relevant"; a timeout fallback; a per-source cap.
+- **Acceptance:** the chosen n sits just past the recall knee; the threshold fires on most no-answer queries
+  and few answerable ones on a held-out half; killing the reranker returns first-stage results, not an error.
 
 ## Role lens
 - **Engineer:** Wires the batched cross-encoder call between retrieval and prompt assembly, enforces the
@@ -387,14 +403,6 @@ than the top 5, reranking only changed order inside a context the model cannot u
 those checks would I try a different or fine-tuned reranker.
 
 ## Interview questions
-### What is the difference between a bi-encoder and a cross-encoder, and why use both?
-- **Bi-encoder:** embeds query and passage independently, so passage vectors are precomputed and scoring
-  is one dot product, which scales to millions of passages.
-- **Cross-encoder:** runs attention over query and passage as one sequence, catching negation, wrong years
-  and missing answers, but needs a full forward pass per pair with nothing precomputable.
-- **So two stages:** the bi-encoder (or BM25, or hybrid) for recall, the cross-encoder for precision over
-  a few dozen candidates.
-
 ### Your agent's context grows past budget on research tasks and its answers wander. How can reranking help?
 - **Shrink each tool result:** rerank 50 candidates and return the top 3 instead of 10, so a 5-search
   task adds about 6,000 tokens of results rather than 20,000 at 400-token chunks.
@@ -454,6 +462,18 @@ those checks would I try a different or fine-tuned reranker.
 > Reranking can only promote what retrieval returned; if the relevant chunk was already within the first
 > 20 nearly every time, deeper candidate lists add cost without new relevant material. Batch size affects
 > throughput, not per-pair scores, and sequence length is per pair, not per batch.
+
+## Mastery test
+**Problem:** a contracts agent reranks 50 hybrid candidates with a 512-token MiniLM cross-encoder. Clauses
+average 1,500 tokens, data may not leave the customer's network, and the agent searches 8 times per task.
+Reviewers say it misses exceptions buried late in clauses and ignores carve-outs that modify a rule.
+
+**A strong answer:**
+- diagnoses truncation: only each clause's first ~490 tokens are scored, so late exceptions are invisible;
+- windows or re-chunks, and costs it: about 4 windows per clause is ~200 pairs, roughly 5× the 21,000
+  encoder tokens of 400-token chunks, paid 8 times per task;
+- recovers budget by picking n from the recall@n knee, self-hosting because hosted APIs are ruled out;
+- keeps rule and carve-out together via larger k or parent expansion, since pairs are scored in isolation.
 
 ## Use cases & projects
 ### Use cases

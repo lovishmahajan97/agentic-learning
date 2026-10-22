@@ -5,8 +5,14 @@ name: UAT (user acceptance testing)
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - evals/task-specific-acceptance-criteria
+  - customer-data-evaluation/representative-test-case-sampling
+  - math-for-ai/statistics-for-evaluation
 related:
   - customer-data-evaluation/acceptance-testing-against-customer-kpis
   - evals/task-specific-acceptance-criteria
@@ -248,12 +254,9 @@ such run blocks sign-off regardless of the pass rate.
 - **Calibration round before scoring.** Testers score the same 20 to 30 outputs, discuss disagreements,
   and tighten rubric definitions before the main round. Monitor inter-rater agreement (for example Cohen's
   kappa) on the overlap set throughout.
-- **Repeated runs with case-level verdicts.** The harness runs each case several times through the full
-  agent loop, records a case-level verdict, and reports flip rate as its own metric. Monitor flip rate per
-  slice; a rising flip rate after a prompt change is a stability regression.
-- **Trace-attached scoring.** The scoring UI shows the tester the tool calls and results next to the final
-  answer, and mechanical gates (forbidden tools, unapproved writes, step budget) run before the rubric.
-  Monitor hard-gate failures per round; any non-zero count blocks exit.
+- **Repeated runs, trace-attached scoring.** The harness runs each case several times through the full
+  agent loop, runs mechanical gates before the rubric, and shows testers the trace. Monitor flip rate per
+  slice (rising after a prompt change is a stability regression) and hard-gate failures (any blocks exit).
 - **Defect tracker with a cause field.** Every failure is filed with severity and one of integration,
   retrieval, tool use, model/prompt or requirement; requirement findings route to the change-request
   process. Monitor defects by cause per round to see whether rounds converge.
@@ -274,19 +277,21 @@ such run blocks sign-off regardless of the pass rate.
   but need data access approvals that can take weeks; start those at kickoff, not at UAT.
 
 ## Pitfalls
-- **Defining criteria during UAT.** Symptom: a moving target where each round of fixes surfaces a new
-  expectation nobody wrote down. Fix: pre-register criteria in scoping.
+- **Defining criteria during UAT.** Symptom: each round of fixes surfaces a new expectation nobody wrote
+  down. Diagnose: count criteria added or changed after round one without a change request. Fix:
+  pre-register criteria in scoping.
 - **Letting the build team score outputs.** Symptom: a high UAT pass rate followed by low adoption and
   complaints in the first week of hypercare. Fix: the customer's users score.
-- **Running each case once.** Symptom: a failure the engineers "cannot reproduce" because a re-run happens
-  to pass. Fix: repeated runs with case-level verdicts.
-- **Scoring the final answer only.** Symptom: an agent that passes UAT, then in production updates the
-  wrong record on the way to a correct-looking reply. Fix: score the trace and the end state, with
-  mechanical gates on actions.
-- **Treating every change request as a defect.** Symptom: UAT rounds that never converge and a backlog
-  where scope creep is indistinguishable from bugs. Fix: a requirement cause class.
-- **Judging on the aggregate only.** Symptom: a passing headline number while one slice, such as one
-  language or document type, fails badly. Fix: per-slice reporting.
+- **Running each case once.** Symptom: a failure engineers "cannot reproduce" because a re-run happens to
+  pass. Diagnose: re-run failed cases several times and compute the flip rate. Fix: repeated runs with
+  case-level verdicts.
+- **Scoring the final answer only.** Symptom: an agent passes UAT, then in production updates the wrong
+  record on the way to a correct-looking reply. Diagnose: diff the sandbox end state against the expected
+  one for every passing case. Fix: score trace and end state, with mechanical gates on actions.
+- **Treating every change request as a defect.** Symptom: rounds that never converge, scope creep
+  indistinguishable from bugs. Diagnose: chart defects by cause per round. Fix: a requirement cause class.
+- **Judging on the aggregate only.** Symptom: a passing headline while one slice (a language, a document
+  type) fails badly. Diagnose: per-slice pass rates with their intervals. Fix: per-slice criteria.
 
 ## When to use
 - **Use when:** people other than the builders will use the agent and acceptance carries weight: a
@@ -296,8 +301,19 @@ such run blocks sign-off regardless of the pass rate.
 - **Go lighter for internal tools** with a small user group: a few power users and a short rubric.
 - **Measure:** pass rate with a confidence interval, per-slice pass rates, hard-gate failures, flip rate,
   inter-rater agreement and defect counts by cause.
-- **Interviews:** the depth signal is criteria fixed in advance, sample size, non-determinism and triage
-  by cause, rather than "users tried it and liked it".
+
+## Exercise
+**Goal:** design and dry-run the UAT plan for an agent you have built (or the toy claims agent). No
+solution is given.
+- **Inputs:** a rate criterion and its bar, at least one hard gate on actions, and two or more slices
+  that matter to the user.
+- **Constraints:** the sample size must be justified by a Wilson lower bound, not the point estimate;
+  every case stores an expected end state.
+- **Deliver:** the pre-registered acceptance doc, a case set of at least 40, a harness that runs each case
+  3 times and writes a report, and a defect log with a cause per failure.
+- **Acceptance:** an injected unapproved write shows up as a hard-gate failure; flipping one case's runs
+  changes the flip rate as you predicted; the report states whether the lower bound clears the bar and
+  how many cases sign-off would need.
 
 ## Role lens
 - **Engineer:** Builds the UAT harness: case loading, repeated runs per case, rubric capture, and export
@@ -339,12 +355,6 @@ blocks.
 - **Mechanical hard gates on actions:** a forbidden tool, an unapproved write or a blown step budget fails
   the run before the rubric counts, and any such failure blocks sign-off.
 
-### How do you handle non-determinism in UAT scoring?
-- **Repeated runs are correlated:** three runs of 200 cases are not 600 independent samples, so the
-  confidence interval uses the case count.
-- **Use a case-level rule** such as passes on at least 2 of 3 runs, and report flip rate separately as a
-  stability defect; agents flip more because one early tool choice changes every later step.
-
 ### An agent fails a UAT task. How do you decide whether it is a model problem?
 - **Triage by cause from the trace:** wrong data from a connector is integration; a document that existed
   but was not found is retrieval; a wrong tool or malformed argument is tool use; right context but a wrong
@@ -384,6 +394,20 @@ blocks.
 - [x] As a requirement finding, handled as a change request with the sponsor
 > The system did what was specified; the specification was wrong or incomplete. Treating it as a defect
 > hides scope change and stops UAT from converging, while a change request makes the cost explicit.
+
+## Mastery test
+**Problem:** a contract-review agent flags risky clauses. Legal reviewers score 300 contracts; 279 are
+flagged correctly (93%) against a 90% bar.
+
+Every contract was run once. 12 of the 21 failures are scanned PDFs, which are 15% of incoming work but
+only 5% of the sample. Do you sign off?
+
+**A strong answer:**
+- computes the interval (roughly 89.5% to 95.4%), so the lower bound sits just under the bar;
+- sees that scanned PDFs are under-sampled and failing far more, so the true rate is likely lower;
+- re-weights or re-samples to 15% scanned, triages those failures (likely parsing, not the model) and
+  re-tests that slice;
+- adds repeated runs to measure flips before signing.
 
 ## Use cases & projects
 ### Use cases

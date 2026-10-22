@@ -5,8 +5,13 @@ name: Agent loop
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: partial
+prerequisites:
+  - prompting/function-tool-calling
+  - prompting/prompt-caching
 related:
   - agents/tool-calling
   - agents/workflows-vs-agents
@@ -97,9 +102,8 @@ this loop with defaults.
   and only the new tail is processed.
 - **Illustrative arithmetic:** a 3,000-token system prompt plus tool definitions, and 1,500 new tokens of
   call-and-result per step, means step *k* sends about 3,000 + 1,500·*k* tokens.
-- **Twenty steps** send roughly 20 × 3,000 + 1,500 × (1 + … + 20) ≈ 60k + 315k = 375k input tokens, for a
-  final transcript of only ~33k. With caching most of the 375k are cache reads billed at a fraction of
-  the normal rate; without it every one is billed in full.
+- **Twenty steps** send roughly 20 × 3,000 + 1,500 × (1 + … + 20) ≈ 60k + 315k = 375k input tokens
+  (worked below).
 - **So harnesses never edit earlier messages in place;** an edit invalidates the cache from that point on.
 - **Reasoning output must pass back untouched.** Claude's thinking blocks carry a signature and must be
   returned unmodified within a tool-use turn; OpenAI's reasoning items come back encrypted for the same
@@ -119,11 +123,9 @@ this loop with defaults.
   delays discovering stuck runs.
 
 ### Where reasoning fits
-- **ReAct came first.** Before native tool calling, the model wrote "Thought / Action / Observation" as
-  text and the harness parsed it with regular expressions.
-- **Native tool calling replaced the parsing** with structured blocks, and models trained for it reason
-  between calls, visibly or in hidden thinking blocks.
-- **The loop shape is identical;** what changed is reliability.
+- **ReAct came first:** the model wrote "Thought / Action / Observation" as text, parsed with regular
+  expressions. Native tool calling replaced the parsing with structured blocks, and models reason between
+  calls, visibly or in thinking blocks. The loop shape is identical; what changed is reliability.
 
 ## Diagram
 Follow the cycle: the model only proposes, the harness decides and executes, and every pass appends one
@@ -145,9 +147,10 @@ flowchart TD
 
 ## Examples
 ### A complete manual loop
-The three things most toy versions omit: a step budget, errors returned as results instead of raised,
-and all results for a turn in one message. The second order id does not exist, so the model receives an
-error result for it and must handle that in its answer.
+What toy versions omit: a step budget, errors returned as results, and all results for a turn in one
+message. Order A200 does not exist, so the model gets an error result for it.
+
+Checked against `anthropic` 2.1.0 (Python 3.12) with scripted responses; a live run needs an API key.
 
 ```python
 import json, anthropic
@@ -236,8 +239,8 @@ Same assumptions as above: 3,000 stable tokens, 1,500 new tokens per step (illus
   byte-identical and first, and mark the end of that prefix with a `cache_control` breakpoint on the Claude
   API. Put a second breakpoint on the newest message each turn, because a breakpoint only on the static
   prefix leaves the growing history uncached. Monitor cache-read tokens against total input tokens.
-- **Graceful exhaustion.** Whenever a budget trips; make the tools-off report call shown above and return
-  `budget_exhausted` with the report. Monitor how often callers can resume from the report.
+- **Graceful exhaustion.** Whenever a budget trips; the tools-off report call above, returning
+  `budget_exhausted`. Monitor how often callers can resume from the report.
 - **Repetition guard.** For long-running agents; hash each call's tool name plus canonical JSON arguments
   and stop or warn after the same call repeats a few times in a row. Monitor guard trips per tool.
 - **Approval gate for side effects.** When tools write or spend; tag tools read-only or mutating in the
@@ -258,18 +261,23 @@ Same assumptions as above: 3,000 stable tokens, 1,500 new tokens per step (illus
   alternative, trusting the model to stop itself, has no upper bound on damage or spend.
 
 ## Pitfalls
-- **Dropping or re-serializing the assistant's `tool_use` blocks before sending results.** Symptom: an API
-  validation error about an unmatched `tool_use_id`, or a model that re-issues the same call. Fix: append
-  `resp.content` as-is.
-- **No step or token budget.** Symptom: a run bouncing between two tools for an hour, usually discovered
-  through the bill. Fix: harness-enforced budgets.
-- **Letting a tool exception escape the loop instead of returning `is_error: true`.** Symptom: a crash on
-  exactly the inputs where you wanted the model to recover. Fix: catch and return the error as a result.
-- **Treating `stop_reason == "max_tokens"` as a finished answer.** Symptom: truncated JSON or a half-written
-  tool call the harness then tries to execute. Fix: treat it as truncation and retry.
-- **Editing earlier messages to "fix" the model's path mid-run.** Symptom: cache hit rate collapses and, if
-  the edit touches signed or encrypted reasoning blocks, requests are rejected. Fix: append a correction or
-  compact explicitly.
+- **Dropped or re-serialized `tool_use` blocks.** Symptom: an API error about an unmatched `tool_use_id`,
+  or the model re-issuing the same call. Cause: the assistant turn was not appended as returned. Diagnose:
+  dump the request and check each `tool_result` id has a `tool_use` block in the previous message. Fix:
+  append `resp.content` as-is.
+- **No step or token budget.** Symptom: a run bouncing between two tools for an hour, found through the
+  bill. Diagnose: plot steps per run from traces; a long tail far past the successful p95 is stuck runs.
+  Fix: harness-enforced budgets.
+- **A tool exception escaping instead of returning `is_error: true`.** Symptom: a crash on exactly the
+  inputs where you wanted recovery. Diagnose: count runs ending in an uncaught exception per tool. Fix:
+  catch and return the error as a result.
+- **Treating `stop_reason == "max_tokens"` as finished.** Symptom: truncated JSON or a half-written tool
+  call the harness executes. Diagnose: log `stop_reason` per step and alert on `max_tokens`. Fix: treat it
+  as truncation and retry.
+- **Editing earlier messages to "fix" the path mid-run.** Symptom: cost per run jumps and, if the edit
+  touches signed or encrypted reasoning blocks, requests are rejected. Diagnose: cache-read tokens per step
+  in `usage` fall toward zero; diff consecutive requests to find the edited message. Fix: append a
+  correction or compact explicitly.
 
 ## When to use
 - **Use when** the next action genuinely depends on the previous result and the space of paths is too
@@ -278,11 +286,20 @@ Same assumptions as above: 3,000 stable tokens, 1,500 new tokens per step (illus
   cheaper, deterministic and testable.
 - **Measure** steps per task, tokens per task, task completion rate and how often the budget trips. A
   rising step count with flat completion is the first sign the tools or instructions are wrong, not the loop.
-- **Day to day** most of your time goes on the harness, not the prompt: budgets, error-to-result
-  conversion, logging every step, and the stop conditions.
-- **Interviews:** expect "walk me through one iteration" and "where does the state live". The strong answer
-  names the transcript as the state, the harness as the authority, and append-only history as the reason
-  caching works.
+- **Day to day and in interviews** the work is the harness: budgets, error-to-result conversion, logging
+  every step and stop conditions. Name the transcript as the state, the harness as the authority, and
+  append-only history as the reason caching works.
+
+## Exercise
+**Goal:** build a loop harness and prove every stop path with a scripted fake model, so no API key is
+needed. No solution is given.
+- **Inputs:** a `model(messages) -> response` callable you script per test; two tools, one that raises.
+- **Constraints:** step, token and wall-clock budgets; append-only history; `run()` returns
+  `{"status", "report", "steps"}` and never raises.
+- **Deliver:** the harness and one test per stop path.
+- **Acceptance:** a model calling the same tool forever ends `budget_exhausted` after a tools-off report
+  call; a raising tool yields an `is_error` result and the run continues; a `max_tokens` turn never
+  executes its call; each request's messages are a prefix of the next one's.
 
 ## Role lens
 - **Engineer:** Writes the loop and its stop conditions, converts exceptions into `tool_result`
@@ -373,6 +390,17 @@ transcript from the model.
 > after it. Compaction is done as an explicit operation precisely because it is the one place where the
 > prefix is allowed to change.
 
+## Mastery test
+**Problem:** after a release, cost per task doubled and some runs are rejected with an error about a
+thinking block. The diff put the current time at the top of the system prompt and added a helper that
+strips whitespace from every message before each call. Explain both symptoms and the fix.
+
+**A strong answer:**
+- the timestamp changes the prefix every call and the helper rewrites history, so cache-read tokens in
+  `usage` collapse; diffing consecutive requests confirms it;
+- stripping whitespace altered signed thinking blocks, which must pass back unchanged;
+- fix: time goes in the newest user message, history stays append-only.
+
 ## Use cases & projects
 ### Use cases
 - **Coding agents.** Read files, run tests, edit and re-run until the suite passes, with a step budget so
@@ -385,12 +413,9 @@ transcript from the model.
   to this loop's steps tells you whether the model, a tool or a budget caused it.
 
 ### Mini project
-**Write an agent loop by hand (2-3 hours).**
-- **Goal:** build a working tool-calling loop on a provider SDK with no agent framework, and make every
-  way it can stop explicit.
+**Put the Exercise harness on a real model (1-2 hours).**
+- **Goal:** run your loop on a provider SDK with no agent framework.
 - **Steps:** declare three small tools (a calculator, a fake order lookup, a fake refund that needs
-  approval); write the loop that appends the assistant turn, executes each tool call, turns exceptions
-  into error results and calls again; add step, token and wall-clock budgets; return a status such as
-  done, budget exceeded or awaiting approval; log one line per iteration.
-- **Done when:** five scripted tasks each end with the expected status, one task trips the step budget on
-  purpose, and the log shows the transcript only ever grew by appending.
+  approval); add an `awaiting_approval` status; log one line per iteration.
+- **Done when:** five tasks each end with the expected status, one trips the step budget on purpose, and
+  the log shows the transcript only ever grew by appending.

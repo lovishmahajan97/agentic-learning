@@ -5,8 +5,14 @@ name: Output validation (Pydantic, Instructor, Outlines)
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: partial
+prerequisites:
+  - python-for-ai/pydantic
+  - prompting/structured-outputs-json-mode
+  - prompting/function-tool-calling
 related:
   - python-for-ai/pydantic
   - python-for-ai/instructor
@@ -47,9 +53,9 @@ guaranteed; meaning must be checked.
   mid-string because `max_tokens` was reached.
 - **The naive fix is dangerous.** `json.loads` inside a try/except either crashes the request or, worse,
   lets a wrong-but-parseable object through to a database write.
-- **Model output is untrusted input.** It feeds a SQL builder, a shell command, a tool-call argument, an
-  HTML template. You would never pass a web form's fields straight into those, and the model is a far
-  less predictable client than a browser.
+- **Model output is untrusted input.** It feeds SQL builders, shell commands, tool arguments and HTML
+  templates. You would never pass a web form's fields straight into those, and a model is less
+  predictable than a browser.
 - **Validity has layers, so three tools exist.** *Syntactic*: the text parses. *Structural*: the right
   keys and types are present. *Semantic*: the values make sense (the date is not in the future, the order
   id exists, the line items sum to the total).
@@ -340,18 +346,22 @@ Illustrative numbers from a week of an extraction pipeline, and what each one sa
 
 ## Pitfalls
 - **Checking only that the text parses.** Symptom: `KeyError` and `TypeError` deep in downstream code on
-  fields that were present but of the wrong type or shape.
-- **Ignoring truncation.** Validation errors mentioning an unterminated string cluster on long outputs
-  because `max_tokens` cut the JSON. Fix: check `stop_reason`, do not retry blindly.
+  fields that were present but of the wrong type or shape. Diagnose: group downstream exceptions by
+  field. Fix: parse into Pydantic at the boundary.
+- **Ignoring truncation.** Symptom: validation errors mentioning an unterminated string, because
+  `max_tokens` cut the JSON. Diagnose: plot those errors against output length and `stop_reason`; they
+  cluster on long outputs. Fix: check `stop_reason`, do not retry blindly.
 - **Retrying with the identical prompt and no error feedback.** Symptom: the same failure three times in
-  a row and a tripled bill.
-- **Trusting unenforced schema keywords.** Sending patterns, bounds or lengths the provider's strict mode
-  does not enforce, and assuming they held; values violating the rule arrive in a valid-looking object.
-- **Making every field `Optional` to reduce failures.** The model learns that `null` escapes validation;
-  the symptom is a rising null rate on fields you actually needed.
+  a row and a tripled bill. Diagnose: diff the retry request against the first; no error text means no
+  feedback. Fix: append the `ValidationError` text.
+- **Trusting unenforced schema keywords.** Patterns, bounds or lengths the provider's strict mode does not
+  enforce arrive violated in a valid-looking object. Diagnose: re-validate a sample of provider outputs
+  with Pydantic. Fix: keep those rules in validators.
+- **Making every field `Optional` to reduce failures.** The model learns that `null` escapes validation.
+  Diagnose: track null rate per field over time. Fix: make needed fields required, with an explicit
+  `unknown` value.
 - **Raising on bad tool arguments instead of returning an error.** Symptom: one malformed call kills a
-  long agent run that the model could have repaired. Fix: return the validation error as a tool result
-  and let the next step fix it, within a repair cap.
+  long run the model could have repaired. Fix: return the error as a tool result, within a repair cap.
 - **Trusting well-formed but hallucinated identifiers.** An `order_id` that matches the regex but does not
   exist produces downstream 404s, so validate against reference data for anything used as a key.
 
@@ -366,7 +376,17 @@ Illustrative numbers from a week of an extraction pipeline, and what each one sa
   say whether the prompt, the schema or the token budget is the problem.
 - **In agents:** validate every tool call in the executor before it runs, and treat plans and handoffs
   between sub-agents as typed contracts too.
-- **Interviews:** separate syntactic from semantic validity and place each tool on that line.
+
+## Exercise
+**Goal:** build a validated extraction step that fails loudly, repairs what it can and tells you why the
+rest failed. No solution is given.
+- **Inputs:** 30 short invoices or tickets you write yourself, including 5 that tempt a future date, 5
+  whose line items do not sum to the total and 3 long enough to truncate at a low `max_tokens`.
+- **Deliver:** a Pydantic model with at least one `field_validator` and one `model_validator`, a retry
+  loop (yours or Instructor) capped at 2, a truncation guard, and a table of failures by `loc` and `type`.
+- **Acceptance:** a pytest suite feeds fixed bad JSON strings (no model call) and asserts each raises the
+  expected error type; no truncated output is retried; every record either validates or lands in a
+  review list with its last error.
 
 ## Role lens
 - **Engineer:** Owns the Pydantic models, keeps schema and prompt in sync, exports `ValidationError` types
@@ -394,14 +414,6 @@ being in the prompt, so fix the prompt before raising retry limits, and track fa
   gives typed errors you can feed back to the model. You want both, because providers often do not
   enforce patterns or numeric bounds.
 
-### How does Outlines stop the model emitting invalid JSON?
-- **It compiles the schema to a finite-state machine** and precomputes, per state, which vocabulary
-  tokens keep the output valid.
-- **At each decode step it masks the rest** by setting their logits to −∞, so a valid output is
-  guaranteed by construction, at the cost of a lookup per step.
-- **It needs logit access,** so it fits local or open-weight models; hosted APIs expose the same idea as
-  structured outputs.
-
 ### Your retry rate jumped from 1% to 12% after a model upgrade. How do you debug it?
 - **Break failures down by field and error type** from `ValidationError.errors()` to see whether one
   field or one rule dominates.
@@ -424,12 +436,6 @@ being in the prompt, so fix the prompt before raising retry limits, and track fa
   model repairs the call on its next step.
 - **Bound it:** cap repairs per call, then stop or escalate, and track repair rate per tool to find
   schemas whose descriptions mislead the model.
-
-### Your agent passes a model-generated identifier into the next tool call. How do you validate it?
-- **Regex or pattern checks only prove format;** a well-formed but hallucinated `order_id` still causes
-  downstream 404s.
-- **Look it up against reference data** in a separate step after parsing, so validators stay cheap and
-  the failure can still be retried or escalated.
 
 ## Quiz
 ### Q: What does constrained decoding with Outlines actually guarantee?
@@ -457,6 +463,20 @@ being in the prompt, so fix the prompt before raising retry limits, and track fa
 > Keys, types and enums are structural and a schema or constrained decoder enforces them. A relationship
 > between two fields is semantic, lives in a `model_validator`, and when it fails the remedy is a retry
 > with the error message.
+
+## Mastery test
+**Problem:** a planner agent emits a JSON plan of up to 12 steps, each naming a tool and its arguments,
+which an orchestrator then runs. After a model upgrade, 3% of runs execute a step whose tool exists but
+whose arguments belong to a different tool. Shape validation passes. Where is the gap and what do you
+change?
+
+**A strong answer:**
+- sees the schema is too loose: arguments typed as a generic object, not tied to the named tool;
+- switches to a discriminated union keyed on the tool name, so each step validates against that tool's
+  own argument model, and re-validates in the executor before each step runs;
+- returns errors to the planner with the step index, caps repairs, and breaks failures down by `loc`
+  to confirm the fix;
+- adds the failing plans to the eval set before the next model upgrade.
 
 ## Use cases & projects
 ### Use cases

@@ -5,8 +5,13 @@ name: Deployment readiness reviews
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - evals/task-specific-acceptance-criteria
+  - llmops-platform/evaluation-gates-for-production-releases
 related:
   - deployment/security-and-architecture-reviews
   - deployment/uat
@@ -27,8 +32,7 @@ ends proven, waived with an expiry, or blocking.
 
 ## For agent builders
 - **Why it matters for agents.** An agent is a model plus a prompt plus a tool list plus a retrieval index
-  plus step budgets. Each piece has a different owner, and the launch fails at the seams: a trajectory
-  eval run on last week's tool set, or a write tool security never saw.
+  plus step budgets, each with a different owner, so launches fail at the seams between them.
 - **Where it shows up in your stack.** A checklist file in the agent's repo, a release fingerprint
   (model, prompt hash, tool manifest, index build) stamped on every eval report, and a CI gate that refuses
   to promote when blocking items lack evidence.
@@ -44,9 +48,8 @@ ends proven, waived with an expiry, or blocking.
 - **The seams are where agent launches fail.** The eval passed, but on last month's index. Security
   approved the architecture, but not the tool the agent gained afterwards. Dashboards exist, but no alert
   routes to a human. A rollback plan exists, but nobody has run it.
-- **"The tech lead decides" fails twice.** One person cannot hold the full checklist, and the items they
-  forget are the ones outside their expertise. Schedule pressure from a date promised to a sponsor
-  rationalises every gap as "we'll fix it in hypercare".
+- **"The tech lead decides" fails twice.** One person cannot hold the full checklist and forgets the items
+  outside their expertise; schedule pressure rationalises every gap as "we'll fix it in hypercare".
 - **The review makes the decision structural.** Criteria are agreed before the date, evidence replaces
   assertions, and the record says which risks were accepted and by whom.
 - **It has precedent.** Google's SRE practice formalised the Production Readiness Review, run before an
@@ -71,8 +74,7 @@ after the system exists describe what was built rather than what is needed.
 ### 2. Evidence, not assertions
 - **Every item has an owner and a link.** An eval report with its dataset version, a load-test result, a
   screenshot of an alert firing in staging, the ticket where security signed off on the tool list.
-- **No evidence means not done**, because "done" is the cheapest word to say and the most expensive to be
-  wrong about.
+- **No evidence means not done**, because "done" is the cheapest word to say.
 - **Pin evidence to the deploying configuration.** Record a release fingerprint (model identifier, prompt
   version or hash, retrieval config, index build, tool list) and attach it to every eval and load-test
   result, because an eval on last week's prompt is evidence about a different agent.
@@ -161,9 +163,8 @@ print(decide(items, date(2026, 10, 20)))
 # ('NO-GO', ['rollback.rehearsed', 'training.agents_trained'])
 ```
 
-Rehearsing the rollback and either training the claims handlers or writing a waiver for it turns this
-into a conditional go, with the load-test gap explicitly owned by the customer's ops lead until 30
-November. (In this item list, `training.agents_trained` means the human agents who use the tool.)
+Rehearsing the rollback and training the claims handlers (or waiving it) makes this a conditional go,
+with the load-test gap owned by the customer's ops lead until 30 November. (In this item list, `training.agents_trained` means the human agents who use the tool.)
 
 ### Fingerprint check that catches stale evidence
 Each piece of evidence stores the release fingerprint it was produced against; the gate compares it with
@@ -186,8 +187,8 @@ print("eval evidence stale:", stale)   # True -> item reverts to not done
 ```
 
 ### Tool-manifest diff: what security has not seen
-An agent's tool list drifts faster than its architecture document. This check compares the tools (and
-their scopes) the candidate ships with against the manifest security approved.
+Tool lists drift faster than architecture documents, so compare the candidate's tools and scopes with
+the manifest security approved.
 
 ```python
 approved = {"lookup_policy": "read", "get_claim": "read"}          # from the signed-off review
@@ -239,13 +240,10 @@ Illustrative findings from one review of the claims-triage agent launch.
   renewed rather than closed.
 - **Risk-tiered reviews.** A prompt tweak behind a flag gets an automated eval gate; a new write-capable
   tool gets the full meeting. Write the tier rules down so the trigger is not negotiated per change.
-- **Escape analysis after launch.** For each incident in the first weeks, ask whether a checklist item
-  would have caught it, and add one if so. Monitor incidents per launch that map to a missing item.
 
 ## Trade-offs
 - **Coverage vs calendar time.** A formal review catches cross-team gaps but adds calendar time; for a
-  low-risk internal read-only agent a lightweight checklist in the pull request is enough, and a full
-  meeting is ceremony.
+  low-risk internal read-only agent a full meeting is ceremony.
 - **Strictness vs honesty.** Strict blocking criteria prevent bad launches, but if everything is blocking
   the team learns to game evidence. Keep the blocking list short and reserve it for irreversible or
   customer-visible harm, such as an agent writing to a system of record.
@@ -256,19 +254,22 @@ Illustrative findings from one review of the claims-triage agent launch.
   reserve humans for exceptions.
 
 ## Pitfalls
-- **Reviewing the day before launch.** Every finding becomes a waiver; the symptom is a "conditional go"
-  with more conditions than the previous three launches combined. Fix: hold it early enough to fix
-  blockers.
+- **Reviewing the day before launch.** Symptom: a "conditional go" with more conditions than the previous
+  three launches combined, because no blocker can be fixed in time. Diagnose: count waivers per review and
+  days between review and go-live. Fix: hold it early enough to fix blockers.
 - **Accepting "yes, done" without a link.** Symptom: an incident where the alert, runbook or rollback
-  marked green never existed. Fix: no link, not done.
+  marked green never existed. Diagnose: count green items with no evidence link (should be zero). Fix: no
+  link, not done.
 - **Reviewing the architecture approved months ago.** Symptom: a tool, data source or model in production
-  that no security reviewer ever saw. Fix: review what is deploying now, by fingerprint and tool-manifest
-  diff.
+  that no security reviewer ever saw. Diagnose: diff the registered tool manifest and fingerprint against
+  the signed-off ones. Fix: review what is deploying now.
 - **Waivers with no expiry or owner.** Symptom: the same accepted risk in next quarter's review and nobody
-  can say who agreed to it. Fix: owner and expiry are mandatory fields.
-- **Treating agent quality as a single number.** Symptom: the launch passed the aggregate eval but fails a
-  critical slice (one claim type, one language, one multi-step task) the business cares most about. Fix:
-  per-slice criteria, including trajectory checks on the riskiest tasks.
+  can say who agreed to it. Diagnose: query the register for waivers missing either field or renewed more
+  than once. Fix: owner and expiry are mandatory fields.
+- **Treating agent quality as a single number.** Symptom: the aggregate eval passed but a critical slice
+  (one claim type, one language, one multi-step task) fails, because averages hide small slices. Diagnose:
+  break the eval report down by slice and compare with the bar. Fix: per-slice criteria, including
+  trajectory checks on the riskiest tasks.
 
 ## When to use
 - **Use before:** any first production launch of an agent, handing operations to a customer team, and
@@ -276,10 +277,20 @@ Illustrative findings from one review of the claims-triage agent launch.
   source, a new region.
 - **Scale it to risk:** a prompt tweak behind a flag needs an automated eval gate, not a meeting; an agent
   that can issue refunds needs the full review.
-- **Measure the review by what escapes it:** track incidents in the first weeks after launch and ask
-  whether a checklist item would have caught each one, then add it.
-- **Interviews:** a strong answer describes criteria, evidence, waivers with expiry, and the re-review
-  trigger (new model, new tool), not just "we had a launch checklist".
+- **Measure the review by what escapes it:** for each incident in the first weeks, ask whether a checklist
+  item would have caught it, and add one if so.
+
+## Exercise
+**Goal:** turn a real or sample agent release into a computed go/no-go. No solution is given.
+- **Inputs:** an agent you have built (or the claims-triage example), its tool list with scopes, and the
+  evidence you actually have: eval reports, load tests, alert screenshots.
+- **Constraints:** at least 10 checklist items across the seven categories, at most 4 of them blocking,
+  and every evidence file stamped with a release fingerprint.
+- **Deliver:** the checklist file, a gate script that exits non-zero on no-go, and a one-page decision
+  record with waivers.
+- **Acceptance:** changing the prompt hash, adding a write tool, or moving a waiver's expiry into the past
+  each flips the result to no-go naming the item; a clean candidate returns go; a colleague can find the
+  owner of every waiver from the record alone.
 
 ## Role lens
 - **Engineer:** Produces the evidence: versioned eval reports, load-test results, a rehearsed rollback,
@@ -318,12 +329,6 @@ answer is no-go or a reduced launch scope. Either way the decision is written do
 - **Make it mechanical:** a CI diff of the registered tools against the approved manifest blocks the
   release until the manifest is re-signed.
 
-### When would you skip a full readiness meeting?
-- **Low-risk, reversible changes:** a prompt tweak behind a flag needs an automated eval gate, and a
-  low-risk internal tool can use a checklist in the pull request.
-- **Never for material changes:** a new model or provider, a write-capable tool, a new data source or
-  region needs at least the affected items re-reviewed.
-
 ### How do you keep waivers from becoming permanent?
 - **Mandatory fields:** named risk owner, compensating control and expiry date; no waiver without all
   three.
@@ -360,6 +365,21 @@ answer is no-go or a reduced launch scope. Either way the decision is written do
 - [x] Giving the agent a new tool that can write to the customer's CRM
 > A review approves a specific configuration. A write-capable tool changes the security surface, the
 > failure modes and the rollback story, so the affected items (security, guardrails, runbooks) must be re-checked.
+
+## Mastery test
+**Problem:** a support agent passed review a month ago. Since then it moved to a newer model version,
+the index is rebuilt nightly, and the `refund_order` limit rose from 50 to 500.
+
+The sponsor says "nothing material changed". What do you re-review, and how do nightly builds avoid
+invalidating every eval?
+
+**A strong answer:**
+- treats the model swap and the widened refund limit as material: re-run quality evals and trajectory
+  evals, and get security sign-off on the new scope and its approval gate;
+- spots that a tenfold refund limit is a scope change even though the tool name did not change;
+- fingerprints the index by schema and pipeline version rather than build date, or re-runs a fast eval
+  gate nightly, so routine rebuilds do not reset evidence;
+- leaves untouched items (alerts, training) green and records the scaled-down decision.
 
 ## Use cases & projects
 ### Use cases

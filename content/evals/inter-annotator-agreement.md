@@ -5,8 +5,13 @@ name: Inter-annotator agreement
 kind: metric
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: implement
+code_tested: yes
+prerequisites:
+  - evals/golden-dataset
+  - math-for-ai/statistics-for-evaluation
 related:
   - evals/golden-dataset
   - evals/rubrics
@@ -267,7 +272,8 @@ criteria. Counts are illustrative; κ is computed with `cohen_kappa` above.
 | Asked a clarifying question when needed | 88 | 6 | 14 | 12 | 0.783 | 0.733 | 0.19 |
 
 - **"Task resolved" can gate,** and a judge for it can be calibrated against these labels.
-- **"Clarifying question" cannot yet:** 78% raw agreement looks fine, but κ = 0.19 is near chance, and
+- **"Clarifying question" cannot yet:** 78% raw agreement looks fine, but chance agreement is already
+  about 73%, κ = 0.19 is near chance, and
   the two reviewers agreed on only 6 of the 32 runs either of them failed. Rewrite the guideline with
   examples of ambiguous versus clear requests, then re-pilot.
 - **A judge scored on that criterion today** would be measured against labels that are mostly one
@@ -275,7 +281,7 @@ criteria. Counts are illustrative; κ is computed with `cohen_kappa` above.
 
 ## Production patterns
 - **Agreement in the labeling export.** Compute per-criterion, per-pair κ on every export, for example
-  `sklearn.metrics.cohen_kappa_score(a, b, weights="quadratic")` for ordinal labels, and α for partial
+  `sklearn.metrics.cohen_kappa_score(a, b, weights="quadratic")` (checked on scikit-learn 1.6) for ordinal labels, and α for partial
   overlap. Monitor the lowest criterion, not the average.
 - **Same trace view for every reviewer.** Render tool calls, results and the reply identically in the
   annotation queue, and log which view each label came from. Monitor κ by trace length bucket, since
@@ -309,19 +315,22 @@ criteria. Counts are illustrative; κ is computed with `cohen_kappa` above.
 
 ## Pitfalls
 - **Reporting only percent agreement.** Symptom: 95% agreement on the pilot while model accuracy on the
-  minority class turns out to be near random. Fix: κ plus the confusion table.
+  minority class turns out to be near random. Diagnose: compute p_e from the label rates; when it is
+  near p_o, κ is near zero. Fix: κ plus the confusion table.
 - **One global kappa pooled across criteria or categories.** Symptom: an acceptable aggregate hiding a
-  criterion that sits at chance. Fix: per-criterion κ.
+  criterion that sits at chance. Diagnose: sort per-criterion κ and read the lowest. Fix: per-criterion κ.
 - **Pearson correlation for score agreement.** Symptom: r = 0.9 while one rater is consistently two
-  points higher, so the two raters' scores cannot be mixed in one dataset. Fix: ICC.
+  points higher, so the two raters' scores cannot be mixed in one dataset. Diagnose: compare each rater's
+  mean score. Fix: ICC.
 - **Annotators who are not independent** (one sees the other's labels, or they confer during the pilot).
-  Symptom: a high pilot kappa followed by a much lower production kappa. Fix: hide labels, no conferring.
+  Symptom: a high pilot kappa followed by a much lower production kappa. Diagnose: check whether the
+  queue showed prior labels. Fix: hide labels, no conferring.
 - **Comparing an LLM judge with labels from a single annotator.** Symptom: a judge that "beats humans",
-  which often means it matches one person's habits and is unverified against everyone else. Fix: score
-  it against an adjudicated or majority label from two or more annotators.
+  which often means it matches one person's habits. Diagnose: compute its κ against each annotator
+  separately. Fix: score it against an adjudicated or majority label from two or more annotators.
 - **Reviewers seeing different slices of an agent trace.** Symptom: low agreement on "action
   completed" because one reviewer trusted the final reply and the other read the failed tool result.
-  Fix: one rendered trajectory view for everyone.
+  Diagnose: split κ by the logged trace view. Fix: one rendered trajectory view for everyone.
 - **Small pilots without intervals.** Symptom: κ = 0.7 on 30 items followed by 0.45 on the next batch
   with no change in process. Fix: bootstrap intervals and a larger pilot.
 
@@ -333,9 +342,18 @@ criteria. Counts are illustrative; κ is computed with `cohen_kappa` above.
   the one criterion that is broken.
 - **Set the target by use:** labels that gate a release need agreement at the high end; preference labels
   for training can tolerate less.
-- **Day to day,** this is a few lines of code in the labeling-tool export.
-- **Interviews:** it answers "how do you know your golden set is good?" and "how do you compare a judge
-  to humans?".
+
+## Exercise
+**Goal:** decide which trace criteria of an agent you have (or a small tool-calling agent you build) are
+reliable enough to gate a release. No solution is given.
+- **Inputs:** 80 traces with tool calls and results, 4-5 pass/fail criteria, and two independent labelers
+  (a colleague, or you a week apart blind to your first labels); a third labeler on 20 traces.
+- **Constraints:** both labelers see the same rendered trajectory; no conferring until labels are in.
+- **Deliver:** per-criterion p_o, κ with a bootstrap interval and the confusion table; Krippendorff's α
+  over all three labelers; a guideline rewrite for the weakest criterion and its re-measured κ.
+- **Acceptance:** your κ matches `sklearn.metrics.cohen_kappa_score` to three decimals and your α
+  matches the `krippendorff` package; each criterion is marked gate or informational with the interval
+  that justifies it.
 
 ## Role lens
 - **Engineer:** Adds the kappa or alpha computation to the labeling export, routes disagreements to
@@ -375,13 +393,6 @@ measured at all.
   example of each level.
 - **Rewrite anchors and re-pilot on 30–50 items,** keeping a confidence interval so you know whether the
   new number is actually better.
-
-### Reviewers agree 78% on whether your agent should have asked a clarifying question, yet κ is 0.19. What do you do?
-- **Read κ, not the 78%:** most runs pass, so chance agreement is already about 73%, and the reviewers
-  agree on very few of the runs either of them failed.
-- **Do not gate or calibrate a judge on it yet;** the labels are mostly one reviewer's opinion.
-- **Fix the guideline:** add examples of ambiguous versus clear requests, make sure both reviewers see
-  the same trajectory view, re-pilot on 30–50 traces and re-measure with an interval.
 
 ### Which statistic would you pick for five annotators who each labeled a different subset on a 1–5 scale?
 - **Krippendorff's alpha,** because it tolerates any number of raters and missing ratings.
@@ -431,12 +442,24 @@ measured at all.
 > has reached annotator quality. Calling it better or worse than humans overreads a three-point difference,
 > and with no ground truth beyond the labels, agreement is the accuracy figure you have.
 
+## Mastery test
+**Problem:** a legal-review agent's golden set has 600 traces labeled by four lawyers, each trace seen by
+one or two of them, on a 1–4 "risk correctly flagged" scale. 90% of traces get a 4. The vendor reports
+"93% agreement" and a judge at "95% agreement with lawyers". Can this set gate releases?
+
+**A strong answer:**
+- rejects both percentages: with 90% of labels at one value, chance agreement is high, and only some
+  traces have two labels, so it computes Krippendorff's α with an ordinal distance on the overlapped
+  traces, with an interval;
+- checks whether the overlap is large enough for a usable interval, and asks for more double-labeling
+  if not;
+- scores the judge against adjudicated labels with the same α next to the human α, and focuses on the
+  rare traces scored below 4, which decide the gate.
+
 ## Use cases & projects
 ### Use cases
 - **Deciding which criteria may gate a release.** Criteria whose human κ clears the agreed bar can block
   a deploy; low-agreement ones stay informational until the guidelines are fixed.
-- **Validating an LLM judge.** Judge–human κ is read next to human–human κ, so the team knows whether the
-  judge has reached annotator quality.
 - **Running a trace-labeling program.** A fixed overlap share of double-labeled traces tracks reviewer
   drift as the agent and the reviewer pool change.
 - **Building a golden set for a customer agent.** Agreement on a pilot batch shows whether the labeling

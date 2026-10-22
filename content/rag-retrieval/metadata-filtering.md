@@ -5,8 +5,14 @@ name: Metadata filtering
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - rag-retrieval/ann-indexes
+  - rag-retrieval/vector-databases
+  - agents/tool-schemas-and-argument-validation
 related:
   - rag-retrieval/ann-indexes
   - rag-retrieval/vector-databases
@@ -172,9 +178,9 @@ covers the security side.
 - **The UI:** date pickers, product selectors.
 - **The authenticated request:** tenant, principals. Never from the request body or the model.
 - **An LLM parsing natural language** ("last quarter's incident reports") into structured predicates: the
-  self-query pattern from query rewriting, or simply the agent filling tool arguments. Validate against
-  an allowlist of fields and values, never let it touch security fields, and add a fallback (retry
-  without the filter, or ask), because a misparsed predicate silently returns an empty result set.
+  self-query pattern from query rewriting, or the agent filling tool arguments. Allowlist, keep it off
+  security fields, and add a fallback (retry without the filter, or ask), because a misparse silently
+  empties the result.
 
 ### Filters and the rest of the pipeline
 - **Same predicate in every arm.** Apply it in BM25 and dense (hybrid search) and before reranking,
@@ -287,8 +293,7 @@ for kf in (10, 100, 1_000, 10_000):
 - **Pre-filtering touched ~2,000 rows and was exact.** Post-filtering had to over-fetch 5% of the whole
   corpus to match it.
 - **Count is fixed before correctness.** At k′ = 1,000 all nine survivors were correct, but the tenant's
-  tenth-nearest row ranked outside the unfiltered top-1,000, so no post-processing of that candidate set
-  could have found it.
+  tenth-nearest row ranked outside the unfiltered top-1,000, beyond any post-processing.
 
 ### Worked scenario: an agent burning steps on empty filtered searches
 A support agent searches a post-filtering store with `top_k=10`. The user asks about one small
@@ -318,10 +323,9 @@ or filtered traversal step 1 returns 10 correct hits, and the run ends in two ca
 - **Tenant-aware layout for skewed tenants.** When a few tenants are huge and most are tiny, mark the
   tenant field as a tenant index (Qdrant) or use native per-tenant shards (Weaviate). Monitor per-tenant
   recall@k and latency, not the global average.
-- **Relax with a visible note, not silently.** On an empty filtered result, relax the model-chosen
-  filters (never the tenant), log the reason, and tell the agent in the tool result. Monitor the relax
-  rate per filter field and the number of search calls per agent run; spikes point at a parsing or
-  indexing regression.
+- **Relax with a visible note, not silently.** On an empty result, relax the model-chosen filters (never
+  the tenant), log why and tell the agent. Monitor relax rate per field and search calls per run; spikes
+  point at a parsing or indexing regression.
 - **Filtered recall in the eval gate.** Bucket labeled queries by selectivity, replay them with the
   filters your agent actually generated, and block deploys on recall@k drops in the 0.1% to 10% band.
   Monitor the same buckets in production traces.
@@ -338,31 +342,33 @@ or filtered traversal step 1 returns 10 correct hits, and the run ends in two ca
 - **Collection per tenant: isolation vs overhead.** Isolation and trivially cheap predicates, but thousands
   of small HNSW graphs cost more memory and operations than one shared graph. The flip depends on tenant
   count and size skew.
-- **Agent-chosen filters: precision vs silent empties.** Letting the model scope searches sharpens
-  results, but every misparse silently empties the result set and invites retries, so it costs a
-  validation layer, a fallback path and an eval on generated filters.
-- **Rich filter schema vs model reliability.** More filterable fields let the agent express more, but
-  each extra argument is another place for the model to guess wrong. Expose the few fields users actually
-  scope by.
+- **Agent-chosen filters: precision vs silent empties.** Model-scoped searches are sharper, but each
+  misparse empties the results, so they cost validation, a fallback and an eval on generated filters.
+- **Rich filter schema vs model reliability.** Each extra field is another place for the model to guess
+  wrong; expose the few fields users actually scope by.
 
 ## Pitfalls
 - **Post-filtering an ANN top-k.** Symptom: small tenants or rare document types return fewer than k
-  results, or none, while the same query without the filter returns plenty; agents loop on retries. Fix:
-  pre-filter or filtered traversal.
+  results, or none, while the unfiltered query returns plenty; agents loop on retries. Cause: only k·s
+  candidates survive. Diagnose: log result count and filter selectivity per call; short results cluster
+  at low *s*. Fix: pre-filter or filtered traversal.
 - **Filtering on a field with no payload index.** Symptom: filtered latency grows with collection size
-  while unfiltered queries stay flat. Fix: add the index.
-- **Dates stored as strings in mixed formats.** Range predicates compare lexically; "newest document"
-  queries return old content or nothing for certain date windows. Fix: integer timestamps.
+  while unfiltered queries stay flat, because the engine scans payloads. Diagnose: list the collection's
+  payload indexes and compare with fields in logged filters. Fix: add the index.
+- **Dates stored as strings in mixed formats.** Range predicates compare lexically, so "newest document"
+  queries return old content or nothing for some windows. Diagnose: sample `created_at` values and their
+  types. Fix: integer timestamps.
 - **Re-embedding to change metadata.** A status or ACL change is a payload update and should cost
-  milliseconds, not an embedding job. Re-embedding burns budget, delays the change (bad for an ACL
-  revoke) and can introduce version skew if the embedding model has moved on.
+  milliseconds. Re-embedding burns budget, delays the change (bad for an ACL revoke) and can introduce
+  version skew if the embedding model has moved on. Fix: a payload write.
 - **Accepting `tenant_id` or ACL values from the client or the model.** Symptom: cross-tenant leakage the
-  moment someone edits a request body or a prompt injection sets a tool argument. Fix: derive them from
-  identity.
+  moment someone edits a request body or a prompt injection sets a tool argument. Diagnose: diff the
+  tenant in each executed filter against the session's tenant. Fix: derive them from identity.
 - **Predicate in only one hybrid arm, or after reranking.** Symptom: results include documents the filter
-  should have excluded. Fix: apply it in every arm, before reranking.
-- **Evaluating recall only without filters.** Symptom: a filtered-traversal recall collapse that shows up in
-  production for selective filters and never in the eval. Fix: bucket by selectivity.
+  should have excluded. Diagnose: check every returned hit against the predicate. Fix: apply it in every
+  arm, before reranking.
+- **Evaluating recall only without filters.** Symptom: a filtered-traversal recall collapse in production
+  for selective filters that never shows in the eval. Fix: bucket by selectivity.
 - **Silent relaxation.** Symptom: the agent cites unfiltered results as if they matched "last 90 days".
   Fix: return a note with the tool result saying the filter was relaxed.
 
@@ -373,11 +379,20 @@ or filtered traversal step 1 returns 10 correct hits, and the run ends in two ca
   reranking, where it trades off against relevance instead of excluding it.
 - **Measure:** filtered recall@k on labeled queries bucketed by selectivity, p95 latency per bucket, the
   rate of queries returning fewer than k results, and search calls per agent run.
-- **Day to day:** the filter builder behind the agent's search tool is where security, UX and retrieval
-  quality meet.
-- **Interviews:** "what happens in your vector database when a filter matches 0.5% of the rows?" Cover
-  pre-, post- and in-traversal filtering, the k·s arithmetic, and the cardinality threshold at which the
-  engine should switch to brute force.
+- **Interviews:** "what happens when a filter matches 0.5% of the rows?" Cover the three strategies, k·s
+  and the brute-force threshold.
+
+## Exercise
+**Goal:** measure filtered recall per selectivity band on a real engine and prove your search tool
+survives model-chosen filters. No solution is given.
+- **Inputs:** 50k-200k vectors (synthetic or your corpus) with `tenant_id`, `doc_type` and an integer
+  `created_at`; a local Qdrant, pgvector or Weaviate; 30 labeled queries.
+- **Constraints:** tenants sized so filters keep 50%, 5%, 0.5% and 0.01% of rows; payload indexes only on
+  fields the tool exposes.
+- **Deliver:** a table of recall@10 against an exact filtered scan, p95 latency and the fewer-than-k rate
+  per band, plus the tool handler.
+- **Acceptance:** recall@10 ≥ 0.95 in every band after tuning; a test proves a model-supplied
+  `tenant_id` is ignored; an empty result returns a relax note.
 
 ## Role lens
 - **Engineer:** Designs the payload schema with typed fields, creates payload indexes for every filtered
@@ -475,6 +490,18 @@ from the client without checking the caller is authorized for it.
 > Range predicates need a numeric or datetime field; mixed string formats compare lexically and silently
 > exclude rows. The embedding is irrelevant to a metadata predicate, and HNSW engines support ranges via
 > payload indexes.
+
+## Mastery test
+**Problem:** a legal agent's search tool stacks `doc_type=contract`, `jurisdiction=DE` and a 30-day range
+on a shared 8M-chunk pgvector table with HNSW. Each filter alone keeps 5% to 20% of rows; users say "it
+finds nothing recent". Diagnose and redesign.
+
+**A strong answer:**
+- multiplies the selectivities (as low as about 0.05% if independent) and sees the stacked filter, not
+  each filter alone, sits in the dangerous band;
+- checks whether the query post-filters `ef_search` candidates, and the type of the date column;
+- proposes iterative index scans (`hnsw.iterative_scan`, pgvector 0.8+) or a pre-filtered exact search for tiny sets, a payload index per field,
+  a relax note, and recall@k measured on stacked filters.
 
 ## Use cases & projects
 ### Use cases

@@ -5,8 +5,13 @@ name: Model evaluation
 kind: concept
 difficulty: intro
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - math-for-ai/statistics-for-evaluation
+  - agents/agent-loop
 related:
   - evals/golden-dataset
   - evals/eval-harness
@@ -277,18 +282,23 @@ print(paired_report(old, new))
   default and add path assertions only for safety and cost.
 
 ## Pitfalls
-- **Confusing capability with application evaluation.** Choosing from a leaderboard and skipping the
-  task eval. Symptom: a "state of the art" model underperforms the cheaper one on your own extraction job.
-- **Reporting a single aggregate.** Symptom: a stable overall score while one customer segment or one
-  intent quietly degrades after a change. Fix: per-slice reporting and floors.
+- **Confusing capability with application evaluation.** Symptom: a "state of the art" model from the
+  leaderboard underperforms the cheaper one on your own extraction job. Cause: the task eval was skipped.
+  Diagnose: run both models on your golden set and diff per item. Fix: shortlist by benchmark, decide on
+  your eval.
+- **Reporting a single aggregate.** Symptom: a stable overall score while one customer segment or intent
+  quietly degrades. Diagnose: group pass-to-fail flips by slice. Fix: per-slice reporting and floors.
 - **Treating a 3-point move on 100 items as a result.** Symptom: prompt changes that "improved things"
-  then regress on the next run with no change at all. Fix: paired comparison and more items.
+  regress on the next run with no change at all. Cause: the gap is inside sampling noise. Diagnose:
+  re-run the unchanged baseline and count items that flip on their own. Fix: paired comparison, more items.
 - **String-overlap metrics as the headline for open text.** Symptom: correct answers scored as failures
-  because they are phrased differently from the reference.
+  because they are phrased differently from the reference. Diagnose: read the failures with the highest
+  judge or human score. Fix: rubric grading.
 - **Trusting an uncalibrated LLM judge.** Symptom: a high eval score alongside user complaints the judge
-  is blind to. Fix: measure its agreement with human labels first.
+  is blind to. Diagnose: label 50-100 items by hand and measure agreement. Fix: calibrate first.
 - **Iterating against the release set.** Symptom: a dev-set score that keeps climbing while the held-out
-  split and production metrics stay flat.
+  split and production metrics stay flat. Diagnose: log reads of the held-out split. Fix: read it only
+  at ship time.
 - **One run per agent task.** Symptom: the same task passes on Monday and fails on Tuesday with no code
   change. Fix: run each task several times and report both mean success and all-runs-pass reliability.
 
@@ -301,8 +311,16 @@ print(paired_report(old, new))
   end-to-end pass rates per slice; a tool-schema change needs tool-selection and argument accuracy.
 - **Day to day:** a harness run in CI, a dashboard of per-slice pass rates with intervals, and a rule that
   every production bug becomes a dataset item.
-- **Interviews:** explain why a benchmark score does not transfer to a task, how you would pick a grader
-  for a given output type, and why a small difference on a small set is not a decision.
+
+## Exercise
+**Goal:** decide, with evidence, whether a cheaper model can replace the current one in an agent you
+have (or a two-tool toy agent). No solution is given.
+- **Inputs:** at least 40 tasks with a checkable final state or answer, tagged by slice; two model ids;
+  a budget of 3 runs per task.
+- **Deliver:** a table per axis (success, all-runs-pass, hard-constraint violations, steps, cost per
+  task), the paired gained/lost counts with a sign-test p-value, the weakest slice, and a one-line verdict.
+- **Acceptance:** re-running the baseline alone flips fewer items than the comparison does; every
+  pass-to-fail item links to its trace; the verdict names which axis decided it.
 
 ## Role lens
 - **Engineer:** Builds the dataset and harness, picks graders by output type, and refuses to merge a
@@ -368,14 +386,6 @@ if not, the benchmark number is irrelevant.
 - **Trade-off:** judges unlock open-ended tasks at the price of cost and noise, so use them only where a
   deterministic grader cannot express the criterion.
 
-### How do you stop the team overfitting prompts to the eval set?
-- **Keep a held-out split** that prompt iteration never reads, used only at ship time, because any set
-  you tune against stops being an unbiased estimate (Goodhart's law).
-- **Watch the dev versus held-out gap;** a dev score that keeps climbing while held-out and production
-  stay flat is the symptom.
-- **Keep feeding production failures in,** so the dataset tracks failures that actually occur rather
-  than the ones the team has already fixed.
-
 ## Quiz
 ### Q: A team wants to evaluate a free-text customer-support reply. Which grading approach is most defensible as the headline metric?
 - [ ] ROUGE-L against a single reference reply
@@ -402,6 +412,18 @@ if not, the benchmark number is irrelevant.
 > An end-to-end failure alone does not say whether retrieval, the prompt or the model is at fault.
 > Component evals attribute the drop; they do not replace the end-to-end check, which is what users
 > experience.
+
+## Mastery test
+**Problem:** a coding agent's new system prompt raises the end-to-end pass rate from 70% to 76% on 150
+tasks, one run each at temperature 0.7. Retrieval hit rate is unchanged, mean steps rose from 9 to 12,
+and the gain is concentrated in Python tasks. The team wants to ship today. What do you do?
+
+**A strong answer:**
+- notes one run per task at temperature 0.7 mixes item and sampling noise, so it re-runs each task
+  several times and compares paired flips, not two averages (SE about 3.6 points each at n = 150);
+- checks the non-Python slices for regressions against a floor;
+- treats 33% more steps as a cost and latency axis to decide, not a footnote;
+- ships behind a canary only if the paired gain holds and no hard constraint or slice fails.
 
 ## Use cases & projects
 ### Use cases

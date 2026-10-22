@@ -5,8 +5,14 @@ name: Cross-tenant data leakage
 kind: concept
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - rag-retrieval/metadata-filtering
+  - system-design/multi-tenancy
+  - backend-fundamentals/authentication-vs-authorization
 related:
   - system-design/tenant-isolation
   - system-design/multi-tenancy
@@ -135,35 +141,38 @@ flowchart TD
 ## Examples
 ### A scoped store with a canary test
 Every method requires a tenant context, the filter runs inside the vector search, the cache key includes
-the tenant, and a parametrised test checks each tenant's canary is invisible to all others. The vector
-call uses a Qdrant-style filter syntax; adapt the dictionary to your engine.
+the tenant, and a parametrised test checks each tenant's canary is invisible to all others. It runs as
+`pytest` against Qdrant's in-process local mode (`pip install qdrant-client pytest`, no server).
 
-- **`self.vec` is a thin client wrapper.** With the Qdrant Python client the equivalent call is
-  `client.query_points(...)` with `collection_name`, `query=qvec`, `query_filter` and `limit`; the older
-  `search` method names the vector argument `query_vector`.
+- **Version-sensitive:** checked against qdrant-client 1.16.1, where the call is `client.query_points(...)`
+  with `collection_name`, `query=qvec`, `query_filter` and `limit`. The older `search` method (vector
+  argument `query_vector`) is gone in that version.
 - **Wire it into the agent:** the retrieval tool calls `answer` or `retrieve` with the context from the
   request, never with arguments the model produced.
 
 ```python
 import hashlib, pytest
 from dataclasses import dataclass
+from qdrant_client import QdrantClient, models   # checked against qdrant-client 1.16.1
 
 @dataclass(frozen=True)
 class TenantCtx:
     tenant_id: str            # set once from the verified JWT at the API edge
     user_id: str
-    groups: frozenset[str]    # document ACL groups, also from the verified identity
+    groups: frozenset         # document ACL groups, also from the verified identity
 
 class ScopedStore:
     """Every method takes ctx; there is no unscoped variant to call by mistake."""
-    def __init__(self, vec, cache):
-        self.vec, self.cache = vec, cache
+    def __init__(self, vec: QdrantClient, cache: dict, collection="docs"):
+        self.vec, self.cache, self.collection = vec, cache, collection
 
     def retrieve(self, ctx: TenantCtx, qvec, k=8):
         # filter evaluated inside the ANN search, so k is k *within* the tenant
-        flt = {"must": [{"key": "tenant_id", "match": {"value": ctx.tenant_id}},
-                        {"key": "acl_groups", "match": {"any": sorted(ctx.groups)}}]}
-        return self.vec.search(vector=qvec, limit=k, query_filter=flt)
+        flt = models.Filter(must=[
+            models.FieldCondition(key="tenant_id", match=models.MatchValue(value=ctx.tenant_id)),
+            models.FieldCondition(key="acl_groups", match=models.MatchAny(any=sorted(ctx.groups)))])
+        return self.vec.query_points(collection_name=self.collection, query=qvec,
+                                     query_filter=flt, limit=k).points
 
     def cache_key(self, ctx: TenantCtx, model: str, prompt: str) -> str:
         acl = ",".join(sorted(ctx.groups))       # same tenant, different permissions => different key
@@ -173,13 +182,32 @@ class ScopedStore:
         key = self.cache_key(ctx, model, prompt)
         if (hit := self.cache.get(key)) is not None:
             return hit
-        docs = self.retrieve(ctx, qvec)
-        out = llm(prompt, docs)
-        self.cache.set(key, out, ttl=3600)
+        out = llm(prompt, self.retrieve(ctx, qvec))
+        self.cache[key] = out                    # a real cache also sets a TTL, e.g. ttl=3600
         return out
 
 # CI: each tenant's canary document must be invisible to every other tenant
 CANARIES = {"acme": "CANARY-acme-7f3a", "globex": "CANARY-globex-91c2", "initech": "CANARY-initech-c0de"}
+
+def toy_embed(text, dim=64):                     # stand-in for a real embedding model
+    v = [0.0] * dim
+    for w in text.lower().replace("?", " ").split():
+        v[int(hashlib.md5(w.encode()).hexdigest(), 16) % dim] += 1.0
+    return v
+
+@pytest.fixture
+def embed():
+    return toy_embed
+
+@pytest.fixture
+def store():
+    client = QdrantClient(":memory:")            # local mode, no server needed
+    client.create_collection("docs", vectors_config=models.VectorParams(size=64, distance=models.Distance.COSINE))
+    client.upsert("docs", points=[
+        models.PointStruct(id=i, vector=toy_embed(f"{tok} is the secret"),
+                           payload={"tenant_id": t, "acl_groups": ["all-staff"], "text": f"{tok} is the secret"})
+        for i, (t, tok) in enumerate(CANARIES.items())])
+    return ScopedStore(client, cache={})
 
 @pytest.mark.parametrize("asker", CANARIES)
 def test_no_cross_tenant_leak(store, embed, asker):
@@ -192,7 +220,7 @@ def test_no_cross_tenant_leak(store, embed, asker):
 ```
 
 - **Why k=50:** the large-k test catches a missing or post-applied filter, because the query is phrased to
-  make the foreign canary the nearest neighbour.
+  make the foreign canary the nearest neighbour. Pass `query_filter=None` and all three cases fail.
 - **Why ACL groups in the cache key:** two users of the same tenant with different permissions never share
   a cached answer, at the price of a lower hit rate.
 
@@ -287,22 +315,25 @@ stores. An audit of a first draft (illustrative):
   adapter.
 
 ## Pitfalls
-- **Reading `tenant_id` from a client-controlled header or body.** Symptom: a penetration tester changes
-  one header and receives another customer's documents.
-- **Letting the model pass the tenant as a tool argument.** Symptom: an injected document says "search
-  tenant acme" and the retrieval tool obeys. Fix: tools take the tenant from the request context only.
-- **Filtering in the application after retrieval.** Symptom: small tenants complain search "returns
-  nothing" while large tenants are fine, followed by someone raising k.
-- **Caching completions keyed on question text or embedding only.** Symptom: a customer sees a policy,
-  price or name that is not theirs, often weeks after the cache was introduced.
+- **Reading `tenant_id` from a client header, body or tool argument.** Symptom: changing one header, or an
+  injected "search tenant acme", returns another customer's documents. Diagnose: grep every place
+  `tenant_id` is assigned; any source but the verified token is the bug. Fix: tools read it from the
+  request context only.
+- **Filtering in the application after retrieval.** Symptom: small tenants say search "returns nothing"
+  while large tenants are fine, then someone raises k. Diagnose: log hits before and after the filter, per
+  tenant size. Fix: filter inside the ANN search.
+- **Caching completions keyed on question text or embedding only, or on tenant but not permissions.**
+  Symptom: a customer sees a policy or price not theirs, or an employee gets a summary of a document that
+  returns 403. Diagnose: log the cache key fields with each hit's owner and ACL. Fix: tenant and ACL hash
+  in the key.
 - **Full prompts and completions in a shared tracing backend.** Symptom: a support engineer can read every
-  customer's conversations, which auditors treat as a breach even without misuse.
+  customer's conversations, which auditors treat as a breach even without misuse. Diagnose: list who can
+  query traces per tenant. Fix: classify traces like the source.
 - **One happy-path isolation query per tenant.** Symptom: passing tests and a leak that only appears under
-  near-duplicate questions or large k.
-- **Keying caches on tenant but not permissions.** Symptom: an employee receives a summary of a document
-  they get a 403 for when they try to open it.
-- **A background job with an optional tenant argument.** Symptom: a nightly digest or rebuilt index
-  containing content from tenants it was never meant to touch.
+  near-duplicate questions or large k. Fix: the canary matrix at k=50.
+- **A background job with an optional tenant argument.** Symptom: a nightly digest or rebuilt index with
+  content from tenants it never meant to touch. Diagnose: count job runs with a `None` tenant. Fix: fail
+  closed.
 
 ## When to use
 - **Use when:** any multi-tenant agent or RAG feature launches; design isolation explicitly before launch.
@@ -311,8 +342,17 @@ stores. An audit of a first draft (illustrative):
 - **Measure:** the fraction of store call sites that take a tenant context (target 100%, enforced by a lint
   or wrapper), canary-test pass rate across tenant pairs in CI, and sampled production outputs scanned for
   foreign canaries.
-- **Interviews:** "how would you isolate tenants in a RAG system?" expects more than "add a filter": where
-  the tenant ID comes from, pre- versus post-filtering, caches, memory, logs, and how you would prove it.
+
+## Exercise
+**Goal:** find and fix every cross-tenant leak in a deliberately leaky RAG agent. No solution given.
+- **Inputs:** three synthetic tenants (40,000, 2,000 and 300 chunks) with one canary each, a semantic cache,
+  a memory dict and a nightly summariser job; seed four bugs (post-filter, question-only cache key,
+  user-keyed memory, job with optional tenant).
+- **Deliver:** a scoped store with no unscoped method, plus a canary matrix covering retrieval, cache,
+  memory and the job.
+- **Acceptance:** the matrix fails on the seeded version for all four surfaces and passes after your fix
+  at k=50; small-tenant recall is 8 of 8; a job started without a tenant raises; two users of one tenant
+  with different groups get different cache keys.
 
 ## Role lens
 - **Engineer:** Writes the scoped wrappers, puts the tenant in every cache key, and adds the canary test
@@ -367,14 +407,6 @@ than per-tenant collections were.
   unaffordable beyond a few hundred.
 - **Mixed tiers** are common: dedicated collections for regulated customers, shared for self-serve.
 
-### How do you prove to a customer's security team that tenants are isolated?
-- **Canary documents:** one unique token per tenant, queried from every other tenant with large k across
-  retrieval, cache and memory, in CI on every deploy.
-- **Structural evidence:** tenant ID only from the verified token, no unscoped store API, tenant and ACL in
-  every cache key.
-- **Production evidence:** sampled outputs scanned for foreign canaries, plus offboarding that re-runs the
-  canary queries after deletion.
-
 ### What is the side-channel risk of prompt or prefix caching across tenants?
 - **No content leak,** because a hit needs the identical token prefix.
 - **But latency leaks:** a hit is measurably faster than a miss, so timing can reveal that someone else
@@ -407,6 +439,17 @@ than per-tenant collections were.
 - [ ] The metadata of the first retrieved document
 > Request bodies, model outputs and retrieved documents are all attacker-influenceable; only the verified
 > credential is a trustworthy source, and carrying it in a context object prevents it being overwritten.
+
+## Mastery test
+**Problem:** a meeting-notes agent serves 600 companies. It transcribes calls, stores per-user memory,
+caches answers to "what did we decide about X?", and a weekly job fine-tunes one shared model on all
+transcripts to improve summaries. Security asks whether tenants are isolated. What do you find and change?
+
+**A strong answer:**
+- calls the shared fine-tune a cross-tenant store with no access control; proposes per-tenant adapters or RAG;
+- keys memory by tenant then user, and the cache on tenant, ACL groups and prompt;
+- makes the weekly job carry the tenant and fail closed, and offboarding reach adapters, caches and traces;
+- proves it with a canary per tenant across retrieval, cache, memory and generated summaries.
 
 ## Use cases & projects
 ### Use cases

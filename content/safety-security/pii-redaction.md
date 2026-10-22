@@ -5,8 +5,13 @@ name: PII redaction
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - agents/agent-loop
+  - observability/tracing
 related:
   - security-governance-compliance/pii-protection-dlp
   - safety-security/data-leakage
@@ -40,16 +45,15 @@ agent able to reason and act.
 
 ## Why it exists
 - **LLM features multiply where user text lives.** The prompt goes to a vendor. Tracing tools store full
-  prompts and completions by default, because that is what makes them useful for debugging. Eval sets
-  and fine-tuning sets are copied from production traces. Output is shown to a person who may not be the
-  data's owner. Each copy is a new retention point.
+  prompts and completions by default, because that makes them useful for debugging. Eval and fine-tuning
+  sets are copied from traces. Output reaches people who may not own the data. Each copy is a new
+  retention point.
 - **Indexes retain identifiers indefinitely.** Chunks and embeddings sit in a vector index; the index
   usually stores the chunk text next to the vector, and embeddings themselves can be partially inverted
   back to text, so a phone number embedded is a phone number retained.
 - **Law and contracts assume you know.** GDPR's data-minimisation principle, HIPAA for health data, PCI
-  DSS for card data, state privacy laws and your data-processing agreement with the model vendor all
-  assume you know what personal data leaves your boundary and where it is retained. Without redaction you
-  cannot answer that.
+  DSS for card data, state privacy laws and your vendor data-processing agreement all assume you know
+  what personal data leaves your boundary and where it is retained.
 - **The shortcuts fail.** "The vendor has zero retention" covers the vendor, not your logs, traces,
   indexes and outputs. "Tell the model not to repeat personal data" is a probabilistic instruction.
   "Don't log prompts at all" destroys debuggability, so teams quietly turn logging back on.
@@ -309,8 +313,6 @@ limit, and a nightly stricter-detector audit to estimate the real leak rate.
 - **Short-lived vault per session.** Store placeholder mappings in a separate store with a TTL measured in
   minutes and re-hydrate only after the same authorisation check as retrieval. Monitor vault reads by
   caller.
-- **Split index text from identifiers.** Redact chunk text before embedding and keep customer ids in
-  access-controlled metadata filters, so search by customer still works for authorised users.
 - **Redact at the tool boundary, re-hydrate at the executor.** Agent teams wrap each data-returning tool
   with the redactor and resolve placeholders only inside the executor for tools that need real values.
   Monitor unresolved-placeholder refusals per tool and raw identifiers found in agent traces by the audit.
@@ -335,22 +337,28 @@ limit, and a nightly stricter-detector audit to estimate the real leak rate.
 
 ## Pitfalls
 - **Redacting after the tracing SDK captured the request.** Symptom: PII in the trace UI for a request the
-  model never saw PII in. Fix: redact in the exporter.
+  model never saw PII in. Cause: the SDK hooks in before the handler. Diagnose: send a fixture with every
+  entity type and grep the trace store. Fix: redact in the exporter.
 - **Detecting cards by format alone.** Symptom: order numbers and tracking ids redacted and support staff
-  unable to do their jobs. Fix: checksum validation.
+  unable to do their jobs. Diagnose: sample CARD redactions and count Luhn failures. Fix: checksum
+  validation.
 - **Shipping US-centric patterns.** Symptom: UK, Indian or Brazilian phone numbers and national ids
-  passing straight through.
+  passing straight through. Diagnose: measure recall per entity and locale on labelled traffic. Fix:
+  per-locale recognizers.
 - **Assuming redaction is anonymisation.** The model re-identifies "<PERSON_1>, the CEO of the company in
-  the previous paragraph" from context, and the name appears in the answer anyway.
+  the previous paragraph" from context, and the name appears in the answer anyway. Fix: treat the text
+  as pseudonymised personal data.
 - **Redacting only the user turn.** Symptom: PII from a CRM lookup or an uploaded document landing in
-  logs through tool results.
+  logs through tool results. Diagnose: run the after-the-fact audit grouped by span type (user turn vs
+  tool result). Fix: wrap every data-returning tool.
 - **Writing session placeholders into long-term memory.** Symptom: next week the agent recalls "<PERSON_1>
   prefers email" and cannot tell who that was, or a new vault reuses the number for someone else. Fix:
   store memory with keyed pseudonyms or irreversible redaction.
 - **Re-hydrating for whoever receives the output.** Symptom: one tenant's phone number in another
   tenant's shared dashboard. Fix: check authorisation first.
 - **Assuming placeholders come back verbatim.** Symptom: users see raw `EMAIL_1` or `<Email 1>` strings
-  because re-hydration matched only the exact token, or a split placeholder in streamed output.
+  because re-hydration matched only the exact token, or a split placeholder in streamed output. Diagnose:
+  count placeholder-shaped strings in delivered output. Fix: lenient matching and buffering.
 - **Plain hashing as a pseudonym.** Symptom: a security review reverses every phone-number hash by
   enumerating the number space in minutes. Fix: keyed HMAC.
 
@@ -363,8 +371,17 @@ limit, and a nightly stricter-detector audit to estimate the real leak rate.
 - **Measure:** recall per entity on a labelled sample of real traffic.
 - **In agents:** redact every data-returning tool's result, keep placeholders in the transcript, and
   re-hydrate only in the executor for the tool that needs the real value.
-- **Interviews:** name the boundaries, explain reversible pseudonymisation with typed placeholders, and
-  know why a keyed HMAC is required instead of a plain hash.
+
+## Exercise
+**Goal:** measure and raise the recall of a redactor on text that looks like your agent's real tool
+results. No solution is given.
+- **Inputs:** the self-contained redactor above, and 50 synthetic records you write: CRM notes, email
+  threads and chat logs with names, emails, at least 3 phone-number locales, Luhn-valid cards and
+  card-like order numbers. Hand-label every identifier.
+- **Deliver:** precision and recall per entity type before and after your changes (for example Presidio
+  recognizers or per-locale phone rules), and a list of every remaining miss with its cause.
+- **Acceptance:** a script recomputes the table from your labels; card recall is 100% with zero order
+  numbers redacted; no entity type falls in precision; the miss list is empty or explained.
 
 ## Role lens
 - **Engineer:** Implements the redactor as a pipeline step and as a processor in the logging and tracing
@@ -414,16 +431,6 @@ and extend patterns for the customer's locales.
   run is authorised for that customer, and refuses any placeholder not in the vault.
 - **Nothing raw is logged:** the resolved arguments never go back into the context or the trace.
 
-### Your redactor has 99% recall. Is that good enough?
-- **It depends on volume:** at 10,000 identifiers a day about 100 still land in logs every day.
-- **So redaction reduces exposure, it does not remove it:** keep access control and retention limits on
-  redacted stores, and audit with a slower detector to estimate the true leak rate.
-
-### How would you redact PII from the index your RAG agent searches without breaking search by customer?
-- **Redact the chunk text before embedding,** because the index stores text next to vectors and
-  embeddings can be partially inverted.
-- **Keep identifiers in access-controlled metadata** and filter on them, so authorised users can still
-  search by customer.
 
 ## Quiz
 ### Q: Why pseudonymise phone numbers with a keyed HMAC rather than a plain SHA-256 hash?
@@ -449,6 +456,19 @@ and extend patterns for the customer's locales.
 - [ ] The language of the surrounding text
 > Replacing every identifier with the same token destroys the information that two mentions refer to the
 > same person and that it was a person rather than an address; typed numbering keeps both while hiding the value.
+
+## Mastery test
+**Problem:** a clinic's scheduling agent reads patient messages, books slots through a calendar tool and
+writes a memory note per patient. Its vendor agreement does not cover health data. A sample of the memory
+store shows "<PERSON_3> needs a wheelchair-accessible room" and traces show real dates of birth. Fix the
+design.
+
+**A strong answer:**
+- places redaction on tool results and the user turn before the model call, and in the trace exporter;
+- re-hydrates names only in the calendar tool's executor, after an authorisation check;
+- stores memory under a keyed pseudonym per patient, not session placeholders, and treats the accessibility
+  need as special-category data with its own retention;
+- notes dates of birth are quasi-identifiers: generalise or redact them, and audit recall on them.
 
 ## Use cases & projects
 ### Use cases

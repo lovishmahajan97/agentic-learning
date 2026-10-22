@@ -168,6 +168,13 @@ def process_invoice(inv, extract, po_db, exception_agent, request_approval):
         return {"route": "manual_queue", "fields": fields}
     request_id = request_approval(proposal)          # a person approves before anything is paid or changed
     return {"route": "pending_approval", "proposal": proposal, "request": request_id}
+
+if __name__ == "__main__":                           # stubs: one clean invoice, one exception
+    from types import SimpleNamespace as NS
+    db = NS(validate=lambda f: [] if f["po"] else ["missing PO"])
+    agent = lambda f, p, max_steps, tools: {"po": "PO-7", "why": "vendor renamed"}
+    for inv in ({"po": "PO-1"}, {"po": None}):
+        print(process_invoice(inv, lambda i: i, db, agent, lambda p: "REQ-1")["route"])  # pay, pending_approval
 ```
 
 ### Mining traces to move the boundary

@@ -5,8 +5,14 @@ name: HyDE (Hypothetical Document Embeddings)
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - rag-retrieval/embedding-models
+  - rag-retrieval/dense-vs-sparse-retrieval
+  - rag-retrieval/query-rewriting
 related:
   - rag-retrieval/query-rewriting
   - rag-retrieval/dense-vs-sparse-retrieval
@@ -271,22 +277,26 @@ Illustrative cost for an agent that searches 3 times per task (substitute your m
   hidden and can be sampled, at one more sequential call per search.
 
 ## Pitfalls
-- **Feeding the hypothetical into the answer prompt.** The symptom is fluent answers containing facts that
-  appear in no retrieved passage.
-- **Encoding the hypothetical with a different model than the index.** The symptom is retrieval worse than
-  the plain-query baseline.
-- **Dropping the original query entirely.** The symptom is regressions on queries with exact identifiers,
-  such as ticket numbers, that the hypothetical paraphrased away.
+- **Feeding the hypothetical into the answer prompt.** Symptom: fluent answers with facts in no retrieved
+  passage. Diagnose: diff the generation prompt against the tool result on the trace. Fix: firewall it.
+- **Encoding the hypothetical with a different model than the index.** Symptom: retrieval worse than the
+  plain-query baseline. Diagnose: compare the query-time encoder name, version and mode with the index's
+  recorded ones. Fix: use the index's encoder.
+- **Dropping the original query entirely.** Symptom: regressions on exact identifiers, such as ticket
+  numbers, the hypothetical paraphrased away. Diagnose: recall@k on an identifier slice. Fix: average in
+  the query and send it to BM25.
 - **Using it on time-sensitive questions** (current prices, latest version). The model writes stale
-  details and the vector drifts toward old passages; the symptom is retrieval of outdated versions.
-- **Adopting it because the paper reported gains.** The symptom is added latency and a flat recall@k.
-- **Reranking against the hypothetical.** The symptom is a top result matching the invented details (the
-  "48 hours" passage from an old version) over the true answer.
-- **Exceeding the encoder's input limit.** The symptom is silent truncation and a vector that represents
-  only the opening sentences.
-- **The agent cites its own draft.** The symptom is an answer whose "fact" appears only in the
-  `draft_passage` argument of an earlier tool call. Say in the tool description that drafts are never
-  evidence, and run the cite-only-returned-passages check in the agent eval.
+  details and the vector drifts toward old passages. Symptom: outdated versions retrieved. Fix: skip HyDE
+  or filter by date.
+- **Adopting it because the paper reported gains.** Symptom: added latency and a flat recall@k. Diagnose:
+  A/B recall@k and p95 on your golden set.
+- **Reranking against the hypothetical.** Symptom: a top result matching invented details (the "48 hours"
+  passage from an old version) over the true answer. Fix: rerank against the question.
+- **Exceeding the encoder's input limit.** Symptom: silent truncation and a vector representing only the
+  opening sentences. Diagnose: log hypothetical token counts against the limit.
+- **The agent cites its own draft.** Symptom: an answer "fact" found only in an earlier `draft_passage`
+  argument. Diagnose: the cite-only-returned-passages check in the agent eval. Fix: say in the tool
+  description that drafts are never evidence.
 
 ## When to use
 - **Use when** queries are question-shaped, the corpus is passage-shaped, and the embedder was not trained
@@ -298,9 +308,16 @@ Illustrative cost for an agent that searches 3 times per task (substitute your m
 - **Try first:** instruction-prefixed embeddings and hybrid search, since they are free at query time.
 - **Avoid for** identifier lookups, time-sensitive facts, and domains the LLM knows nothing about.
 - **Measure:** recall@k and MRR on a golden set with and without it, and the latency it adds at p95.
-- **Interviews:** the standard answer to "how would you improve dense retrieval without labelled data";
-  the strong candidate also explains why hallucinations in the hypothetical are mostly harmless and when
-  they are not.
+
+## Exercise
+**Goal:** decide, with numbers, whether HyDE earns its place in a search tool on your corpus. No solution
+is given.
+- **Inputs:** 30 golden questions with labelled chunks (include 5 with ticket or error identifiers), a
+  passage-shaped corpus, two embedders (one generic, one instruction-prefixed) and any small LLM.
+- **Deliver:** recall@10 and MRR for plain query, HyDE always on (3 samples plus query), and HyDE as a
+  fallback, on both embedders; added p95 latency per search; a keep-or-drop decision.
+- **Acceptance:** the hypothetical never appears in a tool result; the identifier slice does not regress;
+  your decision names the encoder, the fallback threshold and the measured gain per added millisecond.
 
 ## Role lens
 - **Engineer:** Implements the generate, embed, average, search path, keeps the hypothetical out of the
@@ -364,14 +381,6 @@ prompt, invented details get cited. Keep it as a search key only.
 - **The eval:** add a check that every answer fact appears in a returned passage, and flag facts found
   only in drafts or hypotheticals.
 
-### How does HyDE relate to Query2doc and doc2query?
-- **Query2doc** concatenates the original query with the generated pseudo-document, and helps sparse BM25
-  as well as dense retrieval.
-- **Doc2query-style expansion** is the mirror image at index time: generate the questions each chunk
-  answers, so the corpus becomes question-shaped.
-- **Choose by where you can pay:** HyDE for a corpus you cannot re-index or low query volume, doc2query for
-  high volume and a stable corpus.
-
 ## Quiz
 ### Q: Why does a hypothetical answer with a wrong number still retrieve the right passage?
 - [ ] The LLM is usually right about numbers in technical domains
@@ -396,6 +405,18 @@ prompt, invented details get cited. Keep it as a search key only.
 - [ ] When no labelled relevance data exists
 > Such models already map questions near their answers, which is the gap HyDE was designed to close;
 > the remaining benefit is small or negative while the generation cost stays.
+
+## Mastery test
+**Problem:** a support agent over a proprietary hardware manual (internal part codes, 40k chunks, 2
+million searches a month) uses a generic embedder. A teammate proposes HyDE on every search because it
+lifted recall in a demo on public cloud docs. Do you agree?
+
+**A strong answer:**
+- doubts the demo transfers: the model cannot write plausibly about private parts, so hypotheticals go
+  generic or confuse entities, and part codes need the original query in BM25;
+- notes the generation runs on every search at high volume, so index-time question generation or an
+  instruction-prefixed embedder is likely cheaper;
+- proposes measuring recall@k on the real golden set, HyDE only as a fallback if it wins.
 
 ## Use cases & projects
 ### Use cases

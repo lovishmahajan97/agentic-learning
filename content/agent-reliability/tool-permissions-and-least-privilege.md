@@ -5,8 +5,13 @@ name: Tool permissions & least privilege
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - agents/tool-calling
+  - safety-security/prompt-injection
 related:
   - agent-reliability/idempotent-tool-execution
   - agent-reliability/audit-logs-execution-traces
@@ -254,22 +259,28 @@ A support agent started with one all-scopes key. Scores are illustrative (reach 
   saves and should become a post-hoc review.
 
 ## Pitfalls
-- **Enforcing permissions in the system prompt.** Symptom: a red-team transcript where a pasted document
-  makes the agent do the forbidden thing while politely explaining that it should not. Fix: executor checks.
-- **One shared service account for all users.** Symptoms: cross-tenant data appearing in answers and an
-  audit log in which every action is attributed to "agent-bot". Fix: on-behalf-of credentials.
-- **Mounting a shell or generic HTTP tool next to scoped tools.** Symptom: the agent completes a blocked
-  action by a different route, visible only when you grep traces for the unexpected tool. Fix: sandbox it.
-- **Letting a credential into the model context,** for example by returning raw API responses that contain
-  tokens. Symptom: secrets in traces, logs and occasionally user-facing replies. Fix: strip in the adapter.
-- **Denying with an exception instead of a structured result.** Symptom: retry storms and step budgets
-  exhausted on the same denied call. Fix: return `{"ok": False, "error": ...}`.
+- **Permissions enforced in the system prompt.** Symptom: a pasted document makes the agent do the
+  forbidden thing while politely explaining that it should not. Cause: a prompt is a request, not a
+  control. Diagnose: run injection payloads in staging and diff resource state before and after. Fix:
+  executor checks.
+- **One shared service account for all users.** Symptoms: cross-tenant data in answers; every audit row
+  says "agent-bot". Diagnose: count distinct credentials per tool in the audit log (goal: one per user).
+  Fix: on-behalf-of credentials.
+- **A shell or generic HTTP tool next to scoped tools.** Symptom: a blocked action completes by another
+  route. Diagnose: after every denial, grep the same run's later calls for an escape-hatch tool. Fix:
+  sandbox it.
+- **A credential in the model context,** for example a raw API response containing tokens. Symptom:
+  secrets in traces, logs and occasionally replies. Diagnose: run a secret scanner over stored traces.
+  Fix: strip in the adapter.
+- **Denying with an exception instead of a structured result.** Symptom: retry storms and exhausted step
+  budgets. Diagnose: count repeats of the same denied call per run. Fix: return `{"ok": False, "error": ...}`.
 - **"Read-only" tools that are not:** a `search` that writes query history or a `lookup` that triggers a
-  webhook. Symptom: side effects in a run that was supposed to have none.
-- **Checking the egress allowlist only on the emitted URL** while the HTTP client follows redirects.
-  Symptom: egress-proxy logs showing requests to hosts that were never on the list.
-- **Approving each tool in isolation** without asking which combinations a run holds. Symptom: a red-team
-  finding where private data leaves through a harmless-looking fetch or rendered image link.
+  webhook. Symptom: side effects in a run that should have none. Fix: audit each tool's real effects.
+- **Egress allowlist checked only on the emitted URL** while the client follows redirects. Diagnose:
+  egress-proxy logs show hosts never on the list. Fix: disable redirects or check every hop.
+- **Approving each tool in isolation.** Symptom: private data leaves through a harmless-looking fetch or
+  image link. Diagnose: list each profile's private-data, untrusted-input and egress tools; flag all
+  three together. Fix: split the run.
 
 ## When to use
 - **Use for** every tool that can mutate state, spend money, send messages or read non-public data, which
@@ -279,9 +290,17 @@ A support agent started with one all-scopes key. Scores are illustrative (reach 
   rate (one always granted is a candidate for automation), and distinct credentials per tool (one per user).
 - **Review every new tool PR** with one question: what is the worst this call can do with the arguments the
   model could plausibly produce?
-- **Interviews:** "how do you stop an agent from deleting production data" is answered not with "tell it
-  not to" but a layered design: allowlist, argument constraints, scoped identity, approval gate, audit, and
-  a sandbox for escape-hatch tools.
+
+## Exercise
+**Goal:** put a permission layer under a small agent and prove an injected instruction cannot cause a
+forbidden effect. No solution is given.
+- **Inputs:** any tool-calling agent (a scripted fake model is fine) with `read_file`, `write_file`,
+  `http_get` and `refund`, plus five files containing injection payloads.
+- **Constraints:** checks run in the executor on parsed arguments; credentials never enter the context.
+- **Deliver:** two versioned profiles, the executor, an audit log and a CI test file.
+- **Acceptance:** traversal, off-list hosts and redirect hops are denied; `refund` returns "ask"; every
+  verdict has an audit row with run id, user and policy version; 20 runs with payloads change nothing
+  outside the profile.
 
 ## Role lens
 - **Engineer:** Writes the executor-side checks and the structured denial results, and keeps credentials
@@ -338,13 +357,6 @@ have no egress tool at all, or the injection could leak orders instead of droppi
   blast radius is the whole account.
 - **Red-team result:** zero successful forbidden actions on the injection suite, not zero attempts.
 
-### Why return a denial as a tool result instead of raising an exception?
-- **The model can re-plan:** a structured "`send_email` is not permitted in this task" tells it to take
-  another route or ask the user.
-- **An opaque error invites retries:** the symptom is retry storms and step budgets burned on the same
-  denied call.
-- **It still gets audited:** the denial is logged with run id, user and policy version like any allow.
-
 ## Quiz
 ### Q: Why is "never delete files" in the system prompt not a sufficient control for an agent with a `delete_file` tool?
 - [ ] Because system prompts are truncated when the context window fills
@@ -370,6 +382,19 @@ have no egress tool at all, or the injection could leak orders instead of droppi
 - [ ] The restriction holds because argument validation applies to all tools uniformly
 > A shell can do anything `write_file` can and more. Argument-level constraints on one tool mean nothing
 > while an unconstrained general-purpose tool is mounted alongside it.
+
+## Mastery test
+**Problem:** a calendar agent reads a user's calendar, accepts invites from outside senders, and can
+`create_event` with attendees and a description. A security review says this is "read plus one write,
+low risk". Is it? Design the profile and say what you would test.
+
+**A strong answer:**
+- sees all three capabilities in one run: private calendar data, untrusted invite text, and egress,
+  because an event's attendees and description reach outside parties;
+- limits `create_event` in the executor (attendees in the user's domain, or new external attendees
+  gated) and uses an on-behalf-of token;
+- or processes invites in a tool-less quarantined sub-call returning structured fields;
+- proves it with an injection invite and asserts no event reaches an outside address.
 
 ## Use cases & projects
 ### Use cases

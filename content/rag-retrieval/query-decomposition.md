@@ -5,8 +5,13 @@ name: Query decomposition
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - rag-retrieval/query-rewriting
+  - agents/parallel-tool-calls
 related:
   - rag-retrieval/query-rewriting
   - rag-retrieval/multi-hop-retrieval
@@ -302,23 +307,27 @@ async def execute_search_calls(tool_calls, budget_chunks=8):
   when question shapes are known in advance.
 
 ## Pitfalls
-- **Over-decomposing simple questions.** The symptom is lookups that used to be fast and right becoming
-  slower and noisier after the feature shipped.
-- **Dropping shared constraints.** The symptom is a synthesis that compares the right plans for the wrong
-  region, because "for EU customers" fell off one sub-question.
-- **Answering an evidence-less facet from memory.** The symptom is a comparison where one side has
-  precise, cited numbers and the other plausible, uncited ones.
-- **Exceeding the budget with n × k chunks.** The symptom is silent truncation of the evidence for
-  whichever sub-question came last.
-- **No deduplication across sub-questions.** The symptom is repeated passages in the prompt and a model
-  that over-weights whatever was repeated.
-- **Decomposing an enumeration question** ("all plans with EU residency"). The symptom is sub-questions
-  about a member list the planner made up, which omits real members and can include ones that do not exist.
-- **Treating a dependent chain as independent.** The symptom is a second sub-question like "what is the
-  manager's email?" that is vague on its own and retrieves nothing useful.
-- **An agent searching facets one per step.** The symptom is comparison questions taking three or four
-  sequential steps; say in the system prompt or tool description that independent facets should be
-  searched in parallel in one turn, and check the parallel-call share in traces.
+- **Over-decomposing simple questions.** Symptom: lookups that were fast and right become slower and
+  noisier after launch. Diagnose: log sub-question count per query and compare atomic-slice latency and
+  accuracy before and after. Fix: tighten the gate.
+- **Dropping shared constraints.** Symptom: the right plans compared for the wrong region, because "for EU
+  customers" fell off one sub-question. Diagnose: diff qualifiers in the original against each
+  sub-question. Fix: the constraint-carry check.
+- **Answering an evidence-less facet from memory.** Symptom: one side has precise, cited numbers and the
+  other plausible, uncited ones. Diagnose: log hits per facet and flag answer claims without a citation.
+  Fix: an "insufficient evidence" rule.
+- **Exceeding the budget with n × k chunks.** Symptom: silent truncation of the last sub-question's
+  evidence. Diagnose: log prompt tokens and chunks kept per facet. Fix: divide a fixed budget.
+- **No deduplication across sub-questions.** Symptom: repeated passages and a model that over-weights
+  them. Fix: dedupe by chunk id, keep all facet tags.
+- **Decomposing an enumeration question** ("all plans with EU residency"). Symptom: sub-questions about a
+  member list the planner made up, which omits real members and can include ones that do not exist. Fix:
+  route to a filter or an enumeration hop.
+- **Treating a dependent chain as independent.** Symptom: a second sub-question like "what is the
+  manager's email?" that is vague alone and retrieves nothing useful. Fix: run it after the first hop.
+- **An agent searching facets one per step.** Symptom: comparisons take three or four sequential steps.
+  Diagnose: the parallel-call share in traces. Fix: say in the system prompt or tool description that
+  independent facets are searched in parallel in one turn.
 
 ## When to use
 - **Use when** the question shape is "compare", "A and also B", "X before and after Y", or anything naming
@@ -330,8 +339,16 @@ async def execute_search_calls(tool_calls, budget_chunks=8):
   already covers both facets.
 - **Measure:** per-sub-question recall, final-answer accuracy on the compound-question golden slice, the
   fraction of queries decomposed, and the latency distribution.
-- **Interviews:** "a user asks to compare two products and the bot only talks about one" is a decomposition
-  question; the strong answer also says how dependent sub-questions turn into multi-hop retrieval.
+
+## Exercise
+**Goal:** build a gated decomposition step and show it lifts facet recall without slowing atomic
+questions. No solution is given.
+- **Inputs:** a small corpus, 30 golden questions (15 comparisons with evidence labelled per facet, 10
+  atomic lookups, 5 "list all" questions), any retriever and any LLM.
+- **Deliver:** a planner with an atomic branch, parallel retrieval under a shared 8-chunk budget, facet
+  tags, and per-facet "no evidence" results; a table of facet recall, accuracy and p95 latency per slice.
+- **Acceptance:** comparison facet recall rises; atomic p95 latency grows by less than one planner call or
+  the gate skips them; no "list all" question is answered from an invented member list.
 
 ## Role lens
 - **Engineer:** Implements the planner prompt with an atomic branch, parallel retrieval, deduplicated
@@ -392,14 +409,6 @@ measurement would catch. A third is cost: without a gate, every simple question 
 - **Guard the fan-out:** cap calls per step, share the chunk budget, return "no evidence" per empty facet,
   and confirm on the compound slice that accuracy held while steps dropped.
 
-### How do you size retrieval k when splitting into sub-questions, or when an agent emits parallel searches?
-- **Share a fixed chunk budget:** with 8 chunks and 3 sub-questions each facet gets 2 or 3 chunks, so
-  per-facet precision matters more than for one query with 8.
-- **Deduplicate across facets** and tag shared chunks (such as a plan-comparison table) with every facet
-  that found them.
-- **Monitor** prompt tokens and truncation of the last facet's evidence, which is the silent failure when
-  n × k exceeds the budget.
-
 ## Quiz
 ### Q: Why does a single dense retrieval tend to miss half of a two-part comparison question?
 - [ ] Embedding models cannot encode questions longer than one sentence
@@ -424,6 +433,17 @@ measurement would catch. A third is cost: without a gate, every simple question 
 - [ ] The embedding model was trained on one plan's documents
 > An empty retrieval for a facet is invisible to the synthesis step unless the sub-answer prompt must
 > state "insufficient evidence"; without that rule the model fills the gap with a confident guess.
+
+## Mastery test
+**Problem:** a travel-policy agent gets "What are the hotel caps for London, Paris and Tokyo for directors,
+and which of them changed since last year?" Answers cover two cities, use the employee rate for one, and
+the "changed" part is guessed. Design the retrieval plan.
+
+**A strong answer:**
+- splits into three parallel facets that each repeat "for directors", checked by a constraint-carry test;
+- treats "changed since last year" as dependent: compare current and prior versions per city via a date
+  or version filter after the first hop;
+- shares the chunk budget, tags facets, and reports "no evidence" per city instead of guessing.
 
 ## Use cases & projects
 ### Use cases

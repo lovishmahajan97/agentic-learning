@@ -5,8 +5,13 @@ name: Typed tool contracts
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - agents/tool-schemas-and-argument-validation
+  - python-for-ai/pydantic
 related:
   - agents/tool-schemas-and-argument-validation
   - agents/tool-result-interpretation
@@ -48,10 +53,9 @@ always reads results of a stable shape.
   model cannot tell a transient failure it should retry from a permission failure it should not.
 - **"Document it in a wiki and be careful" fails** because nothing enforces it and the failures are silent:
   the model does not crash on a wrong field name, it adapts, badly.
-- **The fix is the one API engineering settled on years ago:** a machine-readable interface definition
-  from which clients, servers and tests are generated. Here the client is the model, the server is your
-  handler, and JSON Schema is the shared language, which is why protocols such as MCP transport tools as
-  schemas rather than code.
+- **The fix API engineering settled on years ago:** a machine-readable interface definition that
+  generates clients, servers and tests. Here the client is the model, the server your handler, and JSON
+  Schema the shared language, which is why MCP transports tools as schemas rather than code.
 
 ## How it works
 ### The four parts of a contract
@@ -80,11 +84,9 @@ always reads results of a stable shape.
   `invalid_argument`, `transient`, `internal`); a real registry defines every kind once for all tools.
 
 ### Making write retries safe
-- **The contract says how a retry is made safe.** The harness derives an idempotency key (for example
-  from the `tool_use` id) and passes it to the handler.
-- **Because** a `transient` error after the downstream system committed the write is indistinguishable,
-  from the harness's side, from one before it; only a key lets the retry be a no-op instead of a double
-  charge.
+- **The contract says how a retry is made safe:** the harness derives an idempotency key (for example
+  from the `tool_use` id) and passes it to the handler, because a `transient` error after the downstream
+  commit looks identical to one before it; only the key makes the retry a no-op, not a double charge.
 
 ### Derivation, not duplication
 1. **A registry maps each tool name to its contract.**
@@ -112,10 +114,9 @@ always reads results of a stable shape.
   the 2025-06-18 revision a server can also declare an `outputSchema` and return matching
   `structuredContent`.
 - **Optional MCP annotations carry side-effect metadata:** `readOnlyHint`, `destructiveHint`,
-  `idempotentHint`. From a server you do not control they are claims, not guarantees, so the harness
-  should not relax a gate on their word alone.
-- **The contract also feeds evals.** Expected arguments in a selection eval are instances of the input
-  type, so a schema change breaks the eval loudly rather than invalidating it silently.
+  `idempotentHint`; from a server you do not control they are claims, not guarantees.
+- **The contract also feeds evals.** Expected arguments are instances of the input type, so a schema
+  change breaks the eval loudly rather than invalidating it silently.
 
 ## Diagram
 One contract feeds both the model-facing schema and the runtime checks; every result, good or bad, leaves
@@ -142,6 +143,7 @@ The handler receives a validated `SearchOrdersIn`, must return something that va
 read by the harness, not the model.
 
 ```python
+# Python 3.10+ (X | None in a field); checked with pydantic 2.14.1. Try SEARCH.run({"customer_id": "C-10492"}).
 import json
 from dataclasses import dataclass
 from enum import Enum
@@ -243,8 +245,8 @@ def test_tool_schemas_match_snapshot():
 - **One registry, generated specs.** As soon as two people edit tools; every tool is registered as a
   contract and the provider tool list is built from `spec()` at startup, never hand-written. Monitor
   per-tool schema-validation failure rate, which should be near zero.
-- **Snapshot in CI.** For every repository with tools; the test above, plus a one-command update so people
-  do not delete it. Monitor how often a contract change broke an eval.
+- **Snapshot in CI.** For every repository with tools; the test below, with its one-command update.
+  Monitor how often a contract change broke an eval.
 - **Alert on `internal`.** In production; an `internal` kind means the handler broke its own output
   contract, usually after an upstream change, so page on its rate per tool rather than waiting for users.
 - **Idempotency keys for writes.** For any write tool that can be retried; derive the key from the
@@ -253,8 +255,8 @@ def test_tool_schemas_match_snapshot():
 - **Retry policy from the taxonomy.** In the harness; auto-retry `transient` and `rate_limited` with
   backoff, never retry `permission_denied`, surface `not_found` to the model. Monitor the share of errors
   that carry a kind; untyped errors mean a handler skipped the contract.
-- **Treat remote annotations as hints.** For MCP servers you do not control; keep your own side-effect
-  class per tool and gate on it, not on `readOnlyHint` alone.
+- **Treat remote annotations as hints.** For MCP servers you do not control; gate on your own
+  side-effect class per tool, not on `readOnlyHint`.
 
 ## Trade-offs
 - **One source of truth vs coupling.** It prevents drift, but couples the model-facing schema to internal
@@ -272,26 +274,36 @@ def test_tool_schemas_match_snapshot():
 ## Pitfalls
 - **Exposing the ORM or API model as the tool input.** Symptom: a thirty-field schema and a model that
   invents values for fields it does not understand. Fix: a thin tool-facing input type.
-- **Returning upstream JSON unchanged.** Symptom appears weeks later, when an upstream field rename makes
-  the agent report null values with full confidence. Fix: a typed output mapped at your boundary.
-- **Renaming a parameter in place.** Symptom: evals on fresh prompts pass while cached conversations and
-  few-shot examples that embed the old name break in production. Fix: new tool name or a transition period.
+- **Returning upstream JSON unchanged.** Symptom, weeks later: an upstream field rename makes the agent
+  report null values with full confidence. Diagnose: diff result shapes in traces before and after the
+  date nulls began. Fix: a typed output mapped at your boundary.
+- **Renaming a parameter in place.** Symptom: fresh-prompt evals pass while cached conversations and
+  few-shot examples with the old name break. Diagnose: validation failures per tool, grouped by the
+  unknown field name. Fix: new tool name or a transition period.
 - **Error strings without kinds.** Symptom: the model retries permission errors and gives up on transient
-  ones, the exact opposite of what you want. Fix: the enum, everywhere.
+  ones. Diagnose: the share of error results carrying a `kind`, per tool. Fix: the enum, everywhere.
 - **Marking a tool `parallel_safe` or `read_only` without checking the handler.** Symptom: duplicated writes
   the first time the model batches two calls to it. Fix: review metadata with the handler code.
 
 ## When to use
-- **Use when** more than one person edits tools, more than one agent shares them, or any tool has side
-  effects; that covers nearly every production system.
-- **Lighter option:** for a throwaway prototype with two read-only tools, an SDK decorator that derives the
+- **Use when** several people edit tools, several agents share them, or any tool has side effects.
+- **Lighter option:** for a throwaway prototype with two read-only tools, an SDK decorator deriving the
   schema from a function signature is enough and is still the same idea.
 - **Measure** schema-validation failure rate per tool (near zero with a good contract), the share of errors
   that carry a kind, and how often a contract change broke an eval.
 - **Debug here first:** when a tool "stopped working", compare the committed schema snapshot with what the
-  model is sending.
-- **Interviews:** the usual question is "how do you keep tools from drifting as the team grows"; answer
-  derive, snapshot, version additively.
+  model is sending. In interviews, "how do you keep tools from drifting" is answered by derive, snapshot,
+  version additively.
+
+## Exercise
+**Goal:** put a drifting upstream behind a contract and prove each failure is caught and recovered
+correctly. No solution is given.
+- **Inputs:** two upstream payload versions you write (v2 renames `state` to `status`); a fake write API
+  that can time out after committing.
+- **Deliver:** a read and a write contract, a retry policy driven by error kind, and tests.
+- **Acceptance:** replaying v2 yields an `internal` error, never nulls; a post-commit timeout retried with
+  the same idempotency key leaves exactly one write; `permission_denied` is never retried (count
+  downstream calls); renaming an input field fails the snapshot test.
 
 ## Role lens
 - **Engineer:** Writes each tool as an input type, an output type and a handler, lets the registry
@@ -376,6 +388,17 @@ hours, not days.
 > Names, descriptions and enums are rendered into the prompt for selection and argument filling. Side-
 > effect and concurrency metadata drive gating, approval and scheduling decisions that belong to the
 > harness, not the model.
+
+## Mastery test
+**Problem:** `create_ticket` takes `priority` as an integer 1-5; product wants `low`, `normal` or `urgent`.
+Long-running conversations, few-shot examples and an eval set all use the integer. Plan the change so
+nothing in flight breaks.
+
+**A strong answer:**
+- calls it breaking (a type change) and ships `create_ticket_v2`, or accepts both with a mapping during a
+  transition;
+- updates the snapshot, examples and eval cases in the same PR and reruns the arguments eval;
+- removes the old shape only when traced calls to it reach zero, keeping the write's idempotency key.
 
 ## Use cases & projects
 ### Use cases

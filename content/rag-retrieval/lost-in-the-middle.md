@@ -5,8 +5,13 @@ name: Lost-in-the-middle
 kind: concept
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - model-internals/context-window
+  - rag-retrieval/reranking
 related:
   - model-internals/context-window
   - model-internals/attention-mechanism
@@ -50,11 +55,11 @@ restate the current goal last.
 - **It was not a quirk.** The effect grew with the number of passages; the extended-context variants of
   the models tested at the time did not escape it; a synthetic key-value lookup task showed the same curve
   for several models, so it is not only about distractors that look like the answer.
-- **The context window is not a database.** "More context means more information means better answers" is
-  wrong because attention is a competition over a fixed budget of probability mass. Retrieved chunks are
-  by construction similar to each other and to the question, so they split that mass among lookalikes.
-- **Training taught the model where things sit:** instructions at the top, the question and answer at the
-  bottom. A pipeline that ignores position quietly converts retrieval wins into generation losses.
+- **The context window is not a database.** "More context means better answers" is wrong because
+  attention is a competition over a fixed budget of probability mass, and retrieved chunks, similar by
+  construction, split it among lookalikes.
+- **Training taught the model where things sit:** instructions at the top, question and answer at the
+  bottom. Ignore position and retrieval wins become generation losses.
 
 ## How it works
 ### The shape of the curve
@@ -97,8 +102,8 @@ Raising k makes every row worse: more distractors, and the evidence deeper in th
 
 - **Symptoms:** the agent re-searches for something it already found, forgets a constraint from the
   original task, or contradicts an earlier tool result.
-- **Each tool result adds to the middle**, so verbose tools (raw HTML, full documents, 50 search hits)
-  deepen the trough for every later step.
+- **Each tool result adds to the middle**: verbose tools (raw HTML, full documents, 50 search hits)
+  deepen the trough for later steps.
 
 ### Mitigations and why each works
 1. **Retrieve fewer, better.** Rerank with a cross-encoder, then cut to a small k (5 to 8 is a common
@@ -107,20 +112,18 @@ Raising k makes every row worse: more distractors, and the evidence deeper in th
 2. **Reorder for the edges.** Rank 1 first, rank 2 last, rank 3 second, rank 4 second-to-last, and so on,
    so the best evidence sits at both ends of the U. LangChain ships this as a document transformer; it is
    ten lines to write yourself.
-3. **Question last.** Long documents first, then the question and instructions, and repeat the key
-   instruction at the end. Anthropic's long-context guidance recommends exactly this layout. The question
-   sits in the recency window right before generation, and the document prefix is stable, which is also
-   what prompt caching wants. In an agent, the equivalent is restating the goal and remaining plan near
-   the end of the context.
-4. **Optionally sandwich the question.** In a causal model, document tokens are encoded before the model
-   has seen a question placed after them, so only the final positions read the documents "with the
-   question in mind". Stating the question briefly *before* the documents too (query-aware
-   contextualization in the original study) lets every document token be processed in light of it.
+3. **Question last.** Long documents first, then the question and instructions, repeating the key
+   instruction at the end, as Anthropic's long-context guidance recommends. The question sits in the
+   recency window, and the stable document prefix suits prompt caching. In an agent: restate the goal and
+   remaining plan near the end.
+4. **Optionally sandwich the question.** In a causal model, document tokens are encoded before a question
+   placed after them, so only the final positions read the documents "with the question in mind". Stating
+   it briefly *before* the documents too (query-aware contextualization in the original study) fixes that.
    - The study found this helped its synthetic key-value lookup a great deal but changed multi-document
      QA little, so measure it; do not default to it.
 5. **Structure the context.** Wrap each chunk in a tagged block with an id and source, and ask the model to
-   quote the relevant sentences before answering. The quotes land at the end of the prompt, right before
-   the answer, turning "find it in the middle" into "read what you just wrote".
+   quote the relevant sentences first. The quotes land right before the answer, turning "find it in the
+   middle" into "read what you just wrote".
 6. **Compress.** Extract only the relevant sentences from each chunk (an LLM or a small extractive model)
    before the final prompt, so the middle is short. For agents, trim tool results to what the step needs
    and compact old turns into a short notes block.
@@ -189,6 +192,15 @@ def position_sweep(llm, build_prompt, gold, distractors, question, grader, k=20,
     return acc
 # Illustrative shape for a 20-chunk context: ~0.9 at position 0, ~0.65 around position 10, ~0.8 at 19.
 # Run it per question type and per model; the trough depth is what tells you how much k you can afford.
+
+def simulated_llm(ctx):                                 # stand-in with a U-curve; swap in your model
+    pos = ctx.index("GOLD")
+    return random.random() < (0.9 - 0.025 * pos if pos <= 10 else 0.65 + 0.0167 * (pos - 10))
+
+random.seed(0)
+acc = position_sweep(simulated_llm, lambda ctx, q: ctx, "GOLD", [f"d{i}" for i in range(100)], "q",
+                     grader=int, trials=300)
+print({p: round(acc[p], 2) for p in (0, 10, 19)})       # close to {0: 0.9, 10: 0.65, 19: 0.8}
 ```
 
 ### Worked numbers: rerank, cut, reorder
@@ -239,14 +251,13 @@ print(triage(rows))   # 39 wrong: 33 with evidence present, 6 missing -> fix lay
 - **Goal and plan restated at the end.** Keep the stable prefix (system prompt, tool schemas, documents)
   first, and end each step's context with the task, key constraints and remaining plan. Monitor
   dropped-constraint errors and prompt-cache hit rate together.
-- **Compact old turns at a boundary.** When the transcript passes a token threshold, summarize old tool
-  results into a short notes block that keeps ids and key facts. Monitor repeat searches for the same
-  query within a run; they signal facts lost in the middle.
-- **Position sweep on every model change.** Run the sweep per question type before switching models or
-  deployments, and store the curve with the model version. Alert when the trough deepens beyond the
-  previous model's.
-- **Evidence-present-but-unused metric.** Log whether the gold or cited chunk was in context for each
-  graded failure; track that rate weekly. Rising values mean layout and distractors, not retrieval.
+- **Compact old turns at a boundary.** Past a token threshold, summarize old tool results into a notes
+  block that keeps ids and key facts. Monitor repeat searches within a run; they signal facts lost in the
+  middle.
+- **Position sweep on every model change.** Run it per question type before switching models or
+  deployments; store the curve with the model version and alert when the trough deepens.
+- **Evidence-present-but-unused metric.** Log whether the gold chunk was in context per graded failure,
+  weekly. Rising values mean layout and distractors, not retrieval.
 
 ## Trade-offs
 - **Smaller k: fewer distractors vs recall.** Cutting k after reranking costs recall. It flips when
@@ -254,44 +265,53 @@ print(triage(rows))   # 39 wrong: 33 with evidence present, 6 missing -> fix lay
   smaller k.
 - **Edge reordering: free vs natural order.** It destroys natural order. It flips when order carries
   meaning (log timelines, document sections); keep the order and label each chunk explicitly instead.
-- **Question before documents: better reading vs prefix caching.** It lets a causal model read the
-  documents with the question in view, but puts per-query text ahead of them and breaks prefix caching. It
-  flips to question-last-only when many questions reuse the same long document set (chat over one
-  contract).
+- **Question before documents: better reading vs prefix caching.** The model reads the documents with the
+  question in view, but per-query text ahead of them breaks prefix caching. It flips to question-last-only
+  when many questions reuse one long document set (chat over one contract).
 - **Quote-then-answer: evidence use vs tokens.** Better evidence use and checkable quotes, at the price of
   output tokens and latency; vendor citation features can recover some of that cost.
-- **Compaction: short middle vs lost detail.** Summarizing old turns keeps the context short, but a
-  summary can drop the one fact a later step needs and costs a prefix-cache miss. Keep ids so the agent
-  can re-fetch.
+- **Compaction: short middle vs lost detail.** A summary can drop the one fact a later step needs and
+  costs a prefix-cache miss. Keep ids so the agent can re-fetch.
 - **Newer long-context model: no engineering vs fragility.** It shrinks the trough, but the effect is
   model-dependent and silently returns when a customer swaps models.
 
 ## Pitfalls
-- **Raising k to fix misses.** Symptom: retrieval recall@k goes up in the eval while end-to-end answer
-  accuracy goes down.
+- **Raising k to fix misses.** Symptom: retrieval recall@k goes up in the eval while answer accuracy goes
+  down, because each chunk is a distractor. Diagnose: plot accuracy against k. Fix: rerank and cut.
 - **Evaluating only with the gold chunk at position 1, or a single-needle test.** Symptom: a green eval and
-  production answers that ignore facts sitting in the prompt.
+  production answers that ignore facts sitting in the prompt. Diagnose: position sweep with multi-fact
+  questions. Fix: add the sweep to the eval suite.
 - **Instructions and question before 20,000 tokens of documents.** Symptom: the model answers a different
-  question or drops constraints stated at the top.
+  question or drops constraints stated at the top. Fix: documents first, question last.
 - **Ordering chunks by document order or timestamp without a reason.** Symptom: the best chunk is buried
-  in the middle behind weaker ones.
+  in the middle behind weaker ones. Diagnose: log the slot of the top-ranked chunk. Fix: edge reorder.
 - **Full parent sections at a high k.** Symptom: context overflow and a quality collapse that looks like a
-  model regression but is a layout problem.
+  model regression but is a layout problem. Fix: smaller k or compression.
 - **Verbose tool results in a long agent loop.** Symptom: the agent repeats searches and contradicts
-  earlier findings after ten or so steps. Fix: trim results, compact old turns, restate the goal last.
+  earlier findings after ten or so steps. Diagnose: count repeat searches per run and check whether the
+  fact was in context. Fix: trim results, compact old turns, restate the goal last.
 - **Treating the effect as fixed.** Symptom: a pipeline tuned for one model regresses silently after a
-  model upgrade or a customer's choice of a different deployment.
+  model upgrade or a customer's choice of a different deployment. Diagnose: compare stored position
+  curves per model version. Fix: re-run the sweep on every change.
 
 ## When to use
-- **Use when** a prompt carries more than a handful of retrieved passages, every time someone proposes
-  raising k, and whenever an agent run grows past a few tool calls.
-- **Measure:** the evidence-present-but-unused rate in error analysis (retrieval found the gold chunk, the
-  answer is still wrong), because that gap, not recall, is what this effect produces. Then run a position
-  sweep and track answer accuracy against k, which usually peaks and then declines.
-- **Day to day:** the ordering in your prompt builder, the cut after the reranker, and the question-last
-  template.
-- **Interviews:** "recall@20 is 95% but answers are wrong 30% of the time, what do you check?" The strong
-  answer names position and distractors before touching the embedding model.
+- **Use when** a prompt carries more than a handful of passages, someone proposes raising k, or an agent
+  run grows past a few tool calls.
+- **Measure:** the evidence-present-but-unused rate (retrieval found the gold chunk, the answer is still
+  wrong), because that gap, not recall, is what this effect produces; then a position sweep and accuracy
+  against k.
+- **Interviews:** "recall@20 is 95% but answers are wrong 30% of the time, what do you check?" Name
+  position and distractors before the embedding model.
+
+## Exercise
+**Goal:** produce your model's position curve and use it to set your search tool's k and layout. No
+solution is given.
+- **Inputs:** 40 questions with known gold chunks, top-50 retrieved chunks per question as distractors,
+  and your agent's model.
+- **Deliver:** accuracy by gold position for k = 20 (positions 0, 5, 10, 15, 19), then the same questions
+  with rerank, cut to 6, edge reorder and question last; a one-line k recommendation.
+- **Acceptance:** at least 10 trials per cell with the spread reported; the triage split of the
+  failures; the trough depth stated in points, and the recommendation follows from it.
 
 ## Role lens
 - **Engineer:** Implements rerank, cut and edge reordering in the prompt builder, uses a documents-first
@@ -381,6 +401,18 @@ a bigger k.
 > The gap is evidence-present-but-unused, a generation-side problem caused by distractors and position.
 > More k or more overlap adds distractors; a different embedding model targets recall, which is already
 > high.
+
+## Mastery test
+**Problem:** a coding agent fixes a bug over 25 steps. At step 3 it reads a config file stating
+`retries=0`. At step 22 it proposes adding retry logic "since none is configured to exist", and its final
+patch contradicts that config. Context at step 22 is 70k tokens. Explain and fix without a bigger model.
+
+**A strong answer:**
+- places the config result deep in the middle, behind 19 steps of verbose tool output;
+- checks trace evidence first: the file content was in context, so this is present-but-unused, not
+  retrieval;
+- trims tool outputs, compacts old turns into notes that keep key facts and ids, restates the task and
+  constraints last, and verifies with repeat-read counts on replayed runs.
 
 ## Use cases & projects
 ### Use cases

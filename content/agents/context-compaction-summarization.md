@@ -5,8 +5,14 @@ name: Context compaction / summarization
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - agents/agent-loop
+  - model-internals/context-window
+  - prompting/prompt-caching
 related:
   - agents/agent-loop
   - agents/agent-memory
@@ -54,12 +60,8 @@ external state; the hard part is choosing what must survive.
 - **Naive fixes fail.** Dropping the oldest messages removes the system prompt, task and constraints,
   the most important tokens. A bigger window moves the wall but keeps the quadratic cost and the
   attention dilution. "Be concise" does not control tool output sizes, which is where the tokens are.
-- **Prompt caching is not a substitute.** An unchanged prefix is billed at a discount on providers that
-  support it, but that only changes the price of re-reading. The window limit and quality problems are
-  untouched, so caching is a reason to compact rarely, not a reason not to compact.
-
-Compaction is the harness taking ownership of what the model sees, with an explicit policy for what
-must be preserved.
+- **Prompt caching is not a substitute.** It discounts re-reading an unchanged prefix but leaves the
+  window limit and quality problems untouched: a reason to compact rarely, not to skip it.
 
 ## How it works
 ### Weigh the transcript by class
@@ -80,9 +82,8 @@ model read the file, edited it and moved on.
 3. **Keep the last K observations intact**, because the model may still be reading them.
 
 - **Practically lossless when tools are idempotent:** the information is one call away.
-- **Often the biggest win.** In a tool-heavy run tool output is typically the large majority of tokens,
-  so this layer alone can extend achievable run length several-fold. How much depends entirely on your
-  output mix; measure it.
+- **Often the biggest win.** Tool output is typically most of a tool-heavy run's tokens, so this layer
+  alone can extend run length several-fold, depending on your output mix; measure it.
 - **Still a prefix edit.** Everything after the first stubbed message misses the prompt cache, so batch
   stubbing at compaction time rather than doing it every step.
 
@@ -129,7 +130,6 @@ model read the file, edited it and moved on.
 - **The cheapest tokens to compact never entered the main context.** Delegate a noisy sub-task (search
   the codebase for every caller of `charge()`) to a sub-agent with a fresh context and return only its
   condensed answer.
-- **Same idea, different boundary:** compaction applied at the edge of a task rather than over time.
 - **Provider features:** some providers now offer server-side context editing or compaction. They
   implement the same layers; you still own the policy for what must survive.
 
@@ -200,6 +200,14 @@ def compact(messages, llm, count_tokens):
     assert not missing, f"summary missing {missing}"
     note = {"role": "user", "content": "Earlier context was compacted. Summary:\n" + json.dumps(data, indent=1)}
     return pinned + [note] + recent          # system prompt + task statement stay pinned
+
+if __name__ == "__main__":   # demo: fake model, chars/4 as the token counter
+    fake = lambda msgs: json.dumps({"goal": "fix test", "state": "PR #1 open", "next_step": "run CI"})
+    tokens = lambda msgs: sum(len(m["content"]) for m in msgs) // 4
+    run = [{"role": "system", "content": "sys"}, {"role": "user", "content": "task"}]
+    run += [m for i in range(40) for m in ({"role": "assistant", "content": f"call {i}"},
+                                           {"role": "tool", "content": "x" * 30_000})]
+    print(tokens(run), "->", tokens(compact(run, fake, tokens)))   # 300k -> ~23k, pruning alone
 ```
 
 ### Anchored merge for the second and later compactions
@@ -255,8 +263,9 @@ print(m["goal"], m["ids_created"], m["next_step"])
 - **Sub-agent isolation for noisy searches.** When a sub-task is mostly exploration. Give it a fresh
   context and a return-size cap on its answer. Monitor parent context growth per delegated task.
 - **Compaction regression eval.** Before changing thresholds or summarizer models. Replay recorded runs,
-  compact them, and ask probe questions whose answers sit in the dropped span. Track task success and
-  probe accuracy, not just tokens saved.
+  compact them, and ask probe questions answered in the dropped span (which PR did you open? which
+  constraint applies?); a wrong answer is a schema gap. Track task success and probe accuracy, not just
+  tokens saved.
 
 ## Trade-offs
 - **Bounded context vs full recall.** Compaction is lossy by construction: a cheaper, bounded context in
@@ -273,20 +282,26 @@ print(m["goal"], m["ids_created"], m["next_step"])
   strict schema with validation recovers most of that, at the price of a retry loop when validation fails.
 
 ## Pitfalls
-- **Summarizing away the task statement or a constraint.** Symptom: an agent that confidently finishes a
-  slightly different task, or asks what it was supposed to do. Fix: pin them outside the compacted span.
-- **Summaries without IDs ("created a ticket").** Symptom: duplicates, such as a second ticket, a second
-  pull request, a second charge. Fix: an `ids_created` field the schema requires.
+- **Summarizing away the task or a constraint.** Symptom: the agent confidently finishes a slightly
+  different task, or asks what it was supposed to do. Cause: the pinned head sat inside the compacted
+  span. Diagnose: diff the prompt before and after compaction; task and constraints must be
+  byte-identical. Fix: pin them outside the span.
+- **Summaries without IDs ("created a ticket").** Symptom: duplicates, such as a second ticket, pull
+  request or charge, soon after a compaction. Diagnose: line up duplicate side effects with compaction
+  events in the trace and grep the summary for the earlier ID. Fix: an `ids_created` field the schema
+  requires.
 - **Cutting between a tool call and its result.** Symptom: API errors about unmatched tool results, or a
-  model that invents the missing result. Fix: move the boundary until pairs stay together.
-- **Compacting on every step.** Symptom: a collapsing cache hit rate, rising cost per step, and a summary
-  that drifts because it is a summary of a summary of a summary. Fix: a threshold.
-- **Re-summarizing the previous summary with the new span.** Symptom: identifiers and decisions present
-  after the first compaction are vague or gone after the third. Fix: anchored merge.
+  model that invents the missing result. Diagnose: after each pass, assert every tool result's call id
+  has its call. Fix: move the boundary until pairs stay together.
+- **Compacting every step, or re-summarizing the summary.** Symptom: a collapsing cache hit rate, rising
+  cost per step, and IDs and decisions that are vague or gone after the third compaction. Cause: each pass
+  is a prefix edit and another lossy step. Diagnose: plot cached-token share per step and run probe
+  questions after the first and third pass. Fix: a threshold plus anchored merge.
 - **Not telling the model compaction happened.** Symptom: references to "the file above" that no longer
   exists, followed by made-up contents. Fix: an explicit compaction note.
-- **Secrets or personal data flowing into a persisted summary.** Symptom: credentials in a memory store
-  or a log. Fix: redact tool outputs before they can reach the summarizer.
+- **Secrets or personal data in a persisted summary.** Symptom: credentials in a memory store or a log.
+  Diagnose: run a secret scanner over stored summaries. Fix: redact tool outputs before they can reach
+  the summarizer.
 
 ## When to use
 - **Use when:** any agent runs more than a handful of steps (at least Layer 1); anything long-running
@@ -296,10 +311,16 @@ print(m["goal"], m["ids_created"], m["next_step"])
 - **Measure:** tokens per step, prompt-cache hit rate, the fraction of runs that hit the window limit,
   and task success before and after. A policy that saves 40% of tokens and loses 10% of task completions
   is a net loss.
-- **Test fidelity directly:** compact a recorded run and ask probe questions answered in the dropped span
-  (which PR did you open? which constraint applies?); a wrong answer is a schema gap.
-- **Interviews:** derive the quadratic cost of an uncompacted run and explain why the summary must be
-  structured and cut at tool-call boundaries; that is the expected depth.
+
+## Exercise
+**Goal:** build and validate the compaction step for a synthetic 60-step agent run. No solution is given.
+- **Inputs:** a transcript with 40+ tool results (20 KB logs mixed with short outputs), three created IDs
+  and two constraints stated early; a token counter (tiktoken, or characters ÷ 4).
+- **Deliver:** prune, schema summary and anchored merge, tuned so the run compacts at least three
+  times, plus a per-step table of tokens sent and compaction events.
+- **Acceptance:** an assertion shows no orphaned tool result after any pass; probe questions for all
+  three IDs and both constraints answer correctly after the third compaction; total tokens sent fall by
+  at least half versus no compaction.
 
 ## Role lens
 - **Engineer:** Implements the pruning and summary step in the harness, chooses thresholds, validates
@@ -384,6 +405,18 @@ probe-question accuracy after compaction, not just token savings.
 - [ ] The user's stated preference for a particular library
 > File contents are cheaply re-derivable with a tool call. Constraints, created identifiers and user
 > preferences are not, and forgetting them causes wrong actions or duplicate side effects.
+
+## Mastery test
+**Problem:** a contract-review agent reads 300-page agreements clause by clause and must quote exact
+wording in its final memo. Since compaction was added, memos paraphrase clauses and twice cited the wrong
+clause number. Redesign the policy.
+
+**A strong answer:**
+- sees that exact text must never pass through a summarizer: store clauses keyed by number outside the
+  context and keep only pointers;
+- keeps clause numbers and findings in append-only fields merged in code, so they are never paraphrased;
+- has the memo step re-read quoted clauses by number from the store;
+- measures exact-match of quotes against the source and clause-number accuracy, before and after.
 
 ## Use cases & projects
 ### Use cases

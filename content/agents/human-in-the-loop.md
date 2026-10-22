@@ -5,8 +5,14 @@ name: Human-in-the-loop
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - agents/agent-loop
+  - agents/state-machines
+  - math-for-ai/statistics-for-evaluation
 related:
   - agents/approval-gates-for-consequential-actions
   - agents/state-machines
@@ -57,9 +63,8 @@ and make each decision cheap, informed and genuine.
   poorly calibrated: it rarely asks on the injected or adversarial case that most needs it, and asks
   constantly on easy cases if prompted to be careful.
 
-As a discipline, the *harness* decides when a person is consulted, on explicit triggers, and the
-interaction is designed so a person decides well in seconds. Each decision is also a labelled example of
-what "correct" means in this deployment, a loop the agent cannot close alone.
+So the *harness* consults a person on explicit triggers, designed so they decide well in seconds; each
+decision is also a labelled example of what "correct" means here.
 
 ## How it works
 ### Three positions for the person
@@ -74,8 +79,7 @@ what "correct" means in this deployment, a loop the agent cannot close alone.
 - **The supervision trap** (described long ago for industrial automation): the more reliable the system,
   the less the supervisor practises the task and the less context they hold, so they intervene late and
   with poor situational awareness.
-- **So supervision works** when the stream highlights the few actions worth a look, not when it asks a
-  person to watch everything.
+- **So supervision works** only when the stream highlights the few actions worth a look.
 
 ### The economics of a review
 Per item, blocking review of a class is worth it when:
@@ -109,7 +113,6 @@ p_error × catch_rate × harm  >  review_cost + delay_cost
    sentence buried in output.
 
 ### Making the decision cheap and real
-What the person sees determines whether the control is real.
 - **Show the action and its *effect*:** the diff, the rows affected, the email as it will be sent.
 - **Show the evidence** the agent relied on and the alternatives it considered.
 - **Offer approve, edit, and reject with a reason.**
@@ -130,7 +133,7 @@ What the person sees determines whether the control is real.
   is looking.
 - **Canaries:** inject known-bad proposals and measure the catch rate.
 - **Queue depth:** decisions made under backlog pressure are worse.
-- **Reviewer clarity:** if reviewers cannot say what they are checking, redesign what you show them.
+- **Reviewer clarity:** reviewers who cannot say what they check need a redesigned view.
 
 ## Diagram
 The harness, not the model, routes each proposed action to blocking review, automatic execution with a
@@ -177,12 +180,10 @@ and 94% agreement above $50.
 - **Above $50** the harm term grows with the amount and the error rate is 6%, so review stays.
 - **The audit is the safety net:** if audited agreement falls below a set threshold, the harness returns
   the class to blocking review automatically.
-- **Window size matters.** At 99.2% agreement, 70 audits a day yield well under one disagreement a day,
-  so judge the threshold over a rolling window of several hundred audits (or raise the sample). A
-  two-day window of 140 cases is too small to distinguish 99% from 97%.
-- **Canary proposals**, obviously wrong refunds inserted into the blocking queue, confirm reviewers
-  still catch the large majority; if that rate drops, redesign what reviewers see before widening
-  autonomy further.
+- **Window size matters.** 70 audits a day yield well under one disagreement, so judge over several
+  hundred audits; a two-day window of 140 cannot tell 99% from 97%.
+- **Canary proposals** (obviously wrong refunds in the blocking queue) confirm reviewers still catch
+  most errors; if not, redesign what they see before widening autonomy.
 
 ### Review economics and audit-window size in code
 Runs as-is. The first function is the inequality above; the second shows why 140 audits cannot tell a
@@ -227,16 +228,14 @@ for n in (140, 500):
 - **Owner-based routing with deny-on-timeout.** For consequential actions. Map each tool or resource to
   an owning team in config, route there, and default to deny when the timeout fires. Monitor queue depth
   and timeouts per owner.
-- **Decision log as eval source.** Always. Store (input, proposal, decision, reason) and export
-  rejections with reasons into the regression eval set weekly. Monitor how many new eval cases each
-  week's rejections produce.
+- **Decision log as eval source.** Always. Export each week's rejections with reasons into the
+  regression eval set. Monitor how many new eval cases they produce.
 
 ## Trade-offs
 - **Control vs latency.** Blocking review buys control at the price of hours of latency when approvers
   are busy; flips to supervision or auditing when latency costs more than the expected error.
 - **Coverage vs reviewer saturation.** More review raises the catch rate only until reviewers saturate;
-  past that point approval quality collapses, so coverage beyond capacity is worse than a smaller,
-  well-designed sample.
+  beyond capacity it is worse than a smaller, well-designed sample.
 - **Graduated autonomy vs distribution shift.** It cuts cost but trusts the audit sample to represent
   traffic; flips when the input distribution shifts faster than the audit cadence can notice.
 - **Clarifying questions vs user attention.** They prevent wrong work but spend attention; past a few per
@@ -246,30 +245,41 @@ for n in (140, 500):
 
 ## Pitfalls
 - **Letting the model decide when to ask.** Symptom: silence on the adversarial case and constant
-  questions on the easy ones. Fix: harness triggers.
+  questions on the easy ones. Diagnose: compare ask rate on red-team inputs with ask rate on easy ones.
+  Fix: harness triggers.
 - **Presenting the transcript instead of the effect.** Symptom: reviewers who take minutes and still miss
-  the harmful line, or stop reading entirely.
+  the harmful line, or stop reading entirely. Diagnose: decision time and canary catch rate per payload
+  type. Fix: a dry-run preview.
 - **No timeout, or "proceed" as the default on consequential actions.** Symptom: an unreviewed refund
-  executed at 3 a.m. because the approver was asleep.
+  executed at 3 a.m. because the approver was asleep. Diagnose: count executions whose decision was a
+  timeout. Fix: deny on timeout.
 - **Not recording the reviewer's reason.** Symptom: a year of decisions that cannot be turned into a
-  single eval case.
-- **Rubber stamping.** Symptom: 99.9% approval, three-second decisions, and canaries sailing through.
+  single eval case. Fix: require a reason.
+- **Rubber stamping.** Symptom: 99.9% approval, three-second decisions, canaries sailing through. Cause:
+  saturation and automation bias. Diagnose: canary catch rate per reviewer against queue depth. Fix:
+  narrow what blocks and redesign the payload.
 - **Supervising a long, uneventful stream.** Symptom: an intervention minutes after the bad action, from
-  someone who has to scroll back to understand it.
+  someone who has to scroll back to understand it. Fix: highlight only actions worth a look.
 - **Routing to whoever is online, not the owner.** Symptom: approvals from people who could not have
-  known the action was wrong.
+  known the action was wrong. Fix: owner-based routing.
 
 ## When to use
 - **Use when** an action is consequential, regulated, novel or ambiguous, and nowhere else: every
   unnecessary review is attention taken from a necessary one.
-- **Start new deployments with full review**, not because the model is bad but because the logged
-  decisions show where it is good; widen autonomy per class as agreement data accumulates.
+- **Start new deployments with full review**, because the logged decisions show where the model is good;
+  widen autonomy per class as agreement data accumulates.
 - **Measure:** agreement rate, decision time, approval rate, canary catch rate and queue depth. Use the
   first and fourth to fill in the review-economics inequality per action class.
-- **Why it matters:** day to day, this is the difference between an agent the business trusts and one it
-  turns off after the first incident.
-- **Interviews:** expect "how would you avoid rubber stamping?" and "how would you decide what to
-  automate first?"
+
+## Exercise
+**Goal:** decide, with evidence, which action classes of a support agent to automate. No solution given.
+- **Inputs:** a synthetic log of 3,000 decisions in four classes (password reset, plan change, refund
+  under $100, refund over $100), each with proposal, human decision, reason and decision time; set your
+  own error rates and harm per class and state them.
+- **Deliver:** a per-class table of agreement, the review-economics result and a chosen mode (block,
+  audit, auto) with audit rate and window size; a canary plan.
+- **Acceptance:** recomputing any row by hand gives the same mode; your window size is backed by a
+  binomial check that a class degraded by 2 points fails the threshold at least 95% of the time.
 
 ## Role lens
 - **Engineer:** Builds the pause-and-resume path, the structured clarification request, the review UI's
@@ -354,6 +364,18 @@ so the customer can widen autonomy on evidence rather than on trust.
 - [ ] The time of day the decision was made
 > Decisions with reasons are labelled data; they measure agreement per action class and seed regression
 > tests. Transcripts are large and rarely read; the other options carry little signal.
+
+## Mastery test
+**Problem:** a hospital scheduling agent books, moves and cancels appointments. Cancelling a
+chemotherapy slot is rare but severe. Staff review every action today and say the queue takes four hours
+a day. Design the loop.
+
+**A strong answer:**
+- splits classes by harm and reversibility: oncology cancellations always block, routine moves go to
+  sampled audit, bookings auto with audit;
+- routes clinical-slot changes to the owning clinic, with deny on timeout;
+- shows the effect (patient, slot, conflicts) rather than the transcript;
+- measures agreement per class with a window large enough to see rare errors, plus canaries.
 
 ## Use cases & projects
 ### Use cases

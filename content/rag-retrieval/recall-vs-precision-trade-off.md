@@ -5,8 +5,13 @@ name: Recall vs precision trade-off
 kind: concept
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - ml-fundamentals/precision-recall-f1
+  - rag-retrieval/similarity-search
 related:
   - ml-fundamentals/precision-recall-f1
   - rag-retrieval/reranking
@@ -306,35 +311,50 @@ transcript for the rest of the run.
   retries become routine rather than rare, buying recall in the tool is usually cheaper.
 
 ## Pitfalls
-- **Measuring only end-to-end accuracy.** Failures cannot be attributed to recall (never retrieved) or
-  precision (retrieved but ignored); the symptom is that every fix is a guess.
-- **Tuning k on a handful of complaint queries.** The symptom is regressions on queries nobody was looking
-  at, visible only once a golden set exists.
-- **Labelling relevance by embedding similarity.** Label by whether the chunk answers the question; the
-  symptom is excellent retrieval metrics alongside wrong answers.
-- **Counting a hit for any chunk of the right document.** The symptom is high "recall" while the specific
-  clause that answers the question is still missing from the prompt.
-- **Treating precision as cost-only.** The symptom is answers citing a plausible but outdated passage that
-  sat next to the correct one in the context.
-- **Reporting hit rate as "recall" on multi-chunk questions.** The symptom is recall@5 near 1.0 while
-  answers to table or multi-condition questions are still incomplete.
-- **Trusting incomplete relevance labels.** The symptom is a retriever change that "lowers precision" where
-  manual inspection shows the new top results are unlabelled duplicates of the answer.
-- **Returning an empty list with no status.** The agent cannot tell "nothing relevant" from "tool broke";
-  the symptom is loops of near-identical searches or a confident answer from memory. Return an explicit
-  `no_evidence` status and say in the tool description what to do with it.
+- **Measuring only end-to-end accuracy.** Symptom: every fix is a guess, because failures cannot be
+  attributed to recall (never retrieved) or precision (retrieved but ignored). Diagnose: for each failing
+  question, log whether a labelled chunk was in the candidates, in the final top-n, and cited. Fix:
+  per-stage metrics on a golden set.
+- **Tuning k on a handful of complaint queries.** Symptom: regressions on queries nobody was looking at.
+  Diagnose: rerun the full golden set before and after and diff per-question recall. Fix: tune only
+  against the golden set.
+- **Labelling relevance by embedding similarity.** Symptom: excellent retrieval metrics alongside wrong
+  answers. Diagnose: hand-check 20 "relevant" labels against the question. Fix: label by whether the chunk
+  answers the question.
+- **Counting any chunk of the right document, or hit rate, as "recall".** Symptom: recall@5 near 1.0 while
+  the clause that answers a table or multi-condition question is still missing. Diagnose: score "all-of"
+  questions with full recall and compare. Fix: label any-of or all-of, at chunk level.
+- **Treating precision as cost-only.** Symptom: answers cite a plausible but outdated passage that sat next
+  to the correct one. Diagnose: list the final top-n of failing questions and flag stale or near-duplicate
+  versions. Fix: rerank, dedupe and filter by version.
+- **Trusting incomplete relevance labels.** Symptom: a retriever change "lowers precision". Diagnose:
+  inspect the new top results by hand; they are often unlabelled duplicates of the answer. Fix: add them to
+  the labels.
+- **Returning an empty list with no status.** The agent cannot tell "nothing relevant" from "tool broke".
+  Symptom: loops of near-identical searches or a confident answer from memory. Diagnose: count consecutive
+  similar queries per run after empty results. Fix: return an explicit `no_evidence` status and say in the
+  tool description what to do with it.
 
 ## When to use
-- **Always, as a lens.** Not an optional technique: apply it whenever a RAG system or an agent's search
-  tool is designed or debugged.
+- **Always, as a lens,** whenever a RAG system or search tool is designed or debugged.
 - **Default to two stages** when the corpus is large enough that stage 1 cannot be precise on its own,
   which is almost always.
 - **Decide k and n from data.** Pick k at the knee of recall@k on a golden set; pick n (what reaches the
   prompt) from the generator's context budget and the measured precision after reranking.
 - **Measure:** recall@k for the candidate stage and precision@n or nDCG@n for the final list, tracked
-  separately so a regression in one is not masked by the other.
-- **Interviews:** "how would you improve a RAG system that answers 70% of questions" is this question in
-  disguise; the strong answer measures which number is failing before proposing a fix.
+  separately so a regression in one is not masked by the other. "Our RAG answers 70% of questions":
+  find which number fails before proposing a fix.
+
+## Exercise
+**Goal:** choose k, n and a "no evidence" threshold for a search tool from your own measurements. No
+solution is given.
+- **Inputs:** any corpus of 200+ chunks, a golden set of 30 questions with labelled chunks (mark each
+  any-of or all-of, include 5 unanswerable ones), BM25 or a small embedding model, and an open
+  cross-encoder.
+- **Deliver:** a recall@k curve for k in 5, 10, 20, 50, 100; nDCG@5 with and without reranking; a threshold
+  on reranker scores; tokens per tool result at your chosen setting.
+- **Acceptance:** you can point to the knee on the curve; the reranked nDCG@5 beats stage 1; at least 4 of
+  the 5 unanswerable questions return `no_evidence` while answerable recall drops by under 5 points.
 
 ## Role lens
 - **Engineer:** Builds the golden set and the metric script, tunes k and the reranker cut-off, and wires
@@ -382,12 +402,6 @@ in the candidate set.
 - **When recall@50 itself is low:** a reranker only reorders candidates, so the fix is chunking, hybrid
   search or the embedding model instead.
 
-### Why can precision@5 average 0.4 on a golden set even with a perfect ranker?
-- **Precision is capped by |R| / k.** A question with one relevant chunk scores at most 0.2 at k = 5,
-  however good the ranking is.
-- **So the average mostly measures** how many relevant chunks each question has, not ranking quality.
-- **Use nDCG@n or MRR** to judge ranking, and read precision@k as the fraction of the prompt that is noise.
-
 ### How do you choose candidate depth k and final n for a search tool an agent calls several times per task?
 - **k from the recall curve:** sweep k (for example 5, 10, 20, 50, 100) on the golden set and set it just
   past the knee, where extra candidates stop buying recall.
@@ -429,6 +443,17 @@ in the candidate set.
 - [ ] Slower first-stage retrieval
 > Cosine or dot-product scores are relative to each query's embedding, so a value that marks "relevant"
 > for one query can be above every candidate for another, which silently returns nothing.
+
+## Mastery test
+**Problem:** a contract-review agent finds the right clause in 90% of runs (hit rate@10 = 0.9), yet lawyers
+report that a third of answers miss a carve-out. Raising k to 30 made answers worse. Each question needs
+the main clause plus any exceptions. Diagnose and redesign the search tool.
+
+**A strong answer:**
+- names hit rate as the wrong metric for all-of questions and measures full recall@10 and recall@30;
+- explains why k = 30 hurt: precision fell, distractors and stale versions entered every later step;
+- proposes wide candidates, a cross-encoder rerank to a token budget, and possibly fetching linked
+  exceptions, gated on per-stage metrics.
 
 ## Use cases & projects
 ### Use cases

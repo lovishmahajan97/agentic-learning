@@ -5,8 +5,13 @@ name: Tool adapters / service interfaces
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - agents/tool-calling
+  - agents/typed-tool-contracts
 related:
   - agent-reliability/tool-permissions-and-least-privilege
   - agent-reliability/idempotent-tool-execution
@@ -45,10 +50,9 @@ returns every outcome as a compact structured result, making tools testable, swa
 - **The model cannot parse vendor failures.** It either hallucinates a fix for an error it cannot read or
   loops on the same call. And the API key has to live somewhere; "in the prompt" is the one place it must
   not be.
-- **Quick SDK functions do not scale either.** They work for a demo and fail the first time you need to
-  swap the vendor, run the agent in an eval harness without hitting production, apply a permission check,
-  or figure out why 8% of calls fail, because the logic is scattered across twenty functions, each with
-  its own idea of an error.
+- **Quick SDK functions do not scale either.** They fail the first time you swap the vendor, run evals
+  without hitting production, apply a permission check, or ask why 8% of calls fail, because the logic is
+  scattered across twenty functions, each with its own idea of an error.
 - **The pattern is older than agents.** Hexagonal architecture calls the consumer-facing contract a *port*
   and the vendor-specific implementation an *adapter*; the application depends only on ports.
 - **What is new is the consumer.** A language model changes what a good contract looks like: fewer
@@ -274,22 +278,26 @@ assert ad.create_ticket({"title": "x", "body": "y", "project": "sales"},
   for a single-service agent.
 
 ## Pitfalls
-- **Exposing a whole OpenAPI spec as tools.** Symptom: a tool list of 80 entries, high token overhead per
-  turn and the model picking near-miss tools.
-- **Letting the adapter raise.** Symptom: agent loops that crash on a vendor 502 instead of telling the
-  model the call failed and is retryable.
-- **Passing vendor error bodies straight through.** Symptom: the model "fixing" an HTML error page by
-  inventing a different argument, repeatedly.
-- **No timeout on the service call.** Symptom: runs that hang for minutes on one tool while the step
-  budget and the user's patience expire.
-- **Results without stable identifiers.** Symptom: a follow-up call refers to "the second ticket" and the
-  adapter cannot resolve it.
-- **Hiding non-idempotent writes behind automatic retries.** Symptom: duplicate tickets, emails or refunds
-  after a transient timeout.
-- **Reporting a composite call's partial failure as a plain failure.** Symptom: orphaned or duplicated
-  records created by the model's well-meaning second attempt.
-- **Renaming an argument in place.** Symptom: a jump in `invalid_arguments` for that tool right after
-  deploy, because the model still emits the old name it learned from examples.
+- **A whole OpenAPI spec exposed as tools.** Symptom: 80 tools, high token overhead per turn, near-miss
+  picks. Diagnose: measure tool-definition tokens per turn and wrong-tool rate on the trajectory suite.
+  Fix: a few intent-level adapters.
+- **An adapter that raises.** Symptom: loops crash on a vendor 502 instead of the model learning the call
+  is retryable. Diagnose: count run crashes whose stack trace ends inside an adapter. Fix: catch and
+  return the envelope.
+- **Vendor error bodies passed straight through.** Symptom: the model "fixes" an HTML error page by
+  inventing different arguments, repeatedly. Diagnose: grep tool results in traces for HTML or vendor
+  codes. Fix: map to the taxonomy.
+- **No timeout on the service call.** Symptom: runs hang for minutes on one tool while the step budget
+  expires. Diagnose: p99 latency per tool against the timeout you think you set. Fix: explicit timeout.
+- **Results without stable identifiers.** Symptom: a follow-up refers to "the second ticket" and the
+  adapter cannot resolve it. Fix: return ids in every result.
+- **Non-idempotent writes behind automatic retries.** Symptom: duplicate tickets, emails or refunds after
+  a transient timeout. Diagnose: count vendor writes per idempotency key (should be one). Fix: key every
+  write.
+- **A composite call's partial failure reported as plain failure.** Symptom: orphaned or duplicated
+  records from the model's second attempt. Fix: compensate or return `"partial"` with what was created.
+- **An argument renamed in place.** Symptom: `invalid_arguments` jumps for that tool right after deploy,
+  because the model emits the old name from examples. Fix: a versioned tool name.
 
 ## When to use
 - **Use when** a tool does anything beyond a pure in-memory computation: any network call, any credential,
@@ -298,8 +306,17 @@ assert ad.create_ticket({"title": "x", "body": "y", "project": "sales"},
 - **Production:** add idempotency keys, policy checks and telemetry.
 - **Measure** per-tool success rate by error class, p95 latency, and the fraction of responses truncated,
   because those three numbers tell you whether the contract or the service is the problem.
-- **Interviews:** "how do you design a tool for an agent" should produce the two-face answer: a contract
-  shaped for a model and a client shaped for the vendor, with the adapter owning everything between.
+
+## Exercise
+**Goal:** wrap a real HTTP API with a large response as one agent tool. No solution is given; the
+`create_ticket` adapter above is a reference shape, not a template to copy.
+- **Inputs:** any public or internal API whose responses exceed a few kilobytes; `httpx.MockTransport`
+  for tests.
+- **Constraints:** three to six arguments with enums; no exception escapes the adapter; the token never
+  appears in a result.
+- **Deliver:** the adapter, recorded contract tests and a table of vendor outcome to adapter result.
+- **Acceptance:** tests cover a success, a 429 with `Retry-After`, a 502, a timeout and invalid
+  arguments; every result uses the `ok/error/retryable` envelope; the success result is under 300 tokens.
 
 ## Role lens
 - **Engineer:** Writes adapters with typed arguments, a shared error taxonomy and tests that run the agent
@@ -352,13 +369,6 @@ with its error class so success rate per tool is visible from day one.
   encode the old shape; the fix is a versioned tool name, not a prompt patch.
 - **Replay recorded vendor responses** through the contract tests to tell adapter bugs from vendor changes.
 
-### How do you keep a tool's response from flooding the context window?
-- **Project to what the next step needs:** a few fields plus stable identifiers the model can refer back to.
-- **Page and offload:** return a cursor for long lists, and put large payloads in a blob store with a
-  reference and a summary.
-- **Allow opt-in detail** through a `fields` argument or a follow-up `get` tool instead of widening the
-  default.
-
 ## Quiz
 ### Q: Why should a tool adapter return a structured error object instead of raising an exception when the upstream service times out?
 - [ ] Exceptions cannot be serialized into the event stream
@@ -384,6 +394,19 @@ with its error class so success rate per tool is visible from day one.
 > Enums the model can read reduce argument errors and decouple the contract from vendor IDs that can
 > change; the adapter owns the translation.
 
+## Mastery test
+**Problem:** a payments vendor answers `POST /charges` with a 200 whose body is
+`{"status": "pending"}`, then settles minutes later via webhook; it ignores idempotency headers. Your
+`charge_customer` tool timed out once and the agent's retry charged twice. Redesign the adapter.
+
+**A strong answer:**
+- deduplicates locally by a run-and-step key before calling, because the vendor will not;
+- treats a timeout as unknown, not failed: looks the charge up by its key before any retry;
+- returns `pending` as its own outcome with the charge id, so the model does not read it as success
+  or failure;
+- moves settlement to a separate status tool or the runtime;
+- adds a contract test for the timeout-then-retry path that asserts one vendor charge.
+
 ## Use cases & projects
 ### Use cases
 - **Agents over SaaS systems.** Ticketing, CRM and billing tools get intent-level contracts and projected
@@ -393,8 +416,7 @@ with its error class so success rate per tool is visible from day one.
 - **Offline evals.** Swapping the service interface for recorded responses lets the same agent run
   deterministically in CI.
 - **Shared tools across agents.** Packaging adapters as MCP servers gives several teams one contract and
-  one implementation of validation, retries and error normalization, at the cost of a network hop and a
-  second place to configure auth.
+  one implementation of validation, retries and error normalization.
 
 ### Mini project
 **Wrap a real API as an agent tool (2-3 hours).**

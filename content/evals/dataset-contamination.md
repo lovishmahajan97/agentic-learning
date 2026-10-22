@@ -5,8 +5,14 @@ name: Dataset contamination
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - evals/golden-dataset
+  - evals/benchmarking
+  - ml-fundamentals/train-test-leakage
 related:
   - evals/benchmarking
   - evals/golden-dataset
@@ -336,11 +342,14 @@ print(f"{sum(flags[i] for i in passed)} of {len(passed)} passes saw the answer i
 
 ## Pitfalls
 - **Trusting a leaderboard without checking cutoffs.** Symptom: a model leads on a 2021 benchmark and
-  underperforms a cheaper, newer model on private tasks of the same kind.
+  underperforms a cheaper, newer model on private tasks of the same kind. Diagnose: list benchmark
+  publication date against each model's cutoff. Fix: weight post-cutoff and private results.
 - **Few-shot examples drawn from the eval split.** Symptom: an offline jump of several points on the day
-  the prompt changed, with no movement in production metrics.
+  the prompt changed, with no movement in production metrics. Diagnose: run the exact-match guard over
+  the prompt's few-shot bank.
 - **Fine-tuning on a dump that includes golden items.** Symptom: near-perfect eval scores on the tuned
-  model and a steep drop on a freshly labeled batch.
+  model and a steep drop on a freshly labeled batch. Diagnose: shingle-check the training file against
+  the eval set. Fix: gate every job on that check.
 - **Treating an n-gram-clean benchmark as uncontaminated.** Symptom: the model reproduces the
   benchmark's answers for paraphrased questions while passing the overlap check.
 - **Using a model to generate "new" eval items from public documents.** Symptom: items the model already
@@ -348,7 +357,8 @@ print(f"{sum(flags[i] for i in passed)} of {len(passed)} passes saw the answer i
 - **Reading a clean-versus-flagged gap as proof without a control.** Symptom: an uncontaminated model
   shows the same "contamination effect", because flagged items were the easier, more widely quoted ones.
 - **Shared memory across agent eval tasks.** Symptom: pass rate rises with item order in the run, and
-  later tasks quote facts only an earlier task's tools returned. Fix: reset memory per task.
+  later tasks quote facts only an earlier task's tools returned. Diagnose: plot pass rate by run position
+  and re-run in shuffled order. Fix: reset memory per task.
 - **Publishing the golden set in a public repository.** Symptom: next year's model aces it and the team
   cannot tell improvement from memorization.
 
@@ -359,8 +369,17 @@ print(f"{sum(flags[i] for i in passed)} of {len(passed)} passes saw the answer i
 - **Before fine-tuning:** run an overlap check between training data and every eval set you care about.
 - **Before sharing an eval set:** add a canary and keep a private held-out split.
 - **Day to day:** a short script in the data pipeline and a line in the model-selection memo.
-- **Interviews:** how to tell whether a model memorized a benchmark without seeing its training data;
-  the strong answer names at least two behavioural probes.
+
+## Exercise
+**Goal:** audit one agent eval for every leak route in the routes table and close the ones you find.
+No solution is given.
+- **Inputs:** your golden set, any fine-tuning file and few-shot bank, the agent's memory store and
+  sandbox setup, and traces from one eval run with search enabled.
+- **Deliver:** a canary in the golden file, a CI step running the shingle check and exact-match guard
+  on every training file, per-task memory and sandbox reset, and a lookup report over the traces.
+- **Acceptance:** four planted leaks (a golden input in the fine-tuning file, a verbatim golden item in
+  the few-shot bank, a carried-over memory entry, a fetched page with the answer) are each caught; the
+  report gives the score with and without lookup-tainted passes.
 
 ## Role lens
 - **Engineer:** Adds an overlap check between fine-tuning data and eval sets to the training pipeline,
@@ -385,13 +404,6 @@ change numeric values and watch whether accuracy collapses. Convergent evidence 
 what I would act on.
 
 ## Interview questions
-### What is dataset contamination, and why is it worse for LLMs than classical ML leakage?
-- **Definition:** eval items, paraphrases or solutions are in the model's training data, so the score
-  measures memorization rather than capability.
-- **Worse for LLMs** because pretraining crawls the public web, which contains benchmark repositories,
-  worked solutions and discussions, and neither the vendor nor you knows exactly what was seen.
-- **Inflation is uneven** by model and benchmark, so a leaderboard partly ranks who saw what.
-
 ### A vendor says their model was decontaminated. What does that usually cover, and what does it miss?
 - **Usually covers:** n-gram filtering against known benchmarks, which catches verbatim copies.
 - **Misses:** indirect routes (paraphrases, translations, solution write-ups) and transitive ones such as
@@ -405,14 +417,6 @@ what I would act on.
 - **Use a control** that could not have seen the corpus: if it shows the same 15-point gap, the items are
   just easier; if its gap is 4 points, the extra 11 points are a memorization signal.
 - **Then act:** quote the clean-subset score and remove flagged items from fine-tuning data.
-
-### How do you choose the n-gram length for an overlap check, and what are its blind spots?
-- **Trade-off:** a short n-gram (5 or 8 words) over-flags common phrasing; a long one (20+) misses light
-  edits. Thirteen is the GPT-3 report's choice and a common compromise, not a law.
-- **Blind spots:** items shorter than n produce no shingles and are never flagged, and paraphrases pass
-  unnoticed.
-- **So a clean result means** "not detectably contaminated", and you pair it with an exact-match guard
-  and behavioural probes.
 
 ### Your search-enabled research agent scores far higher on a public benchmark than on your own tasks. What do you check?
 - **Tool-time lookup:** scan each trace's fetched pages for the item's reference answer; pages that
@@ -456,6 +460,20 @@ what I would act on.
 > A unique random string has no reason to appear in a model's output unless the file containing it was
 > in the training data. It does not stop crawling or leaking; it makes the leak detectable after the
 > fact.
+
+## Mastery test
+**Problem:** your coding agent resolves 64% of a 300-task public benchmark built from real repository
+issues, but 41% of your internal tasks. Each task's sandbox clones the repository at the current head,
+the agent has `web_search`, and last quarter you fine-tuned on 20,000 production traces.
+
+Which routes could explain the gap, and how do you test each?
+
+**A strong answer:**
+- environment: clones at head contain the fix commit; rebuild at the base commit, strip history;
+- tool-time: scan traces for fetched pages that contain the reference patch;
+- training: shingle-check the traces against the benchmark and golden set, excluding eval-tagged runs;
+- model: compare a post-cutoff slice; and notes internal tasks may just be harder, so a gap alone is
+  not proof.
 
 ## Use cases & projects
 ### Use cases

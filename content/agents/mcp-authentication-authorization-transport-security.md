@@ -5,8 +5,14 @@ name: MCP authentication / authorization / transport security
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - agents/model-context-protocol
+  - backend-fundamentals/oauth-2-0-oidc
+  - backend-fundamentals/authentication-vs-authorization
 related:
   - agents/model-context-protocol
   - agents/a2a-protocol
@@ -56,9 +62,8 @@ model is never the trust boundary.
   `delete_repo`", the model may comply. Prompt instructions do not stop that; only an authorization layer
   the model cannot talk its way past does.
 - **So the forcing problem is threefold:** authenticate the *user* (not the agent process), authorize each
-  call against that user's rights, and use a transport that resists network attackers. The MCP
-  authorization spec makes this interoperable, so a host can connect to any compliant server without
-  bespoke login code.
+  call against that user's rights, and use a transport that resists network attackers. The spec makes
+  this interoperable: any host connects to any compliant server without bespoke login code.
 
 ## How it works
 ### Transports decide the threat model
@@ -234,12 +239,12 @@ async def mcp_auth(request, call_next):
     return await call_next(request)
 ```
 
+- **Tested:** against PyJWT 2.15 and Starlette 0.49 (`BaseHTTPMiddleware`, `TestClient`) with a stubbed
+  JWKS: no token, wrong audience and expired tokens get 401, a read-only token on `tools/call` gets 403.
 - **Built in:** `jwt.decode` already rejects expired tokens and `PyJWKClient` caches fetched keys.
-- **In production also:** discover the JWKS URL from the authorization server's metadata instead of
-  hard-coding it, pass a small `leeway` for clock skew, and log the subject and method on every call so
-  the audit trail names a person, not "the agent".
-- **Body reading:** reading the body in middleware is safe on current Starlette, which caches it for the
-  endpoint; very old versions hung on that.
+- **In production also:** discover the JWKS URL from the authorization server's metadata, pass a small
+  `leeway` for clock skew, and log the subject and method on every call.
+- **Body reading:** current Starlette caches the body for the endpoint; very old versions hung on that.
 
 ### Subject-bound session store
 Runnable pure Python: sessions are keyed by `subject:session_id`, so a leaked ID used with another
@@ -293,9 +298,8 @@ A user holds tokens for two servers: a low-risk `docs` server and a sensitive `b
 - **Lock down local HTTP servers.** Bind to `127.0.0.1`, keep an exact `Origin` allowlist, and prefer
   stdio when only one user runs the server. Monitor rejected origins in logs.
 - **Carry the subject into agent traces.** Attach the authenticated subject, tenant and MCP server name
-  as metadata on each tool-call span in your tracing tool (LangSmith, or OpenTelemetry spans to any
-  backend), so one agent run can be read end to end with a person on every write. Monitor tool-call
-  spans missing a subject.
+  on each tool-call span (LangSmith, or OpenTelemetry to any backend), so one agent run reads end to end
+  with a person on every write. Monitor spans missing a subject.
 
 ## Trade-offs
 - **Per-user identity vs login ceremony.** OAuth 2.1 with discovery gives per-user identity, consent and
@@ -312,21 +316,25 @@ A user holds tokens for two servers: a low-risk `docs` server and a sensitive `b
   "all" to avoid pain.
 
 ## Pitfalls
-- **Forwarding the user's token upstream (token passthrough).** Symptom: upstream audit logs show the end
-  user performing actions they never saw, and rate limits burned by the agent. Fix: own credentials or
-  token exchange.
-- **Accepting any token from the issuer without checking audience.** Symptom: a token obtained for a
-  low-risk server works against your sensitive one. Fix: pin `audience` in validation.
-- **Treating the session ID as proof of identity.** Symptom: a leaked `Mcp-Session-Id` in logs lets a
-  second client inject tool calls into another user's session. Fix: validate the token every request and
-  key sessions by subject.
-- **Binding a local HTTP server to all interfaces without an `Origin` check.** Symptom: browser requests
-  from unknown origins in server logs, the fingerprint of DNS rebinding. Fix: loopback plus allowlist.
-- **Putting authorization rules in the system prompt** ("only call delete if the user confirms"). Symptom:
-  a destructive call traced back to a tool result that contained instructions. Fix: enforce in the server.
-- **Running an OAuth proxy with one static upstream client ID and no per-client consent.** Symptom:
-  authorization codes issued for clients the user never saw a consent screen for. Fix: per-client consent
-  and exact redirect URI matching.
+- **Token passthrough.** Symptom: upstream audit logs show the end user performing actions they never
+  saw, and rate limits burned by the agent. Cause: the server forwards the inbound bearer token.
+  Diagnose: compare the client ID in upstream audit entries with the MCP server's own; grep outbound
+  requests for the inbound token. Fix: own credentials or token exchange.
+- **No audience check.** Symptom: a token obtained for a low-risk server works against your sensitive
+  one. Cause: validation trusts any token from the issuer. Diagnose: decode accepted tokens and count
+  `aud` values that are not your canonical URI. Fix: pin `audience` in validation.
+- **Session ID as identity.** Symptom: a leaked `Mcp-Session-Id` lets a second client inject tool calls
+  into another user's session. Diagnose: log subject and session ID per request and alert when one ID
+  appears with two subjects. Fix: validate the token every request and key sessions by subject.
+- **Local HTTP on all interfaces, no `Origin` check.** Symptom: browser requests from unknown origins, the
+  fingerprint of DNS rebinding. Diagnose: log the `Origin` header and listen address. Fix: loopback plus
+  allowlist.
+- **Authorization rules in the system prompt** ("only call delete if the user confirms"). Symptom: a
+  destructive call with no user confirmation. Diagnose: read the trace backwards from the call to the tool
+  result that carried instructions. Fix: enforce in the server.
+- **OAuth proxy with one static upstream client ID and no per-client consent.** Symptom: authorization
+  codes issued for clients the user never saw a consent screen for. Diagnose: join issued codes to
+  consent records per client ID. Fix: per-client consent and exact redirect URI matching.
 
 ## When to use
 - **Use the full OAuth path when** an MCP server is reachable over a network by more than one person,
@@ -335,10 +343,18 @@ A user holds tokens for two servers: a low-risk `docs` server and a sensitive `b
   user who launched it.
 - **Measure:** do server logs attribute every tool call to a human subject, can you revoke one user
   without rotating a shared key, and does a token from one server fail on another?
-- **On the job:** this shows up when onboarding a customer's internal API as an MCP server and their
-  security team asks how identity flows through it.
-- **Interviews:** the strong answer explains why the model cannot be the authorization boundary and what
-  audience binding protects against.
+
+## Exercise
+**Goal:** make a remote MCP endpoint reject every token it should, with per-tool scopes. No solution is
+given.
+- **Inputs:** the middleware above, a locally generated RSA key standing in for the authorization server,
+  and two tools: `search_tickets` (read) and `close_ticket` (write).
+- **Constraints:** scope per tool name from `params.name`, not per JSON-RPC method; the handler reads the
+  subject only from `request.state`.
+- **Deliver:** the middleware, a tests file, and a log line per call with subject, method and tool.
+- **Acceptance:** tests pass for: no token gives 401 with `resource_metadata`; wrong audience gives 401;
+  expired gives 401; a read-only token on `close_ticket` gives 403 naming `tickets:write`; a bad `Origin`
+  gives 403; a valid call logs the subject.
 
 ## Role lens
 - **Engineer:** Implements the resource-metadata endpoint, validates audience and scopes in middleware,
@@ -385,12 +401,6 @@ exchanged specifically for that upstream, logging the authenticated subject on e
 - **Fix structurally:** token exchange or service credentials upstream, audience pinning, and write scopes
   requested only on step-up.
 
-### When would you not bother with OAuth for an MCP server?
-- **Single-user local tools over stdio.** The process runs as the user who launched it, so the OS
-  boundary already answers who is calling, and a browser login adds ceremony without security.
-- **Still protect secrets at rest:** keep env-var credentials out of committed config and vet the server
-  code, because supply chain is the real risk there.
-
 ### What is the confused deputy attack on an MCP OAuth proxy, and what stops it?
 - **Setup:** a proxy uses one static client ID upstream while accepting dynamically registered clients;
   the upstream remembers the user's consent for that static ID.
@@ -433,6 +443,19 @@ exchanged specifically for that upstream, logging the authenticated subject on e
 - [ ] It supports multiple concurrent users sharing one server process
 > With stdio the host spawns the server as a child process, so "who is calling" is already answered by
 > who launched it. The protocol adds no auth there; the risks are supply chain and secrets on disk.
+
+## Mastery test
+**Problem:** a vendor hosts one MCP server for 40 customer tenants. It fronts their Jira via a single
+admin API token, accepts the customer's IdP tokens, and keys sessions by `Mcp-Session-Id` alone. A
+customer reports tickets closed by "the integration" that nobody asked for. Review the design.
+
+**A strong answer:**
+- names three gaps: no per-user upstream identity, no tenant check binding the subject to its data, and
+  sessions not keyed by subject;
+- asks whether audience is pinned, since customer IdP tokens issued for other apps may be accepted;
+- fixes with audience-bound tokens, a tenant check on every tool call, token exchange or per-tenant
+  credentials upstream, write scopes on step-up, and traces that tie each close to a subject and the
+  tool result that preceded it.
 
 ## Use cases & projects
 ### Use cases

@@ -5,8 +5,13 @@ name: Tool schemas & argument validation
 kind: practice
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - agents/tool-calling
+  - python-for-ai/pydantic
 related:
   - agents/tool-calling
   - agents/typed-tool-contracts
@@ -47,15 +52,12 @@ meaning, then permission, and return fixable error results.
   - **Authorization errors:** a well-formed request for a record the current user may not see.
 - **Strict mode fixes only the first class.** Constrained decoding ("strict" schema mode) eliminates shape
   errors on providers that offer it and does nothing for the other two.
-- **Passing `input` straight downstream fails badly.** It yields a 400 at best and a wrong write at worst,
-  and either way the exception kills the loop before the model can correct itself. Validating and
-  crashing is only slightly better.
-- **The model needs what a junior engineer needs from code review:** a specific message saying what was
-  wrong and what would be right. A model that sees "amount must be in cents" fixes itself; a 500 from your
-  handler ends the run.
-- **The schema is documentation the model reads.** A `date` parameter typed as a bare string invites "next
-  Friday"; described as "ISO 8601 date, e.g. 2026-11-03" it gets the right value from the same model. Many
-  "bad arguments" complaints are schema bugs.
+- **Passing `input` straight downstream fails badly:** a 400 at best, a wrong write at worst, and the
+  exception kills the loop before the model can correct itself. Validating and crashing is barely better.
+- **The model needs a specific message,** like a junior engineer in code review: one that sees "amount
+  must be in cents" fixes itself; a 500 from your handler ends the run.
+- **The schema is documentation the model reads.** A bare-string `date` invites "next Friday"; described as
+  "ISO 8601 date, e.g. 2026-11-03" it gets the right value. Many "bad arguments" are schema bugs.
 
 ## How it works
 ### What the model sees
@@ -138,6 +140,7 @@ The regex and bounds are shape rules; the existence check is semantic; the tenan
 using the session, not the model's argument. Errors are turned into results.
 
 ```python
+# Runs as is; checked with pydantic 2.14.1 on Python 3.12 (str.removeprefix needs 3.9+).
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -233,11 +236,10 @@ for i in range(3):
 - **Per-provider schema rendering.** When one tool serves several vendors; keep one canonical Pydantic
   model, render a provider-specific schema that drops unsupported keywords, and keep enforcing them in the
   validator. Monitor 400s mentioning unsupported keywords.
-- **Coerce low-stakes, reject high-stakes.** For cosmetic issues; trim whitespace or upper-case a currency
-  code before validation, but reject ambiguous money, dates and ids. Monitor how often coercion fires.
-- **Retry cap plus escalation.** In every harness; cap rejections at two or three per call and then tell the
-  model to ask the user, as above. Monitor retries per rejected call; a rise after a prompt change usually
-  means a description became ambiguous.
+- **Coerce low-stakes, reject high-stakes.** Trim whitespace or upper-case a currency code before
+  validation; reject ambiguous money, dates and ids. Monitor how often coercion fires.
+- **Retry cap plus escalation.** In every harness; cap rejections and then tell the model to ask the user,
+  as above. Monitor retries per rejected call.
 
 ## Trade-offs
 - **Hard shape guarantee vs vocabulary and latency.** Strict mode limits the schema vocabulary and adds
@@ -254,29 +256,41 @@ for i in range(3):
 
 ## Pitfalls
 - **Generating the schema from an internal database model with thirty fields.** Symptom: the model fills
-  optional fields with invented values or omits the ones that matter. Fix: a purpose-built input model.
-- **A bare `{"type": "string"}` for dates, money or ids with no format in the description.** Symptom: "next
-  Friday", "$12.90" and ids with the wrong prefix arrive in the handler. Fix: formats, patterns, examples.
-- **Taking `tenant_id` or `user_id` from the model's arguments.** Symptom: cross-tenant data access that
-  only shows up in a security review or an incident. Fix: derive scope from the session.
-- **Validating shape only.** Symptom: downstream 400s and refunds off by a factor of 100 because cents and
-  dollars were confused. Fix: semantic and cross-field rules.
-- **Unbounded retry on validation failure.** Symptom: the same call rejected twenty times with the same
-  message until the step budget trips. Fix: a retry cap.
-- **Reusing one schema across providers with different strict-mode subsets.** Symptom: a 400 from one
-  vendor about an unsupported keyword such as `pattern` or `minimum`. Fix: per-provider rendering.
+  optional fields with invented values or omits the ones that matter. Diagnose: per-field fill rate in
+  traces against what the task needs. Fix: a purpose-built input model.
+- **A bare `{"type": "string"}` for dates, money or ids.** Symptom: "next Friday", "$12.90" and ids with the
+  wrong prefix reach the handler. Diagnose: group rejections by field and read the sent values. Fix:
+  formats, patterns, examples.
+- **Taking `tenant_id` or `user_id` from the model's arguments.** Symptom: cross-tenant access found only in
+  a security review or an incident. Diagnose: grep schemas for identity fields. Fix: derive scope from
+  the session.
+- **Validating shape only.** Symptom: downstream 400s and refunds off by 100x from cents-dollars confusion.
+  Diagnose: plot argument distributions (amounts) per tool; a second mode 100x away is a unit bug. Fix:
+  semantic and cross-field rules.
+- **Unbounded validation retries.** Symptom: one call rejected twenty times until the step budget trips.
+  Fix: a retry cap.
+- **One schema across providers with different strict-mode subsets.** Symptom: a 400 from one vendor about
+  an unsupported keyword such as `pattern` or `minimum`. Fix: per-provider rendering.
 
 ## When to use
 - **Always validate;** what varies is how deep.
 - **Read-only search tool:** shape validation and little else.
 - **Tools that move money, delete data or send messages:** all four layers plus an approval gate.
 - **Measure** argument validity rate (calls passing shape), semantic rejection rate, and retries per
-  rejected call. A rising rejection rate after a prompt or model change usually means a description became
-  ambiguous.
-- **Day to day** this is where most tool bugs live, so keep schema and validator in one place and test with
-  the model's actual outputs from traces, not hand-written fixtures.
-- **Interviews:** explain exactly what strict mode does and does not guarantee, and why authorization can
-  never come from a model argument.
+  rejected call; a rise after a prompt or model change usually means an ambiguous description.
+- **Day to day and in interviews:** most tool bugs live here, so keep schema and validator in one place and
+  test with real traced arguments; know what strict mode does not guarantee, and why authorization never
+  comes from a model argument.
+
+## Exercise
+**Goal:** render one Pydantic input model as strict-compatible schemas for two providers without losing
+any rule. No solution is given.
+- **Inputs:** a `CreateInvoiceIn` model with an optional field, an enum, a pattern and numeric bounds;
+  both providers' current strict-mode docs (note the date read).
+- **Deliver:** `render(model, provider)`, a validator enforcing whatever a rendering dropped, and tests.
+- **Acceptance:** the OpenAI rendering lists every property in `required` with optional fields nullable;
+  the Anthropic rendering carries no keywords its subset rejects; a value breaking a dropped bound is
+  still rejected with a message naming the field; both renderings are snapshot-tested.
 
 ## Role lens
 - **Engineer:** Defines each tool's input as a typed model, derives the JSON Schema from it, validates
@@ -361,6 +375,17 @@ corrects itself. Then watch the distribution of amounts in traces to confirm the
 - [ ] The most recent tool result that mentioned a tenant
 > The model will pass any id that appears in its context, including one injected by a document or a
 > user. Authorization must be derived from who is actually calling, which only the harness knows.
+
+## Mastery test
+**Problem:** a `book_meeting` tool takes `start_time` (pattern-checked ISO 8601) with strict mode on, so
+validation never fails. Users in India report meetings landing 5 hours 30 minutes early. Find, confirm
+and fix the bug.
+
+**A strong answer:**
+- a contract bug: the time has no zone, so local times are stored as UTC;
+- traces show a constant stated-versus-stored offset matching the user's zone;
+- renames to `starts_at_utc` or requires an offset, takes the user's zone from the session, adds a
+  semantic check (future, plausible hours), and returns a fixable error.
 
 ## Use cases & projects
 ### Use cases

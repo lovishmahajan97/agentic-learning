@@ -5,8 +5,12 @@ name: BM25 internals
 kind: concept
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: implement
+code_tested: partial
+prerequisites:
+  - rag-retrieval/dense-vs-sparse-retrieval
 related:
   - rag-retrieval/inverted-indexes
   - rag-retrieval/dense-vs-sparse-retrieval
@@ -336,18 +340,21 @@ GET /manuals/_search
 ## Pitfalls
 - **Index and query analyzers differ** (stemming on one side, a different tokenizer, or hyphen handling).
   Symptom: exact phrases copied from a document, or ids copied from another tool's output, return zero
-  results.
+  results. Diagnose: run the text through `_analyze` with both analyzers and diff the tokens. Fix: one
+  analyzer for both sides.
 - **Wrong stopword policy.** Keeping them where meaningless or stripping them where meaningful ("the Who",
   "to be or not to be"). Symptom: noisy hits or impossible queries; IDF does not fully compensate.
 - **Thresholding BM25 scores as absolute relevance.** Symptom: a cutoff that works for three-word queries
-  rejects everything for one-word queries, because the score scales with query length.
+  rejects everything for one-word queries, because the score scales with query length. Diagnose: plot
+  top-1 raw score against query term count from traces. Fix: cut by rank or per-query normalized score.
 - **Changing k1 or b on a live index without re-measuring.** The defaults were chosen on TREC-style
   collections; tweets or 200-page manuals can want very different values. Symptom: a silent shift in
-  which documents win.
+  which documents win. Diagnose: recall@k per query type before and after, on labeled queries.
 - **Forgetting avgdl and IDF are collection statistics.** In sharded engines each shard may compute its own
   unless the engine fetches global statistics first (Elasticsearch's `dfs_query_then_fetch` search type
   does this at extra cost). Symptom: the same document scores differently by shard, most visible on small
-  or uneven shards and in tests with few documents.
+  or uneven shards and in tests with few documents. Diagnose: `explain` the same hit on two shards and
+  compare IDF.
 
 ## When to use
 - **Always first:** BM25 is the right first retriever for any corpus an agent searches and the baseline
@@ -358,7 +365,18 @@ GET /manuals/_search
   as part of the experiment.
 - **Day to day,** the formula explains why a long document ranks low, why a repeated keyword stopped
   helping, or why a fused score needs normalization.
-- **Interviews:** give the formula's pieces and, more importantly, the failure each piece prevents.
+
+## Exercise
+**Goal:** implement BM25 yourself, match a reference implementation, then tune it for agent queries. No
+solution is given.
+- **Inputs:** 1,000+ documents of mixed length (manual sections, tickets) and 20 agent-style queries with
+  labeled answers, several containing hyphenated or dotted ids.
+- **Deliver:** your own BM25 (Lucene IDF, k1, b exposed); a check against `rank_bm25` or Elasticsearch
+  `explain` with the same analyzer; recall@5 over a small k1 by b grid; a tool that returns ranks and
+  matched terms.
+- **Acceptance:** your scores match the reference up to the constant `(k1 + 1)` factor, or you can name the
+  formula difference; one hand-computed term score matches your code; your id-preserving analyzer raises
+  recall on the id queries.
 
 ## Role lens
 - **Engineer:** Configures analyzers consistently across index and query, exposes k1 and b as tunables,
@@ -404,12 +422,6 @@ long, loosely relevant document.
   analyzers, then use `explain` on a document that should match to see which terms contributed.
 - **Check the tool wrapper:** a raw-score cutoff in the tool can hide a top-ranked hit for a short query.
 
-### Why can you not threshold BM25 scores or add them directly to cosine scores?
-- **Scores are query-relative:** a sum of unbounded positive terms, so a three-term query scores higher
-  than a one-term query and a fixed cutoff fails on short queries.
-- **Scales differ across indexes and retrievers,** so fusion needs rank-based methods such as RRF or
-  per-query normalization first.
-
 ### What should a keyword search tool return to an agent, and why not the raw BM25 score?
 - **Return rank and evidence:** the top k by rank, a per-query relative score, and the matched terms, so
   the agent can judge relevance and your traces show why each hit came back.
@@ -422,12 +434,6 @@ long, loosely relevant document.
 - **Raise k1** for short, focused snippets where repetition is meaningful evidence.
 - **Only after a grid search** on labeled queries per query type, because the defaults came from
   TREC-style collections and a change silently shifts which documents win.
-
-### The same document scores differently depending on which shard serves it. Why?
-- **IDF and avgdl are collection statistics,** and each shard computes its own unless the engine fetches
-  global statistics first.
-- **The effect is largest on small or uneven shards and in tests;** use one shard for small indexes or the
-  `dfs_query_then_fetch` search type, which costs an extra round trip.
 
 ## Quiz
 ### Q: Why does BM25 saturate term frequency instead of using raw counts?
@@ -455,6 +461,18 @@ long, loosely relevant document.
 > The classic form ln((N − n + 0.5)/(n + 0.5)) goes negative when n exceeds about half of N, meaning a
 > document could be penalized for containing a query term. Adding 1 inside the log bounds IDF below by
 > zero while leaving rare-term weights nearly unchanged.
+
+## Mastery test
+**Problem:** an on-call agent's keyword tool indexes 50,000 Slack messages of about 15 tokens and 300 CI
+logs of about 3,000 tokens, each log saying "deploy" about 40 times. For "deploy failed" it returns
+one-line chats, never the log. A teammate proposes k1 = 5. Predict the effect, then propose a fix.
+
+**A strong answer:**
+- computes avgdl ≈ 33, so a log's L ≈ 69 and a message's ≈ 0.59 at b = 0.75: TF factors about 0.72
+  versus 1.29;
+- shows k1 = 5 makes it worse (about 0.62 versus 1.51), because it moves toward density f / L;
+- notes b = 0.3 flips this narrowly (about 1.19 versus 1.10) but also lifts every long, loosely related log;
+- prefers chunking logs or a separate log index with its own statistics, then re-measures on labeled queries.
 
 ## Use cases & projects
 ### Use cases

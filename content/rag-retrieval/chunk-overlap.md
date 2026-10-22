@@ -5,8 +5,12 @@ name: Chunk overlap
 kind: concept
 difficulty: intro
 est_minutes: 10
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: implement
+code_tested: yes
+prerequisites:
+  - rag-retrieval/chunking-strategies
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/retrieval-granularity
@@ -34,8 +38,8 @@ that waste agent context unless the tool collapses them.
   or LangGraph retrieve node.
 - **What you control.** The overlap amount (often 10–20% or zero), whether it snaps to sentences, and the
   over-fetch, merge and cut-to-k logic in the tool.
-- **What you can skip.** Fine-tuning the overlap number for weeks. If your splitter follows structure or
-  you return parent sections, zero overlap plus good boundaries usually does as well.
+- **What you can skip.** Weeks of tuning the number. With structure-following splits or parent
+  sections, zero overlap usually does as well.
 
 ## Why it exists
 - **Every chunker sometimes cuts in the wrong place.** A fixed-size splitter does it constantly; even a
@@ -69,10 +73,8 @@ chunks for T      ≈ (T − O) / (S − O)    instead of T / S
 Tokens near the document's ends appear in fewer chunks, so the ratio is an average.
 
 ### Why the last tokens, not random ones
-- **Overlap repeats the *tail* of the previous chunk at the *head* of the next**, because the damage is
-  local to the boundary.
-- An antecedent is normally within a sentence or two of the pronoun, and a table header sits right above
-  its rows. Repeating anything further back buys nothing.
+Overlap repeats the *tail* of the previous chunk at the *head* of the next, because the damage is local:
+an antecedent is normally a sentence or two from its pronoun, a table header right above its rows.
 
 ### Aligning to boundaries
 - **Raw-token overlap can itself cut mid-sentence**, giving the next chunk a half-sentence preamble.
@@ -214,7 +216,8 @@ Same budget, roughly two-thirds more distinct evidence, and fewer "search again"
 - **Sentence-aligned overlap** — on prose, use a splitter that carries whole sentences, such as
   LlamaIndex `SentenceSplitter(chunk_size=..., chunk_overlap=...)` or a token-counted LangChain
   recursive splitter. Monitor the share of chunks that open mid-sentence on a sample.
-- **Store offsets at split time** — set `add_start_index=True` on LangChain text splitters (or record
+- **Store offsets at split time** — set `add_start_index=True` on LangChain text splitters (it writes
+  `start_index` into metadata; checked against langchain-text-splitters 1.1.3), or record
   start and end offsets yourself) so merges slice the source instead of concatenating. Monitor merged
   spans for repeated text.
 - **Over-fetch, collapse, then cut to k inside the tool** — retrieve two to three times k, merge adjacent
@@ -238,28 +241,42 @@ Same budget, roughly two-thirds more distinct evidence, and fewer "search again"
 
 ## Pitfalls
 - **Returning raw top-k without collapsing neighbours.** The same passage appears two or three times in
-  the agent's context, and the answer misses information that ranked sixth.
+  the agent's context, and the answer misses information that ranked sixth. Diagnose: count hits per
+  result that share a document and have adjacent indices. Fix: over-fetch, merge by offsets, cut to k.
 - **Overlap as a fraction of a tiny chunk.** 20 tokens on a 128-token chunk rarely holds a complete
   sentence, so boundary failures persist unchanged.
-- **Trusting the configured overlap.** With piece-based recursive splitters, failures persist exactly
-  where a long paragraph or sentence ended the previous chunk, because no whole piece fit the budget.
-  Inspect actual shared text between neighbours, not the config.
+- **Trusting the configured overlap.** Failures persist exactly where a long paragraph or sentence ended
+  the previous chunk, because piece-based recursive splitters carry nothing when no whole piece fits.
+  Diagnose: measure actual shared text between neighbours on a sample and count zero-overlap
+  boundaries. Fix: sentence-aligned overlap or smaller pieces.
 - **Overlap above half the chunk size.** The index grows two or three times larger than the corpus with
-  no measurable recall gain, and queries slow from the extra vectors.
-- **Expecting overlap to supply far-away context.** Chunks still lack headings or definitions that sit
-  far from the boundary, because overlap only repeats neighbouring text.
-- **Forecasting chunks as tokens ÷ size.** Ignoring the stride makes capacity and cost forecasts
-  undershoot; the vector store fills up well before the projected corpus size.
+  no measurable recall gain, and queries slow. Diagnose: chunks per corpus token against `S / (S − O)`,
+  and recall@k at lower overlap. Fix: drop back to 10–20%.
+- **Expecting overlap to supply far-away context.** Chunks still lack headings or definitions far from
+  the boundary. Diagnose: on failing questions, check the missing fact's distance from the cut. Fix:
+  heading paths, contextual prefixes or parent retrieval.
+- **Forecasting chunks as tokens ÷ size.** Capacity and cost forecasts undershoot; the store fills up
+  well before the projected corpus size. Fix: forecast with the stride.
 
 ## When to use
 - **Use when:** your splitter can cut inside a sentence or argument, which is any fixed-size splitter and
   most recursive splitters on long paragraphs. Use moderate overlap.
 - **Skip when:** boundaries already follow structure (one chunk per section, per function, per FAQ
   entry), or you use small-to-big retrieval, where the parent supplies the context overlap preserved.
+  Keep zero only if recall@k at 0 matches 10% and 20% on the golden set.
 - **Always:** pair overlap with deduplication of adjacent chunks inside the agent's retrieval tool.
 - **Measure:** recall@k at a few overlap settings, plus index size and duplicate rate in the top-k.
-- **Interviews:** the stride arithmetic, the dedup requirement, and the honest statement that overlap
-  patches local damage rather than fixing boundaries.
+
+## Exercise
+**Goal:** implement sentence-aligned overlap and an offset-based collapse step, then prove on boundary
+questions that they help. No solution is given.
+- **Inputs:** 10+ long documents, 15 questions whose answer straddles a chunk boundary at zero overlap,
+  and a tokenizer close to your embedder's.
+- **Deliver:** a splitter that carries whole trailing sentences up to an overlap budget and records start
+  and end offsets; a `collapse(hits, k)` step; a table of recall@5, duplicates per top-5 and chunk count
+  at 0, 10% and 20% overlap.
+- **Acceptance:** no chunk begins mid-sentence; merged spans sliced from the source never repeat text;
+  chunk counts match `(T − O) / (S − O)` within a few percent; you name the overlap you would ship.
 
 ## Role lens
 - **Engineer:** Sets size and overlap in the splitter, writes the adjacent-chunk collapse step in the
@@ -282,14 +299,6 @@ problem is missing context, switch to structure-aware chunking with heading path
 retrieval, then confirm on a golden set with recall@k rather than on the intuition that more is better.
 
 ## Interview questions
-### What is chunk overlap and what problem does it actually solve?
-- **Definition:** consecutive chunks share the last few tokens or sentences of the previous chunk, a
-  sliding window whose stride is smaller than the window.
-- **Why:** a sentence or pronoun-antecedent pair that straddles a boundary appears whole in at least one
-  chunk, so that chunk's vector is specific and retrievable.
-- **Limit:** it only repairs local damage; a heading pages earlier needs structure-aware chunking,
-  contextual prefixes or parent retrieval.
-
 ### Estimate the index size for a 10-million-token corpus at 512-token chunks with 64 tokens of overlap.
 - **Stride** is 512 − 64 = 448 tokens, so chunks ≈ (10,000,000 − 64) / 448, about 22,300.
 - **Without overlap** it would be 10,000,000 / 512, about 19,500, so overlap adds roughly 14%.
@@ -302,13 +311,6 @@ retrieval, then confirm on a golden set with recall@k rather than on the intuiti
 - **Fix:** over-fetch, group by document, merge adjacent chunk indices into one span by stored offsets
   (not concatenation, which repeats the overlap), then cut to k before the agent sees the result.
 - **Monitor:** the duplicate rate in tool results on the eval set and in production traces.
-
-### When would you set overlap to zero?
-- **Structure-aligned boundaries:** one chunk per section, function or FAQ entry already avoids
-  mid-sentence cuts, so overlap mostly buys inflation.
-- **Small-to-big retrieval:** the returned parent supplies the surrounding context overlap would have
-  preserved.
-- **Verify:** keep zero only if recall@k at 0 matches 10% and 20% on the golden set.
 
 ### You configured 100 tokens of overlap but boundary failures persist. Why?
 - **Piece-based splitters treat overlap as a ceiling:** they carry forward only whole trailing pieces that
@@ -350,6 +352,20 @@ retrieval, then confirm on a golden set with recall@k rather than on the intuiti
 > Overlap repeats only the tail of the previous chunk, so it repairs local damage near the boundary.
 > Context far away, like a heading pages earlier, needs structure-aware chunking, contextual prefixes
 > or parent retrieval.
+
+## Mastery test
+**Problem:** a legal agent indexes contracts as 256-token fixed chunks with 128 tokens of overlap. The
+vector bill doubled versus plan, citations often list the same clause twice, and it still misses
+exceptions defined in a "Definitions" section pages earlier. Diagnose each symptom and redesign.
+
+**A strong answer:**
+- computes stride 128, so every token is indexed about twice, explaining the bill;
+- traces duplicate citations to adjacent neighbours ranking together, fixed by over-fetch and
+  collapse by offsets;
+- recognises that overlap cannot reach a distant Definitions section, so it needs heading paths,
+  contextual prefixes, parent retrieval or a definitions lookup tool;
+- cuts overlap to sentence-aligned 10–20% (or zero with clause-aware splitting) and checks recall@k
+  and duplicate rate on boundary questions.
 
 ## Use cases & projects
 ### Use cases

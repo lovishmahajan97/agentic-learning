@@ -5,8 +5,13 @@ name: Benchmarking (MMLU, HumanEval, SWE-bench, GPQA)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - evals/model-evaluation
+  - math-for-ai/statistics-for-evaluation
 related:
   - evals/model-evaluation
   - evals/dataset-contamination
@@ -303,13 +308,15 @@ reaches a selection memo.
 
 ## Pitfalls
 - **Comparing pass@1 with pass@k or best-of-n** from another report. Symptom: a "20-point lead" that
-  disappears when both are run under the same protocol.
+  disappears when both are run under the same protocol. Diagnose: tabulate metric, subset, shots and
+  scaffold per number. Fix: re-run under one protocol or discard.
 - **Reading a 3-point difference on a 198-item set as a ranking.** Symptom: model rankings reorder
-  between runs with no change to the models.
+  between runs with no change to the models. Diagnose: compute the interval and run each model twice.
 - **Treating a SWE-bench number as a model property.** Symptom: the model scores far lower in your own
-  agent scaffold than in the vendor's report.
+  agent scaffold than in the vendor's report. Diagnose: run the same instances through your loop and
+  compare steps and cost per task. Fix: quote scaffold with score.
 - **Ignoring contamination.** Symptom: a model aces HumanEval and fails on your private coding tasks of
-  similar difficulty.
+  similar difficulty. Diagnose: track the public-minus-private-set gap per model.
 - **Choosing a domain model by MMLU score.** Symptom: a broad-knowledge leader underperforms a cheaper
   model on your extraction job because the task needs instruction following, not trivia.
 - **Quoting self-reported scores as independent.** Symptom: a leaderboard entry nobody outside the
@@ -326,8 +333,17 @@ reaches a selection memo.
   for knowledge or reasoning, confirm on your own items.
 - **Day to day:** a one-page model-selection memo citing scores with protocol and intervals, followed by
   a golden-dataset run that actually decides.
-- **Interviews:** name what each of the four benchmarks measures and how, compute pass@k, and explain
-  why a leaderboard lead can be noise, contamination or a scaffold effect.
+
+## Exercise
+**Goal:** write a model-selection memo for an agent you are building, from public numbers to a
+shortlist you have partly reproduced. No solution is given.
+- **Inputs:** two or three candidate models, their published scores on benchmarks matching your
+  agent's capability, and 30-50 auto-scored public tasks you can run.
+- **Deliver:** a protocol table per reported number, 95% intervals, your own re-run under one protocol
+  (plain prompt and inside your scaffold), and cost per solved task.
+- **Acceptance:** every comparison in the memo states protocol and interval; your pass@k matches the
+  estimator above on a hand-checked problem; the memo names which gaps are ties and what your golden
+  set must decide.
 
 ## Role lens
 - **Engineer:** Reproduces a benchmark score locally with an open harness before trusting it, and
@@ -351,14 +367,6 @@ benchmark contains my task. The claim supports shortlisting the model for a pilo
 nothing more.
 
 ## Interview questions
-### What does each of MMLU, HumanEval, SWE-bench and GPQA measure, and how is it scored?
-- **MMLU:** breadth of knowledge, about 14,000 four-option questions across 57 subjects, 5-shot,
-  scored by accuracy with chance at 25%.
-- **HumanEval:** functional correctness of 164 Python problems, graded by hidden unit tests and
-  reported as pass@k.
-- **SWE-bench:** patches for real GitHub issues, graded by FAIL_TO_PASS and PASS_TO_PASS tests.
-  **GPQA:** 448 expert-written science questions (Diamond 198) that web search cannot shortcut.
-
 ### Explain pass@k and why the plug-in estimate is wrong.
 - **Definition:** the probability that at least one of *k* samples passes, estimated from *n* ≥ *k*
   samples with *c* passes as 1 − C(n−c, k) / C(n, k).
@@ -425,6 +433,20 @@ nothing more.
 > The task requires navigating a repository, editing files and running tests; how the harness exposes
 > those actions, how many attempts it allows and what it costs all move the result. The same model in
 > a different scaffold produces a different number.
+
+## Mastery test
+**Problem:** you are choosing the model for a data-analysis agent that writes and runs SQL. Vendor X
+reports 74% on a 200-item text-to-SQL benchmark (best of 3, own agent); vendor Y reports 69% (single
+attempt, plain prompt) and costs a third as much.
+
+Your agent gets one attempt and a `run_sql` tool. What do the numbers support, and what do you run next?
+
+**A strong answer:**
+- refuses to compare: best-of-3 versus one attempt, own scaffold versus plain prompt;
+- notes about ±6 points at n = 200 even under one protocol, so 5 points does not rank them;
+- re-runs both single-attempt in its own scaffold with `run_sql`, paired per item, logging cost per
+  solved task;
+- decides on its own golden queries and schemas, since the public set may be contaminated.
 
 ## Use cases & projects
 ### Use cases

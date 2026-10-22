@@ -6,7 +6,13 @@ kind: concept
 difficulty: core
 est_minutes: 15
 agent_relevance: core
-status: agentic-verified
+status: mastery
+mastery: evaluate
+code_tested: partial
+prerequisites:
+  - agents/tool-schemas-and-argument-validation
+  - slm-for-agents/running-slms-locally
+  - slm-for-agents/evaluating-slms-on-your-agent-tasks
 related:
   - system-design/model-routing-cascading
   - slm-for-agents/when-an-slm-is-enough
@@ -36,8 +42,8 @@ trustworthy.
   OpenAI-compatible API.
 - **What you control.** Which steps go to which tier, the escalation signal (validation, confidence,
   verifier, step budget), and the cost, latency and quality targets.
-- **What you can skip.** Learned-router research details; system-design/model-routing-cascading covers the
-  general design. Here the focus is SLM-first agent loops.
+- **What you can skip.** Learned-router research; system-design/model-routing-cascading covers the general
+  design, this lesson SLM-first agent loops.
 
 ## Why it exists
 - **Agent steps vary wildly in difficulty.** A tool-routing call and a multi-step recovery plan sit in the
@@ -47,7 +53,7 @@ trustworthy.
 - **Agents give you cheap checks.** Tool calls have JSON Schemas, many outputs can be validated by code,
   and tool results reveal errors, so you can often tell when the small model got it wrong.
 - **What it buys.** If most calls stay on the SLM, cost per task falls roughly in proportion and latency
-  drops, while the escalated tail keeps large-model quality (actual savings depend on your escalation rate).
+  drops, while the escalated tail keeps large-model quality.
 
 ## How it works
 ### Three shapes
@@ -76,7 +82,7 @@ trustworthy.
 ### Setting the threshold
 - Build an eval set with labels, run both tiers, and plot quality and cost against the escalation
   threshold. Pick the point that meets the quality target at the lowest cost.
-- Re-tune when either model or the traffic mix changes, because the curve moves.
+- Re-tune when a model or the traffic mix changes, because the curve moves.
 - **Know the break-even.** With escalation rate `e`, a cascade costs about `c_small + e × c_large` per call
   versus `c_large` for large-only, so it saves money while `e < 1 − c_small / c_large`:
 
@@ -110,6 +116,7 @@ The SLM runs locally through Ollama's OpenAI-compatible endpoint; the large mode
 provider. Pydantic validation is the escalation signal.
 
 ```python
+# pip install openai pydantic   (checked against openai 3.36.1, pydantic 2.14.1 with stub endpoints)
 import json, os
 from openai import OpenAI
 from pydantic import BaseModel, ValidationError
@@ -145,9 +152,6 @@ for q in ["Where is order A17?", "I want my money back for B22", "Your app is aw
     print(route(q))
 ```
 
-Log the tier and the reason for every escalation; those rows are your best data for fine-tuning the SLM
-later.
-
 ### Worked scenario: choosing the threshold for an agent's routing step
 Illustrative eval on 1,000 labelled requests, cost in relative units (SLM call = 1, large call = 20,
 verifier cost left out for simplicity).
@@ -162,21 +166,20 @@ verifier cost left out for simplicity).
 
 - **Read the table:** schema checks alone miss wrong-but-valid tool choices; a verifier catches most of them
   at about a quarter of the large-only cost.
-- **Decision:** ship the last row, alert if escalation rate drifts above 30%, and use escalated cases to
-  fine-tune the SLM so the rate falls over time.
+- **Decision:** ship the last row, alert if escalation rate drifts above 30%, and fine-tune on escalations.
 
 ## Production patterns
-- **Put routing in one place.** Implement tiers in a gateway or a LiteLLM Router with fallbacks, not in
-  every agent, so model swaps and thresholds change in config. Monitor requests and spend per tier.
-- **Escalate on validation first.** Use JSON Schema or Pydantic validation and unknown-tool checks as the
-  default signal because they are free and precise; add judges only where valid-but-wrong outputs matter.
-- **Track escalation rate as a health metric.** Alert on sudden rises, which usually mean a prompt change,
-  a new intent or an SLM serving problem, and break it down by step and reason.
-- **Feed escalations into training.** Store the input, the SLM output and the large-model output for each
-  escalation, label a sample, and fine-tune or distill the SLM on it; the cascade becomes cheaper each round.
-- **Bound latency for the worst case.** A cascaded call pays SLM latency plus large-model latency, so set
-  timeouts on the SLM, run the SLM locally or nearby, and consider racing both tiers for latency-critical
-  steps. Monitor p95 latency for escalated calls separately.
+- **Put routing in one place.** Implement tiers in a gateway or a LiteLLM Router with fallbacks, not per
+  agent, so model swaps and thresholds are config. Monitor requests and spend per tier.
+- **Escalate on validation first.** Use JSON Schema or Pydantic validation and unknown-tool checks by
+  default, because they are free and precise; add judges only where valid-but-wrong outputs matter.
+- **Track escalation rate as a health metric.** Break it down by step and reason, and alert on sudden rises:
+  usually a prompt change, a new intent or an SLM serving problem.
+- **Feed escalations into training.** Log the input, the SLM output and the large-model output for each
+  escalation, label a sample, and fine-tune or distill the SLM on it, so the escalation rate falls each round.
+- **Bound latency for the worst case.** A cascaded call pays both latencies, so time out the SLM, run it
+  locally or nearby, and consider racing both tiers for latency-critical steps. Monitor escalated p95
+  latency separately.
 
 ## Trade-offs
 - **Cost vs tail latency.** Cascades save money on the common case but make escalated calls slower than a
@@ -185,19 +188,20 @@ verifier cost left out for simplicity).
   catch more but add their own cost, latency and errors.
 - **Per-call vs per-task escalation.** Per-call is cheaper but mixes two models in one trajectory; per-task
   is coherent but wastes the SLM's partial work when it fails.
-- **More tiers vs operability.** Three or more tiers can save more, but each adds models to evaluate,
-  serve and monitor; the gain flips when traffic is low.
+- **More tiers vs operability.** Three or more tiers can save more, but each adds a model to evaluate,
+  serve and monitor; low traffic flips it.
 
 ## Pitfalls
-- **Trusting raw confidence.** Symptom: the SLM is confidently wrong and never escalates. Fix: calibrate
-  confidence against labelled data, or use validation and verifiers instead.
-- **No check for valid-but-wrong outputs.** Symptom: good escalation stats, bad task success. Fix: measure
-  end-to-end task success, not just schema validity, and add a verifier where wrong tools are costly.
-- **Hidden double cost.** Symptom: the cascade costs more than large-only. Fix: recompute the break-even with
-  the true small-tier cost (verifier calls, retries, idle GPU); if escalation rate is high, route those
-  request types straight to the large model and fine-tune the SLM before retrying.
-- **Stale thresholds.** Symptom: quality drops after a model upgrade. Fix: rerun the threshold eval on every
-  model, prompt or traffic-mix change.
+- **Trusting raw confidence.** Symptom: the SLM is confidently wrong and never escalates. Diagnose: bin
+  labelled calls by confidence and compare each bin's accuracy. Fix: calibrate, or validate instead.
+- **No check for valid-but-wrong outputs.** Symptom: good escalation stats, bad task success. Diagnose:
+  count accepted SLM outputs that were valid but wrong on labelled traffic. Fix: measure end-to-end success
+  and add a verifier where wrong tools are costly.
+- **Hidden double cost.** Symptom: the cascade costs more than large-only. Diagnose: log cost per tier,
+  including verifier calls, retries and idle GPU. Fix: recompute the break-even with that cost; route
+  high-escalation request types straight to the large model and fine-tune the SLM.
+- **Stale thresholds.** Symptom: quality drops after a model upgrade. Diagnose: track escalation rate and
+  accuracy per release. Fix: rerun the threshold eval on any model, prompt or traffic change.
 
 ## When to use
 - **Use when** most agent calls are easy and checkable, traffic is high enough that cost or latency
@@ -206,7 +210,15 @@ verifier cost left out for simplicity).
   the added tail latency breaks a user-facing budget.
 - **Measure** escalation rate by step and reason, end-to-end task success, cost per task and p95 latency
   per tier.
-- **Interviews:** name the escalation signal and how you calibrated it.
+
+## Exercise
+**Goal:** pick a cascade policy for one agent step from data. No solution is given.
+- **Inputs:** 200+ labelled requests for one step, a small and a large model behind OpenAI-compatible
+  endpoints, and your real per-call costs.
+- **Deliver:** a sweep of three escalation policies (schema only, plus verifier, plus tool error) with
+  escalation rate, accuracy, cost per 1,000 and escalated p95 latency.
+- **Acceptance:** the chosen policy meets a stated accuracy target at the lowest cost; your break-even
+  matches `1 − c_small / c_large` by hand; every escalation logs its reason.
 
 ## Role lens
 - **Engineer:** Implements the cascade wrapper with schema validation and escalation logging, and tunes the
@@ -250,13 +262,8 @@ rerun the cost-quality curve to pick a new threshold.
 ### When would you not use an SLM-first cascade?
 - **When most steps are hard:** high escalation means paying twice; use a large model or route hard step
   types directly.
-- **When outputs are not checkable or tail latency is tight:** without a reliable signal the cascade is
-  guessing, and escalated calls add the SLM's latency to the large model's.
-
-### How do you make a cascade cheaper over time?
-- **Log every escalation** with input, SLM output and large-model output.
-- **Label a sample, fine-tune or distill the SLM on it**, re-evaluate, and watch the escalation rate fall
-  release by release.
+- **When outputs are not checkable or tail latency is tight:** without a reliable signal the cascade
+  guesses, and escalated calls pay both latencies.
 
 ## Quiz
 ### Q: In an SLM-first cascade for a tool-calling agent, what is usually the cheapest reliable escalation signal?
@@ -282,6 +289,17 @@ rerun the cost-quality curve to pick a new threshold.
 - [ ] It prevents logging escalations for retraining
 > Mid-run handoffs keep earlier SLM steps in context, including any wrong tool calls. Per-task escalation
 > restarts cleanly at higher cost; teams choose based on how coherent trajectories must be.
+
+## Mastery test
+**Problem:** a coding agent's SLM costs 2 units per call on a dedicated GPU at 30% utilisation; the large
+model costs 10. A cascade escalates on failed tests and on an LLM judge (1 unit per call). Escalation is
+55%. Should you keep it?
+
+**A strong answer:**
+- counts the small tier as 3 units, so cost is 3 + 0.55 × 10 = 8.5 against 10 with break-even at 70%: a
+  thin saving that idle GPU or retries can erase, and escalated calls pay both latencies;
+- breaks escalation down by task type and routes the worst types straight to the large model;
+- fine-tunes the SLM on logged escalations and drops the judge where tests suffice.
 
 ## Use cases & projects
 ### Use cases

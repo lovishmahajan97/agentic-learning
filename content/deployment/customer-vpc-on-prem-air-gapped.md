@@ -5,8 +5,13 @@ name: Customer VPC / on-prem / air-gapped deployment
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: implement
+code_tested: partial
+prerequisites:
+  - backend-fundamentals/docker
+  - backend-fundamentals/kubernetes
 related:
   - deployment/private-endpoints
   - deployment/vpn
@@ -50,10 +55,9 @@ agent becomes a signed, self-contained bundle.
 - **Copying your SaaS stack fails three ways.** It quietly depends on the open internet; you no longer
   own the platform; and you lose your eyes (no dashboards, no logs, no hot-fix at 2 a.m.). For an agent,
   losing traces means losing the only record of why it chose a tool.
-- **So it is a different product shape.** A signed, self-contained bundle, a configuration surface that
-  captures every environment decision, and an operating model where the customer's platform team holds
-  the keys. Each step inward trades your operability for their control, so more of your product
-  is packaging rather than infrastructure you run.
+- **So it is a different product shape:** a signed, self-contained bundle, one configuration surface
+  for every environment decision, and the customer's platform team holding the keys. Each step inward
+  trades your operability for their control.
 
 ### The hidden internet dependencies
 | Dependency | Why it breaks |
@@ -90,9 +94,8 @@ proxy and identity provider.
 - **Control plane / data plane split.** Many vendors host a **control plane** (licensing, version
   catalogue, configuration, upgrade orchestration) while the customer hosts the **data plane** (every
   component that touches customer data: the agent loop, tools, retrieval, memory, traces).
-- **Why the split works.** The customer's requirement is about data custody, not metadata, so you keep
-  operability for everything that is not data. It must be optional *because* some customers reject any
-  outbound connection on principle.
+- **Why the split works.** The requirement is data custody, not metadata, so you keep operability for
+  everything else. It must be optional *because* some customers reject any outbound connection.
 
 **On-prem.**
 - **No managed services.** You get a Kubernetes distribution (OpenShift, Rancher, vanilla upstream, k3s)
@@ -147,8 +150,7 @@ proxy and identity provider.
 - **Key pair (simplest).** A long-lived key pair whose public key ships out of band; verification needs
   nothing but the key, as long as you skip the transparency-log upload when signing (or ship the
   signature bundle), since cosign v2 otherwise looks the entry up in Rekor online.
-- **Most air-gapped sites choose key pairs,** accepting key-rotation work in exchange for simpler
-  verification.
+- **Most air-gapped sites choose key pairs,** trading key-rotation work for simpler verification.
 - **Keyless (cosign's default).** Ties signatures to a short-lived certificate (Fulcio) and a
   transparency log (Rekor).
 - **Keyless offline is possible but heavy.** It verifies offline only if you also ship the signature
@@ -231,9 +233,8 @@ if __name__ == "__main__":
 ```
 
 ### Bundle manifest tool: build and verify
-- **Where it runs.** `build` runs on your connected side after packaging; `verify` runs on the
-  customer's side, before anything is loaded into their mirror registry.
-- **Why verify first.** A corrupted 140 GB copy is caught before the install starts rather than during it.
+- **Where it runs.** `build` on your connected side; `verify` on the customer's side before anything
+  enters their mirror registry, so a corrupted 140 GB copy fails before the install, not during it.
 - **Authorship too.** The manifest is then signed with `cosign sign-blob` in key-pair mode, with no
   transparency-log entry or with the signature bundle shipped, so `cosign verify-blob --key` works
   offline and the customer checks authorship as well as integrity.
@@ -300,11 +301,10 @@ Link speeds are illustrative; a diode or cross-domain solution is often slower a
 
 - **Read it as:** 140 GB × 8 = 1,120 Gb, and 1,120 Gb ÷ 1 Gbps ≈ 1,120 s ≈ 19 min, before hashing,
   media handling and the customer's inbound scanning.
-- **Each extra precision ships as another full copy**, so bundling both 16-bit and 8-bit doubles the
-  media without doubling usefulness; ship the one your agent eval suite approved, including its
-  tool-calling cases.
-- **An agent ships more than one model.** Add the embedding model and any reranker the RAG step uses;
-  they are small next to the LLM but missing either one breaks retrieval at start-up.
+- **Each extra precision ships as another full copy**, so bundling 16-bit and 8-bit doubles the media;
+  ship the one your agent eval suite (including tool-calling cases) approved.
+- **An agent ships more than one model.** The embedding model and any reranker are small next to the
+  LLM, but missing either one breaks retrieval at start-up.
 
 ### Offline-first CI gate: deny egress during the install test
 Run the install test, including one end-to-end agent task, in a namespace whose pods may only reach each
@@ -350,10 +350,9 @@ spec:
   warning weeks before expiry and again during the grace period. Monitor days-to-expiry per site from
   support bundles.
 - **Bounded version support and expand-then-contract migrations.** Publish how many bundle versions you
-  support at once and require sites to upgrade into that window, so back-ports stay finite; track the
-  version each site runs. Add columns
-  and tables first, remove old ones a release later, so `helm rollback` to the previous chart still
-  finds a schema it understands. Test rollback in CI.
+  support and require sites to upgrade into that window, so back-ports stay finite. Add columns and
+  tables first, remove old ones a release later, so `helm rollback` to the previous chart still finds a
+  schema it understands. Test rollback in CI.
 
 ## Trade-offs
 - **Data custody vs observability.** The customer keeps custody of data and uses their own cloud
@@ -374,24 +373,28 @@ spec:
   SaaS uses is not an option inside.
 
 ## Pitfalls
-- **Runtime downloads.** Model weights from a hub, tokenizer files, `pip install` on start, NLTK or
-  tiktoken data. Works in CI, then the pod crash-loops in the customer's cluster with DNS resolution or
-  connection-timeout errors for a public hostname. Fix: bundle them and set the offline flags.
-- **A tool that still points outside.** A web-search or SaaS tool left in the registry fails mid-task, and
-  the agent retries or improvises. Symptom: timeouts on one tool and odd answers. Fix: the start-up
-  preflight above, plus removing the tool from the prompt.
+- **Runtime downloads.** Symptom: works in CI, then the pod crash-loops at the customer with DNS
+  resolution or connection-timeout errors for a public hostname. Cause: hub weights, tokenizer files,
+  `pip install` on start, NLTK or tiktoken data. Diagnose: run the install under the deny-egress policy
+  and grep pod logs for public hostnames. Fix: bundle them and set the offline flags.
+- **A tool that still points outside.** Symptom: timeouts on one tool and odd answers, because a
+  web-search or SaaS tool left in the registry fails mid-task and the agent retries or improvises.
+  Diagnose: per-tool error counts in the traces. Fix: the start-up preflight above, plus removing the
+  tool from the prompt.
 - **Hard-coded registry host, DNS domain or storage class in the chart.** Symptom: `ImagePullBackOff`
-  or persistent volume claims stuck in `Pending` on an otherwise healthy cluster. Fix: make them values.
-- **Not trusting the customer's CA.** Every outbound call from your containers fails with a certificate
-  verification error because their egress proxy re-signs TLS. Fix: mount their CA bundle.
-- **Licence or certificate expiry inside an air gap.** The system stops on a date, nobody can renew
-  online, and the customer discovers it during business hours.
-- **Assuming you will have the logs.** Incidents are debugged from screenshots in email until a support
-  bundle command exists and the customer knows how to run it. For agents, include redacted traces.
-- **Version sprawl across customers.** Each site is on a different bundle, so a fix must be back-ported
-  to several versions; the symptom is a support matrix nobody can keep in their head.
-- **Schema migrations that cannot roll back.** A failed upgrade on-site leaves the customer unable to
-  return to the previous chart version, turning a bad hour into a bad week.
+  or persistent volume claims stuck in `Pending` on a healthy cluster. Diagnose: `kubectl describe` the
+  pod or claim and compare the image reference or class with their values file. Fix: make them values.
+- **Not trusting the customer's CA.** Symptom: every outbound call fails certificate verification,
+  because their egress proxy re-signs TLS. Diagnose: `openssl s_client` through the proxy shows their
+  issuer, not a public one. Fix: mount their CA bundle.
+- **Expiry or missing logs inside an air gap.** Symptom: the system stops on a licence or certificate
+  date nobody can renew online, or incidents are debugged from screenshots in email. Diagnose: can a
+  support bundle answer "days to expiry" and "which tool failed and why"? Fix: early warnings and a
+  support-bundle command, with redacted agent traces, that the customer knows how to run.
+- **Version sprawl and one-way migrations.** Symptom: a support matrix nobody can keep in their head,
+  since fixes are back-ported to every site's bundle, and a failed upgrade that cannot return to the
+  previous chart version, turning a bad hour into a bad week. Diagnose: versions per site from support
+  bundles and a rollback test in CI. Fix: a bounded version window and expand-then-contract migrations.
 
 ## When to use
 - **Customer VPC when** the blocker is data custody within a cloud the customer already runs; it keeps
@@ -399,11 +402,21 @@ spec:
 - **On-prem when** the customer has no cloud footprint, needs GPU proximity to their systems or has a
   contractual prohibition on public cloud.
 - **Air-gapped only when** a regulator or classification policy mandates it, and price the support model in.
-- **Measure before committing:** install time per customer, bundle size, number of supported versions,
-  mean time to deliver a fix, and agent eval scores on the shipped model.
-- **Day to day** this shows up as the values file, the bundle pipeline and the support-bundle tool.
-- **Interviews:** list what breaks when the network goes away and how the delivery pipeline changes as a
-  result; that is the expected depth.
+- **Measure before committing:** install time per customer, bundle size, supported versions, mean time
+  to deliver a fix, and agent eval scores on the shipped model.
+- **Interviews:** list what breaks without a network and how delivery changes.
+
+## Exercise
+**Goal:** prove an agent you have already built can run with no network path out. No solution is given.
+- **Inputs:** any small agent of yours (one model call, one or two tools), Docker, and the two scripts
+  above as starting points.
+- **Constraints:** the model must be served locally (a 0.5-3B open-weight model is enough); nothing may
+  be fetched at container start.
+- **Deliver:** a table of every outbound dependency you found and how you removed it; a bundle directory
+  with a manifest; a one-line command that runs one scripted agent task.
+- **Acceptance:** the task completes under `docker run --network none`; `verify` rejects the bundle
+  after you flip one byte in a weights file and after you add a stray file; pointing one tool at a public
+  host makes the preflight exit 1 before the agent starts.
 
 ## Role lens
 - **Engineer:** Removes every runtime network dependency, moves environment decisions into chart
@@ -457,8 +470,8 @@ observability; fixes arrive as bundles on a schedule, and they must operate the 
   customers reject them on principle, so the split must be optional.
 - **When the air gap is physical.** There is no path to a control plane, so licensing, configuration and
   upgrades must all work locally from the bundle and values file.
-- **Cost of dropping it:** fleet-wide upgrades and configuration become per-site work, so support load grows
-  with customer count.
+- **Cost of dropping it:** upgrades and configuration become per-site work, so support load grows with
+  customer count.
 
 ### A customer wants a 70B model delivered into an air-gapped site. What numbers do you plan around?
 - **Weights:** 70B × 2 bytes in 16-bit ≈ 140 GB; an 8-bit copy is ~70 GB, so precision choice changes the
@@ -473,8 +486,7 @@ observability; fixes arrive as bundles on a schedule, and they must operate the 
   agent traces, tool error counts and versions, since you cannot log in.
 - **Look for the boundary:** a tool timing out through their proxy, a certificate error from a tool
   adapter that skipped their CA bundle, or the open-weight model producing malformed tool arguments.
-- **Close the gap:** add the failing case to the bundled eval set and the offline CI gate, then ship a fix
-  bundle.
+- **Close the gap:** add the failing case to the bundled eval set and CI gate, then ship a fix bundle.
 
 ## Quiz
 ### Q: Why do many vendors split a customer-VPC deployment into a vendor-hosted control plane and a customer-hosted data plane?
@@ -504,6 +516,18 @@ observability; fixes arrive as bundles on a schedule, and they must operate the 
 > offline. A README is unverifiable, a licence file proves entitlement rather than integrity, and a
 > telemetry ping is impossible without a network path.
 
+## Mastery test
+**Problem:** a hospital wants your clinical-notes agent on-prem. You validated it on a 70B model in
+16-bit; their server has two 48 GB GPUs. Media goes through a scanning process that takes three days,
+and they expect a fix bundle every month. Plan the delivery and say what you must re-test.
+
+**A strong answer:**
+- notes 140 GB of 16-bit weights cannot fit in 96 GB, so proposes 8-bit (~70 GB, little KV-cache room)
+  or 4-bit (~35 GB), and ships only the one precision that passed;
+- re-runs the agent eval suite, especially tool-call accuracy, on exactly that model and precision;
+- keeps weights out of monthly bundles unless they change, so each fix is images and chart only;
+- requires reversible migrations, a tested rollback, expiry warnings and a support-bundle command.
+
 ## Use cases & projects
 ### Use cases
 - **Agents for regulated enterprises.** A bank's support agent runs in the bank's VPC, calling Bedrock or
@@ -520,8 +544,7 @@ observability; fixes arrive as bundles on a schedule, and they must operate the 
 - **Goal:** prove a small agent (one model endpoint, two tools, one retrieval step) runs with zero
   internet access.
 - **Steps:** containerise the agent with weights baked in and `HF_HUB_OFFLINE=1` set; serve a small
-  open-weight model (0.5-3B) in-cluster so the model call stays inside; add the host preflight as an
-  init container.
+  open-weight model (0.5-3B) in-cluster; add the host preflight as an init container.
 - **Then gate it:** deploy to a local k3s cluster (it enforces NetworkPolicy out of the box) or kind with
   a policy-enforcing CNI, in a namespace with the deny-egress NetworkPolicy; run a scripted task that
   calls both tools; then add a public web-search tool and watch the preflight fail.

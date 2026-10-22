@@ -5,8 +5,13 @@ name: pass@k
 kind: metric
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - evals/eval-harness
+  - math-for-ai/probability-for-ai-engineers
 related:
   - evals/benchmarking
   - evals/eval-harness
@@ -291,16 +296,19 @@ Two problems, k = 5. Problem 1 has p = 0.9; problem 2 has p = 0.
 
 ## Pitfalls
 - **Computing pass@k from greedy decoding,** so all k samples are identical. Symptom: pass@10 equal to
-  pass@1 to the last decimal. Fix: sample at a real temperature.
+  pass@1 to the last decimal. Diagnose: count distinct outputs per problem and check the logged
+  temperature. Fix: sample at a real temperature.
 - **Pooling c and n across problems.** Symptom: a pass@k that does not reproduce when someone recomputes
-  it per problem. Fix: estimate per problem, then average.
+  it per problem. Diagnose: recompute from the per-problem (n, c) table. Fix: estimate per problem, then
+  average.
 - **Computing the binomials with floating-point factorials** (or a float `comb`) at n = 200. Symptom:
   `inf` or a NaN in the report. Python's exact-integer `math.comb` avoids this, but the product form is
   simpler and vectorises.
 - **Comparing pass@1 across protocols.** Symptom: a model "winning" by a margin that vanishes when both
-  use the same temperature and sample count. Fix: re-run both models under one stamped protocol.
+  use the same temperature and sample count. Diagnose: diff the stamped protocol fields of the two
+  results. Fix: re-run both models under one stamped protocol.
 - **Describing agent reliability with pass@k.** Symptom: pass@5 = 90% on the slide while customers who
-  get one attempt see failures most of the time. Fix: report pass@1 and pass^k.
+  get one attempt see failures most of the time. Diagnose: put per-task pass@1 and pass^k beside it. Fix: report pass@1 and pass^k.
 - **Public benchmark contamination.** Symptom: pass@1 far above what the model achieves on a private set
   of equivalent difficulty. Fix: keep a private set.
 
@@ -311,8 +319,19 @@ Two problems, k = 5. Problem 1 has p = 0.9; problem 2 has p = 0.
   sample-and-verify design, and pass^k when repeated reliability is the product promise.
 - **Protocol:** fix the temperature, use n ≥ k samples, keep tests hidden, and check for contamination
   with a private set.
-- **Interviews:** derive the estimator, explain why the pooled shortcut overestimates, and separate pass@k
-  from pass^k.
+
+## Exercise
+**Goal:** produce the release reliability numbers for an agent you have, or a small tool-calling agent
+you build, from repeated runs. No solution is given.
+- **Inputs:** 20-30 tasks whose success is asserted in code on the final state, a state reset between
+  runs, and your shipping temperature.
+- **Constraints:** n = 10 runs per task; infra errors logged apart from task failures; estimates per
+  task, then averaged.
+- **Deliver:** a per-task table of c, pass@1, pass@3 and pass^3, the means, the three flakiest tasks with
+  one read trace each, and the number you would put on the release report.
+- **Acceptance:** your estimator matches a brute-force average over all k-subsets of the runs for one
+  task; rerunning with a new seed moves mean pass@1 by less than its standard error; pooling c and n
+  gives a different pass@3, and you can say why.
 
 ## Role lens
 - **Engineer:** Implements the product-form estimator, runs samples in a sandbox against hidden tests,
@@ -341,14 +360,6 @@ rerun similar queries daily, report pass^k as well, since reliability is what th
 - **Why it differs:** for k > 1 it assumes an oracle that picks the passing sample, so it measures what
   sample-and-verify could extract, not what one user request gets.
 - **Always state k and the temperature,** because both change the number.
-
-### Walk me through deriving the unbiased estimator.
-- **Draw n ≥ k samples, count c passes.** A random k-subset fails entirely only if it is drawn from the
-  n − c failures: probability C(n − c, k) / C(n, k).
-- **Its expectation is (1 − p)^k** because the samples are independent, so 1 minus it is unbiased for
-  pass@k.
-- **Implement it as a product** 1 − Π (1 − k / i) over i from n − c + 1 to n, returning 1 when n − c < k,
-  to avoid factorial overflow.
 
 ### Someone reports pass@1 = 52% and pass@10 = 52.0% exactly. What happened?
 - **Most likely greedy decoding or near-zero temperature,** so every sample is the same program.
@@ -405,14 +416,24 @@ rerun similar queries daily, report pass^k as well, since reliability is what th
 > pass@k needs only one success among k tries, maj@k needs a majority to agree, and recall@k is a
 > retrieval metric; pass^k is p^k per problem and is the reliability figure for repeated use.
 
+## Mastery test
+**Problem:** a browsing agent books restaurant tables. On 40 tasks with 10 runs each it averages
+pass@1 = 0.70 and pass@5 = 0.97. Product proposes "retry up to 5 times" and a slide saying "97%
+success". Bookings cannot be undone. What do you report and recommend?
+
+**A strong answer:**
+- rejects pass@5 as deliverable: blind retries of a non-idempotent action can double-book, and only a
+  verifier that checks before committing could realise any of the headroom;
+- reports pass@1 per task and pass^k for repeat users, and computes per-task pass^5 to find flaky tasks;
+- recommends a dry-run or confirm step so retries happen before the commit, then re-measures the
+  realised success rate of that design, not pass@k.
+
 ## Use cases & projects
 ### Use cases
 - **Reliability reports for customer agents.** pass^k shows how often a task that users repeat daily
   works every time, which single-run accuracy hides.
 - **Sizing retry and best-of-n loops.** The gap between pass@1 and pass@k says how much a verifier plus
   retries can recover, and at what cost in runs.
-- **Coding agents with test suites.** Retry-until-tests-pass loops deliver roughly pass@k because the
-  tests act as the verifier.
 - **Finding flaky tasks.** Per-task pass counts over n runs separate tasks that always fail from tasks
   the agent solves only sometimes.
 

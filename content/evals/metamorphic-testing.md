@@ -5,8 +5,13 @@ name: Metamorphic testing
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: implement
+code_tested: partial
+prerequisites:
+  - evals/golden-dataset
+  - evals/llm-as-a-judge
 related:
   - evals/property-based-testing
   - evals/regression-tests
@@ -35,8 +40,7 @@ between the two outputs. It needs no labels and exposes brittleness golden sets 
 - **What you control.** The transforms (request paraphrase, distractor tool, tool-list order, noise in
   tool results, document order), the comparator (exact match on tool name and arguments is the
   strictest and best), and the identity noise floor.
-- **What you can skip.** The software-testing theory. Know INV, DIR and the identity floor; that covers
-  agent use.
+- **What you can skip.** The software-testing theory; INV, DIR and the identity floor are enough.
 
 ## Why it exists
 - **Testing needs an oracle, and labels are expensive.** For an LLM system the oracle is a human label,
@@ -121,8 +125,8 @@ Choose the strictest definition the task allows, because a lenient comparator hi
 ### From violations to action
 1. A violated pair goes to a human or a correctness judge to decide which side is wrong.
 2. The losing side becomes a labelled regression case.
-3. Over time the relation suite doubles as the generator for adversarial evaluation: the transforms that
-   violate most often are the ones worth hardening against.
+3. Over time the suite feeds adversarial evaluation: the transforms that violate most are worth
+   hardening against.
 
 ## Diagram
 One source input fans out into transformed variants; each pair of outputs is compared, and only rates
@@ -144,14 +148,20 @@ flowchart TD
 
 ## Examples
 ### Agent scenario: tool-choice invariance on unlabelled requests
-`first_tool_call` runs the agent until its first tool call and returns it. The comparator is exact
-equality on tool name and arguments, the strictest one the task allows, so there is no judge noise.
+`first_tool_call` runs the agent until its first tool call and returns it; here it is a toy router
+where the first matching tool wins, so the script runs as is (Python 3.12). The comparator is exact
+equality on tool name and arguments, so there is no judge noise.
 
 ```python
 import random
 from statistics import mean
 
-def first_tool_call(request: str, tools: list[dict]) -> tuple[str, dict]: ...  # agent under test
+def first_tool_call(request: str, tools: list[dict]) -> tuple[str, dict]:  # replace with your agent
+    words = set(request.lower().strip("?").split())
+    for t in tools:                       # position-biased: the first overlapping description wins
+        if words & set(t["description"].lower().rstrip(".").split()):
+            return t["name"], {}
+    return "none", {}
 
 DECOY = {"name": "get_weather", "description": "Current weather for a city.",
          "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}
@@ -169,6 +179,12 @@ def tool_choice_violations(requests: list[str], tools: list[dict]) -> dict[str, 
     for name, transform in AGENT_RELATIONS.items():
         rates[name] = mean(first_tool_call(*transform(r, tools)) != base[r] for r in requests)
     return rates
+
+TOOLS = [{"name": "get_order", "description": "Order status and details."},
+         {"name": "track_parcel", "description": "Parcel tracking for an order."},
+         {"name": "refund", "description": "Refund a payment."}]
+print(tool_choice_violations(["where is my order", "refund my payment"], TOOLS))
+# {'identity': 0, 'tool_order': 0.5, 'decoy_tool': 0, 'polite_frame': 0}  overlapping tools, order wins
 ```
 
 Illustrative run on 500 logged requests against a 14-tool agent (made-up numbers):
@@ -275,9 +291,8 @@ print(swap_violation_rate(longer_wins, pairs))   # 0.0: symmetric (verbosity bia
 - **Order-swapped pairwise judging.** Run every pairwise judgment in both orders and count a verdict that
   does not swap as a tie. Monitor the swap-violation rate as the judge's position-bias metric.
 - **Compute the base output once.** Cache *f(x)* per question and reuse it across relations, paying one
-  extra call per relation (identity included) instead of two, as the tool-choice example does (the RAG
-  example recomputes it per relation for clarity). Monitor total
-  calls per run against the budget.
+  extra call per relation (identity included) instead of two, as the tool-choice example does. Monitor
+  total calls per run against the budget.
 - **Triage queue into regressions.** Send violated pairs to a reviewer or correctness judge; promote the
   wrong side to a labelled regression case. Monitor the queue size and promotion rate.
 - **Customer-sourced transforms.** Build paraphrase and template transforms from real phrasing variants
@@ -297,18 +312,21 @@ print(swap_violation_rate(longer_wins, pairs))   # 0.0: symmetric (verbosity bia
 
 ## Pitfalls
 - **Skipping the identity baseline.** Symptom: a "12% paraphrase sensitivity" that is the model's own
-  run-to-run variance. Fix: always report against identity.
+  run-to-run variance. Diagnose: run the same input twice and compare the rates. Fix: always report
+  against identity.
 - **A correctness judge as comparator.** Symptom: violations that depend on the judge's opinion of the
-  answer, not on whether the two answers agree. Fix: ask only "same meaning?".
+  answer, not on whether the two answers agree. Diagnose: feed the comparator identical outputs; any
+  "violation" is the judge. Fix: ask only "same meaning?".
 - **Blaming the transformed output.** Symptom: "fixes" that make the original, actually-wrong answer the
   standard. Fix: triage which side is wrong.
 - **Invariance where the feature matters.** Symptom: a flood of violations on code, IDs or case-sensitive
-  names that nobody acts on. Fix: scope the relation.
+  names that nobody acts on. Diagnose: tag violations by input type and look for clusters. Fix: scope
+  the relation.
 - **Relations only on the question.** Symptom: a RAG system that passes paraphrase tests and still
   answers differently when one extra document is retrieved. Fix: perturb the context too.
 - **Comparing only the agent's final text.** Symptom: stable-looking replies while the agent called a
-  different tool or wrote different arguments under the transform. Fix: compare tool calls and end
-  state exactly, and the text only with a "same meaning" judge.
+  different tool under the transform. Diagnose: diff the logged tool calls of each pair. Fix: compare
+  tool calls and end state exactly, and the text only with a "same meaning" judge.
 
 ## When to use
 - **Use when:** you have many unlabelled inputs and stability matters: RAG answers, classifiers,
@@ -317,9 +335,18 @@ print(swap_violation_rate(longer_wins, pairs))   # 0.0: symmetric (verbosity bia
 - **Avoid when:** it would be the only eval. It says nothing about correctness, so pair it with a golden set.
 - **Measure:** violation rate per relation against the identity floor, tracked per version; feed violated
   pairs into the regression suite.
-- **Day to day:** the relation suite is what you run when a prompt change "feels" less stable.
-- **Interviews:** explain the oracle problem, give three relations for a concrete system, and explain the
-  noise-floor measurement.
+
+## Exercise
+**Goal:** find which surface feature your agent or RAG chain is most sensitive to, with no labels. No
+solution is given.
+- **Inputs:** 100 logged or hand-written requests and an agent with at least 4 tools, or a RAG chain
+  with 3+ retrieved chunks per question.
+- **Deliver:** identity plus four relations (one each on the request, the tool list or document order,
+  the context, and a decoy), a strict comparator, and a table of violation rates with the paired excess
+  over identity.
+- **Acceptance:** identity is run first and reported; a two-proportion or paired test says which
+  relations are above the floor; you triage 10 violated pairs by hand and turn at least one into a
+  labelled regression case.
 
 ## Role lens
 - **Engineer:** Writes the transform functions and the agreement comparator, runs the relation table on
@@ -363,13 +390,6 @@ cases. Correctness still needs a golden set; this measures stability, which the 
   count of items that violate only under the transform.
 - **Then read the pairs:** some violations are paraphrases that changed the question, a transform bug.
 
-### Why use a "same meaning" comparator rather than a correctness judge?
-- **It is an easier question:** comparing two answers needs no reference and is more reliable than
-  deciding which is right.
-- **It keeps the test clean:** a correctness judge mixes its opinion of the answer into the violation
-  rate.
-- **Strictness matters:** use exact equality for structured fields and the judge only for prose.
-
 ### How would you test that a tool-calling agent's tool choice is stable without labelling any requests?
 - **Relations on the tool list:** shuffle tool order, add an unrelated decoy tool, add irrelevant fields
   to tool results; the chosen tool and arguments must not change.
@@ -411,6 +431,19 @@ cases. Correctness still needs a golden set; this measures stability, which the 
 > The relation only states that the two outputs must agree. Assuming the paraphrase kept the meaning,
 > disagreement proves inconsistency, not which side is correct; assuming either direction is a common mistake that can enshrine the wrong
 > answer as the expectation.
+
+## Mastery test
+**Problem:** a SQL-writing agent turns analyst questions into queries over a warehouse. There are no
+labelled queries, and analysts complain that "the same question, asked slightly differently, gives
+different numbers". Design a metamorphic suite that finds the cause, and say how you compare outputs.
+
+**A strong answer:**
+- compares executed result sets (or normalised SQL), not query text, because equivalent SQL differs in
+  wording;
+- runs identity first to separate sampling noise from real sensitivity;
+- uses relations that fit SQL: paraphrase, reordered schema or table list, an added unused table,
+  a changed date format, plus a directional one (adding a filter must not grow the row count);
+- triages pairs from relations above the floor into regression cases.
 
 ## Use cases & projects
 ### Use cases

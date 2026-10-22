@@ -5,8 +5,13 @@ name: Hypercare
 kind: practice
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - deployment/runbooks
+  - customer-data-evaluation/customer-specific-regression-suites
 related:
   - deployment/runbooks
   - deployment/deployment-readiness-reviews
@@ -230,9 +235,6 @@ trace to a cause and an owner.
 - **Change freeze with a fix train.** Only hypercare fixes ship, batched into one or two scheduled releases
   a week, each passing the regression suite and a shortened rollout with a written change note. Monitor
   metric shifts against release notes so every movement is attributable.
-- **Failures become regression cases.** Every quality failure from triage is added to the
-  customer-specific regression suite before its fix ships. Monitor suite growth and the number of fixes
-  blocked by a regression.
 - **Shadow-then-lead support transfer.** The customer's service desk first shadows the vendor on tickets,
   then leads with vendor backup, using the runbooks. Monitor the share of tickets resolved without vendor
   escalation against the exit threshold.
@@ -253,15 +255,17 @@ trace to a cause and an owner.
 - **No exit criteria.** Symptom: the delivery team still answers the customer's tickets months after
   go-live, and nobody can say when it ends. Fix: written criteria agreed before go-live.
 - **Prompt tweaks that skip the regression suite.** Symptom: a fix for this week's issue reopens a case
-  accepted in UAT. Fix: no fix ships without the suite.
+  accepted in UAT. Diagnose: list releases with no suite run attached and diff reopened cases against
+  them. Fix: no fix ships without the suite.
 - **Lumping all feedback into "bugs".** Symptom: engineers spend days on missing content or user training
-  while real defects wait. Fix: classify by cause and route to the right owner.
+  while real defects wait. Diagnose: chart engineering hours by triage cause. Fix: classify by cause and
+  route to the right owner.
 - **Measuring only incidents and uptime.** Symptom: a quiet incident queue alongside falling usage,
-  because unhappy users silently returned to the old process. Fix: normalise by active users and track
-  retention.
+  because unhappy users silently returned to the old process. Diagnose: plot issues per 100 active users
+  next to weekly retention. Fix: normalise by active users and track retention.
 - **Reading only final answers.** Symptom: "the answer looks fine" while the agent took 14 steps, called a
-  write tool it did not need, or had its proposals rejected by approvers. Fix: read traces and watch agent
-  signals.
+  write tool it did not need, or had proposals rejected. Diagnose: check steps per task and approval
+  rejections in the daily trace sample. Fix: read traces and watch agent signals.
 - **Doing the support work instead of transferring it.** Symptom: a customer service desk that escalates
   every ticket on the first day after handoff. Fix: the desk leads tickets before exit.
 
@@ -272,8 +276,19 @@ trace to a cause and an owner.
   rollout to thousands of users, or an agent with write tools, needs weeks with dedicated staff.
 - **Track:** issue volume by cause, user feedback, usage and retention, quality on real traffic versus the
   UAT baseline, agent signals, and the share of tickets the customer resolves alone.
-- **Interviews:** strong answers describe hypercare as bounded, criteria-driven and aimed at transferring
-  ownership, with AI-specific feedback classification.
+
+## Exercise
+**Goal:** write the hypercare plan for an agent you have built and run one simulated week against it.
+No solution is given.
+- **Inputs:** at least 300 logged or generated runs with feedback, step counts, tool errors and approval
+  outcomes, plus a user count per day.
+- **Constraints:** exit criteria are written before you look at the data; every criterion is measurable
+  from logs; volume is normalised by active users.
+- **Deliver:** the plan (duration, intake, severities, freeze rules, exit criteria), a labelled daily
+  sample of 40 traces, and a short exit memo.
+- **Acceptance:** every sampled trace has a cause and an owner; a deliberately injected loop shows up in
+  the sample and the agent signal board; the exit memo names each unmet criterion and the single focus
+  of any extension.
 
 ## Role lens
 - **Engineer:** Turns each real failure into a regression case, ships fixes through shortened rollouts,
@@ -301,12 +316,6 @@ incident counts alone would hide the real failure.
 - **Why not standard support:** it is tuned for stable systems, cannot tell a prompt regression from a
   training gap, and cannot change the prompt, retrieval, tools or model.
 
-### Issue volume halved in week two. How do you know the agent actually improved?
-- **Normalise by active users:** volume also falls when people stop using the system, so compute issues
-  per 100 active users and read it next to usage retention.
-- **Example:** 41 issues for 1,900 users (about 2.2 per 100) falling to 9 for 2,900 users (about 0.3) while
-  usage grows is real improvement.
-
 ### What would you watch during hypercare for an agent that can take actions?
 - **Agent signals beyond feedback:** task completion, steps per task, step-budget hits, tool-call errors,
   approval rejection rate and handoffs to humans, each linked to example traces.
@@ -319,12 +328,6 @@ incident counts alone would hide the real failure.
   request)?
 - **Route to the owner:** a knowledge gap goes to the customer's content owners, because tuning the prompt
   for content that is not there risks hallucinated answers.
-
-### Why freeze unrelated changes during hypercare?
-- **Attribution:** feedback signals are already noisy, and two changes in one week make it impossible to
-  tell which moved the thumbs-down rate.
-- **How:** only hypercare fixes ship, batched into one or two predictable releases a week with written
-  change notes, each through the regression suite and a shortened rollout.
 
 ### The exit date has arrived but criteria are not met. What do you do?
 - **Extend with a single focus, not open-endedly:** name the unmet criterion and the work that closes it,
@@ -356,6 +359,21 @@ incident counts alone would hide the real failure.
 - [ ] Because hypercare fixes are deployed to all users at once
 > AI behaviour changes are global: a prompt edit affects every query. The regression suite, extended with
 > each real failure, is what keeps a fast fix cadence from trading one problem for another.
+
+## Mastery test
+**Problem:** week 2 of hypercare for a procurement agent that drafts purchase orders for approval. Issues
+per 100 users fell from 3.1 to 1.2, thumbs-down is flat, but approval rejections rose from 8% to 21%.
+
+Meanwhile the customer asks to slip in a model upgrade "while you are all here". What do you conclude
+and do?
+
+**A strong answer:**
+- reads the falling issue rate as partly users trusting approvers to catch errors, so quality may be
+  worse, not better;
+- samples rejected proposals, classifies the cause (tool description, retrieval of supplier data, a
+  recent fix) and adds them as regression cases;
+- refuses the model upgrade until exit, because two changes would hide which one moved rejections;
+- adds a rejection-rate threshold to the exit criteria.
 
 ## Use cases & projects
 ### Use cases

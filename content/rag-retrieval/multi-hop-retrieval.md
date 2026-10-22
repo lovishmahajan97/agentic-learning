@@ -5,8 +5,14 @@ name: Multi-hop retrieval
 kind: pattern
 difficulty: advanced
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - rag-retrieval/query-decomposition
+  - agents/agent-loop
+  - rag-retrieval/reranking
 related:
   - rag-retrieval/query-decomposition
   - rag-retrieval/agentic-rag
@@ -325,21 +331,24 @@ Illustrative token flow for the INC-4812 question, with a 2,000-token system pro
   same shape (incident → service → owner), a fixed two-step pipeline is cheaper and easier to evaluate.
 
 ## Pitfalls
-- **No hop cap or no-progress check.** The symptom is runaway cost and timeouts on questions the corpus
-  cannot answer.
-- **Answering hop two from parametric memory.** The symptom is a confident final answer whose second fact
-  cites no retrieved passage and cannot be reproduced for private entities.
-- **A generic second-hop query** because the bridge entity was not extracted. The symptom is the same
-  passages retrieved twice and a chain that stalls at hop two.
-- **Evidence overflowing the context across hops.** The symptom is hop-one evidence truncated away by the
-  time the answer is generated.
-- **Scoring only the final answer.** The symptom is a dashboard that cannot show that most failures die at
-  the second hop.
-- **Running comparison questions as sequential chains.** The symptom is latency double what a parallel
-  fan-out would cost.
-- **Stop rules only in the system prompt.** "Stop after three searches" is advice to the model, not a
-  limit; the symptom is the occasional 15-step run. Enforce the cap and the no-progress rule in the
-  harness and end with a forced answer turn.
+- **No hop cap or no-progress check.** Symptom: runaway cost and timeouts on questions the corpus cannot
+  answer. Diagnose: plot the hop-count distribution and count repeated queries per trace. Fix: both
+  guards, in code.
+- **Answering hop two from parametric memory.** Symptom: a confident answer whose second fact cites no
+  retrieved passage and cannot be reproduced for private entities. Diagnose: the uncited-fact rate per
+  hop. Fix: cite-or-refuse.
+- **A generic second-hop query** because the bridge entity was not extracted. Symptom: the same passages
+  retrieved twice and a chain that stalls at hop two. Diagnose: check whether each hop's query contains an
+  entity from the previous result. Fix: few-shot the extraction step.
+- **Evidence overflowing the context across hops.** Symptom: hop-one evidence truncated away before the
+  answer. Diagnose: log transcript tokens per step. Fix: short notes plus ids, full passages at answer time.
+- **Scoring only the final answer.** Symptom: the dashboard cannot show that most failures die at hop two.
+  Fix: per-hop supporting-fact recall.
+- **Running comparison questions as sequential chains.** Symptom: latency double a parallel fan-out. Fix:
+  decompose independent facets.
+- **Stop rules only in the system prompt.** "Stop after three searches" is advice, not a limit. Symptom:
+  the occasional 15-step run. Fix: enforce the cap and no-progress rule in the harness and end with a
+  forced answer turn.
 
 ## When to use
 - **Use when** questions chain through entities the question does not name: org charts and ownership
@@ -350,9 +359,16 @@ Illustrative token flow for the INC-4812 question, with a 2,000-token system pro
   question unanswered.
 - **Measure:** hop-level recall, hop-count distribution, final accuracy on a multi-hop golden slice, and
   cost per question.
-- **Interviews:** "what if the answer needs information from two documents that share no terms" is the
-  multi-hop question; the strong answer names the bridge entity, the loop, its termination rules and
-  compounding error.
+
+## Exercise
+**Goal:** build a bounded two-hop search agent and find where its chains die. No solution is given.
+- **Inputs:** a corpus of about 50 short documents where 15 questions need two linked documents (incident →
+  service → owner) and 5 are unanswerable because the second document is missing; label the supporting
+  document per hop.
+- **Deliver:** a loop with a hop cap, a no-progress rule enforced in code, a forced answer turn, and a
+  per-question trace; a table of per-hop recall, accuracy, hops used and input tokens.
+- **Acceptance:** no run exceeds the cap; every unanswerable question ends with "insufficient" and no
+  invented owner; you can name the hop where each failed chain died.
 
 ## Role lens
 - **Engineer:** Implements the planner prompt, the bounded loop with deduplication and progress checks, and
@@ -398,13 +414,6 @@ slice.
   loop works on fresh data immediately.
 - **For small corpora,** long-context stuffing with caching can be simpler than either.
 
-### Per-hop success is 0.9. What is a three-hop chain's success rate, and how would you raise it?
-- **The probabilities multiply:** 0.9 × 0.9 × 0.9 ≈ 0.73, because a wrong bridge entity is almost never
-  recovered.
-- **Raise per-hop precision** with a reranker on every hop: illustratively 0.95 per hop gives about 0.86.
-- **Keep hops minimal** and, when hop one is ambiguous, keep a small beam of bridge candidates, accepting
-  about b times the later retrievals (3 retrievals become 7 at beam 3).
-
 ### How do you stop the agent's final answer from inventing the second fact?
 - **Require a citation per bridging fact** and reject answers whose second fact cites no retrieved passage.
 - **Let the answer prompt say "insufficient"** when the chain did not complete, so an empty hop is not
@@ -437,6 +446,17 @@ slice.
 - [ ] About 97%, since later hops can correct earlier ones
 > Each hop must succeed for the chain to succeed, so 0.9 × 0.9 × 0.9 ≈ 0.73; this is why per-hop precision
 > via reranking and minimal hop counts matter more in multi-hop than in single-shot RAG.
+
+## Mastery test
+**Problem:** a vendor-risk agent answers "Which of our suppliers' parent companies had a data breach this
+year?" Traces show 9-step runs, repeated queries, and two breaches attributed to a company with the same
+name as a real parent. Per-hop recall is 0.85 at hop one. Redesign it.
+
+**A strong answer:**
+- sees an enumeration first (list suppliers via a filter or table), then a fan-out of two-hop chains;
+- carries a disambiguating attribute (registry number, country) from hop to hop to stop name collisions;
+- enforces caps and no-progress in code, reranks each hop, and estimates success near 0.85 × r2;
+- requires a cited passage per breach and reports suppliers with no evidence.
 
 ## Use cases & projects
 ### Use cases

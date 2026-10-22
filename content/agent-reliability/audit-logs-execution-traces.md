@@ -5,8 +5,13 @@ name: Audit logs / execution traces
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - observability/tracing
+  - agent-reliability/structured-event-streams
 related:
   - agent-reliability/structured-event-streams
   - agent-reliability/deterministic-replay-and-reproducibility
@@ -45,15 +50,14 @@ and mutability, so build both on purpose.
   credential? Was it approved, and by whom? Could it happen again?
 - **Ordinary application logs answer none of them well:** unstructured, scattered across services, missing
   the prompt, and routinely rotated after a week.
-- **Without the exact context, failures are irreproducible and unattributable.** The model's decision is
-  non-deterministic and depends on the full context; without the prompt and tool results you cannot
-  reproduce it, and without the policy decision and credential you cannot attribute it.
+- **Without the exact context, failures are irreproducible and unattributable.** The decision is
+  non-deterministic: without prompt and tool results you cannot reproduce it, and without the policy
+  decision and credential you cannot attribute it.
 - **"Log everything to stdout" fails three ways.** It logs PII, secrets and customer documents into a
   system with no access control; free text cannot be queried ("show me every refund over 1,000 in the last
   30 days where approval was skipped"); and a log that engineers can edit is not evidence.
 - **Debugging and accountability need different artifacts.** The trace wants rich payloads, timings and
-  sampling; the audit log wants completeness, immutability and long retention. One artifact cannot be both
-  without being bad at one of them.
+  sampling; the audit log wants completeness, immutability and long retention. One artifact is bad at one.
 
 ## How it works
 ### Execution trace
@@ -293,22 +297,26 @@ Each standard question is answered by a specific field, and the shared `run_id` 
   retention from the longest investigation window you must support, not from storage cost alone.
 
 ## Pitfalls
-- **Treating the trace as the audit log.** Symptom: an auditor asks for a complete record of refunds and is
-  told the tracing backend samples at 10% and retains for 14 days.
-- **Writing audit records with a role that can delete them.** Symptom: an incident review where "could this
-  have been edited" has no good answer.
-- **Logging full prompts and tool outputs into a shared log platform.** Symptom: a data-protection request
-  that requires purging customer content from a system with no per-record delete.
-- **Missing the prompt version at the decision point.** Symptom: a reproduction attempt that cannot tell
-  whether the model changed or the prompt did.
-- **Recording the action but not the authority.** Symptom: "the agent did X" with no way to say which user
-  asked, which policy allowed it, or who approved it.
-- **Separate run identifiers in trace and audit log.** Symptom: an investigator manually matching
-  timestamps between two systems.
-- **Writing the audit record only after the tool returns.** Symptom: an effect visible in the target system
-  (a refund, an email) with no audit row, traced to a worker that crashed mid-call.
-- **Head-based sampling with a "keep all failures" policy on paper.** Symptom: failed runs missing from the
-  tracing backend at the same rate as successful ones.
+- **The trace treated as the audit log.** Symptom: an auditor asks for every refund and hears the tracing
+  backend samples at 10% and retains for 14 days. Fix: a separate, complete audit sink.
+- **Audit records written with a role that can delete them.** Symptom: "could this have been edited" has
+  no good answer. Diagnose: list the writer role's grants; anything beyond INSERT fails. Fix: insert-only
+  role plus an anchored chain.
+- **Full prompts and tool outputs in a shared log platform.** Symptom: a data-protection request needs
+  customer content purged from a system with no per-record delete. Diagnose: scan log indexes for PII.
+  Fix: payloads by reference.
+- **No prompt version at the decision point.** Symptom: a reproduction cannot tell whether the model or
+  the prompt changed. Fix: model id and prompt version on every LLM span.
+- **The action recorded but not the authority.** Symptom: "the agent did X" with no user, policy or
+  approver. Fix: `actor`, `policy_version` and `approval_id` on every row.
+- **Separate run identifiers in trace and audit log.** Symptom: investigators match timestamps by hand.
+  Fix: one `run_id` in both.
+- **The audit record written only after the tool returns.** Symptom: a refund or email in the target
+  system with no audit row, from a worker that crashed mid-call. Diagnose: reconcile target-system
+  records against audit rows by target id. Fix: `authorized` row first, fail closed.
+- **Head-based sampling with "keep all failures" only on paper.** Symptom: failed runs missing at the
+  same rate as successes. Diagnose: compare the failure count in the backend with the runtime's own
+  counter (coverage should be 100%). Fix: tail-based sampling.
 
 ## When to use
 - **Trace from the first week** for every agent that acts on behalf of a user, because it is how you debug
@@ -318,8 +326,18 @@ Each standard question is answered by a specific field, and the shared `run_id` 
 - **Decide retention, access and redaction per sink up front.**
 - **Measure** trace coverage of failed runs (target 100%), audit write latency on the critical path, and
   time-to-answer for the standard incident questions.
-- **Interviews:** the distinction is intent. Traces serve engineers and are sampled and short-lived; audit
-  logs serve accountability and must be complete, attributable and tamper-evident.
+
+## Exercise
+**Goal:** add a trace and an audit log to a refund agent and prove the audit log is complete and
+tamper-evident. No solution is given.
+- **Inputs:** two tools (`lookup_order`, `refund`), a fake payment service, SQLite for audit rows and an
+  OpenTelemetry console or in-memory exporter.
+- **Constraints:** arguments go in by keyed hash plus reference, never inline; the audit writer is
+  insert-only.
+- **Deliver:** the wrapper, a chain verifier, an anchoring step and a reconciliation query.
+- **Acceptance:** crash the worker between the two writes and an `authorized` row still exists; editing
+  any row or recomputing the chain fails verification; reconciliation finds a refund made outside the
+  runtime; one `run_id` joins an audit row to its spans.
 
 ## Role lens
 - **Engineer:** Instruments steps and tool calls as spans, derives audit rows from permission and result
@@ -345,13 +363,6 @@ the content is purged. To prove integrity, recompute the chain and compare it wi
 head hashes. The identifiers are shared, so a row leads to the trace while it exists.
 
 ## Interview questions
-### What is the difference between an execution trace and an audit log?
-- **Different readers:** traces serve engineers debugging "what did the agent do and why"; audit logs serve
-  security, compliance and incident response asking "who did what with whose authority".
-- **Different properties:** traces are rich, sampled and short-lived; audit logs are small, complete,
-  append-only, tamper-evident and long-lived.
-- **Same facts:** both should be projections of one event stream sharing `run_id`, so they never disagree.
-
 ### A refund appears in the payments system but there is no audit row. How did that happen, and how do you prevent it?
 - **Likely cause:** the audit record was written only after the tool returned, and the worker crashed
   mid-call; or the tool reached the payment service outside the runtime.
@@ -404,6 +415,19 @@ head hashes. The identifiers are shared, so a row leads to the trace while it ex
 > The purpose of a trace is to debug what went wrong; sampling out the failures defeats it. Successful
 > runs are the safe place to save cost.
 
+## Mastery test
+**Problem:** a support agent sends emails through a vendor SaaS. Legal wants every sent email
+attributable for 7 years; a GDPR request asks you to delete one customer's data. Your audit rows store
+recipient address and body inline. Redesign without losing completeness.
+
+**A strong answer:**
+- keeps the row small and fixed: `actor`, `principal`, action, internal target id, keyed args hash,
+  policy version, decision, outcome, `run_id`;
+- moves recipient and body to a blob store with its own retention and per-record delete, referenced by id;
+- explains why the keyed hash still proves which email was sent, but cannot be reversed by guessing;
+- keeps the chain intact, because erasure deletes the blob, not the row;
+- reconciles the vendor's send log against audit rows.
+
 ## Use cases & projects
 ### Use cases
 - **Incident review for a wrong action.** The trace shows the prompt, model and tool results before the
@@ -422,5 +446,4 @@ head hashes. The identifiers are shared, so a row leads to the trace while it ex
 - **Steps:** wrap two tools (`lookup_order`, `refund`) so each call emits a span and, for `refund`, an
   `authorized` row before and a `completed` row after; key the argument hash with an HMAC; chain rows
   with `prev_hash`; crash the process between the two writes once; write a verifier.
-- **Done when:** every refund has an `authorized` row even after the crash, editing one row makes the
-  verifier fail, and a single `run_id` query jumps from an audit row to its full trace.
+- **Done when:** the first, second and fourth Exercise acceptance checks pass.

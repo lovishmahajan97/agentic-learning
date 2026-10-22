@@ -6,7 +6,13 @@ kind: concept
 difficulty: core
 est_minutes: 16
 agent_relevance: core
-status: agentic-verified
+status: mastery
+mastery: evaluate
+code_tested: partial
+prerequisites:
+  - evals/golden-dataset
+  - evals/eval-harness
+  - slm-for-agents/running-slms-locally
 related:
   - evals/golden-dataset
   - evals/eval-harness
@@ -113,6 +119,7 @@ Compares models served by Ollama (or any OpenAI-compatible server) on tool name,
 latency. Each case lists the expected tool and arguments.
 
 ```python
+# pip install openai   (checked against openai 3.36.1 with a stub OpenAI-compatible endpoint)
 import json, statistics, time
 from openai import OpenAI
 
@@ -196,13 +203,15 @@ Illustrative scorecard on 600 cases, same prompts and hardware, three runs each.
 
 ## Pitfalls
 - **Testing a different configuration than you serve.** Symptom: the model scores well offline and fails in
-  production. Fix: evaluate the exact quantization, engine, chat template and decoding settings you deploy.
-- **Only call-level metrics.** Symptom: high tool accuracy but tasks still fail. Fix: add multi-step sandbox
-  tasks and measure end-to-end success.
-- **Too few cases to separate models.** Symptom: rankings flip between runs. Fix: grow slices, repeat runs and
-  report spread before declaring a winner.
-- **Leaking eval cases into fine-tuning data.** Symptom: scores jump after training, production does not. Fix:
-  keep the golden set separate and deduplicate training data against it.
+  production. Diagnose: diff the eval run's model file, quantization, engine version, template and sampling
+  settings against the deployed config. Fix: evaluate exactly what you deploy.
+- **Only call-level metrics.** Symptom: high tool accuracy but tasks still fail. Diagnose: find the first
+  failing step in failed trajectories. Fix: add multi-step sandbox tasks and measure end-to-end success.
+- **Too few cases to separate models.** Symptom: rankings flip between runs. Diagnose: compute the spread
+  across repeated runs; a gap smaller than it is noise. Fix: grow slices, repeat runs and report spread.
+- **Leaking eval cases into fine-tuning data.** Symptom: scores jump after training, production does not.
+  Diagnose: search training data for exact and near duplicates of golden cases. Fix: keep the golden set
+  separate and deduplicate training data against it.
 
 ## When to use
 - **Use when** choosing between SLMs or quantizations, before and after fine-tuning or distillation, when
@@ -211,7 +220,16 @@ Illustrative scorecard on 600 cases, same prompts and hardware, three runs each.
   metrics must confirm.
 - **Measure** parse rate, schema validity, tool and argument accuracy, task success, steps, latency, memory
   and cost per successful task.
-- **Interviews:** show how you would build the set and why public benchmarks are only a shortlist.
+
+## Exercise
+**Goal:** decide whether a 4-bit build of a small model is safe to ship in place of its 8-bit build. No
+solution is given.
+- **Inputs:** one small instruct model in two quantizations behind an OpenAI-compatible server, 3 tool
+  schemas, and 100+ cases across the slices in section 1, including 10 multi-step sandbox tasks.
+- **Deliver:** a scorecard over 3 runs per build with parse rate, tool and argument accuracy, task success
+  (mean and spread), p95 latency and memory, plus failures by category.
+- **Acceptance:** settings other than the quantization are provably identical; the verdict names the gate it
+  applies and whether any gap exceeds run-to-run spread.
 
 ## Role lens
 - **Engineer:** Builds the model-agnostic harness, writes code-checked cases for each tool and runs
@@ -287,6 +305,17 @@ your tools.
 - [ ] To estimate production latency on your hardware
 > Leaderboards are a cheap filter, but they do not cover your tools, formats or hardware. The decision comes
 > from your own eval set run on the served configuration.
+
+## Mastery test
+**Problem:** candidate A scores 91% task success and B 89% on your 50-case multi-step suite, one run each.
+A has a 0.7 s p95 step latency, B 0.4 s. Your agent averages 8 steps per task and every failed task
+escalates to a large model. Which do you pick, and what would you check first?
+
+**A strong answer:**
+- treats a 2-point gap on 50 cases from one run as noise until repeated runs and more cases show spread;
+- converts latency to task terms: about 5.6 s versus 3.2 s per task;
+- compares cost per successful task including escalations, not raw success;
+- checks both were run on the served quantization and template, then picks under the gate.
 
 ## Use cases & projects
 ### Use cases

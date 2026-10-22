@@ -5,8 +5,13 @@ name: Citation correctness
 kind: metric
 difficulty: advanced
 est_minutes: 14
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - rag-retrieval/citations-grounding
+  - evals/llm-as-a-judge
 related:
   - rag-retrieval/citations-grounding
   - evals/faithfulness-groundedness
@@ -42,18 +47,15 @@ necessary), scored per claim by an entailment model or calibrated judge.
 ## Why it exists
 - **A cited but unsupported sentence is worse than an uncited one:** it borrows the source's authority.
   Once a RAG system or agent emits citations, teams need to know whether they can be trusted.
-- **Citation rate is easy and nearly useless.** The share of sentences with a citation says nothing about
-  support: a model can cite every sentence while the cited text says something different. Studies of
-  generative search engines found exactly this gap: fluent, heavily cited answers in which a substantial
-  share of citations did not support their sentences.
+- **Citation rate is easy and nearly useless.** A model can cite every sentence while the cited text says
+  something different. Studies of generative search engines found exactly this: fluent, heavily cited
+  answers in which a substantial share of citations did not support their sentences.
 - **Answer correctness does not cover it.** An answer can be correct while citing the wrong source (the
   model knew the fact from pre-training and attached a nearby chunk), or faithfully cited while wrong
   because the source itself is outdated.
 - **Three different properties:** *answer correctness* (is it true), *faithfulness* (is it derived from the
   provided context), *citation correctness* (does this pointer back this claim). Users clicking a citation
   test the third, and every failed click erodes trust in the others.
-- **So it needs its own metric**, defined per claim and per citation, with a judge whose agreement with
-  humans you have measured.
 
 ## How it works
 ### Unit of evaluation
@@ -212,6 +214,15 @@ def score_trace(trace, judge):
             out["invented"] += 1                       # nothing in the run supports it
     out["citation_recall"] = out["full"] / max(out["n"], 1)
     return out
+
+def keyword_judge(claim, passages):                    # stand-in for an NLI model or LLM judge
+    return "full" if any(claim.lower() in p.lower() for p in passages) else "none"
+
+trace = {"tool_results": {"S1": "Annual plans: refunds within 30 days.", "S2": "Billing runs monthly."},
+         "claims": [{"text": "refunds within 30 days", "source_ids": ["S1"]},
+                    {"text": "billing runs monthly", "source_ids": ["S1"]},     # right fact, wrong ID
+                    {"text": "refunds are prorated", "source_ids": ["S2"]}]}
+print(score_trace(trace, keyword_judge))   # 1 full, 1 misattributed, 1 invented
 ```
 
 | Run slice (illustrative) | Claims | Full | Misattributed | Invented |
@@ -260,9 +271,8 @@ print(f"citation recall {point:.3f}, 95% CI [{lo:.3f}, {hi:.3f}]")
 - **Version-pinned evaluation from traces.** Score against the tool-result text the agent saw (logged with
   the trace), not the document fetched at eval time. Monitor the share of pairs whose chunk version no
   longer exists.
-- **Sampled online scoring of agent runs.** Score a small daily slice of production traces with the same
-  judge and slice by question type and by number of tool calls. Alert on contradiction-rate jumps rather
-  than on the overall average.
+- **Sampled online scoring of agent runs.** Score a daily slice of production traces with the same judge,
+  sliced by question type and tool-call count. Alert on contradiction-rate jumps, not the average.
 - **Misattribution vs invention split.** For each unsupported claim, re-judge against all retrieved
   passages and route misattributions to a re-citation pass. Track the two rates separately, since they
   need opposite fixes.
@@ -283,16 +293,16 @@ print(f"citation recall {point:.3f}, 95% CI [{lo:.3f}, {hi:.3f}]")
 
 ## Pitfalls
 - **Reporting citation rate as citation quality.** Symptom: a dashboard near 100% while user feedback
-  reports "the link doesn't say that".
+  reports "the link doesn't say that". Diagnose: hand-check 50 cited claims. Fix: score support per claim.
 - **Showing the judge the whole answer and all sources** rather than one claim and its cited passages.
-  Symptom: the judge is persuaded by fluency and scores support far higher than humans do. Fix: one
-  claim plus its cited passages per call.
+  Symptom: the judge is persuaded by fluency and scores support far higher than humans do. Diagnose:
+  inspect the judge prompt payload. Fix: one claim plus its cited passages per call.
 - **Never measuring judge agreement with human labels.** Judge scores drift with prompt or model changes,
-  and a regression in citation quality goes unnoticed.
+  and a regression in citation quality goes unnoticed. Fix: a human-labelled calibration set.
 - **Ignoring version skew** between the chunk the model saw and the document fetched at eval time. Correct
-  citations score as unsupported after edits, or wrong ones score as fine.
+  citations score as unsupported after edits, or wrong ones score as fine. Diagnose: compare chunk hashes.
 - **Collapsing "partial" into "full".** Dropped qualifiers and wrong numbers, the errors that cause real
-  harm, disappear from the metric.
+  harm, disappear from the metric. Diagnose: judge "full" precision against humans. Fix: three labels.
 - **Not logging tool results in agent traces.** Symptom: citation IDs in the answer cannot be resolved at
   eval time, so the metric is computed on re-fetched documents or skipped. Fix: persist each tool result
   with its ID.
@@ -302,13 +312,22 @@ print(f"citation recall {point:.3f}, 95% CI [{lo:.3f}, {hi:.3f}]")
   citations, measure faithfulness instead.
 - **Run** offline on a golden set for every prompt, model or retrieval change, and online on a sampled
   slice of production traffic.
-- **Report** recall, precision and contradiction rate separately, alongside retrieval recall, so you can
-  tell generation failures from retrieval failures.
-- **Put an interval on every number** before acting on a change: claims within one answer are correlated,
-  so bootstrap over questions rather than claims, and expect a two-point movement on a few hundred
-  questions to be within noise.
-- **Interviews:** distinguish citation correctness from faithfulness and answer correctness, and explain
-  how you would validate the judge itself.
+- **Report** recall, precision and contradiction rate separately, alongside retrieval recall, to tell
+  generation from retrieval failures.
+- **Put an interval on every number** before acting: bootstrap over questions, since claims within one
+  answer are correlated; a two-point move on a few hundred questions is within noise.
+- **Interviews:** separate it from faithfulness and answer correctness, and explain how you validate the
+  judge.
+
+## Exercise
+**Goal:** build a citation-correctness eval for an agent you run and validate its judge. No solution is
+given.
+- **Inputs:** 50 cited agent answers with their logged tool results, and any LLM or NLI model as judge.
+- **Deliver:** a claim splitter, a per-claim judge call with only the cited passages, recall, precision
+  and contradiction rate with bootstrap intervals over questions, and the misattribution versus invention
+  split.
+- **Acceptance:** 60 claim-citation pairs hand-labelled full / partial / none; judge agreement reported
+  per label, including the precision of its "full" verdict; intervals resampled by question, not claim.
 
 ## Role lens
 - **Engineer:** Builds the claim splitter, the per-claim judge call with only cited passages, and the eval
@@ -396,6 +415,17 @@ accuracy.
 - [ ] It makes the judge agree with the generator more often
 > Citation correctness is about the specific pointer. Given the whole answer, a judge fills gaps from
 > other sentences or sources and over-credits support, inflating scores relative to human labels.
+
+## Mastery test
+**Problem:** your LLM judge reports citation recall 0.91. A human audit of 100 claims finds 0.78, and most
+disagreements are claims citing a pricing table where the passage gives the price but not the "per seat"
+unit the claim adds. What is wrong with the eval, and what do you change?
+
+**A strong answer:**
+- identifies a lenient judge collapsing partial into full, which hides dropped or added qualifiers;
+- checks the judge's input (claim plus cited passages only) and its "full" precision on the human set;
+- switches to a three-way label, decomposes compound claims into atomic facts, re-calibrates, and gates
+  on recall with partial reported separately.
 
 ## Use cases & projects
 ### Use cases

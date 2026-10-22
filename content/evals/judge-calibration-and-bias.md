@@ -5,8 +5,14 @@ name: Judge calibration & bias
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: partial
+prerequisites:
+  - evals/llm-as-a-judge
+  - evals/inter-annotator-agreement
+  - math-for-ai/statistics-for-evaluation
 related:
   - evals/llm-as-a-judge
   - evals/rubrics
@@ -50,8 +56,7 @@ before it gates an agent release.
 - **"Use the strongest model and trust it" fails.** Stronger judges still show these biases, just less,
   and without human labels you cannot tell how much.
 - **Biases are invisible in an aggregate score.** They must be probed deliberately with controlled
-  inputs, not discovered by accident after a bad release. Skip this and a judge score measures the judge,
-  not your system.
+  inputs, not discovered by accident after a bad release.
 
 ## How it works
 ### The known biases
@@ -345,23 +350,29 @@ def judge_view(trace, include_tools=True):
 
 ## Pitfalls
 - **Publishing a win rate without agreement.** Symptom: a prompt change that "improves" the score while
-  user complaints rise. Fix: report agreement with humans next to every judge score.
+  user complaints rise. Diagnose: label 100 or so recent outputs and compare judge agreement with the
+  human–human ceiling. Fix: report agreement with humans next to every judge score.
 - **Generating and judging with the same family.** Symptom: the candidate beats stronger external models
-  suspiciously often, and the ranking changes when the judge family changes. Fix: cross-family judge.
+  suspiciously often. Diagnose: re-judge the same items with another family and check whether the
+  ranking changes. Fix: cross-family judge.
 - **A compressed score distribution.** Symptom: every variant scores 8.2–8.6 with differences inside the
-  bootstrap interval, so the eval cannot distinguish anything. Fix: anchored levels or pairwise.
+  bootstrap interval. Diagnose: histogram the scores and check how much mass sits on two adjacent values.
+  Fix: anchored levels or pairwise.
 - **Silent vendor upgrades of the judge.** Symptom: a step change in a historical trend chart on the day
-  nothing in your system changed. Fix: pin the version and re-calibrate on change.
+  nothing in your system changed. Diagnose: check the logged model version and prompt hash per score.
+  Fix: pin the version and re-calibrate on change.
 - **Reporting only overall accuracy for pass/fail.** Symptom: a judge that "agrees 90%" yet catches few
-  of the failures, visible as a low TNR once human-fail items are counted separately. Fix: report TPR
-  and TNR side by side.
+  of the failures. Diagnose: count human-fail items separately and compute TNR. Fix: report TPR and TNR
+  side by side.
 - **Leaking metadata into the judge prompt** (model names, "v2", "improved"). Symptom: verdicts flip
-  when the labels are swapped while the content stays the same. Fix: strip identifiers.
+  when the labels are swapped while the content stays the same. Diagnose: diff the rendered judge
+  prompts for identifiers. Fix: strip them.
 - **Judging in one fixed order.** Symptom: a leaderboard that reorders when candidate A and B are
-  exchanged. Fix: both-order judging.
+  exchanged. Diagnose: log the flip rate from both-order runs. Fix: both-order judging.
 - **Judging an agent from its final message.** Symptom: high judged resolution rate while users report
-  refunds or bookings that never happened. Fix: include tool calls and results in the judge input, and
-  seed the calibration set with claimed-but-failed traces.
+  refunds or bookings that never happened. Diagnose: compute TNR on traces where the reply and tool
+  results disagree. Fix: include tool calls and results in the judge input, and seed the calibration set
+  with claimed-but-failed traces.
 
 ## When to use
 - **Use when a judge gates a decision:** agent prompt or tool releases, model swaps, fine-tune
@@ -373,9 +384,19 @@ def judge_view(trace, include_tools=True):
   humans.
 - **Avoid when an executable check exists** (tests, exact match, schema validation): do not use a judge
   at all.
-- **Day to day:** this is the calibration job in CI that fails when agreement drops.
-- **Interviews:** "how do you know your judge is right?" expects exactly this: a labeled set,
-  swap-and-average, length control, and kappa against the human ceiling.
+
+## Exercise
+**Goal:** decide whether an LLM judge may gate releases of an agent you have (or a small tool-calling
+agent you build). No solution is given.
+- **Inputs:** 80-150 agent traces with tool calls and results, your own pass/fail labels on the rubric,
+  and a second annotator's labels on at least 40 of them.
+- **Constraints:** at least 30 human-fail traces, some claiming an action whose tool call failed; a
+  judge from another family than the agent.
+- **Deliver:** human–human kappa, judge TPR and TNR for a reply-only and a reply-plus-tools view,
+  the flip rate under order swap on 30 pairs, and the corrected pass rate with a bootstrap interval.
+- **Acceptance:** recomputing TPR and TNR by hand from your confusion counts matches the script; the
+  corrected rate falls within the interval of the human pass rate on a held-out 20 traces; you state a
+  go or no-go with the number that decided it.
 
 ## Role lens
 - **Engineer:** Implements both-order judging, structured verdict output, a pinned judge version, and a
@@ -437,13 +458,6 @@ controls, ship behind an online A/B to confirm.
 - **Fix the input and the oracle:** render tool calls and results into the judge prompt, and assert the
   refund in the sandbox or order system state in code wherever that is possible.
 
-### How do you keep an agent's judge trustworthy over months in production?
-- **Pin a dated judge model and version the judge prompt,** storing both with every score.
-- **Re-run the calibration set in CI** whenever the judge, its prompt or the task changes, and fail the
-  build if agreement or TNR drops below the agreed threshold.
-- **Spot-check weekly:** route a small sample of production-judged items to humans and add them to the
-  calibration set, so drift shows up as falling agreement.
-
 ## Quiz
 ### Q: A judge's verdict changes for 30% of pairs when the two answers are swapped. What is being measured, and what is the fix?
 - [ ] Verbosity bias; fix it by truncating both answers to the same length
@@ -471,6 +485,21 @@ controls, ship behind an online A/B to confirm.
 > that resemblance. Order swapping fixes position bias, references fix knowledge gaps, and temperature
 > only affects variance.
 
+## Mastery test
+**Problem:** a coding agent's patches are graded by a judge from the same family as the agent. A new
+agent model raises the judged pass rate from 70% to 78% and the team wants to ship.
+
+On 150 labeled items the judge has TPR 0.97 and TNR 0.55, and the new model's patches are 40% longer. What do you
+conclude and do?
+
+**A strong answer:**
+- computes TPR + TNR − 1 = 0.52, so the true pass rates are about 48% and 63%: the judge inflates both
+  levels heavily, and the corrected gap rests on a weak TNR estimate that needs a bootstrap interval;
+- names three confounds: shared family (self-preference), verbosity on 40% longer patches, and lenient
+  TNR, and proposes a cross-family judge, a length-controlled comparison and more human-fail labels;
+- replaces the judge for "does it work" with executed tests wherever they exist, keeping the judge only
+  for style or readability.
+
 ## Use cases & projects
 ### Use cases
 - **Release gates for agent prompts and models.** Before a judge's pass rate can block a deploy, the team
@@ -479,8 +508,6 @@ controls, ship behind an online A/B to confirm.
   on every judge version bump catches drift before trend lines move.
 - **Critic and reflection steps inside the agent.** A self-check that approves drafts is a judge too;
   measuring its leniency shows whether it blocks bad replies or rubber-stamps them.
-- **Comparing two agent versions side by side.** Both-order judging and a different judge family keep
-  position and self-preference bias from deciding the winner.
 
 ### Mini project
 **Calibrate a "ticket resolved" judge for a support agent (2-3 hours).**

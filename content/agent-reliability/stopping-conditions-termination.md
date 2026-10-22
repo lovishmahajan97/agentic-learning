@@ -5,8 +5,13 @@ name: Stopping conditions / termination
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - agents/agent-loop
+  - agents/tool-calling
 related:
   - agent-reliability/max-step-budgets
   - agent-reliability/loop-detection
@@ -46,14 +51,12 @@ limits, and every exit records a labelled reason.
   without emitting a call, so the user gets a plan instead of a result, or it declares done after a tool
   error it did not read. *Too late:* tests already pass but it keeps "double-checking", each pass costlier
   because context grew. *Never:* it alternates two failing approaches or polls a status endpoint forever.
-- **"Trust the model" fails** for exactly the reasons above, and each failure looks like success unless
-  the outcome is labelled.
+- **So "trust the model" fails,** and each failure looks like success unless the outcome is labelled.
 - **"Cap at N steps" alone hides the truth.** It turns a never-ending run into a truncated one but tells
   nobody whether the result is complete, so downstream code treats a budget-exhausted draft as finished.
 - **"Stop when the output contains DONE" is brittle.** It is a string match on free text, which the model
-  emits inconsistently and which cannot carry a result payload. So termination needs three ingredients:
-  a structured model signal, independent checks, and hard limits as a backstop, and every exit records
-  *why* it exited.
+  emits inconsistently and which cannot carry a result payload. Hence the three ingredients in the
+  TL;DR, plus a recorded reason on every exit.
 
 ## How it works
 ### Sources of stop signals
@@ -94,10 +97,9 @@ After every step, evaluate signals in a fixed order, cheap and safe checks first
 4. **The verifier.**
 5. **The model's signal.**
 
-- **Refinement: verify a submit that crosses the budget.** If the response that crosses the budget also
-  carries a submit, run the verifier before declaring exhaustion. A *verified* result on the last step is
-  a success; an unverified claim is still `partial`. The verifier may jump the queue because it is the one
-  check that does not depend on the model's judgement.
+- **Refinement: verify a submit that crosses the budget.** If that response carries a submit, run the
+  verifier before declaring exhaustion: a *verified* last-step result is a success, an unverified claim
+  is still `partial`. The verifier may jump the queue because it does not depend on the model's judgement.
 - **Return values.** The function returns `continue`, `done(result)` or `abort(reason)`.
 - **Final record.** It carries `status ∈ {succeeded, partial, aborted, failed}` plus a reason code.
 
@@ -168,12 +170,10 @@ This loop makes "done" a tool call that an external check must accept, treats tr
 nudges exactly once when the model ends its turn without submitting.
 - **Order:** cancellation first; a verified submit is accepted even on the last allowed step (see
   Trade-offs); only then does budget exhaustion produce a `partial` built from the wrap-up turn.
-- **Walk one run through it:** step 6 submits with 2 of 40 tests failing, so the submit is rejected with
-  the failure names and the run continues; step 9 submits with all tests green and the run ends
-  `succeeded/verified`.
-- **Counterfactual:** had step 9 been the twelfth and last allowed step with tests still red, the outcome
-  would be `partial/budget_exhausted` carrying the model's summary, and the dashboard would count it as
-  not done.
+- **Walk one run through it:** step 6 submits with 2 of 40 tests red and is rejected with the failure
+  names; step 9 submits all green and ends `succeeded/verified`. Had step 9 been the last allowed step
+  with tests red, it would end `partial/budget_exhausted`, counted as not done. The scripted runs at
+  the bottom run these paths.
 - **Wire in the fail-closed map.** As written, `decide()` checks raw Claude values only, so a `refusal`
   with no tool calls falls through to `None` and the run idles until the budget fires. In real code, pass
   the stop reason through `normalise()` (next example) and return `failed` on `refused` or `unknown`.
@@ -220,6 +220,30 @@ def run(state, model, tools, verify):
         for call in resp.tool_calls:
             if call.name != "submit_result":     # a rejected submit already got its result
                 state.push_tool_result(call, tools[call.name](**call.args))
+
+# --- runnable check with a scripted fake model (Python 3.10+, no dependencies) ---
+from types import SimpleNamespace as NS
+
+class State:
+    def __init__(self, max_steps=12):
+        self.messages, self.steps, self.tokens = [], 0, 0
+        self.max_steps, self.max_tokens = max_steps, 100_000
+        self.cancelled = self.nudged = False
+    def account(self, resp): self.steps += 1; self.tokens += resp.tokens
+    def push_tool_result(self, call, out): self.messages.append(("tool", call.name, out))
+    def push_user(self, text): self.messages.append(("user", text))
+    def wrap_up(self): return {"summary": "done / remaining / blocked"}
+
+def scripted(*failing):                   # each step submits with this many red tests
+    resps = iter(NS(stop_reason="tool_use", tokens=900,
+                    tool_calls=[NS(name="submit_result", args={"failing": f})]) for f in failing)
+    return lambda messages: next(resps)
+
+verify = lambda a: (a["failing"] == 0, f"{a['failing']} tests failing")
+print(run(State(), scripted(2, 0), {}, verify))           # succeeded / verified
+print(run(State(max_steps=1), scripted(2), {}, verify))   # partial / budget_exhausted
+cut = lambda m: NS(stop_reason="max_tokens", tokens=4096, tool_calls=[])
+print(run(State(), cut, {}, verify))                       # failed / output_truncated
 ```
 
 ### Fail-closed mapping of provider stop reasons
@@ -261,8 +285,7 @@ are illustrative, but the shape is typical: truncations and narrated plans hide 
 ## Production patterns
 - **One outcome taxonomy for every agent.** When several teams ship agents on one platform, define
   `status` plus a reason-code enum in a shared library and reject runs that return a bare string. Monitor
-  the termination-reason distribution per task type; a rising "exhausted" share means the agent is
-  getting stuck more often.
+  the termination-reason distribution per task type.
 - **Fail-closed stop-reason mapping.** On every provider integration, map raw `stop_reason` /
   `finish_reason` values through an explicit table with an "unknown" default (as above), and alert when
   "unknown" appears, which usually means an API version bump.
@@ -283,10 +306,9 @@ are illustrative, but the shape is typical: truncations and narrated plans hide 
 - **Verifier gating vs availability.** It rejects false claims of success, but only when a verifier
   exists; for open-ended tasks such as writing a memo you fall back to rubric-based LLM judges, which
   carry their own error rate and cost.
-- **Budget-first ordering vs last-step successes.** Checking hard budgets before the model's signal
-  guarantees a cap but can reject a success that arrived on the last step. Evaluating a present submit
-  first (as the example does) recovers it, and is safe only because verification is cheap and bounded;
-  if the verifier is expensive (a long test suite), the budget has to cover it too.
+- **Budget-first ordering vs last-step successes.** Budgets first guarantee a cap but can reject a
+  last-step success. Verifying a present submit first (as the example does) recovers it, safely only when
+  verification is cheap and bounded; an expensive verifier (a long test suite) must fit in the budget.
 - **Graceful vs hard termination.** Graceful preserves in-flight results and a coherent record, but a hung
   tool delays the stop until its timeout; for user cancels and safety aborts the trade flips toward hard
   cancellation and accepting "possibly executed" calls.
@@ -294,23 +316,29 @@ are illustrative, but the shape is typical: truncations and narrated plans hide 
   but on a genuinely finished task it wastes a model call; cap it at one nudge per run.
 
 ## Pitfalls
-- **Treating truncation as completion.** `stop_reason == "max_tokens"` (or `finish_reason == "length"`)
-  read as done; the symptom is answers ending mid-sentence or JSON that fails to parse, marked successful
-  in the logs. Fix: map it to `truncated` and fail or continue.
-- **Same shape for "verified done" and "budget exhausted".** The symptom is a completion dashboard that
-  looks healthy while users complain about half-finished work. Fix: a labelled status field.
-- **The model as its own verifier** ("are you sure you are done?"). The symptom is a confident yes on
-  failing tests, because self-assessment correlates poorly with success on the hard cases. Fix: an
-  external check.
-- **Terminal tool that performs the final side effect** (submit = send the email). A rejected
-  verification has already acted; the symptom is duplicate or premature sends when the model resubmits.
-  Fix: submit only proposes; the harness acts after verification.
-- **Ignoring parallel tool calls next to `submit_result`.** The symptom is tools executing after the run
-  is marked done. Fix: decide on the whole response before running any of its calls.
-- **Wrap-up summary with tools still enabled.** The symptom is the "wrap-up" call emitting another tool
-  call, which runs past the budget or is dropped, leaving no summary at all. Fix: withhold tools.
-- **Aborting without cleanup.** The symptom is orphaned sandboxes, leases blocking the next attempt until
-  they expire, and temp branches piling up in the customer's repository. Fix: `finally`-style cleanup.
+- **Treating truncation as completion.** Symptom: answers ending mid-sentence or JSON that fails to
+  parse, marked successful. Cause: `stop_reason == "max_tokens"` (or `finish_reason == "length"`) read as
+  done. Diagnose: log the raw stop reason per response and count `succeeded` runs whose last one was a
+  truncation. Fix: map it to `truncated` and fail or continue.
+- **Same shape for "verified done" and "budget exhausted".** Symptom: a healthy completion dashboard
+  while users complain about half-finished work. Diagnose: sample "completed" traces and count those
+  that hit the step cap or never passed a verifier. Fix: a labelled status field.
+- **The model as its own verifier** ("are you sure you are done?"). Symptom: a confident yes on failing
+  tests, because self-assessment correlates poorly with success on the hard cases. Diagnose: re-run the
+  verifier offline on model-claimed successes and measure disagreement. Fix: an external check.
+- **Terminal tool that performs the final side effect** (submit = send the email). Symptom: duplicate or
+  premature sends when the model resubmits, because a rejected verification has already acted.
+  Diagnose: count side effects per run against accepted submits. Fix: submit only proposes; the harness
+  acts after verification.
+- **Ignoring parallel tool calls next to `submit_result`.** Symptom: tools executing after the run is
+  marked done. Diagnose: find tool spans timestamped after the terminal event. Fix: decide on the whole
+  response before running any of its calls.
+- **Wrap-up summary with tools still enabled.** Symptom: the wrap-up call emits another tool call, which
+  runs past the budget or is dropped, leaving no summary. Diagnose: check the wrap-up response's stop
+  reason. Fix: withhold tools.
+- **Aborting without cleanup.** Symptom: orphaned sandboxes, leases blocking the next attempt until they
+  expire, temp branches piling up in the customer's repository. Diagnose: compare live sandboxes and
+  leases with running runs. Fix: `finally`-style cleanup.
 
 ## When to use
 - **Always:** every agent loop needs this; the choice is how rich to make it.
@@ -320,8 +348,18 @@ are illustrative, but the shape is typical: truncations and narrated plans hide 
 - **Measure:** the distribution of termination reasons per task type (verified, model-claimed, exhausted,
   aborted). A rising "exhausted" share means the agent is getting stuck more often, not that the budget is
   too small.
-- **Interviews:** "how does your agent know it is done" expects all three ingredients and why the model
-  alone cannot be trusted with the decision.
+
+## Exercise
+**Goal:** add labelled termination to a parent agent that delegates to one sub-agent, and prove every
+exit path. No solution is given.
+- **Inputs:** a loop you own (or the example above), a real verifier (tests, schema check or record
+  lookup) and a scripted fake model for both levels.
+- **Constraints:** the fail-closed stop map inside `decide()`, one nudge per run, a reserved no-tools
+  wrap-up call, and a child that returns a labelled status the parent must branch on.
+- **Deliver:** scripted runs forcing truncation, refusal, narration, a rejected then accepted submit,
+  `submit_result` next to a parallel tool call, budget exhaustion, cancel, and a child `partial`.
+- **Acceptance:** tests show no truncated, refused or `unknown` response ever yields `succeeded`; no tool
+  runs after the terminal event; a child `partial` never surfaces as parent success.
 
 ## Role lens
 - **Engineer:** Writes the `decide()` function, maps provider stop reasons correctly, adds the submit
@@ -371,11 +409,6 @@ partial or exhausted so the completion metric reflects reality rather than the m
 - **Record honestly:** mark the run `aborted/user_cancelled` and list the cancelled calls as "possibly
   executed", since they may already have taken effect downstream.
 
-### How should sub-agent termination propagate to the parent?
-- **Same labelled status, never a bare string**, so the parent sees `partial` versus `succeeded`.
-- **Parent decides explicitly:** retry with more budget, switch approach, or propagate `partial` upward.
-  Otherwise a truncation three levels down surfaces at the top as a confident success.
-
 ## Quiz
 ### Q: The model returns stop_reason "max_tokens" with no tool calls. What should the loop do?
 - [ ] Return the text as the final answer, since no tool was requested
@@ -401,6 +434,19 @@ partial or exhausted so the completion metric reflects reality rather than the m
 - [ ] Any order, since each check is independent
 > Hard limits and cancellations must win regardless of what the model claims, so they are evaluated
 > first. The model's signal is the least trustworthy input and comes last, gated by the verifier.
+
+## Mastery test
+**Problem:** an agent migrates 2 million customer rows through a `write_batch` tool. A full row-by-row
+comparison takes 20 minutes; the run cap is 40 steps and 30 minutes. Design how the run ends, including
+a user cancel mid-batch and a provider stop reason you have never seen.
+
+**A strong answer:**
+- gates `submit_result` on a cheap in-loop check (counts, sampled checksums) and runs the full comparison
+  after the loop, reporting `partial` until it passes, because the budget cannot cover it;
+- makes submit only propose, so a rejected claim has written nothing extra;
+- lets the in-flight batch commit or roll back in its transaction on cancel, then lists it as possibly
+  executed and releases locks in cleanup;
+- maps the unseen stop reason to `unknown`, fails closed and alerts.
 
 ## Use cases & projects
 ### Use cases

@@ -5,8 +5,13 @@ name: Eval harness
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - evals/model-evaluation
+  - evals/golden-dataset
 related:
   - evals/golden-dataset
   - evals/llm-as-a-judge
@@ -345,11 +350,14 @@ sys.exit(1 if problems else 0)
 
 ## Pitfalls
 - **Dropping errored items from the denominator.** Symptom: the score improves on the day the provider
-  has an outage, because the hardest, longest items are the ones that timed out.
-- **Changing grader and system in the same run.** Symptom: a score movement nobody can attribute,
-  visible as two manifest fields differing at once.
+  has an outage, because the hardest, longest items are the ones that timed out. Diagnose: compare the
+  graded count with the dataset size and plot error rate per run. Fix: report errors, retry, never drop.
+- **Changing grader and system in the same run.** Symptom: a score movement nobody can attribute.
+  Diagnose: diff the two manifests; more than one changed field is the cause. Fix: change one at a time,
+  re-grading stored outputs first.
 - **One sample per item at temperature 0.7.** Symptom: the score moves several points between identical
-  runs on a few-hundred-item set, which the team reads as regressions and improvements.
+  runs on a few-hundred-item set, which the team reads as regressions and improvements. Diagnose: run
+  the unchanged baseline twice and count flips. Fix: *k* samples and a noise-floor gate.
 - **Grading inside the run loop and never storing outputs.** Symptom: a rubric fix forces a full,
   expensive re-run just to see new scores.
 - **Overall pass rate without intervals or slices.** Symptom: a merged prompt change that lifted the
@@ -357,7 +365,8 @@ sys.exit(1 if problems else 0)
 - **Reading the model alias (`latest`) instead of a pinned snapshot.** Symptom: a score change with an
   empty diff.
 - **Reusing one environment across agent items.** Symptom: results depend on item order; an item passes
-  alone and fails when run after another that changed shared state.
+  alone and fails when run after another that changed shared state. Diagnose: shuffle item order with a
+  fixed seed and diff verdicts. Fix: a fresh sandbox per item.
 - **Retrying agent failures as if they were transient.** Symptom: a looping task burns three full step
   budgets per sample and the run cost triples. Fix: retry only provider errors; record budget overruns
   once as failures.
@@ -370,8 +379,17 @@ sys.exit(1 if problems else 0)
 - **Measure in one report:** pass rate per slice with intervals, error rate, latency percentiles and
   cost per item.
 - **Frameworks:** if you adopt one, keep the target adapter and dataset format yours so you can leave it.
-- **Interviews:** describe the components, why raw outputs are stored before grading, why runs are
-  paired, and how the harness plugs into CI with a gate.
+
+## Exercise
+**Goal:** turn the minimal harness above into one that gates pull requests for an agent you have (or a
+two-tool toy agent). No solution is given.
+- **Inputs:** a JSONL task set with seeds and expected end states; your agent behind `run(item)`.
+- **Deliver:** a sandbox per task, step, token and wall-clock budgets, `BudgetExceeded` recorded as a
+  failure without retry, a cache keyed on configuration hash, item id and sample index, a manifest, and a
+  CI exit code from slice floors and the noise floor.
+- **Acceptance:** two unchanged runs give a stored noise-floor flip count; a deliberately broken prompt
+  exits 1; an injected timeout shows as an error, not a failure; shuffled order changes no verdict;
+  changing the rubric re-grades without calling the agent.
 
 ## Role lens
 - **Engineer:** Owns the harness code, the target adapter and the grader registry, and wires the subset
@@ -394,22 +412,6 @@ instead of silently dropping items, stores raw outputs so the flipped items can 
 per-slice interval that says whether six points at that n is signal at all.
 
 ## Interview questions
-### What is an eval harness, and what does it give you over a notebook loop?
-- **Definition:** code that runs a versioned dataset through the system under test with pinned
-  configuration, stores raw outputs, grades them and reports per-slice scores with intervals.
-- **Why:** the notebook loop does not record what changed, drops errored items and overwrites outputs,
-  so two runs cannot be compared or attributed to a change.
-- **Its status is a test suite:** same inputs, configuration and graders every time, with a gate CI can
-  enforce.
-
-### Design a harness for a tool-using agent that edits tickets.
-- **Fresh environment per item:** a seeded database and mocked or recorded tools, torn down afterwards,
-  because state left by one item changes the next item's starting point.
-- **Grade the final state,** such as the ticket's status and fields, not the final message, since many
-  action sequences are correct.
-- **Store the full trajectory and enforce budgets** on steps, tokens and wall-clock time, so a looping
-  agent is a recorded failure rather than a hung CI job.
-
 ### An agent task passes when run alone but fails in the full harness run. What is wrong?
 - **Shared state between items:** an earlier item wrote a file, row or ticket the later one reads, so
   results depend on order. Fix with a fresh sandbox per item, built from the item's seed.
@@ -468,6 +470,18 @@ per-slice interval that says whether six points at that n is signal at all.
 > A manifest must pin every value that can move the score. An alias can resolve to different weights
 > over time, so an empty diff cannot rule out a model change; pinning the snapshot makes the cause
 > attributable. Reusing cached outputs keyed on the alias would be worse: it would hide the change.
+
+## Mastery test
+**Problem:** a team's harness reports a new planner prompt at 88% versus 84% on 250 coding-agent tasks
+at *k* = 3. The run cost a third of the usual, 31 items show `output: None`, and every task's sandbox is one shared
+git checkout reset only at the start. The cache key is (config hash, item id). Would you approve?
+
+**A strong answer:**
+- rejects the comparison: 31 errored items look excluded, which biases toward easy tasks;
+- spots that a third of the cost at *k* = 3 means the cache returned one output three times; the key
+  needs the sample index;
+- calls out shared checkout state as order dependence, fixed by a fresh sandbox per task;
+- asks for the paired diff and noise floor after the fixes before any decision.
 
 ## Use cases & projects
 ### Use cases

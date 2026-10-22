@@ -6,7 +6,13 @@ kind: concept
 difficulty: advanced
 est_minutes: 17
 agent_relevance: useful
-status: agentic-verified
+status: mastery
+mastery: implement
+code_tested: partial
+prerequisites:
+  - training-adaptation/knowledge-distillation
+  - agents/agent-loop
+  - slm-for-agents/fine-tuning-an-slm-for-an-agent-task
 related:
   - training-adaptation/knowledge-distillation
   - training-adaptation/synthetic-data-generation
@@ -38,7 +44,7 @@ fraction of cost.
 
 ## Why it exists
 - **Large models run the agent well but cost too much at volume.** A frontier model per step, many steps
-  per task, many tasks per day adds up quickly, and its latency compounds across the loop.
+  per task, many tasks a day adds up, and latency compounds across the loop.
 - **SLMs lack training data for your tools.** There are no public traces of your internal APIs, and
   hand-labelling multi-step trajectories is slow and expensive.
 - **The teacher can generate that data on demand.** It already follows your system prompt and tool
@@ -109,6 +115,7 @@ This runs a teacher through an OpenAI-compatible chat API with one tool, verifie
 only successful runs as `{"messages": [...]}` lines for SFT. Point `base_url` at any compatible provider.
 
 ```python
+# pip install openai   (checked against openai 3.36.1 with a stub OpenAI-compatible server)
 import json, os
 from openai import OpenAI
 
@@ -145,12 +152,10 @@ with open("distill.jsonl", "w") as f:
             f.write(json.dumps({"messages": traj, "tools": TOOLS}) + "\n")
 ```
 
-Feed `distill.jsonl` to the SFT recipe in fine-tuning-an-slm-for-an-agent-task. Before training, check two
-format details:
+Feed `distill.jsonl` to the SFT recipe in fine-tuning-an-slm-for-an-agent-task after two format checks:
 - **Tool-call arguments:** the OpenAI API returns `arguments` as a JSON string, while many Hugging Face chat
   templates expect a dict; convert with `json.loads` and inspect one rendered example.
-- **The `tools` column:** whether your trainer reads it and renders it into the chat template depends on its
-  version; check the current docs.
+- **The `tools` column:** whether your trainer renders it into the chat template depends on its version.
 
 ### Worked scenario: distilling an order-support agent
 Illustrative numbers for a 3-tool support agent, teacher = large hosted model, student = 3B model.
@@ -167,9 +172,9 @@ Illustrative numbers for a 3-tool support agent, teacher = large hosted model, s
 | Teacher task success | ~92% |
 
 - **Cost shape:** teacher generation is a one-off cost per data round; inference savings recur on every
-  request, which is why distillation pays off on high-volume agents.
-- **Deployment:** the student handles all traffic; runs it cannot finish within the step budget escalate to
-  the teacher, and those runs become the next round's training data.
+  request, so distillation pays off on high-volume agents.
+- **Deployment:** the student takes all traffic; runs over the step budget escalate to the teacher and
+  become the next round's training data.
 
 ## Production patterns
 - **Use your tracing store as the data pipeline.** Log teacher runs with prompt version and tool schema
@@ -179,11 +184,11 @@ Illustrative numbers for a 3-tool support agent, teacher = large hosted model, s
   before falling back to an LLM judge, because judge errors become training labels. Spot-check a sample of
   judge-passed traces by hand each round.
 - **Distill step by step, not all at once.** Start with the highest-volume, easiest-to-verify step (routing
-  or extraction), keep the teacher on planning, and expand the student's scope as evals allow.
-- **Run the failure loop.** Sample student failures or escalations from production, rerun the teacher on
-  them, verify, add and retrain on a cadence. Track the escalation rate as the headline metric.
-- **Record licences and data lineage.** Store the teacher model, its terms, and the source of every input
-  with the dataset version, so legal review and data-deletion requests can be answered.
+  or extraction), keep the teacher on planning, and widen the student's scope as evals allow.
+- **Run the failure loop.** On a cadence, rerun the teacher on sampled student failures or escalations,
+  verify, add and retrain. Track the escalation rate as the headline metric.
+- **Record licences and data lineage.** Store the teacher model, its terms and every input's source with
+  the dataset version, so legal review and deletion requests can be answered.
 
 ## Trade-offs
 - **Cheap inference vs upfront data cost.** Distillation trades a one-off bill for teacher runs and
@@ -192,16 +197,19 @@ Illustrative numbers for a 3-tool support agent, teacher = large hosted model, s
   teacher's blind spots wherever the verifier cannot catch them.
 - **Whole trajectories vs per-step examples.** Whole runs teach multi-step coherence but need longer
   context and more data; per-step examples are simpler and fit hybrid deployments.
-- **Strict vs loose filtering.** A strict verifier yields cleaner but fewer and easier examples, which can
-  bias the student away from hard cases; balance by sampling more teacher attempts on hard inputs.
+- **Strict vs loose filtering.** A strict verifier yields cleaner but fewer, easier examples, biasing the
+  student away from hard cases; sample more teacher attempts on hard inputs.
 
 ## Pitfalls
 - **Training on unverified teacher output.** Symptom: the student confidently repeats the teacher's
-  mistakes. Fix: add a programmatic or reviewed success check and drop failures.
-- **Environment drift between data and serving.** Symptom: the student calls tools that were renamed. Fix:
-  version tool schemas with the dataset and regenerate when they change.
-- **Narrow input coverage.** Symptom: strong offline scores, poor results on rare intents. Fix: compare
-  intent mix of training inputs with production and generate targeted inputs for gaps.
+  mistakes. Diagnose: hand-review 50 random training trajectories for failed or wasteful runs.
+  Fix: add a programmatic or reviewed success check and drop failures.
+- **Environment drift between data and serving.** Symptom: the student calls tools that were renamed.
+  Diagnose: diff tool names and argument keys in training data against the served schemas. Fix: version
+  tool schemas with the dataset and regenerate when they change.
+- **Narrow input coverage.** Symptom: strong offline scores, poor results on rare intents. Diagnose:
+  compare training and production intent mix, and escalation rate per intent. Fix:
+  generate targeted inputs for the gaps.
 - **Ignoring provider terms.** Symptom: legal blocks the launch late. Fix: confirm the teacher's terms allow
   training on outputs before generating data, or use an open-weight teacher.
 
@@ -212,7 +220,15 @@ Illustrative numbers for a 3-tool support agent, teacher = large hosted model, s
   paying for the large model is cheaper than a data pipeline.
 - **Measure** verifier pass rate, student vs teacher task success on held-out tasks, escalation rate in
   production, and cost per completed task.
-- **Interviews:** stress verification and the failure loop, not the training loss.
+
+## Exercise
+**Goal:** build the teacher-to-dataset half of a distillation pipeline for a two-tool agent and measure
+what the verifier throws away. No solution is given.
+- **Inputs:** two fixture-backed tools, 200 varied requests, any teacher behind an OpenAI-compatible API.
+- **Deliver:** a trajectory log with prompt and schema versions, a verifier with success and step-budget
+  checks, and a filtered SFT file with pass rate per intent.
+- **Acceptance:** every exported tool call validates against its schema; a hand review of 20 kept and 20
+  dropped runs agrees with the verifier on at least 36 of 40.
 
 ## Role lens
 - **Engineer:** Builds the teacher harness, verifiers and trace export, converts trajectories into training
@@ -249,19 +265,14 @@ strict.
 ### Your student matches the teacher on simple requests but fails multi-step ones. What would you do?
 - **Inspect the data mix:** the filter may keep mostly short successful runs, so hard tasks are
   under-represented.
-- **Sample more teacher attempts on hard inputs** to collect enough successes, consider per-step examples
-  for long runs, and keep escalation to the teacher for tasks over a step budget.
+- **Sample more teacher attempts on hard inputs**, consider per-step examples for long runs, and escalate
+  tasks over a step budget to the teacher.
 
 ### When is distillation not worth it?
 - **Low traffic or volatile scope:** teacher runs, verifiers and retraining are a fixed cost that only pays
   back with volume and a stable tool set.
 - **Unverifiable tasks:** without a reliable success signal you are imitating noise, so prompting a capable
   model or a cascade is cheaper and safer.
-
-### What metrics would you put on a dashboard for a distilled agent in production?
-- **Escalation rate to the teacher**, student task success and tool-call validity, by intent.
-- **Cost and latency per completed task** for student and teacher paths, and data-round versions, so a
-  regression can be traced to a specific dataset and model.
 
 ## Quiz
 ### Q: Why do agent-distillation pipelines filter teacher trajectories before training?
@@ -287,6 +298,17 @@ strict.
 - [ ] Repeating the original training set for more epochs
 > Failures and escalations show exactly where the student's coverage is weak. Running the teacher on those
 > inputs and keeping verified successes targets the gap directly.
+
+## Mastery test
+**Problem:** you distill a research agent whose free-text answers are graded by an LLM judge. The student
+matches the teacher on the judge (90% vs 91%), yet users rate it far worse and it cites sources that do
+not exist. What went wrong, and how do you rebuild?
+
+**A strong answer:**
+- sees that judge errors became training labels: fluent but ungrounded answers passed;
+- hand-grades judge-passed traces and checks each citation against the retrieved documents;
+- adds a programmatic citation check, calibrates the judge on labelled data, re-filters, retrains and
+  re-measures against human ratings.
 
 ## Use cases & projects
 ### Use cases

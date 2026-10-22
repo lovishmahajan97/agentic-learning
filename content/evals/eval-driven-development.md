@@ -5,8 +5,14 @@ name: Eval-driven development
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - evals/golden-dataset
+  - evals/eval-harness
+  - evals/error-analysis
 related:
   - evals/golden-dataset
   - evals/eval-harness
@@ -160,8 +166,6 @@ annual plan, whose window is 14 days.
 | Review regressions | of the two regressed traces, one is noise (passes on re-run), one is a real loss on a question spanning both tiers |
 | Grow the suite | that cross-tier case becomes an item; the next iteration starts from there |
 
-Nothing in this loop required anyone to have "tried it in the playground".
-
 ### One iteration on a tool-calling agent
 Illustrative: a support agent on 120 golden tasks, *k* = 3, comparing a planner-prompt change against the
 last accepted baseline.
@@ -294,8 +298,8 @@ print(round(sign_test(15, 3), 3))        # 0.008: unlikely to be chance
 - **Failing item before the fix.** Make "link the eval item that failed before this change" a required
   field in the bug-fix PR template. Monitor time from "bug reported" to "failing eval item added".
 - **Accept-only baseline refresh.** Write the baseline file only on merge to main, never from a branch
-  run, so every gate compares against what actually shipped. Pair the tolerance band with a trend chart
-  across accepted runs to catch slow drift.
+  run, so every gate compares against what actually shipped. The tolerance band absorbs noise but lets
+  slow drift through many small accepted drops, so pair it with a trend chart across accepted runs.
 - **Agent eval tiers per change type.** A tool-description or prompt change runs the full golden task set
   with trajectory graders; a tool-code change also runs that tool's contract tests; a model swap runs
   everything plus the adversarial suite. Monitor runtime and cost per tier so the per-PR tier stays
@@ -310,8 +314,6 @@ print(round(sign_test(15, 3), 3))        # 0.008: unlikely to be chance
   the task even is; even then the evals come before the second iteration.
 - **Larger golden set vs loop speed.** A larger set gives tighter confidence intervals but a slower,
   costlier loop. Split it into a fast smoke subset per commit and the full set nightly or per release.
-- **Tolerance band vs slow drift.** A band absorbs sampling noise but lets slow drift through across many
-  small accepted drops. Pair the gate with a trend chart across runs.
 - **Deterministic graders vs judges.** Deterministic graders are cheap and trustworthy but cover only part
   of quality; judges cover the rest at the cost of calibration work and per-run spend. Use a judge in the
   gate only once its agreement with human labels has been measured; until then it informs review but
@@ -321,19 +323,27 @@ print(round(sign_test(15, 3), 3))        # 0.008: unlikely to be chance
 
 ## Pitfalls
 - **Evals written after the system exists.** Symptom: 100% from day one while users keep reporting
-  failures, because the items describe current behaviour rather than the requirement.
+  failures, because the items describe current behaviour rather than the requirement. Diagnose: turn ten
+  recent complaints into items; if they fail while the suite passes, it encodes the implementation. Fix:
+  criteria first, then items from complaints.
 - **Tuning the prompt against the full eval set repeatedly.** Symptom: the eval climbs while production
-  quality does not, and the held-out slice, if there is one, stays flat.
+  quality does not, and the held-out slice, if there is one, stays flat. Diagnose: plot dev versus
+  held-out score per accepted run; a widening gap is overfitting. Fix: hold out and rotate.
 - **A hard threshold on a noisy metric.** Symptom: CI fails every third run with no change, and engineers
-  re-run until green or mark the test skipped.
+  re-run until green or mark the test skipped. Diagnose: run the unchanged system several times and
+  compare the spread with the margin. Fix: *k* samples, a baseline and a tolerance band.
 - **Treating the vendor's benchmark as your eval.** Symptom: a model swap "improves" on a leaderboard
-  while a key slice of your task regresses unnoticed.
+  while a key slice of your task regresses unnoticed. Diagnose: a paired per-slice comparison on your
+  golden set. Fix: accept models on your suite only.
 - **Judge-only evals with no human calibration.** Symptom: scores rise after changes that only make
-  outputs longer or more confident, which the judge happens to prefer.
+  outputs longer or more confident, which the judge happens to prefer. Diagnose: correlate judge score
+  with output length and measure agreement with human labels. Fix: calibrate before gating.
 - **A golden set that never grows from production.** Symptom: the same forty items for a year while the
-  input distribution moves, and an eval that predicts nothing about user complaints.
+  input distribution moves, and an eval that predicts nothing about user complaints. Diagnose: track the
+  offline-to-online correlation per release. Fix: add items after each error-analysis round.
 - **Scores stored without prompt and dataset versions.** Symptom: nobody can say whether Tuesday's 83%
-  and Friday's 80% were measured on the same thing.
+  and Friday's 80% were measured on the same thing. Diagnose: count runs missing a configuration hash.
+  Fix: hash every run and refuse mismatched comparisons.
 
 ## When to use
 - **Use when** model output reaches users or triggers actions; most strictly before model swaps, prompt
@@ -342,10 +352,18 @@ print(round(sign_test(15, 3), 3))        # 0.008: unlikely to be chance
 - **Measure:** the eval's coverage of known failure modes, time from "bug reported" to "failing eval item
   added", CI eval runtime and cost, and the correlation between the offline score and the online metric
   it should predict.
-- **Day to day:** a pull request whose description is an eval diff.
-- **Interviews:** answer "how do you know your prompt change is an improvement?" with a baseline run,
-  *k* samples per item, per-slice scores, a list of regressed items you have read, a held-out check, and
-  a calibrated judge. "It looked better" is the wrong answer.
+
+## Exercise
+**Goal:** add one capability to an agent eval-first, with the failing items written before the code. No
+solution is given.
+- **Inputs:** an agent you run, a capability it lacks (a new tool or policy rule), and step and cost
+  budgets.
+- **Deliver:** acceptance criteria with thresholds and slice floors; at least 15 tasks that need the
+  capability and 5 that must not use it, on top of the existing suite; outcome and trajectory graders; a
+  *k* = 3 baseline; the change; an eval diff with paired flips and a sign test.
+- **Acceptance:** the new tasks fail before the change and pass after; no slice falls below its floor;
+  your tolerance band comes from at least three runs of the unchanged system, not a copied 0.03; a
+  deliberately bad tool-description edit makes the gate fail.
 
 ## Role lens
 - **Engineer:** Writes the graders and the CI gate, adds a failing eval item before fixing any reported
@@ -392,25 +410,12 @@ latency or benign refusals exceed budget, or if the judge cannot yet be trusted 
   paired against the baseline and read the flips.
 - **Add budgets:** steps and cost per task, since an extra tool often adds calls without adding success.
 
-### When would you not write evals before building?
-- **A one-day throwaway spike** whose purpose is to learn what the task even is; there is no stable
-  requirement to encode yet.
-- **But** the evals come before the second iteration, because from then on every change needs a
-  baseline to be compared with.
-
 ### A candidate prompt lifts the mean from 0.81 to 0.83. Is that real?
 - **Compare paired, not as two means:** count items that flipped each way and run a sign test or paired
   test, because item difficulty variance cancels in the per-item difference.
 - **Check noise:** at 200 items × 3 samples near 0.8, one run's SE is about 0.016 and a difference of two
   runs about 0.023, so a 2-point change of means alone is not convincing.
 - **Read the regressed traces** and check the held-out slice before accepting.
-
-### How do you keep a golden set from going stale or being overfit?
-- **Hold out a subset** you rarely inspect and rotate items between dev and held-out periodically.
-- **Grow it from production:** sample recent traces and add items for new failure modes after each round
-  of error analysis.
-- **Retire or harden** items that have passed for months, keeping a few as smoke tests, because a suite
-  at 100% carries no information.
 
 ## Quiz
 ### Q: Why write acceptance criteria and golden items before building the first version?
@@ -439,6 +444,19 @@ latency or benign refusals exceed budget, or if the judge cannot yet be trusted 
 > Iterating on a prompt against visible items is training on the test set; the dev-set score keeps
 > rising while production does not. A held-out slice, rotated occasionally, is the only unbiased
 > offline estimate of how the change will behave on inputs you have not tuned for.
+
+## Mastery test
+**Problem:** a PR swaps in a new reranker for a RAG agent. The description says: mean 0.78 → 0.80 on the
+judge-graded suite, *k* = 1; 20 pricing items were added this week, bringing it to 150; p95 latency rose
+from 2.1 s to 3.4 s against a 3 s budget. Do you approve?
+
+**A strong answer:**
+- sees the means are not comparable, because 20 new items changed the set; compare shared ids or
+  re-baseline;
+- estimates noise: at about 150 items, *k* = 1, near 0.8, one run's SE is about 0.033 and a difference
+  about 0.046, so 2 points says nothing; asks for flips and a sign test;
+- rejects anyway on latency, because a budget is an acceptance criterion;
+- asks whether the judge is calibrated and reads the regressed traces and held-out slice.
 
 ## Use cases & projects
 ### Use cases

@@ -5,8 +5,13 @@ name: ACL-aware retrieval
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - rag-retrieval/metadata-filtering
+  - backend-fundamentals/authentication-vs-authorization
 related:
   - rag-retrieval/metadata-filtering
   - safety-security/cross-tenant-data-leakage
@@ -46,19 +51,16 @@ parts: capturing ACLs, expanding groups, staying fresh.
   can read everything, because it has to in order to index everything.
 - **The default outcome is a leak.** An intern asks "what is the CFO's compensation?", the top-k returns a
   board-deck chunk, and the model summarizes it politely. The source systems enforced that permission for
-  years; the index threw it away in one afternoon. That is the default for RAG without an authorization
-  model, not an edge case.
+  years; the index threw it away in one afternoon.
 - **Prompt and output defenses fail.** "Do not reveal documents the user is not allowed to see" fails: the
   model does not know the user's permissions, has already consumed the text, and follows instructions only
   probabilistically. Scanning the answer fails because the content already shaped it, and even "there is a
   document about that, but I cannot share it" leaks existence.
-- **Post-filtering fails twice.** It inherits the selectivity problem from metadata filtering, so
-  low-privilege users, who are most users, get empty results. And it is a per-call-site discipline: the
-  debug endpoint, eval script, agent tool and semantic cache must each remember to filter, and the one that
-  forgets is the breach.
+- **Post-filtering fails twice.** Its selectivity problem leaves low-privilege users, who are most users,
+  with empty results. And every call site (debug endpoint, eval script, agent tool, semantic cache) must
+  remember to filter; the one that forgets is the breach.
 - **The fix: authorization is a property of the retrieval query.** Derived from authenticated identity,
-  enforced in one place, applied inside the search, failing closed. Filtering after generation is too late,
-  because the model cannot be trusted to withhold what it has already read.
+  enforced in one place, applied inside the search, failing closed.
 
 ## How it works
 ### 0. Where identity enters an agent
@@ -136,8 +138,6 @@ The practical design is a hybrid:
   accepts a principal list or a raw filter from the caller.
 - **Fail closed.** If the principal set is empty or the directory lookup fails, return nothing, not
   everything. Tell the agent the search failed, so it reports an error rather than "no documents exist".
-- **Agents and MCP servers call retrieval with the end user's identity** (on-behalf-of tokens), not a
-  service account, so a tool call cannot escalate privileges on the user's behalf.
 
 ### 7. Side channels
 All of these carry content and must be scoped by the same principals:
@@ -192,12 +192,17 @@ principals, filters inside the search and late-binds a check. The vector-store c
 client's shape; the identity and source clients are the customer's directory and document system.
 
 ```python
-from qdrant_client import QdrantClient, models
+from types import SimpleNamespace as NS
+from qdrant_client import QdrantClient, models          # checked against qdrant-client 1.16
 
-client = QdrantClient("http://localhost:6333")
-# Ingestion wrote, per chunk: payload={"doc_id": "d17", "allowed": ["group:finance", "user:cfo@acme.com"],
-#                                     "denied": []}
-client.create_payload_index("docs", field_name="allowed", field_schema="keyword")
+client = QdrantClient(":memory:")                         # local mode; use QdrantClient("http://localhost:6333") in prod
+client.create_collection("docs", vectors_config=models.VectorParams(size=2, distance=models.Distance.COSINE))
+client.upsert("docs", points=[                             # ingestion stores principals on every chunk
+    models.PointStruct(id=1, vector=[1, 0], payload={"doc_id": "d17", "allowed": ["group:finance"], "denied": []}),
+    models.PointStruct(id=2, vector=[1, .1], payload={"doc_id": "d18", "allowed": ["public"], "denied": ["user:bo@acme.com"]}),
+    models.PointStruct(id=3, vector=[.9, 0], payload={"doc_id": "d19", "allowed": ["public"], "denied": []}),
+    models.PointStruct(id=4, vector=[.8, .3], payload={"doc_id": "d20", "allowed": ["group:sales"], "denied": []})])
+client.create_payload_index("docs", field_name="allowed", field_schema="keyword")   # no-op in local mode
 client.create_payload_index("docs", field_name="denied", field_schema="keyword")
 
 SEARCH_TOOL = {"name": "search_docs", "input_schema": {      # no user, group or principal fields
@@ -224,6 +229,13 @@ def handle_search_docs(args, session, embed, directory, source, k=8):
     doc_ids = {h.payload["doc_id"] for h in hits}
     readable = source.can_read(user.id, doc_ids)                  # one batched permission check
     return {"results": [h.payload for h in hits if h.payload["doc_id"] in readable][:k]}
+
+# Fakes for the customer's directory and source system: Bo is in sales; d19 was unshared since the last sync.
+directory = NS(transitive_groups=lambda uid: ["sales"])
+source = NS(can_read=lambda uid, ids: ids - {"d19"})
+bo = NS(session=NS(user=NS(id="bo", email="bo@acme.com", domain="acme.com")))
+print(handle_search_docs({"query": "q3"}, bo.session, lambda q: [1, 0], directory, source))
+# only d20: d17 needs finance, d18 denies Bo, d19 is dropped by the late-bound check
 ```
 
 ### Worked numbers: predicate cost and revocation window
@@ -269,10 +281,9 @@ print(visible_derived([finance, legal], only_fin))  # False: Bo cannot read the 
 ```
 
 ## Production patterns
-- **Leakage canaries in the agent eval.** Seed a restricted canary document per data class, then run
-  red-team prompts (including injection attempts that ask the agent to "search as admin") as a
-  low-privilege test user on every deploy. Fail the build if any canary chunk is retrieved, quoted or
-  written to memory. Monitor canary hits in production probes too.
+- **Leakage canaries in the agent eval.** Seed a restricted canary document per data class and run
+  red-team prompts (including "search as admin" injections) as a low-privilege user on every deploy. Fail
+  the build if a canary chunk is retrieved, quoted or written to memory; probe production too.
 - **Directory-backed principal cache.** Expand groups server-side from the identity provider (for Entra ID,
   Microsoft Graph's transitive membership endpoint rather than the token's group claim), cache per user for
   minutes, and invalidate on directory change events. Monitor cache age and directory-lookup failures,
@@ -280,22 +291,22 @@ print(visible_derived([finance, legal], only_fin))  # False: Bo cannot read the 
 - **Late-bound check by data class.** Turn on the batched source permission check for the final top-k only
   for HR, legal and M&A-style collections where revocation must be immediate. Monitor drop rate: a rising
   share of hits removed late means the change feed is lagging.
-- **Change-feed ACL patching plus nightly reconcile.** Subscribe to source permission webhooks or delta
-  queries, patch `allowed`/`denied` payloads without re-embedding, and run a full re-sync to catch missed
-  events. Monitor p95 ACL sync lag against the SLO.
+- **Change-feed ACL patching plus nightly reconcile.** Patch `allowed`/`denied` payloads from source
+  webhooks or delta queries, with a full re-sync for missed events. Monitor p95 ACL sync lag against the
+  SLO.
 - **Principal-scoped caches and memory.** Key semantic and response caches on (principal-set hash, query),
   or cache only results whose chunks are `public`; tag agent memory notes with their source ACLs and search
   them with the same predicate. Monitor cross-user cache hits in an audit log.
-- **On-behalf-of identity for tools.** Agents and MCP servers pass the end user's token to retrieval;
-  service-account calls are rejected at the retrieval service. Monitor calls with no user identity.
+- **On-behalf-of identity for tools.** Agents and MCP servers pass the end user's token; the retrieval
+  service rejects service-account calls. Monitor calls with no user identity.
 
 ## Trade-offs
 - **Early binding: speed vs freshness.** Fast, scales to millions of chunks, but freshness is bounded by
   ACL sync lag. It flips to unacceptable when revocations must be immediate (HR, legal, M&A), which is when
   you add late-binding checks on the top-k.
-- **Late binding: correctness vs cost.** Always correct, but costs per-query calls to rate-limited source
-  APIs and cannot stand alone when a user sees only a sliver of the corpus. It flips to impractical at high
-  query volume without batching and caching; agents that search many times per run hit this sooner.
+- **Late binding: correctness vs cost.** Always correct, but costs calls to rate-limited source APIs and
+  cannot stand alone. It turns impractical at high query volume without batching and caching; agents that
+  search many times per run hit this sooner.
 - **Principals on every chunk: one indexed field vs duplication.** Duplicates ACL data (storage, update
   fan-out per document) but makes the predicate one indexed field; normalizing into a document table would
   need a join the vector store cannot perform.
@@ -303,35 +314,40 @@ print(visible_derived([finance, legal], only_fin))  # False: Bo cannot read the 
   cheaper; per-domain indexes give blast-radius containment. The flip comes when a tenant demands physical
   isolation or data residency.
 - **Query-time vs index-time group expansion.** Query time costs a (cached) directory round trip but makes
-  membership changes instant; index time (storing users) removes the round trip but forces a re-index on
-  every membership change.
-- **Shared agent memory vs per-user memory.** Shared memory lets one user's findings help others, but
-  every note then needs inherited ACLs and filtered recall; per-user memory is simpler and leak-free at the
-  cost of no sharing.
+  membership changes instant; storing users forces a re-index on every membership change.
+- **Shared agent memory vs per-user memory.** Shared memory lets findings help others, but every note
+  needs inherited ACLs and filtered recall; per-user memory is simpler and leak-free but shares nothing.
 
 ## Pitfalls
-- **Crawling with a service account and never capturing ACLs.** Symptom: the first security review, or the
-  first user who finds payroll data in a chat answer.
-- **Accepting principal lists or filters from the client or an agent's tool call.** Symptom: a trivially
-  forged request body, or a prompt injection that sets a tool argument, reads everything.
+- **Crawling with a service account and never capturing ACLs.** Symptom: the first security review, or
+  the first user who finds payroll data in a chat answer. Diagnose: count chunks with an empty `allowed`
+  field per connector. Fix: capture and map ACLs at ingestion.
+- **Accepting principal lists or filters from the client or an agent's tool call.** Symptom: a forged
+  request body, or a prompt injection that sets a tool argument, reads everything. Diagnose: grep tool
+  schemas and request models for identity fields. Fix: derive principals from the session.
 - **Post-filtering after an unfiltered ANN search.** Symptom: low-privilege users get empty answers to
-  questions whose sources they are allowed to read.
+  questions whose sources they may read. Diagnose: compare result counts per user privilege level. Fix:
+  pre-filter or filtered traversal.
 - **Storing individual users on widely shared documents.** Symptom: payloads with tens of thousands of
-  entries and re-index jobs triggered by routine membership changes.
+  entries and re-index jobs triggered by routine membership changes. Fix: store the group principal.
 - **A semantic or response cache keyed on query text alone.** Symptom: user B receives user A's cached
-  answer that drew on a restricted document.
+  answer that drew on a restricted document. Diagnose: audit cache hits where reader and writer differ.
+  Fix: key on the principal-set hash.
 - **Debug, eval and agent paths querying the index directly.** Symptom: a log line showing a "test"
-  endpoint returning documents with no principal set attached.
+  endpoint returning documents with no principal set attached. Diagnose: alert on index calls with no
+  user identity. Fix: one retrieval service owns the index.
 - **No change feed and no late-binding check.** Symptom: an offboarded employee's direct shares still
-  surface hours later, found during an audit.
+  surface hours later, found during an audit. Diagnose: measure p95 ACL sync lag. Fix: change feed plus a
+  late check on the top-k.
 - **Different responses for "not in the index" and "not permitted".** Symptom: users discover documents'
-  existence by probing.
+  existence by probing. Fix: make them indistinguishable.
 - **Taking group memberships from the sign-in token's group claim.** Identity providers cap or omit that
   claim for users in many groups (Entra ID switches to an "overage" indicator). Symptom: heavily grouped
-  users, often managers and admins, suddenly see far less than they should.
+  users, often managers and admins, suddenly see far less. Diagnose: log principal-set size per user.
+  Fix: expand from the directory.
 - **Derived content built across different ACLs.** Summaries, contextual prefixes, graph reports or agent
   memory notes mixing sources; symptom: a restricted fact surfaces in a chunk whose own `allowed` list
-  looks harmless.
+  looks harmless. Fix: store the conjunction of source ACLs.
 
 ## When to use
 - **Use when** the data has per-user permissions, which means almost every enterprise deployment and
@@ -339,12 +355,21 @@ print(visible_derived([finance, legal], only_fin))  # False: Bo cannot read the 
 - **Exemption:** a corpus uniformly public to every user of the app; even then tenant isolation still
   applies.
 - **Decide early:** retrofitting ACL capture into a connector is a rewrite.
-- **Measure:** ACL sync lag (p95 time from a permission change to the index reflecting it), leakage tests
-  (seed a restricted document, run red-team queries as a low-privilege test user in CI), filtered recall
-  for low-privilege users, and the latency overhead of principal expansion.
-- **Interviews:** expect how a revoked permission propagates, how groups are expanded, where enforcement
-  lives, and which side channels you would close. Early versus late binding is the vocabulary the strong
-  answer uses.
+- **Measure:** ACL sync lag (p95 time from a permission change to the index reflecting it), canary
+  leakage tests in CI, filtered recall for low-privilege users, and principal-expansion latency.
+- **Interviews:** expect revocation propagation, group expansion, the enforcement point and side
+  channels, in early versus late binding vocabulary.
+
+## Exercise
+**Goal:** build a retrieval service whose leakage you can prove absent, then break it on purpose. No
+solution is given.
+- **Inputs:** 200 documents across three groups (one nested), some direct shares and denies, a local
+  vector store, and a fake directory you can make fail.
+- **Deliver:** ingestion that stores canonical principals, cached group expansion, the search handler,
+  and a red-team suite of 10 queries per user, including an injected "search as admin" document.
+- **Acceptance:** zero canary chunks reach any low-privilege user; a group removal takes effect within
+  the cache TTL with no re-index; a revoked direct share disappears at the next query via the late-bound
+  check; a directory outage returns an error, never results.
 
 ## Role lens
 - **Engineer:** Builds connector-side ACL capture, cached principal expansion and the filter builder, and
@@ -439,6 +464,18 @@ Fail closed if the directory lookup fails, and key any answer cache on the princ
 - [ ] Embed the group name into the chunk text so the embedding carries it
 > Group principals keep payloads small and make membership changes instant through query-time
 > expansion. Listing users forces a re-index on every change, and embeddings cannot enforce a predicate.
+
+## Mastery test
+**Problem:** your agent writes a weekly "team digest" into a shared index by summarizing the 20 documents
+it read for a manager. A week later a contractor's agent quotes one digest line from an M&A memo. Each
+source chunk's ACL was correct. Find the failure and redesign.
+
+**A strong answer:**
+- names derived content: the digest mixed sources with different ACLs and was written back without
+  them;
+- stores the conjunction of source ACLs (not an intersection of group strings), or scopes digests to one
+  permission domain, and tombstones digests when a source tightens;
+- adds a canary to the M&A collection and a CI probe that searches digests as the contractor.
 
 ## Use cases & projects
 ### Use cases

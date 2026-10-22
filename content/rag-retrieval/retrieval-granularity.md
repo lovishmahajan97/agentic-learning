@@ -5,8 +5,13 @@ name: Retrieval granularity
 kind: decision
 difficulty: core
 est_minutes: 12
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - rag-retrieval/chunking-strategies
+  - model-internals/context-window
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/chunk-overlap
@@ -185,8 +190,9 @@ def retrieve(query: str, k_units: int = 6, k_parents: int = 2):
 
 for hit in retrieve("how much can fees be capped at?"):
     print(hit)
-# Expect "billing/caps" first: the sentence about twelve months matches sharply, and the generator
-# receives the whole section, including the exclusions it needs to answer correctly.
+# Ran with sentence-transformers 6.2.0: "billing/caps" first (0.841), "billing/invoicing" second.
+# The best child is "Fees are capped per contract year", not the twelve-months sentence, which is why
+# returning the section matters: the generator still gets the figure and the tax exclusion.
 ```
 
 ### Agent scenario: search snippets plus a read tool
@@ -257,7 +263,9 @@ print(auto_merge(child_hits, children_of))
 ## Production patterns
 - **Parent-document retriever** — when pointed questions rank diluted chunks above the precise one, use
   LangChain's `ParentDocumentRetriever` with a small `child_splitter` and a larger `parent_splitter`
-  (children in the vector store, parents in a docstore). Monitor parent-level recall@k and prompt tokens.
+  (children in the vector store, parents in a docstore). In LangChain 1.x it is imported from
+  `langchain_classic.retrievers` (checked against langchain-classic 1.0.8). Monitor parent-level
+  recall@k and prompt tokens.
 - **Sentence window with metadata replacement** — for factoid-heavy corpora, LlamaIndex's
   `SentenceWindowNodeParser` stores neighbours in metadata and `MetadataReplacementPostProcessor` swaps
   them in after retrieval. Monitor answers that miss a qualifier from just outside the window.
@@ -293,17 +301,22 @@ print(auto_merge(child_hits, children_of))
 
 ## Pitfalls
 - **Returning the matched sentence alone.** Answers quote a fact correctly but attach it to the wrong
-  entity or ignore an exception stated in the next sentence.
+  entity or ignore an exception in the next sentence. Diagnose: run faithfulness checks on golden
+  questions whose answers carry exceptions. Fix: return a window or the parent.
 - **Not deduplicating parents.** The top-k is three sentences from one section; one source dominates
-  every answer and other relevant sections never appear.
+  and other relevant sections never appear. Diagnose: log distinct parents per result. Fix: collapse
+  children into one parent hit.
 - **One size for matching and returning.** Tuning it endlessly gives a recall-versus-answer-quality
-  seesaw that no single value settles.
-- **Parents so large that two fill the context.** Prompts get long, generations slow and costly, and
-  facts in the middle of the prompt are ignored; in a multi-step agent, earlier results get truncated.
-- **Snippets the agent cannot judge.** A search tool returns bare sentences with no section name, so the
-  agent expands the wrong hit or none. Fix: put the heading path or title in each snippet.
+  seesaw no single value settles. Fix: decouple match and return units.
+- **Parents so large that two fill the context.** Prompts get long, generations slow and costly, middle
+  facts are ignored, and earlier agent results get truncated. Diagnose: prompt tokens p95 and
+  truncation rate per step. Fix: bound parents and pack to an evidence budget.
+- **Snippets the agent cannot judge.** Bare sentences with no section name, so the agent expands the
+  wrong hit or none. Diagnose: in traces, compare expanded ids with the gold parent. Fix: put the
+  heading path or title in each snippet.
 - **Fixed granularity across question types.** Factoid queries do well while "explain" or "compare"
-  queries get fragments that never add up to a complete picture.
+  queries get fragments that never add up. Diagnose: split eval scores by query type. Fix: route scoring
+  by type.
 
 ## When to use
 - **Decouple when:** you see precision problems (large chunks scoring middling for pointed questions) or
@@ -316,8 +329,16 @@ print(auto_merge(child_hits, children_of))
   already the right unit.
 - **Measure:** parent-level recall@k, answer faithfulness and prompt token usage together, because
   granularity moves all three.
-- **Interviews:** answer "what chunk size should we use" with "which size for matching and which for
-  returning, and why they need not be equal".
+
+## Exercise
+**Goal:** decide, with evidence, which granularity set-up to ship for one corpus. No solution is given.
+- **Inputs:** a document set with headings (a product manual or policy set), 30 golden questions
+  labelled factoid or explanatory with their gold section, and an evidence budget of 4,000 tokens.
+- **Deliver:** three retrievers over one index (passage-only, sentence match with section return and
+  max-child scoring, and auto-merging) and a table of parent-level recall@5, evidence tokens per call
+  and answer correctness, split by question type.
+- **Acceptance:** no call exceeds the budget; duplicate parents never appear in one result; you
+  recommend one set-up per question type and cite the failing questions that drove it.
 
 ## Role lens
 - **Engineer:** Stores parent pointers on every unit, implements parent dedupe and scoring in the
@@ -341,13 +362,6 @@ which should not balloon because parents are bounded clauses rather than whole c
 explanatory queries regress, I would add sum-based parent scoring or a reranker over the parents.
 
 ## Interview questions
-### How is retrieval granularity different from chunking?
-- **Chunking** decides how a document is cut into pieces.
-- **Granularity** decides which unit is matched, scored and returned, and the match unit and return unit
-  need not be the same object.
-- **Why it matters:** small vectors match sharply, large units give the generator context, so separating
-  the two removes the compromise size.
-
 ### Design small-to-big retrieval for a product manual. What do you store and what happens at query time?
 - **Store** small units (sentences or about 128-token chunks) with `{unit_id, text, parent_id, position}`,
   and parents (sections or larger chunks) in a docstore.
@@ -368,13 +382,6 @@ explanatory queries regress, I would add sum-based parent scoring or a reranker 
 - **Very large corpora:** a sentence index can hold an order of magnitude more vectors than a passage
   index, which costs storage and latency at tens of millions of units.
 - **Explanatory-heavy traffic** may be better served by passage units with sum scoring or auto-merging.
-
-### You have a 4,000-token evidence budget per agent step. How do you decide what to send?
-- **Do the arithmetic:** forty 100-token windows, eight 500-token passages or two 2,000-token sections.
-- **Prefer fewer, well-chosen parents,** because usage degrades as prompts grow and facts drift to the
-  middle, and agent context already holds earlier tool results.
-- **Over-retrieve and rerank,** then pack in rank order until the cap, and monitor truncation rate and
-  prompt tokens p95.
 
 ### Your agent quotes the right number but misses an exception stated in the next sentence. What is wrong?
 - **The return unit is too small:** the tool is sending the matched sentence alone, or the agent did not
@@ -410,6 +417,19 @@ explanatory queries regress, I would add sum-based parent scoring or a reranker 
 > Explanatory questions are answered by sections that discuss the topic at length, which several
 > matching children indicate. Pointed factual questions want the single best sentence, where max-child
 > scoring is the right signal.
+
+## Mastery test
+**Problem:** an HR-policy agent matches 64-token chunks and returns whole policy documents (about 6,000
+tokens each). Accuracy is high on the first search, but on multi-step tasks later answers ignore
+facts the agent already retrieved, and cost per task tripled. What is happening and what do you change?
+
+**A strong answer:**
+- sees that two or three whole-document returns fill the window, so earlier tool results drift into
+  the middle or get truncated;
+- bounds the return unit to the policy section, dedupes parents and packs to a fixed evidence budget,
+  or switches to snippets plus a `read_section` tool;
+- keeps the small match unit, since matching was not the problem;
+- measures tokens per step, truncation rate, and accuracy on later steps of multi-step tasks.
 
 ## Use cases & projects
 ### Use cases

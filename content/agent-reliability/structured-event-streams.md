@@ -5,8 +5,13 @@ name: Structured event streams
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - agents/agent-loop
+  - serving-inference/streaming
 related:
   - agent-reliability/durable-execution-and-checkpointing
   - agent-reliability/state-persistence-and-conversation-recovery
@@ -41,15 +46,13 @@ replayable source of truth instead of four drifting formats.
 
 ## Why it exists
 - **Every new consumer invents a format.** The first agent returns a final answer. The second needs a
-  progress UI, because a 90-second silent wait reads as a hang. The third must survive a worker restart.
-  The fourth needs traces and eval trajectories. Built separately, the UI parses print statements, the
-  checkpoint serializes a Python object, the tracer wraps functions, the eval harness scrapes logs.
-- **The formats disagree.** None of them can answer "what did the model see when it chose that tool"
+  progress UI, because a 90-second silent wait reads as a hang. The third must survive a worker restart;
+  the fourth needs traces and eval trajectories. Built separately (print statements, a pickled object,
+  wrapped functions, scraped logs), none can answer "what did the model see when it chose that tool"
   without a second instrumentation pass.
-- **An agent's state is a history, not a value.** The next prompt is built from everything that happened
-  before, so the only faithful representation of the run is the ordered list of what happened.
-- **Event sourcing already says this:** store the facts, derive the views. Agent runtimes rediscovered it
-  because live streaming, resumption, audit, replay and evaluation are all projections of the same facts.
+- **An agent's state is a history, not a value.** The next prompt is built from everything before it.
+  Event sourcing already says this: store the facts, derive the views, and live streaming, resumption,
+  audit, replay and evaluation are all projections of the same facts.
 - **Free-text logging fails three ways:** it cannot be parsed reliably, it has no ordering guarantee
   across processes, and the model's token stream, which the UI needs most, does not fit in a log line.
 
@@ -160,6 +163,7 @@ flowchart TD
 ### Typed stream, fold and SSE framing
 A minimal typed stream: a discriminated union of events, a single-writer emitter, a pure fold that
 rebuilds state, and SSE framing for the UI. The same list feeds persistence, replay and evaluation.
+Needs Python 3.10+ for `str | None`; checked with pydantic 2.14.
 
 ```python
 from typing import Literal, Union
@@ -291,7 +295,8 @@ token as the worst case (real streams often batch several tokens per chunk).
   evals, but forces every consumer through one schema, and one team becomes the owner of its evolution.
 - **Persisting deltas vs cost.** Fine-grained token deltas give exact replay of what the user saw, at a
   storage and write-rate cost that is usually not worth it; persist the assembled `llm.response` and keep
-  deltas live-only unless a product requirement says otherwise.
+  deltas live-only unless a product or compliance requirement (a disputed live answer) says otherwise,
+  and then in a short-retention store, not the permanent history.
 - **References vs inlining.** Payloads by hash keep events small and redactable but add a second store and
   a second failure mode; for small internal tools, inlining is simpler until retention or PII rules bite.
 - **Durable-before-act vs latency.** It guarantees the history is trustworthy but adds a write on the
@@ -299,20 +304,22 @@ token as the worst case (real streams often batch several tokens per chunk).
   event.
 
 ## Pitfalls
-- **Ordering by timestamp instead of a per-run sequence.** Symptom: parallel tool results that appear
-  before their requests in the UI or the replay.
-- **Multiple processes writing one run's stream.** Symptom: duplicate or interleaved `seq` values and folds
-  that produce different state on different replays.
-- **Inlining full tool outputs into events.** Symptom: a stream table that grows by megabytes per run and a
-  redaction request that requires rewriting history.
-- **Changing a payload shape without bumping `version`.** Symptom: replay of last month's runs crashing in
-  the fold.
-- **Blocking the agent on a slow websocket consumer.** Symptom: step latency that tracks the user's network
-  rather than the model's.
-- **Emitting events after the side effect instead of before.** Symptom: a crash between the tool running
-  and the event being written leaves a run that resumes and runs the tool again.
-- **Publishing to live subscribers and the durable log as two independent writes.** Symptom: a user saw a
-  step in the UI that is missing when the run is resumed or replayed.
+- **Ordering by timestamp instead of a per-run sequence.** Symptom: parallel tool results appear before
+  their requests in the UI or replay. Diagnose: count events whose `ts` order differs from `seq` order.
+  Fix: sort by `seq` only.
+- **Multiple processes writing one run's stream.** Symptom: duplicate or interleaved `seq` values; folds
+  differ between replays. Diagnose: unique-violation errors on `(run_id, seq)` and the replay-equality
+  check. Fix: one writer; workers report to it.
+- **Full tool outputs inlined into events.** Symptom: megabytes per run; a redaction request means
+  rewriting history. Diagnose: bytes per event by type. Fix: payloads by reference.
+- **A payload shape changed without bumping `version`.** Symptom: replay of last month's runs crashes in
+  the fold. Fix: version plus upcaster, replayed in CI.
+- **The agent blocked on a slow websocket consumer.** Symptom: step latency tracks the user's network,
+  not the model. Diagnose: compare step latency with fan-out lag per subscriber. Fix: buffer or drop deltas.
+- **Events emitted after the side effect.** Symptom: a crash between the tool running and the write leaves
+  a run that resumes and runs the tool again. Fix: durable first, then act.
+- **Live publish and durable log as two writes.** Symptom: a user saw a step that is missing on resume or
+  replay. Diagnose: diff the client's received `seq` list against the log. Fix: subscribers tail the log.
 
 ## When to use
 - **Adopt it** as soon as more than one consumer needs to know what the agent is doing: in practice, the
@@ -320,9 +327,18 @@ token as the worst case (real streams often batch several tokens per chunk).
 - **Keep it for batch agents too,** because the eval trajectory and the audit log come for free.
 - **Measure** events per run, bytes per run, fan-out lag to the slowest subscriber, and the fraction of runs
   that rebuild to identical state on replay.
-- **Daily work:** the stream is where you look first when a run misbehaves.
-- **Interviews:** "state is a fold over events, the UI and the checkpoint are projections" signals you have
-  built an agent that survived contact with production.
+- **Debugging:** the stream is where you look first.
+
+## Exercise
+**Goal:** make a small tool-calling agent event-sourced and prove it survives a crash. No solution is
+given; the examples above show the envelope and fold, not the runtime.
+- **Inputs:** any agent loop (a scripted fake model is fine) and SQLite or Postgres.
+- **Constraints:** one writer per run; state comes only from a pure `apply`; durable before any tool runs.
+- **Deliver:** five event types, an append-only table with unique `(run_id, seq)`, an SSE endpoint with
+  `id: <seq>`, and a resume command.
+- **Acceptance:** kill the process at a random step 20 times; every resumed run rebuilds to the same
+  state hash as a clean fold; a kill between request and result shows a pending call; a reconnecting
+  client receives no gaps or duplicates.
 
 ## Role lens
 - **Engineer:** Defines the event types, assigns sequence numbers from a single writer, writes the fold,
@@ -360,13 +376,6 @@ that even a retry after a crash cannot repeat the effect.
   server tails the log from there. A late joiner starts from `seq` 0.
 - **Deltas are the exception:** they go live-only and may be dropped for a slow client, because the
   assembled `llm.response` is persisted anyway.
-
-### When is persisting every token delta worth it?
-- **Usually not:** deltas outnumber every other event by orders of magnitude, and `llm.response` already
-  holds the assembled text.
-- **Worth it when** a product or compliance requirement says you must reproduce exactly what the user saw
-  and when, for example a disputed live answer.
-- **Middle ground:** keep deltas in a short-retention store, not the permanent history.
 
 ### After a crash, the log has `tool.call.requested` but no `tool.call.result`. What does the runtime do?
 - **Treat it as unknown, not as not-run:** the call may have executed before the crash.
@@ -406,6 +415,18 @@ that even a retry after a crash cannot repeat the effect.
 > Events are the permanent history; payloads carry the bulk and the sensitive content. Separating them
 > keeps transport cheap and retention policies independent.
 
+## Mastery test
+**Problem:** an agent runs three tool calls in parallel on separate workers, each writing its own events
+straight to a Kafka topic partitioned by `tool_name`. Replays of the same run sometimes rebuild different
+state, and the UI occasionally shows a result before its request. Explain and fix.
+
+**A strong answer:**
+- names two causes: several writers assign or race `seq`, and partitioning by tool scatters one run
+  across partitions, so no order holds across them;
+- moves to a single writer per run: workers report results, the writer appends in arrival order;
+- partitions by `run_id` and makes the UI tail the log, ordered by `seq`;
+- verifies with the replay-equality check and the timestamp-versus-`seq` inversion count.
+
 ## Use cases & projects
 ### Use cases
 - **Live agent UIs.** Token deltas and tool status rows stream to the browser, and a reconnect resumes
@@ -424,6 +445,4 @@ that even a retry after a crash cannot repeat the effect.
 - **Steps:** define the envelope and five event types; write events to a SQLite or Postgres table with a
   unique `(run_id, seq)`; derive state with a pure `apply` fold; serve the stream over SSE with
   `id: <seq>`; kill the process mid-run and resume from the log.
-- **Done when:** a browser that reconnects mid-run shows no gaps or duplicates, the resumed run finishes
-  with state identical to a clean rebuild from events, and a crash between request and result shows up
-  as a pending call.
+- **Done when:** the Exercise acceptance checks pass for a single kill mid-run.

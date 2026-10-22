@@ -5,8 +5,12 @@ name: Private endpoints
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: implement
+code_tested: partial
+prerequisites:
+  - engineering-fundamentals/http-from-first-principles
 related:
   - deployment/customer-vpc-on-prem-air-gapped
   - deployment/vpn
@@ -51,10 +55,9 @@ override; DNS is where most failures live.
   allowlist ends up permitting a huge slice of the cloud.
 - **Peering is too broad.** It is usually not offered for multi-tenant services; where it is, it connects
   entire networks, requires non-overlapping CIDR ranges and exposes far more than one API.
-- **A private endpoint says exactly what security wants.** "This subnet may reach this one service, over
-  a path we control, and that service refuses calls that did not come through that path." Once every
-  consumer arrives privately, the provider can disable public network access, so a leaked API key is
-  useless from the internet.
+- **A private endpoint says exactly what security wants:** this subnet may reach this one service over
+  a path we control. Once every consumer arrives privately, the provider can disable public network
+  access, so a leaked API key is useless from the internet.
 
 ## How it works
 The three large clouds implement the same idea under different names:
@@ -106,8 +109,7 @@ Put the four parts together for one agent step calling a model API from a pod:
 1. **Resolve.** The SDK asks the VPC resolver for `bedrock-runtime.<region>.amazonaws.com`; the private
    zone answers with the endpoint interfaces' private IPs (say 10.20.1.15 and 10.20.2.15, one per zone).
 2. **Connect.** The pod opens TCP 443 to 10.20.1.15. The **security group on the endpoint interface**
-   must allow 443 from the pod's subnet. It is a separate control from the pod's own egress rules, and
-   forgetting it is the classic "DNS is right but it still times out" failure.
+   must allow 443 from the pod's subnet, separately from the pod's own egress rules.
 3. **Carry.** The provider network takes the flow to the service's load balancer. The service never sees
    a route into your VPC; it sees a connection tagged with the endpoint it came through, which is what
    resource policies such as "only via endpoint X" match on.
@@ -117,16 +119,14 @@ Put the four parts together for one agent step calling a model API from a pod:
 - **Customer identity for your own SaaS.** On AWS, enabling Proxy Protocol v2 on the NLB is how your
   application learns which customer endpoint a connection came from, *because* the source IP alone is
   not a reliable customer identifier.
-- **One-way by design.** Connections are initiated by the consumer toward the service; the provider
-  cannot open connections back into the consumer network through the endpoint, which is why security
-  teams approve it more easily than a VPN or peering link. A hosted agent therefore cannot use an
-  endpoint to call tools inside the customer's network; that needs a different path.
+- **One-way by design.** Only the consumer initiates connections; the provider cannot open any back
+  through the endpoint, so security approves it more easily than a VPN or peering. A hosted agent
+  therefore cannot use it to call tools inside the customer's network.
 
 ### Gateway endpoints (AWS only)
 - **Older, different mechanism** available only for S3 and DynamoDB: a route-table entry (a prefix list)
   instead of an interface.
-- **Cost and reach.** Cost nothing extra, but only work from inside that VPC, not from on-prem or peered
-  networks.
+- **Cost and reach.** Free, but only from inside that VPC, not from on-prem or peered networks.
 - **Elsewhere.** Azure and Google Cloud have no direct equivalent; their closest analogues are service
   endpoints and Private Google Access respectively.
 
@@ -153,11 +153,10 @@ sequenceDiagram
 
 ## Examples
 ### Deploy-time check that SDK hostnames resolve privately
-- **Setting.** A team runs a RAG agent in a private subnet with no NAT. They created an interface
-  endpoint for the model runtime API and one for object storage, and expose their own vector service
-  through a private endpoint.
-- **Why check.** A failed check is the earliest signal that private DNS is off, which otherwise shows up
-  only as timeouts (no egress) or, worse, silent internet traffic (if egress exists).
+- **Setting.** A RAG agent in a no-NAT subnet, with interface endpoints for the model runtime API and
+  object storage, and its own vector service behind a private endpoint.
+- **Why check.** It is the earliest signal that private DNS is off, which otherwise shows up only as
+  timeouts (no egress) or silent internet traffic (if egress exists).
 
 ```python
 import ipaddress, socket, sys
@@ -189,11 +188,10 @@ if failures:
     print("\n".join("FAIL " + f for f in failures)); sys.exit(1)
 ```
 
-- **Run it from inside the workload** (a pod, a task), not a laptop, because resolution depends on which
-  resolver the caller uses.
+- **Run it from inside the workload,** not a laptop, because resolution depends on the caller's resolver.
 - **Storage may use a gateway route** rather than a private IP; check the route table for those.
-- **Derive the list from the agent's config.** Generate `REQUIRED_PRIVATE` from the model client's
-  region and every tool's base URL, so adding a tool cannot skip the check.
+- **Derive the list from the agent's config** (model region, every tool's base URL) into
+  `REQUIRED_PRIVATE`, so adding a tool cannot skip the check.
 
 ### Agent tool adapter that reports which half broke
 When a tool call fails inside a private subnet, the agent should get a precise, non-retryable error
@@ -225,7 +223,8 @@ def call_tool(tool, host, do_request):
 ```
 
 ### The endpoint in Terraform, with the security group that usually gets forgotten
-One interface per zone, private DNS on, and an ingress rule for 443 from the workload subnets.
+One interface per zone, private DNS on, 443 admitted from the workload subnets (validated with
+Terraform 1.9.8, AWS provider 5.100).
 
 ```hcl
 resource "aws_vpc_endpoint" "bedrock_runtime" {
@@ -255,8 +254,6 @@ resource "aws_security_group" "endpoint" {
 | Timeouts, hostname resolves to 10.20.1.15 | private IP | endpoint security group blocks 443 | admit 443 from the workload subnet |
 | Works in cluster, fails from data centre | public IP on-prem only | no DNS forwarding from on-prem | forward the domain to the cloud resolver |
 
-The second row is the one teams misdiagnose as a provider outage, because DNS already looks correct.
-
 ### Worked scenario: one agent task, many private paths
 An illustrative support agent task in a no-NAT subnet; the counts show why one missing endpoint stalls
 the whole task.
@@ -268,8 +265,7 @@ the whole task.
 | Vector store (your SaaS) | 3 | your PrivateLink endpoint service | retrieval empty or timeout |
 | Token or identity service | 1 | interface endpoint | auth hangs while other calls succeed |
 
-With the adapter above, each missing path surfaces as one named, non-retryable error instead of 8 model
-retries burning the step budget.
+With the adapter above, each missing path is one named, non-retryable error, not 8 model retries.
 
 ## Production patterns
 - **Fail closed at the network layer.** Remove the NAT route from subnets that only need endpointed
@@ -288,9 +284,8 @@ retries burning the step budget.
 - **Manual acceptance for your SaaS endpoint service.** Set `acceptance_required = true` and an explicit
   principal allowlist on the Terraform `aws_vpc_endpoint_service`, so unknown accounts never attach.
   Review the connection list on a schedule.
-- **DNS check as a deploy gate.** Run the resolution script, generated from the agent's model and tool
-  config, as a pre-start job in each environment and block rollout on failure; alert if it ever flips
-  from private to public.
+- **DNS check as a deploy gate.** Run the resolution script as a pre-start job in each environment and
+  block rollout on failure; alert if it ever flips from private to public.
 
 ## Trade-offs
 - **Narrow path vs cost.** You gain a narrow, one-directional path to exactly one service, but pay
@@ -308,24 +303,27 @@ retries burning the step budget.
   need contractual and regional controls instead.
 
 ## Pitfalls
-- **Endpoint without private DNS.** Creating the endpoint but not enabling or linking the private DNS
-  zone. Symptom: the SDK times out in a no-egress subnet, or flow logs show traffic still leaving
-  through the NAT gateway.
-- **Forgetting hybrid callers.** On-prem and peered-VPC callers need DNS forwarding to the cloud
-  resolver. Symptom: "works from the cluster, fails from the data center", with the hostname resolving to
-  a public IP there.
-- **Default security group on the interface.** It does not admit 443 from the workload subnet. Symptom:
-  the hostname correctly resolves to a private IP but every connection times out, which teams misdiagnose
-  as a DNS or provider outage.
-- **Endpointing the API but not its dependencies.** Such as the identity provider, token service or a
-  separate file-upload host. Symptom: authentication or uploads hang while plain calls succeed.
-- **Letting the agent retry network faults.** A tool behind a broken endpoint returns a timeout, the
-  model retries the same call, and the task burns its step budget. Fix: classify network errors in the
+- **Endpoint without private DNS.** Symptom: the SDK times out in a no-egress subnet, or flow logs show
+  traffic still leaving through the NAT gateway. Cause: the private DNS zone is not enabled or not linked
+  to this VPC. Diagnose: resolve the hostname from inside the pod; a public IP confirms it. Fix: enable
+  private DNS and link the zone.
+- **Forgetting hybrid callers.** Symptom: "works from the cluster, fails from the data center", with the
+  hostname resolving to a public IP there. Cause: on-prem and peered-VPC callers need DNS forwarding to
+  the cloud resolver. Diagnose: run the DNS check from an on-prem host. Fix: a conditional forward.
+- **Default security group on the interface.** Symptom: the hostname resolves to a private IP but every
+  connection times out, which teams misdiagnose as a DNS or provider outage. Cause: it does not admit 443
+  from the workload subnet. Diagnose: a TCP connect to that IP on 443 from the pod, as `diagnose` does.
+  Fix: admit 443 from the workload subnets.
+- **Endpointing the API but not its dependencies.** Symptom: authentication or uploads hang while plain
+  calls succeed. Cause: the identity provider, token service or a separate file-upload host has no
+  private path. Diagnose: list every hostname in one task's trace and check each.
+- **Letting the agent retry network faults.** Symptom: the task burns its step budget re-trying one
+  tool. Diagnose: count identical consecutive tool calls per trace. Fix: classify network errors in the
   adapter and return them as non-retryable.
-- **Single-zone interface.** Symptom: a full outage of model calls during a zone incident and unexpected
-  cross-zone data charges in normal operation.
-- **Auto-accept for any principal on your SaaS endpoint service.** Symptom: unknown accounts appear in
-  the connection list, which an audit will flag immediately.
+- **Single-zone interface or auto-accept for any principal.** Symptom: a full outage of model calls
+  during a zone incident plus unexpected cross-zone data charges in normal operation; or unknown
+  accounts in your endpoint service's connection list, which an audit will flag immediately. Diagnose:
+  count endpoint subnets per zone and review connections. Fix: one interface per zone, manual acceptance.
 
 ## When to use
 - **Use when** a customer's workload in a cloud network must call a managed service and policy says "no
@@ -335,8 +333,18 @@ retries burning the step budget.
 - **Prefer it over VPN or peering** when the flow is one-directional to a single service.
 - **Do not use it** as a substitute for authorization, encryption or data-processing terms.
 - **Measure:** flow logs (zero bytes to the service via NAT) and the service rejecting non-endpoint traffic.
-- **Interviews:** explaining the DNS override and the one-way property is what separates real experience
-  from slideware.
+- **Interviews:** explain the DNS override and the one-way property; that separates experience from slideware.
+
+## Exercise
+**Goal:** turn the Terraform example into a reusable endpoint module whose guarantees are tested without
+an AWS account. No solution is given.
+- **Inputs:** a list of interface services, a list of workload subnets (one per zone) and one S3 bucket.
+- **Deliver:** a module that creates one interface endpoint per service with private DNS on, a shared
+  security group admitting 443 only from the workload subnets, an S3 gateway endpoint, and a bucket
+  policy denying requests whose `aws:SourceVpce` is not that endpoint.
+- **Acceptance:** `terraform validate` passes; a `terraform test` file using `mock_provider "aws"`
+  (Terraform 1.7 or later) asserts every endpoint has `private_dns_enabled = true` and spans every
+  subnet, and the bucket policy names the gateway endpoint.
 
 ## Role lens
 - **Engineer:** Writes the endpoint, security group and private DNS resources in Terraform, and adds a
@@ -379,14 +387,12 @@ check to deployment so a regression is caught before traffic flows.
   endpoint or gateway route.
 - **Run the resolution check from the agent pod:** a public answer means private DNS is missing; a private
   answer with timeouts points at the endpoint security group.
-- **Stop the retry spiral:** make the tool and model adapters return a named network error, so traces show
-  the real cause instead of repeated timeouts.
+- **Stop the retry spiral:** adapters return a named network error, so traces show the real cause.
 
 ### When would you choose a VPN or peering instead of private endpoints?
 - **Many services or both directions:** endpoints carry traffic only to one published service, so broad
   or bidirectional flows are simpler over peering or a transit network.
-- **Non-cloud sources needing routes into the VPC:** a VPN joins networks, which endpoints deliberately
-  do not.
+- **Non-cloud sources needing routes into the VPC:** a VPN joins networks; endpoints deliberately do not.
 - **Cost:** endpoints bill per endpoint, per zone and per GB, so dozens of services across many VPCs
   favour a shared hub or a different topology.
 
@@ -431,24 +437,36 @@ check to deployment so a regression is caught before traffic flows.
 > The endpoint adds a private path but does not remove the public one. Only a resource-side restriction,
 > such as disabling public access or a policy requiring this endpoint, makes the key useless from outside.
 
+## Mastery test
+**Problem:** an agent in a customer's Azure Kubernetes cluster calls Azure OpenAI through a private
+endpoint. Security then disables public network access. Next morning the cluster works, but the nightly
+agent eval job on hosted CI runners fails, and analysts on-prem get timeouts from a desktop tool. Explain
+both failures and fix them without re-enabling public access.
+
+**A strong answer:**
+- sees the CI failure as the intended effect: hosted runners now arrive on the public path, so the evals
+  move to a self-hosted runner inside the network or reach it over VPN;
+- traces on-prem to DNS: the private zone answers only inside, so on-prem resolvers need a conditional
+  forward to an inbound resolver (Azure DNS Private Resolver);
+- verifies with a lookup from each caller, and proves a valid key from outside is now denied.
+
 ## Use cases & projects
 ### Use cases
 - **Agents in a bank's no-egress subnet.** The agent reaches Bedrock, Azure OpenAI or Vertex AI and object
-  storage only through private endpoints, so security approves it without a NAT gateway.
+  storage only through private endpoints, with no NAT gateway.
 - **Selling an agent platform to enterprises.** Your agent API or hosted tool server is published as an
-  endpoint service, so customers consume it without a VPN and without public exposure.
-- **Shrinking the blast radius of prompt injection.** With NAT removed, an agent tricked into fetching an
-  attacker's URL has no route to it.
-- **Hybrid agents.** On-prem workers calling a cloud model API stay private through DNS forwarding to the
-  cloud resolver.
+  endpoint service, consumed without a VPN or public exposure.
+- **Shrinking the blast radius of prompt injection.** With NAT removed, an injected attacker URL has no
+  route.
+- **Hybrid agents.** On-prem workers reach a cloud model API privately via DNS forwarding.
 
 ### Mini project
 **Prove an agent's dependencies are private (1-2 hours).**
 - **Goal:** turn an agent's model and tool configuration into a deploy gate that fails on any public or
   unreachable dependency.
-- **Steps:** write a small agent config listing the model client hostname and three tool base URLs;
-  generate the `REQUIRED_PRIVATE` list from it; run the resolution check and the `diagnose` adapter from a
-  container; wrap one tool in `call_tool` inside a minimal agent loop; then point a hosts-file entry at a
-  public IP and, separately, at an unreachable private IP, and record what each reports.
+- **Steps:** write an agent config with the model hostname and three tool base URLs; generate
+  `REQUIRED_PRIVATE` from it; run the check and the `diagnose` adapter from a container; wrap one tool in
+  `call_tool` in a minimal agent loop; point a hosts-file entry at a public IP, then at an unreachable
+  private IP.
 - **Done when:** the gate exits non-zero for both broken cases with the right named cause, passes for the
-  clean config, and the agent loop logs a single non-retryable error instead of repeated timeouts.
+  clean config, and the loop logs one non-retryable error instead of repeated timeouts.

@@ -6,7 +6,14 @@ kind: concept
 difficulty: advanced
 est_minutes: 18
 agent_relevance: useful
-status: agentic-verified
+status: mastery
+mastery: implement
+code_tested: partial
+prerequisites:
+  - training-adaptation/supervised-fine-tuning
+  - training-adaptation/peft
+  - slm-for-agents/tool-calling-and-structured-output-with-slms
+  - slm-for-agents/evaluating-slms-on-your-agent-tasks
 related:
   - training-adaptation/peft
   - training-adaptation/quantization
@@ -36,8 +43,8 @@ call a tool) can make a 1-8B model reliable at that narrow job. The data, not th
   for 4-bit QLoRA, and hosted fine-tuning services; the adapter is then served by vLLM, Ollama or llama.cpp.
 - **What you control.** The task boundary, the training data (format, coverage, negatives), the chat
   template, LoRA rank and target modules, learning rate and epochs, and the eval gate before release.
-- **What you can skip.** The low-rank math and optimizer internals; see training-adaptation/peft for those.
-  Know what rank, alpha and 4-bit loading cost you, and how to read a loss curve.
+- **What you can skip.** The low-rank math and optimizer internals (see training-adaptation/peft). Know what
+  rank, alpha and 4-bit loading cost, and how to read a loss curve.
 
 ## Why it exists
 - **SLMs are fluent but sloppy at agent formats.** Out of the box a 3B model may pick the wrong tool, invent
@@ -50,8 +57,6 @@ call a tool) can make a 1-8B model reliable at that narrow job. The data, not th
 - **LoRA and QLoRA make it a one-GPU job.** LoRA trains small adapter matrices (roughly 0.1-1% of
   parameters, depending on rank and target modules); QLoRA also loads the frozen base in 4-bit, so a 7-8B model typically fits on one 24 GB card
   (rough order of magnitude; check with your sequence length).
-- **What this buys.** A narrow agent step served by a cheap local model with lower latency and cost, and
-  your data stays in-house.
 
 ## How it works
 ### 1. Pick a narrow, measurable task
@@ -123,7 +128,9 @@ A minimal TRL plus PEFT run. `train.jsonl` holds one `{"messages": [...]}` conve
 with your real system prompt and tool schemas.
 
 ```python
-# pip install trl peft transformers datasets bitsandbytes accelerate  (versions move fast; check docs)
+# pip install trl peft transformers datasets bitsandbytes accelerate
+# API checked against trl 1.16.0, peft 0.21.2, transformers 5.20.2 (CPU smoke run without 4-bit);
+# 4-bit loading needs a CUDA GPU for bitsandbytes. Versions move fast; check the docs for yours.
 import torch
 from datasets import load_dataset
 from peft import LoraConfig
@@ -150,12 +157,11 @@ trainer.train()
 trainer.save_model("out/router-lora")   # saves the adapter only (a few MB to tens of MB)
 ```
 
-Drop `quantization_config` for plain LoRA in bf16 when memory allows; it trains faster and avoids the
-small 4-bit quality cost.
+Drop `quantization_config` for plain bf16 LoRA when memory allows (see Trade-offs).
 
 ### Worked scenario: a ticket-triage agent step
 A support agent's first step picks one of 6 tools (or none) and fills arguments. A large hosted model does
-it well but costs too much at high volume. Illustrative figures from a typical project shape:
+it well but costs too much at high volume. Illustrative figures:
 
 | Run | Data | Tool + args exact match | Schema-valid |
 |---|---|---|---|
@@ -173,38 +179,40 @@ it well but costs too much at high volume. Illustrative figures from a typical p
   and LoRA config with each adapter, because a base-model update silently invalidates the adapter. Store
   them in your model registry and refuse to deploy mismatched pairs.
 - **Gate releases on the agent eval, not loss.** Run the held-out set plus a regression suite of past
-  failures through the real agent loop and block the release if tool accuracy or task success drops versus
-  the current model. Monitor the same metrics online per adapter version.
+  failures through the real agent loop; block the release if tool accuracy or task success drops versus
+  the current model, and monitor both online per adapter version.
 - **Serve many adapters on one base.** With vLLM, start the server with LoRA enabled (`--enable-lora`) and
   register adapters per task or tenant, so one GPU hosts several fine-tuned agent steps. Check the current
   vLLM docs for adapter limits and flags.
 - **Refresh from production traces on a schedule.** Sample failed or escalated calls, have humans or a
-  large model label the correct action, add them to training data and retrain, because tool sets and user
-  phrasing drift.
+  large model label the correct action, and retrain, because tool sets and user phrasing drift.
 - **Keep a fallback path.** Route schema-invalid or low-confidence outputs to a stronger model, so a
-  fine-tuning regression degrades cost rather than correctness. Monitor the fallback rate as an early alarm.
+  regression costs money rather than correctness. Monitor the fallback rate as an early alarm.
 
 ## Trade-offs
 - **LoRA vs full fine-tuning.** LoRA trains a tiny fraction of weights on one GPU and ships as a small
-  file; full fine-tuning can reach slightly higher quality on large datasets but costs far more memory and
-  produces a whole new model to host.
+  file; full fine-tuning can edge ahead on large datasets but needs far more memory and a whole new model
+  to host.
 - **QLoRA vs LoRA in bf16.** QLoRA fits bigger bases on smaller GPUs; it trains slower and adds a small
   quantization error. With enough memory, bf16 LoRA is simpler.
-- **Narrow specialist vs general SLM.** Fine-tuning boosts the target step but can degrade unrelated
-  abilities (catastrophic forgetting); keep each adapter to one job and route other work elsewhere.
+- **Narrow specialist vs general SLM.** Fine-tuning boosts the target step but can degrade other abilities
+  (catastrophic forgetting); keep each adapter to one job.
 - **Fine-tuning vs better prompting or retrieval.** Fine-tuning fixes format and behaviour; it is the wrong
   tool for fresh facts, which flips the decision toward RAG.
 
 ## Pitfalls
-- **Chat template mismatch.** Symptom: great eval in the notebook, garbled tool calls when served. Fix:
-  train with the tokenizer's template and confirm the serving engine uses the same one and the same
-  tool-call parser.
-- **Training on tool results and user turns.** Symptom: the model starts writing fake tool outputs. Fix:
-  mask non-assistant tokens from the loss and test that the model stops after emitting a tool call.
-- **No "no tool" or ambiguous cases.** Symptom: the model calls a tool on every request. Fix: include
-  negatives and clarification examples in proportion to real traffic.
-- **Test leakage.** Symptom: offline accuracy far above online accuracy. Fix: split by user or session
-  before generating synthetic variants, so paraphrases of a test case never reach training.
+- **Chat template mismatch.** Symptom: great eval in the notebook, garbled tool calls when served. Diagnose:
+  render one production request with the training template and diff it against the prompt the engine
+  logs; note its tool-call parser. Fix: train and serve with the same template and parser.
+- **Training on tool results and user turns.** Symptom: the model writes fake tool outputs after a call.
+  Diagnose: print the labels or assistant mask for one example; only assistant tokens should count. Fix:
+  mask non-assistant tokens from the loss and test that the model stops after a tool call.
+- **No "no tool" or ambiguous cases.** Symptom: a tool call on every request, because every example ends in
+  one. Diagnose: compare label counts per tool and "none" with a production sample. Fix: add negatives and
+  clarifications in proportion to real traffic.
+- **Test leakage.** Symptom: offline accuracy far above online. Diagnose: look for session ids shared across
+  splits and near-duplicate train/test pairs. Fix: split by user or session before generating synthetic
+  variants.
 
 ## When to use
 - **Use when** one agent step is narrow, high-volume and measurable, a prompted SLM is close but not
@@ -213,7 +221,16 @@ it well but costs too much at high volume. Illustrative figures from a typical p
   knowledge; prompt a larger model or add retrieval instead.
 - **Measure** tool and argument accuracy, schema validity, task success in the full loop, latency and
   fallback rate, before and after.
-- **Interviews:** explain data design (negatives, held-out split, template) before trainer settings.
+
+## Exercise
+**Goal:** show, with an ablation, which data ingredient makes a fine-tuned router reliable. No solution is
+given.
+- **Inputs:** a 0.5-1.5B instruct model, 4 tool schemas, 600+ chat examples with "no tool" and
+  missing-argument cases, split by seed request (100+ held out).
+- **Deliver:** two identically configured LoRA adapters, with and without the negatives, and a table of
+  exact match, schema validity and "no tool" accuracy for them and the prompted baseline.
+- **Acceptance:** a script proves zero seed overlap between splits; the full-data adapter beats the
+  baseline; one request served through your engine parses as a tool call.
 
 ## Role lens
 - **Engineer:** Builds the dataset from traces, runs LoRA or QLoRA with TRL and PEFT, and proves the
@@ -246,8 +263,8 @@ negatives, and gating on an eval set sampled from real traffic.
 ### When would you choose QLoRA over LoRA, and what does it cost?
 - **Choose QLoRA when memory is the constraint:** the frozen base loads in 4-bit, so a 7-8B model fits on a
   single consumer or 24 GB GPU.
-- **The cost** is slower training steps and a small quality loss from quantization; with enough memory,
-  bf16 LoRA is simpler and slightly better, so measure both on the agent eval.
+- **The cost** is slower steps and a small quantization loss; with enough memory bf16 LoRA is simpler and
+  slightly better, so measure both on the agent eval.
 
 ### Your fine-tuned model emits perfect tool calls in tests but the agent loop breaks when served. What do you check?
 - **Chat template and parser:** the engine may use a different template or tool-call parser than training,
@@ -261,12 +278,6 @@ negatives, and gating on an eval set sampled from real traffic.
   and hallucination-prone.
 - **When the task is broad or shifts often:** open-ended planning or weekly-changing tools make the data
   stale, so a prompted larger model or a cascade is cheaper to maintain.
-
-### How do you operate many fine-tuned agent steps in production?
-- **Serve adapters on a shared base** (for example vLLM with LoRA enabled), version each adapter with its
-  base and dataset, and route requests to adapters by task.
-- **Monitor per adapter** tool accuracy, schema validity and fallback rate, and retrain from labelled
-  failures on a schedule.
 
 ## Quiz
 ### Q: What does QLoRA change compared with plain LoRA?
@@ -292,6 +303,18 @@ negatives, and gating on an eval set sampled from real traffic.
 - [ ] It reduces the number of trainable parameters
 > The model learns the exact token layout it sees in training. If serving uses a different template or
 > parser, outputs that looked right offline fail to parse as tool calls in the agent loop.
+
+## Mastery test
+**Problem:** a 3B triage adapter has run for months at 4% fallback. In one week the base model is bumped to
+a new revision and a `cancel_order` tool is added. Fallback hits 15% and cancellations go to
+`refund_order`. Diagnose and fix.
+
+**A strong answer:**
+- separates two causes: an adapter trained on the old base, and a tool absent from training, so the model
+  picks the nearest one it knows;
+- confirms each from fallback reasons by tool and base revision, and the cancel/refund confusion;
+- pins or retrains the base, adds cancel traces with contrasting refunds, re-runs the gate;
+- routes cancels to the large model meanwhile and blocks mismatched base/adapter deploys.
 
 ## Use cases & projects
 ### Use cases

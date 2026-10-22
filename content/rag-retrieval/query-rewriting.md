@@ -5,8 +5,14 @@ name: Query rewriting
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - rag-retrieval/hybrid-search
+  - agents/tool-calling
+  - evals/retrieval-evaluation
 related:
   - rag-retrieval/query-decomposition
   - rag-retrieval/hyde
@@ -288,23 +294,27 @@ def run_search_docs(tool_input, user_message, k=8):
   inside the tool is more controllable and testable, at one more model call per search.
 
 ## Pitfalls
-- **The rewriter invents specifics.** "the API" becomes a named third-party API; the symptom is fluent
-  answers about the wrong product that cite real documents.
-- **Normalisation rewrites exact identifiers.** The symptom is the BM25 leg no longer matching the one
-  document containing the error code, right after rewriting shipped.
-- **Retrieving only for the rewrite.** The symptom is a regression on simple queries that worked before
-  the rewriter shipped.
-- **Fusing a non-standalone original at full weight.** The symptom is follow-up answers whose context is
-  half generic passages matching only the fragment ("Android", "pricing").
-- **Rewriting every turn, including "thanks".** The symptom is wasted calls and odd snippets injected
-  into small talk.
-- **Judging rewrites that "look better".** Measure recall@k before and after on a golden set instead;
-  the symptom is a launch with no metric that moved.
-- **Letting user text steer the rewriter.** The symptom is rewrites containing instructions or filters the
-  user should not be able to set, a prompt-injection path into the retrieval layer.
-- **Stacking a pipeline rewriter in front of an agent's tool.** The agent already condensed the query, so
-  the symptom is two rewrites in series, extra latency and compounding drift. Rewrite once: either the
-  agent or the tool, not both for the same form.
+- **The rewriter invents specifics.** Symptom: "the API" becomes a named third-party API, and fluent
+  answers about the wrong product cite real documents. Diagnose: flag rewrites containing entities absent
+  from the history. Fix: forbid new entities in the prompt and keep the original in the fusion.
+- **Normalisation rewrites exact identifiers.** Symptom: right after rewriting shipped, the BM25 leg stops
+  matching the one document with the error code. Diagnose: diff literals between original and rewrite in
+  the logged pairs. Fix: the literal guard.
+- **Retrieving only for the rewrite.** Symptom: simple queries that worked before the rewriter regress.
+  Diagnose: recall@k on single-turn golden questions with and without the original. Fix: fuse both.
+- **Fusing a non-standalone original at full weight.** Symptom: follow-up contexts are half generic
+  passages matching only the fragment ("Android", "pricing"). Diagnose: count fused top-k ids that came
+  only from the original's list. Fix: down-weight it.
+- **Rewriting every turn, including "thanks".** Symptom: wasted calls and odd snippets in small talk. Fix:
+  honour `needs_retrieval`.
+- **Judging rewrites that "look better".** Symptom: a launch with no metric that moved. Fix: recall@k
+  before and after on a golden set.
+- **Letting user text steer the rewriter.** Symptom: rewrites containing instructions or filters the user
+  should not set, a prompt-injection path into retrieval. Diagnose: sample rewrites whose filters are absent
+  from the conversation. Fix: validate output and allow-list filters.
+- **Stacking a pipeline rewriter in front of an agent's tool.** Symptom: two rewrites in series, extra
+  latency and compounding drift. Diagnose: count model calls per search span in traces. Fix: rewrite once,
+  agent or tool, not both for the same form.
 
 ## When to use
 - **Use condensing** the moment the interface is conversational; without it, follow-up questions retrieve
@@ -316,8 +326,16 @@ def run_search_docs(tool_input, user_message, k=8):
   budget has no room for a sequential call.
 - **Measure:** recall@k with and without the rewriter on a golden set, the p95 latency it adds, and the
   fraction of queries where the rewrite differs from the input.
-- **Interviews:** "how do you handle follow-up questions in a RAG chatbot" and "what if users use
-  different terminology than the docs" are both query-rewriting questions.
+
+## Exercise
+**Goal:** add a guarded rewrite to an agent's search tool and prove it helps follow-ups without hurting
+single turns. No solution is given.
+- **Inputs:** a small docs corpus, 30 golden conversations (15 follow-ups, 10 single turns, 5 containing
+  error codes or versions) with labelled chunks, any retriever and any small LLM.
+- **Deliver:** recall@5 for no rewrite, rewrite only, and rewrite fused with the weighted original; the
+  guard's fallback count; the logged (original, rewrite, ids) pairs.
+- **Acceptance:** follow-up recall@5 rises; single-turn recall@5 drops by no more than one question; no
+  literal from the 5 identifier cases is missing from the final searched queries.
 
 ## Role lens
 - **Engineer:** Writes and versions the rewriter prompt, guards identifiers, fuses results with RRF, and
@@ -364,14 +382,6 @@ and after.
 - **No failure evidence:** each form fixes a specific mismatch, so without failure analysis you are paying
   for drift risk without a measured benefit.
 
-### Why down-weight the original query in RRF for a non-standalone follow-up?
-- **Plain RRF splits the context:** two disjoint 20-item lists fused at equal weight give the fragment's
-  generic hits about half of a top-8.
-- **At weight 0.3** the original's best item scores about 0.0049, below the rewrite's 8th item at about
-  0.0147, so it only contributes where the rewrite's list runs thin or agrees.
-- **Keep equal weight** when the turn is standalone, because then the original is a good query in its own
-  right.
-
 ### How do you keep the rewriter, or an agent's search arguments, from becoming a prompt-injection path?
 - **Treat user text as untrusted:** constrain the output (or the tool's input schema) to JSON and validate
   types and lengths in code before use.
@@ -412,6 +422,17 @@ and after.
 - [ ] The embedding model truncated the rewritten query
 > Normalisation that "fixes" codes, numbers or quoted strings destroys the exact-match signal BM25 depends
 > on; the rewriter prompt must protect literals and the eval should include identifier-heavy queries.
+
+## Mastery test
+**Problem:** an internal IT agent searches a ticket archive. Users paste logs, write in mixed languages,
+and say "same as last week". Recall on follow-ups is fine, but tickets with IDs like `INC-20931` are
+missed and one user's rewrite set a `team` filter to another team. Redesign the rewrite path.
+
+**A strong answer:**
+- extracts IDs and error codes as literals for the sparse leg, guarded so they survive verbatim;
+- resolves "last week" from session context into a date filter, not from the model's guess;
+- takes team or tenant scope from the session, allow-lists filters, and validates arguments in code;
+- measures recall@k on identifier and follow-up slices separately before and after.
 
 ## Use cases & projects
 ### Use cases

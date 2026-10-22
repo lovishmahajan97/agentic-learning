@@ -5,8 +5,12 @@ name: Inverted indexes
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: mastery
 agent_relevance: background
+mastery: implement
+code_tested: partial
+prerequisites:
+  - rag-retrieval/bm25-internals
 related:
   - rag-retrieval/bm25-internals
   - rag-retrieval/dense-vs-sparse-retrieval
@@ -304,12 +308,14 @@ PUT /products
 
 ## Pitfalls
 - **Partial re-index after an analyzer change.** Old segments hold tokens from the old rules. Symptom: a
-  query matches a document indexed last month but not its identical twin indexed today.
+  query matches a document indexed last month but not its identical twin indexed today. Diagnose: run both
+  through `_analyze` and compare stored terms. Fix: full re-index behind an alias.
 - **Expecting writes to be searchable immediately.** Symptom: flaky integration tests that pass only with
   a sleep, or an agent that creates duplicates because it cannot find what it just wrote, caused by the
-  refresh interval and segment flush.
+  refresh interval and segment flush. Diagnose: in traces, compare the write's timestamp with the
+  search's. Fix: `refresh=wait_for` or get by id.
 - **Ignoring deleted-document bloat.** Symptom: index size never shrinks and query latency slowly rises
-  until a forced merge.
+  until a forced merge. Diagnose: track the deleted-docs count in `_cat/indices` over weeks.
 - **Wildcard or leading-wildcard queries on large dictionaries.** Symptom: one query pins a CPU, because it
   expands to thousands of terms and thousands of posting-list reads. Agents given a raw query-string tool
   can emit these; constrain the tool's query syntax.
@@ -328,7 +334,16 @@ PUT /products
   analyzer changes.
 - **Measure:** index size, refresh latency, p99 query latency against posting-list length, and merge I/O.
 - **Day to day** it surfaces as analyzer configuration, mapping decisions and refresh settings.
-- **Interviews:** explain why posting lists are sorted and how a top-k query avoids reading entire lists.
+
+## Exercise
+**Goal:** extend the tiny index into a small engine that answers top-k BM25 queries and shows pruning
+and freshness. No solution is given.
+- **Inputs:** 10,000+ short documents (product titles, issue titles) and 20 queries pairing a rare term
+  with a common one.
+- **Deliver:** sorted posting lists; AND by two-cursor merge; top-10 OR with MaxScore; a write buffer that
+  becomes searchable only on `refresh()`; counters for postings read per query.
+- **Acceptance:** MaxScore top 10 equals an exhaustive scoring top 10 on every query; it reads far fewer
+  postings on rare-plus-common queries; a test shows a write invisible before `refresh()` and visible after.
 
 ## Role lens
 - **Engineer:** Defines field mappings and analyzers, keeps query-time analysis identical to index-time,
@@ -364,12 +379,6 @@ bounds still prune most of the common list for a top-10 result.
   agent's next step ran inside that window (`1s` by default in the snippet above).
 - **Fix:** index agent writes with `refresh=wait_for`, return the new id from the write tool, and read by
   id when the id is known; add an idempotency key so a retry cannot create a second record.
-
-### Integration tests that index a document and immediately search for it are flaky. Why, and what is the fix?
-- **Cause:** new documents become searchable only when a refresh flushes them into a segment, after the
-  refresh interval.
-- **Fix:** index test documents with `refresh=wait_for` or call `_refresh`, instead of adding sleeps that
-  pass on a fast laptop and fail on a busy CI runner.
 
 ### How does a top-10 query avoid reading a posting list of four million entries?
 - **Per-term upper bounds:** with BM25 each term's maximum contribution is known, so once the top-10 heap
@@ -417,6 +426,20 @@ bounds still prune most of the common list for a top-10 result.
 > The analyzer is applied at both index and query time, and lookups are exact-key matches on the stored
 > tokens. Documents indexed under the old rules hold old tokens, so the new query tokens do not find
 > them; a full re-index is required.
+
+## Mastery test
+**Problem:** a coding agent's memory is an Elasticsearch index of notes, updated about 50 times a minute.
+After a month, `search_notes` p99 has doubled at a flat document count; notes the agent rewrote sometimes
+come back in their old wording; and a new query tool lets the model send raw query strings.
+
+Explain each symptom and the fix.
+
+**A strong answer:**
+- traces the latency to deleted-docs bloat: updates are delete plus re-add and postings stay until merges;
+- checks whether the stale wording is a read inside the refresh window, and makes rewrites
+  `refresh=wait_for` or reads by id;
+- flags raw query strings as a leading-wildcard risk and constrains the tool's syntax;
+- monitors deleted docs, segment count and p99.
 
 ## Use cases & projects
 ### Use cases

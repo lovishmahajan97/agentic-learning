@@ -5,8 +5,14 @@ name: Long-context vs RAG
 kind: decision
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - model-internals/context-window
+  - prompting/prompt-caching
+  - rag-retrieval/lost-in-the-middle
 related:
   - model-internals/context-window
   - rag-retrieval/lost-in-the-middle
@@ -266,22 +272,25 @@ print(f"long, 50/day   : ${per_q:.3f} per question vs ${C * p * 0.10:.3f} at a p
 
 ## Pitfalls
 - **Trusting the advertised window as the usable window.** Symptom: a demo that works on the first and
-  last sections and quietly misses facts from the middle of the corpus.
+  last sections and quietly misses facts from the middle of the corpus. Diagnose: split eval accuracy by
+  the position of the answer in the prompt. Fix: cap context where accuracy drops.
 - **Stuffing a multi-tenant corpus into one prompt.** Symptom: a user gets an answer drawn from a document
-  they are not entitled to see.
+  they are not entitled to see. Fix: per-user filters in a retrieval tool.
 - **Comparing approaches on a handful of easy questions.** Both look perfect; the gap only shows on
   multi-fact, distractor-heavy or cross-document questions in a proper eval set.
 - **Forgetting latency.** Symptom: time-to-first-token of many seconds on every request, because the full
-  corpus is prefilled each time without a warm cache; in an agent that delay repeats on every step.
-- **Modelling cached long-context cost at a 100% hit rate.** Symptom: a bill several times the forecast
-  because traffic is bursty or low-volume and the cache keeps expiring between requests.
+  corpus is prefilled each time without a warm cache; in an agent it repeats every step. Diagnose: log
+  TTFT per step against input and cached tokens.
+- **Modelling cached long-context cost at a 100% hit rate.** Symptom: a bill several times the forecast.
+  Cause: bursty or low-volume traffic lets the cache expire between requests. Diagnose: cached-token share
+  from usage fields, plotted against the gap between requests. Fix: re-run the cost model at measured *h*.
 - **Answering corpus-wide aggregate questions with top-k retrieval.** Symptom: confident "trends" built
   from five retrieved examples that a count over the full corpus would contradict.
 - **Building heavy RAG infrastructure for a corpus of a few documents.** Symptom: weeks spent tuning
   chunking for a problem the model could have solved by reading everything.
 - **Sizing the preloaded corpus without the transcript.** Symptom: an agent that works for five steps,
-  then hits the context limit or triggers compaction mid-task. Fix: budget corpus plus the transcript of
-  your longest expected run, with headroom.
+  then hits the context limit or triggers compaction mid-task. Diagnose: log context tokens per step and
+  the step where compaction fires. Fix: budget corpus plus your longest run's transcript, with headroom.
 
 ## When to use
 - **Start with long-context when:** the corpus fits comfortably in the window with headroom, changes
@@ -295,8 +304,18 @@ print(f"long, 50/day   : ${per_q:.3f} per question vs ${C * p * 0.10:.3f} at a p
   run), p95 time-to-first-token, and the real logged cache hit rate rather than an assumed one.
 - **Neither, when:** questions are aggregates over a corpus that does not fit; plan a map-reduce or
   offline summarisation job instead.
-- **Interviews:** the expected answer is "it depends on these five variables, here is the arithmetic",
-  not a preference.
+
+## Exercise
+**Goal:** produce a measured preload-or-search recommendation for one agent workload, with the flip
+point stated in numbers. No solution is given.
+- **Inputs:** a real corpus you can share with a model (a manual or wiki export of 30k-150k tokens), 30
+  questions with known answers (a third needing two facts, some placed mid-corpus), and a provider API
+  with prompt caching.
+- **Deliver:** both variants behind one agent interface, a per-step log of input, cached and output
+  tokens and TTFT, and a cost model fed with the measured hit rate.
+- **Acceptance:** your model's predicted cost per run is within 20% of the billed usage fields; accuracy
+  is split by question type and answer position; you state the corpus size, edit rate or daily volume
+  at which your recommendation flips.
 
 ## Role lens
 - **Engineer:** Builds both variants behind one interface, measures accuracy, cost and latency on the same
@@ -335,13 +354,6 @@ revisit when one changes.
 - **Then constraints:** per-user permissions or frequent edits push to the tool; whole-manual reasoning or
   poor retrieval recall pushes to preloading.
 
-### Model the daily input cost of a 150,000-token manual answering 20,000 questions a day.
-- **No cache:** 150k × 20,000 is 3 billion tokens a day, $9,000 at an illustrative $3 per million.
-- **Cached prefix at 10% price:** about $900 a day plus cache writes, valid only if the hit rate stays near 1,
-  which one question every four seconds or so supports.
-- **RAG at 6,000 tokens per question:** 120M tokens a day, about $360 plus embedding and vector store costs.
-  The numbers are illustrative, so state them as such.
-
 ### When would you pick long-context even though RAG is cheaper per query?
 - **Whole-document reasoning:** listing every clause that conflicts with section 4 needs the whole contract,
   and chunking destroys cross-references.
@@ -357,13 +369,6 @@ revisit when one changes.
   50 questions a day the cost can be roughly 9× the perfect-hit figure.
 - **Look for prefix fragmentation:** per-tenant editions, per-permission prompts or a prefix that is not
   byte-identical (a timestamp near the top, reordered tool schemas) each break reuse.
-
-### What does the middle ground between the two look like?
-- **Retrieve documents, not chunks:** filter per user and rank at the document or section level, then put
-  whole documents into a large window, in agents via a search tool plus a read tool.
-- **Why it works:** it keeps retrieval's selectivity and permission filtering while giving the model full
-  sections, and it tolerates imprecise ranking because the window is generous.
-- **What to monitor:** input tokens per request and accuracy split by question type.
 
 ## Quiz
 ### Q: Why does prompt caching often fail to rescue the long-context approach in a multi-tenant SaaS product?
@@ -389,6 +394,20 @@ revisit when one changes.
 - [ ] Use whatever fits within the per-request rate limit
 > Effective context depends on the model and the task; recall varies with position and with distractors.
 > Only an eval on your data at increasing lengths tells you where quality starts to drop.
+
+## Mastery test
+**Problem:** a coding agent preloads a 60k-token repository summary and runs 30-step sessions. Each step
+adds about 2,000 tokens of tool output. Users report it "forgets the architecture" late in sessions and
+the bill doubled after a change that put the current git branch name at the top of the system prompt.
+Explain both and redesign.
+
+**A strong answer:**
+- computes the late-step context (about 60k + 30 × 2k = 120k) and links forgetting to the summary
+  drifting into the middle, plus compaction if the window is tight;
+- identifies the branch name as breaking the byte-identical prefix, so the cache misses across sessions
+  and branches, and moves volatile text after the stable prefix;
+- proposes keeping a short architecture core in the prefix and the rest behind a `search` or
+  `read_document` tool, checked by cached-token counts and accuracy split by step number.
 
 ## Use cases & projects
 ### Use cases

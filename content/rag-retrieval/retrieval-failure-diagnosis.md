@@ -5,8 +5,15 @@ name: Retrieval failure diagnosis
 kind: practice
 difficulty: advanced
 est_minutes: 16
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - evals/retrieval-evaluation
+  - observability/tracing
+  - rag-retrieval/hybrid-search
+  - rag-retrieval/reranking
 related:
   - evals/retrieval-evaluation
   - evals/error-analysis
@@ -128,10 +135,8 @@ When retrieval is a tool, stage 7 splits into decisions you can read straight fr
   (`gold in candidates@100`, `gold in context`), plus "search was called" for agent runs.
 
 ### What makes this cheap
-- **Log a trace per request:** query, rewritten queries, filters applied, candidate IDs with scores from
-  each retriever, post-rerank order, and final context IDs. In an agent, log this per tool call.
-- **With the trace, steps 5 to 9 are lookups** instead of re-runs.
-- **Without it, every diagnosis reproduces state** that may have changed since.
+- **A per-call trace (fields under Production patterns) makes steps 5 to 9 lookups** instead of re-runs.
+  Without it, every diagnosis reproduces state that may have changed since.
 
 ## Diagram
 Walk a labelled failure down the pipeline and stop at the first "no": that stage is its bucket, and the
@@ -296,17 +301,21 @@ Running attribution across, illustratively, 60 labelled failures of a RAG pipeli
 
 ## Pitfalls
 - **Changing the embedding model first** because it is the most visible component. Symptom: a costly
-  re-index that moves aggregate scores by noise while the same queries keep failing.
+  re-index that moves aggregate scores by noise while the same queries keep failing. Diagnose: compare
+  recall@100 with recall at final k first. Fix: attribute before choosing the component.
 - **Treating content gaps as retrieval bugs.** Symptom: tuning that "improves" recall by surfacing loosely
-  related chunks, which raises confident wrong answers instead of abstentions.
+  related chunks, raising confident wrong answers instead of abstentions. Diagnose: confirm a gold span
+  exists in the corpus before labelling a failure. Fix: abstain and route the gap to content owners.
 - **Diagnosing against today's index for a failure logged last week.** Documents changed in between, so the
   reproduction succeeds and the bug is closed as "cannot reproduce". Fix: logged traces with index version.
-- **Reading only the final context and blaming the model.** Without candidate lists you cannot tell "never
-  retrieved" from "retrieved and cut". Symptom: prompt rewrites that do not help.
+- **Reading only the final context and blaming the model.** Symptom: prompt rewrites that do not help.
+  Cause: without candidate lists you cannot tell "never retrieved" from "retrieved and cut". Diagnose:
+  check gold's rank in each retriever's candidates. Fix: log candidates per retriever.
 - **Fixing failures one by one without counting.** Symptom: whack-a-mole where each fix regresses another
-  query because nobody saw the distribution.
+  query because nobody saw the distribution. Fix: tally first-loss buckets before any change.
 - **Recording gold evidence as chunk IDs.** Symptom: measured recall collapses to near zero right after a
-  chunking change, because the labelled IDs no longer exist, while real answer quality is unchanged.
+  chunking change while real answer quality is unchanged. Diagnose: count gold labels whose IDs no longer
+  exist. Fix: span-based labels.
 - **Evaluating the retriever with your questions, not the agent's queries.** Symptom: offline recall looks
   fine while the agent keeps failing, because it searches with short paraphrases that drop identifiers.
   Fix: build retrieval evals from logged agent tool-call queries as well as user questions.
@@ -318,9 +327,19 @@ Running attribution across, illustratively, 60 labelled failures of a RAG pipeli
   agent-decision bucket or a pipeline bucket.
 - **Measure:** recall@k at candidate depth, recall at final k, and "gold in context" separately, so each
   stage has its own number.
-- **Interviews:** "your RAG bot is wrong 20% of the time, what do you do?" The strong answer is a staged
-  trace with counted buckets, not a list of techniques to try.
 - **Prerequisite:** if you lack gold labels and traces, the first deliverable is building those, not tuning.
+
+## Exercise
+**Goal:** attribute 20 real failures of a small RAG agent to their first-loss stage and prove one fix
+moved its own bucket. No solution is given.
+- **Inputs:** a corpus of at least 50 documents including one scanned or table-heavy PDF, a `search`
+  tool with dense and BM25 legs, and 20 questions the agent gets wrong (seed some: a code the embedding
+  blurs, an ACL-filtered document, a question with no answer in the corpus).
+- **Deliver:** a trace logger per tool call, span-based gold labels, an attribution script that prints
+  one first-loss stage per failure, the bucket table, and one targeted fix.
+- **Acceptance:** every failure has exactly one stage, checked by hand on 5; re-running after the fix
+  shrinks its bucket while other buckets do not grow by more than one; re-chunking the corpus leaves
+  the gold labels resolvable.
 
 ## Role lens
 - **Engineer:** Instruments the pipeline to log candidate IDs, scores, filters and final context per request,
@@ -376,14 +395,6 @@ would not move with any retrieval change.
 - **When the agent never searched:** a tool-selection failure is fixed in the tool description or a
   search-first rule; no ranking change reaches it.
 
-### Measured recall dropped to near zero right after a chunking change, but users report no difference. What happened?
-- **Gold was labelled as chunk IDs**, which are an artifact of the current chunker and no longer exist after
-  re-chunking.
-- **Fix the labels:** store gold as `doc_id` plus answer-span text and resolve it to current chunks at eval
-  time by substring match.
-- **Monitor** spans that resolve to no chunk at all, because those are genuine parsing or chunking losses
-  rather than label drift.
-
 ### What would you put on a retrieval quality dashboard for a production agent, and what numbers would make you act?
 - **Three separate stage numbers:** recall@100, recall at final k, and gold-in-context rate, never one
   blended score.
@@ -420,6 +431,19 @@ would not move with any retrieval change.
 - [ ] The reranker randomly drops candidates; add a seed
 > Documents are synced and re-chunked continuously, so reproducing later tests a different system. Logging
 > what was actually retrieved, with the index version, makes diagnosis a lookup on the real state.
+
+## Mastery test
+**Problem:** after moving from a fixed pipeline to an agent with three search tools (docs, tickets,
+code), accuracy on knowledge questions drops from 81% to 70%. Offline recall@100 on user questions is
+unchanged at 90%. Searches per run fell from 1.0 to 0.6. Where do you look, and in what order?
+
+**A strong answer:**
+- reads the unchanged recall and the fall in searches as a sign the loss is in agent decisions, not the
+  index, and checks tool selection first (runs that answered without searching);
+- then checks tool routing across the three overlapping tools and replays the raw question against the
+  agent's query arguments;
+- counts first-loss buckets on labelled failures before fixing, and proposes tool-description changes or
+  a search-first rule, guarded by per-stage tests including "expected search tool was called".
 
 ## Use cases & projects
 ### Use cases

@@ -5,8 +5,14 @@ name: Planning
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - agents/agent-loop
+  - prompting/react
+  - prompting/structured-outputs-json-mode
 related:
   - agents/agent-loop
   - agents/task-decomposition
@@ -178,6 +184,31 @@ def agent(goal):
     return {"status": "gave_up", "plan": plan, "history": history}
 ```
 
+Run it offline by appending these scripted stubs, which replay the trace below (tested on Python 3.9 and 3.12).
+
+```python
+calls = {"plan": 0, "run": 0}
+FIRST = ["bump dependency", "fix compile errors", "update call sites", "run tests"]
+REPLAN = ["add adapter", "migrate call sites", "run tests"]
+fails_left = {"update call sites": 2}
+
+def llm_json(prompt):
+    if prompt.startswith("Goal:"):                               # planner
+        calls["plan"] += 1
+        goals = FIRST if calls["plan"] == 1 else REPLAN
+        return {"steps": [{"id": g, "goal": g, "done_when": "ok", "depends_on": []} for g in goals]}
+    goal = prompt.split("\n")[0].removeprefix("Step goal: ")     # verifier
+    fails_left[goal] = fails_left.get(goal, 0) - 1
+    return {"done": fails_left[goal] < 0, "why": "no direct replacement"}
+
+def run_step(step, context):
+    calls["run"] += 1
+    return "ok"
+
+result = agent("upgrade the auth library and make the tests pass")
+print(result["status"], calls)   # complete {'plan': 2, 'run': 7}
+```
+
 The deliberate choices:
 - **`done_when` is written at planning time,** *because* that is when the intent is clearest.
 - **One retry before a replan,** *because* a single failure is often transient while two suggest the plan
@@ -287,15 +318,19 @@ Interleaved grows quadratically, so doubling to 20 steps more than triples its t
 
 ## Pitfalls
 - **Letting the plan scroll out of context.** Symptom: the agent repeats completed steps or declares
-  success after the most recent sub-goal rather than the whole task. Fix: re-inject plan state each turn.
-- **Steps without a completion criterion.** Symptom: an executor that "completes" every step and a final
-  result that satisfies none of the goal. Fix: require `done_when`.
-- **Replanning on every hiccup.** Symptom: a trace full of planner calls and few tool calls, with the plan
-  reshuffled each turn. Fix: explicit triggers and a replan cap.
-- **Over-planning simple tasks.** Symptom: five-step plans for one-tool questions and users who notice the
-  latency. Fix: route short tasks to a plain loop.
-- **Planning without knowing the tools.** Symptom: plans that call capabilities the agent does not have,
-  which only surfaces at execution time. Fix: give the planner the tool list and validate plans.
+  success after the latest sub-goal. Diagnose: count tool calls whose step is already `done`, and check
+  whether the prompt sent each turn contains the plan header. Fix: re-inject plan state each turn.
+- **Steps without a completion criterion.** Symptom: every step "completes" and the final result meets
+  none of the goal. Diagnose: list steps verified with an empty or vague `done_when`. Fix: require it.
+- **Replanning on every hiccup.** Symptom: many planner calls, few tool calls, a reshuffled plan.
+  Diagnose: plot planner spans per tool call and the trigger behind each replan. Fix: explicit triggers
+  and a replan cap.
+- **Over-planning simple tasks.** Symptom: five-step plans for one-tool questions and noticeable latency.
+  Diagnose: bucket tasks by tool calls actually used versus planned steps. Fix: route short tasks to a
+  plain loop.
+- **Planning without knowing the tools.** Symptom: plans call capabilities the agent lacks, surfacing only
+  at execution. Diagnose: count plan validation failures by missing tool. Fix: give the planner the tool
+  list and validate plans.
 
 ## When to use
 - **Use explicit planning when** tasks exceed roughly five tool calls, humans must approve the approach
@@ -304,10 +339,17 @@ Interleaved grows quadratically, so doubling to 20 steps more than triples its t
 - **Stay with interleaved ReAct when** tasks are short and the environment is unpredictable.
 - **Prefer a fixed workflow when** the steps are known in advance.
 - **Measure** task completion rate, steps per task against an ideal, replans per task and tokens per task.
-- **On the job:** this is the difference between an agent that migrates a codebase and one that fixes the
-  first error it sees.
-- **Interviews:** explain the four placements and the cost model, then show you would pick by failure mode
-  rather than by fashion.
+
+## Exercise
+**Goal:** show, with numbers, when an explicit plan beats a greedy loop on your own tasks.
+- **Inputs:** 10 multi-step tasks over 3-4 mock tools whose outputs you script, including two tasks where
+  an observation contradicts the obvious plan.
+- **Constraints:** same model and tools for both versions; plan steps carry `done_when`, at least half
+  checked by code; budgets of 20 steps and 3 replans.
+- **Deliver:** a table per version of success, steps, planner calls and input tokens, and one annotated
+  trace per replan.
+- **Acceptance:** rerunning reproduces the table; every replan names its trigger; no step marked done is
+  executed again; you can say on which tasks the greedy loop won and why.
 
 ## Role lens
 - **Engineer:** Writes the planner and verifier prompts, chooses the plan schema, re-injects plan state
@@ -351,12 +393,6 @@ batch. Better still, "matched" should be a deterministic check on stored records
 - **Fix:** retry once for transient failures, replan only on repeated failure, contradicted assumptions or
   budget signals, and cap replans per task (for example three).
 
-### When would you not add an explicit planner?
-- **Short tasks** of one or two tool calls, where a five-step plan adds latency users notice.
-- **Known steps,** where a fixed workflow in code is cheaper and deterministic.
-- **Highly unpredictable environments,** where an up-front plan written with the least information is
-  mostly wasted.
-
 ### How would you estimate the token cost of an interleaved loop versus plan-then-execute for 20 steps?
 - **Interleaved:** step *k* re-reads the stable prompt plus *k*−1 observations, so totals grow roughly
   with steps²; with 2,000 stable and 1,000 per observation, 20 steps is about 230,000 input tokens.
@@ -397,6 +433,19 @@ batch. Better still, "matched" should be a deterministic check on stored records
 - [ ] Every ten steps regardless of progress
 > Replanning is for when the plan's premises are wrong. Single transient errors deserve a retry, and
 > periodic replanning without a signal burns planner calls while shuffling work that was fine.
+
+## Mastery test
+**Problem:** a data-onboarding agent maps 30 CSV columns to a schema, then loads rows. Traces show 11
+planner calls per run, column 17 mapped three times, and runs marked complete with 4 columns unmapped.
+Each column needs one lookup tool call. Redesign the planning.
+
+**A strong answer:**
+- diagnoses over-eager replanning, plan state lost from context, and success judged by the model rather
+  than a check;
+- uses one step per column with a code-checked `done_when` (mapping stored and valid), plan state in
+  storage re-injected as a compact header, and independent columns run in parallel waves;
+- sets replan triggers and a cap, gates completion on all 30 checks, and estimates cost as roughly
+  linear in columns.
 
 ## Use cases & projects
 ### Use cases

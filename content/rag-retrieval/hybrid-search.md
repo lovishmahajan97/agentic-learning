@@ -5,8 +5,13 @@ name: Hybrid search (BM25 + dense)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: partial
+prerequisites:
+  - rag-retrieval/dense-vs-sparse-retrieval
+  - rag-retrieval/bm25-internals
 related:
   - rag-retrieval/dense-vs-sparse-retrieval
   - rag-retrieval/bm25-internals
@@ -315,12 +320,15 @@ A vague query. BM25's top three are a near-tie among weak matches; dense has a c
 
 ## Pitfalls
 - **Summing raw BM25 and cosine scores.** Symptom: results are simply the BM25 list, because its scores
-  are an order of magnitude larger. Fix: RRF or per-query normalization.
+  are an order of magnitude larger. Diagnose: print both arms' raw score ranges for a few queries. Fix:
+  RRF or per-query normalization.
 - **A metadata or ACL filter in one arm only.** Symptom: a user sees a document they should not, or a
   filtered query returns items from the unfiltered arm; in an agent the leaked chunk may be quoted
-  straight into an answer or passed to another tool.
+  straight into an answer or passed to another tool. Diagnose: log `found_by` and the tenant of every
+  returned chunk; a cross-tenant canary query fails.
 - **No shared commit or reconciliation between indexes.** Symptom: "I just deleted that document and it
-  still shows up" from one arm, hours after the other dropped it.
+  still shows up" from one arm, hours after the other dropped it. Diagnose: diff chunk ids per document
+  across the two indexes.
 - **Fused scores as relevance thresholds.** RRF values depend on list depth and the number of arms, so a
   cutoff tuned at depth 50 behaves differently at depth 100.
 - **Declaring victory on aggregate recall.** Symptom: a regression on a query class (say, exact SKU
@@ -334,8 +342,16 @@ A vague query. BM25's top three are a near-tie among weak matches; dense has a c
 - **Measure:** recall@k per arm and fused, sliced by query type, plus end-to-end answer quality or agent
   task success with and without the second arm.
 - **Start with RRF;** move to weighted fusion only with labeled data to tune it and a process to re-tune.
-- **Interviews:** explain why scores cannot be summed, how RRF rewards agreement, and where the reranker
-  sits.
+
+## Exercise
+**Goal:** build a hybrid search tool for a two-tenant corpus and prove both its gain and its safety. No
+solution is given.
+- **Inputs:** 2,000+ chunks split across two `tenant_id` values, a BM25 retriever and a vector store of
+  your choice, and 40 labeled queries tagged identifier or question.
+- **Deliver:** one async tool running both arms with one filter object, RRF fusion, `found_by` provenance
+  per chunk; recall@10 per arm and fused, per slice; the same with min–max weighted fusion at two α values.
+- **Acceptance:** fused recall@10 is at least the best single arm on each slice, or you explain the slice
+  where it is not; a cross-tenant canary test passes; arm depth versus recall shows where it goes flat.
 
 ## Role lens
 - **Engineer:** Implements both arms behind one retrieval interface, writes the RRF or normalized fusion
@@ -370,17 +386,6 @@ per query type, inspect queries that regressed, and check p95 latency, since the
 time.
 
 ## Interview questions
-### What is hybrid search and why does it usually beat either retriever alone?
-- **Definition:** run BM25 and a dense retriever on the same query and fuse their ranked lists.
-- **Why it helps:** their failures overlap only partly (BM25 misses paraphrase, dense misses identifiers
-  and jargon), so the union raises first-stage recall, which bounds everything the generator can answer.
-
-### How does reciprocal rank fusion work, and what does the constant k do?
-- **Formula:** each arm contributes 1 / (k + rank), summed across arms; k = 60 in the original paper.
-- **Effect:** agreement wins, since rank 10 in both arms (≈ 0.0286) beats rank 1 in one (1/61 ≈ 0.0164).
-- **k as a knob:** smaller k steepens the curve so top ranks count more; larger k flattens it toward
-  counting agreement.
-
 ### Design the retrieval tool for a multi-tenant support agent. What goes into it?
 - **One fused tool:** BM25 and dense arms run in parallel at depth 50 or so, fused with RRF, then a
   reranker picks the top k that enters the agent's context.
@@ -436,6 +441,18 @@ time.
 > Fusion merges whatever each arm returns; a filter missing from one arm lets forbidden documents into
 > the candidate pool, and a strong lexical match can carry one to the top. Filters and ACLs must be
 > enforced identically in both arms.
+
+## Mastery test
+**Problem:** a parts-catalog agent fuses BM25 and dense with RRF (k = 60). The team adds a third arm, a
+learned sparse index, and aggregate recall@10 rises 3 points, but exact part-number lookups regress: the
+right part, BM25's rank 1 and absent elsewhere, now often lands outside the top 10. Explain and fix.
+
+**A strong answer:**
+- computes a lone rank 1 at 1/61 ≈ 0.0164, while a near-miss part at rank 30 in two arms gets
+  2/90 ≈ 0.022, so agreement on look-alike codes outvotes the exact match;
+- fixes with a higher BM25 weight on identifier-style queries (2/61 ≈ 0.033), a smaller k, or an
+  exact-match short-circuit;
+- gates releases on the identifier slice, not aggregate recall, and checks the reranker sees the true part.
 
 ## Use cases & projects
 ### Use cases

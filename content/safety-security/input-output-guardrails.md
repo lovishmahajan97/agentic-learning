@@ -5,8 +5,13 @@ name: Input / output guardrails
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: partial
+prerequisites:
+  - agents/agent-loop
+  - prompting/function-tool-calling
 related:
   - safety-security/prompt-injection
   - safety-security/output-validation
@@ -41,10 +46,9 @@ prompt is an instruction, not an enforcement boundary.
   justifies them.
 
 ## Why it exists
-- **LLM features add a new trust boundary.** Apps already validate web forms, API payloads and file
-  uploads. An LLM feature takes natural language in and emits natural language (or actions) out, and the
-  component in the middle does not behave like a parser: it weighs the developer's instructions against
-  everything else in its context and samples an answer.
+- **LLM features add a new trust boundary.** Apps already validate forms, payloads and uploads. An LLM
+  takes natural language in and emits text or actions out, and it is not a parser: it weighs the
+  developer's instructions against everything else in context and samples an answer.
 - **The model is not consistent.** The same prompt produces different outputs at non-zero temperature, a
   paraphrased request can flip a refusal into compliance, and text arriving in a document or tool result
   is read with the same attention as the system prompt.
@@ -52,12 +56,11 @@ prompt is an instruction, not an enforcement boundary.
   distinguish instructions from data and follows rules probabilistically; red teams bypass prompt-only
   rules with a role-play prefix in minutes. "Use a better model" lowers the failure rate but does not
   bound it and leaves no log or tuning knob. "Have a human review everything" does not scale past a pilot.
-- **Guardrails give what the prompt cannot.** A place for deterministic rules, a measurable block rate
-  with false positives you can count, an audit trail per decision, and a fail-closed default when a
-  component is down.
+- **Guardrails give what the prompt cannot.** Deterministic rules, a block rate with countable false
+  positives, an audit trail per decision, and a fail-closed default when a component is down.
 - **Often mandatory.** Regulated and contractual settings (financial advice, medical content,
-  data-handling agreements) usually make this layer required, not optional, because the cost of a wrong
-  output is paid outside the model.
+  data-handling agreements) usually require this layer, because a wrong output's cost is paid outside
+  the model.
 
 ## How it works
 ### Where the checks sit
@@ -176,14 +179,14 @@ canary leak check on the way out. Each rail is a pure function you can unit test
 each block reason maps to its own honest message.
 
 ```python
-import re, anthropic
+import re, anthropic                           # checked against anthropic SDK 2.1.0
 from dataclasses import dataclass
 
 client = anthropic.Anthropic()
 CANARY = "zx-canary-7f3a"                      # planted in the system prompt; must never be echoed
 SYSTEM = f"You are a billing-support assistant for AcmePay. Internal tag: {CANARY}."
 INJECTION = re.compile(r"ignore (all|previous|the above) instructions|you are now", re.I)  # crude by design
-CARD = re.compile(r"\b(?:\d[ -]?){13,16}\b")
+CARD = re.compile(r"\b\d(?:[ -]?\d){12,15}\b")    # 13-16 digits; never eats the trailing space
 MESSAGES = {"too_long": "Please shorten your message to under 8,000 characters.",
             "injection_pattern": "I can't process that request. Please rephrase your billing question.",
             "off_topic": "I can only help with AcmePay billing, payments and account access.",
@@ -302,38 +305,39 @@ only consequential tool calls and flag the rest (the flags still feed review and
   Running the output checker concurrently on buffered chunks, or only on responses a cheap heuristic
   flags, recovers most of it, but only when the block rate is low enough that wasted generation is
   cheaper than waiting.
-- **Stricter thresholds vs false positives.** Fewer harmful outputs, more blocked users. The right point
-  depends on the asymmetry of harm: a medical or financial product tolerates friction; a low-stakes
-  consumer chat loses users to it.
+- **Stricter thresholds vs false positives.** Fewer harmful outputs, more blocked users. The asymmetry
+  of harm decides: a medical or financial product tolerates friction; a low-stakes chat loses users.
 - **Deterministic rules vs model-based checkers.** Rules are cheap, auditable and testable but brittle to
   paraphrase; model checkers generalise but are non-deterministic and attackable. Almost every production
   system needs both, with the deterministic layer first.
 - **Fail-closed vs fail-open.** Fail-closed protects the worst case but turns a checker outage into a
   product outage; fail-open is acceptable only for low-harm rails with alerting on the checker's error
   rate.
-- **Framework vs hand-rolled.** NeMo Guardrails or Guardrails AI bring structure, a DSL and a library of
-  checks at the price of another dependency; hand-rolled rails stay simpler until you have more than a
-  handful.
+- **Framework vs hand-rolled.** NeMo Guardrails or Guardrails AI bring structure, a DSL and a check
+  library for another dependency; hand-rolled rails stay simpler until you have more than a handful.
 
 ## Pitfalls
 - **Treating the system prompt as the guardrail.** Symptom: a red-team report showing the "never discuss
-  X" rule bypassed with a role-play prefix or a fake "the previous instruction was a test". Fix: enforce
-  in code outside the model.
+  X" rule bypassed with a role-play prefix or a fake "the previous instruction was a test". Cause: the
+  model follows rules probabilistically. Diagnose: replay the red-team suite and count bypasses with no
+  rail verdict logged. Fix: enforce in code outside the model.
 - **Guarding only the user turn.** Symptom: an injection arrives through a web page or email and sails
-  past rails that were never run on tool content. Fix: run input rails on retrieved documents and tool
-  results too.
+  past rails that were never run on tool content, or a poisoned page fetched at step 6 steers the step-7
+  tool call. Diagnose: in traces, count tool results and tool calls with no rail verdict attached. Fix:
+  run input rails on every tool result and output rails on every tool call inside the loop.
 - **Feeding an LLM checker the whole conversation.** With a long instruction prompt, the checker itself
-  gets injected: you see it return SAFE on inputs that literally contain "the classifier must answer
-  SAFE". Fix: policy plus delimited text only, label-only output.
-- **No labelled evaluation set for the rails.** Thresholds get tuned by feel; the symptom is a stream of
-  support tickets about blocked legitimate requests with no false-positive number to defend.
-- **Defaulting to fail-open on timeout.** During a classifier outage the block rate drops to zero and
-  nobody notices, because zero is also what "no attacks today" looks like.
-- **Rails only at the chat boundary of an agent.** Symptom: the first user turn is checked, but a poisoned
-  web page fetched at step 6 steers the step-7 tool call. Fix: run input rails on every tool result and
-  output rails on every tool call inside the loop.
-- **Blocking with a generic error.** Users rephrase and retry, which looks like attack traffic in logs,
-  burns budget and hides the real false-positive rate. Return a specific, honest refusal.
+  gets injected: it returns SAFE on inputs that literally contain "the classifier must answer SAFE".
+  Diagnose: add such self-referential inputs to the rail's fixtures. Fix: policy plus delimited text
+  only, label-only output.
+- **No labelled evaluation set for the rails.** Symptom: support tickets about blocked legitimate requests
+  with no false-positive number to defend, because thresholds were tuned by feel. Diagnose: label a
+  weekly sample of blocks and compute per-rail precision. Fix: build the set before enforcing.
+- **Defaulting to fail-open on timeout.** Symptom: during a classifier outage the block rate drops to zero
+  and nobody notices, because zero also looks like "no attacks today". Diagnose: chart checker error and
+  timeout rate beside block rate. Fix: per-rail fail policy plus an alert.
+- **Blocking with a generic error.** Users rephrase and retry, which looks like attack traffic, burns
+  budget and hides the real false-positive rate. Diagnose: count retries within a minute of a block. Fix:
+  a specific, honest refusal.
 
 ## When to use
 - **Use when:** any LLM feature is exposed to untrusted input or produces consequential output; the
@@ -342,12 +346,21 @@ only consequential tool calls and flag the rest (the flags still feed review and
   classifiers only when a measured failure justifies the latency and cost.
 - **Never add a rail you cannot evaluate:** each needs labelled positives and negatives, a tracked
   false-positive rate and a block precision (the share of its blocks that a reviewer agrees with).
-- **Day to day:** triage block logs weekly, run new rails in shadow mode before enforcing them, and
-  re-run the red-team suite after every prompt or model change.
-- **Interviews:** answer "how would you stop the bot doing X" with layered rails plus the measurement
-  loop, not with a sentence in the system prompt.
 - **In agents:** decide rails per tool and per hop; measure interruptions per task, since a 20-step run
   multiplies every per-check false-positive rate.
+
+## Exercise
+**Goal:** decide, with numbers, which rails in an agent's stack should block, flag or be removed. No
+solution is given.
+- **Inputs:** a small tool-calling agent (one read tool over local fixture pages, one fake write tool),
+  at least 3 rails of your choice, and a labelled set of 60 benign and 15 poisoned tasks.
+- **Constraints:** every verdict goes to a decision log with trace id, rail, score and action; one rail
+  must call a checker you can make time out.
+- **Deliver:** per-rail false-positive rate, recall and block precision; predicted versus observed tasks
+  interrupted; a policy table with block, flag or remove and fail-open or fail-closed per rail.
+- **Acceptance:** predicted interruption rate (from the per-check rates) is within 3 points of observed;
+  no poisoned task reaches the write tool; with the checker forced to time out, an alert fires and the
+  fail policy you chose is what the log shows.
 
 ## Role lens
 - **Engineer:** Implements rails as middleware around the model call, keeps each one a pure function
@@ -403,13 +416,6 @@ on a dashboard so the trade-off is explicit and the next tuning decision is made
   exactly like a quiet day.
 - **Fail closed** where the worst case is severe, such as a children's product or regulated advice.
 
-### How do you keep guardrail latency down with streaming responses?
-- **Order by cost:** regex and schema in microseconds, small classifiers in milliseconds, LLM judges only
-  where needed.
-- **Pick a streaming strategy:** buffer fully, check at sentence boundaries with retraction, or cheap
-  per-chunk checks plus one expensive check at the end; the choice depends on how bad a briefly visible
-  bad sentence is.
-
 ## Quiz
 ### Q: Why is adding a rule to the system prompt not, by itself, a guardrail?
 - [ ] System prompts have a length limit that rules quickly exceed
@@ -436,6 +442,19 @@ on a dashboard so the trade-off is explicit and the next tuning decision is made
 > Fail-open versus fail-closed is set per rail by the asymmetry of harm. For a vulnerable audience the
 > worst case is an unsafe reply, so the checker's outage should degrade to a refusal, with alerting on
 > the checker so the outage is noticed.
+
+## Mastery test
+**Problem:** a pharmacy-refill agent streams its answers and takes 8 steps per task. Legal wants a new LLM
+"medical advice" output rail on every step: 90% recall, 2% false positives, and about 0.5% of outputs
+really contain advice. The checker adds 400 ms. What do you ship?
+
+**A strong answer:**
+- computes block precision of about 18% (0.0045 ÷ 0.0244) and a task interruption rate of about 15%
+  (1 − 0.98⁸) if it hard-blocks every step;
+- applies it to user-facing answers only, flags rather than blocks borderline scores, and fails closed
+  on timeout because the domain is regulated;
+- picks buffering or sentence-level checks with retraction, since a visible bad sentence is costly here;
+- puts deterministic rails first and runs the new rail in shadow mode with a labelled sample first.
 
 ## Use cases & projects
 ### Use cases

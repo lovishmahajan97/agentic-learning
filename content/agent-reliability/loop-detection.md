@@ -5,8 +5,13 @@ name: Loop detection
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - agents/agent-loop
+  - agent-reliability/max-step-budgets
 related:
   - agent-reliability/stopping-conditions-termination
   - agent-reliability/max-step-budgets
@@ -24,8 +29,7 @@ allowance and making repetition visible is the cheapest fix.
 ## For agent builders
 - **Why it matters for agents.** Repeating the same failing tool call is the most common way a
   tool-calling loop gets stuck, and from inside the context the repeats look like ordinary history.
-  Catching it at step eight instead of the budget at step thirty saves most of the cost and gives the run
-  a chance to recover.
+  Catching it early saves most of the cost and gives the run a chance to recover.
 - **Where it shows up in your stack.** In your harness, between the model's response and tool dispatch;
   in the orchestrator of a multi-agent system for handoff ping-pong; and in offline jobs over traces of
   budget-exhausted runs.
@@ -46,8 +50,7 @@ allowance and making repetition visible is the cheapest fix.
   twenty-five increasingly expensive steps, yields an exhausted partial, and teaches you nothing about
   *why*. Detecting it at step eight saves most of the cost and creates a chance to recover.
 - **Telling the model works.** "You have run this exact command three times with the same output" often
-  makes it change strategy. What is obvious to a human watching the trace is not obvious from inside the
-  context, because repeated blocks look like ordinary history.
+  makes it change strategy, because what a human sees in the trace is invisible from inside the context.
 - **"Abort if the same tool is called twice" fails both ways.** It kills legitimate repeats (polling a
   job status, reading two files with the same tool, re-running tests after each edit) and misses loops
   where arguments differ trivially (whitespace, a reworded query) or the cycle spans several steps.
@@ -135,10 +138,9 @@ flowchart TD
 
 ## Examples
 ### A result-aware loop guard
-- **Escalates on *stale* repeats:** calls with identical canonical (tool, args) whose result matched an
-  earlier result for the same call.
-- **Changing results never escalate by count** (re-running tests after each edit); the cycle check
-  catches them only if the actions themselves repeat, such as two edits undoing each other.
+- **Escalates on *stale* repeats:** identical canonical (tool, args) whose result matched an earlier one.
+- **Changing results never escalate by count** (tests re-run after each edit); only the cycle check
+  catches repeating actions, such as two edits undoing each other.
 - **Pollable tools** get the same ladder with thresholds scaled up, as a stand-in for a time budget.
 - **A refused call counts as stale,** because blocking made no progress either, so a model that keeps
   insisting climbs to abort.
@@ -232,8 +234,7 @@ for i, (name, args) in enumerate([*undo, *undo, *undo], 1):
   delegation depth in the orchestrator and route to a human after a small repeat count. Monitor
   handoff-repeat detections per agent pair.
 - **Offline trace mining.** Run exact and semantic repeat detection as a batch job over budget-exhausted
-  runs to find loops the online guard missed, then tune thresholds or tool error messages. Monitor the
-  share of exhausted runs containing an undetected repeat pattern.
+  runs to find loops the online guard missed, then tune thresholds or tool error messages.
 
 ## Trade-offs
 - **Exact match vs coverage.** Exact-match detection is cheap with near-zero false positives, but misses
@@ -248,20 +249,24 @@ for i, (name, args) in enumerate([*undo, *undo, *undo], 1):
   cycles; per-tool thresholds and result-aware rules restore those at the price of more configuration.
 
 ## Pitfalls
-- **Keying only on the tool name.** Every file read looks like a repeat; the symptom is aborts on
-  perfectly healthy runs that read several files. Fix: hash name plus canonical args.
-- **Blocking polling tools.** The symptom is long-running jobs that never complete because the status
-  check is refused after the third call. Fix: mark them pollable and rely on the result hash.
-- **Detecting but only logging.** The symptom is traces showing "loop detected" at step six and budget
-  exhaustion at step thirty. Fix: wire the ladder.
-- **Vague warnings ("you seem stuck").** The symptom is the model acknowledging and repeating. Fix:
-  include the exact call, the count and the fact that the result was identical.
-- **Hashing arguments without canonicalization.** The symptom is obvious repeats with reordered JSON keys
-  that are never counted. Fix: sorted keys and normalized whitespace.
-- **Escalating on raw call counts instead of unchanged results.** The symptom is healthy edit-test cycles
-  aborted as "stuck" on the sixth test run while every run was making progress. Fix: count stale repeats.
-- **Running the detector per agent in a multi-agent system.** The symptom is a task bouncing between two
-  agents for the whole budget while each agent's guard reports nothing. Fix: detect in the orchestrator.
+- **Keying only on the tool name.** Symptom: aborts on healthy runs that read several files, because
+  every file read looks like a repeat. Diagnose: list the hashes behind each abort; distinct arguments
+  under one key give it away. Fix: hash name plus canonical args.
+- **Blocking polling tools.** Symptom: long-running jobs never complete because the status check is
+  refused after the third call. Diagnose: blocks on tools whose results were changing. Fix: mark them
+  pollable and rely on the result hash.
+- **Detecting but only logging.** Symptom: traces show "loop detected" at step six and budget exhaustion
+  at step thirty. Diagnose: steps between first detection and run end. Fix: wire the ladder.
+- **Vague warnings ("you seem stuck").** Symptom: the model acknowledges and repeats. Diagnose: recovery
+  rate after the inform rung. Fix: name the exact call, the count and the identical result.
+- **Hashing arguments without canonicalization.** Symptom: obvious repeats with reordered JSON keys are
+  never counted. Fix: sorted keys and normalized whitespace.
+- **Escalating on raw call counts instead of unchanged results.** Symptom: healthy edit-test cycles
+  aborted as "stuck" on the sixth test run while every run made progress. Diagnose: check whether the
+  aborted calls' result hashes differed. Fix: count stale repeats.
+- **Running the detector per agent in a multi-agent system.** Symptom: a task bounces between two agents
+  for the whole budget while each guard reports nothing. Diagnose: count (from, to, task) handoffs per
+  run. Fix: detect in the orchestrator.
 
 ## When to use
 - **Use when:** any agent calls tools more than a few times per run, and especially anything that runs
@@ -272,8 +277,18 @@ for i, (name, args) in enumerate([*undo, *undo, *undo], 1):
   demonstrably misses loops you care about.
 - **Measure:** detections per hundred runs by tool, recovery rate after the inform rung, and the share of
   budget-exhausted runs that contained an undetected repeat pattern (mine the traces offline).
-- **Interviews:** describe the signals, the legitimate-repeat problem, and why informing the model comes
-  before aborting.
+
+## Exercise
+**Goal:** find the loops your own agent misses, then tune a guard to catch them without false
+positives. No solution is given.
+- **Inputs:** at least 20 traces of budget-exhausted or slow runs (yours, or scripted ones covering a
+  failing test, a reworded empty search, a poller and an edit pair that undo each other).
+- **Constraints:** result hashing with volatile fields stripped per tool, pollable tools flagged, ladder
+  thresholds set from the traces.
+- **Deliver:** an offline replay that labels each trace with the rung reached and the step it fired, plus
+  a list of loops still missed and why.
+- **Acceptance:** every scripted loop is caught before step 8; no healthy edit-test or polling trace
+  reaches block; replaying twice gives identical labels.
 
 ## Role lens
 - **Engineer:** Implements the guard in the tool-dispatch path, canonicalizes arguments, tunes
@@ -296,12 +311,6 @@ model with the exact command and output, refuse the fourth, and abort with statu
 persists. Log both cases so the thresholds can be tuned from real traces rather than guesses.
 
 ## Interview questions
-### Why not just rely on the step budget to stop looping agents?
-- **It fires too late.** A loop starting at step five of thirty burns twenty-five increasingly expensive
-  steps before the budget stops it.
-- **It teaches nothing and recovers nothing.** Detecting at step eight saves most of the cost, records the
-  evidence, and gives the model a chance to change strategy once told about the repeat.
-
 ### How would you tell a stuck loop apart from legitimate repetition such as polling?
 - **Hash the result as well as the action.** Polling that returns a changing status is progress; an
   identical (action, result) pair means the world did not change.
@@ -348,6 +357,20 @@ persists. Log both cases so the thresholds can be tuned from real traces rather 
 - [ ] Increase the repeat threshold
 > Models vary key order and whitespace between calls; without canonicalization identical intents hash
 > differently and are never counted. Hashing only the name would flag unrelated calls instead.
+
+## Mastery test
+**Problem:** a browsing agent searches, opens a result, finds nothing useful, and searches again with a
+reworded query. Each page includes a fresh ad id and timestamp. The guard never fires and runs end at
+the budget. Why, and what do you change?
+
+**A strong answer:**
+- sees that reworded queries hash differently and volatile page fields make every result unique, so
+  neither exact nor no-progress signals fire;
+- strips volatile fields per tool and adds a progress metric such as distinct useful URLs or new facts
+  found, counting steps since it last improved;
+- considers semantic similarity on queries only if that still misses, accepting its cost and false
+  positives;
+- validates offline on exhausted traces before enabling block.
 
 ## Use cases & projects
 ### Use cases
