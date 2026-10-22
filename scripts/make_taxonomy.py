@@ -214,6 +214,26 @@ TAXONOMY = [
   "change management","user training","workshops","stakeholder management","exec communication","usage analytics",
   "adoption & value-realization measurement","continuous improvement","handoff to customer teams",
   "feature-request triage"]),
+ ("agent-frameworks", 1, "Agent frameworks & tooling", [
+  ("choosing an agent framework (build on SDKs vs frameworks)", "decision: how to pick between raw SDKs, LangGraph, LlamaIndex, OpenAI/Claude agent SDKs, CrewAI, Pydantic AI"),
+  ("LangChain (LCEL, chat models, tools, retrievers)", "tool"),
+  ("LangGraph fundamentals (StateGraph, nodes, edges, conditional routing)", "tool"),
+  ("LangGraph persistence, streaming and human-in-the-loop (checkpointers, interrupts)", "tool"),
+  ("LangGraph multi-agent patterns (supervisor, handoffs, subgraphs)", "tool"),
+  ("LangSmith for agents (tracing, datasets, evaluators, prompt hub)", "tool"),
+  ("LlamaIndex (indexes, query engines, agents, workflows)", "tool"),
+  ("OpenAI Agents SDK (agents, tools, handoffs, guardrails, tracing)", "tool"),
+  ("Claude Agent SDK (agent loop, tools, MCP, subagents)", "tool"),
+  ("Pydantic AI (typed agents, dependencies, structured results)", "tool"),
+  ("CrewAI (crews, roles, tasks, flows)", "tool"),
+  ("AutoGen / AG2 (conversational multi-agent)", "tool"),
+  ("Google Agent Development Kit (ADK)", "tool"),
+  ("DSPy (signatures, modules, optimizers)", "tool"),
+  ("Mastra (TypeScript agents and workflows)", "tool"),
+  ("agent memory libraries (Mem0, Letta)", "tool"),
+  ("code-execution sandboxes for agents (E2B, Modal, Docker)", "tool"),
+  ("end-to-end agent stack (framework, LLM gateway, vector store, tracing, evals, deployment)", "decision: a reference stack and how the pieces connect"),
+ ]),
 ]
 
 TIER_INFO = {
@@ -257,7 +277,7 @@ def main():
                 t["kind_hint"] = "tool"
             if hint.startswith("caveat"):
                 t["caveat"] = hint.split(":", 1)[1].strip()
-            if hint.startswith("orientation"):
+            if hint.startswith(("orientation", "decision")):
                 t["note"] = hint.split(":", 1)[1].strip()
             topics.append(t); all_ids.append(t["key"])
         modules.append({"id": mid, "tier": tier, "order": order, "title": title, "topics": topics})

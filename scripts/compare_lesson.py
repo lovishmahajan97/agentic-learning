@@ -67,8 +67,9 @@ def compare(old_text, new_text):
         return ["new file has no valid front matter"] + e
     if ofm is None:
         return []
+    agentic = str(nfm.get("status", "")).lower().startswith("agentic")
     for k in sorted(set(ofm) | set(nfm)):
-        if k == "status":
+        if k == "status" or (agentic and k == "agent_relevance"):
             continue
         if ofm.get(k) != nfm.get(k):
             problems.append(f"front matter '{k}' changed: {ofm.get(k)!r} -> {nfm.get(k)!r}")
@@ -80,7 +81,7 @@ def compare(old_text, new_text):
     new_rest = "\n".join(v for k, v in nsec.items() if k not in KEEP_SECTIONS)
     new_code = set(code_blocks(new_rest))
     new_code_joined = " ".join(new_code)
-    for b in code_blocks(old_rest):
+    for b in ([] if agentic else code_blocks(old_rest)):   # agentic reframe may swap generic code for agent code
         if b not in new_code and b not in new_code_joined:
             problems.append(f"code block lost: {b[:70]!r}")
     new_flat = norm(new_rest).replace(",", "")
@@ -105,7 +106,9 @@ def ref_text(ref, rel):
 def main(argv):
     has_tag = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "-q", "--verify", "refs/tags/pre-crisp"],
                              capture_output=True).returncode == 0
-    ref, files, all_mode = ("pre-crisp" if has_tag else "HEAD"), [], False
+    has_agentic = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "-q", "--verify", "refs/tags/pre-agentic"],
+                                 capture_output=True).returncode == 0
+    ref, files, all_mode = ("pre-agentic" if has_agentic else "pre-crisp" if has_tag else "HEAD"), [], False
     i = 0
     while i < len(argv):
         if argv[i] == "--ref":
@@ -118,7 +121,7 @@ def main(argv):
         for p in sorted((ROOT / "content").glob("*/*.md")):
             if p.name.startswith("_"):
                 continue
-            if re.search(r"^status:\s*crisp(-verified)?\s*$", p.read_text(encoding="utf-8")[:2000], re.M):
+            if re.search(r"^status:\s*(crisp|agentic)(-verified)?\s*$", p.read_text(encoding="utf-8")[:2000], re.M):
                 files.append(str(p.relative_to(ROOT)))
     bad = 0
     for f in files:

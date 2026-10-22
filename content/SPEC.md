@@ -1,4 +1,34 @@
-# Lesson authoring spec (v2: crisp format)
+# Lesson authoring spec (v3: agent-builder framing on the crisp format)
+
+**Who this is for.** The learner is preparing to BUILD AGENTS: LLM apps that plan, call tools, retrieve,
+remember, run in production and get evaluated. Every lesson is written from that seat. General theory
+appears only as much as an agent builder needs it, framed by what it changes in their agent.
+- Example of the stance: "gradient descent" is not taught as calculus; it is taught as what you need to
+  read a fine-tuning loss curve, pick a learning rate for LoRA on agent traces, and spot a run that
+  diverged. The math stays (keep every fact) but compressed into a "Background" subsection.
+
+**v3 adds to the crisp format (v2 below):**
+- front matter `agent_relevance: core | useful | background` (core = you use it directly when building
+  agents; useful = you meet it when fine-tuning, serving or operating agents; background = context you
+  should recognise) and `status: agentic` once both checks pass (`agentic-verified` after review);
+- a `## For agent builders` section directly after the TL;DR: 3-5 bold-led bullets, e.g. **Why it matters
+  for agents**, **Where it shows up in your stack** (frameworks, APIs, settings), **What you control**,
+  **What you can skip**;
+- the TL;DR, How it works, Diagram, Examples, Production patterns and Interview questions all framed in
+  agent terms: at least one example is an agent scenario (tool-calling loop, RAG step, memory, eval,
+  serving agents); production patterns are things agent teams do; at least 2 interview questions are
+  about building or operating agents;
+- unchanged: Role lens, Check yourself and Quiz (copied exactly);
+- no-loss rule vs tag `pre-agentic`: front matter (except status and agent_relevance), Role lens, Check
+  yourself and Quiz unchanged; every number and inline code span must still appear. Generic code blocks
+  MAY be replaced by agent-focused code. Check with `python3 scripts/build.py --check --v3 <file>` and
+  `python3 scripts/compare_lesson.py <file>`.
+
+The exemplar is `content/model-internals/kv-cache.md` (compare with `git show pre-agentic:<path>`).
+
+---
+
+# Base format (v2: crisp format)
 
 One Markdown file per topic at `content/<module>/<slug>.md` (`<module>` and `<slug>` from `taxonomy.json`).
 Check every file you write with both tools and fix until both print ✓:

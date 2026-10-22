@@ -3258,6 +3258,122 @@
      "name": "feature-request triage"
     }
    ]
+  },
+  {
+   "id": "agent-frameworks",
+   "tier": 1,
+   "order": 30,
+   "title": "Agent frameworks & tooling",
+   "topics": [
+    {
+     "id": "choosing-an-agent-framework",
+     "key": "agent-frameworks/choosing-an-agent-framework",
+     "name": "choosing an agent framework (build on SDKs vs frameworks)",
+     "note": "how to pick between raw SDKs, LangGraph, LlamaIndex, OpenAI/Claude agent SDKs, CrewAI, Pydantic AI"
+    },
+    {
+     "id": "langchain",
+     "key": "agent-frameworks/langchain",
+     "name": "LangChain (LCEL, chat models, tools, retrievers)",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "langgraph-fundamentals",
+     "key": "agent-frameworks/langgraph-fundamentals",
+     "name": "LangGraph fundamentals (StateGraph, nodes, edges, conditional routing)",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "langgraph-persistence-streaming-and-human-in-the-loop",
+     "key": "agent-frameworks/langgraph-persistence-streaming-and-human-in-the-loop",
+     "name": "LangGraph persistence, streaming and human-in-the-loop (checkpointers, interrupts)",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "langgraph-multi-agent-patterns",
+     "key": "agent-frameworks/langgraph-multi-agent-patterns",
+     "name": "LangGraph multi-agent patterns (supervisor, handoffs, subgraphs)",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "langsmith-for-agents",
+     "key": "agent-frameworks/langsmith-for-agents",
+     "name": "LangSmith for agents (tracing, datasets, evaluators, prompt hub)",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "llamaindex",
+     "key": "agent-frameworks/llamaindex",
+     "name": "LlamaIndex (indexes, query engines, agents, workflows)",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "openai-agents-sdk",
+     "key": "agent-frameworks/openai-agents-sdk",
+     "name": "OpenAI Agents SDK (agents, tools, handoffs, guardrails, tracing)",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "claude-agent-sdk",
+     "key": "agent-frameworks/claude-agent-sdk",
+     "name": "Claude Agent SDK (agent loop, tools, MCP, subagents)",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "pydantic-ai",
+     "key": "agent-frameworks/pydantic-ai",
+     "name": "Pydantic AI (typed agents, dependencies, structured results)",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "crewai",
+     "key": "agent-frameworks/crewai",
+     "name": "CrewAI (crews, roles, tasks, flows)",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "autogen-ag2",
+     "key": "agent-frameworks/autogen-ag2",
+     "name": "AutoGen / AG2 (conversational multi-agent)",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "google-agent-development-kit",
+     "key": "agent-frameworks/google-agent-development-kit",
+     "name": "Google Agent Development Kit (ADK)",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "dspy",
+     "key": "agent-frameworks/dspy",
+     "name": "DSPy (signatures, modules, optimizers)",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "mastra",
+     "key": "agent-frameworks/mastra",
+     "name": "Mastra (TypeScript agents and workflows)",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "agent-memory-libraries",
+     "key": "agent-frameworks/agent-memory-libraries",
+     "name": "agent memory libraries (Mem0, Letta)",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "code-execution-sandboxes-for-agents",
+     "key": "agent-frameworks/code-execution-sandboxes-for-agents",
+     "name": "code-execution sandboxes for agents (E2B, Modal, Docker)",
+     "kind_hint": "tool"
+    },
+    {
+     "id": "end-to-end-agent-stack",
+     "key": "agent-frameworks/end-to-end-agent-stack",
+     "name": "end-to-end agent stack (framework, LLM gateway, vector store, tracing, evals, deployment)",
+     "note": "a reference stack and how the pieces connect"
+    }
+   ]
   }
  ]
 }

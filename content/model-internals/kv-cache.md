@@ -5,7 +5,8 @@ name: KV cache
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - model-internals/self-attention
   - model-internals/grouped-query-attention
@@ -20,9 +21,22 @@ sources:
 ---
 
 ## TL;DR
-The KV cache stores earlier tokens' keys and values so a decoder projects each position once, not once
-per step. Generation becomes cheap in compute but costly in GPU memory, so memory usually caps how many
-requests a server runs.
+Every agent step re-sends a growing transcript; the KV cache stores earlier tokens' keys and values so
+the model projects each position once. It makes long agent loops affordable in compute but costly in GPU
+memory, which caps how many agents a server runs.
+
+## For agent builders
+- **Why it matters for agents.** An agent's context only grows: system prompt, tool definitions, then
+  every tool call and result appended step after step. The KV cache (and prefix caching on top of it)
+  decides whether step 20 costs as little as step 1 or re-processes the whole transcript.
+- **Where it shows up in your stack.** Provider prompt caching for hosted models, `enable_prefix_caching`
+  in vLLM or RadixAttention in SGLang for self-hosted ones, and the concurrency limit of any GPU serving
+  your agents.
+- **What you control.** Keep the prefix stable (system prompt and tool schemas first, byte-identical),
+  append instead of editing history, and compact old turns deliberately, because any edit invalidates
+  the cache from that point on.
+- **What you can skip.** The CUDA kernels behind attention. Know the bytes-per-token formula and the
+  prefill/decode split; that is enough to size and debug agent serving.
 
 ## Why it exists
 - **Generation is a loop.** Feed the prompt, get a token, append it, feed everything again. Without a
@@ -177,7 +191,27 @@ A team raised `max_model_len` from 8k to 32k on an 80 GB GPU running a 7B MHA mo
 
 The fix was not more compute: cap context per tier, move to a GQA model, and enable an FP8 cache.
 
+### Worked scenario: a 20-step research agent
+A coding agent starts with a 6k-token prefix (system prompt plus tool schemas) and appends ~1.5k tokens
+per step (tool call plus result).
+
+| Step | Context | Without prefix reuse | With an append-only transcript and prefix caching |
+|---|---|---|---|
+| 1 | 6k | prefill 6k | prefill 6k (cache written) |
+| 10 | 19.5k | prefill 19.5k | prefill ~1.5k new tokens |
+| 20 | 34.5k | prefill 34.5k | prefill ~1.5k new tokens |
+| Total prefill over 20 steps | | ~405k tokens | ~34.5k tokens |
+
+The cache also has to hold 34.5k tokens × ~0.5 MB ≈ 17 GB for one agent on a 7B MHA model, which is why
+long-running agents need GQA models, FP8 caches or context compaction.
+
 ## Production patterns
+- **Keep agent transcripts append-only.** Put stable content first (system prompt, tool schemas), append
+  tool calls and results, and never rewrite earlier turns mid-run. Monitor cached-token share per agent
+  step; it should climb toward the prefix length on every step after the first.
+- **Compact on purpose, at a boundary.** When context nears the window, summarize old turns once into a
+  new stable block and accept one cache miss, instead of trimming a little every step and missing the
+  cache every time.
 - **Size admission from cache math, not weights.** Compute bytes-per-token from the model config, then
   set `max_model_len` and `max_num_seqs` (vLLM) so the expected mix fits with ~10% headroom. Monitor KV
   utilization and preemption counts.
@@ -274,6 +308,13 @@ answer also notes decode is bandwidth-bound, so higher concurrency raises per-re
 - **MQA** shares one K/V head across all query heads: the biggest saving, often some quality cost.
 - **GQA** shares each K/V head across a group (for example 8 KV heads instead of 32), a 4x saving.
 - **MLA** caches a compressed latent per token and reconstructs K and V from it.
+
+### Your agent's latency grows with every step even though each tool result is small. What do you check?
+- **Is the prefix stable?** Timestamps, random IDs or reordered tool schemas at the top of the prompt
+  break prefix reuse, so every step re-prefills the whole transcript.
+- **Is history edited?** Rewriting or trimming earlier turns invalidates the cache from that position on.
+- **Measure** cached versus uncached input tokens per step from the provider usage fields or engine
+  metrics; the uncached count should stay near the size of the newest step.
 
 ## Quiz
 ### Q: Why does the KV cache store keys and values but not queries?

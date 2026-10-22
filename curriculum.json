@@ -1,25 +1,78 @@
 {
  "about": "The single learning track: stages in order, modules in order inside each stage. Topic order inside a module comes from that module's _module.md 'Suggested order'. Tiers and role paths in taxonomy.json are kept as metadata.",
  "stages": [
-  {"id": "foundations", "title": "Programming foundations",
+  {
+   "id": "foundations",
+   "title": "Programming foundations",
    "blurb": "The Python, backend and service skills every later module builds on.",
-   "modules": ["python-for-ai", "backend-fundamentals", "fastapi-for-ai", "node-ts-for-ai"]},
-  {"id": "ml-core", "title": "ML and model foundations",
+   "modules": [
+    "python-for-ai",
+    "backend-fundamentals",
+    "fastapi-for-ai",
+    "node-ts-for-ai"
+   ]
+  },
+  {
+   "id": "ml-core",
+   "title": "ML and model foundations",
    "blurb": "How models learn, how transformers work inside, and how they are adapted.",
-   "modules": ["ml-fundamentals", "model-internals", "training-adaptation"]},
-  {"id": "llm-apps", "title": "Building LLM applications",
-   "blurb": "Prompting, retrieval, multimodal inputs and agents that use tools reliably.",
-   "modules": ["prompting", "rag-retrieval", "multimodal", "agents", "agent-reliability"]},
-  {"id": "production", "title": "Quality and production",
+   "modules": [
+    "ml-fundamentals",
+    "model-internals",
+    "training-adaptation"
+   ]
+  },
+  {
+   "id": "llm-apps",
+   "title": "Building LLM applications",
+   "blurb": "Prompting, retrieval, multimodal inputs, agents, the frameworks that build them, and running them reliably.",
+   "modules": [
+    "prompting",
+    "rag-retrieval",
+    "multimodal",
+    "agents",
+    "agent-frameworks",
+    "agent-reliability"
+   ]
+  },
+  {
+   "id": "production",
+   "title": "Quality and production",
    "blurb": "Evaluating, serving, observing and securing AI systems in production.",
-   "modules": ["evals", "serving-inference", "observability", "safety-security"]},
-  {"id": "architecture", "title": "Architecture",
+   "modules": [
+    "evals",
+    "serving-inference",
+    "observability",
+    "safety-security"
+   ]
+  },
+  {
+   "id": "architecture",
+   "title": "Architecture",
    "blurb": "The AI Architect's decisions: system shape, reliability, data, cost, platform and governance.",
-   "modules": ["system-design", "reliability", "agent-runtime-architecture", "data-architecture",
-               "infra-capacity-economics", "llmops-platform", "security-governance-compliance", "strategy"]},
-  {"id": "delivery", "title": "Customer delivery",
+   "modules": [
+    "system-design",
+    "reliability",
+    "agent-runtime-architecture",
+    "data-architecture",
+    "infra-capacity-economics",
+    "llmops-platform",
+    "security-governance-compliance",
+    "strategy"
+   ]
+  },
+  {
+   "id": "delivery",
+   "title": "Customer delivery",
    "blurb": "The Forward Deployed Engineer's work: scoping, integrating, deploying and driving adoption.",
-   "modules": ["scoping", "enterprise-integration", "customer-data-evaluation", "deployment",
-               "delivery-ownership", "adoption"]}
+   "modules": [
+    "scoping",
+    "enterprise-integration",
+    "customer-data-evaluation",
+    "deployment",
+    "delivery-ownership",
+    "adoption"
+   ]
+  }
  ]
 }

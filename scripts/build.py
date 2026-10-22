@@ -21,6 +21,8 @@ KINDS = {"concept", "tool", "metric", "pattern", "practice", "decision"}
 DIFFS = {"intro", "core", "advanced"}
 TOPIC_SECTIONS = ["TL;DR", "Why it exists", "How it works", "Example", "Trade-offs", "Pitfalls",
                   "When to use", "Role lens", "Check yourself", "Quiz"]
+RELEVANCE = {"core", "useful", "background"}
+V3_FORCE = False          # set by --v3: check against the agent-builder format (SPEC v3)
 TOPIC_SECTIONS_V2 = ["TL;DR", "Why it exists", "How it works", "Diagram", "Example", "Production patterns",
                      "Trade-offs", "Pitfalls", "When to use", "Role lens", "Check yourself",
                      "Interview questions", "Quiz"]
@@ -41,6 +43,7 @@ def norm_heading(h):
                "trade-offs": "Trade-offs", "tradeoffs": "Trade-offs", "trade offs": "Trade-offs",
                "pitfalls": "Pitfalls", "common pitfalls": "Pitfalls",
                "production patterns": "Production patterns", "in production": "Production patterns",
+               "for agent builders": "For agent builders", "agent builder's take": "For agent builders",
                "diagram": "Diagram", "flowchart": "Diagram", "flow": "Diagram",
                "interview questions": "Interview questions", "interview prep": "Interview questions",
                "when to use": "When to use", "when to use / decide": "When to use", "when to use it": "When to use",
@@ -277,8 +280,10 @@ def parse_topic(path: Path):
         if nh is None: errs.append(f"unknown '## {h}' section; allowed: {TOPIC_SECTIONS_V2}")
         elif nh in got: errs.append(f"duplicate section '{nh}'")
         else: got[nh] = c
-    v2 = V2_FORCE or str(fm.get("status", "")).lower().startswith("crisp") or "Production patterns" in got
-    need = TOPIC_SECTIONS_V2 if v2 else TOPIC_SECTIONS
+    st_ = str(fm.get("status", "")).lower()
+    v3 = V3_FORCE or st_.startswith("agentic")
+    v2 = v3 or V2_FORCE or st_.startswith("crisp") or "Production patterns" in got
+    need = (["For agent builders"] + TOPIC_SECTIONS_V2) if v3 else (TOPIC_SECTIONS_V2 if v2 else TOPIC_SECTIONS)
     for s in need:
         if s not in got: errs.append(f"missing section '## {s}'")
     if any(s not in got for s in need):
@@ -315,6 +320,14 @@ def parse_topic(path: Path):
             if words(b) < 15: errs.append(f"production pattern too thin (min 15 words): {b[:50]!r}")
         if len(bullets(got["When to use"])) < 3: errs.append("'When to use' needs bullets (use when / avoid when / measure)")
         dia = diagram(got["Diagram"], errs)
+        if v3:
+            rel = str(fm.get("agent_relevance", "")).lower()
+            if rel not in RELEVANCE: errs.append(f"front matter agent_relevance must be one of {sorted(RELEVANCE)}")
+            fb = bullets(got["For agent builders"])
+            if len(fb) < 3: errs.append("'For agent builders' needs 3-5 bold-led bullets (why it matters for agents, where it shows up in an agent stack, what you can skip)")
+            if words(got["For agent builders"]) < 50: errs.append("'For agent builders' too thin (min 50 words)")
+            for kind_, w, head in long_blocks(got["For agent builders"]):
+                errs.append(f"'For agent builders': {kind_} of {w} words; split it: {head!r}")
         ivq = interview(got["Interview questions"], errs)
         for sec in ("TL;DR", "Why it exists", "How it works", "Diagram", "Example", "Production patterns",
                     "Trade-offs", "Pitfalls", "When to use", "Interview questions"):
@@ -332,7 +345,8 @@ def parse_topic(path: Path):
          "taxonomy_name": tax_t["name"], "kind": kind, "difficulty": diff, "est_minutes": est,
          "related": [r for r in related if r in ALL_KEYS], "sources": sources,
          "tldr": got["TL;DR"], "why": got["Why it exists"], "how": got["How it works"],
-         "example": got["Example"], "patterns": patterns, "diagram": dia, "interview": ivq, "format": "crisp" if v2 else "long", "tradeoffs": tr, "pitfalls": pf, "when": got["When to use"],
+         "example": got["Example"], "patterns": patterns, "agent": got.get("For agent builders") if v3 else None,
+         "agent_relevance": str(fm.get("agent_relevance", "")).lower() or None, "diagram": dia, "interview": ivq, "format": "crisp" if v2 else "long", "tradeoffs": tr, "pitfalls": pf, "when": got["When to use"],
          "role_lens": role_lens(got["Role lens"], errs, "Role lens"),
          "check": check_yourself(got["Check yourself"], errs), "quiz": quiz(got["Quiz"], errs)}
     if "caveat" in tax_t: t["caveat"] = tax_t["caveat"]
@@ -378,7 +392,7 @@ def parse_module(path: Path):
         if s not in capn: errs.append(f"Capstone needs '### {s}'")
     if any(s not in capn for s in ("Brief", "Deliverables", "Rubric")): return None, errs
     if words(capn["Brief"]) < 120: errs.append("Capstone brief too short (min 120 words)")
-    if V2_FORCE or str(fm.get("status", "")).lower().startswith("crisp"):
+    if V2_FORCE or str(fm.get("status", "")).lower().startswith(("crisp", "agentic")):
         for sec, md_ in (("Overview", got["Overview"]), ("Mental model", got["Mental model"]),
                          ("Capstone brief", capn["Brief"])):
             for kind_, w, head in long_blocks(md_):
@@ -446,7 +460,7 @@ def build(report_only=False):
         for k, v in list(report["invalid"].items())[:40]:
             print(f"  ✗ {k}: {v[0]}")
         return
-    HEAVY = ("why", "how", "example", "patterns", "diagram", "interview", "tradeoffs", "pitfalls", "when", "role_lens", "check", "quiz", "sources")
+    HEAVY = ("agent", "why", "how", "example", "patterns", "diagram", "interview", "tradeoffs", "pitfalls", "when", "role_lens", "check", "quiz", "sources")
     built = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     (ROOT / "site" / "data").mkdir(exist_ok=True)
     light_modules, total_bytes = [], 0
@@ -484,6 +498,8 @@ if __name__ == "__main__":
     a = sys.argv[1:]
     if "--v2" in a:
         a.remove("--v2"); V2_FORCE = True
+    if "--v3" in a:
+        a.remove("--v3"); V3_FORCE = True; V2_FORCE = True
     if a[:1] == ["--check"]:
         sys.exit(1 if check_files(a[1:]) else 0)
     if a[:1] == ["--check-module"]:
